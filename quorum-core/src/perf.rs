@@ -452,12 +452,18 @@ pub struct IntentFacts {
     pub config_evidence: Option<serde_json::Value>,
     pub final_worker: Option<serde_json::Value>,
     pub contributing_attempts: Option<serde_json::Value>,
+    /// Raw normalized durable token buckets grouped by role. The nested
+    /// `provisional_effective_token_total` is deliberately not a cost or
+    /// billing definition; provider totals/cost stay null when not durable.
     pub role_tokens_usd: Option<serde_json::Value>,
     pub active_model_secs: Option<i64>,
     pub wall_secs: Option<i64>,
     pub rework_count: Option<i64>,
     pub recovery_count: Option<i64>,
     pub replan_count: Option<i64>,
+    pub provider_failure_count: Option<i64>,
+    pub abnormal_runner_ending_count: Option<i64>,
+    pub collector_failure_count: Option<i64>,
     pub incident_count: Option<i64>,
     pub review_quality: Option<serde_json::Value>,
 
@@ -481,12 +487,15 @@ pub struct IntentCoverage {
     pub rework: bool,
     pub recovery: bool,
     pub replan: bool,
+    pub provider_failure: bool,
+    pub abnormal_runner_ending: bool,
+    pub collector_failure: bool,
     pub incident: bool,
     pub review_quality: bool,
 }
 
 impl IntentCoverage {
-    fn iter_named(&self) -> [(&'static str, bool); 15] {
+    fn iter_named(&self) -> [(&'static str, bool); 18] {
         [
             ("lineage", self.lineage),
             ("terminal", self.terminal),
@@ -501,6 +510,9 @@ impl IntentCoverage {
             ("rework", self.rework),
             ("recovery", self.recovery),
             ("replan", self.replan),
+            ("provider_failure", self.provider_failure),
+            ("abnormal_runner_ending", self.abnormal_runner_ending),
+            ("collector_failure", self.collector_failure),
             ("incident", self.incident),
             ("review_quality", self.review_quality),
         ]
@@ -556,6 +568,10 @@ struct FactsTaskRow {
     id: i64,
     status: String,
     review_only: bool,
+    created_at: i64,
+    updated_at: i64,
+    rework_round: i64,
+    recovery_attempts: i64,
     completion_provenance: Option<String>,
     refs: Option<String>,
 }
@@ -570,7 +586,8 @@ fn load_facts_candidate_tasks(
 ) -> Result<Vec<FactsTaskRow>> {
     let since_val = since.unwrap_or(0);
     let mut stmt = conn.prepare(
-        "SELECT id,status,review_only,completion_provenance,refs \
+        "SELECT id,status,review_only,created_at,updated_at,rework_round,recovery_attempts,
+                completion_provenance,refs \
          FROM tasks \
          WHERE updated_at >= ?1 \
          ORDER BY id ASC \
@@ -582,8 +599,12 @@ fn load_facts_candidate_tasks(
                 id: r.get(0)?,
                 status: r.get(1)?,
                 review_only: r.get::<_, i64>(2)? != 0,
-                completion_provenance: r.get(3)?,
-                refs: r.get(4)?,
+                created_at: r.get(3)?,
+                updated_at: r.get(4)?,
+                rework_round: r.get(5)?,
+                recovery_attempts: r.get(6)?,
+                completion_provenance: r.get(7)?,
+                refs: r.get(8)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -602,7 +623,8 @@ fn load_facts_tasks_by_id(
     for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
         let placeholders = sql_placeholders(batch.len());
         let sql = format!(
-            "SELECT id,status,review_only,completion_provenance,refs
+            "SELECT id,status,review_only,created_at,updated_at,rework_round,recovery_attempts,
+                    completion_provenance,refs
              FROM tasks WHERE id IN ({placeholders})"
         );
         let mut statement = conn.prepare(&sql)?;
@@ -612,8 +634,12 @@ fn load_facts_tasks_by_id(
                     id: row.get(0)?,
                     status: row.get(1)?,
                     review_only: row.get::<_, i64>(2)? != 0,
-                    completion_provenance: row.get(3)?,
-                    refs: row.get(4)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                    rework_round: row.get(5)?,
+                    recovery_attempts: row.get(6)?,
+                    completion_provenance: row.get(7)?,
+                    refs: row.get(8)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -660,6 +686,9 @@ fn new_intent_facts(
         rework_count: None,
         recovery_count: None,
         replan_count: None,
+        provider_failure_count: None,
+        abnormal_runner_ending_count: None,
+        collector_failure_count: None,
         incident_count: None,
         review_quality: None,
         coverage: IntentCoverage::default(),
@@ -1558,6 +1587,10 @@ struct CohortSnapshot {
 // planner attempts to the same number under the per-task cap below.
 const MAX_ATTRIBUTION_TASKS_PER_SNAPSHOT: usize = 1_024;
 const MAX_ATTRIBUTION_ATTEMPTS_PER_TASK: usize = 64;
+const MAX_TOKEN_USAGE_ROWS_PER_TASK: usize = 128;
+const MAX_PLANNING_INCIDENT_ROWS_PER_TASK: usize = 64;
+const MAX_REVIEW_COLLECTION_ROWS_PER_TASK: usize = 64;
+const MAX_REVIEW_FINDINGS_PER_TASK: usize = 256;
 
 #[derive(Debug, Clone)]
 struct AssignmentFact {
@@ -1615,12 +1648,64 @@ struct PlannerAttemptFact {
     assignment: AssignmentFact,
 }
 
+/// A task-bound runner interval. Unlike attribution/configuration evidence,
+/// time remains attributable when a legacy row lacks a role assignment: the
+/// immutable `agent_runs.task_id` link is itself sufficient evidence.
+#[derive(Debug, Clone)]
+struct ActiveRunFact {
+    id: i64,
+    role: String,
+    spawned_at: i64,
+    ended_at: Option<i64>,
+    end_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TokenUsageFact {
+    agent_run_id: Option<i64>,
+    purpose: String,
+    usage: crate::token_usage::TokenUsage,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PlanningIncidentFact {
+    replan_count: i64,
+    provider_failure_count: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewCollectionFact {
+    pr_number: i64,
+    status: String,
+    findings_count: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewFindingFact {
+    pr_number: i64,
+    kind: String,
+    author_pushback: bool,
+    pushback_accepted: Option<bool>,
+    addressed_status: Option<String>,
+}
+
 #[derive(Debug, Default)]
 struct AttributionSnapshot {
     managed_by_task: HashMap<i64, Vec<ManagedAttemptFact>>,
     latest_worker_run_by_task: HashMap<i64, i64>,
     incomplete_managed_task_ids: HashSet<i64>,
     planners_by_task: HashMap<i64, Vec<PlannerAttemptFact>>,
+    active_runs_by_task: HashMap<i64, Vec<ActiveRunFact>>,
+    capped_active_run_task_ids: HashSet<i64>,
+    token_usage_by_task: HashMap<i64, Vec<TokenUsageFact>>,
+    capped_token_usage_task_ids: HashSet<i64>,
+    planning_incidents_by_task: HashMap<i64, PlanningIncidentFact>,
+    incomplete_planning_incident_task_ids: HashSet<i64>,
+    capped_planning_incident_task_ids: HashSet<i64>,
+    review_collections_by_task: HashMap<i64, Vec<ReviewCollectionFact>>,
+    capped_review_collection_task_ids: HashSet<i64>,
+    review_findings_by_task: HashMap<i64, Vec<ReviewFindingFact>>,
+    capped_review_finding_task_ids: HashSet<i64>,
 }
 
 fn present_text(value: &str) -> bool {
@@ -2039,7 +2124,270 @@ fn load_attribution_snapshot(conn: &Connection, task_ids: &[i64]) -> Result<Attr
                 .push(planner);
         }
     }
+    load_active_run_facts(conn, task_ids, &mut snapshot)?;
+    load_token_usage_facts(conn, task_ids, &mut snapshot)?;
+    load_planning_incident_facts(conn, task_ids, &mut snapshot)?;
+    load_review_quality_facts(conn, task_ids, &mut snapshot)?;
     Ok(snapshot)
+}
+
+/// Load only a bounded prefix plus one overflow probe for each task. A prefix
+/// is useful only when it is complete, so a probe makes the whole timing fact
+/// explicitly unknown rather than reporting a partial duration.
+fn load_active_run_facts(
+    conn: &Connection,
+    task_ids: &[i64],
+    snapshot: &mut AttributionSnapshot,
+) -> Result<()> {
+    for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
+        let placeholders = sql_placeholders(batch.len());
+        let sql = format!(
+            "SELECT task_id,id,role,spawned_at,ended_at,end_reason,row_num FROM (
+                 SELECT task_id,id,role,spawned_at,ended_at,end_reason,
+                        ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY id) AS row_num
+                 FROM agent_runs
+                 WHERE task_id IN ({placeholders})
+                   AND role IN ('worker','reviewer')
+             ) WHERE row_num <= ?
+             ORDER BY task_id,id"
+        );
+        let mut values = batch.to_vec();
+        values.push((MAX_ATTRIBUTION_ATTEMPTS_PER_TASK + 1) as i64);
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    ActiveRunFact {
+                        id: row.get(1)?,
+                        role: row.get(2)?,
+                        spawned_at: row.get(3)?,
+                        ended_at: row.get(4)?,
+                        end_reason: row.get(5)?,
+                    },
+                    row.get::<_, i64>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (task_id, run, row_num) in rows {
+            if row_num > MAX_ATTRIBUTION_ATTEMPTS_PER_TASK as i64 {
+                snapshot.capped_active_run_task_ids.insert(task_id);
+            } else {
+                snapshot
+                    .active_runs_by_task
+                    .entry(task_id)
+                    .or_default()
+                    .push(run);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_token_usage_facts(
+    conn: &Connection,
+    task_ids: &[i64],
+    snapshot: &mut AttributionSnapshot,
+) -> Result<()> {
+    for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
+        let placeholders = sql_placeholders(batch.len());
+        let sql = format!(
+            "SELECT task_id,agent_run_id,purpose,uncached_input_tokens,cached_input_tokens,
+                    cache_write_input_tokens,output_tokens,reasoning_tokens,row_num
+             FROM (
+                 SELECT mapping.task_id,usage.agent_run_id,usage.purpose,
+                        usage.uncached_input_tokens,usage.cached_input_tokens,
+                        usage.cache_write_input_tokens,usage.output_tokens,usage.reasoning_tokens,
+                        ROW_NUMBER() OVER (PARTITION BY mapping.task_id ORDER BY usage.id) AS row_num
+                 FROM token_usage_run_tasks mapping
+                 JOIN token_usage_runs usage ON usage.id=mapping.run_id
+                 WHERE mapping.task_id IN ({placeholders})
+             ) WHERE row_num <= ?
+             ORDER BY task_id,row_num"
+        );
+        let mut values = batch.to_vec();
+        values.push((MAX_TOKEN_USAGE_ROWS_PER_TASK + 1) as i64);
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    TokenUsageFact {
+                        agent_run_id: row.get(1)?,
+                        purpose: row.get(2)?,
+                        usage: crate::token_usage::TokenUsage {
+                            uncached_input_tokens: row.get(3)?,
+                            cached_input_tokens: row.get(4)?,
+                            cache_write_input_tokens: row.get(5)?,
+                            output_tokens: row.get(6)?,
+                            reasoning_tokens: row.get(7)?,
+                        },
+                    },
+                    row.get::<_, i64>(8)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (task_id, usage, row_num) in rows {
+            if row_num > MAX_TOKEN_USAGE_ROWS_PER_TASK as i64 {
+                snapshot.capped_token_usage_task_ids.insert(task_id);
+            } else {
+                snapshot
+                    .token_usage_by_task
+                    .entry(task_id)
+                    .or_default()
+                    .push(usage);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_planning_incident_facts(
+    conn: &Connection,
+    task_ids: &[i64],
+    snapshot: &mut AttributionSnapshot,
+) -> Result<()> {
+    for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
+        let placeholders = sql_placeholders(batch.len());
+        let sql = format!(
+            "SELECT source_task_id,proposal_attempts,provider_failures,row_num FROM (
+                 SELECT source_task_id,proposal_attempts,provider_failures,
+                        ROW_NUMBER() OVER (PARTITION BY source_task_id ORDER BY id) AS row_num
+                 FROM task_decompositions
+                 WHERE source_task_id IN ({placeholders})
+             ) WHERE row_num <= ?
+             ORDER BY source_task_id,row_num"
+        );
+        let mut values = batch.to_vec();
+        values.push((MAX_PLANNING_INCIDENT_ROWS_PER_TASK + 1) as i64);
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (task_id, replan_count, provider_failure_count, row_num) in rows {
+            if row_num > MAX_PLANNING_INCIDENT_ROWS_PER_TASK as i64 {
+                snapshot.capped_planning_incident_task_ids.insert(task_id);
+                continue;
+            }
+            let current = snapshot
+                .planning_incidents_by_task
+                .entry(task_id)
+                .or_default();
+            match (
+                replan_count >= 0,
+                provider_failure_count >= 0,
+                current.replan_count.checked_add(replan_count),
+                current
+                    .provider_failure_count
+                    .checked_add(provider_failure_count),
+            ) {
+                (true, true, Some(replans), Some(provider_failures)) => {
+                    current.replan_count = replans;
+                    current.provider_failure_count = provider_failures;
+                }
+                _ => {
+                    snapshot
+                        .incomplete_planning_incident_task_ids
+                        .insert(task_id);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_review_quality_facts(
+    conn: &Connection,
+    task_ids: &[i64],
+    snapshot: &mut AttributionSnapshot,
+) -> Result<()> {
+    for batch in task_ids.chunks(LINEAGE_ID_BATCH) {
+        let placeholders = sql_placeholders(batch.len());
+        let collections_sql = format!(
+            "SELECT task_id,pr_number,status,findings_count,row_num FROM (
+                 SELECT task_id,pr_number,status,findings_count,
+                        ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY pr_number) AS row_num
+                 FROM review_collection_runs
+                 WHERE task_id IN ({placeholders})
+             ) WHERE row_num <= ?
+             ORDER BY task_id,pr_number"
+        );
+        let mut values = batch.to_vec();
+        values.push((MAX_REVIEW_COLLECTION_ROWS_PER_TASK + 1) as i64);
+        let mut statement = conn.prepare(&collections_sql)?;
+        let collections = statement
+            .query_map(params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    ReviewCollectionFact {
+                        pr_number: row.get(1)?,
+                        status: row.get(2)?,
+                        findings_count: row.get(3)?,
+                    },
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (task_id, collection, row_num) in collections {
+            if row_num > MAX_REVIEW_COLLECTION_ROWS_PER_TASK as i64 {
+                snapshot.capped_review_collection_task_ids.insert(task_id);
+            } else {
+                snapshot
+                    .review_collections_by_task
+                    .entry(task_id)
+                    .or_default()
+                    .push(collection);
+            }
+        }
+
+        let findings_sql = format!(
+            "SELECT task_id,pr_number,kind,author_pushback,pushback_accepted,addressed_status,row_num
+             FROM (
+                 SELECT task_id,pr_number,kind,author_pushback,pushback_accepted,addressed_status,
+                        ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY id) AS row_num
+                 FROM review_findings
+                 WHERE task_id IN ({placeholders})
+             ) WHERE row_num <= ?
+             ORDER BY task_id,row_num"
+        );
+        let mut values = batch.to_vec();
+        values.push((MAX_REVIEW_FINDINGS_PER_TASK + 1) as i64);
+        let mut statement = conn.prepare(&findings_sql)?;
+        let findings = statement
+            .query_map(params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    ReviewFindingFact {
+                        pr_number: row.get(1)?,
+                        kind: row.get(2)?,
+                        author_pushback: row.get::<_, i64>(3)? != 0,
+                        pushback_accepted: row.get::<_, Option<i64>>(4)?.map(|value| value != 0),
+                        addressed_status: row.get(5)?,
+                    },
+                    row.get::<_, i64>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (task_id, finding, row_num) in findings {
+            if row_num > MAX_REVIEW_FINDINGS_PER_TASK as i64 {
+                snapshot.capped_review_finding_task_ids.insert(task_id);
+            } else {
+                snapshot
+                    .review_findings_by_task
+                    .entry(task_id)
+                    .or_default()
+                    .push(finding);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn root_complexity_facts(
@@ -2104,10 +2452,10 @@ fn attribution_members_for_intent(
     if let Some(recoveries) = lineage.original_to_recoveries.get(&root) {
         members.extend(recoveries.iter().map(|pair| pair.recovery_task_id));
     }
-    members
-        .into_iter()
-        .take(MAX_CONTRIBUTING_TASKS_PER_INTENT)
-        .collect()
+    // Lineage construction already bounds each graph to MAX_CHILDREN and
+    // rejects ambiguous recovery mappings. Keep this internal set complete;
+    // only the public contributing-task list is capped for output size.
+    members.into_iter().collect()
 }
 
 /// A global attribution cap makes the omitted lineage member unknown, not
@@ -2117,9 +2465,31 @@ fn clear_capped_attribution(intent: &mut IntentFacts) {
     intent.final_worker = None;
     intent.contributing_attempts = None;
     intent.config_evidence = None;
+    intent.role_tokens_usd = None;
+    intent.active_model_secs = None;
+    intent.wall_secs = None;
+    intent.rework_count = None;
+    intent.recovery_count = None;
+    intent.replan_count = None;
+    intent.provider_failure_count = None;
+    intent.abnormal_runner_ending_count = None;
+    intent.collector_failure_count = None;
+    intent.incident_count = None;
+    intent.review_quality = None;
     intent.coverage.final_worker = false;
     intent.coverage.contributing_attempts = false;
     intent.coverage.config = false;
+    intent.coverage.role_tokens_usd = false;
+    intent.coverage.active_model_secs = false;
+    intent.coverage.wall_secs = false;
+    intent.coverage.rework = false;
+    intent.coverage.recovery = false;
+    intent.coverage.replan = false;
+    intent.coverage.provider_failure = false;
+    intent.coverage.abnormal_runner_ending = false;
+    intent.coverage.collector_failure = false;
+    intent.coverage.incident = false;
+    intent.coverage.review_quality = false;
 }
 
 fn populate_attribution(
@@ -2213,6 +2583,589 @@ fn populate_attribution(
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct TokenTotals {
+    uncached_input_tokens: i64,
+    cached_input_tokens: i64,
+    cache_write_input_tokens: i64,
+    output_tokens: i64,
+    reasoning_tokens: i64,
+}
+
+impl TokenTotals {
+    fn add_usage(&mut self, usage: crate::token_usage::TokenUsage) -> bool {
+        if [
+            usage.uncached_input_tokens,
+            usage.cached_input_tokens,
+            usage.cache_write_input_tokens,
+            usage.output_tokens,
+            usage.reasoning_tokens,
+        ]
+        .into_iter()
+        .any(|value| value < 0)
+        {
+            return false;
+        }
+        let Some(uncached_input_tokens) = self
+            .uncached_input_tokens
+            .checked_add(usage.uncached_input_tokens)
+        else {
+            return false;
+        };
+        let Some(cached_input_tokens) = self
+            .cached_input_tokens
+            .checked_add(usage.cached_input_tokens)
+        else {
+            return false;
+        };
+        let Some(cache_write_input_tokens) = self
+            .cache_write_input_tokens
+            .checked_add(usage.cache_write_input_tokens)
+        else {
+            return false;
+        };
+        let Some(output_tokens) = self.output_tokens.checked_add(usage.output_tokens) else {
+            return false;
+        };
+        let Some(reasoning_tokens) = self.reasoning_tokens.checked_add(usage.reasoning_tokens)
+        else {
+            return false;
+        };
+        *self = Self {
+            uncached_input_tokens,
+            cached_input_tokens,
+            cache_write_input_tokens,
+            output_tokens,
+            reasoning_tokens,
+        };
+        true
+    }
+
+    /// This is intentionally a transparent, provisional sum rather than a
+    /// cost estimate or a claim about provider billing. Providers differ on
+    /// whether reasoning and cache-write buckets overlap other counters; raw
+    /// buckets stay alongside it so a later definition can change safely.
+    fn provisional_effective_token_total(self) -> Option<i64> {
+        self.uncached_input_tokens
+            .checked_add(self.cached_input_tokens)?
+            .checked_add(self.cache_write_input_tokens)?
+            .checked_add(self.output_tokens)?
+            .checked_add(self.reasoning_tokens)
+    }
+
+    fn json_value(self) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "uncached_input_tokens": self.uncached_input_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
+            "cache_write_input_tokens": self.cache_write_input_tokens,
+            "output_tokens": self.output_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "provisional_effective_token_total": self.provisional_effective_token_total()?,
+            // The durable token schema intentionally contains no provider
+            // total/cost columns. Keep that absence explicit; do not derive
+            // historical cost from the transient journal.
+            "provider_reported_total_tokens": serde_json::Value::Null,
+            "provider_reported_cost_usd": serde_json::Value::Null,
+            "coverage": {
+                "uncached_input_tokens": true,
+                "cached_input_tokens": true,
+                "cache_write_input_tokens": true,
+                "output_tokens": true,
+                "reasoning_tokens": true,
+                "provisional_effective_token_total": true,
+                "provider_reported_total_tokens": false,
+                "provider_reported_cost_usd": false,
+            },
+        }))
+    }
+}
+
+fn supported_token_purpose(purpose: &str) -> bool {
+    matches!(
+        purpose,
+        "worker" | "reviewer" | "classifier" | "collector" | "planner" | "arbiter"
+    )
+}
+
+fn populate_token_facts(
+    intent: &mut IntentFacts,
+    members: &[i64],
+    attribution: &AttributionSnapshot,
+) {
+    let mut role_totals: BTreeMap<String, TokenTotals> = BTreeMap::new();
+    let mut total = TokenTotals::default();
+    let mut expected_managed_runs = HashSet::new();
+    let mut observed_managed_runs = HashSet::new();
+    let mut complete = true;
+    let mut has_usage = false;
+
+    for &task_id in members {
+        if attribution.capped_token_usage_task_ids.contains(&task_id) {
+            complete = false;
+        }
+        if attribution.capped_active_run_task_ids.contains(&task_id) {
+            complete = false;
+        }
+        if let Some(runs) = attribution.active_runs_by_task.get(&task_id) {
+            expected_managed_runs.extend(runs.iter().map(|run| run.id));
+        }
+        for usage in attribution
+            .token_usage_by_task
+            .get(&task_id)
+            .into_iter()
+            .flatten()
+        {
+            has_usage = true;
+            if !supported_token_purpose(&usage.purpose) {
+                complete = false;
+                continue;
+            }
+            if !total.add_usage(usage.usage)
+                || !role_totals
+                    .entry(usage.purpose.clone())
+                    .or_default()
+                    .add_usage(usage.usage)
+            {
+                complete = false;
+            }
+            match usage.agent_run_id {
+                Some(run_id) => {
+                    let matching_run = attribution
+                        .active_runs_by_task
+                        .get(&task_id)
+                        .into_iter()
+                        .flatten()
+                        .find(|run| run.id == run_id);
+                    if matching_run.is_some_and(|run| run.role == usage.purpose) {
+                        observed_managed_runs.insert(run_id);
+                    } else {
+                        complete = false;
+                    }
+                }
+                None if matches!(usage.purpose.as_str(), "worker" | "reviewer") => {
+                    // Managed worker/reviewer telemetry has a durable run id.
+                    complete = false;
+                }
+                None => {}
+            }
+        }
+    }
+
+    if !has_usage || observed_managed_runs != expected_managed_runs {
+        complete = false;
+    }
+    if !complete {
+        return;
+    }
+    let Some(provisional_effective_token_total) = total.provisional_effective_token_total() else {
+        return;
+    };
+    let mut roles = serde_json::Map::new();
+    for (role, totals) in role_totals {
+        let Some(value) = totals.json_value() else {
+            return;
+        };
+        roles.insert(role, value);
+    }
+    intent.role_tokens_usd = Some(serde_json::json!({
+        "roles": roles,
+        "provisional_effective_token_total": provisional_effective_token_total,
+        "provider_reported_total_tokens": serde_json::Value::Null,
+        "provider_reported_cost_usd": serde_json::Value::Null,
+        "coverage": {
+            "uncached_input_tokens": true,
+            "cached_input_tokens": true,
+            "cache_write_input_tokens": true,
+            "output_tokens": true,
+            "reasoning_tokens": true,
+            "provisional_effective_token_total": true,
+            "provider_reported_total_tokens": false,
+            "provider_reported_cost_usd": false,
+        },
+    }));
+    intent.coverage.role_tokens_usd = true;
+}
+
+fn populate_timing_facts(
+    intent: &mut IntentFacts,
+    members: &[i64],
+    task_evidence_by_id: &HashMap<i64, FactsTaskRow>,
+    attribution: &AttributionSnapshot,
+) {
+    let mut earliest_created_at: Option<i64> = None;
+    let mut latest_updated_at: Option<i64> = None;
+    let mut wall_complete = true;
+    let mut active_model_secs = 0_i64;
+    let mut active_complete = true;
+    let mut has_active_interval = false;
+
+    for &task_id in members {
+        let Some(task) = task_evidence_by_id.get(&task_id) else {
+            wall_complete = false;
+            active_complete = false;
+            continue;
+        };
+        if task.created_at < 0 || task.updated_at < task.created_at {
+            wall_complete = false;
+        } else {
+            earliest_created_at = Some(
+                earliest_created_at.map_or(task.created_at, |value| value.min(task.created_at)),
+            );
+            latest_updated_at =
+                Some(latest_updated_at.map_or(task.updated_at, |value| value.max(task.updated_at)));
+        }
+        if attribution.capped_active_run_task_ids.contains(&task_id) {
+            active_complete = false;
+        }
+        for run in attribution
+            .active_runs_by_task
+            .get(&task_id)
+            .into_iter()
+            .flatten()
+        {
+            let Some(ended_at) = run.ended_at else {
+                active_complete = false;
+                continue;
+            };
+            let Some(duration) = ended_at.checked_sub(run.spawned_at) else {
+                active_complete = false;
+                continue;
+            };
+            if duration < 0 {
+                active_complete = false;
+                continue;
+            }
+            let Some(sum) = active_model_secs.checked_add(duration) else {
+                active_complete = false;
+                continue;
+            };
+            active_model_secs = sum;
+            has_active_interval = true;
+        }
+    }
+
+    if wall_complete {
+        if let (Some(first), Some(last)) = (earliest_created_at, latest_updated_at) {
+            intent.wall_secs = last.checked_sub(first);
+            intent.coverage.wall_secs = intent.wall_secs.is_some();
+        }
+    }
+    if active_complete && has_active_interval {
+        intent.active_model_secs = Some(active_model_secs);
+        intent.coverage.active_model_secs = true;
+    }
+}
+
+enum RunnerEnding {
+    Normal,
+    Abnormal,
+    Unknown,
+}
+
+fn classify_runner_ending(reason: &str) -> RunnerEnding {
+    if matches!(
+        reason,
+        "submitted"
+            | "awaiting_merge"
+            | "completed"
+            | "merged"
+            | "done"
+            | "in-review"
+            | "merging"
+            | "turn-completed"
+            | "verdict:approved"
+            | "r2-pending"
+            | "r2-provision-unavailable"
+            | "ownership_transferred"
+            | "drain"
+            | "cancelled"
+    ) || reason.starts_with("verdict:changes")
+    {
+        RunnerEnding::Normal
+    } else if matches!(
+        reason,
+        "failed"
+            | "crashed"
+            | "agent_failed"
+            | "idle_reaped"
+            | "provider_blocked"
+            | "journal-handoff-failed"
+            | "fallback-route-unavailable"
+            | "attachment-failed"
+            | "graph-blocker"
+            | "r2-spawn-error"
+    ) {
+        RunnerEnding::Abnormal
+    } else {
+        RunnerEnding::Unknown
+    }
+}
+
+fn add_metric(total: &mut i64, value: i64) -> bool {
+    if value < 0 {
+        return false;
+    }
+    let Some(next) = total.checked_add(value) else {
+        return false;
+    };
+    *total = next;
+    true
+}
+
+fn populate_incident_facts(
+    intent: &mut IntentFacts,
+    members: &[i64],
+    task_evidence_by_id: &HashMap<i64, FactsTaskRow>,
+    attribution: &AttributionSnapshot,
+) {
+    let mut rework_count = 0;
+    let mut recovery_count = 0;
+    let mut replan_count = 0;
+    let mut provider_failure_count = 0;
+    let mut abnormal_runner_ending_count = 0;
+    let mut collector_failure_count = 0;
+    let mut task_counts_complete = true;
+    let mut planning_counts_complete = true;
+    let mut abnormal_counts_complete = true;
+    let mut collector_counts_complete = true;
+
+    for &task_id in members {
+        let Some(task) = task_evidence_by_id.get(&task_id) else {
+            task_counts_complete = false;
+            planning_counts_complete = false;
+            abnormal_counts_complete = false;
+            collector_counts_complete = false;
+            continue;
+        };
+        task_counts_complete &= add_metric(&mut rework_count, task.rework_round);
+        task_counts_complete &= add_metric(&mut recovery_count, task.recovery_attempts);
+
+        if attribution
+            .incomplete_planning_incident_task_ids
+            .contains(&task_id)
+            || attribution
+                .capped_planning_incident_task_ids
+                .contains(&task_id)
+        {
+            planning_counts_complete = false;
+        }
+        let planning = attribution
+            .planning_incidents_by_task
+            .get(&task_id)
+            .copied()
+            .unwrap_or_default();
+        planning_counts_complete &= add_metric(&mut replan_count, planning.replan_count);
+        planning_counts_complete &=
+            add_metric(&mut provider_failure_count, planning.provider_failure_count);
+
+        if attribution.capped_active_run_task_ids.contains(&task_id) {
+            abnormal_counts_complete = false;
+        }
+        for run in attribution
+            .active_runs_by_task
+            .get(&task_id)
+            .into_iter()
+            .flatten()
+        {
+            let Some(reason) = run.end_reason.as_deref() else {
+                abnormal_counts_complete = false;
+                continue;
+            };
+            match classify_runner_ending(reason) {
+                RunnerEnding::Normal => {}
+                RunnerEnding::Abnormal => {
+                    abnormal_counts_complete &= add_metric(&mut abnormal_runner_ending_count, 1);
+                }
+                RunnerEnding::Unknown => abnormal_counts_complete = false,
+            }
+        }
+
+        if attribution
+            .capped_review_collection_task_ids
+            .contains(&task_id)
+        {
+            collector_counts_complete = false;
+        }
+        for collection in attribution
+            .review_collections_by_task
+            .get(&task_id)
+            .into_iter()
+            .flatten()
+        {
+            match collection.status.as_str() {
+                "success" => {}
+                "failed" => {
+                    collector_counts_complete &= add_metric(&mut collector_failure_count, 1);
+                }
+                _ => collector_counts_complete = false,
+            }
+        }
+    }
+
+    if task_counts_complete {
+        intent.rework_count = Some(rework_count);
+        intent.recovery_count = Some(recovery_count);
+        intent.coverage.rework = true;
+        intent.coverage.recovery = true;
+    }
+    if planning_counts_complete {
+        intent.replan_count = Some(replan_count);
+        intent.provider_failure_count = Some(provider_failure_count);
+        intent.coverage.replan = true;
+        intent.coverage.provider_failure = true;
+    }
+    if abnormal_counts_complete {
+        intent.abnormal_runner_ending_count = Some(abnormal_runner_ending_count);
+        intent.coverage.abnormal_runner_ending = true;
+    }
+    if collector_counts_complete {
+        intent.collector_failure_count = Some(collector_failure_count);
+        intent.coverage.collector_failure = true;
+    }
+    if let (
+        Some(rework),
+        Some(recovery),
+        Some(replan),
+        Some(provider_failures),
+        Some(abnormal_endings),
+        Some(collector_failures),
+    ) = (
+        intent.rework_count,
+        intent.recovery_count,
+        intent.replan_count,
+        intent.provider_failure_count,
+        intent.abnormal_runner_ending_count,
+        intent.collector_failure_count,
+    ) {
+        intent.incident_count = rework
+            .checked_add(recovery)
+            .and_then(|value| value.checked_add(replan))
+            .and_then(|value| value.checked_add(provider_failures))
+            .and_then(|value| value.checked_add(abnormal_endings))
+            .and_then(|value| value.checked_add(collector_failures));
+        intent.coverage.incident = intent.incident_count.is_some();
+    }
+}
+
+fn populate_review_quality_facts(
+    intent: &mut IntentFacts,
+    members: &[i64],
+    attribution: &AttributionSnapshot,
+) {
+    let mut collections = Vec::new();
+    let mut findings = Vec::new();
+    for &task_id in members {
+        if attribution
+            .capped_review_collection_task_ids
+            .contains(&task_id)
+            || attribution
+                .capped_review_finding_task_ids
+                .contains(&task_id)
+        {
+            return;
+        }
+        collections.extend(
+            attribution
+                .review_collections_by_task
+                .get(&task_id)
+                .into_iter()
+                .flatten(),
+        );
+        findings.extend(
+            attribution
+                .review_findings_by_task
+                .get(&task_id)
+                .into_iter()
+                .flatten(),
+        );
+    }
+    if collections.is_empty() || collections.iter().any(|run| run.status != "success") {
+        return;
+    }
+
+    let mut expected_by_pr = BTreeMap::new();
+    for run in collections {
+        if run.findings_count < 0 {
+            return;
+        }
+        if expected_by_pr
+            .insert(run.pr_number, run.findings_count)
+            .is_some()
+        {
+            return;
+        }
+    }
+    let mut actual_by_pr: BTreeMap<i64, i64> =
+        expected_by_pr.keys().copied().map(|pr| (pr, 0)).collect();
+    for finding in &findings {
+        let Some(count) = actual_by_pr.get_mut(&finding.pr_number) else {
+            return;
+        };
+        if !add_metric(count, 1) {
+            return;
+        }
+    }
+    if expected_by_pr
+        .iter()
+        .any(|(pr, expected)| actual_by_pr.get(pr).copied().unwrap_or(0) != *expected)
+    {
+        return;
+    }
+
+    let mut blocking_count = 0;
+    let mut suggestion_count = 0;
+    let mut author_pushback_count = 0;
+    let mut pushback_accepted_count = 0;
+    let mut pushback_overridden_count = 0;
+    let mut pushback_unknown_count = 0;
+    let mut dispositions = BTreeMap::from([
+        ("addressed", 0_i64),
+        ("unaddressed", 0_i64),
+        ("partial", 0_i64),
+        ("unclear", 0_i64),
+        ("withdrawn", 0_i64),
+    ]);
+    let mut disposition_unknown_count = 0;
+    for finding in findings {
+        match finding.kind.as_str() {
+            "blocking" => blocking_count += 1,
+            "suggestion" => suggestion_count += 1,
+            _ => return,
+        }
+        if finding.author_pushback {
+            author_pushback_count += 1;
+            match finding.pushback_accepted {
+                Some(true) => pushback_accepted_count += 1,
+                Some(false) => pushback_overridden_count += 1,
+                None => pushback_unknown_count += 1,
+            }
+        }
+        match finding.addressed_status.as_deref() {
+            Some(status) if dispositions.contains_key(status) => {
+                *dispositions.get_mut(status).expect("checked key") += 1;
+            }
+            None => disposition_unknown_count += 1,
+            Some(_) => return,
+        }
+    }
+    intent.review_quality = Some(serde_json::json!({
+        "finding_count": blocking_count + suggestion_count,
+        "finding_kinds": {
+            "blocking": blocking_count,
+            "suggestion": suggestion_count,
+        },
+        "disposition_counts": dispositions,
+        "disposition_unknown_count": disposition_unknown_count,
+        "pushback": {
+            "raised_count": author_pushback_count,
+            "accepted_count": pushback_accepted_count,
+            "overridden_count": pushback_overridden_count,
+            "unknown_count": pushback_unknown_count,
+        },
+    }));
+    intent.coverage.review_quality = true;
+}
+
 /// Take the watermark, aggregate counts, and bounded candidate scan under
 /// a single WAL read snapshot so their totals are internally consistent —
 /// even if a daemon lifecycle write commits between conceptual steps. If the
@@ -2261,8 +3214,10 @@ fn read_cohort_snapshot(conn: &Connection, include_all: bool) -> Result<CohortSn
             .into_iter()
             .take(MAX_ATTRIBUTION_TASKS_PER_SNAPSHOT)
             .collect();
-        let root_task_ids: Vec<i64> = lineage.source_to_children.keys().copied().collect();
-        let root_tasks = load_facts_tasks_by_id(c, &root_task_ids)?;
+        // These task rows underpin wall-clock and incident facts too. Load the
+        // same bounded attribution membership rather than only graph roots so
+        // a collapsed recovery or sibling is never silently omitted.
+        let root_tasks = load_facts_tasks_by_id(c, &attribution_task_ids)?;
         let attribution = load_attribution_snapshot(c, &attribution_task_ids)?;
         let recoverable_graph_task_ids = load_recoverable_graph_task_ids(c, &capped_ids, now)?;
         let unsatisfiable_parked_task_ids = load_unsatisfiable_parked_task_ids(
@@ -2421,6 +3376,20 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
         let attribution_members =
             attribution_members_for_intent(root, &members_for_evidence, &lineage);
         populate_attribution(&mut intent, &attribution_members, &attribution);
+        populate_token_facts(&mut intent, &attribution_members, &attribution);
+        populate_timing_facts(
+            &mut intent,
+            &attribution_members,
+            &task_evidence_by_id,
+            &attribution,
+        );
+        populate_incident_facts(
+            &mut intent,
+            &attribution_members,
+            &task_evidence_by_id,
+            &attribution,
+        );
+        populate_review_quality_facts(&mut intent, &attribution_members, &attribution);
         if attribution_members
             .iter()
             .any(|task_id| capped_attribution_task_ids.contains(task_id))
@@ -3915,7 +4884,7 @@ mod tests {
     }
 
     #[test]
-    fn facts_sibling_owned_evidence_null_and_coverage_false() {
+    fn facts_metric_coverage_uses_only_durable_evidence() {
         // A standalone task carries no durable collapse relation — its
         // lineage_evidence must remain JSON null with coverage.lineage=false
         // so consumers can distinguish an unavailable lineage from a
@@ -3937,7 +4906,8 @@ mod tests {
             "standalone lineage must remain an explicit coverage gap"
         );
         // Terminal evidence comes from the durable merged completion. The
-        // remaining enrichment fields retain their explicit null coverage gaps.
+        // Token and active-model evidence is absent/incomplete, while task
+        // timestamps and durable zero-valued incident counters are measured.
         assert_eq!(i.terminal_outcome.as_deref(), Some("done"));
         assert!(i.terminal_evidence.is_some());
         assert_eq!(i.merge_provenance.as_deref(), Some("merged"));
@@ -3948,25 +4918,47 @@ mod tests {
         assert!(i.contributing_attempts.is_none());
         assert!(i.role_tokens_usd.is_none());
         assert!(i.active_model_secs.is_none());
-        assert!(i.wall_secs.is_none());
-        assert!(i.rework_count.is_none());
-        assert!(i.recovery_count.is_none());
-        assert!(i.replan_count.is_none());
+        assert_eq!(i.wall_secs, Some(600));
+        assert_eq!(i.rework_count, Some(0));
+        assert_eq!(i.recovery_count, Some(0));
+        assert_eq!(i.replan_count, Some(0));
+        assert_eq!(i.provider_failure_count, Some(0));
+        assert!(i.abnormal_runner_ending_count.is_none());
+        assert_eq!(i.collector_failure_count, Some(0));
         assert!(i.incident_count.is_none());
         assert!(i.review_quality.is_none());
-        // Terminal and merge-provenance are resolved here; all enrichment
-        // siblings remain uncovered.
+        // The unmanaged open run means an abnormal-ending count and total
+        // incident count cannot be fabricated as zero.
         for (name, covered) in i.coverage.iter_named() {
             assert_eq!(
                 covered,
-                matches!(name, "terminal" | "merge_provenance"),
+                matches!(
+                    name,
+                    "terminal"
+                        | "merge_provenance"
+                        | "wall_secs"
+                        | "rework"
+                        | "recovery"
+                        | "replan"
+                        | "provider_failure"
+                        | "collector_failure"
+                ),
                 "coverage.{name}"
             );
         }
-        // Coverage summary reflects the two resolved fields precisely.
+        // Coverage summary reflects every independently measured fact.
         for (name, fc) in &r.coverage.fields {
-            let expected_covered =
-                i64::from(matches!(name.as_str(), "terminal" | "merge_provenance"));
+            let expected_covered = i64::from(matches!(
+                name.as_str(),
+                "terminal"
+                    | "merge_provenance"
+                    | "wall_secs"
+                    | "rework"
+                    | "recovery"
+                    | "replan"
+                    | "provider_failure"
+                    | "collector_failure"
+            ));
             assert_eq!(fc.covered, expected_covered, "field {name} covered count");
             assert_eq!(
                 fc.uncovered,
@@ -3989,19 +4981,346 @@ mod tests {
 
     #[test]
     fn facts_json_null_distinct_from_measured_zero() {
-        // Serialize a scaffold intent and one with an explicit measured zero,
-        // verifying null is distinguishable from a real 0.
+        // A missing active-model interval stays null, unlike an explicit
+        // measured zero. This is the JSON contract consumers use for gaps.
         let (_d, mut c) = open_tmp();
         seed_ordinary(&mut c, 1600);
         let r = perf_facts(&c, false).unwrap();
         let unpop = serde_json::to_value(&r.intents[0]).unwrap();
-        assert_eq!(unpop.get("rework_count").unwrap(), &serde_json::Value::Null);
+        assert_eq!(
+            unpop.get("active_model_secs").unwrap(),
+            &serde_json::Value::Null
+        );
 
         let mut zeroed = r.intents[0].clone_for_test();
-        zeroed.rework_count = Some(0);
-        zeroed.coverage.rework = true;
+        zeroed.active_model_secs = Some(0);
+        zeroed.coverage.active_model_secs = true;
         let pop = serde_json::to_value(&zeroed).unwrap();
-        assert_eq!(pop.get("rework_count").unwrap(), &serde_json::json!(0));
+        assert_eq!(pop.get("active_model_secs").unwrap(), &serde_json::json!(0));
+    }
+
+    #[test]
+    fn facts_aggregate_rework_fallback_tokens_time_and_incidents() {
+        // One task can retry in-place. Its first failed route and its fallback
+        // route are both part of the same intent; neither queue time nor the
+        // gap between routes is relabelled as model time.
+        let (_d, mut c) = open_tmp();
+        let task_id = seed_ordinary(&mut c, 1_600);
+        c.execute(
+            "UPDATE tasks SET rework_round=1,recovery_attempts=2 WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        let assignment = seed_assignment(&c, task_id, "worker", None, None, "primary");
+        let first_run = seed_attributed_run(
+            &c,
+            task_id,
+            "first-worker",
+            "worker",
+            "gpt-primary",
+            "codex",
+            "high",
+            assignment,
+            None,
+            1_010,
+            1_025,
+            "fallback-route-unavailable",
+        );
+        let fallback_profile = "fallback";
+        seed_routing_attempt(
+            &c,
+            assignment,
+            &format!("worker:task:{task_id}:primary"),
+            fallback_profile,
+            "codex",
+            "gpt-fallback",
+            "medium",
+        );
+        let fallback_run = seed_attributed_run(
+            &c,
+            task_id,
+            "fallback-worker",
+            "worker",
+            "gpt-fallback",
+            "codex",
+            "medium",
+            assignment,
+            Some(fallback_profile),
+            1_200,
+            1_230,
+            "completed",
+        );
+        for (run_id, usage) in [
+            (
+                first_run,
+                crate::token_usage::TokenUsage {
+                    uncached_input_tokens: 1,
+                    cached_input_tokens: 10,
+                    cache_write_input_tokens: 100,
+                    output_tokens: 1_000,
+                    reasoning_tokens: 10_000,
+                },
+            ),
+            (
+                fallback_run,
+                crate::token_usage::TokenUsage {
+                    uncached_input_tokens: 2,
+                    cached_input_tokens: 20,
+                    cache_write_input_tokens: 200,
+                    output_tokens: 2_000,
+                    reasoning_tokens: 20_000,
+                },
+            ),
+        ] {
+            crate::token_usage::record(
+                &mut c,
+                Some(run_id),
+                "worker",
+                &[task_id],
+                None,
+                "codex",
+                "test-model",
+                "high",
+                usage,
+                250,
+            )
+            .unwrap();
+        }
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,planned_source_revision,proposal_attempts,
+                 provider_failures,created_at,updated_at)
+             VALUES (?1,'completed',1,3,4,1,2)",
+            [task_id],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO review_collection_runs(
+                 pr_number,task_id,status,error,collector_model,collector_version,
+                 findings_count,attempted_at,completed_at)
+             VALUES (99,?1,'failed','collector unavailable','test','v1',0,300,301)",
+            [task_id],
+        )
+        .unwrap();
+
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must remain read-only");
+        let intent = &report.intents[0];
+        assert_eq!(intent.intent_id, format!("intent-{task_id}"));
+        assert_eq!(intent.contributing_task_ids, vec![task_id]);
+
+        let tokens = intent.role_tokens_usd.as_ref().unwrap();
+        assert_eq!(tokens["roles"]["worker"]["uncached_input_tokens"], 3);
+        assert_eq!(tokens["roles"]["worker"]["cached_input_tokens"], 30);
+        assert_eq!(tokens["roles"]["worker"]["cache_write_input_tokens"], 300);
+        assert_eq!(tokens["roles"]["worker"]["output_tokens"], 3_000);
+        assert_eq!(tokens["roles"]["worker"]["reasoning_tokens"], 30_000);
+        assert_eq!(
+            tokens["roles"]["worker"]["provisional_effective_token_total"],
+            33_333
+        );
+        assert!(tokens["provider_reported_total_tokens"].is_null());
+        assert!(tokens["provider_reported_cost_usd"].is_null());
+        assert_eq!(tokens["coverage"]["provider_reported_total_tokens"], false);
+        assert_eq!(tokens["coverage"]["provider_reported_cost_usd"], false);
+        assert!(intent.coverage.role_tokens_usd);
+
+        assert_eq!(intent.active_model_secs, Some(45));
+        assert_eq!(intent.wall_secs, Some(600));
+        assert!(intent.coverage.active_model_secs);
+        assert!(intent.coverage.wall_secs);
+        assert_ne!(intent.active_model_secs, intent.wall_secs);
+        assert_eq!(intent.rework_count, Some(1));
+        assert_eq!(intent.recovery_count, Some(2));
+        assert_eq!(intent.replan_count, Some(3));
+        assert_eq!(intent.provider_failure_count, Some(4));
+        assert_eq!(intent.abnormal_runner_ending_count, Some(1));
+        assert_eq!(intent.collector_failure_count, Some(1));
+        assert_eq!(intent.incident_count, Some(12));
+        assert!(intent.coverage.rework);
+        assert!(intent.coverage.recovery);
+        assert!(intent.coverage.replan);
+        assert!(intent.coverage.provider_failure);
+        assert!(intent.coverage.abnormal_runner_ending);
+        assert!(intent.coverage.collector_failure);
+        assert!(intent.coverage.incident);
+    }
+
+    #[test]
+    fn facts_recovery_lineage_aggregates_attempt_metrics_into_root_intent() {
+        // Exact recovery adoption collapses a failed generated child and its
+        // recovery delivery. Their model work must be credited once to the
+        // source intent, never emitted as unrelated attempts.
+        let (_d, mut c) = open_tmp();
+        let source = seed_ordinary(&mut c, 1_600);
+        let original = seed_ordinary(&mut c, 1_650);
+        let recovery = seed_ordinary(&mut c, 1_700);
+        let graph_id = seed_decomposition(&c, source, 1);
+        seed_graph_member(&c, graph_id, original, "child", 1);
+        set_refs(
+            &c,
+            original,
+            &serde_json::json!({
+                "recovery_delivery": {
+                    "source_task": original,
+                    "recovery_task": recovery,
+                    "pr": 7,
+                    "merged_head_sha": "recovered-head",
+                }
+            })
+            .to_string(),
+        );
+        record_explicit_recovery_adoption(&c, graph_id, original, recovery);
+        c.execute("UPDATE tasks SET rework_round=1 WHERE id=?1", [original])
+            .unwrap();
+        c.execute(
+            "UPDATE tasks SET recovery_attempts=1 WHERE id=?1",
+            [recovery],
+        )
+        .unwrap();
+        let original_assignment = seed_assignment(&c, original, "worker", None, None, "original");
+        let original_run = seed_attributed_run(
+            &c,
+            original,
+            "original-worker",
+            "worker",
+            "gpt-original",
+            "codex",
+            "high",
+            original_assignment,
+            None,
+            10,
+            30,
+            "fallback-route-unavailable",
+        );
+        let recovery_assignment = seed_assignment(&c, recovery, "worker", None, None, "recovery");
+        let recovery_run = seed_attributed_run(
+            &c,
+            recovery,
+            "recovery-worker",
+            "worker",
+            "gpt-recovery",
+            "codex",
+            "high",
+            recovery_assignment,
+            None,
+            50,
+            80,
+            "completed",
+        );
+        for (run_id, task_id, uncached_input_tokens) in
+            [(original_run, original, 11), (recovery_run, recovery, 22)]
+        {
+            crate::token_usage::record(
+                &mut c,
+                Some(run_id),
+                "worker",
+                &[task_id],
+                None,
+                "codex",
+                "test-model",
+                "high",
+                crate::token_usage::TokenUsage {
+                    uncached_input_tokens,
+                    ..Default::default()
+                },
+                100,
+            )
+            .unwrap();
+        }
+
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must remain read-only");
+        assert_eq!(report.intents.len(), 1);
+        let intent = &report.intents[0];
+        assert_eq!(intent.intent_id, format!("intent-{source}"));
+        assert_eq!(
+            intent.contributing_task_ids,
+            vec![source, original, recovery]
+        );
+        assert_eq!(intent.active_model_secs, Some(50));
+        assert_eq!(
+            intent.role_tokens_usd.as_ref().unwrap()["roles"]["worker"]["uncached_input_tokens"],
+            33
+        );
+        assert_eq!(intent.rework_count, Some(1));
+        assert_eq!(intent.recovery_count, Some(1));
+        assert_eq!(intent.abnormal_runner_ending_count, Some(1));
+        assert_eq!(intent.incident_count, Some(3));
+    }
+
+    #[test]
+    fn facts_missing_token_and_active_timing_evidence_are_coverage_gaps() {
+        let (_d, mut c) = open_tmp();
+        let task_id = seed_ordinary(&mut c, 1_600);
+        // An unclosed managed run proves neither a completed active interval
+        // nor a durable token record. Neither fact may become a zero.
+        let assignment = seed_assignment(&c, task_id, "worker", None, None, "primary");
+        c.execute(
+            "INSERT INTO agent_runs(
+                 task_id,agent_name,role,model,effort,provider,role_assignment_id,spawned_at)
+             VALUES (?1,'still-running','worker','gpt','high','codex',?2,10)",
+            rusqlite::params![task_id, assignment],
+        )
+        .unwrap();
+
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must remain read-only");
+        let intent = &report.intents[0];
+        assert!(intent.role_tokens_usd.is_none());
+        assert!(!intent.coverage.role_tokens_usd);
+        assert!(intent.active_model_secs.is_none());
+        assert!(!intent.coverage.active_model_secs);
+        // Task lifecycle timestamps are a different, available wall-clock
+        // fact; their presence must not fill the active-model gap.
+        assert_eq!(intent.wall_secs, Some(600));
+        assert!(intent.coverage.wall_secs);
+        assert!(intent.abnormal_runner_ending_count.is_none());
+        assert!(!intent.coverage.abnormal_runner_ending);
+        assert!(intent.incident_count.is_none());
+        assert!(!intent.coverage.incident);
+    }
+
+    #[test]
+    fn facts_review_quality_uses_successful_durable_collection() {
+        let (_d, mut c) = open_tmp();
+        let task_id = seed_ordinary(&mut c, 1_600);
+        c.execute(
+            "INSERT INTO review_collection_runs(
+                 pr_number,task_id,status,collector_model,collector_version,
+                 findings_count,attempted_at,completed_at)
+             VALUES (77,?1,'success','test','v1',2,10,11)",
+            [task_id],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO review_findings(
+                 pr_number,task_id,reviewer,kind,author_pushback,pushback_accepted,
+                 text,source_endpoint,created_at,addressed_status)
+             VALUES
+                 (77,?1,'r1','blocking',1,0,'must fix','pulls',10,'addressed'),
+                 (77,?1,'r2','suggestion',0,NULL,'consider','issues',10,'unaddressed')",
+            [task_id],
+        )
+        .unwrap();
+
+        let before = snapshot_db_state(&c);
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(before, snapshot_db_state(&c), "facts must remain read-only");
+        let intent = &report.intents[0];
+        let quality = intent.review_quality.as_ref().unwrap();
+        assert_eq!(quality["finding_count"], 2);
+        assert_eq!(quality["finding_kinds"]["blocking"], 1);
+        assert_eq!(quality["finding_kinds"]["suggestion"], 1);
+        assert_eq!(quality["disposition_counts"]["addressed"], 1);
+        assert_eq!(quality["disposition_counts"]["unaddressed"], 1);
+        assert_eq!(quality["disposition_unknown_count"], 0);
+        assert_eq!(quality["pushback"]["raised_count"], 1);
+        assert_eq!(quality["pushback"]["overridden_count"], 1);
+        assert!(intent.coverage.review_quality);
     }
 
     #[test]
@@ -5920,6 +7239,9 @@ mod tests {
                 rework_count: self.rework_count,
                 recovery_count: self.recovery_count,
                 replan_count: self.replan_count,
+                provider_failure_count: self.provider_failure_count,
+                abnormal_runner_ending_count: self.abnormal_runner_ending_count,
+                collector_failure_count: self.collector_failure_count,
                 incident_count: self.incident_count,
                 review_quality: self.review_quality.clone(),
                 coverage: self.coverage,
