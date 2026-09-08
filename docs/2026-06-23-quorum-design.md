@@ -813,17 +813,26 @@ only through an explicit outside request)
   changes by the daemon.
 - **Dependency gating:** tasks with `depends_on` are only claimable when all deps are `done`.
   A daemon-observed merge also records GitHub's immutable merge commit in
-  `refs.merge_commit_sha`. Before allocating a dependent task's branch or worktree, the
-  daemon fetches its authoritative target branch and requires every dependency's recorded
-  merge commit to be an ancestor of that fetched base SHA; that exact verified SHA is the
-  allocation provenance. If a completed dependency has `refs.pr` but no SHA (for example, it
-  was manually closed after a recovery), the daemon resolves its merged PR outside the DB
-  transaction, falling back to an exact GitHub merge subject match on `origin/<base>`, then conditionally stamps
-  the still-missing ref under the write lock. The durable PR ref may be either an integer or a
-  canonical decimal string. An open or unmerged PR parks the dependent with
-  the named dependency and PR; no SHA is invented. A just-merged commit absent from the fetched
-  ref is a bounded, claim-free deferral. The daemon never cuts the dependent branch from an
-  unverifiable base.
+  `refs.merge_commit_sha`. Before **first** allocation of a dependent's branch, the daemon
+  fetches its authoritative target branch and requires every dependency's recorded merge
+  commit to be an ancestor of that fetched base SHA; that exact verified SHA is the
+  allocation provenance. On **resume** (an existing `task_branches` row), the daemon
+  instead verifies each dependency merge commit is an ancestor of the branch itself
+  (local `refs/heads/<branch>`, falling back to `refs/remotes/origin/<branch>`); the
+  stored provenance is preserved unchanged. Base staleness between allocation and resume
+  is never a resume failure — it is resolved at merge time by the ordinary
+  rebase/merge-in path. A just-merged commit absent from the fetched ref is a bounded,
+  claim-free deferral (logged once); after three attempts, or when a completed dependency
+  lacks its merge SHA, or when an existing dependent branch does not contain a
+  dependency's merge commit, the task parks loudly with the named commit/dependency. If a
+  completed dependency has `refs.pr` but no SHA (for example, it was manually closed after a
+  recovery), the daemon resolves its merged PR outside the DB transaction, falling back to an
+  exact GitHub merge subject match on `origin/<base>`, then conditionally stamps the
+  still-missing ref under the write lock. The durable PR ref may be either an integer or a
+  canonical decimal string. An open or unmerged PR parks the dependent with the named
+  dependency and PR; no SHA is invented. The
+  daemon never cuts the dependent branch from an unverifiable base, and never resumes
+  onto a branch that does not already include every dependency's merge.
 - **Concurrency cap:** `--cap N` limits the daemon to N concurrent tasks (≤ 2N agents:
   one worker + one reviewer per task).
 - **No passive execution (v2).** External/interactive agents cannot claim, execute,

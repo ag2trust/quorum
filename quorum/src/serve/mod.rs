@@ -121,7 +121,9 @@ fn prepare_reviewer_authority(
     )
 }
 use tokio::io::{AsyncRead, AsyncReadExt};
-use worktree::{ContinuationBaseMerge, DependencyBaseVerification, WorktreeManager};
+use worktree::{
+    BranchAncestryVerification, ContinuationBaseMerge, DependencyBaseVerification, WorktreeManager,
+};
 
 const MAX_POISON_STRIKES: u32 = 3;
 const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
@@ -20562,7 +20564,10 @@ async fn provision_reviewer_reserved(
 /// Returns true if a worker was spawned, false if no ready tasks or names available.
 enum DependencyBaseAdmission {
     NotRequired,
-    Verified { base_sha: String },
+    Verified {
+        base_sha: String,
+        merge_commits: Vec<String>,
+    },
     Deferred,
 }
 
@@ -20708,7 +20713,10 @@ async fn verify_dependency_base_before_allocation(
             .await
         {
             Ok(DependencyBaseVerification::Verified { base_sha }) => {
-                return Ok(DependencyBaseAdmission::Verified { base_sha });
+                return Ok(DependencyBaseAdmission::Verified {
+                    base_sha,
+                    merge_commits,
+                });
             }
             Ok(DependencyBaseVerification::Missing { merge_commit_sha }) => format!(
                 "fetched origin/{base_branch} does not yet contain dependency merge commit {merge_commit_sha}"
@@ -20982,13 +20990,16 @@ async fn spawn_worker(
             return Ok(false);
         }
     };
-    let verified_dependency_base = match dependency_base_admission {
-        DependencyBaseAdmission::NotRequired => None,
-        DependencyBaseAdmission::Verified { base_sha } => Some(base_sha),
-        DependencyBaseAdmission::Deferred => {
-            name_pool.release(&agent_name);
-            return Ok(false);
-        }
+    let (verified_dependency_base, verified_dependency_merges) = match dependency_base_admission {
+        DependencyBaseAdmission::NotRequired => (None, Vec::new()),
+        DependencyBaseAdmission::Verified {
+            base_sha,
+            merge_commits,
+        } => (Some(base_sha), merge_commits),
+            DependencyBaseAdmission::Deferred => {
+                name_pool.release(&agent_name);
+                return Ok(false);
+            }
     };
 
     lifetime_roster.register(&agent_name);
@@ -21121,7 +21132,61 @@ async fn spawn_worker(
         } else {
             "open"
         };
-        let requires_verified_dependency_provenance = verified_dependency_base.is_some();
+        // Look up any existing allocation up front. Resume verifies dependency
+        // inclusion against the branch itself; base advance between original
+        // allocation and resume is a merge-time concern, not an allocation
+        // failure, so stored provenance is preserved rather than overwritten.
+        let existing_allocation: Option<(String, Option<String>)> = {
+            let allocation_db = db_path.clone();
+            let allocation_task = task.id;
+            tokio::task::spawn_blocking(move || -> Result<Option<(String, Option<String>)>> {
+                let conn = quorum_core::db::open(&allocation_db)?;
+                Ok(conn
+                    .query_row(
+                        "SELECT allocated_by,provenance_sha FROM task_branches WHERE task_id=?1",
+                        [allocation_task],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?)
+            })
+            .await
+            .map_err(|e| QuorumError::Io(format!("allocation lookup join: {e}")))??
+        };
+        // Existing allocation with dependencies: verify the branch already
+        // contains every done dependency's merge commit. Ancestry is the
+        // correct test — a branch cut from an earlier verified base stays
+        // valid as long as its ancestry still includes the dependency merge,
+        // regardless of how far the base tip has since advanced. Legacy NULL
+        // provenance rows use the same check and are backfilled on success.
+        if existing_allocation.is_some() && !verified_dependency_merges.is_empty() {
+            match wt_mgr
+                .verify_branch_contains_commits(
+                    worker_repo_dir,
+                    &branch,
+                    &verified_dependency_merges,
+                )
+                .await
+            {
+                Ok(BranchAncestryVerification::Verified)
+                | Ok(BranchAncestryVerification::NotFound) => {}
+                Ok(BranchAncestryVerification::Missing { merge_commit_sha }) => {
+                    let reason = format!(
+                        "existing dependent branch {branch} does not contain dependency merge {merge_commit_sha}"
+                    );
+                    persist_provisioning_failure(&db_path, task.id, &reason).await;
+                    park_task(&db_path, task.id, &reason, allocation_resume_status).await;
+                    guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
+                    return Ok(false);
+                }
+                Err(error) => {
+                    let reason = format!("branch ancestry verification failed: {error}");
+                    persist_provisioning_failure(&db_path, task.id, &reason).await;
+                    park_task(&db_path, task.id, &reason, allocation_resume_status).await;
+                    guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
+                    return Ok(false);
+                }
+            }
+        }
         let resolved_provenance = match verified_dependency_base {
             Some(base_sha) => base_sha,
             None => {
@@ -21146,32 +21211,15 @@ async fn spawn_worker(
         let allocation_task = task.id;
         let recorded = tokio::task::spawn_blocking(move || {
             let mut conn = quorum_core::db::open(&allocation_db)?;
-            let existing: Option<(String, Option<String>)> = conn
-                .query_row(
-                    "SELECT allocated_by,provenance_sha FROM task_branches WHERE task_id=?1",
-                    [allocation_task],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if requires_verified_dependency_provenance
-                && existing
-                    .as_ref()
-                    .is_some_and(|(_, provenance)| provenance.is_none())
-            {
-                // A legacy allocation cannot prove where its already-existing
-                // branch began. Do not backfill the current base onto that
-                // row and then reuse an unverifiable checkout.
-                return Ok(false);
-            }
-            let (allocator, provenance) = match existing.as_ref() {
-                // A dependent's freshly verified base is its allocation
-                // provenance requirement. Replaying an older allocation would
-                // otherwise reuse its branch unchanged, even if that branch
-                // was cut before the dependency merge reached the base.
-                Some((allocator, Some(provenance))) if !requires_verified_dependency_provenance => {
-                    (allocator.as_str(), provenance.as_str())
-                }
-                Some((allocator, _)) => (allocator.as_str(), resolved_provenance.as_str()),
+            let (allocator, provenance) = match existing_allocation.as_ref() {
+                // Stored provenance is preserved on replay; ancestry (above)
+                // is what verifies dependency inclusion, so overwriting the
+                // recorded provenance with a moving base tip only produces
+                // spurious identity mismatches.
+                Some((allocator, Some(provenance))) => (allocator.as_str(), provenance.as_str()),
+                // Legacy NULL row: fill in the current verified base so the
+                // allocation is durable going forward.
+                Some((allocator, None)) => (allocator.as_str(), resolved_provenance.as_str()),
                 None => (allocation_agent.as_str(), resolved_provenance.as_str()),
             };
             quorum_core::branches::record_exact_allocation(
@@ -36886,9 +36934,14 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let child = tasks::get(&conn, child_id).unwrap().unwrap();
         assert_eq!(child.status, "failed");
         let refs: serde_json::Value = serde_json::from_str(child.refs.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            refs[quorum_core::tasks::PARKED_REASON_REF],
-            "branch allocation provenance conflict"
+        let park_reason = refs[quorum_core::tasks::PARKED_REASON_REF]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            park_reason.starts_with(&format!(
+                "existing dependent branch {stale_branch} does not contain dependency merge "
+            )) && park_reason.contains(&merge_commit),
+            "park reason must name the missing dependency merge (got: {park_reason})"
         );
         let recorded_provenance: String = conn
             .query_row(
@@ -36897,7 +36950,384 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(recorded_provenance, stale_provenance);
+        assert_eq!(
+            recorded_provenance, stale_provenance,
+            "the stored provenance must not be overwritten on refusal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_advance_preserves_dependent_branch_allocation_on_resume() {
+        // A dependent whose worker was reaped after the base advanced by
+        // unrelated commits must resume on its existing branch: the
+        // dependency merge is included by ancestry, not by whether the
+        // recorded provenance still equals the base tip. Regression for the
+        // #245 → #248 cascade where every dependent parked on
+        // "branch allocation provenance conflict".
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let remote = dir.path().join("remote.git");
+        let worker = dir.path().join("worker");
+        let git = |repo: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-q"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "test"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "base"]);
+        git(&source, &["branch", "-M", "main"]);
+        git(
+            &source,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&source, &["push", "-q", "origin", "main"]);
+
+        // Merge a dependency into main.
+        git(&source, &["checkout", "-q", "-b", "dependency"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "dependency"]);
+        git(&source, &["checkout", "-q", "main"]);
+        git(
+            &source,
+            &["merge", "--no-ff", "dependency", "-m", "merge dependency"],
+        );
+        let dep_merge_commit = git(&source, &["rev-parse", "HEAD"]);
+        git(&source, &["push", "-q", "origin", "main"]);
+
+        assert!(std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                worker.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success());
+
+        // Cut the child branch from the base that already contains the
+        // dependency merge — this is what an in-flight dependent's daemon
+        // clone looks like at the moment the worker was reaped.
+        let child_branch = "daemon/child-t2";
+        let base_at_child_cut = git(&worker, &["rev-parse", "origin/main"]);
+        assert_eq!(base_at_child_cut, dep_merge_commit);
+        git(
+            &worker,
+            &["checkout", "-q", "-b", child_branch, "origin/main"],
+        );
+        git(&worker, &["checkout", "-q", "main"]);
+
+        // Advance origin/main by an unrelated commit — this is what makes
+        // the tip-equality check fail even though ancestry still holds.
+        git(&source, &["commit", "--allow-empty", "-qm", "unrelated"]);
+        git(&source, &["push", "-q", "origin", "main"]);
+        let advanced_base = git(&source, &["rev-parse", "HEAD"]);
+        assert_ne!(base_at_child_cut, advanced_base);
+
+        let db_path = dir.path().join("quorum.db");
+        let worktree = dir.path().join("worktrees").join("child-t2");
+        let child_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let dependency_id = tasks::create(
+                &mut conn,
+                "owner",
+                "merged dependency",
+                None,
+                0,
+                None,
+                Some(
+                    &serde_json::json!({
+                        "merge_commit_sha": dep_merge_commit,
+                    })
+                    .to_string(),
+                ),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='done', completion_provenance='merged' WHERE id=?1",
+                [dependency_id],
+            )
+            .unwrap();
+            let child_id = tasks::create(
+                &mut conn,
+                "owner",
+                "dependent whose worker was reaped after base advance",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                Some(&format!("[{dependency_id}]")),
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            assert!(quorum_core::branches::record_exact_allocation(
+                &mut conn,
+                child_id,
+                child_branch,
+                &worktree.to_string_lossy(),
+                "OriginalWorker",
+                &base_at_child_cut,
+                now_unix(),
+            )
+            .unwrap());
+            child_id
+        };
+
+        let mut config = pre_review_ci_test_config(db_path.clone(), worker.clone());
+        config.worktree_base = dir.path().join("worktrees");
+        let mut names = Pool::new_generated();
+        let mut workers_out = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+
+        // spawn_worker may return true or false depending on how far the
+        // downstream launch gets in the test env; we assert only that the
+        // allocation step no longer refuses this task.
+        let _ = spawn_worker(
+            &config,
+            &WorktreeManager::new(),
+            &mut names,
+            &mut workers_out,
+            &mut poison,
+            &mut skips,
+            &mut roster,
+        )
+        .await
+        .unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let recorded_provenance: String = conn
+            .query_row(
+                "SELECT provenance_sha FROM task_branches WHERE task_id=?1",
+                [child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded_provenance, base_at_child_cut,
+            "resume must preserve the original allocation provenance, not overwrite it with the advanced base tip"
+        );
+        let child = tasks::get(&conn, child_id).unwrap().unwrap();
+        let park_reason = child
+            .refs
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|refs| {
+                refs[quorum_core::tasks::PARKED_REASON_REF]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        assert!(
+            !park_reason.starts_with("branch allocation provenance conflict")
+                && !park_reason.starts_with("existing dependent branch")
+                && !park_reason.starts_with("branch ancestry verification failed"),
+            "resume must not park at the allocation ancestry check (got: {park_reason})"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_null_provenance_dependent_branch_resumes_when_ancestry_holds() {
+        // A row from before allocation provenance was recorded (NULL
+        // provenance_sha) must not be refused outright when it has done
+        // dependencies. Ancestry against the branch itself decides.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let remote = dir.path().join("remote.git");
+        let worker = dir.path().join("worker");
+        let git = |repo: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-q"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "test"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "base"]);
+        git(&source, &["branch", "-M", "main"]);
+        git(
+            &source,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&source, &["push", "-q", "origin", "main"]);
+
+        git(&source, &["checkout", "-q", "-b", "dependency"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "dependency"]);
+        git(&source, &["checkout", "-q", "main"]);
+        git(
+            &source,
+            &["merge", "--no-ff", "dependency", "-m", "merge dependency"],
+        );
+        let dep_merge_commit = git(&source, &["rev-parse", "HEAD"]);
+        git(&source, &["push", "-q", "origin", "main"]);
+
+        assert!(std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                worker.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success());
+
+        let child_branch = "daemon/legacy-child-t2";
+        git(
+            &worker,
+            &["checkout", "-q", "-b", child_branch, "origin/main"],
+        );
+        git(&worker, &["checkout", "-q", "main"]);
+
+        let db_path = dir.path().join("quorum.db");
+        let worktree = dir.path().join("worktrees").join("legacy-child-t2");
+        let child_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let dependency_id = tasks::create(
+                &mut conn,
+                "owner",
+                "merged dependency",
+                None,
+                0,
+                None,
+                Some(
+                    &serde_json::json!({
+                        "merge_commit_sha": dep_merge_commit,
+                    })
+                    .to_string(),
+                ),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='done', completion_provenance='merged' WHERE id=?1",
+                [dependency_id],
+            )
+            .unwrap();
+            let child_id = tasks::create(
+                &mut conn,
+                "owner",
+                "legacy dependent with null provenance",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                Some(&format!("[{dependency_id}]")),
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            // Pre-provenance-migration allocation row: no provenance_sha.
+            conn.execute(
+                "INSERT INTO task_branches(task_id,branch,worktree,allocated_by,allocated_at,provenance_sha)
+                 VALUES (?1,?2,?3,?4,?5,NULL)",
+                rusqlite::params![
+                    child_id,
+                    child_branch,
+                    worktree.to_string_lossy().into_owned(),
+                    "LegacyWorker",
+                    now_unix()
+                ],
+            )
+            .unwrap();
+            child_id
+        };
+
+        let mut config = pre_review_ci_test_config(db_path.clone(), worker.clone());
+        config.worktree_base = dir.path().join("worktrees");
+        let mut names = Pool::new_generated();
+        let mut workers_out = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+
+        let _ = spawn_worker(
+            &config,
+            &WorktreeManager::new(),
+            &mut names,
+            &mut workers_out,
+            &mut poison,
+            &mut skips,
+            &mut roster,
+        )
+        .await
+        .unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let recorded_provenance: Option<String> = conn
+            .query_row(
+                "SELECT provenance_sha FROM task_branches WHERE task_id=?1",
+                [child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            recorded_provenance.is_some(),
+            "legacy NULL provenance must be backfilled after a successful ancestry check"
+        );
+        let child = tasks::get(&conn, child_id).unwrap().unwrap();
+        let park_reason = child
+            .refs
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|refs| {
+                refs[quorum_core::tasks::PARKED_REASON_REF]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        assert!(
+            !park_reason.starts_with("branch allocation provenance conflict")
+                && !park_reason.starts_with("existing dependent branch")
+                && !park_reason.starts_with("branch ancestry verification failed"),
+            "legacy dependent must not park at allocation (got: {park_reason})"
+        );
     }
 
     #[cfg(unix)]
