@@ -788,6 +788,35 @@ fn has_requested_continuation(row: &FactsTaskRow) -> bool {
             == Some(true)
 }
 
+/// A cancelled dependency makes every parked retry/continuation path
+/// unsatisfiable. Reuse the lifecycle's exact guard under the facts snapshot
+/// rather than approximating its JSON dependency traversal here.
+fn load_unsatisfiable_parked_task_ids(
+    conn: &Connection,
+    candidate_tasks: &[FactsTaskRow],
+) -> Result<HashSet<i64>> {
+    let mut unsatisfiable = HashSet::new();
+    for row in candidate_tasks {
+        if parked_disposition(row) == ParkDisposition::Retryable
+            && !crate::tasks::cancelled_dep_ids(conn, row.id)?.is_empty()
+        {
+            unsatisfiable.insert(row.id);
+        }
+    }
+    Ok(unsatisfiable)
+}
+
+fn has_supported_recovery(
+    row: &FactsTaskRow,
+    recoverable_graph_task_ids: &HashSet<i64>,
+    unsatisfiable_parked_task_ids: &HashSet<i64>,
+) -> bool {
+    !unsatisfiable_parked_task_ids.contains(&row.id)
+        && (recoverable_graph_task_ids.contains(&row.id)
+            || has_requested_continuation(row)
+            || parked_disposition(row) == ParkDisposition::Retryable)
+}
+
 fn terminal_evidence(rows: &[&FactsTaskRow], merge_commit_shas: &[String]) -> serde_json::Value {
     let tasks: Vec<serde_json::Value> = rows
         .iter()
@@ -856,6 +885,7 @@ fn dedup_merge_witnesses(witnesses: Vec<String>) -> Vec<String> {
 fn resolve_intent(
     rows: &[&FactsTaskRow],
     recoverable_graph_task_ids: &HashSet<i64>,
+    unsatisfiable_parked_task_ids: &HashSet<i64>,
     completed_graph_source_task_ids: &HashSet<i64>,
     recovery_merge_witnesses: &HashMap<i64, String>,
 ) -> ResolvedIntent {
@@ -864,9 +894,11 @@ fn resolve_intent(
     if rows.iter().any(|row| row.review_only) {
         if rows.iter().any(|row| {
             !matches!(row.status.as_str(), "done" | "failed" | "cancelled")
-                || recoverable_graph_task_ids.contains(&row.id)
-                || has_requested_continuation(row)
-                || parked_disposition(row) == ParkDisposition::Retryable
+                || has_supported_recovery(
+                    row,
+                    recoverable_graph_task_ids,
+                    unsatisfiable_parked_task_ids,
+                )
         }) {
             return ResolvedIntent::nonterminal_with_reason(InclusionReason::ExcludedReviewOnly);
         }
@@ -903,9 +935,11 @@ fn resolve_intent(
     }
     if rows.iter().any(|row| {
         !matches!(row.status.as_str(), "done" | "failed")
-            || recoverable_graph_task_ids.contains(&row.id)
-            || has_requested_continuation(row)
-            || parked_disposition(row) == ParkDisposition::Retryable
+            || has_supported_recovery(
+                row,
+                recoverable_graph_task_ids,
+                unsatisfiable_parked_task_ids,
+            )
     }) {
         return ResolvedIntent::nonterminal();
     }
@@ -1458,6 +1492,7 @@ struct CohortSnapshot {
     candidate_tasks: Vec<FactsTaskRow>,
     lineage: LineageSnapshot,
     recoverable_graph_task_ids: HashSet<i64>,
+    unsatisfiable_parked_task_ids: HashSet<i64>,
     completed_graph_source_task_ids: HashSet<i64>,
 }
 
@@ -1483,6 +1518,10 @@ fn read_cohort_snapshot(conn: &Connection, include_all: bool) -> Result<CohortSn
             .collect();
         let lineage = build_lineage_snapshot(c, &capped_ids)?;
         let recoverable_graph_task_ids = load_recoverable_graph_task_ids(c, &capped_ids, now)?;
+        let unsatisfiable_parked_task_ids = load_unsatisfiable_parked_task_ids(
+            c,
+            &candidate_tasks[..candidate_tasks.len().min(MAX_INTENTS)],
+        )?;
         let completed_graph_source_task_ids = load_completed_graph_source_task_ids(c, &capped_ids)?;
         Ok(CohortSnapshot {
             watermark,
@@ -1490,6 +1529,7 @@ fn read_cohort_snapshot(conn: &Connection, include_all: bool) -> Result<CohortSn
             candidate_tasks,
             lineage,
             recoverable_graph_task_ids,
+            unsatisfiable_parked_task_ids,
             completed_graph_source_task_ids,
         })
     };
@@ -1524,6 +1564,7 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
         candidate_tasks,
         lineage,
         recoverable_graph_task_ids,
+        unsatisfiable_parked_task_ids,
         completed_graph_source_task_ids,
     } = snap;
 
@@ -1590,6 +1631,7 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
             resolve_intent(
                 &member_rows,
                 &recoverable_graph_task_ids,
+                &unsatisfiable_parked_task_ids,
                 &completed_graph_source_task_ids,
                 &recovery_merge_witnesses,
             )
@@ -2852,6 +2894,59 @@ mod tests {
         )
         .unwrap()
         .is_some());
+    }
+
+    #[test]
+    fn facts_includes_parked_failure_with_cancelled_dependency() {
+        let (_d, mut c) = open_tmp();
+        let cancelled_dependency = seed_task(&mut c, "cancelled", None, 0, None, 1000, 1600);
+        let parked = seed_task(&mut c, "failed", None, 0, None, 1000, 1650);
+        c.execute(
+            "UPDATE tasks SET depends_on=?2,refs=?3 WHERE id=?1",
+            rusqlite::params![
+                parked,
+                format!("[{cancelled_dependency}]"),
+                r#"{"daemon_parked":1,"daemon_resume_status":"open"}"#,
+            ],
+        )
+        .unwrap();
+
+        // Prove the exact lifecycle recovery path refuses this durable
+        // dependency state before facts classifies it as irrecoverable.
+        assert!(crate::tasks::retry_parked(
+            &mut c,
+            parked,
+            "retry-owner",
+            true,
+            crate::clock::now(),
+        )
+        .unwrap()
+        .is_none());
+
+        let report = perf_facts(&c, false).unwrap();
+        assert_eq!(
+            report.counts,
+            CohortCounts {
+                candidate: 2,
+                included: 1,
+                excluded: 1,
+            }
+        );
+        let by_task: HashMap<i64, &IntentFacts> = report
+            .intents
+            .iter()
+            .map(|intent| (intent.contributing_task_ids[0], intent))
+            .collect();
+        let intent = by_task[&parked];
+        assert!(intent.included);
+        assert_eq!(intent.reason, InclusionReason::IncludedIrrecoverableFailure);
+        assert_eq!(intent.terminal_outcome.as_deref(), Some("failed"));
+        assert!(intent.terminal_evidence.is_some());
+        assert!(intent.merge_provenance.is_none());
+        assert_eq!(
+            by_task[&cancelled_dependency].reason,
+            InclusionReason::ExcludedHousekeepingCancellation
+        );
     }
 
     #[test]
