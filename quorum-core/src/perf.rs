@@ -2705,7 +2705,8 @@ mod tests {
             r#"{"cx_ready":false,"cx_not_ready_reason":"missing owner decision"}"#,
         );
         let manual = seed_task(&mut c, "open", None, 0, None, 1000, 1800);
-        crate::tasks::close_manual(&mut c, "owner", manual, "resolved elsewhere", 1800).unwrap();
+        crate::tasks::close_manual(&mut c, "owner", manual, "resolved elsewhere", None, 1800)
+            .unwrap();
         let review_only = seed_review_only(&mut c, 1900);
 
         let report = perf_facts(&c, false).unwrap();
@@ -3214,6 +3215,7 @@ mod tests {
             "manual-owner",
             manual_child,
             "manual delivery fixture",
+            None,
             1640,
         )
         .unwrap()
