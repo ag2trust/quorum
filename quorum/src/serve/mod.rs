@@ -20996,10 +20996,10 @@ async fn spawn_worker(
             base_sha,
             merge_commits,
         } => (Some(base_sha), merge_commits),
-            DependencyBaseAdmission::Deferred => {
-                name_pool.release(&agent_name);
-                return Ok(false);
-            }
+        DependencyBaseAdmission::Deferred => {
+            name_pool.release(&agent_name);
+            return Ok(false);
+        }
     };
 
     lifetime_roster.register(&agent_name);

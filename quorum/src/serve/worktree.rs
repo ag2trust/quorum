@@ -834,6 +834,8 @@ impl WorktreeManager {
         }
         let sha = git_diagnostic(&output.stdout);
         Ok((!sha.is_empty()).then_some(sha))
+    }
+
     /// Resolve `branch` (preferring the local ref, then `origin/<branch>`)
     /// and verify every `merge_commits` entry is an ancestor of that head.
     /// Base staleness is a merge-time concern, so at resume the correct test
