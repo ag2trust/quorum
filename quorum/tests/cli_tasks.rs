@@ -1810,6 +1810,35 @@ fn task_close_rejects_open_pr_unless_reason_marks_task_obsolete() {
             "1",
             "--reason-stdin",
         ])
+        .write_stdin("this task is not obsolete; keep the PR open\n")
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("PR #78 is still open"));
+
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let (status, refs): (String, String) = conn
+        .query_row("SELECT status,refs FROM tasks WHERE id=1", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+    assert_eq!(status, "open");
+    assert!(
+        refs.get("merge_commit_sha").is_none(),
+        "rejected negated obsolete reason must not fabricate a merge SHA"
+    );
+    drop(conn);
+
+    quorum(home.path())
+        .env("PATH", format!("{}:{path}", shim_dir.path().display()))
+        .args([
+            "task-close",
+            "--agent",
+            "owner",
+            "--task-id",
+            "1",
+            "--reason-stdin",
+        ])
         .write_stdin("obsolete: superseded by another change\n")
         .assert()
         .success();

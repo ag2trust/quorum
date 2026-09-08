@@ -433,9 +433,36 @@ fn resolve_gh_repo(repo_dir: &str) -> Option<String> {
 }
 
 fn manual_close_reason_marks_obsolete(reason: &str) -> bool {
-    reason
+    let words = reason
         .split(|ch: char| !ch.is_alphanumeric())
-        .any(|word| word.eq_ignore_ascii_case("obsolete"))
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+
+    // `obsolete:` is an explicit operator marker. Otherwise require an
+    // affirmative declaration about the task itself, rather than treating an
+    // incidental or negated mention (for example, "not obsolete") as
+    // authorization to close an open PR.
+    matches!(words.first().map(String::as_str), Some("obsolete"))
+        || words.windows(3).any(|words| {
+            matches!(
+                words,
+                [subject, copula, obsolete]
+                    if matches!(subject.as_str(), "task" | "this" | "it")
+                        && matches!(copula.as_str(), "is" | "was")
+                        && obsolete == "obsolete"
+            )
+        })
+        || words.windows(4).any(|words| {
+            matches!(
+                words,
+                [article, subject, copula, obsolete]
+                    if matches!(article.as_str(), "the" | "this")
+                        && subject == "task"
+                        && matches!(copula.as_str(), "is" | "was")
+                        && obsolete == "obsolete"
+            )
+        })
 }
 
 /// Wait for a spawned child with a timeout. Returns stdout on success, None on
