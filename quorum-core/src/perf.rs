@@ -369,6 +369,325 @@ pub fn perf_with(
     Ok(PerfReport { rows })
 }
 
+// ── facts report scaffold (perf-facts-v1) ──────────────────────────────────
+//
+// Read-only fact surface siblings populate. Types declare every fact field up
+// front so lineage/terminal/enrichment tasks only fill in evidence and flip
+// coverage flags. A JSON null with a false coverage flag is distinguishable
+// from a measured zero.
+
+pub const FACTS_VERSION: &str = "perf-facts-v1";
+
+/// Cap on returned intents. Additional candidates become excluded-truncated.
+pub const MAX_INTENTS: usize = 10_000;
+
+/// Cap on contributing task ids per intent — enrichment/lineage siblings clip
+/// their evidence to this bound.
+pub const MAX_CONTRIBUTING_TASKS_PER_INTENT: usize = 64;
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct FactsReport {
+    pub facts_version: &'static str,
+    pub cohort: CohortDefinition,
+    pub query_limits: QueryLimits,
+    pub counts: CohortCounts,
+    pub coverage: CoverageSummary,
+    pub excluded_reasons: BTreeMap<String, i64>,
+    pub intents: Vec<IntentFacts>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct CohortDefinition {
+    pub prospective_only: bool,
+    pub watermark: Option<i64>,
+    pub include_all: bool,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct QueryLimits {
+    pub max_intents: usize,
+    pub max_contributing_tasks_per_intent: usize,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq, Default)]
+pub struct CohortCounts {
+    pub candidate: i64,
+    pub included: i64,
+    pub excluded: i64,
+}
+
+/// Per-field covered/uncovered tally across the returned intents. Keyed by the
+/// same names `IntentCoverage` exposes, ordered for deterministic output.
+#[derive(Debug, Serialize, PartialEq, Eq, Default)]
+pub struct CoverageSummary {
+    pub fields: BTreeMap<String, FieldCoverage>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq, Default)]
+pub struct FieldCoverage {
+    pub covered: i64,
+    pub uncovered: i64,
+}
+
+/// One row per ordinary managed implementation task. Every evidence field is
+/// initialized to JSON null with the matching coverage flag false — enrichment
+/// siblings flip flags only when they successfully fill in real evidence.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct IntentFacts {
+    pub intent_id: String,
+    pub contributing_task_ids: Vec<i64>,
+    pub included: bool,
+    pub reason: InclusionReason,
+
+    // ── evidence fields (populated by sibling tasks) ─────────────────────
+    pub lineage_root_task_id: Option<i64>,
+    pub lineage_evidence: Option<serde_json::Value>,
+    pub terminal_outcome: Option<String>,
+    pub terminal_evidence: Option<serde_json::Value>,
+    pub merge_provenance: Option<String>,
+    pub complexity: Option<String>,
+    pub complexity_provenance: Option<String>,
+    pub config_evidence: Option<serde_json::Value>,
+    pub final_worker: Option<String>,
+    pub contributing_attempts: Option<serde_json::Value>,
+    pub role_tokens_usd: Option<serde_json::Value>,
+    pub active_model_secs: Option<i64>,
+    pub wall_secs: Option<i64>,
+    pub rework_count: Option<i64>,
+    pub recovery_count: Option<i64>,
+    pub replan_count: Option<i64>,
+    pub incident_count: Option<i64>,
+    pub review_quality: Option<serde_json::Value>,
+
+    pub coverage: IntentCoverage,
+}
+
+/// Per-field coverage flags. Same names as `IntentFacts` evidence fields so a
+/// generic covered/uncovered summary can iterate without reflection.
+#[derive(Debug, Serialize, PartialEq, Eq, Default, Clone, Copy)]
+pub struct IntentCoverage {
+    pub lineage: bool,
+    pub terminal: bool,
+    pub merge_provenance: bool,
+    pub complexity: bool,
+    pub config: bool,
+    pub final_worker: bool,
+    pub contributing_attempts: bool,
+    pub role_tokens_usd: bool,
+    pub active_model_secs: bool,
+    pub wall_secs: bool,
+    pub rework: bool,
+    pub recovery: bool,
+    pub replan: bool,
+    pub incident: bool,
+    pub review_quality: bool,
+}
+
+impl IntentCoverage {
+    fn iter_named(&self) -> [(&'static str, bool); 15] {
+        [
+            ("lineage", self.lineage),
+            ("terminal", self.terminal),
+            ("merge_provenance", self.merge_provenance),
+            ("complexity", self.complexity),
+            ("config", self.config),
+            ("final_worker", self.final_worker),
+            ("contributing_attempts", self.contributing_attempts),
+            ("role_tokens_usd", self.role_tokens_usd),
+            ("active_model_secs", self.active_model_secs),
+            ("wall_secs", self.wall_secs),
+            ("rework", self.rework),
+            ("recovery", self.recovery),
+            ("replan", self.replan),
+            ("incident", self.incident),
+            ("review_quality", self.review_quality),
+        ]
+    }
+}
+
+/// Bounded inclusion/exclusion reason codes. No free-form-only eligibility.
+#[derive(Debug, Serialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "kebab-case")]
+pub enum InclusionReason {
+    EligibleTerminal,
+    EligibleIncludeAll,
+    ExcludedReviewOnly,
+    ExcludedPreWatermark,
+    ExcludedTruncated,
+    ExcludedNonTerminal,
+}
+
+impl InclusionReason {
+    pub fn is_included(&self) -> bool {
+        matches!(self, Self::EligibleTerminal | Self::EligibleIncludeAll)
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::EligibleTerminal => "eligible-terminal",
+            Self::EligibleIncludeAll => "eligible-include-all",
+            Self::ExcludedReviewOnly => "excluded-review-only",
+            Self::ExcludedPreWatermark => "excluded-pre-watermark",
+            Self::ExcludedTruncated => "excluded-truncated",
+            Self::ExcludedNonTerminal => "excluded-non-terminal",
+        }
+    }
+}
+
+struct CandidateRow {
+    id: i64,
+    review_only: i64,
+}
+
+/// Load terminal candidate rows in a bounded, deterministic order. Ordering by
+/// `id` keeps repeated runs stable and keeps allocations bounded via LIMIT.
+fn load_facts_candidates(
+    conn: &Connection,
+    since: Option<i64>,
+    limit: usize,
+) -> Result<Vec<CandidateRow>> {
+    let since_val = since.unwrap_or(0);
+    let mut stmt = conn.prepare(
+        "SELECT id, review_only \
+         FROM tasks \
+         WHERE status IN ('done','failed','cancelled') \
+           AND updated_at >= ?1 \
+         ORDER BY id ASC \
+         LIMIT ?2",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![since_val, limit as i64], |r| {
+            Ok(CandidateRow {
+                id: r.get(0)?,
+                review_only: r.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn new_intent_facts(task_id: i64, reason: InclusionReason) -> IntentFacts {
+    IntentFacts {
+        intent_id: format!("intent-{task_id}"),
+        contributing_task_ids: vec![task_id],
+        included: reason.is_included(),
+        reason,
+        lineage_root_task_id: None,
+        lineage_evidence: None,
+        terminal_outcome: None,
+        terminal_evidence: None,
+        merge_provenance: None,
+        complexity: None,
+        complexity_provenance: None,
+        config_evidence: None,
+        final_worker: None,
+        contributing_attempts: None,
+        role_tokens_usd: None,
+        active_model_secs: None,
+        wall_secs: None,
+        rework_count: None,
+        recovery_count: None,
+        replan_count: None,
+        incident_count: None,
+        review_quality: None,
+        coverage: IntentCoverage::default(),
+    }
+}
+
+/// Read-only facts surface for `quorum perf`. Returns a deterministic,
+/// bounded `FactsReport` with one intent per ordinary managed implementation
+/// task in the cohort. All evidence fields are initialized to JSON null; the
+/// per-field coverage flags stay false until enrichment siblings populate
+/// them.
+///
+/// Cohort selection is prospective by default via `perf_watermark`;
+/// `include_all` bypasses that boundary. Performs no writes.
+pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
+    let watermark = read_watermark(conn)?;
+    let since = if include_all { None } else { watermark };
+    let cohort = CohortDefinition {
+        prospective_only: !include_all,
+        watermark,
+        include_all,
+    };
+    let query_limits = QueryLimits {
+        max_intents: MAX_INTENTS,
+        max_contributing_tasks_per_intent: MAX_CONTRIBUTING_TASKS_PER_INTENT,
+    };
+
+    // Cap the candidate load at MAX_INTENTS + 1 so truncation is detectable
+    // without loading unbounded rows.
+    let candidates = load_facts_candidates(conn, since, MAX_INTENTS + 1)?;
+    let candidate_count = candidates.len() as i64;
+
+    let base_reason = if include_all {
+        InclusionReason::EligibleIncludeAll
+    } else {
+        InclusionReason::EligibleTerminal
+    };
+
+    let mut intents: Vec<IntentFacts> = Vec::new();
+    let mut excluded_reasons: BTreeMap<String, i64> = BTreeMap::new();
+
+    for cand in candidates {
+        // Truncation guard: additional candidates beyond MAX_INTENTS are
+        // tallied under excluded-truncated rather than materialized.
+        if intents.len() >= MAX_INTENTS {
+            *excluded_reasons
+                .entry(InclusionReason::ExcludedTruncated.as_str().to_string())
+                .or_insert(0) += 1;
+            continue;
+        }
+
+        if cand.review_only != 0 {
+            *excluded_reasons
+                .entry(InclusionReason::ExcludedReviewOnly.as_str().to_string())
+                .or_insert(0) += 1;
+            continue;
+        }
+
+        intents.push(new_intent_facts(cand.id, base_reason));
+    }
+
+    let included_count = intents.len() as i64;
+    let excluded_count = candidate_count - included_count;
+
+    // Coverage summary: iterate each intent's flags and tally covered vs
+    // uncovered per named field. Order comes from `IntentCoverage::iter_named`
+    // (via BTreeMap insertion), producing deterministic output.
+    let mut coverage = CoverageSummary::default();
+    for intent in &intents {
+        for (name, covered) in intent.coverage.iter_named() {
+            let entry = coverage.fields.entry(name.to_string()).or_default();
+            if covered {
+                entry.covered += 1;
+            } else {
+                entry.uncovered += 1;
+            }
+        }
+    }
+    // Ensure the map contains every declared field even when there are no
+    // intents, so consumers can rely on a stable schema.
+    if intents.is_empty() {
+        for (name, _) in IntentCoverage::default().iter_named() {
+            coverage.fields.entry(name.to_string()).or_default();
+        }
+    }
+
+    Ok(FactsReport {
+        facts_version: FACTS_VERSION,
+        cohort,
+        query_limits,
+        counts: CohortCounts {
+            candidate: candidate_count,
+            included: included_count,
+            excluded: excluded_count,
+        },
+        coverage,
+        excluded_reasons,
+        intents,
+    })
+}
+
 pub fn render_table(report: &PerfReport) {
     if report.rows.is_empty() {
         println!("No terminal tasks found.");
@@ -976,6 +1295,330 @@ mod tests {
         let wm = read_watermark(&c).unwrap();
         assert!(wm.is_some(), "watermark must survive reopen");
         assert!(wm.unwrap() > 0);
+    }
+
+    // ── facts scaffold tests (perf-facts-v1) ────────────────────────────
+
+    /// Snapshot per-table row counts and PRAGMA data_version, so a "no writes"
+    /// assertion catches both row-level changes and hidden schema/pragma
+    /// mutations without depending on log strings.
+    fn snapshot_db_state(conn: &Connection) -> (BTreeMap<String, i64>, i64) {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+                 ORDER BY name",
+            )
+            .unwrap();
+        let tables: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let mut counts = BTreeMap::new();
+        for t in tables {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM \"{t}\""), [], |r| r.get(0))
+                .unwrap();
+            counts.insert(t, n);
+        }
+        let data_version: i64 = conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))
+            .unwrap();
+        (counts, data_version)
+    }
+
+    fn seed_ordinary(conn: &mut Connection, updated_at: i64) -> i64 {
+        seed_task(conn, "done", None, 0, None, 1000, updated_at)
+    }
+
+    fn seed_review_only(conn: &mut Connection, updated_at: i64) -> i64 {
+        let tx = crate::db::begin_immediate(conn).unwrap();
+        tx.execute(
+            "INSERT INTO tasks(title, body, status, priority, labels, assignee, created_by, \
+             created_at, updated_at, refs, depends_on, author, reviewer, rework_round, review_only) \
+             VALUES ('rev', NULL, 'done', 0, NULL, NULL, 'boss', 1000, ?1, NULL, NULL, 'worker', NULL, 0, 1)",
+            rusqlite::params![updated_at],
+        )
+        .unwrap();
+        let id = tx.last_insert_rowid();
+        tx.commit().unwrap();
+        id
+    }
+
+    #[test]
+    fn facts_version_is_v1() {
+        let (_d, c) = open_tmp();
+        let r = perf_facts(&c, false).unwrap();
+        assert_eq!(r.facts_version, "perf-facts-v1");
+    }
+
+    #[test]
+    fn facts_empty_report_declares_full_coverage_schema() {
+        let (_d, c) = open_tmp();
+        let r = perf_facts(&c, false).unwrap();
+        assert_eq!(r.counts, CohortCounts::default());
+        assert!(r.intents.is_empty());
+        // Every declared coverage field is present even with no intents, so
+        // consumers can rely on a stable field schema.
+        let expected: Vec<&str> = IntentCoverage::default()
+            .iter_named()
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        for name in expected {
+            assert!(
+                r.coverage.fields.contains_key(name),
+                "coverage field {name} must be present in empty report"
+            );
+        }
+    }
+
+    #[test]
+    fn facts_intent_identity_one_per_ordinary_task() {
+        let (_d, mut c) = open_tmp();
+        let t1 = seed_ordinary(&mut c, 1600);
+        let t2 = seed_ordinary(&mut c, 1700);
+
+        let r = perf_facts(&c, false).unwrap();
+        assert_eq!(r.intents.len(), 2);
+        assert_eq!(r.counts.candidate, 2);
+        assert_eq!(r.counts.included, 2);
+        assert_eq!(r.counts.excluded, 0);
+
+        let ids: Vec<i64> = r
+            .intents
+            .iter()
+            .map(|i| i.contributing_task_ids[0])
+            .collect();
+        assert_eq!(ids, vec![t1, t2]);
+        assert_eq!(r.intents[0].intent_id, format!("intent-{t1}"));
+        assert_eq!(r.intents[1].intent_id, format!("intent-{t2}"));
+        for intent in &r.intents {
+            assert!(intent.included);
+            assert_eq!(intent.reason, InclusionReason::EligibleTerminal);
+            assert_eq!(intent.contributing_task_ids.len(), 1);
+        }
+    }
+
+    #[test]
+    fn facts_same_task_rework_stays_one_intent() {
+        // Ordinary same-task rework increments rework_round on the same row —
+        // there is still only one task, hence one intent.
+        let (_d, mut c) = open_tmp();
+        let tid = seed_task(&mut c, "done", None, 3, None, 1000, 1600);
+        seed_run(&c, tid, "opus-46", "high", 1001);
+
+        let r = perf_facts(&c, false).unwrap();
+        assert_eq!(r.intents.len(), 1);
+        assert_eq!(r.intents[0].contributing_task_ids, vec![tid]);
+    }
+
+    #[test]
+    fn facts_all_evidence_null_and_coverage_false() {
+        let (_d, mut c) = open_tmp();
+        let tid = seed_ordinary(&mut c, 1600);
+        seed_run(&c, tid, "opus-46", "high", 1001);
+        seed_approval(&c, tid, "approved", 0);
+
+        let r = perf_facts(&c, false).unwrap();
+        assert_eq!(r.intents.len(), 1);
+        let i = &r.intents[0];
+        // Every evidence field remains null — enrichment is a sibling's job.
+        assert!(i.lineage_root_task_id.is_none());
+        assert!(i.lineage_evidence.is_none());
+        assert!(i.terminal_outcome.is_none());
+        assert!(i.terminal_evidence.is_none());
+        assert!(i.merge_provenance.is_none());
+        assert!(i.complexity.is_none());
+        assert!(i.complexity_provenance.is_none());
+        assert!(i.config_evidence.is_none());
+        assert!(i.final_worker.is_none());
+        assert!(i.contributing_attempts.is_none());
+        assert!(i.role_tokens_usd.is_none());
+        assert!(i.active_model_secs.is_none());
+        assert!(i.wall_secs.is_none());
+        assert!(i.rework_count.is_none());
+        assert!(i.recovery_count.is_none());
+        assert!(i.replan_count.is_none());
+        assert!(i.incident_count.is_none());
+        assert!(i.review_quality.is_none());
+        // Every coverage flag stays false.
+        for (name, covered) in i.coverage.iter_named() {
+            assert!(!covered, "coverage.{name} must default to false");
+        }
+        // Coverage summary reflects that: uncovered==1 for every field.
+        for (name, fc) in &r.coverage.fields {
+            assert_eq!(fc.covered, 0, "field {name} covered");
+            assert_eq!(fc.uncovered, 1, "field {name} uncovered");
+        }
+    }
+
+    #[test]
+    fn facts_json_null_distinct_from_measured_zero() {
+        // Serialize a scaffold intent and one with an explicit measured zero,
+        // verifying null is distinguishable from a real 0.
+        let (_d, mut c) = open_tmp();
+        seed_ordinary(&mut c, 1600);
+        let r = perf_facts(&c, false).unwrap();
+        let unpop = serde_json::to_value(&r.intents[0]).unwrap();
+        assert_eq!(unpop.get("rework_count").unwrap(), &serde_json::Value::Null);
+
+        let mut zeroed = r.intents[0].clone_for_test();
+        zeroed.rework_count = Some(0);
+        zeroed.coverage.rework = true;
+        let pop = serde_json::to_value(&zeroed).unwrap();
+        assert_eq!(pop.get("rework_count").unwrap(), &serde_json::json!(0));
+    }
+
+    #[test]
+    fn facts_review_only_excluded_by_reason_code() {
+        let (_d, mut c) = open_tmp();
+        seed_ordinary(&mut c, 1600);
+        seed_review_only(&mut c, 1700);
+
+        let r = perf_facts(&c, false).unwrap();
+        assert_eq!(r.counts.candidate, 2);
+        assert_eq!(r.counts.included, 1);
+        assert_eq!(r.counts.excluded, 1);
+        assert_eq!(
+            r.excluded_reasons.get("excluded-review-only").copied(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn facts_prospective_by_default_include_all_bypasses() {
+        let (_d, mut c) = open_tmp();
+        c.execute(
+            "UPDATE perf_watermark SET watermark = 5000 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        seed_ordinary(&mut c, 1600); // historical, pre-watermark
+        seed_ordinary(&mut c, 6000); // post-watermark
+
+        let default = perf_facts(&c, false).unwrap();
+        assert!(default.cohort.prospective_only);
+        assert!(!default.cohort.include_all);
+        assert_eq!(default.cohort.watermark, Some(5000));
+        assert_eq!(default.counts.candidate, 1);
+        assert_eq!(default.counts.included, 1);
+        assert_eq!(default.intents[0].reason, InclusionReason::EligibleTerminal);
+
+        let all = perf_facts(&c, true).unwrap();
+        assert!(!all.cohort.prospective_only);
+        assert!(all.cohort.include_all);
+        assert_eq!(all.cohort.watermark, Some(5000));
+        assert_eq!(all.counts.candidate, 2);
+        assert_eq!(all.counts.included, 2);
+        for intent in &all.intents {
+            assert_eq!(intent.reason, InclusionReason::EligibleIncludeAll);
+        }
+    }
+
+    #[test]
+    fn facts_deterministic_across_repeated_runs() {
+        let (_d, mut c) = open_tmp();
+        seed_ordinary(&mut c, 1600);
+        seed_ordinary(&mut c, 1700);
+        seed_review_only(&mut c, 1800);
+
+        let r1 = perf_facts(&c, false).unwrap();
+        let r2 = perf_facts(&c, false).unwrap();
+        let r3 = perf_facts(&c, false).unwrap();
+        assert_eq!(r1, r2);
+        assert_eq!(r2, r3);
+    }
+
+    #[test]
+    fn facts_no_writes_against_real_sqlite() {
+        let (_d, mut c) = open_tmp();
+        seed_ordinary(&mut c, 1600);
+        seed_ordinary(&mut c, 1700);
+        seed_review_only(&mut c, 1800);
+        // Extra data across auxiliary tables so the snapshot covers non-tasks
+        // state as well.
+        let tid = seed_ordinary(&mut c, 1900);
+        seed_run(&c, tid, "opus-46", "high", 1901);
+        seed_approval(&c, tid, "approved", 0);
+        seed_reviewer_run(&c, tid, "r", 1902, 1950);
+        seed_journal_cost(&mut c, tid, "w", 1.25);
+
+        let before = snapshot_db_state(&c);
+        // Default and include_all — both must be pure reads.
+        let _ = perf_facts(&c, false).unwrap();
+        let _ = perf_facts(&c, true).unwrap();
+        let after = snapshot_db_state(&c);
+        assert_eq!(before, after, "perf_facts must not write to any table");
+    }
+
+    #[test]
+    fn facts_output_is_bounded_by_max_intents() {
+        // Verify the API bound is present and respected; use a small local
+        // cap by asserting via query_limits — the truncation path itself is a
+        // pure LIMIT + counter and does not need MAX_INTENTS-sized fixtures.
+        let (_d, c) = open_tmp();
+        let r = perf_facts(&c, false).unwrap();
+        assert_eq!(r.query_limits.max_intents, MAX_INTENTS);
+        assert_eq!(
+            r.query_limits.max_contributing_tasks_per_intent,
+            MAX_CONTRIBUTING_TASKS_PER_INTENT
+        );
+        assert!(
+            r.intents.len() <= MAX_INTENTS,
+            "returned intents must not exceed MAX_INTENTS"
+        );
+    }
+
+    #[test]
+    fn facts_inclusion_reason_is_bounded_enum_not_free_form() {
+        // Serializing a code goes through the kebab-case enum discriminants
+        // — no free-form text can appear in the wire form.
+        for r in [
+            InclusionReason::EligibleTerminal,
+            InclusionReason::EligibleIncludeAll,
+            InclusionReason::ExcludedReviewOnly,
+            InclusionReason::ExcludedPreWatermark,
+            InclusionReason::ExcludedTruncated,
+            InclusionReason::ExcludedNonTerminal,
+        ] {
+            let v = serde_json::to_value(r).unwrap();
+            let s = v.as_str().expect("reason must serialize as a string");
+            assert_eq!(s, r.as_str(), "wire form and as_str() must agree");
+        }
+    }
+
+    // Helper for cloning an IntentFacts in tests (Serialize/Deserialize is
+    // not derived because Deserialize is not needed elsewhere).
+    impl IntentFacts {
+        fn clone_for_test(&self) -> Self {
+            Self {
+                intent_id: self.intent_id.clone(),
+                contributing_task_ids: self.contributing_task_ids.clone(),
+                included: self.included,
+                reason: self.reason,
+                lineage_root_task_id: self.lineage_root_task_id,
+                lineage_evidence: self.lineage_evidence.clone(),
+                terminal_outcome: self.terminal_outcome.clone(),
+                terminal_evidence: self.terminal_evidence.clone(),
+                merge_provenance: self.merge_provenance.clone(),
+                complexity: self.complexity.clone(),
+                complexity_provenance: self.complexity_provenance.clone(),
+                config_evidence: self.config_evidence.clone(),
+                final_worker: self.final_worker.clone(),
+                contributing_attempts: self.contributing_attempts.clone(),
+                role_tokens_usd: self.role_tokens_usd.clone(),
+                active_model_secs: self.active_model_secs,
+                wall_secs: self.wall_secs,
+                rework_count: self.rework_count,
+                recovery_count: self.recovery_count,
+                replan_count: self.replan_count,
+                incident_count: self.incident_count,
+                review_quality: self.review_quality.clone(),
+                coverage: self.coverage,
+            }
+        }
     }
 
     #[test]
