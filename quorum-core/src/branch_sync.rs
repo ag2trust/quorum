@@ -43,6 +43,24 @@ pub fn is_valid_phase(phase: &str) -> bool {
     )
 }
 
+/// Whether `next_phase` is a legal one-way transition from `phase`.
+///
+/// The clean path advances one step at a time. Outcome terminals are admitted
+/// only where their underlying operation occurs; `failed` and `cancelled` may
+/// end any active phase. This prevents a restarted executor from replaying or
+/// skipping durable work after it has observed a current row.
+pub fn is_valid_transition(phase: &str, next_phase: &str) -> bool {
+    matches!(
+        (phase, next_phase),
+        ("requested", "pinned")
+            | ("pinned", "prepared" | "noop" | "conflict")
+            | ("prepared", "published")
+            | ("published", "checks")
+            | ("checks", "merging" | "ci_failed")
+            | ("merging", "done" | "conflict")
+    ) || (!is_terminal_phase(phase) && matches!(next_phase, "failed" | "cancelled"))
+}
+
 /// Durable synchronization state.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct BranchSync {
@@ -173,6 +191,11 @@ pub fn set_phase(
 ) -> Result<Option<BranchSync>> {
     if !is_valid_phase(expected_phase) || !is_valid_phase(next_phase) {
         return Err(QuorumError::Usage("invalid branch sync phase".into()));
+    }
+    if !is_valid_transition(expected_phase, next_phase) {
+        return Err(QuorumError::Usage(format!(
+            "invalid branch sync transition: {expected_phase} -> {next_phase}"
+        )));
     }
     let tx = begin_immediate(conn)?;
     let terminal = i64::from(is_terminal_phase(next_phase));
@@ -313,9 +336,22 @@ mod tests {
     fn terminal_done_releases_the_pair_for_a_new_request() {
         let (_dir, mut conn) = open_tmp();
         let first = requested(request(&mut conn, "main", "develop", "A", 100).unwrap());
-        let done = set_phase(&mut conn, first.id, "requested", "done", 101)
-            .unwrap()
-            .expect("current phase must advance");
+        let mut phase = "requested";
+        for (next, now) in [
+            ("pinned", 101),
+            ("prepared", 102),
+            ("published", 103),
+            ("checks", 104),
+            ("merging", 105),
+            ("done", 106),
+        ] {
+            let advanced = set_phase(&mut conn, first.id, phase, next, now)
+                .unwrap()
+                .expect("current phase must advance");
+            assert_eq!(advanced.phase, next);
+            phase = next;
+        }
+        let done = get(&conn, first.id).unwrap().unwrap();
         assert_eq!(done.phase, "done");
         assert!(!done.active, "terminal update must release the pair");
         assert!(active_for_pair(&conn, "main", "develop").unwrap().is_none());
@@ -332,9 +368,53 @@ mod tests {
         assert!(set_phase(&mut conn, sync.id, "requested", "pinned", 101)
             .unwrap()
             .is_some());
-        assert!(set_phase(&mut conn, sync.id, "requested", "prepared", 102)
+        assert!(set_phase(&mut conn, sync.id, "requested", "pinned", 102)
             .unwrap()
             .is_none());
         assert_eq!(get(&conn, sync.id).unwrap().unwrap().phase, "pinned");
+    }
+
+    #[test]
+    fn reverse_skipped_and_same_phase_transitions_are_rejected_without_mutation() {
+        let (_dir, mut conn) = open_tmp();
+        let sync = requested(request(&mut conn, "main", "develop", "A", 100).unwrap());
+
+        let error = set_phase(&mut conn, sync.id, "requested", "prepared", 101).unwrap_err();
+        assert!(matches!(error, QuorumError::Usage(_)), "skip must reject");
+        assert_eq!(
+            get(&conn, sync.id).unwrap().unwrap(),
+            sync,
+            "skip must leave the row unchanged"
+        );
+
+        let pinned = set_phase(&mut conn, sync.id, "requested", "pinned", 101)
+            .unwrap()
+            .expect("requested must advance to pinned");
+
+        for next in ["requested", "pinned"] {
+            let error = set_phase(&mut conn, sync.id, "pinned", next, 102).unwrap_err();
+            assert!(matches!(error, QuorumError::Usage(_)), "{next} must reject");
+            assert_eq!(
+                get(&conn, sync.id).unwrap().unwrap(),
+                pinned,
+                "{next} must leave the row unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_outcomes_follow_their_operation_phase() {
+        let (_dir, mut conn) = open_tmp();
+        let sync = requested(request(&mut conn, "main", "develop", "A", 100).unwrap());
+
+        let error = set_phase(&mut conn, sync.id, "requested", "done", 101).unwrap_err();
+        assert!(matches!(error, QuorumError::Usage(_)));
+        assert_eq!(get(&conn, sync.id).unwrap().unwrap(), sync);
+
+        let failed = set_phase(&mut conn, sync.id, "requested", "failed", 102)
+            .unwrap()
+            .expect("failed must end any active phase");
+        assert_eq!(failed.phase, "failed");
+        assert!(!failed.active);
     }
 }

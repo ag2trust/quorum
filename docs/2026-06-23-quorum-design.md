@@ -461,11 +461,13 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   SHAs, temporary sync branch, merge SHA, PR, optional judgment task, requestor/error details,
   and timestamps. `UNIQUE(source_branch, target_branch) WHERE active=1` is the durable
   cross-process guard for a single live synchronization per directed pair.
-- Phases are `requested` → `pinned` → `prepared` → `published` → `checks` → `merging`, then
-  `done`; `noop`, `conflict`, `ci_failed`, `failed`, and `cancelled` are terminal alternatives.
-  Phase changes are guarded compare-and-set updates, so stale executors cannot overwrite newer
-  progress. Every terminal transition clears `active` in the same statement, releasing the
-  pair for a later request.
+- Phases advance through the one-way clean path `requested` → `pinned` → `prepared` →
+  `published` → `checks` → `merging` → `done`. `pinned` may end `noop` or `conflict`, `checks`
+  may end `ci_failed`, and `merging` may end `conflict`; `failed` and `cancelled` may end any
+  active phase. Phase changes are guarded compare-and-set updates and reject backward, skipped,
+  and same-phase writes, so stale or restarted executors cannot overwrite or reorder durable
+  progress. Every terminal transition clears `active` in the same statement, releasing the pair
+  for a later request.
 - The daemon executes the clean path internally; no task is created merely to merge, publish,
   wait for checks, or complete a no-op. Only `conflict` and `ci_failed` lead to a judgment task.
 
