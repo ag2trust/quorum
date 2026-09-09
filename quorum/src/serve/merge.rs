@@ -756,21 +756,50 @@ fn parse_repository_default_branch(output: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[derive(Debug)]
+struct MergeBranchMetadata {
+    head_ref: String,
+    pr_base_branch: String,
+    default_branch: String,
+}
+
+fn merge_branch_metadata(
+    head_ref: Option<String>,
+    pr_base_branch: Option<String>,
+    default_branch: Option<String>,
+) -> std::result::Result<MergeBranchMetadata, MergeResult> {
+    let head_ref = head_ref.ok_or_else(|| MergeResult {
+        success: false,
+        message: "PR head branch could not be resolved; merge not attempted".into(),
+        failure_kind: Some(MergeFailureKind::PolicyBlocked),
+    })?;
+    let pr_base_branch = pr_base_branch.ok_or_else(|| MergeResult {
+        success: false,
+        message: "PR base branch could not be resolved; merge not attempted".into(),
+        failure_kind: Some(MergeFailureKind::PolicyBlocked),
+    })?;
+    let default_branch = default_branch.ok_or_else(|| MergeResult {
+        success: false,
+        message: "repository default branch could not be resolved; merge not attempted".into(),
+        failure_kind: Some(MergeFailureKind::PolicyBlocked),
+    })?;
+
+    Ok(MergeBranchMetadata {
+        head_ref,
+        pr_base_branch,
+        default_branch,
+    })
+}
+
 fn merge_command_args<'a>(
     pr: &'a str,
     expected_head_sha: &'a str,
-    head_ref: Option<&str>,
-    protected_branches: [Option<&str>; 4],
+    head_ref: &str,
+    protected_branches: [&str; 4],
 ) -> Vec<&'a str> {
-    // A failed branch lookup must retain the branch rather than risk deleting
-    // a protected one. Branch cleanup is optional; a merge is not.
-    let delete_branch = head_ref.is_some_and(|head_ref| {
-        protected_branches.iter().all(|branch| branch.is_some())
-            && protected_branches
-                .iter()
-                .flatten()
-                .all(|protected| head_ref != *protected)
-    });
+    let delete_branch = protected_branches
+        .iter()
+        .all(|protected| head_ref != *protected);
 
     let mut args = vec!["pr", "merge", pr, "--merge"];
     if delete_branch {
@@ -934,19 +963,24 @@ impl MergeExecutor for GhMergeExecutor {
             return rejected;
         }
 
-        let head_ref = self.live_head_ref(pr, repo_dir);
-        let pr_base_branch = self.live_base_branch(pr, repo_dir).ok();
-        let default_branch = self.repository_default_branch(repo_dir);
+        let branch_metadata = match merge_branch_metadata(
+            self.live_head_ref(pr, repo_dir),
+            self.live_base_branch(pr, repo_dir).ok(),
+            self.repository_default_branch(repo_dir),
+        ) {
+            Ok(metadata) => metadata,
+            Err(result) => return result,
+        };
         let result = self.run_gh(
             &merge_command_args(
                 &pr_str,
                 &ctx.expected_head_sha,
-                head_ref.as_deref(),
+                &branch_metadata.head_ref,
                 [
-                    Some(&self.base_branch),
-                    Some(&self.self_update_branch),
-                    pr_base_branch.as_deref(),
-                    default_branch.as_deref(),
+                    &self.base_branch,
+                    &self.self_update_branch,
+                    &branch_metadata.pr_base_branch,
+                    &branch_metadata.default_branch,
                 ],
             ),
             repo_dir,
@@ -1348,13 +1382,8 @@ mod tests {
             merge_command_args(
                 "42",
                 "approved-sha",
-                Some("daemon/worker-t1"),
-                [
-                    Some("configured-base"),
-                    Some("self-update"),
-                    Some("pr-base"),
-                    Some("default"),
-                ],
+                "daemon/worker-t1",
+                ["configured-base", "self-update", "pr-base", "default"],
             ),
             vec![
                 "pr",
@@ -1380,13 +1409,8 @@ mod tests {
                 merge_command_args(
                     "42",
                     "approved-sha",
-                    Some(protected_head),
-                    [
-                        Some("configured-base"),
-                        Some("self-update"),
-                        Some("pr-base"),
-                        Some("default"),
-                    ],
+                    protected_head,
+                    ["configured-base", "self-update", "pr-base", "default"],
                 ),
                 vec![
                     "pr",
@@ -1402,28 +1426,34 @@ mod tests {
     }
 
     #[test]
-    fn production_merge_command_retains_head_when_branch_lookup_fails() {
-        assert_eq!(
-            merge_command_args(
-                "42",
-                "approved-sha",
+    fn branch_metadata_lookup_failures_block_merge_before_mutation() {
+        for (head_ref, pr_base_branch, default_branch, missing) in [
+            (
                 None,
-                [
-                    Some("base"),
-                    Some("self-update"),
-                    Some("pr-base"),
-                    Some("default")
-                ],
+                Some("pr-base".into()),
+                Some("default".into()),
+                "PR head branch",
             ),
-            vec![
-                "pr",
-                "merge",
-                "42",
-                "--merge",
-                "--match-head-commit",
-                "approved-sha"
-            ],
-        );
+            (
+                Some("head".into()),
+                None,
+                Some("default".into()),
+                "PR base branch",
+            ),
+            (
+                Some("head".into()),
+                Some("pr-base".into()),
+                None,
+                "repository default branch",
+            ),
+        ] {
+            let result = merge_branch_metadata(head_ref, pr_base_branch, default_branch)
+                .expect_err("missing branch metadata must block the merge");
+            assert!(!result.success);
+            assert_eq!(result.failure_kind, Some(MergeFailureKind::PolicyBlocked));
+            assert!(result.message.contains(missing));
+            assert!(result.message.contains("merge not attempted"));
+        }
     }
 
     #[test]
