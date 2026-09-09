@@ -170,6 +170,8 @@ elif [ "$cmd" = "pr view" ]; then
   printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"%s","state":"OPEN"}\n' "$branch" "$sha" "$QUORUM_TEST_GH_BASE"
 elif [ "$cmd" = "pr review" ] || [ "$cmd" = "pr merge" ]; then
   exit 0
+elif [ "$cmd" = "repo view" ]; then
+  printf '{"defaultBranchRef":{"name":"main"}}\n'
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
