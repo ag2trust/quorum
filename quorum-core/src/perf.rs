@@ -6934,6 +6934,7 @@ mod tests {
         const PR: i64 = 526;
         const ORIGINAL_HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         const RECOVERY_HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const RECOVERY_MERGE: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
         let source = seed_task(&mut c, "decomposed", None, 0, None, 1, 10);
         let original = seed_task(&mut c, "failed", None, 0, None, 2, 20);
@@ -6947,14 +6948,19 @@ mod tests {
         )
         .unwrap();
 
-        // This recovery intentionally has no top-level merge_commit_sha. The
-        // durable explicit-adoption ledger, written below by the lifecycle,
-        // is the only recovery merge witness the facts reader may use.
+        // Explicit adoption requires the daemon-recorded merge commit. Remove
+        // it after adoption so the durable adoption ledger remains the only
+        // recovery merge witness available to the facts reader.
         let recovery = seed_task(&mut c, "done", None, 0, None, 9, 40);
         set_refs(
             &c,
             recovery,
-            &serde_json::json!({ "pr": PR, "source_task": original }).to_string(),
+            &serde_json::json!({
+                "pr": PR,
+                "source_task": original,
+                "merge_commit_sha": RECOVERY_MERGE
+            })
+            .to_string(),
         );
         c.execute(
             "UPDATE tasks SET completion_provenance=?2,continue_pr=?3 WHERE id=?1",
@@ -7021,6 +7027,11 @@ mod tests {
             },
         )
         .unwrap());
+        c.execute(
+            "UPDATE tasks SET refs=json_remove(refs,'$.merge_commit_sha') WHERE id IN (?1,?2)",
+            rusqlite::params![original, recovery],
+        )
+        .unwrap();
         let completion: (String, i64, String, Option<String>) = c
             .query_row(
                 "SELECT d.state,d.active,t.status,t.completion_provenance

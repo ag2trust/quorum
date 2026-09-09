@@ -429,6 +429,7 @@ mod tests {
     use serde_json::json;
 
     const RECOVERY_HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const RECOVERY_MERGE: &str = "cccccccccccccccccccccccccccccccccccccccc";
     const PR: i64 = 526;
     const NOW: i64 = 50;
     const LIVE_UNTIL: i64 = 4_000_000_000;
@@ -456,7 +457,7 @@ mod tests {
                    (307,'failed child','failed','owner',1,1,
                     '{\"pr\":526,\"daemon_parked\":true,\"daemon_parked_reason\":\"publication failed\",\"daemon_resume_status\":\"rework\",\"daemon_publication\":{\"pr\":526}}',NULL),
                    (320,'merged continuation','done','owner',9,40,
-                    '{\"pr\":526,\"source_task\":307}',NULL);
+                    '{\"pr\":526,\"source_task\":307,\"merge_commit_sha\":\"cccccccccccccccccccccccccccccccccccccccc\"}',NULL);
 
                  INSERT INTO task_decompositions(
                      id,source_task_id,state,active,freeze_active,planned_source_revision,
@@ -530,6 +531,15 @@ mod tests {
         assert_eq!(fixture.status(307), "done", "#307 must adopt #320");
         assert_eq!(fixture.status(299), "done", "#299 aggregate must finish");
         assert_eq!(graph, ("completed".into(), 0));
+        let refs: String = conn
+            .query_row("SELECT refs FROM tasks WHERE id=307", [], |row| row.get(0))
+            .unwrap();
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        assert_eq!(
+            refs[quorum_core::tasks::MERGE_COMMIT_SHA_REF],
+            RECOVERY_MERGE
+        );
+        assert_eq!(refs["recovery_delivery"]["merged_head_sha"], RECOVERY_HEAD);
 
         drop(conn);
         let mut conn = quorum_core::db::open(&fixture.db_path).unwrap();

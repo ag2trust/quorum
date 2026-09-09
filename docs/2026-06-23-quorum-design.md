@@ -2520,10 +2520,22 @@ including while sibling children remain pending, or for the failed child named b
 `generated-child-failed` block while siblings remain. The automatic path's immediate transaction requires the same repository and PR,
 creator-selected `continue_pr`, explicit `source_task` provenance, live daemon publication and
 merge events (`expires_at > now`), immutable managed-review authority, and one consistent PR
-target/approved head SHA. It changes only the failed child and records recovery provenance while
-preserving the PR; on a blocked graph it leaves the graph blocked and active. Missing or expired
-evidence, replay, and losing concurrent callers are clean no-ops with no events; the winner emits
-bounded child-completion events once.
+target/approved head SHA. Its final assigned worker must be `completed` before the final target
+resolves, `merged`, or a graceful cleanup with the same durable handoff rule used by explicit
+adoption: `submitted` requires a live `task_in_review` event naming that worker within its run and
+at or before target resolution; `awaiting_merge` additionally requires the later live
+`task_merging` event within that run. Both adoption paths also require the recovery task's durable
+top-level `refs.merge_commit_sha` to be a non-empty, NUL-free 40- or 64-hex Git SHA, then atomically
+project that exact SHA to the adopted child's top-level `refs.merge_commit_sha`. Recovery provenance
+retains the approved PR head separately and never substitutes it for the merge commit. Ordinary
+adoption changes only the failed child and records recovery provenance while preserving the PR; on a
+blocked graph it
+leaves the graph blocked and active.
+For a pre-provenance adoption that is already `done`, an explicit rerun may repair only a missing
+top-level SHA after revalidating the exact stored recovery-task, PR, and approved-head pair; it
+does not overwrite recovery provenance or emit another child/graph lifecycle transition.
+Missing or expired evidence, replay, and losing concurrent callers are clean no-ops with no
+events; the winner emits bounded child-completion events once.
 
 For a coordinator/operator-selected incident pair, `quorum decomposition-adopt-recovery
 --original-child-id <child> --recovery-task-id <continuation> --by <operator>` is the sole explicit
@@ -2534,9 +2546,11 @@ and exact target/head agreement. It permits absent `source_task` metadata becaus
 named the exact pair, but rejects conflicting metadata; normal `--continue-pr` creation stamps the
 failed child's source provenance when that exact relationship is already known. Instead of expiring feed events it requires
 the durable daemon chain: the final assigned worker run is either `completed` before the persisted
-final PR target or `merged` (which may end after that target resolves), an assigned approved
-reviewer bound to that exact target head and sampling decision, and merged
-completion provenance. Success writes the operator, source, child, recovery task, PR, and head to
+final PR target, `merged` (which may end after that target resolves), `submitted` with a
+`task_in_review` event naming that worker within its run and at or before target resolution, or
+`awaiting_merge` with that exact handoff plus its later `task_merging` event within the run. An
+assigned approved reviewer bound to that exact target head and sampling decision, and merged
+completion provenance, close the chain. Success writes the operator, source, child, recovery task, PR, and head to
 the decomposition recovery ledger and child recovery projection before final-child completion. On
 an active graph this is ordinary completion. On a blocked graph a `boundary-violation` hold is
 eligible only when its JSON `affected_task` exactly equals the named failed child; the same

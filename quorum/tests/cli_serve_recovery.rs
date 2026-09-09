@@ -943,7 +943,7 @@ impl TestEnv {
         conn.execute_batch(
             "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at,refs,continue_pr)
              VALUES (320,'merged continuation','done','owner',9,40,
-                     '{\"pr\":526,\"source_task\":307}',526);
+                     '{\"pr\":526,\"source_task\":307,\"merge_commit_sha\":\"cccccccccccccccccccccccccccccccccccccccc\"}',526);
              INSERT INTO pr_targets(task_id,pr_number,head_ref,head_sha,is_fork,resolved_at)
              VALUES (320,526,'daemon/original','bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',0,25);
 
