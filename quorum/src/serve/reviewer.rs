@@ -787,14 +787,14 @@ mod tests {
             "completion instructions must not add a routine note step: {completion}"
         );
 
-        let lower = turn.to_ascii_lowercase();
+        let lower = completion.to_ascii_lowercase();
         let commit = lower
             .find("commit")
             .expect("worker prompt must require a commit");
-        let verification = turn
+        let verification = completion
             .find("Run the verification prescribed")
             .expect("worker prompt must require verification");
-        let submit = turn
+        let submit = completion
             .find("quorum submit")
             .expect("worker prompt must require completion signaling");
         assert!(
