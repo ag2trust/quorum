@@ -3,8 +3,8 @@
 use super::review_cycle_context::ReviewCycleContext;
 use super::review_ledger;
 use super::reviewer::{
-    graph_review_contract, COMPLETE_REVIEW_CONTRACT, REVIEWER_VERIFICATION_BOUNDARY,
-    REVIEW_FINDING_CONTRACT, VERDICT_RESIGNAL_CONTRACT,
+    graph_review_contract, review_delivery_contract, COMPLETE_REVIEW_CONTRACT,
+    REVIEW_FINDING_CONTRACT,
 };
 
 /// Context shared by sticky re-review turns and replacement reviewer prompts.
@@ -47,48 +47,24 @@ pub fn build_rereview_turn_with_context(
         "The author ({worker}) pushed rework for PR #{pr}. Re-review the updated diff.\n\n\
          Verify the branch actually advanced (new commits since prior review) — approving \
          an unchanged diff over prior blocking findings is forbidden.\n\n\
-         Invoke the builtin `review` skill (via the Skill tool) at effort level {effort} \
-         for the review methodology. If the builtin skill is unavailable, read the full \
-         PR diff and surrounding code and check the repo CLAUDE.md invariants.\n\n\
+         Invoke the builtin `review` skill (via the Skill tool) at effort level {effort}. If it \
+         is unavailable, read the full current PR diff and surrounding code and check repo \
+         CLAUDE.md invariants.\n\n\
          Verify prior fixes by reading the prior review thread on the PR. Then re-audit the \
-         full current diff and relevant sibling paths; do not narrowly inspect only the last \
+         current diff and relevant sibling paths; do not narrowly inspect only the last \
          remediation commit.\n\n\
          {review_round_contract}\n\
          {complete_review_contract}\n\
          {finding_contract}\n\
-         The PR is the source of truth for this review:\n\
-         - Read the prior review thread on the PR. For each earlier finding, resolve it on \
-         the PR — mark it fixed, downgrade it, or reaffirm it — so a later reader can \
-         determine fixed / accepted / overridden / unaddressed outcomes. Do not silently \
-         drop a prior blocker.\n\
-         - Post new findings to the PR (inline where a specific file/line is involved, \
-         summary comment for cross-cutting findings) and reply to author pushback there.\n\
-         - Encouraged GitHub operations: normal PR comments, inline comments, and review summary \
-         comments.\n\
-         - Forbidden GitHub operations: formal `gh pr review --approve`, `gh pr review \
-         --request-changes`, and `gh pr merge` — the daemon posts the formal review from \
-         your verdict as the merge account and owns merge.\n\n\
-         {verification_boundary}\n\
-         Review contract (#206 — the verdict MUST match your own findings):\n\
-         - Zero blocking findings: run: quorum submit --agent {name} --pr {pr} \
-         --verdict approved --blocking 0\n\
-         - One or more blocking findings: write a short blocker summary to a temp file, then \
-         run: quorum submit --agent {name} --pr {pr} --verdict changes --blocking <count> \
-         --feedback-file <path>\n\
-         - The feedback file is a lifecycle-signal summary; the authoritative \
-         findings must already be on the PR.\n\n\
-         Do NOT merge the PR yourself — the daemon handles merging.\n\
-         Do NOT run `gh pr review --approve` — the daemon posts the formal GitHub \
-         approval as the merge account after your verdict.\n\
-         Do NOT mark the task done yourself — the daemon handles task lifecycle.\n\n\
-         {verdict_resignal}{graph_contract}",
-        verdict_resignal = VERDICT_RESIGNAL_CONTRACT,
+         - For each earlier finding, update the PR record as fixed, downgraded, or reaffirmed \
+         so a later reader can determine fixed / accepted / overridden / unaddressed outcomes. \
+         Do not silently drop a prior blocker.\n\
+        {delivery_contract}{graph_contract}",
         worker = worker_agent,
-        name = reviewer_name,
         pr = pr,
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
         finding_contract = REVIEW_FINDING_CONTRACT,
-        verification_boundary = REVIEWER_VERIFICATION_BOUNDARY,
+        delivery_contract = review_delivery_contract(reviewer_name, pr),
         graph_contract = graph_review_contract(reviewer_name, pr, graph_context),
         review_round_contract = review_round_contract(pr, review_cycle),
     ))
