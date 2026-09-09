@@ -54,6 +54,12 @@ accepted task
   → daemon-controlled approval and merge
 ```
 
+Configured branch synchronization is the narrow daemon-internal carve-out: it
+deterministically carries commits between owner-selected branch pairs and does
+not create a task on the clean path. A task is created only when a merge
+conflict or CI failure requires judgment; the daemon remains the sole owner of
+the clean synchronization workflow.
+
 This boundary is intentional. Quorum is **not** a general-purpose agent orchestrator,
 model gateway, arbitrary workflow engine, or agent-provider plugin host. The task,
 worktree, PR, review, rework, CI, and merge lifecycle is the product. A coding CLI is
@@ -444,6 +450,24 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   Unblocked and terminal tasks return the clean-negative exit 1.
 - `quorum task-list [--status <s>] [--label <l>] [--assignee <id>]` (read-filtered)
 - `quorum task-get --task-id <n>`
+
+### Branch sync
+- `quorum branch-sync --by <agent> --from <branch> --to <branch> [--repo owner/name]` →
+  `{id, phase}` (0) when the exact directed pair is configured in serve
+  `sync_pairs`; an unconfigured pair or identical source/target exits 2. One active row for
+  the pair exits 1 as a clean negative. `quorum sync` remains the agent-compass command;
+  branch synchronization always uses the spelled-out `branch-sync` name.
+- `branch_syncs` records the request and executor evidence: source/target branches and pinned
+  SHAs, temporary sync branch, merge SHA, PR, optional judgment task, requestor/error details,
+  and timestamps. `UNIQUE(source_branch, target_branch) WHERE active=1` is the durable
+  cross-process guard for a single live synchronization per directed pair.
+- Phases are `requested` → `pinned` → `prepared` → `published` → `checks` → `merging`, then
+  `done`; `noop`, `conflict`, `ci_failed`, `failed`, and `cancelled` are terminal alternatives.
+  Phase changes are guarded compare-and-set updates, so stale executors cannot overwrite newer
+  progress. Every terminal transition clears `active` in the same statement, releasing the
+  pair for a later request.
+- The daemon executes the clean path internally; no task is created merely to merge, publish,
+  wait for checks, or complete a no-op. Only `conflict` and `ci_failed` lead to a judgment task.
 
 ### Ops
 - `quorum status [--watch]` → read-only health snapshot. Alerts and critical messages are

@@ -81,6 +81,7 @@ primary = 100
 # no_bare_agent = true   # default: use operator's Claude login (no --bare)
 # allowed_tools = \"Bash,Read,Write,Edit,Grep,Glob\"
 # base_branch = \"main\" # task/PR base: worktrees, PRs, validation, and merges
+# sync_pairs = [[\"main\", \"develop\"], [\"develop\", \"main\"]] # disabled when omitted
 # self_update_branch = \"main\" # daemon update poll; defaults to resolved base_branch
 
 ## Grok Build settings for managed worker roles only.
@@ -162,6 +163,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::TaskUpdate { .. } => "task-update",
         cli::Command::TaskList { .. } => "task-list",
         cli::Command::TaskGet { .. } => "task-get",
+        cli::Command::BranchSync { .. } => "branch-sync",
         cli::Command::Post { .. } => "post",
         cli::Command::Read { .. } => "read",
         cli::Command::Log { .. } => "log",
@@ -644,6 +646,40 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             )?;
             output::emit(&serde_json::json!({ "id": id, "repo": resolved_repo }));
             Ok(0)
+        }
+        cli::Command::BranchSync { by, from, to, repo } => {
+            quorum_core::tasks::validate_target_branch(&from)?;
+            quorum_core::tasks::validate_target_branch(&to)?;
+            if from == to {
+                return Err(QuorumError::Usage(
+                    "branch-sync --from and --to must differ".into(),
+                ));
+            }
+            let resolved_repo = resolve_repo_override(repo.as_deref())?;
+            let configured = serve_config::branch_sync_pairs(&resolved_repo)?;
+            if !configured
+                .iter()
+                .any(|pair| pair[0] == from && pair[1] == to)
+            {
+                return Err(QuorumError::Usage(format!(
+                    "branch sync pair {from:?} -> {to:?} is not configured in sync_pairs"
+                )));
+            }
+            let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&resolved_repo)?)?;
+            match quorum_core::branch_sync::request(&mut conn, &from, &to, &by, now)? {
+                quorum_core::branch_sync::RequestOutcome::Requested(sync) => {
+                    output::emit(&serde_json::json!({ "id": sync.id, "phase": sync.phase }));
+                    Ok(0)
+                }
+                quorum_core::branch_sync::RequestOutcome::AlreadyActive(sync) => {
+                    output::emit(&serde_json::json!({
+                        "ok": false,
+                        "id": sync.id,
+                        "phase": sync.phase,
+                    }));
+                    Ok(1)
+                }
+            }
         }
         cli::Command::TaskUpdate {
             agent,

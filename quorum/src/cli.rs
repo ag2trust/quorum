@@ -154,6 +154,24 @@ pub enum Command {
         #[arg(long = "task-id")]
         task_id: i64,
     },
+    /// Enqueue one configured, daemon-internal branch synchronization. A
+    /// clean synchronization remains taskless; later daemon work handles it.
+    #[command(name = "branch-sync")]
+    BranchSync {
+        /// Identity recorded as the requestor.
+        #[arg(long)]
+        by: String,
+        /// Source branch whose commits will be synchronized.
+        #[arg(long)]
+        from: String,
+        /// Target branch to receive the source commits.
+        #[arg(long)]
+        to: String,
+        /// Target repo as owner/name (e.g. ag2trust/quorum). Routes to that
+        /// repo's DB and serve configuration instead of cwd/env.
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Post a message to the feed. Body (free text) via --body-stdin or --body-file.
     /// `--to <agent>` marks it as a direct message to that agent; omitted = broadcast.
     Post {

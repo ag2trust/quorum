@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 73). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 76). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -129,6 +129,38 @@ CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC)
 -- REVIEWING_TASK_LIMIT-sized candidate sets are merged for global ordering.
 CREATE INDEX IF NOT EXISTS tasks_reviewing_newest
     ON tasks(status, updated_at DESC, id DESC);
+
+-- v76: daemon-internal branch synchronization. A clean synchronization never
+-- creates a task; task_id is reserved only for the later judgment-required
+-- conflict/CI paths. The explicit active sentinel makes the partial unique
+-- index the cross-process authority for one live synchronization per directed
+-- pair.
+CREATE TABLE IF NOT EXISTS branch_syncs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_branch TEXT NOT NULL,
+    target_branch TEXT NOT NULL,
+    source_sha    TEXT,
+    target_sha    TEXT,
+    sync_branch   TEXT,
+    merge_sha     TEXT,
+    pr            INTEGER,
+    phase         TEXT NOT NULL CHECK(phase IN (
+                      'requested','pinned','prepared','published','checks',
+                      'merging','done','noop','conflict','ci_failed','failed',
+                      'cancelled')),
+    task_id       INTEGER REFERENCES tasks(id),
+    active        INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)),
+    requested_by  TEXT NOT NULL,
+    last_error    TEXT,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS branch_syncs_one_active_pair
+    ON branch_syncs(source_branch, target_branch) WHERE active = 1;
+-- Keep the sweep-on-write durable-task guard index-bounded when a conflict or
+-- CI-failure path has attached a judgment task.
+CREATE INDEX IF NOT EXISTS branch_syncs_task_id
+    ON branch_syncs(task_id) WHERE task_id IS NOT NULL;
 -- v36: durable candidate representation for corrupt terminal retry authority.
 -- These partial indexes contain only rows reconciliation/status need to inspect,
 -- so proving the healthy steady state does not scan the unbounded terminal task

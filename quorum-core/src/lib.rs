@@ -8,6 +8,7 @@ pub mod activity;
 pub mod agent_runs;
 pub mod agents;
 pub mod approvals;
+pub mod branch_sync;
 pub mod branches;
 pub mod capabilities;
 pub mod claims;

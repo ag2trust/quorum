@@ -323,6 +323,10 @@ fn delete_orphaned_task_rows_bounded(conn: &Connection, limit: usize) -> Result<
 /// review-follow-up history. Add here whenever a new durable FK to tasks(id) is
 /// introduced; the FK inventory test below fails when a new one is missed.
 const DURABLE_TASK_REF_TABLES: &[(&str, &str)] = &[
+    // A clean branch sync has no task. When judgment is required, retain both
+    // the task and the durable sync provenance rather than severing the link
+    // during task GC.
+    ("branch_syncs", "task_id"),
     ("cancelled_dependency_reconciliation", "cancelled_task_id"),
     ("task_decompositions", "source_task_id"),
     ("task_graph_members", "task_id"),
@@ -2665,6 +2669,16 @@ mod tests {
         fn decomp(c: &Connection, t: i64) {
             insert_decomposition(c, t);
         }
+        fn branch_sync(c: &Connection, t: i64) {
+            c.execute(
+                "INSERT INTO branch_syncs(
+                     source_branch, target_branch, phase, task_id, requested_by,
+                     created_at, updated_at
+                 ) VALUES ('main', 'develop', 'conflict', ?1, 'owner', 1, 1)",
+                [t],
+            )
+            .unwrap();
+        }
         fn graph_member(c: &Connection, t: i64) {
             let source_id: i64 = c
                 .query_row(
@@ -2766,6 +2780,10 @@ mod tests {
             .unwrap();
         }
         let cases = [
+            Case {
+                label: "branch_syncs.task_id",
+                plant: branch_sync,
+            },
             Case {
                 label: "task_decompositions.source_task_id",
                 plant: decomp,
