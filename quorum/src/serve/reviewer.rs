@@ -599,6 +599,14 @@ const WORKING_STYLE: &str =
      austerity degrade quality or completeness — run the verification the task requires, \
      and do not skip a real check to save tokens.";
 
+/// Task notes are exceptional diagnostics, not a normal completion record. Completion,
+/// PR discussion, and reactions already carry the usual durable evidence.
+const EXCEPTIONAL_NOTE_GUIDANCE: &str =
+    "Do not post routine status/progress notes. A task note is only for unexpected durable \
+     diagnostics absent from the submission, PR, or reaction, and must be written before \
+     submitting or reacting. Put blocked/failed/needs-info reasons in `react`; remediation \
+     evidence belongs on the PR.";
+
 /// Build the raw worker prompt (no runner-specific wrapping).
 pub fn build_worker_prompt(
     agent_name: &str,
@@ -610,17 +618,20 @@ pub fn build_worker_prompt(
     format!(
         "You are agent {agent}. Task #{task_id}: {title}\n\n\
          {body}\n\n\
-         {working_style}{budget}\n\n\
+         {working_style}\n\n\
+         {note_guidance}{budget}\n\n\
          When your work is complete:\n\
          1. Commit your work. Do NOT push or open a PR; the daemon publishes and verifies it.\n\
-         2. Signal completion: quorum submit --agent {agent}\n\
-         3. Post progress notes by writing text to a temp file, then: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
+         2. Run the verification prescribed by the target repository's checked-in instructions \
+         and applicable CI/delivery contract; do not invent unavailable scripts or checks.\n\
+         3. Signal completion: quorum submit --agent {agent}\n\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
         agent = agent_name,
         task_id = task_id,
         title = title,
         body = body,
         working_style = WORKING_STYLE,
+        note_guidance = EXCEPTIONAL_NOTE_GUIDANCE,
         budget = budget_line(0.0, max_task_cost_usd),
     )
 }
@@ -644,7 +655,7 @@ pub fn build_worker_turn(
 
 pub fn build_rework_prompt(
     agent_name: &str,
-    task_id: i64,
+    _task_id: i64,
     pr: i64,
     feedback: &str,
     spent_usd: f64,
@@ -667,16 +678,16 @@ pub fn build_rework_prompt(
          merge it into the PR branch. Never rebase, reset away, squash-rebuild, or otherwise \
          replace the published PR head; it must remain an ancestor of your final commit.\n\n\
          Fix directly in this session — do not spawn subagents for rework.{budget}\n\n\
+         {note_guidance}\n\n\
          After fixing and committing (do not push):\n\
          1. Run the verification prescribed by the target repository's checked-in instructions \
          and applicable CI/delivery contract; do not invent unavailable scripts or checks.\n\
-         2. Re-signal completion with your PR number: quorum submit --agent {agent} --pr {pr}\n\
-         3. Post progress via: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
+         2. Re-signal completion with your PR number: quorum submit --agent {agent} --pr {pr}\n\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
         feedback = feedback,
         agent = agent_name,
         pr = pr,
-        task_id = task_id,
+        note_guidance = EXCEPTIONAL_NOTE_GUIDANCE,
         budget = budget_line(spent_usd, max_task_cost_usd),
     )
 }
@@ -731,19 +742,23 @@ pub fn build_remediation_turn(
          - The final PR history must let a later reader determine, for each finding, whether \
          it was fixed, accepted, overridden with evidence, or unaddressed.\n\n\
          Fix directly in this session — do not spawn subagents for rework.{budget}\n\n\
+         {note_guidance}\n\n\
          After fixing and committing (do not push):\n\
          1. Run the verification prescribed by the target repository's checked-in instructions \
          and applicable CI/delivery contract; do not invent unavailable scripts or checks.\n\
-         2. Signal completion with the existing PR: quorum submit --agent {agent} --pr {pr}\n\
-         3. Post progress: quorum task-update --task-id {task_id} --agent {agent} --note-file <path>\n\n\
+         2. Signal completion with the existing PR: quorum submit --agent {agent} --pr {pr}\n\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
         agent = agent_name,
         pr = pr,
         local_branch = remediation_branch(agent_name, task_id),
-        body = if task_body.is_empty() { "(no task body)" } else { task_body },
+        body = if task_body.is_empty() {
+            "(no task body)"
+        } else {
+            task_body
+        },
         feedback = feedback,
         continuation_context = continuation_context.unwrap_or_default(),
-        task_id = task_id,
+        note_guidance = EXCEPTIONAL_NOTE_GUIDANCE,
         budget = budget_line(0.0, max_task_cost_usd),
     )
 }
@@ -751,6 +766,42 @@ pub fn build_remediation_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_exception_only_note_guidance_and_completion_order(turn: &str) {
+        assert!(
+            turn.contains(EXCEPTIONAL_NOTE_GUIDANCE),
+            "worker prompt must carry the shared exception-only note guidance: {turn}"
+        );
+        assert!(
+            !turn.contains("Post progress"),
+            "worker prompt must not require a routine progress note: {turn}"
+        );
+
+        let completion_start = turn
+            .find("When your work is complete:")
+            .or_else(|| turn.find("After fixing and committing"))
+            .expect("worker prompt must contain completion instructions");
+        let completion = &turn[completion_start..];
+        assert!(
+            !completion.contains("note") && !completion.contains("task-update"),
+            "completion instructions must not add a routine note step: {completion}"
+        );
+
+        let lower = turn.to_ascii_lowercase();
+        let commit = lower
+            .find("commit")
+            .expect("worker prompt must require a commit");
+        let verification = turn
+            .find("Run the verification prescribed")
+            .expect("worker prompt must require verification");
+        let submit = turn
+            .find("quorum submit")
+            .expect("worker prompt must require completion signaling");
+        assert!(
+            commit < verification && verification < submit,
+            "worker prompt must require commit and verification before submission: {turn}"
+        );
+    }
 
     #[test]
     fn task_review_contract_carries_bounded_authoritative_fields() {
@@ -1319,10 +1370,6 @@ mod tests {
             "rework template must instruct agent to re-signal done with PR number"
         );
         assert!(
-            turn.contains("quorum task-update --task-id 42 --agent W-1 --note-file"),
-            "rework template must instruct agent to post progress notes"
-        );
-        assert!(
             turn.contains("Do NOT mark the task done yourself"),
             "rework template must warn against manual task-done"
         );
@@ -1638,13 +1685,22 @@ mod tests {
             "worker template must instruct agent to signal completion"
         );
         assert!(
-            turn.contains("quorum task-update --task-id 42 --agent W-1 --note-file"),
-            "worker template must instruct agent to post progress notes"
-        );
-        assert!(
             turn.contains("Do NOT mark the task done yourself"),
             "worker template must warn against manual task-done"
         );
+    }
+
+    #[test]
+    fn managed_worker_turns_make_notes_exception_only() {
+        let turns = [
+            build_worker_turn("W-1", 42, "title", "body", None),
+            build_rework_turn("W-1", 42, 99, "fix it", 0.0, None),
+            build_remediation_turn("W-1", 42, 99, "fix it", "body", None, None),
+        ];
+
+        for turn in turns {
+            assert_exception_only_note_guidance_and_completion_order(&turn);
+        }
     }
 
     /// Extracts every `quorum <subcommand> --<flag>` from all turn-template
