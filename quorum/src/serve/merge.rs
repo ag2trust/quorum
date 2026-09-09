@@ -450,13 +450,16 @@ pub fn parse_default_branch_ci(json: &str) -> DefaultBranchStatus {
 }
 
 /// Production executor: posts a formal GitHub approval review, then runs
-/// `gh pr merge <pr> --merge --delete-branch`. If `token_file` is set,
+/// `gh pr merge <pr> --merge`, deleting only non-protected head branches. If `token_file` is set,
 /// reads the token at call time and passes it via `GH_TOKEN` env var.
 /// The token is never exposed to agent processes.
 pub struct GhMergeExecutor {
     pub token_file: Option<std::path::PathBuf>,
     /// `owner/repo` slug for `-R` flag — avoids cwd git dependency.
     pub gh_repo: Option<String>,
+    /// Long-lived daemon branches that must never be deleted after a merge.
+    pub base_branch: String,
+    pub self_update_branch: String,
 }
 
 impl GhMergeExecutor {
@@ -551,6 +554,26 @@ impl GhMergeExecutor {
         }
         parse_pr_head_sha(&output.stdout)
             .ok_or_else(|| "gh pr view returned no headRefOid".to_string())
+    }
+
+    fn live_head_ref(&self, pr: i64, repo_dir: &Path) -> Option<String> {
+        let pr_str = pr.to_string();
+        let mut cmd =
+            self.build_gh_cmd(&["pr", "view", &pr_str, "--json", "headRefName"], repo_dir);
+        let output = cmd.output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_pr_head_ref(&output.stdout)
+    }
+
+    fn repository_default_branch(&self, repo_dir: &Path) -> Option<String> {
+        let mut cmd = self.build_gh_cmd(&["repo", "view", "--json", "defaultBranchRef"], repo_dir);
+        let output = cmd.output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_repository_default_branch(&output.stdout)
     }
 
     fn reject_base_drift(
@@ -714,16 +737,47 @@ fn parse_pr_head_sha(output: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn merge_command_args<'a>(pr: &'a str, expected_head_sha: &'a str) -> [&'a str; 7] {
-    [
-        "pr",
-        "merge",
-        pr,
-        "--merge",
-        "--delete-branch",
-        "--match-head-commit",
-        expected_head_sha,
-    ]
+fn parse_pr_head_ref(output: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(output)
+        .ok()?
+        .get("headRefName")?
+        .as_str()
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned)
+}
+
+fn parse_repository_default_branch(output: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(output)
+        .ok()?
+        .get("defaultBranchRef")?
+        .get("name")?
+        .as_str()
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned)
+}
+
+fn merge_command_args<'a>(
+    pr: &'a str,
+    expected_head_sha: &'a str,
+    head_ref: Option<&str>,
+    protected_branches: [Option<&str>; 4],
+) -> Vec<&'a str> {
+    // A failed branch lookup must retain the branch rather than risk deleting
+    // a protected one. Branch cleanup is optional; a merge is not.
+    let delete_branch = head_ref.is_some_and(|head_ref| {
+        protected_branches.iter().all(|branch| branch.is_some())
+            && protected_branches
+                .iter()
+                .flatten()
+                .all(|protected| head_ref != *protected)
+    });
+
+    let mut args = vec!["pr", "merge", pr, "--merge"];
+    if delete_branch {
+        args.push("--delete-branch");
+    }
+    args.extend(["--match-head-commit", expected_head_sha]);
+    args
 }
 
 /// Return true iff the `reviews` array (from `gh pr view --json reviews`)
@@ -880,8 +934,21 @@ impl MergeExecutor for GhMergeExecutor {
             return rejected;
         }
 
+        let head_ref = self.live_head_ref(pr, repo_dir);
+        let pr_base_branch = self.live_base_branch(pr, repo_dir).ok();
+        let default_branch = self.repository_default_branch(repo_dir);
         let result = self.run_gh(
-            &merge_command_args(&pr_str, &ctx.expected_head_sha),
+            &merge_command_args(
+                &pr_str,
+                &ctx.expected_head_sha,
+                head_ref.as_deref(),
+                [
+                    Some(&self.base_branch),
+                    Some(&self.self_update_branch),
+                    pr_base_branch.as_deref(),
+                    default_branch.as_deref(),
+                ],
+            ),
             repo_dir,
         );
 
@@ -1276,10 +1343,20 @@ mod tests {
     }
 
     #[test]
-    fn production_merge_command_pins_the_approved_head() {
+    fn production_merge_command_deletes_unprotected_daemon_head() {
         assert_eq!(
-            merge_command_args("42", "approved-sha"),
-            [
+            merge_command_args(
+                "42",
+                "approved-sha",
+                Some("daemon/worker-t1"),
+                [
+                    Some("configured-base"),
+                    Some("self-update"),
+                    Some("pr-base"),
+                    Some("default"),
+                ],
+            ),
+            vec![
                 "pr",
                 "merge",
                 "42",
@@ -1288,6 +1365,64 @@ mod tests {
                 "--match-head-commit",
                 "approved-sha",
             ]
+        );
+    }
+
+    #[test]
+    fn production_merge_command_retains_protected_heads() {
+        for (protected_head, label) in [
+            ("configured-base", "configured base branch"),
+            ("self-update", "self-update branch"),
+            ("pr-base", "PR base branch"),
+            ("default", "repository default branch"),
+        ] {
+            assert_eq!(
+                merge_command_args(
+                    "42",
+                    "approved-sha",
+                    Some(protected_head),
+                    [
+                        Some("configured-base"),
+                        Some("self-update"),
+                        Some("pr-base"),
+                        Some("default"),
+                    ],
+                ),
+                vec![
+                    "pr",
+                    "merge",
+                    "42",
+                    "--merge",
+                    "--match-head-commit",
+                    "approved-sha"
+                ],
+                "{label} must not be deleted",
+            );
+        }
+    }
+
+    #[test]
+    fn production_merge_command_retains_head_when_branch_lookup_fails() {
+        assert_eq!(
+            merge_command_args(
+                "42",
+                "approved-sha",
+                None,
+                [
+                    Some("base"),
+                    Some("self-update"),
+                    Some("pr-base"),
+                    Some("default")
+                ],
+            ),
+            vec![
+                "pr",
+                "merge",
+                "42",
+                "--merge",
+                "--match-head-commit",
+                "approved-sha"
+            ],
         );
     }
 
@@ -1410,6 +1545,8 @@ mod tests {
         let exec = GhMergeExecutor {
             token_file: Some(std::path::PathBuf::from("/nonexistent/token")),
             gh_repo: None,
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
         };
         let result = exec.merge(1, Path::new("/tmp"), &ctx);
         assert!(!result.success);
@@ -1874,6 +2011,8 @@ mod tests {
         let exec = GhMergeExecutor {
             token_file: Some(std::path::PathBuf::from("/nonexistent/path/token")),
             gh_repo: None,
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
         };
         assert!(exec.read_token().is_none());
     }
@@ -1886,6 +2025,8 @@ mod tests {
         let exec = GhMergeExecutor {
             token_file: Some(token_path),
             gh_repo: None,
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
         };
         assert_eq!(exec.read_token().unwrap(), "my-secret-token");
     }
@@ -1895,6 +2036,8 @@ mod tests {
         let exec = GhMergeExecutor {
             token_file: None,
             gh_repo: None,
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
         };
         assert!(exec.read_token().is_none());
     }
