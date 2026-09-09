@@ -679,10 +679,11 @@ pub fn build_rework_prompt(
          replace the published PR head; it must remain an ancestor of your final commit.\n\n\
          Fix directly in this session — do not spawn subagents for rework.{budget}\n\n\
          {note_guidance}\n\n\
-         After fixing and committing (do not push):\n\
-         1. Run the verification prescribed by the target repository's checked-in instructions \
+         After fixing:\n\
+         1. Commit your work. Do NOT push or open a PR; the daemon publishes and verifies it.\n\
+         2. Run the verification prescribed by the target repository's checked-in instructions \
          and applicable CI/delivery contract; do not invent unavailable scripts or checks.\n\
-         2. Re-signal completion with your PR number: quorum submit --agent {agent} --pr {pr}\n\n\
+         3. Re-signal completion with your PR number: quorum submit --agent {agent} --pr {pr}\n\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
         feedback = feedback,
         agent = agent_name,
@@ -743,10 +744,11 @@ pub fn build_remediation_turn(
          it was fixed, accepted, overridden with evidence, or unaddressed.\n\n\
          Fix directly in this session — do not spawn subagents for rework.{budget}\n\n\
          {note_guidance}\n\n\
-         After fixing and committing (do not push):\n\
-         1. Run the verification prescribed by the target repository's checked-in instructions \
+         After fixing:\n\
+         1. Commit your work. Do NOT push or open a PR; the daemon publishes and verifies it.\n\
+         2. Run the verification prescribed by the target repository's checked-in instructions \
          and applicable CI/delivery contract; do not invent unavailable scripts or checks.\n\
-         2. Signal completion with the existing PR: quorum submit --agent {agent} --pr {pr}\n\n\
+         3. Signal completion with the existing PR: quorum submit --agent {agent} --pr {pr}\n\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.",
         agent = agent_name,
         pr = pr,
@@ -779,7 +781,7 @@ mod tests {
 
         let completion_start = turn
             .find("When your work is complete:")
-            .or_else(|| turn.find("After fixing and committing"))
+            .or_else(|| turn.find("After fixing:"))
             .expect("worker prompt must contain completion instructions");
         let completion = &turn[completion_start..];
         assert!(
@@ -789,8 +791,8 @@ mod tests {
 
         let lower = completion.to_ascii_lowercase();
         let commit = lower
-            .find("commit")
-            .expect("worker prompt must require a commit");
+            .find("1. commit your work.")
+            .expect("completion instructions must require a numbered commit step");
         let verification = completion
             .find("Run the verification prescribed")
             .expect("worker prompt must require verification");
