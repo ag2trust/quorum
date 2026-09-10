@@ -49,10 +49,12 @@ pub async fn reconcile_one(config: &ServeConfig, worktrees: &WorktreeManager) ->
 }
 
 fn sync_branch(sync: &BranchSync) -> String {
-    format!(
-        "sync/{}-into-{}-{}",
-        sync.source_branch, sync.target_branch, sync.id
-    )
+    // The row ID is globally unique and durable, which makes it sufficient for
+    // restart reconciliation without concatenating owner-controlled branch
+    // names into a filesystem-backed ref component. Source/target remain in
+    // the row and PR title, while this name stays far below Git's component
+    // limit even when both configured branches are individually maximal.
+    format!("sync/{}", sync.id)
 }
 
 fn sync_worktree(config: &ServeConfig, sync: &BranchSync) -> std::path::PathBuf {
@@ -401,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_branch_cannot_match_task_branch_grammar() {
+    fn sync_branch_is_bounded_and_cannot_match_task_branch_grammar() {
         let row = BranchSync {
             id: 42,
             source_branch: "main".into(),
@@ -419,8 +421,24 @@ mod tests {
             created_at: 0,
             updated_at: 0,
         };
-        assert_eq!(sync_branch(&row), "sync/main-into-develop-42");
+        assert_eq!(sync_branch(&row), "sync/42");
         assert!(!sync_branch(&row).starts_with("daemon/"));
+
+        let long_row = BranchSync {
+            source_branch: "a".repeat(quorum_core::tasks::MAX_TARGET_BRANCH_BYTES),
+            target_branch: "b".repeat(quorum_core::tasks::MAX_TARGET_BRANCH_BYTES),
+            ..row
+        };
+        quorum_core::tasks::validate_target_branch(&long_row.source_branch).unwrap();
+        quorum_core::tasks::validate_target_branch(&long_row.target_branch).unwrap();
+        let branch = sync_branch(&long_row);
+        assert_eq!(branch, "sync/42");
+        assert!(branch.len() <= quorum_core::tasks::MAX_TARGET_BRANCH_BYTES);
+        let check = Command::new("git")
+            .args(["check-ref-format", "--branch", &branch])
+            .output()
+            .unwrap();
+        assert!(check.status.success());
     }
 
     fn git(dir: &Path, args: &[&str]) {
@@ -505,7 +523,7 @@ mod tests {
         std::fs::write(
             program,
             format!(
-                "#!/bin/sh\ncase \"$1 $2\" in\n  'pr list') echo '[]' ;;\n  'pr create') echo 'https://github.test/owner/repo/pull/42' ;;\n  'pr view') echo '{{\"headRefName\":\"sync/develop-into-main-1\",\"headRefOid\":\"{head}\",\"isCrossRepository\":false,\"baseRefName\":\"main\",\"state\":\"{state}\"}}' ;;\n  *) exit 2 ;;\nesac\n"
+                "#!/bin/sh\ncase \"$1 $2\" in\n  'pr list') echo '[]' ;;\n  'pr create') echo 'https://github.test/owner/repo/pull/42' ;;\n  'pr view') echo '{{\"headRefName\":\"sync/1\",\"headRefOid\":\"{head}\",\"isCrossRepository\":false,\"baseRefName\":\"main\",\"state\":\"{state}\"}}' ;;\n  *) exit 2 ;;\nesac\n"
             ),
         )
         .unwrap();

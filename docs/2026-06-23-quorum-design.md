@@ -463,8 +463,10 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   cross-process guard for a single live synchronization per directed pair.
 - Phases advance through the one-way clean path `requested` → `pinned` → `prepared` →
   `published` → `checks` → `merging` → `done`. The daemon fetches and pins both remote tips
-  before it allocates `sync/<from>-into-<to>-<id>` from the pinned target. It first proves a
-  no-op by ancestry; otherwise it runs an explicit `--no-ff` merge of the pinned source, records
+  before it allocates the bounded deterministic `sync/<id>` branch from the pinned target. The
+  source/target names remain in the durable row and PR title, so supported long branch names
+  never overflow a filesystem-backed Git ref component. It first proves a no-op by ancestry;
+  otherwise it runs an explicit `--no-ff` merge of the pinned source, records
   the resulting merge SHA, pushes only that new branch, and creates the PR against the pinned
   target branch. A restart reuses those pins: `pinned` rebuilds only from the stored SHAs,
   `prepared` rechecks the local tip before publishing, and `published` verifies the live open PR
