@@ -472,13 +472,16 @@ pub fn parse_default_branch_ci(json: &str) -> DefaultBranchStatus {
 }
 
 /// Production executor: posts a formal GitHub approval review, then runs
-/// `gh pr merge <pr> --merge --delete-branch`. If `token_file` is set,
+/// `gh pr merge <pr> --merge`, deleting only non-protected head branches. If `token_file` is set,
 /// reads the token at call time and passes it via `GH_TOKEN` env var.
 /// The token is never exposed to agent processes.
 pub struct GhMergeExecutor {
     pub token_file: Option<std::path::PathBuf>,
     /// `owner/repo` slug for `-R` flag — avoids cwd git dependency.
     pub gh_repo: Option<String>,
+    /// Long-lived daemon branches that must never be deleted after a merge.
+    pub base_branch: String,
+    pub self_update_branch: String,
 }
 
 impl GhMergeExecutor {
@@ -573,6 +576,26 @@ impl GhMergeExecutor {
         }
         parse_pr_head_sha(&output.stdout)
             .ok_or_else(|| "gh pr view returned no headRefOid".to_string())
+    }
+
+    fn live_head_ref(&self, pr: i64, repo_dir: &Path) -> Option<String> {
+        let pr_str = pr.to_string();
+        let mut cmd =
+            self.build_gh_cmd(&["pr", "view", &pr_str, "--json", "headRefName"], repo_dir);
+        let output = cmd.output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_pr_head_ref(&output.stdout)
+    }
+
+    fn repository_default_branch(&self, repo_dir: &Path) -> Option<String> {
+        let mut cmd = self.build_gh_cmd(&["repo", "view", "--json", "defaultBranchRef"], repo_dir);
+        let output = cmd.output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_repository_default_branch(&output.stdout)
     }
 
     fn reject_base_drift(
@@ -736,16 +759,76 @@ fn parse_pr_head_sha(output: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn merge_command_args<'a>(pr: &'a str, expected_head_sha: &'a str) -> [&'a str; 7] {
-    [
-        "pr",
-        "merge",
-        pr,
-        "--merge",
-        "--delete-branch",
-        "--match-head-commit",
-        expected_head_sha,
-    ]
+fn parse_pr_head_ref(output: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(output)
+        .ok()?
+        .get("headRefName")?
+        .as_str()
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned)
+}
+
+fn parse_repository_default_branch(output: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(output)
+        .ok()?
+        .get("defaultBranchRef")?
+        .get("name")?
+        .as_str()
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned)
+}
+
+#[derive(Debug)]
+struct MergeBranchMetadata {
+    head_ref: String,
+    pr_base_branch: String,
+    default_branch: String,
+}
+
+fn merge_branch_metadata(
+    head_ref: Option<String>,
+    pr_base_branch: Option<String>,
+    default_branch: Option<String>,
+) -> std::result::Result<MergeBranchMetadata, MergeResult> {
+    let head_ref = head_ref.ok_or_else(|| MergeResult {
+        success: false,
+        message: "PR head branch could not be resolved; merge not attempted".into(),
+        failure_kind: Some(MergeFailureKind::PolicyBlocked),
+    })?;
+    let pr_base_branch = pr_base_branch.ok_or_else(|| MergeResult {
+        success: false,
+        message: "PR base branch could not be resolved; merge not attempted".into(),
+        failure_kind: Some(MergeFailureKind::PolicyBlocked),
+    })?;
+    let default_branch = default_branch.ok_or_else(|| MergeResult {
+        success: false,
+        message: "repository default branch could not be resolved; merge not attempted".into(),
+        failure_kind: Some(MergeFailureKind::PolicyBlocked),
+    })?;
+
+    Ok(MergeBranchMetadata {
+        head_ref,
+        pr_base_branch,
+        default_branch,
+    })
+}
+
+fn merge_command_args<'a>(
+    pr: &'a str,
+    expected_head_sha: &'a str,
+    head_ref: &str,
+    protected_branches: [&str; 4],
+) -> Vec<&'a str> {
+    let delete_branch = protected_branches
+        .iter()
+        .all(|protected| head_ref != *protected);
+
+    let mut args = vec!["pr", "merge", pr, "--merge"];
+    if delete_branch {
+        args.push("--delete-branch");
+    }
+    args.extend(["--match-head-commit", expected_head_sha]);
+    args
 }
 
 /// Return true iff the `reviews` array (from `gh pr view --json reviews`)
@@ -921,8 +1004,26 @@ impl MergeExecutor for GhMergeExecutor {
             return rejected;
         }
 
+        let branch_metadata = match merge_branch_metadata(
+            self.live_head_ref(pr, repo_dir),
+            self.live_base_branch(pr, repo_dir).ok(),
+            self.repository_default_branch(repo_dir),
+        ) {
+            Ok(metadata) => metadata,
+            Err(result) => return result,
+        };
         let result = self.run_gh(
-            &merge_command_args(&pr_str, &ctx.expected_head_sha),
+            &merge_command_args(
+                &pr_str,
+                &ctx.expected_head_sha,
+                &branch_metadata.head_ref,
+                [
+                    &self.base_branch,
+                    &self.self_update_branch,
+                    &branch_metadata.pr_base_branch,
+                    &branch_metadata.default_branch,
+                ],
+            ),
             repo_dir,
         );
 
@@ -1332,10 +1433,15 @@ mod tests {
     }
 
     #[test]
-    fn production_merge_command_pins_the_approved_head() {
+    fn production_merge_command_deletes_unprotected_daemon_head() {
         assert_eq!(
-            merge_command_args("42", "approved-sha"),
-            [
+            merge_command_args(
+                "42",
+                "approved-sha",
+                "daemon/worker-t1",
+                ["configured-base", "self-update", "pr-base", "default"],
+            ),
+            vec![
                 "pr",
                 "merge",
                 "42",
@@ -1345,6 +1451,65 @@ mod tests {
                 "approved-sha",
             ]
         );
+    }
+
+    #[test]
+    fn production_merge_command_retains_protected_heads() {
+        for (protected_head, label) in [
+            ("configured-base", "configured base branch"),
+            ("self-update", "self-update branch"),
+            ("pr-base", "PR base branch"),
+            ("default", "repository default branch"),
+        ] {
+            assert_eq!(
+                merge_command_args(
+                    "42",
+                    "approved-sha",
+                    protected_head,
+                    ["configured-base", "self-update", "pr-base", "default"],
+                ),
+                vec![
+                    "pr",
+                    "merge",
+                    "42",
+                    "--merge",
+                    "--match-head-commit",
+                    "approved-sha"
+                ],
+                "{label} must not be deleted",
+            );
+        }
+    }
+
+    #[test]
+    fn branch_metadata_lookup_failures_block_merge_before_mutation() {
+        for (head_ref, pr_base_branch, default_branch, missing) in [
+            (
+                None,
+                Some("pr-base".into()),
+                Some("default".into()),
+                "PR head branch",
+            ),
+            (
+                Some("head".into()),
+                None,
+                Some("default".into()),
+                "PR base branch",
+            ),
+            (
+                Some("head".into()),
+                Some("pr-base".into()),
+                None,
+                "repository default branch",
+            ),
+        ] {
+            let result = merge_branch_metadata(head_ref, pr_base_branch, default_branch)
+                .expect_err("missing branch metadata must block the merge");
+            assert!(!result.success);
+            assert_eq!(result.failure_kind, Some(MergeFailureKind::PolicyBlocked));
+            assert!(result.message.contains(missing));
+            assert!(result.message.contains("merge not attempted"));
+        }
     }
 
     #[test]
@@ -1466,6 +1631,8 @@ mod tests {
         let exec = GhMergeExecutor {
             token_file: Some(std::path::PathBuf::from("/nonexistent/token")),
             gh_repo: None,
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
         };
         let result = exec.merge(1, Path::new("/tmp"), &ctx);
         assert!(!result.success);
@@ -1930,6 +2097,8 @@ mod tests {
         let exec = GhMergeExecutor {
             token_file: Some(std::path::PathBuf::from("/nonexistent/path/token")),
             gh_repo: None,
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
         };
         assert!(exec.read_token().is_none());
     }
@@ -1942,6 +2111,8 @@ mod tests {
         let exec = GhMergeExecutor {
             token_file: Some(token_path),
             gh_repo: None,
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
         };
         assert_eq!(exec.read_token().unwrap(), "my-secret-token");
     }
@@ -1951,6 +2122,8 @@ mod tests {
         let exec = GhMergeExecutor {
             token_file: None,
             gh_repo: None,
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
         };
         assert!(exec.read_token().is_none());
     }

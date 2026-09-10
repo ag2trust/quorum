@@ -1684,6 +1684,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     std::sync::Arc::new(serve::merge::GhMergeExecutor {
                         token_file: r_merge_token.value.map(std::path::PathBuf::from),
                         gh_repo: resolve_gh_repo(&r_repo_dir.value),
+                        base_branch: r_base_branch.value.clone(),
+                        self_update_branch: r_self_update_branch.value.clone(),
                     })
                 };
 
