@@ -12074,7 +12074,6 @@ async fn tick(
                         "verdict: approved — waiting for checks on PR #{pr_num}"
                     ));
 
-                    const MAX_POLICY_RETRIES: u32 = 3;
                     let mut policy_retry = 0u32;
                     let mut drain_interrupted = false;
                     let checks_outcome = {
@@ -12982,12 +12981,13 @@ async fn tick(
 
                         if !attempt.success
                             && attempt.failure_kind == Some(merge::MergeFailureKind::PolicyPending)
-                            && policy_retry < MAX_POLICY_RETRIES
+                            && policy_retry < merge::MAX_POLICY_RETRIES
                         {
                             policy_retry += 1;
                             log(&format!(
                                 "PR #{pr_num} merge policy-pending (attempt {policy_retry}/\
-                                 {MAX_POLICY_RETRIES}): {} — re-waiting for checks",
+                                 {}): {} — re-waiting for checks",
+                                merge::MAX_POLICY_RETRIES,
                                 attempt.message
                             ));
                             let retry_outcome = {

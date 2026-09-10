@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 76;
+pub const SCHEMA_VERSION: i64 = 77;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1391,6 +1391,40 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
         // active-pair unique index, and task-reference lookup index are new
         // schema objects, so SCHEMA_SQL creates them for fresh databases and
         // upgrades alike. No data backfill is needed.
+        //
+        // v77 = restart-safe bounded branch-sync CI waits. These additive
+        // columns preserve the finite attempt budget, scheduled retry time,
+        // and pre-network admission boundary across daemon restarts; the
+        // partial due index keeps the scheduler's checks scan bounded.
+        if current < 77 {
+            if !column_exists(conn, "branch_syncs", "ci_attempts")? {
+                conn.execute(
+                    "ALTER TABLE branch_syncs
+                     ADD COLUMN ci_attempts INTEGER NOT NULL DEFAULT 0
+                     CHECK(ci_attempts >= 0)",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "branch_syncs", "ci_next_attempt_at")? {
+                conn.execute(
+                    "ALTER TABLE branch_syncs ADD COLUMN ci_next_attempt_at INTEGER",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "branch_syncs", "ci_wait_inflight")? {
+                conn.execute(
+                    "ALTER TABLE branch_syncs
+                     ADD COLUMN ci_wait_inflight INTEGER NOT NULL DEFAULT 0
+                     CHECK(ci_wait_inflight IN (0,1))",
+                    [],
+                )?;
+            }
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS branch_syncs_checks_due
+                     ON branch_syncs(ci_next_attempt_at, updated_at, id)
+                     WHERE active = 1 AND phase = 'checks'",
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1706,6 +1740,9 @@ mod tests {
             "merge_sha",
             "pr",
             "phase",
+            "ci_attempts",
+            "ci_next_attempt_at",
+            "ci_wait_inflight",
             "task_id",
             "active",
             "requested_by",
@@ -1718,7 +1755,11 @@ mod tests {
                 "branch_syncs column {column} missing after v75 upgrade"
             );
         }
-        for index in ["branch_syncs_one_active_pair", "branch_syncs_task_id"] {
+        for index in [
+            "branch_syncs_one_active_pair",
+            "branch_syncs_task_id",
+            "branch_syncs_checks_due",
+        ] {
             assert!(migrated
                 .query_row(
                     "SELECT EXISTS(
@@ -1740,6 +1781,57 @@ mod tests {
         drop(migrated);
         let reopened = open(&path).unwrap();
         assert!(column_exists(&reopened, "branch_syncs", "active").unwrap());
+    }
+
+    /// v76 had durable branch-sync rows but no restart-safe bounded CI wait
+    /// evidence. The upgrade must add all retry fields and its due index
+    /// without changing prior row semantics.
+    #[test]
+    fn v76_to_v77_adds_durable_branch_sync_ci_retry_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v76-branch-sync-ci-retry.db");
+        {
+            let raw = Connection::open(&path).unwrap();
+            apply_pragmas(&raw).unwrap();
+            migrate(&raw).unwrap();
+            raw.execute_batch(
+                "DROP INDEX branch_syncs_checks_due;
+                 ALTER TABLE branch_syncs DROP COLUMN ci_wait_inflight;
+                 ALTER TABLE branch_syncs DROP COLUMN ci_next_attempt_at;
+                 ALTER TABLE branch_syncs DROP COLUMN ci_attempts;
+                 PRAGMA user_version=76;",
+            )
+            .unwrap();
+        }
+
+        let migrated = open(&path).unwrap();
+        for column in ["ci_attempts", "ci_next_attempt_at", "ci_wait_inflight"] {
+            assert!(
+                column_exists(&migrated, "branch_syncs", column).unwrap(),
+                "branch_syncs column {column} missing after v76 upgrade"
+            );
+        }
+        let defaults: (i64, Option<i64>, bool) = migrated
+            .query_row(
+                "INSERT INTO branch_syncs(
+                     source_branch,target_branch,phase,requested_by,created_at,updated_at
+                 ) VALUES ('main','develop','requested','owner',1,1)
+                 RETURNING ci_attempts,ci_next_attempt_at,ci_wait_inflight",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(defaults, (0, None, false));
+        assert!(migrated
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master
+                     WHERE type='index' AND name='branch_syncs_checks_due'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
     }
 
     #[test]

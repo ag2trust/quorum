@@ -14,14 +14,21 @@ use quorum_core::error::{QuorumError, Result};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 
 const PR_OPEN: &str = "OPEN";
+/// Branch-sync CI gets the same finite policy-retry budget as a merge. The
+/// first complete wait is followed by at most this many durable retries.
+const MAX_BRANCH_SYNC_CHECK_ATTEMPTS: i64 = merge::MAX_POLICY_RETRIES as i64 + 1;
+/// A small global cap leaves Tokio's blocking pool available for SQLite and
+/// lifecycle work even when an owner configures many independent sync pairs.
+const MAX_BRANCH_SYNC_CHECK_WAITS: usize = 2;
+const CHECK_RETRY_LIMIT_ERROR: &str = "branch sync CI wait retry limit exceeded";
 
-/// Retained, bounded branch-sync CI work. Each active checks row owns at most
-/// one background waiter; a pending waiter is excluded from selection so it
-/// cannot hold the serialized daemon tick or monopolize the sync slot.
+/// Retained branch-sync CI work. At most [`MAX_BRANCH_SYNC_CHECK_WAITS`] full
+/// waits exist in this map; retry count and cadence are durable row fields.
 #[derive(Default)]
 pub struct BranchSyncChecks {
     waits: HashMap<i64, BranchSyncCheckWait>,
@@ -29,32 +36,29 @@ pub struct BranchSyncChecks {
 
 struct BranchSyncCheckWait {
     pr: i64,
-    state: BranchSyncCheckState,
-}
-
-enum BranchSyncCheckState {
-    Waiting(JoinHandle<merge::ChecksOutcome>),
-    Retry { not_before: Instant },
+    attempts: i64,
+    handle: JoinHandle<merge::ChecksOutcome>,
 }
 
 impl BranchSyncChecks {
     fn excluded_ids(&self) -> Vec<i64> {
-        let now = Instant::now();
         self.waits
             .iter()
-            .filter_map(|(id, wait)| match &wait.state {
-                BranchSyncCheckState::Waiting(handle) if !handle.is_finished() => Some(*id),
-                BranchSyncCheckState::Retry { not_before } if *not_before > now => Some(*id),
-                BranchSyncCheckState::Waiting(_) | BranchSyncCheckState::Retry { .. } => None,
-            })
+            .filter_map(|(id, wait)| (!wait.handle.is_finished()).then_some(*id))
             .collect()
+    }
+
+    /// Once the cap is full, only already-admitted rows may be selected. A
+    /// completed handle remains selectable for settlement, while an excess
+    /// durable `checks` row waits fairly for that slot to be released.
+    fn admitted_check_ids_if_full(&self) -> Option<Vec<i64>> {
+        (self.waits.len() >= MAX_BRANCH_SYNC_CHECK_WAITS)
+            .then(|| self.waits.keys().copied().collect())
     }
 
     fn cancel(&mut self, id: i64) {
         if let Some(wait) = self.waits.remove(&id) {
-            if let BranchSyncCheckState::Waiting(handle) = wait.state {
-                handle.abort();
-            }
+            wait.handle.abort();
         }
     }
 }
@@ -62,9 +66,7 @@ impl BranchSyncChecks {
 impl Drop for BranchSyncChecks {
     fn drop(&mut self) {
         for wait in self.waits.values_mut() {
-            if let BranchSyncCheckState::Waiting(handle) = &wait.state {
-                handle.abort();
-            }
+            wait.handle.abort();
         }
     }
 }
@@ -78,9 +80,16 @@ pub async fn reconcile_one(
 ) -> Result<()> {
     let db_path = config.db_path.clone();
     let excluded = checks.excluded_ids();
+    let admitted_check_ids = checks.admitted_check_ids_if_full();
+    let now = quorum_core::clock::now();
     let sync = tokio::task::spawn_blocking(move || -> Result<Option<BranchSync>> {
         let conn = quorum_core::db::open(&db_path)?;
-        branch_sync::next_clean_path_excluding(&conn, &excluded)
+        branch_sync::next_clean_path_excluding_at(
+            &conn,
+            &excluded,
+            admitted_check_ids.as_deref(),
+            now,
+        )
     })
     .await
     .map_err(|error| QuorumError::Io(format!("branch sync selection join: {error}")))??;
@@ -345,64 +354,90 @@ async fn run_checks(
         waits.cancel(sync.id);
     }
 
-    let state = waits.waits.remove(&sync.id).map(|wait| wait.state);
-    let checks = match state {
-        Some(BranchSyncCheckState::Waiting(handle)) if !handle.is_finished() => {
-            waits.waits.insert(
-                sync.id,
-                BranchSyncCheckWait {
-                    pr,
-                    state: BranchSyncCheckState::Waiting(handle),
-                },
-            );
-            return Ok(());
-        }
-        Some(BranchSyncCheckState::Waiting(handle)) => handle
-            .await
-            .map_err(|error| format!("branch sync checks join: {error}"))?,
-        Some(BranchSyncCheckState::Retry { not_before }) if not_before > Instant::now() => {
-            waits.waits.insert(
-                sync.id,
-                BranchSyncCheckWait {
-                    pr,
-                    state: BranchSyncCheckState::Retry { not_before },
-                },
-            );
-            return Ok(());
-        }
-        Some(BranchSyncCheckState::Retry { .. }) | None => {
-            start_checks_wait(config, waits, sync.id, pr);
-            return Ok(());
-        }
+    let wait = waits.waits.remove(&sync.id);
+    let Some(wait) = wait else {
+        return admit_checks_wait(config, sync, waits, pr).await;
     };
+    if !wait.handle.is_finished() {
+        waits.waits.insert(sync.id, wait);
+        return Ok(());
+    }
+    let checks = wait
+        .handle
+        .await
+        .map_err(|error| format!("branch sync checks join: {error}"))?;
 
-    settle_checks(config, sync, waits, pr, checks).await
+    settle_checks(config, sync, pr, wait.attempts, checks).await
 }
 
-fn start_checks_wait(config: &ServeConfig, waits: &mut BranchSyncChecks, id: i64, pr: i64) {
-    let handle = {
-        let repo = config.repo_dir.clone();
-        let executor = Arc::clone(&config.merge_executor);
-        let timeout = config.merge_checks_timeout_secs;
-        let poll = config.merge_checks_poll_secs;
-        tokio::task::spawn_blocking(move || {
-            executor.wait_for_branch_sync_checks(pr, &repo, timeout, poll)
-        })
+async fn admit_checks_wait(
+    config: &ServeConfig,
+    sync: &BranchSync,
+    waits: &mut BranchSyncChecks,
+    pr: i64,
+) -> std::result::Result<(), String> {
+    if waits.waits.len() >= MAX_BRANCH_SYNC_CHECK_WAITS {
+        return Ok(());
+    }
+    if !sync.ci_wait_inflight && sync.ci_attempts >= MAX_BRANCH_SYNC_CHECK_ATTEMPTS {
+        return Err(check_retry_limit_error(pr, sync.ci_attempts));
+    }
+
+    let db_path = config.db_path.clone();
+    let id = sync.id;
+    let admitted = tokio::task::spawn_blocking(move || -> Result<Option<BranchSync>> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        branch_sync::admit_check_wait(
+            &mut conn,
+            id,
+            MAX_BRANCH_SYNC_CHECK_ATTEMPTS,
+            quorum_core::clock::now(),
+        )
+    })
+    .await
+    .map_err(|error| format!("branch sync checks admission join: {error}"))?
+    .map_err(|error| error.to_string())?;
+    let Some(admitted) = admitted else {
+        return Ok(());
     };
+
+    let repo = config.repo_dir.clone();
+    let executor = Arc::clone(&config.merge_executor);
+    let timeout = config.merge_checks_timeout_secs;
+    let poll = config.merge_checks_poll_secs;
+    let handle = tokio::task::spawn_blocking(move || {
+        executor.wait_for_branch_sync_checks(pr, &repo, timeout, poll)
+    });
     waits.waits.insert(
-        id,
+        sync.id,
         BranchSyncCheckWait {
             pr,
-            state: BranchSyncCheckState::Waiting(handle),
+            attempts: admitted.ci_attempts,
+            handle,
         },
     );
+    Ok(())
+}
+
+fn check_retry_limit_error(pr: i64, attempts: i64) -> String {
+    format!("{CHECK_RETRY_LIMIT_ERROR} after {attempts} attempts for PR #{pr}")
+}
+
+fn check_retry_delay_secs(config: &ServeConfig, attempts: i64) -> u64 {
+    let exponent = u32::try_from(attempts.saturating_sub(1))
+        .unwrap_or(u32::MAX)
+        .min(63);
+    config
+        .merge_checks_poll_secs
+        .saturating_mul(1_u64 << exponent)
+        .min(config.merge_checks_timeout_secs)
 }
 
 async fn settle_checks(
     config: &ServeConfig,
     sync: &BranchSync,
-    waits: &mut BranchSyncChecks,
     pr: i64,
+    attempts: i64,
     mut checks: merge::ChecksOutcome,
 ) -> std::result::Result<(), String> {
     if matches!(checks, merge::ChecksOutcome::Ready) {
@@ -444,20 +479,22 @@ async fn settle_checks(
             .map_err(|error| error.to_string())
         }
         merge::ChecksOutcome::Pending { .. } | merge::ChecksOutcome::TimedOut => {
-            // The full wait has already bounded its own polling. Retain only
-            // a scheduled retry, rather than waiting inside this tick or
-            // immediately selecting the same row again.
-            waits.waits.insert(
-                sync.id,
-                BranchSyncCheckWait {
-                    pr,
-                    state: BranchSyncCheckState::Retry {
-                        not_before: Instant::now()
-                            + Duration::from_secs(config.merge_checks_poll_secs),
-                    },
-                },
-            );
-            Ok(())
+            if attempts >= MAX_BRANCH_SYNC_CHECK_ATTEMPTS {
+                return Err(check_retry_limit_error(pr, attempts));
+            }
+            let delay = check_retry_delay_secs(config, attempts);
+            let db_path = config.db_path.clone();
+            let id = sync.id;
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = quorum_core::db::open(&db_path)?;
+                let now = quorum_core::clock::now();
+                let next_attempt_at = now.saturating_add(delay.try_into().unwrap_or(i64::MAX));
+                let _ = branch_sync::schedule_check_retry(&mut conn, id, next_attempt_at, now)?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| format!("branch sync CI retry settlement join: {error}"))?
+            .map_err(|error| error.to_string())
         }
     }
 }
@@ -711,6 +748,9 @@ mod tests {
             merge_sha: None,
             pr: None,
             phase: "requested".into(),
+            ci_attempts: 0,
+            ci_next_attempt_at: None,
+            ci_wait_inflight: false,
             task_id: None,
             active: true,
             requested_by: "owner".into(),
@@ -1117,7 +1157,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_checks_waits_are_nonblocking_and_do_not_monopolize_reconciliation() {
+    async fn pending_checks_waits_are_nonblocking_and_globally_capped() {
         let root = tempfile::tempdir().unwrap();
         let db_path = root.path().join("quorum.db");
         let first = sync_at_phase_for_pair(
@@ -1134,6 +1174,14 @@ mod tests {
             "main",
             &"c".repeat(40),
             &"d".repeat(40),
+            "checks",
+        );
+        let third = sync_at_phase_for_pair(
+            &db_path,
+            "stable",
+            "main",
+            &"e".repeat(40),
+            &"f".repeat(40),
             "checks",
         );
         let executor = Arc::new(
@@ -1188,6 +1236,51 @@ mod tests {
         );
         assert!(checks.waits.contains_key(&first.id));
         assert!(checks.waits.contains_key(&second.id));
+
+        let capped_tick = Instant::now();
+        reconcile_one(&config, &manager, &mut checks).await.unwrap();
+        assert!(
+            capped_tick.elapsed() < Duration::from_millis(200),
+            "a saturated branch-sync CI cap must leave the daemon tick free"
+        );
+        assert_eq!(checks.waits.len(), MAX_BRANCH_SYNC_CHECK_WAITS);
+        assert_eq!(
+            executor
+                .wait_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the third durable checks row must wait for a global admission slot"
+        );
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while checks.waits.len() == MAX_BRANCH_SYNC_CHECK_WAITS && Instant::now() < deadline {
+            reconcile_one(&config, &manager, &mut checks).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            checks.waits.len() < MAX_BRANCH_SYNC_CHECK_WAITS,
+            "a completed wait must release capacity for the next durable row"
+        );
+
+        while executor
+            .wait_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < 3
+            && Instant::now() < deadline
+        {
+            reconcile_one(&config, &manager, &mut checks).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            executor
+                .wait_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the oldest unadmitted checks row must receive the released slot"
+        );
+        assert!(checks.waits.contains_key(&third.id));
+        assert!(checks.waits.len() <= MAX_BRANCH_SYNC_CHECK_WAITS);
     }
 
     #[tokio::test]
@@ -1204,7 +1297,7 @@ mod tests {
         ));
         let mut config = config_with_executor(
             root.path(),
-            db_path,
+            db_path.clone(),
             executor.clone(),
             vec!["ci".to_string()],
         );
@@ -1214,18 +1307,22 @@ mod tests {
 
         reconcile_one(&config, &manager, &mut checks).await.unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
-        while !matches!(
-            checks.waits.get(&row.id).map(|wait| &wait.state),
-            Some(BranchSyncCheckState::Retry { .. })
-        ) && Instant::now() < deadline
-        {
+        while Instant::now() < deadline {
             reconcile_one(&config, &manager, &mut checks).await.unwrap();
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let scheduled = branch_sync::get(&conn, row.id).unwrap().unwrap();
+            if scheduled.ci_attempts == 1 && scheduled.ci_next_attempt_at.is_some() {
+                assert!(!scheduled.ci_wait_inflight);
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        assert!(matches!(
-            checks.waits.get(&row.id).map(|wait| &wait.state),
-            Some(BranchSyncCheckState::Retry { .. })
-        ));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let scheduled = branch_sync::get(&conn, row.id).unwrap().unwrap();
+        assert_eq!(scheduled.ci_attempts, 1);
+        assert!(scheduled.ci_next_attempt_at.is_some());
+        assert!(!scheduled.ci_wait_inflight);
+        assert!(checks.waits.is_empty());
 
         for _ in 0..20 {
             reconcile_one(&config, &manager, &mut checks).await.unwrap();
@@ -1237,6 +1334,93 @@ mod tests {
             1,
             "a completed timeout must wait for its scheduled retry instead of polling every tick"
         );
+    }
+
+    #[tokio::test]
+    async fn timed_out_checks_have_a_finite_durable_retry_budget_across_restarts() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("quorum.db");
+        let row = sync_at_phase(&db_path, &"a".repeat(40), &"b".repeat(40), "checks");
+        let executor = Arc::new(SyncExecutor::new(
+            merge::ChecksOutcome::TimedOut,
+            merge::RequiredJobsOutcome::AllSucceeded,
+            MergeCommitStatus::Open,
+            None,
+            true,
+        ));
+        let mut config = config_with_executor(
+            root.path(),
+            db_path.clone(),
+            executor.clone(),
+            vec!["ci".to_string()],
+        );
+        config.merge_checks_poll_secs = 1;
+        config.merge_checks_timeout_secs = 8;
+        let manager = WorktreeManager::new();
+
+        for attempt in 1..=MAX_BRANCH_SYNC_CHECK_ATTEMPTS {
+            // A fresh coordinator models a daemon restart. The row's attempt
+            // count and scheduled time, rather than process memory, govern
+            // the next admission.
+            let mut checks = BranchSyncChecks::default();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                reconcile_one(&config, &manager, &mut checks).await.unwrap();
+                let conn = quorum_core::db::open(&db_path).unwrap();
+                let current = branch_sync::get(&conn, row.id).unwrap().unwrap();
+                if attempt < MAX_BRANCH_SYNC_CHECK_ATTEMPTS
+                    && current.phase == "checks"
+                    && current.ci_attempts == attempt
+                    && current.ci_next_attempt_at.is_some()
+                {
+                    let expected_delay = check_retry_delay_secs(&config, attempt) as i64;
+                    assert!(
+                        current.ci_next_attempt_at.unwrap() >= current.updated_at + expected_delay,
+                        "retry {attempt} must persist exponential backoff"
+                    );
+                    drop(conn);
+                    let conn = quorum_core::db::open(&db_path).unwrap();
+                    conn.execute(
+                        "UPDATE branch_syncs SET ci_next_attempt_at=0 WHERE id=?1",
+                        [row.id],
+                    )
+                    .unwrap();
+                    break;
+                }
+                if attempt == MAX_BRANCH_SYNC_CHECK_ATTEMPTS && current.phase == "failed" {
+                    assert_eq!(current.ci_attempts, attempt);
+                    assert!(!current.active);
+                    assert!(current
+                        .last_error
+                        .as_deref()
+                        .unwrap()
+                        .contains(CHECK_RETRY_LIMIT_ERROR));
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "attempt {attempt} did not settle"
+                );
+                drop(conn);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+
+        assert_eq!(
+            executor
+                .wait_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            MAX_BRANCH_SYNC_CHECK_ATTEMPTS as usize
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let event: String = conn
+            .query_row(
+                "SELECT kind FROM events WHERE subject=?1 ORDER BY seq DESC LIMIT 1",
+                [format!("branch_sync#{}", row.id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event, "branch_sync_failed");
     }
 
     #[cfg(unix)]

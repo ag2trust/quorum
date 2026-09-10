@@ -84,6 +84,10 @@ pub struct MergeResult {
     pub failure_kind: Option<MergeFailureKind>,
 }
 
+/// Bounded retries after a merge policy reports a transient pending state.
+/// Branch-sync CI uses the same retry budget after its initial full wait.
+pub const MAX_POLICY_RETRIES: u32 = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChecksOutcome {
     /// All required checks passed — safe to merge.

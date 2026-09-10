@@ -475,11 +475,14 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   `branch sync requires a non-empty required_jobs gate`, an `errors` row, and a
   `branch_sync_failed` event. Its CI wait never accepts an empty `statusCheckRollup`; the
   ordinary task merge two-empty-polls compatibility rule does not apply. Failed checks enter
-  active `ci_failed` with `branch_sync_ci_failed` for later judgment work. Each pending CI
-  wait is one bounded, cancellable daemon-owned background operation. Its active row is
-  excluded from subsequent clean-path selection (and timeout retries are cadenced), so it
-  cannot hold a serialized daemon tick or monopolize later branch syncs; restart reconstructs
-  the wait from durable `checks` state. Green checks cross
+  active `ci_failed` with `branch_sync_ci_failed` for later judgment work. At most two pending
+  CI waits run daemon-wide, so configured pairs cannot exhaust the blocking pool; excess due
+  `checks` rows remain durable and selectable when a slot opens. Each wait records its attempt
+  count, due time, and in-flight admission on the row. The initial wait plus the bounded merge
+  retry budget is the finite lifetime allowance; pending or timed-out attempts use a capped
+  exponential delay, and exhausting that allowance fails the row loudly with
+  `branch_sync_failed`. Restart preserves the attempt and schedule, and reconstructs an
+  interrupted in-flight wait without granting another allowance. Green checks cross
   the durable `checks` → `merging` admission before one daemon-owned `gh pr merge` call, with
   the prepared merge SHA and target branch revalidated but no formal approval review. After a
   reported merge, the daemon fetches the target, reads GitHub's immutable `mergeCommit`, and

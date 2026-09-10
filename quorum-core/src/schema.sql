@@ -130,7 +130,7 @@ CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC)
 CREATE INDEX IF NOT EXISTS tasks_reviewing_newest
     ON tasks(status, updated_at DESC, id DESC);
 
--- v76: daemon-internal branch synchronization. A clean synchronization never
+-- v76/v77: daemon-internal branch synchronization. A clean synchronization never
 -- creates a task; task_id is reserved only for the later judgment-required
 -- conflict/CI paths. The explicit active sentinel makes the partial unique
 -- index the cross-process authority for one live synchronization per directed
@@ -148,6 +148,9 @@ CREATE TABLE IF NOT EXISTS branch_syncs (
                       'requested','pinned','prepared','published','checks',
                       'merging','done','noop','conflict','ci_failed','failed',
                       'cancelled')),
+    ci_attempts   INTEGER NOT NULL DEFAULT 0 CHECK(ci_attempts >= 0),
+    ci_next_attempt_at INTEGER,
+    ci_wait_inflight INTEGER NOT NULL DEFAULT 0 CHECK(ci_wait_inflight IN (0,1)),
     task_id       INTEGER REFERENCES tasks(id),
     active        INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)),
     requested_by  TEXT NOT NULL,
