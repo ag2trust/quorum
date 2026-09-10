@@ -589,10 +589,35 @@ impl GhMergeExecutor {
         parse_pr_head_ref(&output.stdout)
     }
 
+    /// Build the `gh repo view` command for the repository default-branch lookup.
+    ///
+    /// `gh repo view` takes the repo *positionally* and has no `-R` flag, so it
+    /// cannot route through `build_gh_cmd` (which appends `-R <nwo>` and fails with
+    /// `unknown shorthand flag: 'R' in -R`). This replicates `build_gh_cmd`'s token +
+    /// cwd behavior, with the only difference being the slug is passed positionally.
+    fn repo_view_default_branch_cmd(&self, repo_dir: &Path) -> Command {
+        let mut cmd = Command::new("gh");
+        cmd.args(["repo", "view"]);
+        if let Some(ref nwo) = self.gh_repo {
+            cmd.arg(nwo);
+        } else {
+            cmd.current_dir(repo_dir);
+        }
+        cmd.args(["--json", "defaultBranchRef"]);
+        if let Some(token) = self.read_token() {
+            cmd.env("GH_TOKEN", token);
+        }
+        cmd
+    }
+
     fn repository_default_branch(&self, repo_dir: &Path) -> Option<String> {
-        let mut cmd = self.build_gh_cmd(&["repo", "view", "--json", "defaultBranchRef"], repo_dir);
+        let mut cmd = self.repo_view_default_branch_cmd(repo_dir);
         let output = cmd.output().ok()?;
         if !output.status.success() {
+            eprintln!(
+                "warn: gh repo view failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
             return None;
         }
         parse_repository_default_branch(&output.stdout)
@@ -2126,6 +2151,97 @@ mod tests {
             self_update_branch: "main".into(),
         };
         assert!(exec.read_token().is_none());
+    }
+
+    fn repo_view_argv(exec: &GhMergeExecutor, repo_dir: &Path) -> Vec<String> {
+        let cmd = exec.repo_view_default_branch_cmd(repo_dir);
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Regression: `gh repo view` takes the repo positionally and rejects `-R`
+    /// (`unknown shorthand flag: 'R' in -R`). Routing it through `build_gh_cmd`
+    /// appended `-R <nwo>`, so the lookup always failed and the fail-closed gate
+    /// parked every merge. The argv must pass the slug positionally, never via -R.
+    #[test]
+    fn repo_view_default_branch_passes_slug_positionally_never_with_r_flag() {
+        let exec = GhMergeExecutor {
+            token_file: None,
+            gh_repo: Some("owner/repo".into()),
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
+        };
+        let cmd = exec.repo_view_default_branch_cmd(Path::new("/tmp"));
+        assert_eq!(cmd.get_program().to_string_lossy(), "gh");
+
+        let argv = repo_view_argv(&exec, Path::new("/tmp"));
+        assert_eq!(
+            argv,
+            vec!["repo", "view", "owner/repo", "--json", "defaultBranchRef"],
+        );
+        assert!(
+            !argv.iter().any(|a| a == "-R"),
+            "gh repo view must not receive -R: {argv:?}"
+        );
+    }
+
+    /// With no configured slug the command falls back to running in `repo_dir`
+    /// (no positional slug), matching `build_gh_cmd`'s cwd fallback.
+    #[test]
+    fn repo_view_default_branch_falls_back_to_cwd_without_slug() {
+        let exec = GhMergeExecutor {
+            token_file: None,
+            gh_repo: None,
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
+        };
+        let repo_dir = Path::new("/tmp/some-repo");
+        let cmd = exec.repo_view_default_branch_cmd(repo_dir);
+        assert_eq!(
+            cmd.get_current_dir(),
+            Some(repo_dir),
+            "no-slug lookup must run in repo_dir",
+        );
+
+        let argv = repo_view_argv(&exec, repo_dir);
+        assert_eq!(argv, vec!["repo", "view", "--json", "defaultBranchRef"]);
+        assert!(!argv.iter().any(|a| a == "-R"));
+    }
+
+    fn gh_available() -> bool {
+        std::process::Command::new("gh")
+            .args(["auth", "status"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Real-binary contract test: spawns the installed, authed `gh` against a
+    /// configured slug and asserts a default branch is actually resolved. This
+    /// is the boundary the parser-only tests could not see — the old `-R` argv
+    /// failed here at runtime. Skipped when `gh` is absent or unauthenticated.
+    #[test]
+    fn repo_view_default_branch_resolves_against_real_gh() {
+        if !gh_available() {
+            eprintln!("skipping: gh not available/authenticated");
+            return;
+        }
+        // A configured slug (`gh_repo = Some`) is the exact case the old `-R` argv
+        // broke: `gh repo view -R <slug>` errored, so the lookup returned None.
+        let exec = GhMergeExecutor {
+            token_file: None,
+            gh_repo: Some("cli/cli".into()),
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
+        };
+        let branch = exec.repository_default_branch(Path::new("."));
+        assert!(
+            branch.as_deref().is_some_and(|b| !b.is_empty()),
+            "gh repo view must resolve a non-empty default branch for a configured slug, got {branch:?}"
+        );
     }
 
     #[test]
