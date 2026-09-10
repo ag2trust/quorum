@@ -10073,6 +10073,7 @@ async fn tick_loop(
     let wt_mgr = WorktreeManager::new();
     let mut workers: Vec<SlotState> = Vec::new();
     let mut reviewers: Vec<SlotState> = Vec::new();
+    let mut branch_sync_checks = branch_sync::BranchSyncChecks::default();
     let mut pre_review_checks: HashMap<i64, PreReviewChecksEntry> = HashMap::new();
     let mut pending_reviewer_resumes: HashMap<i64, i64> = HashMap::new();
     let mut poison_tracker = PoisonTracker::new();
@@ -10108,7 +10109,7 @@ async fn tick_loop(
     // Branch synchronizations are daemon-owned non-task work. Reconcile one
     // before lifecycle recovery so a crash can resume its pinned/prepared
     // evidence without waiting for the first normal daemon tick.
-    branch_sync::reconcile_one(config, &wt_mgr).await?;
+    branch_sync::reconcile_one(config, &wt_mgr, &mut branch_sync_checks).await?;
 
     // `attempting` means the prior daemon crossed the durable boundary before
     // a merge network call (ordinary reviewed merge or explicit replay), but
@@ -10642,6 +10643,7 @@ async fn tick_loop(
             &mut name_pool,
             &mut workers,
             &mut reviewers,
+            &mut branch_sync_checks,
             &mut pre_review_checks,
             &mut pending_reviewer_resumes,
             &mut poison_tracker,
@@ -10763,6 +10765,7 @@ async fn tick(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     reviewers: &mut Vec<SlotState>,
+    branch_sync_checks: &mut branch_sync::BranchSyncChecks,
     pre_review_checks: &mut HashMap<i64, PreReviewChecksEntry>,
     pending_reviewer_resumes: &mut HashMap<i64, i64>,
     poison_tracker: &mut PoisonTracker,
@@ -10787,8 +10790,9 @@ async fn tick(
     let db_path = config.db_path.clone();
 
     // Bound daemon-internal branch synchronization to one durable row per
-    // tick. Its Git/GitHub work is complete before any SQLite settlement.
-    branch_sync::reconcile_one(config, wt_mgr).await?;
+    // tick. A pending sync CI wait is retained separately, so this pass only
+    // starts or settles it and never holds lifecycle work for its timeout.
+    branch_sync::reconcile_one(config, wt_mgr, branch_sync_checks).await?;
 
     let decomposition_freeze = tick_decomposition(
         config,
@@ -12070,7 +12074,6 @@ async fn tick(
                         "verdict: approved — waiting for checks on PR #{pr_num}"
                     ));
 
-                    const MAX_POLICY_RETRIES: u32 = 3;
                     let mut policy_retry = 0u32;
                     let mut drain_interrupted = false;
                     let checks_outcome = {
@@ -12978,12 +12981,13 @@ async fn tick(
 
                         if !attempt.success
                             && attempt.failure_kind == Some(merge::MergeFailureKind::PolicyPending)
-                            && policy_retry < MAX_POLICY_RETRIES
+                            && policy_retry < merge::MAX_POLICY_RETRIES
                         {
                             policy_retry += 1;
                             log(&format!(
                                 "PR #{pr_num} merge policy-pending (attempt {policy_retry}/\
-                                 {MAX_POLICY_RETRIES}): {} — re-waiting for checks",
+                                 {}): {} — re-waiting for checks",
+                                merge::MAX_POLICY_RETRIES,
                                 attempt.message
                             ));
                             let retry_outcome = {
@@ -34289,6 +34293,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     reviewers[0].reviewed_head_sha = fixture.reviewed_head_sha;
                     let wt_mgr = WorktreeManager::new();
                     let mut workers = Vec::new();
+                    let mut branch_sync_checks = branch_sync::BranchSyncChecks::default();
                     let mut pre_review_checks = HashMap::new();
                     let mut pending_reviewer_resumes = HashMap::new();
                     let mut poison_tracker = PoisonTracker::new();
@@ -34314,6 +34319,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         &mut name_pool,
                         &mut workers,
                         &mut reviewers,
+                        &mut branch_sync_checks,
                         &mut pre_review_checks,
                         &mut pending_reviewer_resumes,
                         &mut poison_tracker,
@@ -34375,6 +34381,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     reviewers[0].pr = Some(pr);
                     let wt_mgr = WorktreeManager::new();
                     let mut workers = Vec::new();
+                    let mut branch_sync_checks = branch_sync::BranchSyncChecks::default();
                     let mut pre_review_checks = HashMap::new();
                     let mut pending_reviewer_resumes = HashMap::new();
                     let mut poison_tracker = PoisonTracker::new();
@@ -34400,6 +34407,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         &mut name_pool,
                         &mut workers,
                         &mut reviewers,
+                        &mut branch_sync_checks,
                         &mut pre_review_checks,
                         &mut pending_reviewer_resumes,
                         &mut poison_tracker,

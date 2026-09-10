@@ -1048,6 +1048,63 @@ impl WorktreeManager {
         }
     }
 
+    /// Refresh the post-merge target branch before branch-sync completion
+    /// reads GitHub's merge-commit identity.
+    pub async fn fetch_branch_sync_target(
+        &self,
+        repo_dir: &Path,
+        target_branch: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        let mut fetch = self.git_cmd(repo_dir);
+        fetch.args(["fetch", "origin", target_branch]);
+        let fetched = run_git(fetch, self.fetch_timeout, "git fetch branch sync target").await?;
+        if !fetched.status.success() {
+            return Err(format!(
+                "git fetch origin {target_branch} failed: {}",
+                git_diagnostic(&fetched.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Prove that an immutable GitHub merge commit contains both tips pinned
+    /// by a branch synchronization. Callers fetch the target immediately
+    /// before resolving the merge commit, so this check has the remote object
+    /// graph needed for a loud verification failure rather than a guess.
+    pub async fn verify_branch_sync_merge_ancestry(
+        &self,
+        repo_dir: &Path,
+        merge_commit_sha: &str,
+        source_sha: &str,
+        target_sha: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        for (tip_name, tip_sha) in [("source", source_sha), ("target", target_sha)] {
+            let mut ancestry = self.git_cmd(repo_dir);
+            ancestry.args(["merge-base", "--is-ancestor", tip_sha, merge_commit_sha]);
+            let result = run_git(
+                ancestry,
+                self.local_timeout,
+                "git verify branch sync merge ancestry",
+            )
+            .await?;
+            if result.status.success() {
+                continue;
+            }
+            if matches!(result.status.code(), Some(1) | Some(128)) {
+                return Err(format!(
+                    "branch sync merge commit {merge_commit_sha} does not contain pinned {tip_name} tip {tip_sha}"
+                ));
+            }
+            return Err(format!(
+                "cannot verify pinned {tip_name} tip {tip_sha} against branch sync merge commit {merge_commit_sha}: {}",
+                git_diagnostic(&result.stderr)
+            ));
+        }
+        Ok(())
+    }
+
     /// Reconstruct (or reopen) the daemon-owned sync worktree at a pinned
     /// target and merge the pinned source. The manager lock serializes branch
     /// creation, worktree attachment, and the merge so another daemon action
