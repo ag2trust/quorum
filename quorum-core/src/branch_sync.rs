@@ -8,7 +8,7 @@
 use crate::db::{begin_immediate, map_sql_err};
 use crate::error::{QuorumError, Result};
 use crate::sweep::SWEEP_LIMIT;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use serde::Serialize;
 
 const COLS: &str = "id, source_branch, target_branch, source_sha, target_sha, sync_branch, \
@@ -254,17 +254,37 @@ pub fn list_active(conn: &Connection) -> Result<Vec<BranchSync>> {
 /// conflict or CI failure remains active for its later judgment path, but must
 /// not monopolize a daemon tick.
 pub fn next_clean_path(conn: &Connection) -> Result<Option<BranchSync>> {
+    next_clean_path_excluding(conn, &[])
+}
+
+/// Select one runnable clean-path row while excluding in-flight external
+/// operations owned by the daemon's in-memory coordinator. Exclusion is only
+/// a scheduling concern: the durable `phase` remains the authority after a
+/// restart, when no stale process-local handle survives.
+pub fn next_clean_path_excluding(
+    conn: &Connection,
+    excluded_ids: &[i64],
+) -> Result<Option<BranchSync>> {
+    let mut sql = format!(
+        "SELECT {COLS} FROM branch_syncs
+         WHERE active=1
+           AND phase IN ('requested','pinned','prepared','published','checks','merging')"
+    );
+    if !excluded_ids.is_empty() {
+        let placeholders = std::iter::repeat_n("?", excluded_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(&format!(" AND id NOT IN ({placeholders})"));
+    }
+    sql.push_str(
+        " ORDER BY CASE WHEN phase IN ('published','checks','merging') THEN 1 ELSE 0 END,
+                  updated_at ASC, id ASC
+          LIMIT 1",
+    );
     Ok(conn
         .query_row(
-            &format!(
-                "SELECT {COLS} FROM branch_syncs
-                 WHERE active=1
-                   AND phase IN ('requested','pinned','prepared','published','checks','merging')
-                 ORDER BY CASE WHEN phase IN ('published','checks','merging') THEN 1 ELSE 0 END,
-                          updated_at ASC, id ASC
-                 LIMIT 1"
-            ),
-            [],
+            &sql,
+            params_from_iter(excluded_ids.iter()),
             row_to_branch_sync,
         )
         .optional()?)
@@ -785,6 +805,38 @@ mod tests {
             get(&conn, published_row.id).unwrap().unwrap().updated_at,
             105,
             "published rows rotate only after a successful live verification"
+        );
+    }
+
+    #[test]
+    fn excluded_checks_row_yields_to_another_checks_row() {
+        let (_dir, mut conn) = open_tmp();
+        let source = "a".repeat(40);
+        let target = "b".repeat(40);
+        let first = requested(request(&mut conn, "main", "develop", "A", 100).unwrap());
+        pin(&mut conn, first.id, &source, &target, "sync/1", 101)
+            .unwrap()
+            .unwrap();
+        prepared(&mut conn, first.id, "sync/1", &"c".repeat(40), 102)
+            .unwrap()
+            .unwrap();
+        published(&mut conn, first.id, 41, 103).unwrap().unwrap();
+        begin_checks(&mut conn, first.id, 104).unwrap().unwrap();
+
+        let second = requested(request(&mut conn, "release", "develop", "B", 100).unwrap());
+        pin(&mut conn, second.id, &source, &target, "sync/2", 101)
+            .unwrap()
+            .unwrap();
+        prepared(&mut conn, second.id, "sync/2", &"d".repeat(40), 102)
+            .unwrap()
+            .unwrap();
+        published(&mut conn, second.id, 42, 103).unwrap().unwrap();
+        begin_checks(&mut conn, second.id, 104).unwrap().unwrap();
+
+        assert_eq!(
+            next_clean_path_excluding(&conn, &[first.id]).unwrap(),
+            Some(get(&conn, second.id).unwrap().unwrap()),
+            "an in-flight checks wait must not monopolize reconciliation"
         );
     }
 

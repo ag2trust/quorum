@@ -11,18 +11,76 @@ use super::{
 };
 use quorum_core::branch_sync::{self, BranchSync};
 use quorum_core::error::{QuorumError, Result};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 
 const PR_OPEN: &str = "OPEN";
 
+/// Retained, bounded branch-sync CI work. Each active checks row owns at most
+/// one background waiter; a pending waiter is excluded from selection so it
+/// cannot hold the serialized daemon tick or monopolize the sync slot.
+#[derive(Default)]
+pub struct BranchSyncChecks {
+    waits: HashMap<i64, BranchSyncCheckWait>,
+}
+
+struct BranchSyncCheckWait {
+    pr: i64,
+    state: BranchSyncCheckState,
+}
+
+enum BranchSyncCheckState {
+    Waiting(JoinHandle<merge::ChecksOutcome>),
+    Retry { not_before: Instant },
+}
+
+impl BranchSyncChecks {
+    fn excluded_ids(&self) -> Vec<i64> {
+        let now = Instant::now();
+        self.waits
+            .iter()
+            .filter_map(|(id, wait)| match &wait.state {
+                BranchSyncCheckState::Waiting(handle) if !handle.is_finished() => Some(*id),
+                BranchSyncCheckState::Retry { not_before } if *not_before > now => Some(*id),
+                BranchSyncCheckState::Waiting(_) | BranchSyncCheckState::Retry { .. } => None,
+            })
+            .collect()
+    }
+
+    fn cancel(&mut self, id: i64) {
+        if let Some(wait) = self.waits.remove(&id) {
+            if let BranchSyncCheckState::Waiting(handle) = wait.state {
+                handle.abort();
+            }
+        }
+    }
+}
+
+impl Drop for BranchSyncChecks {
+    fn drop(&mut self) {
+        for wait in self.waits.values_mut() {
+            if let BranchSyncCheckState::Waiting(handle) = &wait.state {
+                handle.abort();
+            }
+        }
+    }
+}
+
 /// Reconcile one active clean-path row. Invoking this on startup and once per
 /// normal tick gives crash recovery without an unbounded non-task scan.
-pub async fn reconcile_one(config: &ServeConfig, worktrees: &WorktreeManager) -> Result<()> {
+pub async fn reconcile_one(
+    config: &ServeConfig,
+    worktrees: &WorktreeManager,
+    checks: &mut BranchSyncChecks,
+) -> Result<()> {
     let db_path = config.db_path.clone();
+    let excluded = checks.excluded_ids();
     let sync = tokio::task::spawn_blocking(move || -> Result<Option<BranchSync>> {
         let conn = quorum_core::db::open(&db_path)?;
-        branch_sync::next_clean_path(&conn)
+        branch_sync::next_clean_path_excluding(&conn, &excluded)
     })
     .await
     .map_err(|error| QuorumError::Io(format!("branch sync selection join: {error}")))??;
@@ -35,7 +93,7 @@ pub async fn reconcile_one(config: &ServeConfig, worktrees: &WorktreeManager) ->
         "pinned" => prepare_pinned(config, worktrees, &sync).await,
         "prepared" => publish_prepared(config, worktrees, &sync).await,
         "published" => begin_published_checks(config, &sync).await,
-        "checks" => run_checks(config, &sync).await,
+        "checks" => run_checks(config, &sync, checks).await,
         "merging" => reconcile_merge(config, worktrees, &sync).await,
         // `next_clean_path` is intentionally narrower than the persisted
         // vocabulary, so this means the database query and row parser no
@@ -273,12 +331,56 @@ async fn begin_published_checks(
 
 const REQUIRED_JOBS_ERROR: &str = "branch sync requires a non-empty required_jobs gate";
 
-async fn run_checks(config: &ServeConfig, sync: &BranchSync) -> std::result::Result<(), String> {
+async fn run_checks(
+    config: &ServeConfig,
+    sync: &BranchSync,
+    waits: &mut BranchSyncChecks,
+) -> std::result::Result<(), String> {
     if config.required_jobs.is_empty() {
+        waits.cancel(sync.id);
         return Err(REQUIRED_JOBS_ERROR.to_string());
     }
     let pr = required_pr(sync)?;
-    let mut checks = {
+    if waits.waits.get(&sync.id).is_some_and(|wait| wait.pr != pr) {
+        waits.cancel(sync.id);
+    }
+
+    let state = waits.waits.remove(&sync.id).map(|wait| wait.state);
+    let checks = match state {
+        Some(BranchSyncCheckState::Waiting(handle)) if !handle.is_finished() => {
+            waits.waits.insert(
+                sync.id,
+                BranchSyncCheckWait {
+                    pr,
+                    state: BranchSyncCheckState::Waiting(handle),
+                },
+            );
+            return Ok(());
+        }
+        Some(BranchSyncCheckState::Waiting(handle)) => handle
+            .await
+            .map_err(|error| format!("branch sync checks join: {error}"))?,
+        Some(BranchSyncCheckState::Retry { not_before }) if not_before > Instant::now() => {
+            waits.waits.insert(
+                sync.id,
+                BranchSyncCheckWait {
+                    pr,
+                    state: BranchSyncCheckState::Retry { not_before },
+                },
+            );
+            return Ok(());
+        }
+        Some(BranchSyncCheckState::Retry { .. }) | None => {
+            start_checks_wait(config, waits, sync.id, pr);
+            return Ok(());
+        }
+    };
+
+    settle_checks(config, sync, waits, pr, checks).await
+}
+
+fn start_checks_wait(config: &ServeConfig, waits: &mut BranchSyncChecks, id: i64, pr: i64) {
+    let handle = {
         let repo = config.repo_dir.clone();
         let executor = Arc::clone(&config.merge_executor);
         let timeout = config.merge_checks_timeout_secs;
@@ -286,9 +388,23 @@ async fn run_checks(config: &ServeConfig, sync: &BranchSync) -> std::result::Res
         tokio::task::spawn_blocking(move || {
             executor.wait_for_branch_sync_checks(pr, &repo, timeout, poll)
         })
-        .await
-        .map_err(|error| format!("branch sync checks join: {error}"))?
     };
+    waits.waits.insert(
+        id,
+        BranchSyncCheckWait {
+            pr,
+            state: BranchSyncCheckState::Waiting(handle),
+        },
+    );
+}
+
+async fn settle_checks(
+    config: &ServeConfig,
+    sync: &BranchSync,
+    waits: &mut BranchSyncChecks,
+    pr: i64,
+    mut checks: merge::ChecksOutcome,
+) -> std::result::Result<(), String> {
     if matches!(checks, merge::ChecksOutcome::Ready) {
         let required_jobs = {
             let repo = config.repo_dir.clone();
@@ -327,7 +443,22 @@ async fn run_checks(config: &ServeConfig, sync: &BranchSync) -> std::result::Res
             .map_err(|error| format!("branch sync CI failure settlement join: {error}"))?
             .map_err(|error| error.to_string())
         }
-        merge::ChecksOutcome::Pending { .. } | merge::ChecksOutcome::TimedOut => Ok(()),
+        merge::ChecksOutcome::Pending { .. } | merge::ChecksOutcome::TimedOut => {
+            // The full wait has already bounded its own polling. Retain only
+            // a scheduled retry, rather than waiting inside this tick or
+            // immediately selecting the same row again.
+            waits.waits.insert(
+                sync.id,
+                BranchSyncCheckWait {
+                    pr,
+                    state: BranchSyncCheckState::Retry {
+                        not_before: Instant::now()
+                            + Duration::from_secs(config.merge_checks_poll_secs),
+                    },
+                },
+            );
+            Ok(())
+        }
     }
 }
 
@@ -691,6 +822,8 @@ mod tests {
         merge_success: bool,
         merge_calls: std::sync::atomic::AtomicUsize,
         merge_heads: Mutex<Vec<String>>,
+        wait_calls: std::sync::atomic::AtomicUsize,
+        wait_delay: Option<Duration>,
     }
 
     impl SyncExecutor {
@@ -709,7 +842,14 @@ mod tests {
                 merge_success,
                 merge_calls: std::sync::atomic::AtomicUsize::new(0),
                 merge_heads: Mutex::new(Vec::new()),
+                wait_calls: std::sync::atomic::AtomicUsize::new(0),
+                wait_delay: None,
             }
+        }
+
+        fn with_wait_delay(mut self, delay: Duration) -> Self {
+            self.wait_delay = Some(delay);
+            self
         }
     }
 
@@ -749,6 +889,11 @@ mod tests {
             _timeout_secs: u64,
             _poll_interval_secs: u64,
         ) -> merge::ChecksOutcome {
+            self.wait_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(delay) = self.wait_delay {
+                std::thread::sleep(delay);
+            }
             self.checks.clone()
         }
 
@@ -768,15 +913,29 @@ mod tests {
         target_sha: &str,
         phase: &str,
     ) -> BranchSync {
+        sync_at_phase_for_pair(db_path, "develop", "main", source_sha, target_sha, phase)
+    }
+
+    fn sync_at_phase_for_pair(
+        db_path: &Path,
+        source_branch: &str,
+        target_branch: &str,
+        source_sha: &str,
+        target_sha: &str,
+        phase: &str,
+    ) -> BranchSync {
         let mut conn = quorum_core::db::open(db_path).unwrap();
-        let row = match branch_sync::request(&mut conn, "develop", "main", "owner", 1).unwrap() {
+        let row = match branch_sync::request(&mut conn, source_branch, target_branch, "owner", 1)
+            .unwrap()
+        {
             branch_sync::RequestOutcome::Requested(row) => row,
             branch_sync::RequestOutcome::AlreadyActive(_) => unreachable!(),
         };
-        branch_sync::pin(&mut conn, row.id, source_sha, target_sha, "sync/1", 2)
+        let sync_branch = format!("sync/{}", row.id);
+        branch_sync::pin(&mut conn, row.id, source_sha, target_sha, &sync_branch, 2)
             .unwrap()
             .unwrap();
-        branch_sync::prepared(&mut conn, row.id, "sync/1", &"c".repeat(40), 3)
+        branch_sync::prepared(&mut conn, row.id, &sync_branch, &"c".repeat(40), 3)
             .unwrap()
             .unwrap();
         branch_sync::published(&mut conn, row.id, 42, 4)
@@ -793,6 +952,26 @@ mod tests {
                 .unwrap();
         }
         branch_sync::get(&conn, row.id).unwrap().unwrap()
+    }
+
+    async fn reconcile_until_phase(
+        config: &ServeConfig,
+        worktrees: &WorktreeManager,
+        checks: &mut BranchSyncChecks,
+        db_path: &Path,
+        id: i64,
+        phase: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            reconcile_one(config, worktrees, checks).await.unwrap();
+            let conn = quorum_core::db::open(db_path).unwrap();
+            if branch_sync::get(&conn, id).unwrap().unwrap().phase == phase {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("branch sync #{id} did not reach {phase}");
     }
 
     fn config_with_executor(
@@ -826,7 +1005,8 @@ mod tests {
         ));
         let config = config_with_executor(root.path(), db_path.clone(), executor, Vec::new());
 
-        reconcile_one(&config, &WorktreeManager::new())
+        let mut checks = BranchSyncChecks::default();
+        reconcile_one(&config, &WorktreeManager::new(), &mut checks)
             .await
             .unwrap();
 
@@ -874,9 +1054,17 @@ mod tests {
             vec!["ci".to_string()],
         );
 
-        reconcile_one(&config, &WorktreeManager::new())
-            .await
-            .unwrap();
+        let manager = WorktreeManager::new();
+        let mut checks = BranchSyncChecks::default();
+        reconcile_until_phase(
+            &config,
+            &manager,
+            &mut checks,
+            &db_path,
+            row.id,
+            "ci_failed",
+        )
+        .await;
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         let failed = branch_sync::get(&conn, row.id).unwrap().unwrap();
@@ -912,9 +1100,9 @@ mod tests {
             vec!["ci".to_string()],
         );
 
-        reconcile_one(&config, &WorktreeManager::new())
-            .await
-            .unwrap();
+        let manager = WorktreeManager::new();
+        let mut checks = BranchSyncChecks::default();
+        reconcile_until_phase(&config, &manager, &mut checks, &db_path, row.id, "merging").await;
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         let merging = branch_sync::get(&conn, row.id).unwrap().unwrap();
@@ -925,6 +1113,129 @@ mod tests {
                 .merge_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_checks_waits_are_nonblocking_and_do_not_monopolize_reconciliation() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("quorum.db");
+        let first = sync_at_phase_for_pair(
+            &db_path,
+            "develop",
+            "main",
+            &"a".repeat(40),
+            &"b".repeat(40),
+            "checks",
+        );
+        let second = sync_at_phase_for_pair(
+            &db_path,
+            "release",
+            "main",
+            &"c".repeat(40),
+            &"d".repeat(40),
+            "checks",
+        );
+        let executor = Arc::new(
+            SyncExecutor::new(
+                merge::ChecksOutcome::TimedOut,
+                merge::RequiredJobsOutcome::AllSucceeded,
+                MergeCommitStatus::Open,
+                None,
+                true,
+            )
+            .with_wait_delay(Duration::from_millis(500)),
+        );
+        let mut config = config_with_executor(
+            root.path(),
+            db_path,
+            executor.clone(),
+            vec!["ci".to_string()],
+        );
+        config.merge_checks_poll_secs = 30;
+        let manager = WorktreeManager::new();
+        let mut checks = BranchSyncChecks::default();
+
+        let first_tick = Instant::now();
+        reconcile_one(&config, &manager, &mut checks).await.unwrap();
+        assert!(
+            first_tick.elapsed() < Duration::from_millis(200),
+            "the synchronous CI waiter must not hold the daemon tick"
+        );
+
+        let second_tick = Instant::now();
+        reconcile_one(&config, &manager, &mut checks).await.unwrap();
+        assert!(
+            second_tick.elapsed() < Duration::from_millis(200),
+            "an in-flight checks row must not delay another row"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while executor
+            .wait_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < 2
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            executor
+                .wait_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "each checks row owns one retained wait instead of reselecting the oldest row"
+        );
+        assert!(checks.waits.contains_key(&first.id));
+        assert!(checks.waits.contains_key(&second.id));
+    }
+
+    #[tokio::test]
+    async fn timed_out_checks_wait_is_cadenced_outside_the_tick_loop() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("quorum.db");
+        let row = sync_at_phase(&db_path, &"a".repeat(40), &"b".repeat(40), "checks");
+        let executor = Arc::new(SyncExecutor::new(
+            merge::ChecksOutcome::TimedOut,
+            merge::RequiredJobsOutcome::AllSucceeded,
+            MergeCommitStatus::Open,
+            None,
+            true,
+        ));
+        let mut config = config_with_executor(
+            root.path(),
+            db_path,
+            executor.clone(),
+            vec!["ci".to_string()],
+        );
+        config.merge_checks_poll_secs = 30;
+        let manager = WorktreeManager::new();
+        let mut checks = BranchSyncChecks::default();
+
+        reconcile_one(&config, &manager, &mut checks).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !matches!(
+            checks.waits.get(&row.id).map(|wait| &wait.state),
+            Some(BranchSyncCheckState::Retry { .. })
+        ) && Instant::now() < deadline
+        {
+            reconcile_one(&config, &manager, &mut checks).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(matches!(
+            checks.waits.get(&row.id).map(|wait| &wait.state),
+            Some(BranchSyncCheckState::Retry { .. })
+        ));
+
+        for _ in 0..20 {
+            reconcile_one(&config, &manager, &mut checks).await.unwrap();
+        }
+        assert_eq!(
+            executor
+                .wait_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a completed timeout must wait for its scheduled retry instead of polling every tick"
         );
     }
 
@@ -997,7 +1308,8 @@ mod tests {
             vec!["ci".to_string()],
         );
 
-        reconcile_one(&config, &WorktreeManager::new())
+        let mut checks = BranchSyncChecks::default();
+        reconcile_one(&config, &WorktreeManager::new(), &mut checks)
             .await
             .unwrap();
 
@@ -1034,7 +1346,8 @@ mod tests {
             merged_executor.clone(),
             vec!["ci".to_string()],
         );
-        reconcile_one(&merged_config, &WorktreeManager::new())
+        let mut merged_checks = BranchSyncChecks::default();
+        reconcile_one(&merged_config, &WorktreeManager::new(), &mut merged_checks)
             .await
             .unwrap();
         let merged_conn = quorum_core::db::open(&merged_db).unwrap();
@@ -1076,7 +1389,8 @@ mod tests {
             open_executor.clone(),
             vec!["ci".to_string()],
         );
-        reconcile_one(&open_config, &WorktreeManager::new())
+        let mut open_checks = BranchSyncChecks::default();
+        reconcile_one(&open_config, &WorktreeManager::new(), &mut open_checks)
             .await
             .unwrap();
         let open_conn = quorum_core::db::open(&open_db).unwrap();
@@ -1113,7 +1427,8 @@ mod tests {
             closed_executor.clone(),
             vec!["ci".to_string()],
         );
-        reconcile_one(&closed_config, &WorktreeManager::new())
+        let mut closed_checks = BranchSyncChecks::default();
+        reconcile_one(&closed_config, &WorktreeManager::new(), &mut closed_checks)
             .await
             .unwrap();
         let closed_conn = quorum_core::db::open(&closed_db).unwrap();
@@ -1183,15 +1498,16 @@ mod tests {
         };
         drop(conn);
         let manager = WorktreeManager::new();
+        let mut checks = BranchSyncChecks::default();
 
-        reconcile_one(&config, &manager).await.unwrap();
+        reconcile_one(&config, &manager, &mut checks).await.unwrap();
         let conn = quorum_core::db::open(&db_path).unwrap();
         let pinned = branch_sync::get(&conn, row.id).unwrap().unwrap();
         assert_eq!(pinned.phase, "pinned");
         assert!(pinned.source_sha.is_some() && pinned.target_sha.is_some());
         drop(conn);
 
-        reconcile_one(&config, &manager).await.unwrap();
+        reconcile_one(&config, &manager, &mut checks).await.unwrap();
         let conn = quorum_core::db::open(&db_path).unwrap();
         let prepared = branch_sync::get(&conn, row.id).unwrap().unwrap();
         assert_eq!(prepared.phase, "prepared");
@@ -1203,7 +1519,7 @@ mod tests {
         );
 
         write_gh(&gh, &merge_sha, "OPEN");
-        reconcile_one(&config, &manager).await.unwrap();
+        reconcile_one(&config, &manager, &mut checks).await.unwrap();
         let conn = quorum_core::db::open(&db_path).unwrap();
         let published = branch_sync::get(&conn, row.id).unwrap().unwrap();
         assert_eq!(published.phase, "published");
@@ -1211,7 +1527,7 @@ mod tests {
         drop(conn);
 
         write_gh(&gh, "stale", "OPEN");
-        reconcile_one(&config, &manager).await.unwrap();
+        reconcile_one(&config, &manager, &mut checks).await.unwrap();
         let conn = quorum_core::db::open(&db_path).unwrap();
         let failed = branch_sync::get(&conn, row.id).unwrap().unwrap();
         assert_eq!(failed.phase, "failed");
