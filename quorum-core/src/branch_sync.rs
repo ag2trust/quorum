@@ -717,6 +717,107 @@ pub fn fail(
     Ok(sync)
 }
 
+/// Result of a coordinator-issued cancel attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// Cancellation succeeded; the row is now terminal and the pair released.
+    Cancelled(BranchSync),
+    /// No such id.
+    NotFound,
+    /// Row exists but is not in a cancellable phase, or a judgment task is
+    /// already attached — the operator must intervene through the task itself.
+    NotCancellable(BranchSync),
+}
+
+/// Phases a coordinator may cancel. `checks` and `merging` are excluded
+/// because an in-flight external CI wait or `gh pr merge` call owns
+/// authority; `conflict` and terminals cannot be cancelled from the CLI.
+fn is_coordinator_cancellable(phase: &str) -> bool {
+    matches!(
+        phase,
+        "requested" | "pinned" | "prepared" | "published" | "ci_failed"
+    )
+}
+
+/// Atomically cancel one active row and release the pair. Rows with a
+/// judgment task attached are rejected: the operator must cancel that task.
+pub fn cancel_request(conn: &mut Connection, id: i64, by: &str, now: i64) -> Result<CancelOutcome> {
+    if by.is_empty() || by.contains('\0') {
+        return Err(QuorumError::Usage(
+            "branch-sync --by must not be empty or contain NUL".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    crate::agents::touch(&tx, by, now)?;
+    let Some(current) = tx
+        .query_row(
+            &format!("SELECT {COLS} FROM branch_syncs WHERE id=?1"),
+            [id],
+            row_to_branch_sync,
+        )
+        .optional()?
+    else {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(CancelOutcome::NotFound);
+    };
+    if !current.active || !is_coordinator_cancellable(&current.phase) || current.task_id.is_some() {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(CancelOutcome::NotCancellable(current));
+    }
+    let cancelled = tx
+        .query_row(
+            &format!(
+                "UPDATE branch_syncs
+                 SET phase='cancelled',active=0,updated_at=?1
+                 WHERE id=?2 AND phase=?3 AND active=1 AND task_id IS NULL
+                 RETURNING {COLS}"
+            ),
+            params![now, id, current.phase],
+            row_to_branch_sync,
+        )
+        .optional()?;
+    let Some(row) = cancelled else {
+        // A concurrent phase advance won the race; reread and report the current row.
+        let reread = tx
+            .query_row(
+                &format!("SELECT {COLS} FROM branch_syncs WHERE id=?1"),
+                [id],
+                row_to_branch_sync,
+            )
+            .optional()?;
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(match reread {
+            Some(row) => CancelOutcome::NotCancellable(row),
+            None => CancelOutcome::NotFound,
+        });
+    };
+    crate::events::emit(
+        &tx,
+        "branch_sync_cancelled",
+        &format!("branch_sync#{id}"),
+        &format!(
+            "{} -> {} cancelled by {} from {}",
+            row.source_branch, row.target_branch, by, current.phase
+        ),
+        now,
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(CancelOutcome::Cancelled(row))
+}
+
+/// Return the most recent terminal rows, newest first. Bounded by `limit` so
+/// a long history stays cheap for a short read.
+pub fn list_recent_terminal(conn: &Connection, limit: i64) -> Result<Vec<BranchSync>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLS} FROM branch_syncs WHERE active=0
+         ORDER BY updated_at DESC, id DESC LIMIT ?1"
+    ))?;
+    let syncs = stmt
+        .query_map(params![limit], row_to_branch_sync)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(syncs)
+}
+
 fn bounded_error(error: &str) -> String {
     let mut value = error.replace('\0', "<NUL>");
     const LIMIT: usize = 2048;
@@ -1048,5 +1149,113 @@ mod tests {
             .expect("failed must end any active phase");
         assert_eq!(failed.phase, "failed");
         assert!(!failed.active);
+    }
+
+    #[test]
+    fn cancel_request_releases_pair_and_emits_event() {
+        let (_dir, mut conn) = open_tmp();
+        let sync = requested(request(&mut conn, "main", "develop", "A", 100).unwrap());
+        let outcome = cancel_request(&mut conn, sync.id, "coordinator", 101).unwrap();
+        match outcome {
+            CancelOutcome::Cancelled(row) => {
+                assert_eq!(row.phase, "cancelled");
+                assert!(!row.active);
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+        assert!(active_for_pair(&conn, "main", "develop").unwrap().is_none());
+        let event: String = conn
+            .query_row(
+                "SELECT kind FROM events WHERE subject=?1 ORDER BY seq DESC LIMIT 1",
+                [format!("branch_sync#{}", sync.id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event, "branch_sync_cancelled");
+    }
+
+    #[test]
+    fn cancel_request_rejects_checks_merging_and_conflict() {
+        let (_dir, mut conn) = open_tmp();
+        let source = "a".repeat(40);
+        let target = "b".repeat(40);
+
+        // checks phase — not cancellable
+        let a = requested(request(&mut conn, "main", "develop", "A", 100).unwrap());
+        pin(&mut conn, a.id, &source, &target, "sync/1", 101)
+            .unwrap()
+            .unwrap();
+        prepared(&mut conn, a.id, "sync/1", &"c".repeat(40), 102)
+            .unwrap()
+            .unwrap();
+        published(&mut conn, a.id, 11, 103).unwrap().unwrap();
+        begin_checks(&mut conn, a.id, 104).unwrap().unwrap();
+        assert!(matches!(
+            cancel_request(&mut conn, a.id, "coordinator", 105).unwrap(),
+            CancelOutcome::NotCancellable(row) if row.phase == "checks"
+        ));
+
+        // conflict phase — not cancellable via CLI
+        let b = requested(request(&mut conn, "release", "develop", "A", 100).unwrap());
+        pin(&mut conn, b.id, &source, &target, "sync/2", 101)
+            .unwrap()
+            .unwrap();
+        conflict(&mut conn, b.id, 102).unwrap().unwrap();
+        assert!(matches!(
+            cancel_request(&mut conn, b.id, "coordinator", 103).unwrap(),
+            CancelOutcome::NotCancellable(row) if row.phase == "conflict"
+        ));
+    }
+
+    #[test]
+    fn cancel_request_of_missing_row_is_a_clean_negative() {
+        let (_dir, mut conn) = open_tmp();
+        assert_eq!(
+            cancel_request(&mut conn, 999, "coordinator", 100).unwrap(),
+            CancelOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn cancel_request_of_terminal_row_reports_not_cancellable() {
+        let (_dir, mut conn) = open_tmp();
+        let sync = requested(request(&mut conn, "main", "develop", "A", 100).unwrap());
+        set_phase(&mut conn, sync.id, "requested", "failed", 101)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            cancel_request(&mut conn, sync.id, "coordinator", 102).unwrap(),
+            CancelOutcome::NotCancellable(row) if row.phase == "failed"
+        ));
+    }
+
+    #[test]
+    fn list_recent_terminal_returns_newest_first_bounded() {
+        let (_dir, mut conn) = open_tmp();
+        for (i, (src, dst)) in [
+            ("main", "develop"),
+            ("release", "develop"),
+            ("hotfix", "main"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sync = requested(request(&mut conn, src, dst, "A", 100 + i as i64).unwrap());
+            set_phase(
+                &mut conn,
+                sync.id,
+                "requested",
+                "failed",
+                200 + i as i64 * 10,
+            )
+            .unwrap()
+            .unwrap();
+        }
+        let all = list_recent_terminal(&conn, 10).unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(all[0].updated_at >= all[1].updated_at);
+        assert!(all[1].updated_at >= all[2].updated_at);
+        let limited = list_recent_terminal(&conn, 2).unwrap();
+        assert_eq!(limited.len(), 2);
     }
 }

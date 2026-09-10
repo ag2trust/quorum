@@ -154,19 +154,33 @@ pub enum Command {
         #[arg(long = "task-id")]
         task_id: i64,
     },
-    /// Enqueue one configured, daemon-internal branch synchronization. A
-    /// clean synchronization remains taskless; later daemon work handles it.
+    /// Enqueue one configured, daemon-internal branch synchronization, list
+    /// active and recent rows, or cancel one active row. A clean
+    /// synchronization remains taskless; later daemon work handles it.
+    ///
+    /// Modes:
+    ///   `--by <id> --from <src> --to <dst>` — enqueue one request.
+    ///   `--list` — JSON of active rows plus the last 10 terminal rows.
+    ///   `--cancel <id> --by <agent>` — cancel one cancellable active row.
+    ///
+    /// The modes are mutually exclusive.
     #[command(name = "branch-sync")]
     BranchSync {
-        /// Identity recorded as the requestor.
+        /// Identity recorded as the requestor or canceller.
         #[arg(long)]
-        by: String,
+        by: Option<String>,
         /// Source branch whose commits will be synchronized.
-        #[arg(long)]
-        from: String,
+        #[arg(long, conflicts_with_all = ["list", "cancel"])]
+        from: Option<String>,
         /// Target branch to receive the source commits.
-        #[arg(long)]
-        to: String,
+        #[arg(long, conflicts_with_all = ["list", "cancel"])]
+        to: Option<String>,
+        /// List active and recent branch-sync rows as JSON.
+        #[arg(long, conflicts_with_all = ["from", "to", "cancel"])]
+        list: bool,
+        /// Cancel one active branch-sync by id. Requires `--by <agent>`.
+        #[arg(long, conflicts_with_all = ["from", "to", "list"])]
+        cancel: Option<i64>,
         /// Target repo as owner/name (e.g. ag2trust/quorum). Routes to that
         /// repo's DB and serve configuration instead of cwd/env.
         #[arg(long)]

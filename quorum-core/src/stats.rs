@@ -461,6 +461,33 @@ pub fn alert_due_at_retry(count: i64) -> bool {
     count == 0 || (count > 0 && (count & (count - 1)) == 0)
 }
 
+/// Compact projection of one active branch-sync row for `quorum status`.
+/// Bounded fields only — no free-text error detail, sync branch, or SHAs.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct BranchSyncSummary {
+    pub id: i64,
+    pub from: String,
+    pub to: String,
+    pub phase: String,
+    pub pr: Option<i64>,
+    pub task_id: Option<i64>,
+    pub updated_at: i64,
+}
+
+impl From<&crate::branch_sync::BranchSync> for BranchSyncSummary {
+    fn from(row: &crate::branch_sync::BranchSync) -> Self {
+        BranchSyncSummary {
+            id: row.id,
+            from: row.source_branch.clone(),
+            to: row.target_branch.clone(),
+            phase: row.phase.clone(),
+            pr: row.pr,
+            task_id: row.task_id,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
 /// Daemon liveness snapshot read from `daemon_lock`. Populated by the binary
 /// crate, which owns the platform PID-alive syscall used for the diagnostic
 /// `pid_dead` field.
@@ -605,6 +632,9 @@ pub struct Stats {
     pub alerts: Vec<AlertMessage>,
     /// #177: tasks stuck in the merge pipeline waiting on external conditions.
     pub merge_blockers: Vec<MergeBlockerView>,
+    /// Active daemon-internal branch synchronizations. Bounded projection —
+    /// the durable row is read via `branch-sync --list` or inspect helpers.
+    pub branch_syncs: Vec<BranchSyncSummary>,
     /// #115: daemon liveness from daemon_lock (populated by binary crate).
     pub daemon: DaemonLiveness,
     /// Live host memory/swap and filesystem telemetry. Populated after the
@@ -700,6 +730,10 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     let session_cost: f64 = daemon_agents.iter().map(|d| d.cost_usd).sum();
     let unbacked_prs = crate::drift::unbacked_pr_events(conn, now).unwrap_or_default();
     let twin_prs = crate::drift::twin_pr_events(conn, now).unwrap_or_default();
+    let branch_syncs = crate::branch_sync::list_active(conn)?
+        .iter()
+        .map(BranchSyncSummary::from)
+        .collect::<Vec<_>>();
 
     Ok(Stats {
         agents_total,
@@ -732,6 +766,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         twin_prs,
         alerts,
         merge_blockers,
+        branch_syncs,
         daemon: DaemonLiveness::default(),
         resources: None,
     })

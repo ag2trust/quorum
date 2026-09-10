@@ -21,6 +21,19 @@ COORDINATOR
   Send only execution-ready tasks. Interactive callers create, inspect, or cancel work;
   they do not claim tasks, impersonate managed agents, submit work, or set tasks to done.
 
+  Branch sync (daemon-internal; clean path creates no task):
+
+  quorum branch-sync --by <id> --from <src> --to <dst>
+      Enqueue one sync for a configured source/target pair.
+  quorum branch-sync --list
+      JSON of active rows plus the last 10 terminal rows.
+  quorum branch-sync --cancel <id> --by <id>
+      Cancel one active row on the clean path
+      (phases requested/pinned/prepared/published/ci_failed with no task).
+      The daemon removes the sync/ branch and closes the PR on its next tick.
+      A conflict or CI failure creates a judgment task with R1-only scoped review;
+      cancel the task itself, not the sync row.
+
 MANAGED AGENTS
   A managed worker or reviewer follows its spawn prompt. It receives its assignment and
   run identity from the daemon; it does not poll or claim work. The prompt supplies the

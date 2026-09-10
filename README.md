@@ -324,14 +324,20 @@ assignment directly; they do not poll or claim tasks.
 ## See what is happening
 
 ```sh
-quorum status                 # terminal overview
+quorum status                 # terminal overview (includes active branch syncs)
 quorum web                    # loopback-only, read-only dashboard
 quorum task-list --brief      # queue summary
 quorum task-get --task-id 42  # full task and notes
 quorum log --refs task#42     # lifecycle events
 quorum tail Agent-42          # one managed session
 quorum perf --by complexity   # terminal-task performance aggregates
+quorum branch-sync --list     # active + last 10 terminal branch-sync rows
 ```
+
+Configured branch synchronization runs internally between owner-selected branch pairs.
+A clean sync creates no task; a conflict or CI failure creates one judgment task with
+R1-only scoped review. Enqueue with `quorum branch-sync --by <id> --from <src> --to <dst>`
+and cancel a clean-path row with `quorum branch-sync --cancel <id> --by <id>`.
 
 The web dashboard's Live events view follows newly arriving provider events by default.
 Use **Load history** to replay the selected run from its recorded beginning. Unless

@@ -647,37 +647,111 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             output::emit(&serde_json::json!({ "id": id, "repo": resolved_repo }));
             Ok(0)
         }
-        cli::Command::BranchSync { by, from, to, repo } => {
-            quorum_core::tasks::validate_target_branch(&from)?;
-            quorum_core::tasks::validate_target_branch(&to)?;
-            if from == to {
-                return Err(QuorumError::Usage(
-                    "branch-sync --from and --to must differ".into(),
-                ));
-            }
+        cli::Command::BranchSync {
+            by,
+            from,
+            to,
+            list,
+            cancel,
+            repo,
+        } => {
             let resolved_repo = resolve_repo_override(repo.as_deref())?;
-            let configured = serve_config::branch_sync_pairs(&resolved_repo)?;
-            if !configured
-                .iter()
-                .any(|pair| pair[0] == from && pair[1] == to)
-            {
-                return Err(QuorumError::Usage(format!(
-                    "branch sync pair {from:?} -> {to:?} is not configured in sync_pairs"
-                )));
-            }
-            let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&resolved_repo)?)?;
-            match quorum_core::branch_sync::request(&mut conn, &from, &to, &by, now)? {
-                quorum_core::branch_sync::RequestOutcome::Requested(sync) => {
-                    output::emit(&serde_json::json!({ "id": sync.id, "phase": sync.phase }));
-                    Ok(0)
+            let db_path = paths::ensure_repo_dir(&resolved_repo)?;
+            if list {
+                if by.is_some() {
+                    return Err(QuorumError::Usage(
+                        "branch-sync --list does not take --by".into(),
+                    ));
                 }
-                quorum_core::branch_sync::RequestOutcome::AlreadyActive(sync) => {
-                    output::emit(&serde_json::json!({
-                        "ok": false,
-                        "id": sync.id,
-                        "phase": sync.phase,
-                    }));
-                    Ok(1)
+                let conn = quorum_core::db::open(&db_path)?;
+                let active: Vec<_> = quorum_core::branch_sync::list_active(&conn)?
+                    .iter()
+                    .map(quorum_core::stats::BranchSyncSummary::from)
+                    .collect();
+                let recent: Vec<_> = quorum_core::branch_sync::list_recent_terminal(&conn, 10)?
+                    .iter()
+                    .map(quorum_core::stats::BranchSyncSummary::from)
+                    .collect();
+                output::emit(&serde_json::json!({
+                    "active": active,
+                    "recent_terminal": recent,
+                }));
+                return Ok(0);
+            }
+            if let Some(id) = cancel {
+                let Some(by) = by else {
+                    return Err(QuorumError::Usage(
+                        "branch-sync --cancel requires --by <agent>".into(),
+                    ));
+                };
+                let mut conn = quorum_core::db::open(&db_path)?;
+                match quorum_core::branch_sync::cancel_request(&mut conn, id, &by, now)? {
+                    quorum_core::branch_sync::CancelOutcome::Cancelled(sync) => {
+                        output::emit(&serde_json::json!({
+                            "ok": true,
+                            "id": sync.id,
+                            "phase": sync.phase,
+                            "from": sync.source_branch,
+                            "to": sync.target_branch,
+                        }));
+                        Ok(0)
+                    }
+                    quorum_core::branch_sync::CancelOutcome::NotFound => {
+                        output::emit(&serde_json::json!({
+                            "ok": false,
+                            "reason": "no branch-sync row at that id",
+                            "id": id,
+                        }));
+                        Ok(1)
+                    }
+                    quorum_core::branch_sync::CancelOutcome::NotCancellable(sync) => {
+                        output::emit(&serde_json::json!({
+                            "ok": false,
+                            "reason": "row is not in a coordinator-cancellable state",
+                            "id": sync.id,
+                            "phase": sync.phase,
+                            "active": sync.active,
+                            "task_id": sync.task_id,
+                        }));
+                        Ok(1)
+                    }
+                }
+            } else {
+                let (Some(by), Some(from), Some(to)) = (by, from, to) else {
+                    return Err(QuorumError::Usage(
+                        "branch-sync requires --by, --from, and --to (or --list / --cancel)".into(),
+                    ));
+                };
+                quorum_core::tasks::validate_target_branch(&from)?;
+                quorum_core::tasks::validate_target_branch(&to)?;
+                if from == to {
+                    return Err(QuorumError::Usage(
+                        "branch-sync --from and --to must differ".into(),
+                    ));
+                }
+                let configured = serve_config::branch_sync_pairs(&resolved_repo)?;
+                if !configured
+                    .iter()
+                    .any(|pair| pair[0] == from && pair[1] == to)
+                {
+                    return Err(QuorumError::Usage(format!(
+                        "branch sync pair {from:?} -> {to:?} is not configured in sync_pairs"
+                    )));
+                }
+                let mut conn = quorum_core::db::open(&db_path)?;
+                match quorum_core::branch_sync::request(&mut conn, &from, &to, &by, now)? {
+                    quorum_core::branch_sync::RequestOutcome::Requested(sync) => {
+                        output::emit(&serde_json::json!({ "id": sync.id, "phase": sync.phase }));
+                        Ok(0)
+                    }
+                    quorum_core::branch_sync::RequestOutcome::AlreadyActive(sync) => {
+                        output::emit(&serde_json::json!({
+                            "ok": false,
+                            "id": sync.id,
+                            "phase": sync.phase,
+                        }));
+                        Ok(1)
+                    }
                 }
             }
         }

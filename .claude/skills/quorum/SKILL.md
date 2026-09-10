@@ -166,6 +166,18 @@ quorum task-close --agent <You> --task-id <N> --reason-file <path>
 If implementation moves outside an existing Quorum task, cancel that task before external work
 starts. When the external PR is ready, create a new `--review-pr` task.
 
+### Branch sync
+
+Configured branch synchronization deterministically carries commits between owner-selected
+branch pairs. A clean sync creates no task — the daemon handles pin, prepare, publish, CI,
+and merge internally against a `sync/` branch. A conflict or CI failure creates one
+judgment task with R1-only scoped review that a coordinator can inspect and cancel like
+any other task; the sync row stays active until that task resolves. Inspect the active and
+recent rows with `quorum branch-sync --list`, and cancel one taskless row on the clean path
+(phases `requested`/`pinned`/`prepared`/`published`/`ci_failed`) with
+`quorum branch-sync --cancel <id> --by <You>`. The daemon removes the `sync/` branch and
+closes the PR on its next tick.
+
 ## Operator
 
 This is a separately designated daemon-operator role, not an interactive coordinator. Start the
