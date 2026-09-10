@@ -1,8 +1,8 @@
 use quorum_core::drift::{TwinPr, UnbackedPr};
 use quorum_core::stats::{
-    AlertMessage, BlockedTask, DaemonAgentView, DaemonLiveness, DecompositionStatusView,
-    DedupedError, HealthVerdict, HostResourcesView, MergeBlockerView, PipelineTask, QueueTask,
-    ResourceSeverity, ReviewingTask, Stats,
+    AlertMessage, BlockedTask, BranchSyncSummary, DaemonAgentView, DaemonLiveness,
+    DecompositionStatusView, DedupedError, HealthVerdict, HostResourcesView, MergeBlockerView,
+    PipelineTask, QueueTask, ResourceSeverity, ReviewingTask, Stats,
 };
 use std::io::Write;
 
@@ -141,6 +141,7 @@ fn render_with_style_at_width(s: &Stats, sty: &Style, w: &mut dyn Write, width: 
     render_pipeline(&s.pipeline, sty, w, width);
     render_decomposition(s.decomposition.as_ref(), sty, w, width);
     render_merge_wait(&s.merge_blockers, sty, w, width);
+    render_branch_syncs(&s.branch_syncs, sty, w, width);
     render_unbacked_prs(&s.unbacked_prs, &s.twin_prs, sty, w, width);
     render_alerts(&s.alerts, sty, w, width);
     render_errors(&s.recent_errors, s.older_errors_silenced, sty, w, width);
@@ -741,6 +742,34 @@ fn render_unbacked_prs(
             warn,
             t.task_id,
             prs.join(", "),
+        );
+    }
+}
+
+fn render_branch_syncs(syncs: &[BranchSyncSummary], sty: &Style, w: &mut dyn Write, width: usize) {
+    if syncs.is_empty() {
+        return;
+    }
+    let _ = writeln!(w);
+    let _ = writeln!(w, "{}", sty.section_rule("BRANCH SYNCS", width));
+    for sync in syncs {
+        let pr = sync
+            .pr
+            .map(|n| format!("#{n}"))
+            .unwrap_or_else(|| "—".into());
+        let task = sync
+            .task_id
+            .map(|n| format!("task#{n}"))
+            .unwrap_or_else(|| "—".into());
+        let pair = format!("{} → {}", sync.from, sync.to);
+        let _ = writeln!(
+            w,
+            "  #{:<4} {:<28} {:<10} PR {:<6} {:<10}",
+            sync.id,
+            truncate(&pair, 28),
+            truncate(&sync.phase, 10),
+            pr,
+            task,
         );
     }
 }
