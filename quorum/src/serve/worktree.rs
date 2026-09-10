@@ -976,8 +976,10 @@ impl WorktreeManager {
         target_branch: &str,
     ) -> Result<(String, String), String> {
         let _guard = self.lock.lock().await;
+        let source_ref = format!("+refs/heads/{source_branch}:refs/remotes/origin/{source_branch}");
+        let target_ref = format!("+refs/heads/{target_branch}:refs/remotes/origin/{target_branch}");
         let mut fetch = self.git_cmd(repo_dir);
-        fetch.args(["fetch", "origin", source_branch, target_branch]);
+        fetch.args(["fetch", "origin", &source_ref, &target_ref]);
         let fetched = run_git(fetch, self.fetch_timeout, "git fetch branch sync refs").await?;
         if !fetched.status.success() {
             return Err(format!(
@@ -2256,6 +2258,41 @@ mod tests {
             .await
             .unwrap());
         assert!(!tmp.path().join("sync-worktree").exists());
+    }
+
+    #[tokio::test]
+    async fn branch_sync_fetch_pins_current_tips_in_a_fresh_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (source, bare) = init_repo_with_bare_remote(tmp.path());
+        let worker = tmp.path().join("fresh-clone");
+        assert!(StdCommand::new("git")
+            .args(["clone", &bare.to_string_lossy(), &worker.to_string_lossy()])
+            .status()
+            .unwrap()
+            .success());
+        let source_tip = push_branch(&source, "develop");
+        assert!(
+            !git_output(
+                &worker,
+                &["show-ref", "--verify", "refs/remotes/origin/develop"]
+            )
+            .status
+            .success(),
+            "the fresh clone must prove fetch creates the tracking ref"
+        );
+
+        let mgr = WorktreeManager::new();
+        let (pinned_source, pinned_target) = mgr
+            .fetch_sync_tips(&worker, "develop", "main")
+            .await
+            .unwrap();
+        assert_eq!(pinned_source, source_tip);
+        assert_eq!(pinned_target, git_rev_parse(&source, "main"));
+        assert_eq!(
+            git_rev_parse(&worker, "refs/remotes/origin/develop"),
+            source_tip,
+            "the persisted pin must come from the ref refreshed by this fetch"
+        );
     }
 
     #[tokio::test]

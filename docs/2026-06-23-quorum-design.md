@@ -473,7 +473,9 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   end any active phase. Phase changes are guarded compare-and-set updates and reject backward,
   skipped, and same-phase writes, so stale or restarted executors cannot overwrite or reorder
   durable progress. Every terminal transition except a judgment-pending `conflict` clears
-  `active` in the same statement, releasing the pair for a later request.
+  `active` in the same statement, releasing the pair for a later request. Bounded published-PR
+  reconciliation yields to any requested/pinned/prepared row and rotates successful published
+  checks, so an older active published row cannot starve a later synchronization.
 - The daemon executes the clean path internally; no task is created merely to merge, publish,
   wait for checks, or complete a no-op. A conflict preserves the daemon-owned worktree's
   `MERGE_HEAD` and unmerged index, stays active for the later judgment task, and is never pushed.

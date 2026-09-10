@@ -253,9 +253,11 @@ pub fn list_active(conn: &Connection) -> Result<Vec<BranchSync>> {
     Ok(syncs)
 }
 
-/// Select one active row that still has daemon-owned clean-path work. A
-/// conflict remains active while the later judgment path owns it, but it must
-/// not monopolize every tick before that path is implemented.
+/// Select one active row that still has daemon-owned clean-path work. Pending
+/// pin/merge/publication work takes precedence over an already-published row:
+/// published reconciliation is observational in this task, so allowing it to
+/// win by age would starve later requests forever. A conflict remains active
+/// while the later judgment path owns it, but it must not monopolize a tick.
 pub fn next_clean_path(conn: &Connection) -> Result<Option<BranchSync>> {
     Ok(conn
         .query_row(
@@ -263,13 +265,34 @@ pub fn next_clean_path(conn: &Connection) -> Result<Option<BranchSync>> {
                 "SELECT {COLS} FROM branch_syncs
                  WHERE active=1
                    AND phase IN ('requested','pinned','prepared','published')
-                 ORDER BY created_at ASC, id ASC
+                 ORDER BY CASE WHEN phase='published' THEN 1 ELSE 0 END,
+                          updated_at ASC, id ASC
                  LIMIT 1"
             ),
             [],
             row_to_branch_sync,
         )
         .optional()?)
+}
+
+/// Record one successful published-PR reconciliation so that multiple live
+/// published rows share the bounded observation slot instead of the oldest
+/// row being checked forever.
+pub fn touch_published(conn: &mut Connection, id: i64, now: i64) -> Result<Option<BranchSync>> {
+    let tx = begin_immediate(conn)?;
+    let sync = tx
+        .query_row(
+            &format!(
+                "UPDATE branch_syncs SET updated_at=?1
+                 WHERE id=?2 AND phase='published' AND active=1
+                 RETURNING {COLS}"
+            ),
+            params![now, id],
+            row_to_branch_sync,
+        )
+        .optional()?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(sync)
 }
 
 /// Store the immutable remote tips and deterministic local branch name in the
@@ -612,6 +635,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(event, "branch_sync_conflict");
+    }
+
+    #[test]
+    fn published_reconciliation_yields_to_later_clean_path_work() {
+        let (_dir, mut conn) = open_tmp();
+        let published_row = requested(request(&mut conn, "main", "develop", "A", 100).unwrap());
+        let source = "a".repeat(40);
+        let target = "b".repeat(40);
+        pin(
+            &mut conn,
+            published_row.id,
+            &source,
+            &target,
+            "sync/main-into-develop-1",
+            101,
+        )
+        .unwrap()
+        .unwrap();
+        prepared(
+            &mut conn,
+            published_row.id,
+            "sync/main-into-develop-1",
+            &"c".repeat(40),
+            102,
+        )
+        .unwrap()
+        .unwrap();
+        published(&mut conn, published_row.id, 77, 103)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next_clean_path(&conn).unwrap(),
+            Some(get(&conn, published_row.id).unwrap().unwrap())
+        );
+
+        let requested_row = requested(request(&mut conn, "release", "develop", "B", 104).unwrap());
+        assert_eq!(next_clean_path(&conn).unwrap(), Some(requested_row));
+        touch_published(&mut conn, published_row.id, 105)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            get(&conn, published_row.id).unwrap().unwrap().updated_at,
+            105,
+            "published rows rotate only after a successful live verification"
+        );
     }
 
     #[test]

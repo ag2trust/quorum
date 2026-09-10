@@ -252,7 +252,17 @@ async fn verify_published(
         .ok_or_else(|| "missing pr".to_string())?;
     let merge_sha = required(sync.merge_sha.as_deref(), "merge_sha")?;
     let target = resolve_pr_target(config, pr).await?;
-    validate_published_target(&target, merge_sha, &sync.target_branch)
+    validate_published_target(&target, merge_sha, &sync.target_branch)?;
+    let db_path = config.db_path.clone();
+    let id = sync.id;
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        let _ = branch_sync::touch_published(&mut conn, id, quorum_core::clock::now())?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("branch sync published refresh join: {error}"))?
+    .map_err(|error| error.to_string())
 }
 
 fn validate_published_target(
