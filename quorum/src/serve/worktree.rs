@@ -28,6 +28,15 @@ pub enum ContinuationBaseMerge {
     Conflicted,
 }
 
+/// The one clean-path merge outcome a branch synchronization persists. A
+/// conflict intentionally leaves the worktree and Git's merge state intact
+/// for the later judgment-required path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncMerge {
+    Clean { merge_sha: String },
+    Conflicted,
+}
+
 /// Result of fetching the target branch immediately before allocating a
 /// dependent task. A missing commit is an expected short-lived GitHub ref
 /// propagation outcome; transport and Git failures remain errors.
@@ -947,24 +956,7 @@ impl WorktreeManager {
             return Ok(ContinuationBaseMerge::Clean);
         }
 
-        let mut merge_head = self.git_cmd(worktree_dir);
-        merge_head.args(["rev-parse", "--verify", "MERGE_HEAD"]);
-        let merge_head = run_git(
-            merge_head,
-            self.local_timeout,
-            "git verify continuation merge conflict",
-        )
-        .await?;
-        let mut conflicts = self.git_cmd(worktree_dir);
-        conflicts.args(["diff", "--name-only", "--diff-filter=U"]);
-        let conflicts = run_git(
-            conflicts,
-            self.local_timeout,
-            "git list continuation merge conflicts",
-        )
-        .await?;
-        if merge_head.status.success() && conflicts.status.success() && !conflicts.stdout.is_empty()
-        {
+        if self.is_merge_conflict_unlocked(worktree_dir).await? {
             Ok(ContinuationBaseMerge::Conflicted)
         } else {
             Err(format!(
@@ -972,6 +964,219 @@ impl WorktreeManager {
                 git_diagnostic(&merged.stderr)
             ))
         }
+    }
+
+    /// Fetch both configured sync branches and return their exact remote
+    /// commit IDs. This is the sole pinning read; callers persist the result
+    /// only after this method releases the worktree lock.
+    pub async fn fetch_sync_tips(
+        &self,
+        repo_dir: &Path,
+        source_branch: &str,
+        target_branch: &str,
+    ) -> Result<(String, String), String> {
+        let _guard = self.lock.lock().await;
+        let source_ref = format!("+refs/heads/{source_branch}:refs/remotes/origin/{source_branch}");
+        let target_ref = format!("+refs/heads/{target_branch}:refs/remotes/origin/{target_branch}");
+        let mut fetch = self.git_cmd(repo_dir);
+        fetch.args(["fetch", "origin", &source_ref, &target_ref]);
+        let fetched = run_git(fetch, self.fetch_timeout, "git fetch branch sync refs").await?;
+        if !fetched.status.success() {
+            return Err(format!(
+                "git fetch origin {source_branch} {target_branch} failed: {}",
+                git_diagnostic(&fetched.stderr)
+            ));
+        }
+
+        let source_sha = self
+            .resolve_sync_tip_unlocked(repo_dir, source_branch, source_branch, target_branch)
+            .await?;
+        let target_sha = self
+            .resolve_sync_tip_unlocked(repo_dir, target_branch, source_branch, target_branch)
+            .await?;
+        Ok((source_sha, target_sha))
+    }
+
+    async fn resolve_sync_tip_unlocked(
+        &self,
+        repo_dir: &Path,
+        branch: &str,
+        source_branch: &str,
+        target_branch: &str,
+    ) -> Result<String, String> {
+        let mut resolve = self.git_cmd(repo_dir);
+        let reference = format!("refs/remotes/origin/{branch}^{{commit}}");
+        resolve.args(["rev-parse", "--verify", &reference]);
+        let out = run_git(resolve, self.local_timeout, "git rev-parse branch sync tip").await?;
+        let sha = git_diagnostic(&out.stdout);
+        if !out.status.success() || sha.is_empty() {
+            return Err(format!(
+                "git fetch origin {source_branch} {target_branch} did not resolve origin/{branch}: {}",
+                git_diagnostic(&out.stderr)
+            ));
+        }
+        Ok(sha)
+    }
+
+    /// Check the pinned no-op condition without updating remote refs or
+    /// allocating a branch. Exit 1 from merge-base is the expected divergent
+    /// outcome; every other non-zero result is a loud Git failure.
+    pub async fn source_is_ancestor_of_target(
+        &self,
+        repo_dir: &Path,
+        source_sha: &str,
+        target_sha: &str,
+    ) -> Result<bool, String> {
+        let _guard = self.lock.lock().await;
+        let mut ancestry = self.git_cmd(repo_dir);
+        ancestry.args(["merge-base", "--is-ancestor", source_sha, target_sha]);
+        let out = run_git(
+            ancestry,
+            self.local_timeout,
+            "git merge-base branch sync no-op",
+        )
+        .await?;
+        if out.status.success() {
+            Ok(true)
+        } else if out.status.code() == Some(1) {
+            Ok(false)
+        } else {
+            Err(format!(
+                "git merge-base --is-ancestor {source_sha} {target_sha} failed: {}",
+                git_diagnostic(&out.stderr)
+            ))
+        }
+    }
+
+    /// Reconstruct (or reopen) the daemon-owned sync worktree at a pinned
+    /// target and merge the pinned source. The manager lock serializes branch
+    /// creation, worktree attachment, and the merge so another daemon action
+    /// cannot observe a half-created branch.
+    pub async fn prepare_sync_merge(
+        &self,
+        repo_dir: &Path,
+        worktree_dir: &Path,
+        branch: &str,
+        source_sha: &str,
+        target_sha: &str,
+    ) -> Result<SyncMerge, String> {
+        let _guard = self.lock.lock().await;
+        self.ensure_sync_worktree_unlocked(repo_dir, worktree_dir, branch, Some(target_sha))
+            .await?;
+
+        let mut merge = self.git_cmd(worktree_dir);
+        merge.args(["merge", "--no-ff", "--no-edit", source_sha]);
+        let merged = run_git(merge, self.local_timeout, "git merge branch sync source").await?;
+        if merged.status.success() {
+            let mut head = self.git_cmd(worktree_dir);
+            head.args(["rev-parse", "HEAD"]);
+            let head = run_git(head, self.local_timeout, "git rev-parse branch sync merge").await?;
+            let merge_sha = git_diagnostic(&head.stdout);
+            if !head.status.success() || merge_sha.is_empty() {
+                return Err(format!(
+                    "git rev-parse HEAD after branch sync merge failed: {}",
+                    git_diagnostic(&head.stderr)
+                ));
+            }
+            return Ok(SyncMerge::Clean { merge_sha });
+        }
+
+        if self.is_merge_conflict_unlocked(worktree_dir).await? {
+            Ok(SyncMerge::Conflicted)
+        } else {
+            Err(format!(
+                "git merge {source_sha} failed without leaving a resolvable merge: {}",
+                git_diagnostic(&merged.stderr)
+            ))
+        }
+    }
+
+    /// Reopen a previously prepared local branch without ever recreating it.
+    /// A missing branch is stale durable state and must be failed by the
+    /// caller instead of being silently cut from another ref.
+    pub async fn open_existing_sync_worktree(
+        &self,
+        repo_dir: &Path,
+        worktree_dir: &Path,
+        branch: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        self.ensure_sync_worktree_unlocked(repo_dir, worktree_dir, branch, None)
+            .await
+    }
+
+    async fn ensure_sync_worktree_unlocked(
+        &self,
+        repo_dir: &Path,
+        worktree_dir: &Path,
+        branch: &str,
+        create_at: Option<&str>,
+    ) -> Result<(), String> {
+        let branch_exists = self.branch_exists_unlocked(repo_dir, branch).await;
+        if !branch_exists && create_at.is_none() {
+            return Err(format!("branch sync local branch {branch} is missing"));
+        }
+        if branch_exists {
+            if let Some(existing) = self
+                .find_worktree_for_branch_unlocked(repo_dir, branch)
+                .await
+            {
+                let expected = std::fs::canonicalize(worktree_dir).ok();
+                let actual = std::fs::canonicalize(&existing).ok();
+                if expected.is_some() && expected == actual {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "branch collision: '{branch}' already checked out in worktree '{existing}'"
+                ));
+            }
+            let mut add = self.git_cmd(repo_dir);
+            add.args(["worktree", "add"]);
+            add.arg(worktree_dir).arg(branch);
+            let added = run_git(
+                add,
+                self.local_timeout,
+                "git worktree add branch sync existing",
+            )
+            .await?;
+            if !added.status.success() {
+                return Err(format!(
+                    "git worktree add branch sync existing failed: {}",
+                    git_diagnostic(&added.stderr)
+                ));
+            }
+            return Ok(());
+        }
+
+        let base = create_at.expect("create_at checked above");
+        let mut add = self.git_cmd(repo_dir);
+        add.args(["worktree", "add", "-b", branch]);
+        add.arg(worktree_dir).arg(base);
+        let added = run_git(add, self.local_timeout, "git worktree add branch sync").await?;
+        if !added.status.success() {
+            return Err(format!(
+                "git worktree add branch sync failed: {}",
+                git_diagnostic(&added.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Exact conflict witness shared with continuation-base integration and
+    /// branch synchronization. Git must retain both MERGE_HEAD and at least
+    /// one unmerged path; a generic merge error never masquerades as a human
+    /// resolvable conflict.
+    async fn is_merge_conflict_unlocked(&self, worktree_dir: &Path) -> Result<bool, String> {
+        let mut merge_head = self.git_cmd(worktree_dir);
+        merge_head.args(["rev-parse", "--verify", "MERGE_HEAD"]);
+        let merge_head =
+            run_git(merge_head, self.local_timeout, "git verify merge conflict").await?;
+        let mut conflicts = self.git_cmd(worktree_dir);
+        conflicts.args(["diff", "--name-only", "--diff-filter=U"]);
+        let conflicts = run_git(conflicts, self.local_timeout, "git list merge conflicts").await?;
+        Ok(merge_head.status.success()
+            && conflicts.status.success()
+            && !conflicts.stdout.is_empty())
     }
 
     /// Fetch a PR head via `refs/pull/<pr>/head` and provision a worktree.
@@ -2036,6 +2241,162 @@ mod tests {
             .unwrap();
         assert!(out.status.success(), "rev-parse {rev} failed");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn branch_sync_noop_uses_pinned_ancestry_without_a_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _bare) = init_repo_with_bare_remote(tmp.path());
+        let develop = push_branch(&repo, "develop");
+        let main = git_rev_parse(&repo, "main");
+        let mgr = WorktreeManager::new();
+        let (source, target) = mgr.fetch_sync_tips(&repo, "main", "develop").await.unwrap();
+        assert_eq!(source, main);
+        assert_eq!(target, develop);
+        assert!(mgr
+            .source_is_ancestor_of_target(&repo, &source, &target)
+            .await
+            .unwrap());
+        assert!(!tmp.path().join("sync-worktree").exists());
+    }
+
+    #[tokio::test]
+    async fn branch_sync_fetch_pins_current_tips_in_a_fresh_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (source, bare) = init_repo_with_bare_remote(tmp.path());
+        let worker = tmp.path().join("fresh-clone");
+        assert!(StdCommand::new("git")
+            .args(["clone", &bare.to_string_lossy(), &worker.to_string_lossy()])
+            .status()
+            .unwrap()
+            .success());
+        let source_tip = push_branch(&source, "develop");
+        assert!(
+            !git_output(
+                &worker,
+                &["show-ref", "--verify", "refs/remotes/origin/develop"]
+            )
+            .status
+            .success(),
+            "the fresh clone must prove fetch creates the tracking ref"
+        );
+
+        let mgr = WorktreeManager::new();
+        let (pinned_source, pinned_target) = mgr
+            .fetch_sync_tips(&worker, "develop", "main")
+            .await
+            .unwrap();
+        assert_eq!(pinned_source, source_tip);
+        assert_eq!(pinned_target, git_rev_parse(&source, "main"));
+        assert_eq!(
+            git_rev_parse(&worker, "refs/remotes/origin/develop"),
+            source_tip,
+            "the persisted pin must come from the ref refreshed by this fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_sync_clean_merge_records_an_ancestry_preserving_merge_sha() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _bare) = init_repo_with_bare_remote(tmp.path());
+        let source_tip = push_branch(&repo, "develop");
+        let target_tip = git_rev_parse(&repo, "main");
+        let worktree = tmp.path().join("sync-worktree");
+        let mgr = WorktreeManager::new();
+        let (source, target) = mgr.fetch_sync_tips(&repo, "develop", "main").await.unwrap();
+        assert_eq!(source, source_tip);
+        assert_eq!(target, target_tip);
+        let SyncMerge::Clean { merge_sha } = mgr
+            .prepare_sync_merge(
+                &repo,
+                &worktree,
+                "sync/develop-into-main-1",
+                &source,
+                &target,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("divergent fixture must merge cleanly");
+        };
+        assert_ne!(merge_sha, source, "--no-ff must retain a merge commit");
+        for ancestor in [&source, &target] {
+            assert!(
+                git_output(
+                    &worktree,
+                    &["merge-base", "--is-ancestor", ancestor, &merge_sha]
+                )
+                .status
+                .success(),
+                "{ancestor} must be an ancestor of the recorded merge"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn branch_sync_conflict_keeps_merge_head_and_unmerged_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _bare) = init_repo_with_bare_remote(tmp.path());
+        let repo_text = repo.to_string_lossy().to_string();
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        assert!(git_output(&repo, &["add", "shared.txt"]).status.success());
+        assert!(git_output(&repo, &["commit", "-m", "base shared file"])
+            .status
+            .success());
+        assert!(git_output(&repo, &["push", "origin", "main"])
+            .status
+            .success());
+
+        assert!(StdCommand::new("git")
+            .args(["-C", &repo_text, "checkout", "-b", "develop"])
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(repo.join("shared.txt"), "source\n").unwrap();
+        assert!(git_output(&repo, &["commit", "-am", "source change"])
+            .status
+            .success());
+        assert!(git_output(&repo, &["push", "origin", "develop"])
+            .status
+            .success());
+        assert!(StdCommand::new("git")
+            .args(["-C", &repo_text, "checkout", "main"])
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(repo.join("shared.txt"), "target\n").unwrap();
+        assert!(git_output(&repo, &["commit", "-am", "target change"])
+            .status
+            .success());
+        assert!(git_output(&repo, &["push", "origin", "main"])
+            .status
+            .success());
+
+        let mgr = WorktreeManager::new();
+        let (source, target) = mgr.fetch_sync_tips(&repo, "develop", "main").await.unwrap();
+        let worktree = tmp.path().join("sync-conflict-worktree");
+        assert_eq!(
+            mgr.prepare_sync_merge(
+                &repo,
+                &worktree,
+                "sync/develop-into-main-2",
+                &source,
+                &target,
+            )
+            .await
+            .unwrap(),
+            SyncMerge::Conflicted
+        );
+        assert!(
+            git_output(&worktree, &["rev-parse", "--verify", "MERGE_HEAD"])
+                .status
+                .success()
+        );
+        assert!(
+            !git_output(&worktree, &["diff", "--name-only", "--diff-filter=U"])
+                .stdout
+                .is_empty()
+        );
     }
 
     #[tokio::test]

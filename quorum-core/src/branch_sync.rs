@@ -20,7 +20,7 @@ const COLS: &str = "id, source_branch, target_branch, source_sha, target_sha, sy
 pub fn is_terminal_phase(phase: &str) -> bool {
     matches!(
         phase,
-        "done" | "noop" | "conflict" | "ci_failed" | "failed" | "cancelled"
+        "done" | "noop" | "ci_failed" | "failed" | "cancelled"
     )
 }
 
@@ -253,6 +253,250 @@ pub fn list_active(conn: &Connection) -> Result<Vec<BranchSync>> {
     Ok(syncs)
 }
 
+/// Select one active row that still has daemon-owned clean-path work. Pending
+/// pin/merge/publication work takes precedence over an already-published row:
+/// published reconciliation is observational in this task, so allowing it to
+/// win by age would starve later requests forever. A conflict remains active
+/// while the later judgment path owns it, but it must not monopolize a tick.
+pub fn next_clean_path(conn: &Connection) -> Result<Option<BranchSync>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {COLS} FROM branch_syncs
+                 WHERE active=1
+                   AND phase IN ('requested','pinned','prepared','published')
+                 ORDER BY CASE WHEN phase='published' THEN 1 ELSE 0 END,
+                          updated_at ASC, id ASC
+                 LIMIT 1"
+            ),
+            [],
+            row_to_branch_sync,
+        )
+        .optional()?)
+}
+
+/// Record one successful published-PR reconciliation so that multiple live
+/// published rows share the bounded observation slot instead of the oldest
+/// row being checked forever.
+pub fn touch_published(conn: &mut Connection, id: i64, now: i64) -> Result<Option<BranchSync>> {
+    let tx = begin_immediate(conn)?;
+    let sync = tx
+        .query_row(
+            &format!(
+                "UPDATE branch_syncs SET updated_at=?1
+                 WHERE id=?2 AND phase='published' AND active=1
+                 RETURNING {COLS}"
+            ),
+            params![now, id],
+            row_to_branch_sync,
+        )
+        .optional()?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(sync)
+}
+
+/// Store the immutable remote tips and deterministic local branch name in the
+/// same compare-and-set transition that makes the request pinned.
+pub fn pin(
+    conn: &mut Connection,
+    id: i64,
+    source_sha: &str,
+    target_sha: &str,
+    sync_branch: &str,
+    now: i64,
+) -> Result<Option<BranchSync>> {
+    let tx = begin_immediate(conn)?;
+    let sync = tx
+        .query_row(
+            &format!(
+                "UPDATE branch_syncs
+                 SET source_sha=?1,target_sha=?2,sync_branch=?3,phase='pinned',updated_at=?4
+                 WHERE id=?5 AND phase='requested' AND active=1
+                 RETURNING {COLS}"
+            ),
+            params![source_sha, target_sha, sync_branch, now, id],
+            row_to_branch_sync,
+        )
+        .optional()?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(sync)
+}
+
+/// Record the exact local merge commit after a clean pinned merge.
+pub fn prepared(
+    conn: &mut Connection,
+    id: i64,
+    sync_branch: &str,
+    merge_sha: &str,
+    now: i64,
+) -> Result<Option<BranchSync>> {
+    let tx = begin_immediate(conn)?;
+    let sync = tx
+        .query_row(
+            &format!(
+                "UPDATE branch_syncs
+                 SET sync_branch=?1,merge_sha=?2,phase='prepared',updated_at=?3
+                 WHERE id=?4 AND phase='pinned' AND active=1
+                 RETURNING {COLS}"
+            ),
+            params![sync_branch, merge_sha, now, id],
+            row_to_branch_sync,
+        )
+        .optional()?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(sync)
+}
+
+/// Set a no-op terminal and emit its durable operator event.
+pub fn noop(conn: &mut Connection, id: i64, now: i64) -> Result<Option<BranchSync>> {
+    let tx = begin_immediate(conn)?;
+    let sync = tx
+        .query_row(
+            &format!(
+                "UPDATE branch_syncs
+                 SET phase='noop',active=0,updated_at=?1
+                 WHERE id=?2 AND phase='pinned' AND active=1
+                 RETURNING {COLS}"
+            ),
+            params![now, id],
+            row_to_branch_sync,
+        )
+        .optional()?;
+    if let Some(row) = &sync {
+        crate::events::emit(
+            &tx,
+            "branch_sync_noop",
+            &format!("branch_sync#{}", row.id),
+            &format!(
+                "{} -> {} already contains pinned source",
+                row.source_branch, row.target_branch
+            ),
+            now,
+        )?;
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(sync)
+}
+
+/// Keep a conflict active for the later judgment-required path and preserve
+/// the in-progress worktree merge as its durable external evidence.
+pub fn conflict(conn: &mut Connection, id: i64, now: i64) -> Result<Option<BranchSync>> {
+    let tx = begin_immediate(conn)?;
+    let sync = tx
+        .query_row(
+            &format!(
+                "UPDATE branch_syncs
+                 SET phase='conflict',updated_at=?1
+                 WHERE id=?2 AND phase='pinned' AND active=1
+                 RETURNING {COLS}"
+            ),
+            params![now, id],
+            row_to_branch_sync,
+        )
+        .optional()?;
+    if let Some(row) = &sync {
+        crate::events::emit(
+            &tx,
+            "branch_sync_conflict",
+            &format!("branch_sync#{}", row.id),
+            &format!(
+                "{} -> {} requires conflict resolution",
+                row.source_branch, row.target_branch
+            ),
+            now,
+        )?;
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(sync)
+}
+
+/// Bind the published PR to the prepared merge SHA before later CI/merge work
+/// receives authority.
+pub fn published(conn: &mut Connection, id: i64, pr: i64, now: i64) -> Result<Option<BranchSync>> {
+    let tx = begin_immediate(conn)?;
+    let sync = tx
+        .query_row(
+            &format!(
+                "UPDATE branch_syncs
+                 SET pr=?1,phase='published',updated_at=?2
+                 WHERE id=?3 AND phase='prepared' AND active=1
+                 RETURNING {COLS}"
+            ),
+            params![pr, now, id],
+            row_to_branch_sync,
+        )
+        .optional()?;
+    if let Some(row) = &sync {
+        crate::events::emit(
+            &tx,
+            "branch_sync_published",
+            &format!("branch_sync#{}", row.id),
+            &format!(
+                "{} -> {} published as PR #{}",
+                row.source_branch, row.target_branch, pr
+            ),
+            now,
+        )?;
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(sync)
+}
+
+/// Fail one current active phase loudly. The compare-and-set avoids an old
+/// executor overwriting newer progress after an external operation returns.
+pub fn fail(
+    conn: &mut Connection,
+    id: i64,
+    expected_phase: &str,
+    error: &str,
+    now: i64,
+) -> Result<Option<BranchSync>> {
+    if !is_valid_phase(expected_phase) || is_terminal_phase(expected_phase) {
+        return Err(QuorumError::Usage(
+            "invalid active branch sync failure phase".into(),
+        ));
+    }
+    let detail = bounded_error(error);
+    let tx = begin_immediate(conn)?;
+    let sync = tx
+        .query_row(
+            &format!(
+                "UPDATE branch_syncs
+                 SET phase='failed',active=0,last_error=?1,updated_at=?2
+                 WHERE id=?3 AND phase=?4 AND active=1
+                 RETURNING {COLS}"
+            ),
+            params![detail, now, id, expected_phase],
+            row_to_branch_sync,
+        )
+        .optional()?;
+    if sync.is_some() {
+        crate::errlog::log_error(&tx, now, "branch_sync", &detail);
+        crate::events::emit(
+            &tx,
+            "branch_sync_failed",
+            &format!("branch_sync#{id}"),
+            &detail,
+            now,
+        )?;
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(sync)
+}
+
+fn bounded_error(error: &str) -> String {
+    let mut value = error.replace('\0', "<NUL>");
+    const LIMIT: usize = 2048;
+    if value.len() > LIMIT {
+        let mut end = LIMIT;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +603,83 @@ mod tests {
         let second = requested(request(&mut conn, "main", "develop", "B", 102).unwrap());
         assert!(second.id > first.id);
         assert_eq!(second.phase, "requested");
+    }
+
+    #[test]
+    fn conflict_stays_active_and_clean_path_selection_skips_it() {
+        let (_dir, mut conn) = open_tmp();
+        let conflicted = requested(request(&mut conn, "main", "develop", "A", 100).unwrap());
+        let source = "a".repeat(40);
+        let target = "b".repeat(40);
+        pin(
+            &mut conn,
+            conflicted.id,
+            &source,
+            &target,
+            "sync/main-into-develop-1",
+            101,
+        )
+        .unwrap()
+        .unwrap();
+        let conflict = conflict(&mut conn, conflicted.id, 102).unwrap().unwrap();
+        assert!(conflict.active, "a conflict awaits later judgment work");
+        assert_eq!(conflict.phase, "conflict");
+
+        let requested = requested(request(&mut conn, "release", "develop", "B", 103).unwrap());
+        assert_eq!(next_clean_path(&conn).unwrap(), Some(requested));
+        let event: String = conn
+            .query_row(
+                "SELECT kind FROM events WHERE subject=?1 ORDER BY seq DESC LIMIT 1",
+                [format!("branch_sync#{}", conflicted.id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event, "branch_sync_conflict");
+    }
+
+    #[test]
+    fn published_reconciliation_yields_to_later_clean_path_work() {
+        let (_dir, mut conn) = open_tmp();
+        let published_row = requested(request(&mut conn, "main", "develop", "A", 100).unwrap());
+        let source = "a".repeat(40);
+        let target = "b".repeat(40);
+        pin(
+            &mut conn,
+            published_row.id,
+            &source,
+            &target,
+            "sync/main-into-develop-1",
+            101,
+        )
+        .unwrap()
+        .unwrap();
+        prepared(
+            &mut conn,
+            published_row.id,
+            "sync/main-into-develop-1",
+            &"c".repeat(40),
+            102,
+        )
+        .unwrap()
+        .unwrap();
+        published(&mut conn, published_row.id, 77, 103)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next_clean_path(&conn).unwrap(),
+            Some(get(&conn, published_row.id).unwrap().unwrap())
+        );
+
+        let requested_row = requested(request(&mut conn, "release", "develop", "B", 104).unwrap());
+        assert_eq!(next_clean_path(&conn).unwrap(), Some(requested_row));
+        touch_published(&mut conn, published_row.id, 105)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            get(&conn, published_row.id).unwrap().unwrap().updated_at,
+            105,
+            "published rows rotate only after a successful live verification"
+        );
     }
 
     #[test]
