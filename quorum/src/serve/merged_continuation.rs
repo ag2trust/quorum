@@ -638,6 +638,7 @@ mod tests {
             serde_json::from_str(updated.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs["source_task"], 307);
         assert_eq!(refs["ticket"], "REC-1");
+        assert_eq!(refs["merge_commit_sha"], RECOVERY_MERGE);
         conn.execute("UPDATE tasks SET status='done' WHERE id=320", [])
             .unwrap();
         drop(conn);

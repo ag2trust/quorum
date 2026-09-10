@@ -578,6 +578,11 @@ pub fn validate_creator_refs(refs_json: Option<&str>) -> Result<()> {
             "refs key 'source_task' is daemon-owned recovery provenance".into(),
         ));
     }
+    if object.contains_key(MERGE_COMMIT_SHA_REF) {
+        return Err(QuorumError::Usage(format!(
+            "refs key '{MERGE_COMMIT_SHA_REF}' is daemon-owned merge provenance"
+        )));
+    }
     if object.contains_key(MERGE_RETRY_REF) {
         return Err(QuorumError::Usage(format!(
             "refs key '{MERGE_RETRY_REF}' is daemon-owned; use task-retry"
@@ -638,7 +643,8 @@ fn preserve_protected_refs(
             );
             let runner_state =
                 preserve_runner_state && (key.starts_with("runner_") || key.starts_with("codex_"));
-            let recovery_provenance = preserve_recovery_provenance && key == "source_task";
+            let recovery_provenance = preserve_recovery_provenance
+                && matches!(key.as_str(), "source_task" | MERGE_COMMIT_SHA_REF);
             if classifier_or_pr || runner_state || recovery_provenance {
                 next_map.insert(key, value);
             }
@@ -10339,6 +10345,9 @@ mod tests {
         assert!(format!("{pr_err}").contains("--continue-pr"));
         let source_err = validate_creator_refs(Some(r#"{"source_task":42}"#)).unwrap_err();
         assert!(format!("{source_err}").contains("recovery provenance"));
+        let merge_err =
+            validate_creator_refs(Some(r#"{"merge_commit_sha":"deadbeef"}"#)).unwrap_err();
+        assert!(format!("{merge_err}").contains("merge provenance"));
         let retry_err =
             validate_creator_refs(Some(r#"{"daemon_merge_retry":"requested"}"#)).unwrap_err();
         assert!(format!("{retry_err}").contains("task-retry"));
@@ -10359,7 +10368,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_update_preserves_daemon_pr_and_classifier_refs() {
+    fn metadata_update_preserves_daemon_pr_classifier_and_merge_refs() {
         let (_d, mut c) = open_tmp();
         let id = create(
             &mut c,
@@ -10368,14 +10377,14 @@ mod tests {
             None,
             0,
             None,
-            Some(r#"{"cx_est":5,"cx_by":"classifier:v1","pr":41}"#),
+            Some(r#"{"cx_est":5,"cx_by":"classifier:v1","pr":41,"merge_commit_sha":"trusted"}"#),
             None,
             None,
             1000,
         )
         .unwrap();
         let fields = TaskUpdate {
-            refs: Some(r#"{"pr":42,"ticket":"ABC"}"#),
+            refs: Some(r#"{"pr":42,"ticket":"ABC","merge_commit_sha":"forged"}"#),
             expected_revision: Some(1),
             ..Default::default()
         };
@@ -10386,6 +10395,7 @@ mod tests {
         assert_eq!(refs["ticket"], "ABC");
         assert_eq!(refs["cx_est"], 5);
         assert_eq!(refs["cx_by"], "classifier:v1");
+        assert_eq!(refs[MERGE_COMMIT_SHA_REF], "trusted");
     }
 
     #[test]
