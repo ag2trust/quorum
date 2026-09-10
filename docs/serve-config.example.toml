@@ -76,6 +76,9 @@ max_task_cost_usd  = 100.0
 # merge_token_file         = "/home/user/.quorum/serve/merge-token"
 merge_checks_timeout_secs  = 900
 # merge_checks_poll_secs   = 30
+# Required for every configured branch sync. Syncs fail closed once published
+# when this is empty, even though ordinary task merges may leave it unset.
+required_jobs = ["ci"]
 
 # ── self-update ───────────────────────────────────────────────────────
 self_update_drain = true
@@ -86,7 +89,8 @@ drain_timeout_secs = 900
 base_branch = "main"
 # Directed source/target pairs eligible for daemon-internal branch sync.
 # Omit or set [] to disable it. Configure both directions explicitly when
-# main and develop should each receive the other's changes.
+# main and develop should each receive the other's changes. Every enabled pair
+# requires the non-empty required_jobs gate above.
 sync_pairs = [["main", "develop"], ["develop", "main"]]
 
 # ── observational host resources ─────────────────────────────────────

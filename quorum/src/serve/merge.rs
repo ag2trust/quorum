@@ -151,6 +151,14 @@ pub enum MergeCommitStatus {
 pub trait MergeExecutor: Send + Sync {
     fn merge(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult;
 
+    /// Daemon-internal branch syncs have no reviewer, so they must not post a
+    /// formal approval. Implementations still validate the pinned head/base
+    /// before the irreversible merge call. The default keeps lightweight test
+    /// executors source-compatible; the GitHub executor overrides it.
+    fn merge_without_approval(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult {
+        self.merge(pr, repo_dir, ctx)
+    }
+
     /// GitHub's immutable merge commit for a completed PR. The production
     /// implementation asks the PR API after merge; unavailable metadata is
     /// intentionally represented as `None` so callers can keep the lifecycle
@@ -179,6 +187,20 @@ pub trait MergeExecutor: Send + Sync {
         _poll_interval_secs: u64,
     ) -> ChecksOutcome {
         ChecksOutcome::Ready
+    }
+
+    /// CI wait for a branch sync. Unlike ordinary task merges, an empty
+    /// status-check rollup never establishes readiness: the sync path has a
+    /// mandatory non-empty required-jobs gate. The production executor
+    /// overrides this while test executors can share `wait_for_checks`.
+    fn wait_for_branch_sync_checks(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        timeout_secs: u64,
+        poll_interval_secs: u64,
+    ) -> ChecksOutcome {
+        self.wait_for_checks(pr, repo_dir, timeout_secs, poll_interval_secs)
     }
 
     /// Names of checks that are still pending, used only to make a prolonged
@@ -376,6 +398,30 @@ fn checks_query_from_parsed(
     }
 
     ChecksQueryResult::AllPassed
+}
+
+/// Branch synchronization is fail-closed for an empty rollup. Ordinary task
+/// merges retain their two-poll no-CI compatibility rule; this path can only
+/// advance after actual checks report green and the configured named jobs are
+/// subsequently verified.
+fn branch_sync_checks_query_outcome(query: ChecksQueryResult) -> Option<ChecksOutcome> {
+    match query {
+        ChecksQueryResult::AllPassed => Some(ChecksOutcome::Ready),
+        ChecksQueryResult::SomeFailed(failing_checks) => {
+            Some(ChecksOutcome::Failed { failing_checks })
+        }
+        ChecksQueryResult::Pending | ChecksQueryResult::NoChecksConfigured => None,
+    }
+}
+
+fn branch_sync_checks_query_from_parsed(
+    merge_state: &Option<String>,
+    checks: &Option<Vec<(String, SingleCheckStatus)>>,
+) -> ChecksQueryResult {
+    if checks.as_ref().is_some_and(Vec::is_empty) {
+        return ChecksQueryResult::NoChecksConfigured;
+    }
+    checks_query_from_parsed(merge_state, checks)
 }
 
 /// Check whether each required job in the PR's `statusCheckRollup` has conclusion
@@ -698,6 +744,30 @@ impl GhMergeExecutor {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let (merge_state, checks) = parse_checks_json(&stdout);
         checks_query_from_parsed(&merge_state, &checks)
+    }
+
+    /// Branch sync has a stricter interpretation than an ordinary task merge:
+    /// GitHub may call the PR CLEAN even while its rollup is an empty array,
+    /// but that array still cannot satisfy the mandatory named-jobs gate.
+    fn query_branch_sync_checks(&self, pr: i64, repo_dir: &Path) -> ChecksQueryResult {
+        let pr_str = pr.to_string();
+        let mut cmd = self.build_gh_cmd(
+            &[
+                "pr",
+                "view",
+                &pr_str,
+                "--json",
+                "statusCheckRollup,mergeStateStatus",
+            ],
+            repo_dir,
+        );
+        let output = match cmd.output() {
+            Ok(o) if o.status.success() => o,
+            _ => return ChecksQueryResult::Pending,
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (merge_state, checks) = parse_checks_json(&stdout);
+        branch_sync_checks_query_from_parsed(&merge_state, &checks)
     }
 
     fn is_draft(&self, pr: i64, repo_dir: &Path) -> bool {
@@ -1066,6 +1136,63 @@ impl MergeExecutor for GhMergeExecutor {
         result
     }
 
+    fn merge_without_approval(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult {
+        let pr_str = pr.to_string();
+
+        // Branch syncs have no reviewer whose verdict can authorize a formal
+        // approval, but their deterministic PR still gets the same base/head
+        // drift protection immediately before the GitHub write.
+        if let Some(rejected) = self.reject_base_drift(pr, repo_dir, &ctx.expected_base_branch) {
+            return rejected;
+        }
+        if let Some(rejected) = self.reject_head_drift(pr, repo_dir, &ctx.expected_head_sha) {
+            return rejected;
+        }
+
+        let branch_metadata = match merge_branch_metadata(
+            self.live_head_ref(pr, repo_dir),
+            self.live_base_branch(pr, repo_dir).ok(),
+            self.repository_default_branch(repo_dir),
+        ) {
+            Ok(metadata) => metadata,
+            Err(result) => return result,
+        };
+
+        // Close the metadata-query window before the irreversible merge.
+        if let Some(rejected) = self.reject_base_drift(pr, repo_dir, &ctx.expected_base_branch) {
+            return rejected;
+        }
+        if let Some(rejected) = self.reject_head_drift(pr, repo_dir, &ctx.expected_head_sha) {
+            return rejected;
+        }
+
+        let result = self.run_gh(
+            &merge_command_args(
+                &pr_str,
+                &ctx.expected_head_sha,
+                &branch_metadata.head_ref,
+                [
+                    &self.base_branch,
+                    &self.self_update_branch,
+                    &branch_metadata.pr_base_branch,
+                    &branch_metadata.default_branch,
+                ],
+            ),
+            repo_dir,
+        );
+        if !result.success && self.verify_pr_merged(pr, repo_dir) {
+            return MergeResult {
+                success: true,
+                message: format!(
+                    "merge succeeded (post-merge cleanup failed: {})",
+                    result.message,
+                ),
+                failure_kind: None,
+            };
+        }
+        result
+    }
+
     fn merge_commit_sha(&self, pr: i64, repo_dir: &Path) -> Option<String> {
         let pr = pr.to_string();
         let mut cmd = self.build_gh_cmd(&["pr", "view", &pr, "--json", "mergeCommit"], repo_dir);
@@ -1120,6 +1247,27 @@ impl MergeExecutor for GhMergeExecutor {
                 ChecksQueryResult::Pending => {
                     consecutive_no_checks = 0;
                 }
+            }
+            if Instant::now() + Duration::from_secs(poll_interval_secs) > deadline {
+                return ChecksOutcome::TimedOut;
+            }
+            std::thread::sleep(Duration::from_secs(poll_interval_secs));
+        }
+    }
+
+    fn wait_for_branch_sync_checks(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        timeout_secs: u64,
+        poll_interval_secs: u64,
+    ) -> ChecksOutcome {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        loop {
+            if let Some(outcome) =
+                branch_sync_checks_query_outcome(self.query_branch_sync_checks(pr, repo_dir))
+            {
+                return outcome;
             }
             if Instant::now() + Duration::from_secs(poll_interval_secs) > deadline {
                 return ChecksOutcome::TimedOut;
@@ -1424,6 +1572,23 @@ mod tests {
             expected_base_branch: "main".into(),
             expected_head_sha: "abc123".into(),
         }
+    }
+
+    #[test]
+    fn branch_sync_empty_rollup_is_not_ready() {
+        let (merge_state, checks) =
+            parse_checks_json(r#"{"mergeStateStatus":"CLEAN","statusCheckRollup":[]}"#);
+        assert_eq!(
+            branch_sync_checks_query_outcome(branch_sync_checks_query_from_parsed(
+                &merge_state,
+                &checks,
+            )),
+            None
+        );
+        assert_eq!(
+            branch_sync_checks_query_outcome(ChecksQueryResult::Pending),
+            None
+        );
     }
 
     #[test]

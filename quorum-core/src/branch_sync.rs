@@ -18,10 +18,7 @@ const COLS: &str = "id, source_branch, target_branch, source_sha, target_sha, sy
 /// Terminal branch-sync phases release the active-pair slot in the statement
 /// that records the phase, allowing a subsequent request for that pair.
 pub fn is_terminal_phase(phase: &str) -> bool {
-    matches!(
-        phase,
-        "done" | "noop" | "ci_failed" | "failed" | "cancelled"
-    )
+    matches!(phase, "done" | "noop" | "failed" | "cancelled")
 }
 
 /// The complete closed vocabulary persisted in `branch_syncs.phase`.
@@ -253,19 +250,17 @@ pub fn list_active(conn: &Connection) -> Result<Vec<BranchSync>> {
     Ok(syncs)
 }
 
-/// Select one active row that still has daemon-owned clean-path work. Pending
-/// pin/merge/publication work takes precedence over an already-published row:
-/// published reconciliation is observational in this task, so allowing it to
-/// win by age would starve later requests forever. A conflict remains active
-/// while the later judgment path owns it, but it must not monopolize a tick.
+/// Select one active row that still has daemon-owned clean-path work. A
+/// conflict or CI failure remains active for its later judgment path, but must
+/// not monopolize a daemon tick.
 pub fn next_clean_path(conn: &Connection) -> Result<Option<BranchSync>> {
     Ok(conn
         .query_row(
             &format!(
                 "SELECT {COLS} FROM branch_syncs
                  WHERE active=1
-                   AND phase IN ('requested','pinned','prepared','published')
-                 ORDER BY CASE WHEN phase='published' THEN 1 ELSE 0 END,
+                   AND phase IN ('requested','pinned','prepared','published','checks','merging')
+                 ORDER BY CASE WHEN phase IN ('published','checks','merging') THEN 1 ELSE 0 END,
                           updated_at ASC, id ASC
                  LIMIT 1"
             ),
@@ -273,6 +268,117 @@ pub fn next_clean_path(conn: &Connection) -> Result<Option<BranchSync>> {
             row_to_branch_sync,
         )
         .optional()?)
+}
+
+/// Admit the CI gate after the published PR's immutable head/base have been
+/// revalidated. This is a separate durable boundary: checks must never be
+/// queried with merge authority still implicit in `published`.
+pub fn begin_checks(conn: &mut Connection, id: i64, now: i64) -> Result<Option<BranchSync>> {
+    set_phase(conn, id, "published", "checks", now)
+}
+
+/// Record a failed branch-sync CI gate without releasing the pair. A later
+/// daemon-owned judgment task consumes this row, so treating it as a terminal
+/// request would permit a second sync to race its remediation.
+pub fn ci_failed(
+    conn: &mut Connection,
+    id: i64,
+    detail: &str,
+    now: i64,
+) -> Result<Option<BranchSync>> {
+    let detail = bounded_error(detail);
+    let tx = begin_immediate(conn)?;
+    let sync = tx
+        .query_row(
+            &format!(
+                "UPDATE branch_syncs
+                 SET phase='ci_failed',last_error=?1,updated_at=?2
+                 WHERE id=?3 AND phase='checks' AND active=1
+                 RETURNING {COLS}"
+            ),
+            params![detail, now, id],
+            row_to_branch_sync,
+        )
+        .optional()?;
+    if let Some(row) = &sync {
+        crate::events::emit(
+            &tx,
+            "branch_sync_ci_failed",
+            &format!("branch_sync#{}", row.id),
+            &detail,
+            now,
+        )?;
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(sync)
+}
+
+/// Cross the durable uncertainty boundary immediately before the daemon makes
+/// its one branch-sync merge call. A crash after this transition is reconciled
+/// from the pinned head/base evidence rather than replaying a blind merge.
+pub fn begin_merge_attempt(conn: &mut Connection, id: i64, now: i64) -> Result<Option<BranchSync>> {
+    let tx = begin_immediate(conn)?;
+    let sync = tx
+        .query_row(
+            &format!(
+                "UPDATE branch_syncs
+                 SET phase='merging',updated_at=?1
+                 WHERE id=?2 AND phase='checks' AND active=1
+                 RETURNING {COLS}"
+            ),
+            params![now, id],
+            row_to_branch_sync,
+        )
+        .optional()?;
+    if let Some(row) = &sync {
+        crate::events::emit(
+            &tx,
+            "branch_sync_merge_attempt_started",
+            &format!("branch_sync#{}", row.id),
+            "branch-sync merge call admitted by daemon",
+            now,
+        )?;
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(sync)
+}
+
+/// Settle a verified GitHub merge. `merge_commit_sha` is the immutable remote
+/// witness, intentionally distinct from the locally prepared `merge_sha`.
+pub fn complete_merge(
+    conn: &mut Connection,
+    id: i64,
+    merge_commit_sha: &str,
+    now: i64,
+) -> Result<Option<BranchSync>> {
+    let merge_commit_sha = bounded_error(merge_commit_sha);
+    let tx = begin_immediate(conn)?;
+    let sync = tx
+        .query_row(
+            &format!(
+                "UPDATE branch_syncs
+                 SET phase='done',active=0,updated_at=?1
+                 WHERE id=?2 AND phase='merging' AND active=1
+                 RETURNING {COLS}"
+            ),
+            params![now, id],
+            row_to_branch_sync,
+        )
+        .optional()?;
+    if let Some(row) = &sync {
+        crate::events::emit(
+            &tx,
+            "branch_sync_merged",
+            &format!("branch_sync#{}", row.id),
+            &format!(
+                "{} -> {} merged as {}",
+                row.source_branch, row.target_branch, merge_commit_sha
+            ),
+            now,
+        )?;
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(sync)
 }
 
 /// Record one successful published-PR reconciliation so that multiple live

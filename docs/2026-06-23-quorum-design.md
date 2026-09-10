@@ -470,14 +470,26 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   the resulting merge SHA, pushes only that new branch, and creates the PR against the pinned
   target branch. A restart reuses those pins: `pinned` rebuilds only from the stored SHAs,
   `prepared` rechecks the local tip before publishing, and `published` verifies the live open PR
-  head/base before later work receives authority. `pinned` may end `noop` or become `conflict`,
-  `checks` may end `ci_failed`, and `merging` may end `conflict`; `failed` and `cancelled` may
-  end any active phase. Phase changes are guarded compare-and-set updates and reject backward,
-  skipped, and same-phase writes, so stale or restarted executors cannot overwrite or reorder
-  durable progress. Every terminal transition except a judgment-pending `conflict` clears
-  `active` in the same statement, releasing the pair for a later request. Bounded published-PR
-  reconciliation yields to any requested/pinned/prepared row and rotates successful published
-  checks, so an older active published row cannot starve a later synchronization.
+  head/base before later work receives authority. Branch sync requires a non-empty effective
+  `required_jobs` configuration: an empty gate fails the row loudly with
+  `branch sync requires a non-empty required_jobs gate`, an `errors` row, and a
+  `branch_sync_failed` event. Its CI wait never accepts an empty `statusCheckRollup`; the
+  ordinary task merge two-empty-polls compatibility rule does not apply. Failed checks enter
+  active `ci_failed` with `branch_sync_ci_failed` for later judgment work. Green checks cross
+  the durable `checks` → `merging` admission before one daemon-owned `gh pr merge` call, with
+  the prepared merge SHA and target branch revalidated but no formal approval review. After a
+  reported merge, the daemon fetches the target, reads GitHub's immutable `mergeCommit`, and
+  proves both pinned source and target tips are ancestors before `done` and
+  `branch_sync_merged`. Any missing metadata or ancestry failure is loud `failed`, never
+  silently done. Restart reconciliation of `merging` reads PR state: merged verifies ancestry,
+  open receives one pinned-head retry, and closed/unknown fails with evidence. `pinned` may end
+  `noop` or become `conflict`; `failed` and `cancelled` may end any active phase. Phase changes
+  are guarded compare-and-set updates and reject backward, skipped, and same-phase writes, so
+  stale or restarted executors cannot overwrite or reorder durable progress. Every terminal
+  transition except judgment-pending `conflict` and `ci_failed` clears `active` in the same
+  statement, releasing the pair for a later request. Published/check/merge reconciliation yields
+  to newly requested, pinned, or prepared rows so an older sync cannot starve fresh clean-path
+  work.
 - The daemon executes the clean path internally; no task is created merely to merge, publish,
   wait for checks, or complete a no-op. A conflict preserves the daemon-owned worktree's
   `MERGE_HEAD` and unmerged index, stays active for the later judgment task, and is never pushed.

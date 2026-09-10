@@ -3,6 +3,7 @@
 //! Each pass reads one durable row, does all GitHub/Git work without a
 //! database transaction, then settles exactly the phase that operation earned.
 
+use super::merge::{self, MergeCommitStatus};
 use super::worktree::{SyncMerge, WorktreeManager};
 use super::{
     log, parse_created_pr_number, parse_initial_pr_list, resolve_pr_target_with_program,
@@ -11,6 +12,7 @@ use super::{
 use quorum_core::branch_sync::{self, BranchSync};
 use quorum_core::error::{QuorumError, Result};
 use std::path::Path;
+use std::sync::Arc;
 
 const PR_OPEN: &str = "OPEN";
 
@@ -32,7 +34,9 @@ pub async fn reconcile_one(config: &ServeConfig, worktrees: &WorktreeManager) ->
         "requested" => pin_requested(config, worktrees, &sync).await,
         "pinned" => prepare_pinned(config, worktrees, &sync).await,
         "prepared" => publish_prepared(config, worktrees, &sync).await,
-        "published" => verify_published(config, &sync).await,
+        "published" => begin_published_checks(config, &sync).await,
+        "checks" => run_checks(config, &sync).await,
+        "merging" => reconcile_merge(config, worktrees, &sync).await,
         // `next_clean_path` is intentionally narrower than the persisted
         // vocabulary, so this means the database query and row parser no
         // longer agree rather than silently ignoring a future phase.
@@ -244,7 +248,7 @@ async fn find_branch_sync_pr(
     parse_initial_pr_list(&output.stdout, branch)
 }
 
-async fn verify_published(
+async fn begin_published_checks(
     config: &ServeConfig,
     sync: &BranchSync,
 ) -> std::result::Result<(), String> {
@@ -259,12 +263,174 @@ async fn verify_published(
     let id = sync.id;
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&db_path)?;
-        let _ = branch_sync::touch_published(&mut conn, id, quorum_core::clock::now())?;
+        let _ = branch_sync::begin_checks(&mut conn, id, quorum_core::clock::now())?;
         Ok(())
     })
     .await
-    .map_err(|error| format!("branch sync published refresh join: {error}"))?
+    .map_err(|error| format!("branch sync checks admission join: {error}"))?
     .map_err(|error| error.to_string())
+}
+
+const REQUIRED_JOBS_ERROR: &str = "branch sync requires a non-empty required_jobs gate";
+
+async fn run_checks(config: &ServeConfig, sync: &BranchSync) -> std::result::Result<(), String> {
+    if config.required_jobs.is_empty() {
+        return Err(REQUIRED_JOBS_ERROR.to_string());
+    }
+    let pr = required_pr(sync)?;
+    let mut checks = {
+        let repo = config.repo_dir.clone();
+        let executor = Arc::clone(&config.merge_executor);
+        let timeout = config.merge_checks_timeout_secs;
+        let poll = config.merge_checks_poll_secs;
+        tokio::task::spawn_blocking(move || {
+            executor.wait_for_branch_sync_checks(pr, &repo, timeout, poll)
+        })
+        .await
+        .map_err(|error| format!("branch sync checks join: {error}"))?
+    };
+    if matches!(checks, merge::ChecksOutcome::Ready) {
+        let required_jobs = {
+            let repo = config.repo_dir.clone();
+            let executor = Arc::clone(&config.merge_executor);
+            let jobs = config.required_jobs.clone();
+            tokio::task::spawn_blocking(move || executor.check_required_jobs(pr, &repo, &jobs))
+                .await
+                .map_err(|error| format!("branch sync required-jobs join: {error}"))?
+        };
+        checks = merge::apply_required_jobs_gate(checks, required_jobs);
+    }
+
+    match checks {
+        merge::ChecksOutcome::Ready => {
+            let db_path = config.db_path.clone();
+            let id = sync.id;
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = quorum_core::db::open(&db_path)?;
+                let _ = branch_sync::begin_merge_attempt(&mut conn, id, quorum_core::clock::now())?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| format!("branch sync merge admission join: {error}"))?
+            .map_err(|error| error.to_string())
+        }
+        merge::ChecksOutcome::Failed { failing_checks } => {
+            let detail = format!("PR #{pr} CI failed: {}", failing_checks.join(", "));
+            let db_path = config.db_path.clone();
+            let id = sync.id;
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = quorum_core::db::open(&db_path)?;
+                let _ = branch_sync::ci_failed(&mut conn, id, &detail, quorum_core::clock::now())?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| format!("branch sync CI failure settlement join: {error}"))?
+            .map_err(|error| error.to_string())
+        }
+        merge::ChecksOutcome::Pending { .. } | merge::ChecksOutcome::TimedOut => Ok(()),
+    }
+}
+
+/// Reconcile the durable merge boundary. A live `merging` row may represent a
+/// crash before or after the one remote call, so query GitHub first; only an
+/// open PR receives the bounded single retry with the original pinned head.
+async fn reconcile_merge(
+    config: &ServeConfig,
+    worktrees: &WorktreeManager,
+    sync: &BranchSync,
+) -> std::result::Result<(), String> {
+    let pr = required_pr(sync)?;
+    let status = {
+        let repo = config.repo_dir.clone();
+        let executor = Arc::clone(&config.merge_executor);
+        tokio::task::spawn_blocking(move || executor.merge_commit_status(pr, &repo))
+            .await
+            .map_err(|error| format!("branch sync merge state lookup join: {error}"))?
+    };
+    match status {
+        MergeCommitStatus::Merged { .. } => {
+            complete_verified_merge(config, worktrees, sync, pr).await
+        }
+        MergeCommitStatus::Open => {
+            let merge_sha = required(sync.merge_sha.as_deref(), "merge_sha")?.to_string();
+            let base = sync.target_branch.clone();
+            let repo = config.repo_dir.clone();
+            let executor = Arc::clone(&config.merge_executor);
+            let context = merge::MergeContext {
+                reviewer_name: "daemon branch sync".to_string(),
+                review_task_id: sync.id,
+                expected_base_branch: base,
+                expected_head_sha: merge_sha,
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                executor.merge_without_approval(pr, &repo, &context)
+            })
+            .await
+            .map_err(|error| format!("branch sync merge execution join: {error}"))?;
+            if !result.success {
+                return Err(format!(
+                    "branch sync merge PR #{pr} failed: {}",
+                    result.message
+                ));
+            }
+            complete_verified_merge(config, worktrees, sync, pr).await
+        }
+        MergeCommitStatus::Closed => Err(format!("branch sync PR #{pr} is closed without merge")),
+        MergeCommitStatus::Unknown => Err(format!(
+            "branch sync PR #{pr} merge state could not be determined during merging reconciliation"
+        )),
+    }
+}
+
+async fn complete_verified_merge(
+    config: &ServeConfig,
+    worktrees: &WorktreeManager,
+    sync: &BranchSync,
+    pr: i64,
+) -> std::result::Result<(), String> {
+    worktrees
+        .fetch_branch_sync_target(&config.repo_dir, &sync.target_branch)
+        .await?;
+    let merge_commit_sha = {
+        let repo = config.repo_dir.clone();
+        let executor = Arc::clone(&config.merge_executor);
+        tokio::task::spawn_blocking(move || executor.merge_commit_sha(pr, &repo))
+            .await
+            .map_err(|error| format!("branch sync merge commit lookup join: {error}"))?
+    }
+    .filter(|sha| !sha.is_empty())
+    .ok_or_else(|| format!("branch sync PR #{pr} is merged but has no merge_commit_sha"))?;
+    let source_sha = required(sync.source_sha.as_deref(), "source_sha")?;
+    let target_sha = required(sync.target_sha.as_deref(), "target_sha")?;
+    worktrees
+        .verify_branch_sync_merge_ancestry(
+            &config.repo_dir,
+            &merge_commit_sha,
+            source_sha,
+            target_sha,
+        )
+        .await?;
+    let db_path = config.db_path.clone();
+    let id = sync.id;
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        let _ = branch_sync::complete_merge(
+            &mut conn,
+            id,
+            &merge_commit_sha,
+            quorum_core::clock::now(),
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("branch sync completion settlement join: {error}"))?
+    .map_err(|error| error.to_string())
+}
+
+fn required_pr(sync: &BranchSync) -> std::result::Result<i64, String> {
+    sync.pr
+        .filter(|pr| *pr > 0)
+        .ok_or_else(|| "missing pr".to_string())
 }
 
 fn validate_published_target(
@@ -374,7 +540,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::process::Command;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     fn target(state: &str, head: &str, base: &str) -> PrTarget {
         PrTarget {
@@ -517,6 +683,455 @@ mod tests {
         }
     }
 
+    struct SyncExecutor {
+        checks: merge::ChecksOutcome,
+        required_jobs: merge::RequiredJobsOutcome,
+        merge_status: MergeCommitStatus,
+        merge_commit_sha: Option<String>,
+        merge_success: bool,
+        merge_calls: std::sync::atomic::AtomicUsize,
+        merge_heads: Mutex<Vec<String>>,
+    }
+
+    impl SyncExecutor {
+        fn new(
+            checks: merge::ChecksOutcome,
+            required_jobs: merge::RequiredJobsOutcome,
+            merge_status: MergeCommitStatus,
+            merge_commit_sha: Option<String>,
+            merge_success: bool,
+        ) -> Self {
+            Self {
+                checks,
+                required_jobs,
+                merge_status,
+                merge_commit_sha,
+                merge_success,
+                merge_calls: std::sync::atomic::AtomicUsize::new(0),
+                merge_heads: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl merge::MergeExecutor for SyncExecutor {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            context: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            self.merge_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.merge_heads
+                .lock()
+                .unwrap()
+                .push(context.expected_head_sha.clone());
+            merge::MergeResult {
+                success: self.merge_success,
+                message: "fake merge".to_string(),
+                failure_kind: (!self.merge_success)
+                    .then_some(merge::MergeFailureKind::PolicyBlocked),
+            }
+        }
+
+        fn merge_commit_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+            self.merge_commit_sha.clone()
+        }
+
+        fn merge_commit_status(&self, _pr: i64, _repo_dir: &Path) -> MergeCommitStatus {
+            self.merge_status.clone()
+        }
+
+        fn wait_for_branch_sync_checks(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _timeout_secs: u64,
+            _poll_interval_secs: u64,
+        ) -> merge::ChecksOutcome {
+            self.checks.clone()
+        }
+
+        fn check_required_jobs(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _required_jobs: &[String],
+        ) -> merge::RequiredJobsOutcome {
+            self.required_jobs.clone()
+        }
+    }
+
+    fn sync_at_phase(
+        db_path: &Path,
+        source_sha: &str,
+        target_sha: &str,
+        phase: &str,
+    ) -> BranchSync {
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        let row = match branch_sync::request(&mut conn, "develop", "main", "owner", 1).unwrap() {
+            branch_sync::RequestOutcome::Requested(row) => row,
+            branch_sync::RequestOutcome::AlreadyActive(_) => unreachable!(),
+        };
+        branch_sync::pin(&mut conn, row.id, source_sha, target_sha, "sync/1", 2)
+            .unwrap()
+            .unwrap();
+        branch_sync::prepared(&mut conn, row.id, "sync/1", &"c".repeat(40), 3)
+            .unwrap()
+            .unwrap();
+        branch_sync::published(&mut conn, row.id, 42, 4)
+            .unwrap()
+            .unwrap();
+        if phase == "checks" || phase == "merging" {
+            branch_sync::begin_checks(&mut conn, row.id, 5)
+                .unwrap()
+                .unwrap();
+        }
+        if phase == "merging" {
+            branch_sync::begin_merge_attempt(&mut conn, row.id, 6)
+                .unwrap()
+                .unwrap();
+        }
+        branch_sync::get(&conn, row.id).unwrap().unwrap()
+    }
+
+    fn config_with_executor(
+        root: &Path,
+        db_path: PathBuf,
+        executor: Arc<dyn merge::MergeExecutor>,
+        required_jobs: Vec<String>,
+    ) -> ServeConfig {
+        let mut config = sync_test_config(
+            db_path,
+            root.join("repo"),
+            root.join("worktrees"),
+            root.join("fake-gh"),
+        );
+        config.merge_executor = executor;
+        config.required_jobs = required_jobs;
+        config
+    }
+
+    #[tokio::test]
+    async fn checks_fail_closed_when_required_jobs_are_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("quorum.db");
+        let row = sync_at_phase(&db_path, &"a".repeat(40), &"b".repeat(40), "checks");
+        let executor = Arc::new(SyncExecutor::new(
+            merge::ChecksOutcome::Ready,
+            merge::RequiredJobsOutcome::AllSucceeded,
+            MergeCommitStatus::Open,
+            None,
+            true,
+        ));
+        let config = config_with_executor(root.path(), db_path.clone(), executor, Vec::new());
+
+        reconcile_one(&config, &WorktreeManager::new())
+            .await
+            .unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let failed = branch_sync::get(&conn, row.id).unwrap().unwrap();
+        assert_eq!(failed.phase, "failed");
+        assert!(!failed.active);
+        assert_eq!(failed.last_error.as_deref(), Some(REQUIRED_JOBS_ERROR));
+        let error_rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM errors WHERE source='branch_sync'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(error_rows, 1);
+        let event: String = conn
+            .query_row(
+                "SELECT kind FROM events WHERE subject=?1 ORDER BY seq DESC LIMIT 1",
+                [format!("branch_sync#{}", row.id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event, "branch_sync_failed");
+    }
+
+    #[tokio::test]
+    async fn failed_checks_stay_active_for_later_judgment() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("quorum.db");
+        let row = sync_at_phase(&db_path, &"a".repeat(40), &"b".repeat(40), "checks");
+        let executor = Arc::new(SyncExecutor::new(
+            merge::ChecksOutcome::Failed {
+                failing_checks: vec!["ci".to_string()],
+            },
+            merge::RequiredJobsOutcome::AllSucceeded,
+            MergeCommitStatus::Open,
+            None,
+            true,
+        ));
+        let config = config_with_executor(
+            root.path(),
+            db_path.clone(),
+            executor,
+            vec!["ci".to_string()],
+        );
+
+        reconcile_one(&config, &WorktreeManager::new())
+            .await
+            .unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let failed = branch_sync::get(&conn, row.id).unwrap().unwrap();
+        assert_eq!(failed.phase, "ci_failed");
+        assert!(failed.active);
+        assert!(failed.last_error.as_deref().unwrap().contains("ci"));
+        let event: String = conn
+            .query_row(
+                "SELECT kind FROM events WHERE subject=?1 ORDER BY seq DESC LIMIT 1",
+                [format!("branch_sync#{}", row.id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event, "branch_sync_ci_failed");
+    }
+
+    #[tokio::test]
+    async fn green_checks_cross_durable_merging_admission_before_remote_call() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("quorum.db");
+        let row = sync_at_phase(&db_path, &"a".repeat(40), &"b".repeat(40), "checks");
+        let executor = Arc::new(SyncExecutor::new(
+            merge::ChecksOutcome::Ready,
+            merge::RequiredJobsOutcome::AllSucceeded,
+            MergeCommitStatus::Open,
+            None,
+            true,
+        ));
+        let config = config_with_executor(
+            root.path(),
+            db_path.clone(),
+            executor.clone(),
+            vec!["ci".to_string()],
+        );
+
+        reconcile_one(&config, &WorktreeManager::new())
+            .await
+            .unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let merging = branch_sync::get(&conn, row.id).unwrap().unwrap();
+        assert_eq!(merging.phase, "merging");
+        assert!(merging.active);
+        assert_eq!(
+            executor
+                .merge_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    fn git_sha(dir: &Path) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[cfg(unix)]
+    fn init_merge_reconciliation_repo(root: &Path, divergent: bool) -> (PathBuf, String, String) {
+        let bare = root.join("origin.git");
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        assert!(Command::new("git")
+            .args(["init", "--bare", "-b", "main", &bare.to_string_lossy()])
+            .status()
+            .unwrap()
+            .success());
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
+        let source_sha = git_sha(&repo);
+        git(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
+        git(&repo, &["push", "-u", "origin", "main"]);
+        if divergent {
+            git(&repo, &["checkout", "-b", "develop"]);
+            git(&repo, &["commit", "--allow-empty", "-m", "source"]);
+            let source_sha = git_sha(&repo);
+            git(&repo, &["push", "origin", "develop"]);
+            git(&repo, &["checkout", "main"]);
+            git(&repo, &["commit", "--allow-empty", "-m", "target"]);
+            let target_sha = git_sha(&repo);
+            git(&repo, &["push", "origin", "main"]);
+            return (repo, source_sha, target_sha);
+        }
+        git(&repo, &["commit", "--allow-empty", "-m", "target"]);
+        let target_sha = git_sha(&repo);
+        git(&repo, &["push", "origin", "main"]);
+        (repo, source_sha, target_sha)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ancestry_failure_after_merge_fails_loudly() {
+        let root = tempfile::tempdir().unwrap();
+        let (_repo, source_sha, target_sha) = init_merge_reconciliation_repo(root.path(), true);
+        let db_path = root.path().join("quorum.db");
+        let row = sync_at_phase(&db_path, &source_sha, &target_sha, "merging");
+        let executor = Arc::new(SyncExecutor::new(
+            merge::ChecksOutcome::Ready,
+            merge::RequiredJobsOutcome::AllSucceeded,
+            MergeCommitStatus::Merged {
+                merge_commit_sha: Some(target_sha.clone()),
+            },
+            Some(target_sha),
+            true,
+        ));
+        let config = config_with_executor(
+            root.path(),
+            db_path.clone(),
+            executor,
+            vec!["ci".to_string()],
+        );
+
+        reconcile_one(&config, &WorktreeManager::new())
+            .await
+            .unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let failed = branch_sync::get(&conn, row.id).unwrap().unwrap();
+        assert_eq!(failed.phase, "failed");
+        assert!(failed
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("does not contain pinned source tip"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn merging_restart_reconciles_merged_open_and_closed_pr_states() {
+        let root = tempfile::tempdir().unwrap();
+        let (_repo, source_sha, target_sha) = init_merge_reconciliation_repo(root.path(), false);
+
+        let merged_db = root.path().join("merged.db");
+        let merged_row = sync_at_phase(&merged_db, &source_sha, &target_sha, "merging");
+        let merged_executor = Arc::new(SyncExecutor::new(
+            merge::ChecksOutcome::Ready,
+            merge::RequiredJobsOutcome::AllSucceeded,
+            MergeCommitStatus::Merged {
+                merge_commit_sha: Some(target_sha.clone()),
+            },
+            Some(target_sha.clone()),
+            true,
+        ));
+        let merged_config = config_with_executor(
+            root.path(),
+            merged_db.clone(),
+            merged_executor.clone(),
+            vec!["ci".to_string()],
+        );
+        reconcile_one(&merged_config, &WorktreeManager::new())
+            .await
+            .unwrap();
+        let merged_conn = quorum_core::db::open(&merged_db).unwrap();
+        assert_eq!(
+            branch_sync::get(&merged_conn, merged_row.id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            "done"
+        );
+        let merged_event: (String, String) = merged_conn
+            .query_row(
+                "SELECT kind, body FROM events WHERE subject=?1 ORDER BY seq DESC LIMIT 1",
+                [format!("branch_sync#{}", merged_row.id)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(merged_event.0, "branch_sync_merged");
+        assert!(merged_event.1.contains(&target_sha));
+        assert_eq!(
+            merged_executor
+                .merge_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        let open_db = root.path().join("open.db");
+        let open_row = sync_at_phase(&open_db, &source_sha, &target_sha, "merging");
+        let open_executor = Arc::new(SyncExecutor::new(
+            merge::ChecksOutcome::Ready,
+            merge::RequiredJobsOutcome::AllSucceeded,
+            MergeCommitStatus::Open,
+            None,
+            false,
+        ));
+        let open_config = config_with_executor(
+            root.path(),
+            open_db.clone(),
+            open_executor.clone(),
+            vec!["ci".to_string()],
+        );
+        reconcile_one(&open_config, &WorktreeManager::new())
+            .await
+            .unwrap();
+        let open_conn = quorum_core::db::open(&open_db).unwrap();
+        assert_eq!(
+            branch_sync::get(&open_conn, open_row.id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            "failed"
+        );
+        assert_eq!(
+            open_executor
+                .merge_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        {
+            let open_heads = open_executor.merge_heads.lock().unwrap();
+            assert_eq!(open_heads.as_slice(), &["c".repeat(40)]);
+        }
+
+        let closed_db = root.path().join("closed.db");
+        let closed_row = sync_at_phase(&closed_db, &source_sha, &target_sha, "merging");
+        let closed_executor = Arc::new(SyncExecutor::new(
+            merge::ChecksOutcome::Ready,
+            merge::RequiredJobsOutcome::AllSucceeded,
+            MergeCommitStatus::Closed,
+            None,
+            true,
+        ));
+        let closed_config = config_with_executor(
+            root.path(),
+            closed_db.clone(),
+            closed_executor.clone(),
+            vec!["ci".to_string()],
+        );
+        reconcile_one(&closed_config, &WorktreeManager::new())
+            .await
+            .unwrap();
+        let closed_conn = quorum_core::db::open(&closed_db).unwrap();
+        assert_eq!(
+            branch_sync::get(&closed_conn, closed_row.id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            "failed"
+        );
+        assert_eq!(
+            closed_executor
+                .merge_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
     #[cfg(unix)]
     fn write_gh(program: &Path, head: &str, state: &str) {
         use std::os::unix::fs::PermissionsExt;
@@ -595,7 +1210,6 @@ mod tests {
         assert_eq!(published.pr, Some(42));
         drop(conn);
 
-        reconcile_one(&config, &manager).await.unwrap();
         write_gh(&gh, "stale", "OPEN");
         reconcile_one(&config, &manager).await.unwrap();
         let conn = quorum_core::db::open(&db_path).unwrap();
