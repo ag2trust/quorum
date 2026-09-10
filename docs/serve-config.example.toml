@@ -84,6 +84,10 @@ drain_timeout_secs = 900
 
 # ── misc ──────────────────────────────────────────────────────────────
 base_branch = "main"
+# Directed source/target pairs eligible for daemon-internal branch sync.
+# Omit or set [] to disable it. Configure both directions explicitly when
+# main and develop should each receive the other's changes.
+sync_pairs = [["main", "develop"], ["develop", "main"]]
 
 # ── observational host resources ─────────────────────────────────────
 # These values affect status severity and transition-only daemon warnings.

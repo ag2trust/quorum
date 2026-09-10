@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 75;
+pub const SCHEMA_VERSION: i64 = 76;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1387,6 +1387,10 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                      ON planner_submissions(graph_id)",
             )?;
         }
+        // v76 = durable branch synchronization rows. The table, its partial
+        // active-pair unique index, and task-reference lookup index are new
+        // schema objects, so SCHEMA_SQL creates them for fresh databases and
+        // upgrades alike. No data backfill is needed.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1470,6 +1474,7 @@ mod tests {
             "cursors",
             "claims",
             "tasks",
+            "branch_syncs",
             "errors",
             "events",
             "task_notes",
@@ -1669,6 +1674,72 @@ mod tests {
                 |row| row.get::<_, bool>(0),
             )
             .unwrap());
+    }
+
+    /// A v75 database predates branch synchronization storage. Upgrading must
+    /// create both the durable rows and the partial active-pair guard, and a
+    /// later ordinary open must be a no-op.
+    #[test]
+    fn v75_to_v76_adds_branch_syncs_table_and_index_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v75-branch-syncs.db");
+        {
+            let raw = Connection::open(&path).unwrap();
+            apply_pragmas(&raw).unwrap();
+            migrate(&raw).unwrap();
+            raw.execute_batch(
+                "DROP INDEX branch_syncs_one_active_pair;
+                 DROP TABLE branch_syncs;
+                 PRAGMA user_version=75;",
+            )
+            .unwrap();
+        }
+
+        let migrated = open(&path).unwrap();
+        for column in [
+            "id",
+            "source_branch",
+            "target_branch",
+            "source_sha",
+            "target_sha",
+            "sync_branch",
+            "merge_sha",
+            "pr",
+            "phase",
+            "task_id",
+            "active",
+            "requested_by",
+            "last_error",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(
+                column_exists(&migrated, "branch_syncs", column).unwrap(),
+                "branch_syncs column {column} missing after v75 upgrade"
+            );
+        }
+        for index in ["branch_syncs_one_active_pair", "branch_syncs_task_id"] {
+            assert!(migrated
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type='index' AND name=?1
+                     )",
+                    [index],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap());
+        }
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        assert!(column_exists(&reopened, "branch_syncs", "active").unwrap());
     }
 
     #[test]
