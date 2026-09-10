@@ -462,14 +462,25 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   and timestamps. `UNIQUE(source_branch, target_branch) WHERE active=1` is the durable
   cross-process guard for a single live synchronization per directed pair.
 - Phases advance through the one-way clean path `requested` → `pinned` → `prepared` →
-  `published` → `checks` → `merging` → `done`. `pinned` may end `noop` or `conflict`, `checks`
-  may end `ci_failed`, and `merging` may end `conflict`; `failed` and `cancelled` may end any
-  active phase. Phase changes are guarded compare-and-set updates and reject backward, skipped,
-  and same-phase writes, so stale or restarted executors cannot overwrite or reorder durable
-  progress. Every terminal transition clears `active` in the same statement, releasing the pair
-  for a later request.
+  `published` → `checks` → `merging` → `done`. The daemon fetches and pins both remote tips
+  before it allocates `sync/<from>-into-<to>-<id>` from the pinned target. It first proves a
+  no-op by ancestry; otherwise it runs an explicit `--no-ff` merge of the pinned source, records
+  the resulting merge SHA, pushes only that new branch, and creates the PR against the pinned
+  target branch. A restart reuses those pins: `pinned` rebuilds only from the stored SHAs,
+  `prepared` rechecks the local tip before publishing, and `published` verifies the live open PR
+  head/base before later work receives authority. `pinned` may end `noop` or become `conflict`,
+  `checks` may end `ci_failed`, and `merging` may end `conflict`; `failed` and `cancelled` may
+  end any active phase. Phase changes are guarded compare-and-set updates and reject backward,
+  skipped, and same-phase writes, so stale or restarted executors cannot overwrite or reorder
+  durable progress. Every terminal transition except a judgment-pending `conflict` clears
+  `active` in the same statement, releasing the pair for a later request.
 - The daemon executes the clean path internally; no task is created merely to merge, publish,
-  wait for checks, or complete a no-op. Only `conflict` and `ci_failed` lead to a judgment task.
+  wait for checks, or complete a no-op. A conflict preserves the daemon-owned worktree's
+  `MERGE_HEAD` and unmerged index, stays active for the later judgment task, and is never pushed.
+  Sync branches deliberately use the `sync/` namespace rather than the task-only
+  `daemon/<author>-t<id>` grammar, so task branch cleanup and orphan discovery do not reap them.
+  Their preserved conflict worktrees also live beside, rather than under, the task worktree base
+  that recovery garbage-collects; `cleanup.rs` only accepts a matching `task_branches` allocation.
 
 ### Ops
 - `quorum status [--watch]` → read-only health snapshot. Alerts and critical messages are

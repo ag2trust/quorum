@@ -7,6 +7,7 @@ pub mod agent;
 pub mod agent_endpoint;
 pub mod approvals;
 pub mod arbiter;
+pub mod branch_sync;
 pub mod classifier;
 pub mod cleanup;
 #[allow(dead_code)]
@@ -10104,6 +10105,11 @@ async fn tick_loop(
     // intents have settled or exhausted.
     cleanup::startup(config, &wt_mgr).await?;
 
+    // Branch synchronizations are daemon-owned non-task work. Reconcile one
+    // before lifecycle recovery so a crash can resume its pinned/prepared
+    // evidence without waiting for the first normal daemon tick.
+    branch_sync::reconcile_one(config, &wt_mgr).await?;
+
     // `attempting` means the prior daemon crossed the durable boundary before
     // a merge network call (ordinary reviewed merge or explicit replay), but
     // crashed before recording its outcome. Never guess or issue a duplicate
@@ -10779,6 +10785,10 @@ async fn tick(
     signal_count: &std::sync::Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
+
+    // Bound daemon-internal branch synchronization to one durable row per
+    // tick. Its Git/GitHub work is complete before any SQLite settlement.
+    branch_sync::reconcile_one(config, wt_mgr).await?;
 
     let decomposition_freeze = tick_decomposition(
         config,
