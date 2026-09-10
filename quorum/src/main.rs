@@ -1223,6 +1223,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 let executor = serve::merge::GhMergeExecutor {
                     token_file: None,
                     gh_repo: Some(repo),
+                    // task-close only queries PR state; these merge-policy
+                    // fields are not consulted by merge_commit_status.
+                    base_branch: "main".into(),
+                    self_update_branch: "main".into(),
                 };
                 match executor.merge_commit_status(pr, std::path::Path::new(".")) {
                     serve::merge::MergeCommitStatus::Merged {
