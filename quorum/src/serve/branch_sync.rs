@@ -1368,24 +1368,25 @@ mod tests {
                 reconcile_one(&config, &manager, &mut checks).await.unwrap();
                 let conn = quorum_core::db::open(&db_path).unwrap();
                 let current = branch_sync::get(&conn, row.id).unwrap().unwrap();
-                if attempt < MAX_BRANCH_SYNC_CHECK_ATTEMPTS
-                    && current.phase == "checks"
-                    && current.ci_attempts == attempt
-                    && current.ci_next_attempt_at.is_some()
-                {
-                    let expected_delay = check_retry_delay_secs(&config, attempt) as i64;
-                    assert!(
-                        current.ci_next_attempt_at.unwrap() >= current.updated_at + expected_delay,
-                        "retry {attempt} must persist exponential backoff"
-                    );
-                    drop(conn);
-                    let conn = quorum_core::db::open(&db_path).unwrap();
-                    conn.execute(
-                        "UPDATE branch_syncs SET ci_next_attempt_at=0 WHERE id=?1",
-                        [row.id],
-                    )
-                    .unwrap();
-                    break;
+                if let Some(next_attempt_at) = current.ci_next_attempt_at {
+                    if attempt < MAX_BRANCH_SYNC_CHECK_ATTEMPTS
+                        && current.phase == "checks"
+                        && current.ci_attempts == attempt
+                    {
+                        let expected_delay = check_retry_delay_secs(&config, attempt) as i64;
+                        assert!(
+                            next_attempt_at >= current.updated_at + expected_delay,
+                            "retry {attempt} must persist exponential backoff"
+                        );
+                        drop(conn);
+                        let conn = quorum_core::db::open(&db_path).unwrap();
+                        conn.execute(
+                            "UPDATE branch_syncs SET ci_next_attempt_at=0 WHERE id=?1",
+                            [row.id],
+                        )
+                        .unwrap();
+                        break;
+                    }
                 }
                 if attempt == MAX_BRANCH_SYNC_CHECK_ATTEMPTS && current.phase == "failed" {
                     assert_eq!(current.ci_attempts, attempt);
