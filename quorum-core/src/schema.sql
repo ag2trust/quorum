@@ -999,6 +999,8 @@ CREATE TABLE IF NOT EXISTS fallback_launch_intents (
 );
 CREATE INDEX IF NOT EXISTS fallback_launch_intents_task
     ON fallback_launch_intents(task_id);
+CREATE INDEX IF NOT EXISTS fallback_launch_intents_agent_run
+    ON fallback_launch_intents(agent_run_id);
 
 -- v27: prospective-only boundary for PR-interaction performance analytics
 -- (#158). Single row (id=1) recording the unix timestamp at which
