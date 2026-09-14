@@ -9,7 +9,11 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
+<<<<<<< HEAD
 pub const SCHEMA_VERSION: i64 = 77;
+=======
+pub const SCHEMA_VERSION: i64 = 72;
+>>>>>>> main
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1333,6 +1337,7 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 [],
             )?;
         }
+<<<<<<< HEAD
         // v72 = per-attempt decomposition-eligibility + fewest-L rank columns.
         // Additive/observational; no backfill. `CREATE TABLE IF NOT EXISTS` in
         // SCHEMA_SQL is a no-op for existing tables, so each column must be
@@ -1423,6 +1428,15 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 "CREATE INDEX IF NOT EXISTS branch_syncs_checks_due
                      ON branch_syncs(ci_next_attempt_at, updated_at, id)
                      WHERE active = 1 AND phase = 'checks'",
+=======
+        // v72 indexes the second durable FK into agent_runs. Opportunistic
+        // sweep probes this column for each bounded raw run candidate, so the
+        // lookup must not scan the retained fallback-intent ledger.
+        if current < 72 {
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS fallback_launch_intents_agent_run
+                     ON fallback_launch_intents(agent_run_id)",
+>>>>>>> main
             )?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -2213,6 +2227,53 @@ mod tests {
                 .unwrap(),
             SCHEMA_VERSION,
             "a second migration-open must be a no-op"
+        );
+    }
+
+    #[test]
+    fn v71_to_v72_indexes_fallback_intent_agent_run_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v71-fallback-agent-run-index.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "DROP INDEX fallback_launch_intents_agent_run;
+                 PRAGMA user_version=71;",
+            )
+            .unwrap();
+        }
+
+        let upgraded = open(&path).unwrap();
+        let indexed_column: String = upgraded
+            .query_row(
+                "SELECT name FROM pragma_index_info('fallback_launch_intents_agent_run')
+                 WHERE seqno=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed_column, "agent_run_id");
+        assert_eq!(
+            upgraded
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(upgraded);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT count(*) FROM pragma_index_info(
+                         'fallback_launch_intents_agent_run'
+                     ) WHERE seqno=0 AND name='agent_run_id'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "a second migration-open must preserve the lookup index"
         );
     }
 
