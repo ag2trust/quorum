@@ -9,11 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-<<<<<<< HEAD
-pub const SCHEMA_VERSION: i64 = 77;
-=======
-pub const SCHEMA_VERSION: i64 = 72;
->>>>>>> main
+pub const SCHEMA_VERSION: i64 = 78;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1337,7 +1333,6 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 [],
             )?;
         }
-<<<<<<< HEAD
         // v72 = per-attempt decomposition-eligibility + fewest-L rank columns.
         // Additive/observational; no backfill. `CREATE TABLE IF NOT EXISTS` in
         // SCHEMA_SQL is a no-op for existing tables, so each column must be
@@ -1428,15 +1423,17 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 "CREATE INDEX IF NOT EXISTS branch_syncs_checks_due
                      ON branch_syncs(ci_next_attempt_at, updated_at, id)
                      WHERE active = 1 AND phase = 'checks'",
-=======
-        // v72 indexes the second durable FK into agent_runs. Opportunistic
+            )?;
+        }
+        // v78 indexes the second durable FK into agent_runs. Opportunistic
         // sweep probes this column for each bounded raw run candidate, so the
-        // lookup must not scan the retained fallback-intent ledger.
-        if current < 72 {
+        // lookup must not scan the retained fallback-intent ledger. This is
+        // v78 on develop because that line had already shipped schema v77
+        // before the main hotfix was synchronized.
+        if current < 78 {
             conn.execute_batch(
                 "CREATE INDEX IF NOT EXISTS fallback_launch_intents_agent_run
                      ON fallback_launch_intents(agent_run_id)",
->>>>>>> main
             )?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -2231,14 +2228,14 @@ mod tests {
     }
 
     #[test]
-    fn v71_to_v72_indexes_fallback_intent_agent_run_references() {
+    fn v77_to_v78_indexes_fallback_intent_agent_run_references() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v71-fallback-agent-run-index.db");
+        let path = dir.path().join("v77-fallback-agent-run-index.db");
         {
             let conn = open(&path).unwrap();
             conn.execute_batch(
                 "DROP INDEX fallback_launch_intents_agent_run;
-                 PRAGMA user_version=71;",
+                 PRAGMA user_version=77;",
             )
             .unwrap();
         }
