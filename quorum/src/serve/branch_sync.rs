@@ -1302,6 +1302,7 @@ mod tests {
             vec!["ci".to_string()],
         );
         config.merge_checks_poll_secs = 30;
+        config.merge_checks_timeout_secs = 300;
         let manager = WorktreeManager::new();
         let mut checks = BranchSyncChecks::default();
 
