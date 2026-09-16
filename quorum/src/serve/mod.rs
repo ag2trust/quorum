@@ -18478,7 +18478,8 @@ async fn persist_fallback_install_diagnostic(
 /// installer conflict (or exhausted transient retry budget) is terminal.
 /// `Some` is the exact agent-run end reason for immediate teardown; `None`
 /// retains the slot only while either the retry budget or a DB mutation retry
-/// remains outstanding.
+/// remains outstanding, or while a post-snapshot reviewer verdict awaits
+/// Phase 2 delivery.
 async fn surface_reviewer_fallback_install_failure(
     db_path: &Path,
     slot: &mut SlotState,
@@ -22471,7 +22472,9 @@ async fn fire_actionable_rework_event(
 /// Atomically fail a reviewer only if it still owns `in-review`.
 ///
 /// A clean `false` means the reviewer already transferred ownership (normally
-/// via `VerdictChanges`) and teardown must not mutate the lifecycle.
+/// via `VerdictChanges`) and teardown must not mutate the lifecycle. `None`
+/// also retains the slot when a verdict committed after this tick's mailbox
+/// snapshot: the core guard leaves that durable row for Phase 2 next tick.
 async fn fail_reviewer_if_owner(
     db_path: &std::path::Path,
     reviewer: &str,
@@ -22481,14 +22484,32 @@ async fn fail_reviewer_if_owner(
     let p = db_path.to_path_buf();
     let actor = reviewer.to_string();
     let failure_reason = reason.to_string();
-    let result = tokio::task::spawn_blocking(move || {
-        let mut conn = quorum_core::db::open(&p)?;
-        tasks::fail_reviewer_if_owner(&mut conn, &actor, task_id, &failure_reason, now_unix())
-    })
-    .await;
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<(Option<tasks::TransitionResult>, bool)> {
+            let mut conn = quorum_core::db::open(&p)?;
+            let mutation = tasks::fail_reviewer_if_owner(
+                &mut conn,
+                &actor,
+                task_id,
+                &failure_reason,
+                now_unix(),
+            )?;
+            let pending_verdict = mutation.is_none()
+                && conn.query_row(
+                    "SELECT EXISTS(
+                     SELECT 1 FROM mailbox
+                     WHERE agent=?1 AND kind='done' AND task_id=?2
+                       AND verdict IS NOT NULL AND consumed_at IS NULL
+                 )",
+                    rusqlite::params![actor, task_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+            Ok((mutation, pending_verdict))
+        })
+        .await;
 
     match result {
-        Ok(Ok(Some(tr))) => {
+        Ok(Ok((Some(tr), _))) => {
             let names: Vec<String> = tr.effects.iter().map(tasks::effect_name).collect();
             log(&format!(
                 "lifecycle: task #{task_id} -> {} (effects: [{}])",
@@ -22497,7 +22518,13 @@ async fn fail_reviewer_if_owner(
             ));
             Some(true)
         }
-        Ok(Ok(None)) => {
+        Ok(Ok((None, true))) => {
+            log(&format!(
+                "reviewer {reviewer} failure deferred for task #{task_id}: pending verdict awaits mailbox delivery"
+            ));
+            None
+        }
+        Ok(Ok((None, false))) => {
             log(&format!(
                 "reviewer {reviewer} failure ignored after review ownership transferred"
             ));
@@ -23256,13 +23283,20 @@ async fn activate_reviewer_fallback(
                 "reviewer {} has no eligible alternate after {}: {}",
                 slot.agent_name, block.provider, block.reason
             ));
-            let _ = fail_reviewer_if_owner(
+            if fail_reviewer_if_owner(
                 &config.db_path,
                 &slot.agent_name,
                 slot.task_id,
                 &block.reason,
             )
-            .await;
+            .await
+            .is_none()
+            {
+                // A verdict that committed after Phase 2's snapshot retains
+                // the slot through the next mailbox pass; tearing it down
+                // here would orphan that authoritative result.
+                return Ok(ReviewerFallbackActivation::NotInstalled);
+            }
             return Ok(ReviewerFallbackActivation::Settled);
         }
         fallback::FallbackInstallOutcome::Installed(intent) => intent,
@@ -29557,19 +29591,57 @@ mod tests {
     async fn racing_reviewer_verdict_wins_over_fallback_conflict_failure() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("reviewer-fallback-verdict-race.db");
-        let (_config, task_id, run_id, agent) = seed_reviewer_fallback_failure_fixture(&db_path);
+        let (config, task_id, run_id, agent) = seed_reviewer_fallback_failure_fixture(&db_path);
         let mut slot = failed_reviewer_fallback_test_slot(task_id, run_id, agent.clone());
-        {
+
+        // Mirror the real interleaving: Phase 1 has already taken an empty
+        // snapshot, then the reviewer durably submits before Phase 3 reaches
+        // the terminal fallback conflict.
+        let mailbox_id = {
             let mut conn = quorum_core::db::open(&db_path).unwrap();
-            tasks::apply_event(
+            journal::upsert(
                 &mut conn,
-                &agent,
-                task_id,
-                &Event::VerdictChanges,
-                now_unix(),
+                &JournalEntry {
+                    agent: agent.clone(),
+                    role: "reviewer".into(),
+                    task_id: Some(task_id),
+                    session_id: slot.session_id.clone(),
+                    worktree: Some(slot.worktree_path.to_string_lossy().into()),
+                    branch: None,
+                    phase: "reviewing".into(),
+                    cost_tokens: 0,
+                    agent_state: None,
+                    cost_usd: 0.0,
+                    log_dir: None,
+                    pid: None,
+                    pr: Some(77),
+                    rework_count: 0,
+                    provider: Some("codex".into()),
+                    continuation_id: None,
+                    local_branch: None,
+                },
             )
             .unwrap();
-        }
+            assert!(
+                mailbox::poll_unconsumed(&conn).unwrap().is_empty(),
+                "the Phase 1 snapshot precedes the reviewer submission"
+            );
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: agent.clone(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(77),
+                    verdict: Some("changes".into()),
+                    feedback: Some("fix the conflict".into()),
+                    note: None,
+                    to_agent: None,
+                    payload: Some(r#"{"blocking":1}"#.into()),
+                },
+            )
+            .unwrap()
+        };
 
         assert_eq!(
             surface_reviewer_fallback_install_failure(
@@ -29578,7 +29650,34 @@ mod tests {
                 &QuorumError::FallbackInstallConflict,
             )
             .await,
-            Some("ownership_transferred"),
+            None,
+            "the immediate failure must defer to the post-snapshot verdict",
+        );
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let task = tasks::get(&conn, task_id).unwrap().unwrap();
+            assert_eq!(task.status, "in-review");
+            assert_eq!(task.reviewer.as_deref(), Some(agent.as_str()));
+            assert!(
+                mailbox::has_unconsumed(&conn, &agent, mailbox::MailboxKind::Done, task_id,)
+                    .unwrap()
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM errors WHERE source='fallback_install'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+                0,
+            );
+        }
+
+        assert_eq!(
+            fold_pending_reviewer_verdict(&config, &agent, task_id)
+                .await
+                .unwrap(),
+            Some(tasks::LateReviewerVerdict::Changes),
         );
         let conn = quorum_core::db::open(&db_path).unwrap();
         assert_eq!(
@@ -29587,13 +29686,13 @@ mod tests {
         );
         assert_eq!(
             conn.query_row(
-                "SELECT COUNT(*) FROM errors WHERE source='fallback_install'",
-                [],
-                |row| row.get::<_, i64>(0),
+                "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+                [mailbox_id],
+                |row| row.get::<_, bool>(0),
             )
             .unwrap(),
-            0,
-            "the post-verdict guarded mutation must not report reviewer failure",
+            true,
+            "the deferred verdict must fold rather than become a phantom",
         );
     }
 
