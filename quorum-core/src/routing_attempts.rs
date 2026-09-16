@@ -72,6 +72,12 @@ pub struct RoutingAttempt {
     /// `None` means the attempt has no classified pre-authoritative runner
     /// failure. Semantic outcomes and authoritative signals must use `None`.
     pub failure_disposition: Option<FailureDisposition>,
+    /// The exact failed `agent_runs.id` whose retirement authorized this
+    /// attempt. Populated for fallback-authorizing failures so a second
+    /// same-profile failure cannot be collapsed into a replay of the first.
+    /// `None` is reserved for grandfathered pre-v79 rows and non-fallback
+    /// recording sites that do not identify a failed managed run.
+    pub failed_agent_run_id: Option<i64>,
     pub recorded_at: i64,
 }
 
@@ -81,6 +87,9 @@ pub struct RecordRoutingAttempt<'a> {
     pub responsibility_key: &'a str,
     pub profile: &'a ModelProfile,
     pub failure_disposition: Option<FailureDisposition>,
+    /// Distinct generation key for this attempt. Fallback retirement supplies
+    /// the failed managed-run identity here; other callers pass `None`.
+    pub failed_agent_run_id: Option<i64>,
     pub recorded_at: i64,
 }
 
@@ -225,17 +234,35 @@ pub fn record_tx(
         .ok_or_else(|| QuorumError::Io("routing attempt role assignment is missing".into()))?;
     validate_assignment(&assignment, input, eligible_pool)?;
 
-    if let Some(existing) = get_by_route(tx, input.role_assignment_id, &input.profile.id)? {
+    if let Some(existing) = get_by_route(
+        tx,
+        input.role_assignment_id,
+        &input.profile.id,
+        input.failed_agent_run_id,
+    )? {
         ensure_replay_matches(&existing, input, eligible_pool)?;
         return Ok(RecordOutcome::Replayed(existing));
     }
 
-    let distinct: i64 = tx.query_row(
-        "SELECT count(*) FROM routing_attempts WHERE role_assignment_id=?1",
+    // The eligible pool bounds the distinct routes an assignment may attempt.
+    // With per-failed-run rows this counts distinct profile ids, not total
+    // rows, so a second failure of the same profile cannot artificially
+    // exhaust the budget while still preserving the same one-per-profile
+    // ceiling for route exhaustion.
+    let distinct_profiles: i64 = tx.query_row(
+        "SELECT count(DISTINCT profile_id) FROM routing_attempts
+         WHERE role_assignment_id=?1",
         [input.role_assignment_id],
         |row| row.get(0),
     )?;
-    if distinct >= eligible_pool.profiles.len() as i64 {
+    let profile_already_seen: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM routing_attempts
+             WHERE role_assignment_id=?1 AND profile_id=?2)",
+        params![input.role_assignment_id, input.profile.id],
+        |row| row.get(0),
+    )?;
+    if !profile_already_seen && distinct_profiles >= eligible_pool.profiles.len() as i64 {
         return Err(QuorumError::Io(
             "routing attempts exceed configured eligible routes".into(),
         ));
@@ -244,8 +271,8 @@ pub fn record_tx(
     tx.execute(
         "INSERT INTO routing_attempts(
              role_assignment_id,responsibility_key,profile_id,provider,runner,model,effort,
-             pool_key,policy_generation,failure_disposition,recorded_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+             pool_key,policy_generation,failure_disposition,failed_agent_run_id,recorded_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         params![
             input.role_assignment_id,
             input.responsibility_key,
@@ -257,11 +284,17 @@ pub fn record_tx(
             eligible_pool.pool_key,
             eligible_pool.policy_generation,
             input.failure_disposition.map(FailureDisposition::as_str),
+            input.failed_agent_run_id,
             input.recorded_at,
         ],
     )?;
-    let inserted = get_by_route(tx, input.role_assignment_id, &input.profile.id)?
-        .ok_or_else(|| QuorumError::Io("recorded routing attempt is missing".into()))?;
+    let inserted = get_by_route(
+        tx,
+        input.role_assignment_id,
+        &input.profile.id,
+        input.failed_agent_run_id,
+    )?
+    .ok_or_else(|| QuorumError::Io("recorded routing attempt is missing".into()))?;
     Ok(RecordOutcome::Inserted(inserted))
 }
 
@@ -270,7 +303,8 @@ pub fn list(conn: &Connection, responsibility_key: &str) -> Result<Vec<RoutingAt
     validate_text("responsibility key", responsibility_key)?;
     let mut statement = conn.prepare(
         "SELECT id,role_assignment_id,responsibility_key,profile_id,provider,runner,model,
-                effort,pool_key,policy_generation,failure_disposition,recorded_at
+                effort,pool_key,policy_generation,failure_disposition,failed_agent_run_id,
+                recorded_at
          FROM routing_attempts WHERE responsibility_key=?1 ORDER BY id",
     )?;
     let attempts = statement
@@ -438,6 +472,7 @@ fn ensure_replay_matches(
         || existing.pool_key != pool.pool_key
         || existing.policy_generation != pool.policy_generation
         || existing.failure_disposition != input.failure_disposition
+        || existing.failed_agent_run_id != input.failed_agent_run_id
     {
         return Err(QuorumError::Io(
             "routing attempt replay conflicts with immutable evidence".into(),
@@ -450,12 +485,18 @@ fn get_by_route(
     conn: &Connection,
     assignment_id: i64,
     profile_id: &str,
+    failed_agent_run_id: Option<i64>,
 ) -> Result<Option<RoutingAttempt>> {
+    // SQLite treats NULL as a distinct value in equality comparisons, so an
+    // `IS` predicate is required to match both grandfathered NULL rows and
+    // new failure-keyed rows deterministically.
     conn.query_row(
         "SELECT id,role_assignment_id,responsibility_key,profile_id,provider,runner,model,
-                effort,pool_key,policy_generation,failure_disposition,recorded_at
-         FROM routing_attempts WHERE role_assignment_id=?1 AND profile_id=?2",
-        params![assignment_id, profile_id],
+                effort,pool_key,policy_generation,failure_disposition,failed_agent_run_id,
+                recorded_at
+         FROM routing_attempts
+         WHERE role_assignment_id=?1 AND profile_id=?2 AND failed_agent_run_id IS ?3",
+        params![assignment_id, profile_id, failed_agent_run_id],
         row_to_attempt,
     )
     .optional()
@@ -489,7 +530,8 @@ fn row_to_attempt(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutingAttempt> {
         pool_key: row.get(8)?,
         policy_generation: row.get(9)?,
         failure_disposition,
-        recorded_at: row.get(11)?,
+        failed_agent_run_id: row.get(11)?,
+        recorded_at: row.get(12)?,
     })
 }
 
@@ -647,6 +689,7 @@ mod tests {
                 responsibility_key: responsibility,
                 profile: &pool.profiles[profile_index].profile,
                 failure_disposition: disposition,
+                failed_agent_run_id: None,
                 recorded_at,
             },
             pool,
@@ -1291,6 +1334,7 @@ mod tests {
                 responsibility_key: "worker:task:7",
                 profile: &unconfigured,
                 failure_disposition: Some(FailureDisposition::ProfileUnavailable),
+                failed_agent_run_id: None,
                 recorded_at: 30,
             },
             &pool,
@@ -1471,5 +1515,110 @@ mod tests {
         );
         assert!(matches!(conflict, Err(QuorumError::Io(_))));
         assert_eq!(list(&conn, "worker:task:80").unwrap().len(), 1);
+    }
+
+    fn insert_dummy_agent_run(conn: &Connection, agent: &str, task_id: i64) -> i64 {
+        conn.execute(
+            "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,spawned_at)
+             VALUES (?1,?2,'worker','model','high','codex',1)",
+            params![task_id, agent],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn distinct_failed_runs_of_same_profile_get_distinct_attempts_bounded_by_profile_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("per-failed-run.db")).unwrap();
+        let pool = pool();
+        insert_assignment_for_pool(&conn, 1, "worker:task:1", 1, &pool, 0);
+        let failed_run_1 = insert_dummy_agent_run(&conn, "worker-1", 1);
+        let failed_run_2 = insert_dummy_agent_run(&conn, "worker-2", 1);
+        let failed_run_3 = insert_dummy_agent_run(&conn, "worker-3", 1);
+        let failed_run_4 = insert_dummy_agent_run(&conn, "worker-4", 1);
+
+        let record_with_failed_run = |conn: &mut Connection,
+                                      failed_run: Option<i64>,
+                                      disposition: FailureDisposition,
+                                      recorded_at: i64| {
+            record(
+                conn,
+                &RecordRoutingAttempt {
+                    role_assignment_id: 1,
+                    responsibility_key: "worker:task:1",
+                    profile: &pool.profiles[0].profile,
+                    failure_disposition: Some(disposition),
+                    failed_agent_run_id: failed_run,
+                    recorded_at,
+                },
+                &pool,
+            )
+        };
+
+        let first = record_with_failed_run(
+            &mut conn,
+            Some(failed_run_1),
+            FailureDisposition::ProviderUnavailable,
+            10,
+        )
+        .unwrap();
+        let second = record_with_failed_run(
+            &mut conn,
+            Some(failed_run_2),
+            FailureDisposition::ProviderUnavailable,
+            11,
+        )
+        .unwrap();
+        assert!(matches!(first, RecordOutcome::Inserted(_)));
+        assert!(matches!(second, RecordOutcome::Inserted(_)));
+        assert_ne!(first.attempt().id, second.attempt().id);
+        assert_eq!(first.attempt().failed_agent_run_id, Some(failed_run_1));
+        assert_eq!(second.attempt().failed_agent_run_id, Some(failed_run_2));
+        assert_eq!(list(&conn, "worker:task:1").unwrap().len(), 2);
+
+        // Same failed run replays the same immutable row.
+        let replay = record_with_failed_run(
+            &mut conn,
+            Some(failed_run_1),
+            FailureDisposition::ProviderUnavailable,
+            99,
+        )
+        .unwrap();
+        assert!(matches!(replay, RecordOutcome::Replayed(_)));
+        assert_eq!(replay.attempt().id, first.attempt().id);
+        assert_eq!(list(&conn, "worker:task:1").unwrap().len(), 2);
+
+        // The exclusion budget still bounds by distinct profile count, so
+        // an unrelated profile may still record its own attempt.
+        record(
+            &mut conn,
+            &RecordRoutingAttempt {
+                role_assignment_id: 1,
+                responsibility_key: "worker:task:1",
+                profile: &pool.profiles[1].profile,
+                failure_disposition: Some(FailureDisposition::ProfileUnavailable),
+                failed_agent_run_id: Some(failed_run_3),
+                recorded_at: 12,
+            },
+            &pool,
+        )
+        .unwrap();
+        // A third distinct profile would exceed the budget, so a fresh
+        // failed_run against a third-profile attempt is rejected even when
+        // its failed_agent_run_id is distinct from prior rows.
+        record(
+            &mut conn,
+            &RecordRoutingAttempt {
+                role_assignment_id: 1,
+                responsibility_key: "worker:task:1",
+                profile: &pool.profiles[2].profile,
+                failure_disposition: Some(FailureDisposition::ProviderUnavailable),
+                failed_agent_run_id: Some(failed_run_4),
+                recorded_at: 13,
+            },
+            &pool,
+        )
+        .unwrap();
     }
 }

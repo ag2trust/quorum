@@ -325,7 +325,7 @@ pub fn insert_alternate_with_attribution(
     spawned_at: i64,
 ) -> Result<i64> {
     let tx = begin_immediate(conn)?;
-    let id = insert_alternate_with_attribution_tx(&tx, token, agent_name, spawned_at)?;
+    let id = insert_alternate_with_attribution_tx(&tx, token, agent_name, None, spawned_at)?;
     tx.commit().map_err(map_sql_err)?;
     Ok(id)
 }
@@ -335,11 +335,14 @@ pub fn insert_alternate_with_attribution(
 /// Fallback installation composes the attributed run with a freshly issued
 /// capability and other failure evidence under one serialization point. This
 /// helper keeps the attribution checks identical for that composite write and
-/// for the standalone historical-evidence writer above.
+/// for the standalone historical-evidence writer above. `failed_agent_run_id`
+/// is the exact managed run this alternate replaces; distinct values produce
+/// distinct alternate rows even for the same (assignment, profile).
 pub fn insert_alternate_with_attribution_tx(
     tx: &Transaction<'_>,
     token: &ValidatedFallbackAttribution,
     agent_name: &str,
+    failed_agent_run_id: Option<i64>,
     spawned_at: i64,
 ) -> Result<i64> {
     if agent_name.is_empty() || agent_name.len() > 1024 || agent_name.contains('\0') {
@@ -391,10 +394,17 @@ pub fn insert_alternate_with_attribution_tx(
         ));
     }
 
-    // Reuse: an existing row for the same (assignment, configured profile) is
-    // authoritative. Verify it agrees with the token before returning, so a
-    // replay with tampered evidence still fails closed.
-    let existing = fetch_configured_route(tx, token.assignment_id(), &token.profile().id)?;
+    // Reuse: an existing row for the same (assignment, configured profile,
+    // failed_agent_run_id) is authoritative. Distinct failed runs of the same
+    // profile deliberately do not collapse into one alternate — the caller
+    // supplies the failed generation identifier so a replay of the same
+    // failure returns the same row while a fresh failure inserts its own.
+    let existing = fetch_configured_route(
+        tx,
+        token.assignment_id(),
+        &token.profile().id,
+        failed_agent_run_id,
+    )?;
 
     if let Some(row) = existing {
         let id = row.id;
@@ -420,8 +430,9 @@ pub fn insert_alternate_with_attribution_tx(
         "INSERT INTO agent_runs(
              task_id, agent_name, role, sub_role, model, effort, provider,
              role_assignment_id, spawned_at,
-             configured_profile_id, configured_provider, configured_model, configured_effort)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             configured_profile_id, configured_provider, configured_model, configured_effort,
+             failed_agent_run_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             task_id,
             agent_name,
@@ -436,6 +447,7 @@ pub fn insert_alternate_with_attribution_tx(
             profile.provider,
             profile.model,
             profile.effort,
+            failed_agent_run_id,
         ],
     )?;
     Ok(tx.last_insert_rowid())
@@ -609,21 +621,26 @@ pub fn runs_for_task(conn: &Connection, task_id: i64) -> Result<Vec<AgentRun>> {
 }
 
 /// Fetch the row (if any) that already attributes `profile_id` as an alternate
-/// route for `role_assignment_id`. Used by
-/// [`insert_alternate_with_attribution`] to detect idempotent replays and
-/// concurrent duplicate attributions.
+/// route for `role_assignment_id` and the exact failed generation identified
+/// by `failed_agent_run_id`. Used by [`insert_alternate_with_attribution`] to
+/// detect idempotent replays and concurrent duplicate attributions without
+/// collapsing distinct failure generations into one alternate row.
 pub(crate) fn fetch_configured_route(
     conn: &Connection,
     role_assignment_id: i64,
     profile_id: &str,
+    failed_agent_run_id: Option<i64>,
 ) -> Result<Option<AgentRun>> {
+    // `IS ?3` matches NULL to NULL for grandfathered pre-v79 rows and matches
+    // an exact identifier for post-v79 alternates.
     conn.query_row(
         "SELECT id, agent_name, role, sub_role, model, effort, provider, role_assignment_id,
                 configured_profile_id, configured_provider, configured_model, configured_effort,
                 spawned_at, ended_at, end_reason
          FROM agent_runs
-         WHERE role_assignment_id = ?1 AND configured_profile_id = ?2",
-        params![role_assignment_id, profile_id],
+         WHERE role_assignment_id = ?1 AND configured_profile_id = ?2
+           AND failed_agent_run_id IS ?3",
+        params![role_assignment_id, profile_id, failed_agent_run_id],
         |r| {
             Ok(AgentRun {
                 id: r.get(0)?,
@@ -1359,6 +1376,7 @@ mod tests {
                     responsibility_key: responsibility,
                     profile: &pool.profiles[failed_index].profile,
                     failure_disposition: Some(disposition),
+                    failed_agent_run_id: None,
                     recorded_at: 10,
                 },
                 pool,
@@ -1589,6 +1607,7 @@ mod tests {
                     responsibility_key: responsibility,
                     profile: &pool.profiles[2].profile,
                     failure_disposition: Some(FailureDisposition::ProfileUnavailable),
+                    failed_agent_run_id: None,
                     recorded_at: 15,
                 },
                 &pool,
@@ -1732,6 +1751,7 @@ mod tests {
                     responsibility_key: "worker:taskless",
                     profile: &pool.profiles[0].profile,
                     failure_disposition: Some(FailureDisposition::ProviderUnavailable),
+                    failed_agent_run_id: None,
                     recorded_at: 5,
                 },
                 &pool,
@@ -1802,6 +1822,7 @@ mod tests {
                     responsibility_key: responsibility,
                     profile: token.profile(),
                     failure_disposition: Some(FailureDisposition::ProfileUnavailable),
+                    failed_agent_run_id: None,
                     recorded_at: 20,
                 },
                 &pool,
@@ -1815,7 +1836,7 @@ mod tests {
 
             // The historical row survives — expiring the token invalidates the
             // replay authority, not the immutable evidence of the earlier run.
-            let preserved = fetch_configured_route(&c, 57, &token.profile().id)
+            let preserved = fetch_configured_route(&c, 57, &token.profile().id, None)
                 .unwrap()
                 .unwrap();
             assert_eq!(preserved.id, first);
@@ -1929,6 +1950,7 @@ mod tests {
                         responsibility_key: responsibility,
                         profile: &pool.profiles[1].profile,
                         failure_disposition: Some(FailureDisposition::ProfileUnavailable),
+                        failed_agent_run_id: None,
                         recorded_at: 20,
                     },
                     &pool,
@@ -2048,6 +2070,7 @@ mod tests {
                     responsibility_key: responsibility,
                     profile: &pool.profiles[1].profile,
                     failure_disposition: Some(FailureDisposition::ProfileUnavailable),
+                    failed_agent_run_id: None,
                     recorded_at: 20,
                 },
                 &pool,
@@ -2130,7 +2153,7 @@ mod tests {
 
             let tx = begin_immediate(&mut c).unwrap();
             let agent_run_id =
-                insert_alternate_with_attribution_tx(&tx, &token, "Alternate", 100).unwrap();
+                insert_alternate_with_attribution_tx(&tx, &token, "Alternate", None, 100).unwrap();
             let capability = crate::capabilities::issue_attributed_alternate_tx(
                 &tx,
                 &token,
@@ -2235,7 +2258,8 @@ mod tests {
 
                 let tx = begin_immediate(&mut c).unwrap();
                 let agent_run_id =
-                    insert_alternate_with_attribution_tx(&tx, &token, agent, task_id).unwrap();
+                    insert_alternate_with_attribution_tx(&tx, &token, agent, None, task_id)
+                        .unwrap();
                 let capability = crate::capabilities::issue_attributed_alternate_tx(
                     &tx,
                     &token,

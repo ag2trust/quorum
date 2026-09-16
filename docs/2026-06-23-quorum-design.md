@@ -2806,6 +2806,19 @@ stored turn verbatim. A launch-time provider/profile failure is recorded like an
 may advance to another bounded eligible route. Reviewer attachment transfers the task lease to the
 reviewer, so fallback currency can never be borrowed from a prior worker or replacement reviewer.
 
+Fallback identity is a per-failed-run generation. Each routing attempt, attributed alternate
+`agent_runs` row, and durable fallback launch intent is keyed by the exact failed managed
+`agent_runs.id` it replaces, not by the responsibility and profile pair alone. A second failure of
+the same profile under the same role assignment therefore materializes its own routing-attempt
+row, its own alternate agent_run and capability, and its own launch intent with the fresh
+worktree/head instead of colliding with the first generation's persisted evidence. Replay of the
+same failed run (same worktree/head) still resolves to the persisted intent so crash-restart
+remains idempotent, and the pre-launch stale-evidence guard stays strict because it now only ever
+compares against the intent for the exact failure being installed. The provider/profile exclusion
+set continues to derive from every classified attempt, and route exhaustion is still bounded by
+the count of distinct configured profiles in the eligible pool — not the total number of attempt
+rows — so a repeated same-profile failure does not weaken or accelerate route exhaustion.
+
 ### Verification gates
 
 Before Codex is production-selectable:
