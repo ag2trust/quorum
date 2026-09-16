@@ -131,6 +131,9 @@ const MAX_POISON_STRIKES: u32 = 3;
 const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
 const MAX_CI_REMEDIATION_PROVISION_STRIKES: i64 = 3;
 const MAX_ERROR_RETRIES: u32 = 3;
+/// An installer retry replays exactly the same durable failure evidence, so
+/// keep it independently bounded from provider turn retries.
+const MAX_FALLBACK_INSTALL_RETRIES: u32 = 3;
 // A post-launch journal failure can race a fast provider's terminal record.
 // Bound both time and allocation so a malformed provider cannot prevent the
 // original fatal handoff outcome or synchronous reap.
@@ -4107,6 +4110,10 @@ pub(crate) struct SlotState {
     session_log: Option<session_log::SessionLog>,
     live_stats: LiveStats,
     error_turn_count: u32,
+    /// Consecutive failures to install a fallback for the current failed run.
+    /// This is intentionally separate from provider turn retries: an install
+    /// is a daemon/DB operation, not another provider turn.
+    fallback_install_error_count: u32,
     last_error_text: Option<String>,
     agent_run_id: Option<i64>,
     /// Daemon-issued run capability id (#130). Used for revocation on teardown.
@@ -8307,6 +8314,7 @@ fn classify_tick_error(e: &QuorumError) -> TickErrorAction {
         | QuorumError::Usage(_)
         | QuorumError::BadInput(_)
         | QuorumError::Busy
+        | QuorumError::FallbackInstallConflict
         | QuorumError::Db(_)
         | QuorumError::Io(_) => TickErrorAction::Continue,
     }
@@ -14406,7 +14414,7 @@ async fn tick(
     // process remains alive. They have no ordinary error-refeed loop, so route
     // the exact failed turn as soon as it becomes idle. The installer still
     // lets any racing verdict win under the write lock.
-    let mut settled_reviewer_fallbacks = Vec::new();
+    let mut reviewer_fallback_teardowns = Vec::new();
     for (i, reviewer) in reviewers.iter_mut().enumerate() {
         if !slot_is_live_provider_fallback_candidate(reviewer) {
             continue;
@@ -14430,17 +14438,45 @@ async fn tick(
         };
         match activate_reviewer_fallback(config, reviewer, &failure, &currency).await {
             Ok(ReviewerFallbackActivation::Activated) => {}
-            Ok(ReviewerFallbackActivation::Settled) => settled_reviewer_fallbacks.push(i),
+            Ok(ReviewerFallbackActivation::Settled) => {
+                reviewer_fallback_teardowns.push((i, "provider_blocked"))
+            }
             Ok(ReviewerFallbackActivation::NotInstalled) => {}
-            Err(error) => log(&format!(
-                "reviewer {} live-turn fallback failed; retaining slot: {error}",
-                reviewer.agent_name
-            )),
+            Err(error) => {
+                if let Some(end_reason) =
+                    surface_reviewer_fallback_install_failure(&db_path, reviewer, &error).await
+                {
+                    reviewer_fallback_teardowns.push((i, end_reason));
+                }
+            }
         }
     }
-    for i in settled_reviewer_fallbacks.into_iter().rev() {
+    for (i, end_reason) in reviewer_fallback_teardowns.into_iter().rev() {
         let dead = reviewers.remove(i);
-        teardown_reviewer(config, wt_mgr, name_pool, dead, "provider_blocked").await;
+        teardown_reviewer(config, wt_mgr, name_pool, dead, end_reason).await;
+    }
+
+    // Unlike workers, reviewers get no same-provider error refeed: an
+    // unclassified terminal turn is failed on this tick. This prevents an
+    // unknown provider failure from idling until the 900s watchdog.
+    let unclassified_reviewer_errors: Vec<usize> = reviewers
+        .iter()
+        .enumerate()
+        .filter(|(_, reviewer)| slot_is_reviewer_unclassified_error_candidate(reviewer))
+        .map(|(i, _)| i)
+        .collect();
+    for i in unclassified_reviewer_errors.into_iter().rev() {
+        if let Some(end_reason) = fail_reviewer_for_unclassified_turn(&db_path, &reviewers[i]).await
+        {
+            let dead = reviewers.remove(i);
+            if end_reason == "turn-error-unclassified" {
+                log(&format!(
+                    "reviewer {} turn error was unclassified; failing task #{} without idle reap",
+                    dead.agent_name, dead.task_id,
+                ));
+            }
+            teardown_reviewer(config, wt_mgr, name_pool, dead, end_reason).await;
+        }
     }
 
     // ── Phase 3-idle: Kill idle reviewers (same logic as workers) ──────
@@ -14740,12 +14776,11 @@ async fn tick(
                     }
                     Ok(WorkerFallbackActivation::NotInstalled) => {}
                     Err(error) => {
-                        log(&format!(
-                            "worker {} fallback installation failed; retaining slot for retry: {error}",
-                            dead.agent_name
-                        ));
-                        workers.insert(i, dead);
-                        continue;
+                        if !surface_worker_fallback_install_failure(config, &mut dead, &error).await
+                        {
+                            workers.insert(i, dead);
+                            continue;
+                        }
                     }
                 }
             }
@@ -14958,12 +14993,11 @@ async fn tick(
                     }
                     Ok(WorkerFallbackActivation::NotInstalled) => {}
                     Err(error) => {
-                        log(&format!(
-                            "worker {} fallback installation failed; retaining slot for retry: {error}",
-                            dead.agent_name
-                        ));
-                        workers.insert(i, dead);
-                        continue;
+                        if !surface_worker_fallback_install_failure(config, &mut dead, &error).await
+                        {
+                            workers.insert(i, dead);
+                            continue;
+                        }
                     }
                 }
             }
@@ -15229,10 +15263,16 @@ async fn tick(
                     }
                     Ok(ReviewerFallbackActivation::NotInstalled) => {}
                     Err(error) => {
-                        log(&format!(
-                            "reviewer {} fallback installation failed; retaining slot for retry: {error}",
-                            reviewers[i].agent_name
-                        ));
+                        if let Some(end_reason) = surface_reviewer_fallback_install_failure(
+                            &db_path,
+                            &mut reviewers[i],
+                            &error,
+                        )
+                        .await
+                        {
+                            let dead = reviewers.remove(i);
+                            teardown_reviewer(config, wt_mgr, name_pool, dead, end_reason).await;
+                        }
                         continue;
                     }
                 }
@@ -18327,6 +18367,173 @@ fn slot_is_live_provider_fallback_candidate(slot: &SlotState) -> bool {
             })
 }
 
+/// Reviewers deliberately do not get the worker's same-provider refeed. A
+/// reviewer turn with an error that did not establish provider-unavailable
+/// evidence is failed on the next tick, rather than silently consuming the
+/// idle watchdog interval and a reviewer allowance.
+fn slot_is_reviewer_unclassified_error_candidate(slot: &SlotState) -> bool {
+    slot_is_error_refeed_candidate(slot)
+}
+
+/// Return the terminal cleanup reason when a fallback installer error must no
+/// longer be retried. Immutable replay conflicts are terminal immediately;
+/// all other installer failures receive a small, separate retry budget.
+fn fallback_install_failure_end_reason(
+    slot: &mut SlotState,
+    error: &QuorumError,
+) -> Option<&'static str> {
+    if matches!(error, QuorumError::FallbackInstallConflict) {
+        return Some("fallback-install-conflict");
+    }
+    if slot.fallback_install_error_count >= MAX_FALLBACK_INSTALL_RETRIES {
+        return Some("fallback-install-retry-exhausted");
+    }
+    slot.fallback_install_error_count += 1;
+    None
+}
+
+/// Persist one bounded installer diagnostic. The failed run remains available
+/// even after the guarded lifecycle mutation closes it, so use its immutable
+/// assignment identity rather than deriving a responsibility from mutable task
+/// state.
+async fn persist_fallback_install_diagnostic(
+    db_path: &Path,
+    role: &str,
+    slot: &SlotState,
+    error: &QuorumError,
+) {
+    let db_path = db_path.to_path_buf();
+    let role = role.to_string();
+    let agent = slot.agent_name.clone();
+    let task_id = slot.task_id;
+    let failed_agent_run_id = slot.agent_run_id.unwrap_or(-1);
+    let error = error.to_string();
+    let log_role = role.clone();
+    let log_agent = agent.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let conn = quorum_core::db::open(&db_path)?;
+        let responsibility_key: Option<String> = conn
+            .query_row(
+                "SELECT responsibility_key FROM role_assignments
+                 WHERE id=(SELECT role_assignment_id FROM agent_runs WHERE id=?1)",
+                [failed_agent_run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        quorum_core::errlog::log_fallback_install_diagnostic(
+            &conn,
+            now_unix(),
+            &quorum_core::errlog::FallbackInstallDiagnostic {
+                role: &role,
+                agent: &agent,
+                task_id,
+                responsibility_key: responsibility_key.as_deref().unwrap_or("<unknown>"),
+                failed_agent_run_id,
+                error: &error,
+            },
+        );
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(log_error)) => log(&format!(
+            "{log_role} {log_agent} could not persist fallback-install diagnostic for task #{task_id}: {log_error}"
+        )),
+        Err(join_error) => log(&format!(
+            "{log_role} {log_agent} fallback-install diagnostic join failed for task #{task_id}: {join_error}"
+        )),
+    }
+}
+
+/// Fail a reviewer through its existing guarded lifecycle mutation once an
+/// installer conflict (or exhausted transient retry budget) is terminal.
+/// `Some` is the exact agent-run end reason for immediate teardown; `None`
+/// retains the slot only while either the retry budget or a DB mutation retry
+/// remains outstanding.
+async fn surface_reviewer_fallback_install_failure(
+    db_path: &Path,
+    slot: &mut SlotState,
+    error: &QuorumError,
+) -> Option<&'static str> {
+    let Some(end_reason) = fallback_install_failure_end_reason(slot, error) else {
+        log(&format!(
+            "reviewer {} fallback installation failed; retry {}/{}: {error}",
+            slot.agent_name, slot.fallback_install_error_count, MAX_FALLBACK_INSTALL_RETRIES,
+        ));
+        return None;
+    };
+    match fail_reviewer_if_owner(
+        db_path,
+        &slot.agent_name,
+        slot.task_id,
+        &format!("{end_reason}: {error}"),
+    )
+    .await
+    {
+        Some(true) => {
+            persist_fallback_install_diagnostic(db_path, "reviewer", slot, error).await;
+            log(&format!(
+                "reviewer {} fallback installation surfaced for task #{}: {error}",
+                slot.agent_name, slot.task_id,
+            ));
+            Some(end_reason)
+        }
+        // A racing verdict owns lifecycle authority. Tear down its obsolete
+        // process without logging a fallback failure against that outcome.
+        Some(false) => Some("ownership_transferred"),
+        None => None,
+    }
+}
+
+/// Reviewers intentionally receive no same-provider refeed for an error that
+/// failed to establish an eligible fallback disposition. The guarded mutation
+/// lets a verdict that landed between ticks win instead.
+async fn fail_reviewer_for_unclassified_turn(
+    db_path: &Path,
+    slot: &SlotState,
+) -> Option<&'static str> {
+    let reason = slot
+        .last_error_text
+        .as_deref()
+        .unwrap_or("reviewer turn ended with an unclassified error");
+    match fail_reviewer_if_owner(
+        db_path,
+        &slot.agent_name,
+        slot.task_id,
+        &format!("turn-error-unclassified: {reason}"),
+    )
+    .await
+    {
+        Some(true) => Some("turn-error-unclassified"),
+        Some(false) => Some("ownership_transferred"),
+        None => None,
+    }
+}
+
+/// A worker exit reaches its existing guarded lifecycle funnel after a
+/// terminal installer failure. Returning `true` means that caller must not
+/// put the dead slot back for another identical install.
+async fn surface_worker_fallback_install_failure(
+    config: &ServeConfig,
+    slot: &mut SlotState,
+    error: &QuorumError,
+) -> bool {
+    let Some(end_reason) = fallback_install_failure_end_reason(slot, error) else {
+        log(&format!(
+            "worker {} fallback installation failed; retry {}/{}: {error}",
+            slot.agent_name, slot.fallback_install_error_count, MAX_FALLBACK_INSTALL_RETRIES,
+        ));
+        return false;
+    };
+    persist_fallback_install_diagnostic(&config.db_path, "worker", slot, error).await;
+    log(&format!(
+        "worker {} fallback installation surfaced for task #{} ({end_reason}): {error}",
+        slot.agent_name, slot.task_id,
+    ));
+    true
+}
+
 fn slot_is_error_refeed_candidate(slot: &SlotState) -> bool {
     slot.error_turn_count > 0
         && !slot.draining
@@ -20656,6 +20863,7 @@ async fn provision_reviewer_reserved(
                 session_log: reviewer_session_log,
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
+                fallback_install_error_count: 0,
                 last_error_text: None,
                 agent_run_id: Some(reviewer_run_id),
                 cap_run_id: Some(cap_run_id),
@@ -20721,6 +20929,7 @@ async fn provision_reviewer_reserved(
                 session_log: reviewer_session_log,
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
+                fallback_install_error_count: 0,
                 last_error_text: Some(e.detail().to_string()),
                 agent_run_id: Some(reviewer_run_id),
                 cap_run_id: Some(cap_run_id.clone()),
@@ -21867,6 +22076,7 @@ async fn spawn_worker(
                 session_log: worker_session_log,
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
+                fallback_install_error_count: 0,
                 last_error_text: None,
                 agent_run_id: Some(worker_run_id),
                 cap_run_id: Some(cap_run_id),
@@ -21919,6 +22129,7 @@ async fn spawn_worker(
                 session_log: worker_session_log,
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
+                fallback_install_error_count: 0,
                 last_error_text: Some(e.detail().to_string()),
                 agent_run_id: Some(worker_run_id),
                 cap_run_id: Some(cap_run_id),
@@ -22309,6 +22520,18 @@ enum ReviewerFallbackActivation {
     /// Installation retired the failed run, but no live alternate remains.
     /// The helper has already settled reviewer lifecycle authority.
     Settled,
+}
+
+/// Preserve the installer's immutable-evidence distinction across the serve
+/// boundary. All other errors retain their ordinary `QuorumError` class so
+/// callers can use the bounded retry policy for transient DB/I/O failures.
+fn fallback_install_error_to_quorum(error: fallback::FallbackInstallError) -> QuorumError {
+    match error {
+        fallback::FallbackInstallError::ImmutableEvidenceConflict => {
+            QuorumError::FallbackInstallConflict
+        }
+        fallback::FallbackInstallError::Quorum(error) => error,
+    }
 }
 
 type ConfiguredRunRoute = (
@@ -22991,7 +23214,8 @@ async fn activate_reviewer_fallback(
             spawned_at: installed_at,
             issued_at: installed_at,
         },
-    )?;
+    )
+    .map_err(fallback_install_error_to_quorum)?;
     drop(conn);
 
     let intent = match install {
@@ -23173,6 +23397,7 @@ async fn activate_reviewer_fallback(
     slot.draining = true;
     slot.pending_watchdog_breach = None;
     slot.error_turn_count = 0;
+    slot.fallback_install_error_count = 0;
     slot.last_error_text = None;
     slot.token_usage = runner::TokenUsage::default();
     slot.last_terminal_usage = runner::TokenUsage::default();
@@ -23552,7 +23777,8 @@ async fn activate_worker_fallback(
             spawned_at: installed_at,
             issued_at: installed_at,
         },
-    )?;
+    )
+    .map_err(fallback_install_error_to_quorum)?;
     drop(conn);
     let intent = match install {
         fallback::FallbackInstallOutcome::NoFailover
@@ -23755,6 +23981,7 @@ async fn activate_worker_fallback(
     slot.draining = true;
     slot.pending_watchdog_breach = None;
     slot.error_turn_count = 0;
+    slot.fallback_install_error_count = 0;
     slot.last_error_text = None;
     slot.token_usage = runner::TokenUsage::default();
     slot.last_terminal_usage = runner::TokenUsage::default();
@@ -23921,6 +24148,7 @@ async fn resume_pending_fallbacks(
             session_log,
             live_stats: LiveStats::new(),
             error_turn_count: 0,
+            fallback_install_error_count: 0,
             last_error_text: None,
             agent_run_id: Some(intent.agent_run_id),
             cap_run_id: Some(intent.capability_run_id.clone()),
@@ -26067,6 +26295,7 @@ async fn spawn_remediation_worker(
                 session_log: worker_session_log,
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
+                fallback_install_error_count: 0,
                 last_error_text: None,
                 agent_run_id: worker_run_id,
                 cap_run_id: Some(cap_run_id),
@@ -28435,6 +28664,7 @@ mod tests {
             session_log: None,
             live_stats: LiveStats::new(),
             error_turn_count: 0,
+            fallback_install_error_count: 0,
             last_error_text: None,
             agent_run_id: None,
             cap_run_id: None,
@@ -29016,6 +29246,300 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn seed_reviewer_fallback_failure_fixture(db_path: &Path) -> (ServeConfig, i64, i64, String) {
+        let root = db_path.parent().unwrap();
+        let config = pre_review_checks_config(db_path.to_path_buf(), root.to_path_buf());
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        let now = now_unix();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "reviewer fallback failure",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            ),
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        tasks::claim(&mut conn, "Author", Some(task_id), &[], 3600, now)
+            .unwrap()
+            .unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "Author",
+            task_id,
+            &Event::SignaledDone { pr: "77".into() },
+            now + 1,
+        )
+        .unwrap();
+        tasks::claim(
+            &mut conn,
+            "Fallback-Reviewer",
+            Some(task_id),
+            &[],
+            3600,
+            now + 2,
+        )
+        .unwrap()
+        .unwrap();
+        let responsibility = format!("reviewer:task:{task_id}:r1");
+        let (_, run_id, agent) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "reviewer",
+            Some(77),
+            Some("r1"),
+        );
+        (config, task_id, run_id, agent)
+    }
+
+    #[cfg(unix)]
+    fn failed_reviewer_fallback_test_slot(
+        task_id: i64,
+        agent_run_id: i64,
+        agent: String,
+    ) -> SlotState {
+        let now = std::time::Instant::now();
+        SlotState {
+            agent_name: agent,
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "failed-reviewer-session".into(),
+            model: "test".into(),
+            effort: "medium".into(),
+            worktree_path: PathBuf::from("/tmp/reviewer-fallback-test"),
+            branch: "reviewer-fallback-test".into(),
+            remote_branch: "reviewer-fallback-test".into(),
+            draining: false,
+            pending_watchdog_breach: None,
+            pr: Some(77),
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: Some(now),
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 1,
+            fallback_install_error_count: 0,
+            last_error_text: Some("unmatched provider failure".into()),
+            agent_run_id: Some(agent_run_id),
+            cap_run_id: Some("initial-cap".into()),
+            r2_origin: false,
+            reviewed_head_sha: Some("head-a".into()),
+            continuation_id: None,
+            pending_prompt: "exact reviewer prompt".into(),
+            pending_turn_kind: "review".into(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewer_fallback_conflict_is_logged_once_and_failed_without_idle_reap() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reviewer-fallback-conflict.db");
+        let (_config, task_id, run_id, agent) = seed_reviewer_fallback_failure_fixture(&db_path);
+        let mut slot = failed_reviewer_fallback_test_slot(task_id, run_id, agent);
+
+        assert_eq!(
+            surface_reviewer_fallback_install_failure(
+                &db_path,
+                &mut slot,
+                &QuorumError::FallbackInstallConflict,
+            )
+            .await,
+            Some("fallback-install-conflict"),
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert!(
+            task.reviewer.is_none(),
+            "guarded failure released review ownership"
+        );
+        let detail: String = conn
+            .query_row(
+                "SELECT detail FROM errors WHERE source='fallback_install'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!(detail["role"], "reviewer");
+        assert_eq!(detail["task"], task_id);
+        assert_eq!(
+            detail["responsibility_key"],
+            format!("reviewer:task:{task_id}:r1")
+        );
+        assert_eq!(detail["failed_agent_run_id"], run_id);
+        assert!(detail["error"]
+            .as_str()
+            .unwrap()
+            .contains("immutable evidence"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM errors WHERE source='fallback_install'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+            "the removed reviewer slot cannot surface a second install failure",
+        );
+        drop(conn);
+        assert_eq!(
+            surface_reviewer_fallback_install_failure(
+                &db_path,
+                &mut slot,
+                &QuorumError::FallbackInstallConflict,
+            )
+            .await,
+            Some("ownership_transferred"),
+            "a stale retained slot cannot replay a failure after its guarded transition",
+        );
+        close_agent_run(&db_path, Some(run_id), "fallback-install-conflict").await;
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            agent_run_end_reason(&conn, run_id).as_deref(),
+            Some("fallback-install-conflict"),
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM errors WHERE source='fallback_install'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewer_fallback_transient_install_errors_stop_after_bounded_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reviewer-fallback-retries.db");
+        let (_config, task_id, run_id, agent) = seed_reviewer_fallback_failure_fixture(&db_path);
+        let mut slot = failed_reviewer_fallback_test_slot(task_id, run_id, agent);
+        let transient = QuorumError::Busy;
+
+        for retry in 1..=MAX_FALLBACK_INSTALL_RETRIES {
+            assert_eq!(
+                surface_reviewer_fallback_install_failure(&db_path, &mut slot, &transient).await,
+                None,
+            );
+            assert_eq!(slot.fallback_install_error_count, retry);
+        }
+        assert_eq!(
+            surface_reviewer_fallback_install_failure(&db_path, &mut slot, &transient).await,
+            Some("fallback-install-retry-exhausted"),
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM errors WHERE source='fallback_install'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1,
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unclassified_reviewer_turn_fails_on_next_tick_path_not_idle_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reviewer-unclassified-turn.db");
+        let (_config, task_id, run_id, agent) = seed_reviewer_fallback_failure_fixture(&db_path);
+        let slot = failed_reviewer_fallback_test_slot(task_id, run_id, agent);
+
+        assert!(slot_is_reviewer_unclassified_error_candidate(&slot));
+        assert_eq!(
+            fail_reviewer_for_unclassified_turn(&db_path, &slot).await,
+            Some("turn-error-unclassified"),
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert!(
+            tasks::get(&conn, task_id)
+                .unwrap()
+                .unwrap()
+                .reviewer
+                .is_none(),
+            "the next-tick reaction released review ownership before idle expiry",
+        );
+        drop(conn);
+        close_agent_run(&db_path, Some(run_id), "turn-error-unclassified").await;
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            agent_run_end_reason(&conn, run_id).as_deref(),
+            Some("turn-error-unclassified"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn racing_reviewer_verdict_wins_over_fallback_conflict_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reviewer-fallback-verdict-race.db");
+        let (_config, task_id, run_id, agent) = seed_reviewer_fallback_failure_fixture(&db_path);
+        let mut slot = failed_reviewer_fallback_test_slot(task_id, run_id, agent.clone());
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::apply_event(
+                &mut conn,
+                &agent,
+                task_id,
+                &Event::VerdictChanges,
+                now_unix(),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            surface_reviewer_fallback_install_failure(
+                &db_path,
+                &mut slot,
+                &QuorumError::FallbackInstallConflict,
+            )
+            .await,
+            Some("ownership_transferred"),
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "rework"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM errors WHERE source='fallback_install'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "the post-verdict guarded mutation must not report reviewer failure",
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn live_worker_fallback_swaps_run_capability_process_and_journal() {
         use std::os::unix::fs::PermissionsExt;
@@ -29145,6 +29669,7 @@ mod tests {
             session_log: None,
             live_stats: LiveStats::new(),
             error_turn_count: 0,
+            fallback_install_error_count: 0,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -29332,6 +29857,7 @@ mod tests {
             session_log: None,
             live_stats: LiveStats::new(),
             error_turn_count: 0,
+            fallback_install_error_count: 0,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -29523,6 +30049,7 @@ mod tests {
             session_log: None,
             live_stats: LiveStats::new(),
             error_turn_count: 0,
+            fallback_install_error_count: 0,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -29792,6 +30319,7 @@ mod tests {
             session_log: None,
             live_stats: LiveStats::new(),
             error_turn_count: 0,
+            fallback_install_error_count: 0,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -30106,6 +30634,7 @@ mod tests {
             session_log: None,
             live_stats: LiveStats::new(),
             error_turn_count: 0,
+            fallback_install_error_count: 0,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -32458,6 +32987,7 @@ printf '%s\n' '{"type":"end","sessionId":"grok-session-terminal"}'"#,
                 session_log: None,
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
+                fallback_install_error_count: 0,
                 last_error_text: None,
                 agent_run_id: Some(old_run_id),
                 cap_run_id: Some(old_capability.clone()),
@@ -33686,6 +34216,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             session_log: None,
             live_stats: LiveStats::new(),
             error_turn_count: 0,
+            fallback_install_error_count: 0,
             last_error_text: None,
             agent_run_id: None,
             cap_run_id: None,
@@ -42784,6 +43315,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             session_log: None,
             live_stats: LiveStats::new(),
             error_turn_count: 0,
+            fallback_install_error_count: 0,
             last_error_text: None,
             agent_run_id,
             cap_run_id: Some(cap_run_id.into()),

@@ -22,6 +22,44 @@ pub fn log_error(conn: &Connection, now: i64, source: &str, detail: &str) {
     );
 }
 
+/// Immutable context for a fallback installation failure. These failures are
+/// lifecycle-inert diagnostics: the daemon records this row only after the
+/// role-specific guarded failure path establishes that it still owned the
+/// failed responsibility.
+pub struct FallbackInstallDiagnostic<'a> {
+    pub role: &'a str,
+    pub agent: &'a str,
+    pub task_id: i64,
+    pub responsibility_key: &'a str,
+    pub failed_agent_run_id: i64,
+    pub error: &'a str,
+}
+
+/// Record one structured fallback-install failure in `errors`.
+///
+/// Callers decide when the failure is terminal, so this helper deliberately
+/// does not mutate task lifecycle state or create unbounded retry evidence.
+pub fn log_fallback_install_diagnostic(
+    conn: &Connection,
+    now: i64,
+    diagnostic: &FallbackInstallDiagnostic<'_>,
+) {
+    let detail = format!(
+        concat!(
+            "{{\"role\":\"{}\",\"agent\":\"{}\",\"task\":{},",
+            "\"responsibility_key\":\"{}\",\"failed_agent_run_id\":{},",
+            "\"error\":\"{}\"}}"
+        ),
+        json_escape(diagnostic.role),
+        json_escape(diagnostic.agent),
+        diagnostic.task_id,
+        json_escape(diagnostic.responsibility_key),
+        diagnostic.failed_agent_run_id,
+        json_escape(diagnostic.error),
+    );
+    log_error(conn, now, "fallback_install", &detail);
+}
+
 /// Context for a daemon-managed lifecycle failure diagnostic.
 pub struct LifecycleDiagnostic<'a> {
     pub task_id: i64,
@@ -225,6 +263,34 @@ mod tests {
         assert_eq!(source, "claim");
         assert_eq!(detail, "database busy after timeout");
         assert_eq!(expires, 100 + ERROR_TTL_SECS);
+    }
+
+    #[test]
+    fn fallback_install_diagnostic_records_bounded_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = crate::db::open(&dir.path().join("q.db")).unwrap();
+        log_fallback_install_diagnostic(
+            &c,
+            100,
+            &FallbackInstallDiagnostic {
+                role: "reviewer",
+                agent: "R1",
+                task_id: 42,
+                responsibility_key: "reviewer:42:r1",
+                failed_agent_run_id: 99,
+                error: "immutable evidence conflict",
+            },
+        );
+        let (source, detail): (String, String) = c
+            .query_row("SELECT source, detail FROM errors", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(source, "fallback_install");
+        assert_eq!(
+            detail,
+            r#"{"role":"reviewer","agent":"R1","task":42,"responsibility_key":"reviewer:42:r1","failed_agent_run_id":99,"error":"immutable evidence conflict"}"#
+        );
     }
 
     #[test]
