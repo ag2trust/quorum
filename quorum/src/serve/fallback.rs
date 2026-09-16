@@ -23,6 +23,46 @@ use quorum_core::routing_attempts::{
 };
 use quorum_core::runner_state::{PendingTurn, ProviderBlock};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use std::fmt;
+
+/// Errors from the durable fallback installer which need different lifecycle
+/// reactions from ordinary SQLite or filesystem failures.
+#[derive(Debug)]
+pub enum FallbackInstallError {
+    /// A replayed intent disagrees with evidence that was already committed.
+    /// Retrying the identical install cannot make this true.
+    ImmutableEvidenceConflict,
+    /// All other installer errors may be transient (for example a busy
+    /// database) and are left to the caller's bounded retry policy.
+    Quorum(QuorumError),
+}
+
+impl fmt::Display for FallbackInstallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ImmutableEvidenceConflict => {
+                f.write_str("fallback launch intent replay conflicts with immutable evidence")
+            }
+            Self::Quorum(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for FallbackInstallError {}
+
+impl From<QuorumError> for FallbackInstallError {
+    fn from(error: QuorumError) -> Self {
+        Self::Quorum(error)
+    }
+}
+
+impl From<rusqlite::Error> for FallbackInstallError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Quorum(error.into())
+    }
+}
+
+type InstallResult<T> = std::result::Result<T, FallbackInstallError>;
 
 /// Immutable input for one possible fallback installation.
 ///
@@ -83,7 +123,7 @@ pub enum FallbackInstallOutcome {
 pub fn install(
     conn: &mut Connection,
     input: &FallbackInstallInput<'_>,
-) -> Result<FallbackInstallOutcome> {
+) -> InstallResult<FallbackInstallOutcome> {
     match fallback_preflight::preflight(&FallbackPreflightInput {
         disposition: input.disposition,
         assignment: input.assignment,
@@ -130,9 +170,7 @@ pub fn install(
         failed_attempt.id,
     )? {
         if !replay_matches(input, &exclusions, launch_head.as_ref(), &intent)? {
-            return Err(QuorumError::Io(
-                "fallback launch intent replay conflicts with immutable evidence".into(),
-            ));
+            return Err(FallbackInstallError::ImmutableEvidenceConflict);
         }
         let alternate_agent = capability_agent(&tx, &intent.capability_run_id)?;
         if !live_responsibility_has_no_outcome(&tx, input, &alternate_agent)? {
@@ -145,7 +183,11 @@ pub fn install(
             failed_attempt.id,
         )?
         .map(|intent| FallbackInstallOutcome::Installed(Box::new(intent)))
-        .ok_or_else(|| QuorumError::Io("committed fallback launch intent is missing".into()));
+        .ok_or_else(|| {
+            FallbackInstallError::from(QuorumError::Io(
+                "committed fallback launch intent is missing".into(),
+            ))
+        });
     }
 
     let established = fallback_establish::establish(
@@ -213,7 +255,11 @@ pub fn install(
             routing_attempt_id,
         )?
         .map(|intent| FallbackInstallOutcome::Installed(Box::new(intent)))
-        .ok_or_else(|| QuorumError::Io("committed fallback launch intent is missing".into())),
+        .ok_or_else(|| {
+            FallbackInstallError::from(QuorumError::Io(
+                "committed fallback launch intent is missing".into(),
+            ))
+        }),
         outcome => Ok(outcome),
     }
 }
@@ -845,6 +891,32 @@ mod tests {
             FallbackInstallOutcome::Installed(Box::new(intent.clone()))
         );
         assert_eq!(state(&fixture.conn, fixture.task_id), (1, 2, 2, 1, 0, 0));
+
+        // A contradictory replay must retain its semantic error class. The
+        // caller uses this to fail the stuck logical slot instead of parsing
+        // an I/O string and retrying the same immutable conflict forever.
+        let conflicting_turn = PendingTurn {
+            prompt: "different replay prompt".into(),
+            ..turn.clone()
+        };
+        let before_conflict = state(&fixture.conn, fixture.task_id);
+        let conflict = install(
+            &mut fixture.conn,
+            &input(
+                &fixture.assignment,
+                &fixture.pool,
+                FailureDisposition::ProviderUnavailable,
+                &currency,
+                &currency,
+                &conflicting_turn,
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            conflict,
+            FallbackInstallError::ImmutableEvidenceConflict
+        ));
+        assert_eq!(state(&fixture.conn, fixture.task_id), before_conflict);
 
         // A second failure of the same profile under the same role
         // assignment, keyed by a distinct failed agent_run identity and a

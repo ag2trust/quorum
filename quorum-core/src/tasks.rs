@@ -2502,7 +2502,9 @@ pub fn reset_ci_remediation_for_recovery(conn: &mut Connection, id: i64, now: i6
 ///
 /// Reviewer processes are turn-oriented and may exit after their verdict has
 /// already transferred the task to remediation. The ownership predicate and
-/// `AgentFailed` transition must therefore share one write transaction.
+/// `AgentFailed` transition must therefore share one write transaction. An
+/// unconsumed verdict from the same reviewer also returns `None`: Phase 2 must
+/// consume that durable authority before a failure can release the reviewer.
 pub fn fail_reviewer_if_owner(
     conn: &mut Connection,
     reviewer: &str,
@@ -2521,6 +2523,25 @@ pub fn fail_reviewer_if_owner(
         .optional()?
         .is_some();
     if !still_owns_review {
+        tx.commit()?;
+        return Ok(None);
+    }
+
+    // A reviewer can submit after the daemon's Phase 1 mailbox snapshot but
+    // before a later phase attempts this failure. The Done row is durable
+    // lifecycle authority even though Phase 2 has not folded it yet. Check it
+    // in this same write transaction so AgentFailed cannot clear the reviewer
+    // and orphan that verdict for next tick's phantom-row handling.
+    let pending_verdict: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM mailbox
+             WHERE agent=?1 AND kind='done' AND task_id=?2
+               AND verdict IS NOT NULL AND consumed_at IS NULL
+         )",
+        params![reviewer, id],
+        |row| row.get(0),
+    )?;
+    if pending_verdict {
         tx.commit()?;
         return Ok(None);
     }
@@ -7011,6 +7032,66 @@ mod tests {
         assert!(result.effects.contains(&Effect::SpawnReviewer));
         assert!(result.task.reviewer.is_none());
         assert!(result.task.assignee.is_none());
+    }
+
+    #[test]
+    fn reviewer_failure_preserves_verdict_submitted_after_mailbox_snapshot() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "author", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "author",
+            id,
+            &Event::SignaledDone {
+                pr: "99".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "reviewer", Some(id), &[], TTL, 1002).unwrap();
+
+        assert!(crate::mailbox::poll_unconsumed(&c).unwrap().is_empty());
+        let mailbox_id = crate::mailbox::append(
+            &mut c,
+            &crate::mailbox::MailboxRow {
+                agent: "reviewer".into(),
+                kind: crate::mailbox::MailboxKind::Done,
+                task_id: Some(id),
+                pr: Some(99),
+                verdict: Some("changes".into()),
+                feedback: Some("fix it".into()),
+                note: None,
+                to_agent: None,
+                payload: Some(r#"{"blocking":1}"#.into()),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            fail_reviewer_if_owner(&mut c, "reviewer", id, "reviewer process died", 1003)
+                .unwrap()
+                .is_none(),
+            "the post-snapshot durable verdict must suppress AgentFailed"
+        );
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(task.reviewer.as_deref(), Some("reviewer"));
+        assert!(crate::mailbox::has_unconsumed(
+            &c,
+            "reviewer",
+            crate::mailbox::MailboxKind::Done,
+            id,
+        )
+        .unwrap());
+        let consumed: Option<i64> = c
+            .query_row(
+                "SELECT consumed_at FROM mailbox WHERE id=?1",
+                [mailbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(consumed.is_none());
     }
 
     fn dead_turn_retry() -> PendingTurn {
