@@ -14451,32 +14451,35 @@ async fn tick(
             }
         }
     }
-    for (i, end_reason) in reviewer_fallback_teardowns.into_iter().rev() {
-        let dead = reviewers.remove(i);
-        teardown_reviewer(config, wt_mgr, name_pool, dead, end_reason).await;
-    }
-
     // Unlike workers, reviewers get no same-provider error refeed: an
     // unclassified terminal turn is failed on this tick. This prevents an
     // unknown provider failure from idling until the 900s watchdog.
-    let unclassified_reviewer_errors: Vec<usize> = reviewers
+    // A nested alternate-provider launch can leave a slot Failed with its
+    // original error count after the fallback loop has already queued it.
+    // Keep every removal in one queue so slot indexes remain valid until the
+    // descending drain below.
+    let queued_reviewer_fallbacks = reviewer_fallback_teardowns
         .iter()
-        .enumerate()
-        .filter(|(_, reviewer)| slot_is_reviewer_unclassified_error_candidate(reviewer))
-        .map(|(i, _)| i)
-        .collect();
+        .map(|(index, _)| *index)
+        .collect::<HashSet<_>>();
+    let unclassified_reviewer_errors =
+        unclassified_reviewer_error_indexes(&reviewers, &queued_reviewer_fallbacks);
     for i in unclassified_reviewer_errors.into_iter().rev() {
         if let Some(end_reason) = fail_reviewer_for_unclassified_turn(&db_path, &reviewers[i]).await
         {
-            let dead = reviewers.remove(i);
             if end_reason == "turn-error-unclassified" {
                 log(&format!(
                     "reviewer {} turn error was unclassified; failing task #{} without idle reap",
-                    dead.agent_name, dead.task_id,
+                    reviewers[i].agent_name, reviewers[i].task_id,
                 ));
             }
-            teardown_reviewer(config, wt_mgr, name_pool, dead, end_reason).await;
+            reviewer_fallback_teardowns.push((i, end_reason));
         }
+    }
+    order_reviewer_teardowns(&mut reviewer_fallback_teardowns);
+    for (i, end_reason) in reviewer_fallback_teardowns.into_iter().rev() {
+        let dead = reviewers.remove(i);
+        teardown_reviewer(config, wt_mgr, name_pool, dead, end_reason).await;
     }
 
     // ── Phase 3-idle: Kill idle reviewers (same logic as workers) ──────
@@ -18373,6 +18376,31 @@ fn slot_is_live_provider_fallback_candidate(slot: &SlotState) -> bool {
 /// idle watchdog interval and a reviewer allowance.
 fn slot_is_reviewer_unclassified_error_candidate(slot: &SlotState) -> bool {
     slot_is_error_refeed_candidate(slot)
+}
+
+/// Returns slots whose terminal errors need the reviewer-only immediate
+/// failure reaction. Fallback slots already selected for teardown must remain
+/// in that queue: removing one here would invalidate its queued slot index.
+fn unclassified_reviewer_error_indexes(
+    reviewers: &[SlotState],
+    queued_fallback_teardowns: &HashSet<usize>,
+) -> Vec<usize> {
+    reviewers
+        .iter()
+        .enumerate()
+        .filter(|(index, reviewer)| {
+            !queued_fallback_teardowns.contains(index)
+                && slot_is_reviewer_unclassified_error_candidate(reviewer)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Vector removals must happen highest-index first. The fallback and
+/// unclassified passes contribute independently, so normalize their combined
+/// queue before draining it.
+fn order_reviewer_teardowns(teardowns: &mut [(usize, &'static str)]) {
+    teardowns.sort_unstable_by_key(|(index, _)| *index);
 }
 
 /// Return the terminal cleanup reason when a fallback installer error must no
@@ -29492,6 +29520,36 @@ mod tests {
             agent_run_end_reason(&conn, run_id).as_deref(),
             Some("turn-error-unclassified"),
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queued_fallback_reviewer_is_not_reconsidered_as_unclassified() {
+        let reviewer = failed_reviewer_fallback_test_slot(42, 7, "alternate-failed".into());
+        assert!(slot_is_reviewer_unclassified_error_candidate(&reviewer));
+
+        let queued = [0].into_iter().collect::<HashSet<_>>();
+        assert!(
+            unclassified_reviewer_error_indexes(&[reviewer], &queued).is_empty(),
+            "a fallback teardown owns this index until the single descending drain"
+        );
+    }
+
+    #[test]
+    fn combined_reviewer_teardowns_remove_highest_slot_first() {
+        let mut teardowns = vec![
+            (1, "fallback-install-conflict"),
+            (0, "turn-error-unclassified"),
+        ];
+        order_reviewer_teardowns(&mut teardowns);
+
+        let mut reviewers = vec!["unclassified", "fallback", "unaffected"];
+        let mut removed = Vec::new();
+        for (index, _) in teardowns.into_iter().rev() {
+            removed.push(reviewers.remove(index));
+        }
+        assert_eq!(removed, ["fallback", "unclassified"]);
+        assert_eq!(reviewers, ["unaffected"]);
     }
 
     #[cfg(unix)]
