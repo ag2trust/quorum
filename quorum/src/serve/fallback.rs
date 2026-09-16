@@ -157,6 +157,7 @@ pub fn install(
             exclusions: &exclusions,
             agent: input.alternate_agent,
             capability_run_id: input.alternate_capability_run_id,
+            failed_agent_run_id: Some(input.failed_run.agent_run_id),
             reviewer_launch: input.reviewer_launch,
             spawned_at: input.spawned_at,
             issued_at: input.issued_at,
@@ -189,6 +190,7 @@ pub fn install(
                     pending_turn: &pending_turn,
                     agent_run_id,
                     capability_run_id: &capability.run_id,
+                    failed_agent_run_id: Some(input.failed_run.agent_run_id),
                     created_at: input.issued_at,
                 },
             )?;
@@ -387,12 +389,16 @@ fn replay_matches(
 }
 
 fn failed_attempt(conn: &Connection, input: &FallbackInstallInput<'_>) -> Result<RoutingAttempt> {
+    // The routing attempt is keyed by the exact failed agent_run so a second
+    // same-profile failure under the same role assignment resolves to its own
+    // generation instead of replaying the first attempt.
     routing_attempts::list(conn, input.responsibility.responsibility_key)?
         .into_iter()
         .find(|attempt| {
             attempt.role_assignment_id == input.assignment.id
                 && attempt.profile == *input.failed_route
                 && attempt.failure_disposition == Some(input.disposition)
+                && attempt.failed_agent_run_id == Some(input.failed_run.agent_run_id)
         })
         .ok_or_else(|| QuorumError::Io("retired fallback route attempt is missing".into()))
 }
@@ -834,8 +840,116 @@ mod tests {
         replay_input.alternate_capability_run_id =
             "new-capability-must-not-replace-the-persisted-intent";
         let replay = install(&mut fixture.conn, &replay_input).unwrap();
-        assert_eq!(replay, FallbackInstallOutcome::Installed(Box::new(intent)));
+        assert_eq!(
+            replay,
+            FallbackInstallOutcome::Installed(Box::new(intent.clone()))
+        );
         assert_eq!(state(&fixture.conn, fixture.task_id), (1, 2, 2, 1, 0, 0));
+
+        // A second failure of the same profile under the same role
+        // assignment, keyed by a distinct failed agent_run identity and a
+        // fresh worktree, materialises its own routing_attempts row, its
+        // own attributed alternate run + capability, and its own fallback
+        // launch intent — instead of colliding with the first generation's
+        // persisted worktree evidence and returning "replay conflicts".
+        let primary = &fixture.pool.profiles[0].profile;
+        let second_failed_run_id: i64 = fixture
+            .conn
+            .query_row(
+                "INSERT INTO agent_runs(
+                     task_id,agent_name,role,model,effort,provider,role_assignment_id,spawned_at)
+                 VALUES (?1,'failed-agent','worker',?2,?3,?4,?5,20) RETURNING id",
+                params![
+                    fixture.task_id,
+                    primary.model,
+                    primary.effort,
+                    primary.provider,
+                    fixture.assignment.id,
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        fixture
+            .conn
+            .execute(
+                "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at,agent_run_id)
+                 VALUES ('failed-capability-2',?1,'failed-agent','worker',20,?2)",
+                [fixture.task_id, second_failed_run_id],
+            )
+            .unwrap();
+        // A fresh reviewer/worker generation has a fresh session and worktree.
+        fixture
+            .conn
+            .execute(
+                "UPDATE journal SET session_id='failed-session-2',worktree=?2
+                 WHERE agent='failed-agent'",
+                rusqlite::params![fixture.task_id, "/tmp/fallback-install-worktree-gen-2"],
+            )
+            .unwrap();
+        let mut second_input = input(
+            &fixture.assignment,
+            &fixture.pool,
+            FailureDisposition::ProviderUnavailable,
+            &currency,
+            &currency,
+            &turn,
+        );
+        second_input.failed_run = FailedManagedRun {
+            agent_run_id: second_failed_run_id,
+            capability_run_id: "failed-capability-2",
+            agent: "failed-agent",
+            ended_at: 21,
+            end_reason: "fallback-route-unavailable",
+        };
+        second_input.alternate_capability_run_id = "alternate-capability-gen-2";
+        second_input.fallback_session_id = "fallback-session-gen-2";
+        second_input.worktree = "/tmp/fallback-install-worktree-gen-2";
+        second_input.recorded_at = 22;
+        second_input.spawned_at = 23;
+        second_input.issued_at = 24;
+        let second = install(&mut fixture.conn, &second_input).unwrap();
+        let FallbackInstallOutcome::Installed(second_intent) = second else {
+            panic!("second-generation install must succeed: {second:?}");
+        };
+        let second_intent = *second_intent;
+        assert_ne!(second_intent.id, intent.id);
+        assert_ne!(
+            second_intent.routing_attempt_id, intent.routing_attempt_id,
+            "each failed managed run gets its own routing attempt"
+        );
+        assert_ne!(second_intent.agent_run_id, intent.agent_run_id);
+        assert_eq!(
+            second_intent.worktree,
+            "/tmp/fallback-install-worktree-gen-2"
+        );
+        assert_eq!(
+            second_intent.failed_agent_run_id,
+            Some(second_failed_run_id)
+        );
+        // Two routing_attempts, two intents, and two alternate agent_runs
+        // now coexist under the same responsibility_key. The original intent
+        // survives so restart-recovery of the first generation still resolves.
+        let (attempts, intents): (i64, i64) = fixture
+            .conn
+            .query_row(
+                "SELECT
+                     (SELECT count(*) FROM routing_attempts
+                      WHERE responsibility_key=?1),
+                     (SELECT count(*) FROM fallback_launch_intents
+                      WHERE responsibility_key=?1)",
+                [&fixture.assignment.responsibility_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempts, 2);
+        assert_eq!(intents, 2);
+        let first_reconstructed = quorum_core::fallback_launch::reconstruct(
+            &fixture.conn,
+            &fixture.assignment.responsibility_key,
+            intent.routing_attempt_id,
+        )
+        .unwrap();
+        assert_eq!(first_reconstructed, Some(intent));
     }
 
     #[test]

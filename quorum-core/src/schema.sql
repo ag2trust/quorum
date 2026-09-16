@@ -564,11 +564,19 @@ CREATE TABLE IF NOT EXISTS routing_attempts (
                                   'retryable-same-route',
                                   'non-failover',
                                   'unclassified')),
+    -- v79: distinct failed agent_run identity that authorized this attempt.
+    -- A second failure of the same profile under the same role assignment now
+    -- gets its own routing_attempts row (keyed by failed_agent_run_id), so a
+    -- replay of the first failure cannot mask a later generation. NULL is
+    -- reserved for grandfathered pre-v79 rows and non-failure attempts.
+    failed_agent_run_id   INTEGER REFERENCES agent_runs(id),
     recorded_at           INTEGER NOT NULL,
-    UNIQUE(role_assignment_id, profile_id)
+    UNIQUE(role_assignment_id, profile_id, failed_agent_run_id)
 );
 CREATE INDEX IF NOT EXISTS routing_attempts_responsibility
     ON routing_attempts(responsibility_key, id);
+-- v79's `routing_attempts_failed_agent_run` index is created in the
+-- migration branch after the routing_attempts rebuild that adds the column.
 
 CREATE TRIGGER IF NOT EXISTS routing_attempts_assignment_guard
 BEFORE INSERT ON routing_attempts
@@ -642,9 +650,20 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     configured_profile_id TEXT,
     configured_provider   TEXT,
     configured_model      TEXT,
-    configured_effort     TEXT
+    configured_effort     TEXT,
+    -- v79: the exact failed managed run this row is the alternate for. NULL
+    -- retains legacy (assignment, configured_profile) deduplication for
+    -- pre-v79 fallback rows and every non-alternate run. Populated by the
+    -- fallback installer so a second same-profile failure of the same
+    -- assignment materialises its own alternate run instead of colliding
+    -- with the first generation's persisted evidence.
+    failed_agent_run_id INTEGER REFERENCES agent_runs(id)
 );
 CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id);
+-- v79's `agent_runs_failed_agent_run` index is created in the migration
+-- branch after the ALTER TABLE that adds the column; putting it here would
+-- fail on upgrades because SCHEMA_SQL is a no-op for the CREATE TABLE but
+-- would evaluate the CREATE INDEX before the ALTER runs.
 -- v62: the UNIQUE partial index `agent_runs_configured_route` is defined only in
 -- the migration branch below because it names `role_assignment_id` and
 -- `configured_profile_id`, both of which pre-v42 / pre-v61 legacy tables lack.
@@ -1046,6 +1065,12 @@ CREATE TABLE IF NOT EXISTS fallback_launch_intents (
                               AND json_type(pending_turn_json, '$.continuation_id') IS NULL),
     agent_run_id        INTEGER NOT NULL REFERENCES agent_runs(id),
     capability_run_id   TEXT NOT NULL REFERENCES run_capabilities(run_id),
+    -- v79: the exact failed agent_run whose retirement authorized this
+    -- fallback generation. Recovery/replay uses this identity so a second
+    -- failure of the same profile under the same role assignment installs
+    -- its own alternate instead of colliding with the first generation's
+    -- worktree and head. NULL is reserved for grandfathered pre-v79 rows.
+    failed_agent_run_id INTEGER REFERENCES agent_runs(id),
     created_at          INTEGER NOT NULL,
     CHECK((pr_number IS NULL AND head_sha IS NULL)
           OR (pr_number > 0 AND head_sha IS NOT NULL)),
@@ -1055,6 +1080,8 @@ CREATE INDEX IF NOT EXISTS fallback_launch_intents_task
     ON fallback_launch_intents(task_id);
 CREATE INDEX IF NOT EXISTS fallback_launch_intents_agent_run
     ON fallback_launch_intents(agent_run_id);
+-- v79's `fallback_launch_intents_failed_agent_run` index is created in the
+-- migration branch after the ALTER TABLE that adds the column.
 
 -- v27: prospective-only boundary for PR-interaction performance analytics
 -- (#158). Single row (id=1) recording the unix timestamp at which

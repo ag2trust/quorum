@@ -321,6 +321,9 @@ fn delete_orphaned_task_rows_bounded(conn: &Connection, limit: usize) -> Result<
 const DURABLE_AGENT_RUN_REF_TABLES: &[(&str, &str)] = &[
     ("run_capabilities", "agent_run_id"),
     ("fallback_launch_intents", "agent_run_id"),
+    ("fallback_launch_intents", "failed_agent_run_id"),
+    ("routing_attempts", "failed_agent_run_id"),
+    ("agent_runs", "failed_agent_run_id"),
 ];
 
 fn agent_run_ref_guard_predicates() -> String {

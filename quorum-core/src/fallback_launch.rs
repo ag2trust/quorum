@@ -76,6 +76,10 @@ pub struct FallbackLaunchIntent {
     pub pending_turn: PendingManagedTurn,
     pub agent_run_id: i64,
     pub capability_run_id: String,
+    /// The exact failed `agent_runs.id` whose retirement authorized this
+    /// fallback generation. Populated for v79+ intents; `None` on
+    /// grandfathered pre-v79 rows.
+    pub failed_agent_run_id: Option<i64>,
     pub created_at: i64,
 }
 
@@ -92,6 +96,10 @@ pub struct FallbackLaunchInput<'a> {
     pub pending_turn: &'a PendingManagedTurn,
     pub agent_run_id: i64,
     pub capability_run_id: &'a str,
+    /// The exact failed managed-run identity that authorized this intent.
+    /// Bound to the row so `reconstruct` can verify it belongs to the caller's
+    /// current failure generation before returning it as replay evidence.
+    pub failed_agent_run_id: Option<i64>,
     pub created_at: i64,
 }
 
@@ -140,8 +148,9 @@ pub fn persist_tx(
     tx.execute(
         "INSERT INTO fallback_launch_intents(
              responsibility_key,routing_attempt_id,task_id,role,worktree,
-             pr_number,head_sha,pending_turn_json,agent_run_id,capability_run_id,created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+             pr_number,head_sha,pending_turn_json,agent_run_id,capability_run_id,
+             failed_agent_run_id,created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
         params![
             input.attribution.responsibility_key(),
             input.routing_attempt_id,
@@ -153,6 +162,7 @@ pub fn persist_tx(
             pending_turn_json,
             input.agent_run_id,
             input.capability_run_id,
+            input.failed_agent_run_id,
             input.created_at,
         ],
     )?;
@@ -168,6 +178,7 @@ pub fn persist_tx(
         pending_turn: input.pending_turn.clone(),
         agent_run_id: input.agent_run_id,
         capability_run_id: input.capability_run_id.to_string(),
+        failed_agent_run_id: input.failed_agent_run_id,
         created_at: input.created_at,
     })
 }
@@ -194,7 +205,8 @@ pub fn reconstruct(
     let row = conn
         .query_row(
             "SELECT id,responsibility_key,routing_attempt_id,task_id,role,worktree,
-                    pr_number,head_sha,pending_turn_json,agent_run_id,capability_run_id,created_at
+                    pr_number,head_sha,pending_turn_json,agent_run_id,capability_run_id,
+                    failed_agent_run_id,created_at
              FROM fallback_launch_intents
              WHERE responsibility_key=?1 AND routing_attempt_id=?2",
             params![responsibility_key, routing_attempt_id],
@@ -211,7 +223,8 @@ pub fn reconstruct(
                     row.get::<_, String>(8)?,
                     row.get::<_, i64>(9)?,
                     row.get::<_, String>(10)?,
-                    row.get::<_, i64>(11)?,
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, i64>(12)?,
                 ))
             },
         )
@@ -228,6 +241,7 @@ pub fn reconstruct(
         pending_turn_json,
         agent_run_id,
         capability_run_id,
+        failed_agent_run_id,
         created_at,
     )) = row
     else {
@@ -255,6 +269,7 @@ pub fn reconstruct(
         pending_turn,
         agent_run_id,
         capability_run_id,
+        failed_agent_run_id,
         created_at,
     };
     validate_stored_intent(&intent)?;
@@ -330,6 +345,7 @@ fn validate_attribution_reference(
         .ok_or_else(|| QuorumError::Io("fallback routing attempt is missing".into()))?;
     if routing_attempt.role_assignment_id != input.attribution.assignment_id()
         || routing_attempt.responsibility_key != input.attribution.responsibility_key()
+        || routing_attempt.failed_agent_run_id != input.failed_agent_run_id
         || !matches!(
             routing_attempt.failure_disposition,
             Some(FailureDisposition::ProviderUnavailable | FailureDisposition::ProfileUnavailable)
@@ -344,6 +360,7 @@ fn validate_attribution_reference(
         tx,
         input.attribution.assignment_id(),
         &input.attribution.profile().id,
+        input.failed_agent_run_id,
     )?
     .ok_or_else(|| QuorumError::Io("attributed fallback run is missing".into()))?;
     let attributed_run_task_id: i64 = tx.query_row(
@@ -389,6 +406,7 @@ fn same_descriptor(
         && existing.pending_turn == *input.pending_turn
         && existing.agent_run_id == input.agent_run_id
         && existing.capability_run_id == input.capability_run_id
+        && existing.failed_agent_run_id == input.failed_agent_run_id
 }
 
 fn validate_stored_intent(intent: &FallbackLaunchIntent) -> Result<()> {
@@ -560,6 +578,7 @@ mod tests {
                 responsibility_key: responsibility,
                 profile: &pool.profiles[0].profile,
                 failure_disposition: Some(FailureDisposition::ProviderUnavailable),
+                failed_agent_run_id: None,
                 recorded_at: 10,
             },
             &pool,
@@ -587,7 +606,8 @@ mod tests {
         .unwrap();
         let tx = begin_immediate(conn).unwrap();
         let agent_run_id =
-            agent_runs::insert_alternate_with_attribution_tx(&tx, &token, "Fallback", 11).unwrap();
+            agent_runs::insert_alternate_with_attribution_tx(&tx, &token, "Fallback", None, 11)
+                .unwrap();
         let capability = capabilities::issue_attributed_alternate_tx(
             &tx,
             &token,
@@ -628,6 +648,7 @@ mod tests {
             pending_turn: &pending_turn,
             agent_run_id,
             capability_run_id: &capability_run_id,
+            failed_agent_run_id: None,
             created_at: 13,
         };
         let intent = persist(&mut conn, &input).unwrap();
@@ -691,6 +712,7 @@ mod tests {
                 pending_turn: &pending_turn,
                 agent_run_id,
                 capability_run_id: &capability_run_id,
+                failed_agent_run_id: None,
                 created_at: 13,
             },
         )
@@ -705,6 +727,7 @@ mod tests {
                 pending_turn: &pending_turn,
                 agent_run_id,
                 capability_run_id: &capability_run_id,
+                failed_agent_run_id: None,
                 created_at: 99,
             },
         )
@@ -721,6 +744,7 @@ mod tests {
                 pending_turn: &pending_turn,
                 agent_run_id,
                 capability_run_id: &capability_run_id,
+                failed_agent_run_id: None,
                 created_at: 100,
             },
         );
@@ -756,6 +780,7 @@ mod tests {
                             pending_turn: &pending_turn,
                             agent_run_id,
                             capability_run_id: &capability_run_id,
+                            failed_agent_run_id: None,
                             created_at: 13,
                         },
                     )
