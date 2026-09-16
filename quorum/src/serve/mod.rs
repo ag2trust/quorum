@@ -14408,19 +14408,12 @@ async fn tick(
     // lets any racing verdict win under the write lock.
     let mut settled_reviewer_fallbacks = Vec::new();
     for (i, reviewer) in reviewers.iter_mut().enumerate() {
-        if reviewer.draining || reviewer.error_turn_count == 0 {
+        if !slot_is_live_provider_fallback_candidate(reviewer) {
             continue;
         }
-        let Some(failure) = reviewer.observed_pre_authoritative_failure() else {
-            continue;
-        };
-        if !matches!(
-            failure.disposition(),
-            runner::FailureDisposition::ProviderUnavailable
-                | runner::FailureDisposition::ProfileUnavailable
-        ) {
-            continue;
-        }
+        let failure = reviewer
+            .observed_pre_authoritative_failure()
+            .expect("live provider fallback candidate has observed failure");
         let observed_at = now_unix();
         let currency = match quorum_core::db::open(&config.db_path)
             .and_then(|conn| load_reviewer_fallback_currency(&conn, reviewer, observed_at))
@@ -14639,12 +14632,34 @@ async fn tick(
         }
     }
 
-    // ── Phase 4-refeed: Auto-refeed workers whose last turn ended with an error ──
+    // ── Phase 4-refeed: Route unavailable workers, then refeed transient errors ──
     // An error-terminated result (is_error=true) leaves the worker idle with
-    // error_turn_count > 0. Re-feed a continuation turn so the agent retries.
-    // After MAX_ERROR_RETRIES consecutive errors, fire AgentFailed.
-    let mut error_failed: Vec<usize> = Vec::new();
-    for (i, w) in workers.iter_mut().enumerate() {
+    // error_turn_count > 0. A bounded route-unavailable observation goes to
+    // fallback immediately; other errors re-feed a continuation turn. After
+    // MAX_ERROR_RETRIES consecutive errors, fire AgentFailed.
+    let mut error_failed: Vec<i64> = Vec::new();
+    let mut settled_worker_fallbacks = Vec::new();
+    for (i, worker) in workers.iter_mut().enumerate() {
+        match route_live_worker_provider_failure(config, worker).await {
+            Ok(LiveWorkerFallbackRoute::NotCandidate) => {}
+            Ok(LiveWorkerFallbackRoute::Activated) => {}
+            Ok(LiveWorkerFallbackRoute::Settled) => settled_worker_fallbacks.push(i),
+            // A stale or fail-closed installation must not reopen the
+            // same-provider refeed loop. Fall through to the established
+            // terminal disposition below instead.
+            Ok(LiveWorkerFallbackRoute::NotInstalled) => error_failed.push(worker.task_id),
+            Err(QuorumError::Usage(_)) => continue,
+            Err(error) => log(&format!(
+                "worker {} live-turn fallback failed; retaining slot: {error}",
+                worker.agent_name
+            )),
+        }
+    }
+    for i in settled_worker_fallbacks.into_iter().rev() {
+        let dead = workers.remove(i);
+        cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked").await;
+    }
+    for w in workers.iter_mut() {
         if !slot_is_error_refeed_candidate(w) {
             continue;
         }
@@ -14653,7 +14668,7 @@ async fn tick(
                 "worker {} exhausted error retries ({}/{}) on task #{} — firing AgentFailed",
                 w.agent_name, w.error_turn_count, MAX_ERROR_RETRIES, w.task_id
             ));
-            error_failed.push(i);
+            error_failed.push(w.task_id);
             continue;
         }
         let raw_prompt = format!(
@@ -14677,11 +14692,14 @@ async fn tick(
                     "auto-refeed worker {} failed: {e} — marking for AgentFailed",
                     w.agent_name
                 ));
-                error_failed.push(i);
+                error_failed.push(w.task_id);
             }
         }
     }
-    for &i in error_failed.iter().rev() {
+    for task_id in error_failed {
+        let Some(i) = workers.iter().position(|worker| worker.task_id == task_id) else {
+            continue;
+        };
         let mut dead = workers.remove(i);
         // TurnFailed already carried bounded provider evidence. Try an
         // eligible alternate before either the turn-oriented provider block
@@ -18294,8 +18312,26 @@ fn slot_has_pending_watchdog_outcome(slot: &SlotState) -> bool {
     slot.pending_watchdog_breach.is_some()
 }
 
+fn slot_is_live_provider_fallback_candidate(slot: &SlotState) -> bool {
+    slot.error_turn_count > 0
+        && !slot.draining
+        && !slot_has_pending_watchdog_outcome(slot)
+        && slot
+            .observed_pre_authoritative_failure()
+            .is_some_and(|failure| {
+                matches!(
+                    failure.disposition(),
+                    runner::FailureDisposition::ProviderUnavailable
+                        | runner::FailureDisposition::ProfileUnavailable
+                )
+            })
+}
+
 fn slot_is_error_refeed_candidate(slot: &SlotState) -> bool {
-    slot.error_turn_count > 0 && !slot.draining && !slot_has_pending_watchdog_outcome(slot)
+    slot.error_turn_count > 0
+        && !slot.draining
+        && !slot_has_pending_watchdog_outcome(slot)
+        && !slot_is_live_provider_fallback_candidate(slot)
 }
 
 /// Shared by worker and reviewer graceful drain selection.
@@ -23243,6 +23279,41 @@ enum WorkerFallbackActivation {
     NotInstalled,
     Activated,
     Settled,
+}
+
+/// Result of routing an error-terminated persistent worker turn before the
+/// generic same-provider refeed loop. A classified unavailable route must be
+/// tried exactly here, while transient and unknown failures remain eligible
+/// for the bounded refeed budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveWorkerFallbackRoute {
+    NotCandidate,
+    NotInstalled,
+    Activated,
+    Settled,
+}
+
+async fn route_live_worker_provider_failure(
+    config: &ServeConfig,
+    slot: &mut SlotState,
+) -> Result<LiveWorkerFallbackRoute> {
+    if !slot_is_live_provider_fallback_candidate(slot) {
+        return Ok(LiveWorkerFallbackRoute::NotCandidate);
+    }
+    let failure = slot
+        .observed_pre_authoritative_failure()
+        .expect("live provider fallback candidate has observed failure");
+    let observed_at = now_unix();
+    let conn = quorum_core::db::open(&config.db_path)?;
+    let currency = load_worker_fallback_currency(&conn, slot, observed_at)?;
+    drop(conn);
+    Ok(
+        match activate_worker_fallback(config, slot, &failure, &currency).await? {
+            WorkerFallbackActivation::NotInstalled => LiveWorkerFallbackRoute::NotInstalled,
+            WorkerFallbackActivation::Activated => LiveWorkerFallbackRoute::Activated,
+            WorkerFallbackActivation::Settled => LiveWorkerFallbackRoute::Settled,
+        },
+    )
 }
 
 fn worker_fallback_pending_turn(slot: &SlotState) -> PendingTurn {
@@ -28947,9 +29018,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn live_worker_fallback_swaps_run_capability_process_and_journal() {
+        use std::os::unix::fs::PermissionsExt;
+
         let root = tempfile::tempdir().unwrap();
         let worktree = root.path().join("worker-wt");
         std::fs::create_dir_all(&worktree).unwrap();
+        let primary_runner = root.path().join("unavailable-primary-codex");
+        std::fs::write(
+            &primary_runner,
+            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"turn.failed\",\"error\":{\"message\":\"The model gpt-5.6-sol does not exist or you do not have access to it.\"}}'\nexec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&primary_runner, std::fs::Permissions::from_mode(0o755)).unwrap();
         let runner_program = live_fallback_runner(root.path());
         let config = live_fallback_test_config(
             root.path().join("worker.db"),
@@ -29018,9 +29098,28 @@ mod tests {
         let now = std::time::Instant::now();
         let mut slot = SlotState {
             agent_name,
-            proc: SlotProcess::Failed {
-                kind: runner::AgentKind::Codex,
-            },
+            proc: SlotProcess::running(
+                runner::RunnerProc::launch(
+                    &runner::LaunchRequest {
+                        model: &assignment.model,
+                        effort: &assignment.effort,
+                        worktree: &worktree,
+                        prompt: "exact initial prompt",
+                        environment: &[],
+                        mode: runner::LaunchMode::Normal,
+                        continuation_id: None,
+                    },
+                    &runner::AdapterConfig {
+                        executable: primary_runner.to_str(),
+                        claude_bare: false,
+                        claude_allowed_tools: "",
+                        codex_sandbox: "danger-full-access",
+                        grok: Default::default(),
+                    },
+                )
+                .await
+                .unwrap(),
+            ),
             task_id,
             session_id: "initial-session".into(),
             model: assignment.model.clone(),
@@ -29055,18 +29154,41 @@ mod tests {
             pending_prompt: "exact initial prompt".into(),
             pending_turn_kind: "initial".into(),
         };
-        let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
         drop(conn);
-        let failure = runner::RunnerFailure::classified(
-            runner::FailureDisposition::ProfileUnavailable,
-            "primary profile unavailable",
-            std::io::ErrorKind::Other,
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while slot.error_turn_count == 0 {
+                assert!(
+                    drain_events(&mut slot, &config.db_path, "worker", &config.limits)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("primary must report its classified error turn");
+        assert_eq!(slot.error_turn_count, 1);
+        assert!(slot_is_live_provider_fallback_candidate(&slot));
+        assert!(
+            !slot_is_error_refeed_candidate(&slot),
+            "a classified unavailable route must never reach same-provider refeed"
         );
+        slot.pending_watchdog_breach = Some("watchdog outcome pending".into());
+        assert!(
+            !slot_is_live_provider_fallback_candidate(&slot),
+            "a pending watchdog outcome must defer fallback routing"
+        );
+        assert!(
+            !slot_is_error_refeed_candidate(&slot),
+            "a pending watchdog outcome must also defer refeed"
+        );
+        slot.pending_watchdog_breach = None;
         assert_eq!(
-            activate_worker_fallback(&config, &mut slot, &failure, &currency)
+            route_live_worker_provider_failure(&config, &mut slot)
                 .await
                 .unwrap(),
-            WorkerFallbackActivation::Activated
+            LiveWorkerFallbackRoute::Activated
         );
         assert_eq!(slot.model, "gpt-5.6-terra");
         assert_ne!(slot.agent_run_id, Some(initial_run));
@@ -35828,7 +35950,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(!slot_is_graceful_drain_candidate(&slot));
 
         slot.pending_watchdog_breach = None;
+        assert!(
+            !slot_is_live_provider_fallback_candidate(&slot),
+            "an unknown error has no fallback disposition"
+        );
         assert!(slot_is_error_refeed_candidate(&slot));
+        slot.error_turn_count = MAX_ERROR_RETRIES;
+        assert!(
+            slot_is_error_refeed_candidate(&slot),
+            "unknown failures remain on the existing bounded refeed/AgentFailed path"
+        );
         assert!(slot_is_graceful_drain_candidate(&slot));
         slot.error_turn_count = 0;
         assert!(slot_is_idle_zombie_candidate(&slot, 300));
