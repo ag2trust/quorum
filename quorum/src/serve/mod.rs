@@ -36,6 +36,7 @@ pub mod session_log;
 pub mod stream;
 pub mod worktree;
 
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 
 use names::Pool;
@@ -53,7 +54,7 @@ use rusqlite::OptionalExtension;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 fn load_graph_review_context(db_path: &Path, task_id: i64) -> Result<Option<String>> {
@@ -2039,8 +2040,178 @@ async fn publish_worker_completion(
     Ok(published_completion(intent, pr))
 }
 
+const SERVE_LOG_FILE: &str = "serve.log";
+const SERVE_LOG_MAX_BYTES: u64 = 1024 * 1024;
+/// Includes the active log plus its two rotated predecessors.
+const SERVE_LOG_FILE_COUNT: usize = 3;
+const SERVE_LOG_PREFIX: &str = "quorum serve: ";
+const SERVE_LOG_TRUNCATED: &str = " … [truncated]\n";
+
+/// The daemon is single-process by contract, but multiple async tasks can log
+/// concurrently. Keep one append handle behind a short synchronous mutex so
+/// each record and a rare rotation are serialized.
+static DAEMON_LOG: LazyLock<Mutex<Option<ServeLog>>> = LazyLock::new(|| Mutex::new(None));
+
+struct ServeLog {
+    path: PathBuf,
+    file: Option<File>,
+    len: u64,
+    max_bytes: u64,
+    file_count: usize,
+}
+
+impl ServeLog {
+    fn open(log_dir: &Path, max_bytes: u64, file_count: usize) -> std::io::Result<Self> {
+        let min_record_bytes = (SERVE_LOG_PREFIX.len() + SERVE_LOG_TRUNCATED.len()) as u64;
+        if max_bytes < min_record_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("daemon log size must be at least {min_record_bytes} bytes"),
+            ));
+        }
+        if file_count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "daemon log must retain at least one file",
+            ));
+        }
+
+        fs::create_dir_all(log_dir)?;
+        let path = log_dir.join(SERVE_LOG_FILE);
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let len = file.metadata()?.len();
+        Ok(Self {
+            path,
+            file: Some(file),
+            len,
+            max_bytes,
+            file_count,
+        })
+    }
+
+    fn append(&mut self, msg: &str) -> std::io::Result<()> {
+        let line = self.bounded_line(msg);
+        let line_len = line.len() as u64;
+        if self.len.saturating_add(line_len) > self.max_bytes {
+            self.rotate()?;
+        }
+
+        let file = self.file.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "daemon log file is unavailable after rotation",
+            )
+        })?;
+        file.write_all(&line)?;
+        self.len += line_len;
+        Ok(())
+    }
+
+    fn bounded_line(&self, msg: &str) -> Vec<u8> {
+        let full_len = SERVE_LOG_PREFIX.len() + msg.len() + 1;
+        if full_len <= self.max_bytes as usize {
+            return format!("{SERVE_LOG_PREFIX}{msg}\n").into_bytes();
+        }
+
+        let max_message_bytes =
+            self.max_bytes as usize - SERVE_LOG_PREFIX.len() - SERVE_LOG_TRUNCATED.len();
+        let mut end = max_message_bytes.min(msg.len());
+        while !msg.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{SERVE_LOG_PREFIX}{}{SERVE_LOG_TRUNCATED}", &msg[..end]).into_bytes()
+    }
+
+    fn rotate(&mut self) -> std::io::Result<()> {
+        // Close before renaming so rotation also works on filesystems that do
+        // not permit renaming an open file.
+        self.file.take();
+
+        if self.file_count > 1 {
+            let oldest = self.rotated_path(self.file_count - 1);
+            match fs::remove_file(oldest) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+
+            for index in (1..self.file_count - 1).rev() {
+                let from = self.rotated_path(index);
+                let to = self.rotated_path(index + 1);
+                match fs::rename(from, to) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+
+            match fs::rename(&self.path, self.rotated_path(1)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        } else {
+            match fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        self.file = Some(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?,
+        );
+        self.len = 0;
+        Ok(())
+    }
+
+    fn rotated_path(&self, index: usize) -> PathBuf {
+        let mut path = self.path.as_os_str().to_os_string();
+        path.push(".");
+        path.push(index.to_string());
+        PathBuf::from(path)
+    }
+}
+
+fn configure_daemon_log(log_dir: Option<&Path>) {
+    let logger = match log_dir {
+        Some(log_dir) => match ServeLog::open(log_dir, SERVE_LOG_MAX_BYTES, SERVE_LOG_FILE_COUNT) {
+            Ok(logger) => Some(logger),
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "quorum serve: daemon log file disabled for {}: {error}",
+                    log_dir.display()
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let mut configured = DAEMON_LOG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *configured = logger;
+}
+
 fn log(msg: &str) {
-    let _ = writeln!(std::io::stderr(), "quorum serve: {msg}");
+    let _ = writeln!(std::io::stderr(), "{SERVE_LOG_PREFIX}{msg}");
+
+    let mut daemon_log = DAEMON_LOG
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(logger) = daemon_log.as_mut() {
+        if let Err(error) = logger.append(msg) {
+            *daemon_log = None;
+            let _ = writeln!(
+                std::io::stderr(),
+                "quorum serve: daemon log file disabled after write failure: {error}"
+            );
+        }
+    }
 }
 
 /// Fire off a detached post-merge review-analytics collection for `pr_num`.
@@ -3549,7 +3720,8 @@ pub struct ServeConfig {
     /// plugins, memory, and MCP config. Default: false (inherit operator login).
     pub bare_agent: bool,
     pub limits: CostLimits,
-    /// Directory for per-agent session logs (stream.jsonl, transcript.md, meta.json).
+    /// Directory for daemon and per-agent session logs. Daemon decisions append to
+    /// `serve.log`, which rotates at 1 MiB and retains three files including the active log.
     pub log_dir: Option<PathBuf>,
     /// When true, the daemon drains and exits 75 when its own repo's self-update branch advances.
     pub self_update_drain: bool,
@@ -3622,6 +3794,7 @@ const PUBLICATION_REF_RECONCILE_INTERVAL_SECS: u64 = 60;
 const PUBLICATION_REF_RECONCILE_BATCH_SIZE: i64 = 64;
 
 pub fn run_serve(config: ServeConfig) -> Result<i32> {
+    configure_daemon_log(config.log_dir.as_deref());
     log(&format!(
         "starting (cap={}, repo={})",
         config.cap, config.repo
@@ -49599,5 +49772,77 @@ exec /bin/cat '{stdout}'
 
         planner_slot.kill_and_reap().await;
         arbiter_slot.kill_and_reap().await;
+    }
+
+    static TEST_DAEMON_LOG_CONFIG: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn daemon_log_appends_log_output_to_configured_log_dir() {
+        let _guard = TEST_DAEMON_LOG_CONFIG.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        configure_daemon_log(Some(dir.path()));
+        log("durable daemon log test");
+        configure_daemon_log(None);
+
+        let contents = fs::read_to_string(dir.path().join(SERVE_LOG_FILE)).unwrap();
+        assert!(contents.contains("quorum serve: durable daemon log test\n"));
+    }
+
+    #[test]
+    fn daemon_log_rotates_at_the_size_limit_with_bounded_retention() {
+        const TEST_MAX_BYTES: u64 = 96;
+        const TEST_FILE_COUNT: usize = 3;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut logger = ServeLog::open(dir.path(), TEST_MAX_BYTES, TEST_FILE_COUNT).unwrap();
+        for index in 0..6 {
+            logger
+                .append(&format!("record-{index}-{}", "x".repeat(60)))
+                .unwrap();
+        }
+        // A single oversized record must not defeat the disk bound.
+        logger
+            .append(&"x".repeat(TEST_MAX_BYTES as usize * 2))
+            .unwrap();
+        drop(logger);
+
+        let files = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(SERVE_LOG_FILE))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), TEST_FILE_COUNT);
+        assert!(dir.path().join(SERVE_LOG_FILE).is_file());
+        assert!(dir.path().join("serve.log.1").is_file());
+        assert!(dir.path().join("serve.log.2").is_file());
+        assert!(!dir.path().join("serve.log.3").exists());
+        for file in &files {
+            assert!(
+                fs::metadata(file).unwrap().len() <= TEST_MAX_BYTES,
+                "{} exceeded the rotation limit",
+                file.display()
+            );
+        }
+        assert!(fs::read_to_string(dir.path().join("serve.log.1"))
+            .unwrap()
+            .contains("record-5-"));
+    }
+
+    #[test]
+    fn unavailable_daemon_log_dir_does_not_block_logging() {
+        let _guard = TEST_DAEMON_LOG_CONFIG.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_directory = dir.path().join("not-a-directory");
+        fs::write(&not_a_directory, "not a directory").unwrap();
+
+        configure_daemon_log(Some(&not_a_directory));
+        log("daemon continues after log setup failure");
+        assert!(DAEMON_LOG.lock().unwrap().is_none());
+        configure_daemon_log(None);
     }
 }
