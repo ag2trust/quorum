@@ -14463,7 +14463,7 @@ async fn tick(
         .map(|(index, _)| *index)
         .collect::<HashSet<_>>();
     let unclassified_reviewer_errors =
-        unclassified_reviewer_error_indexes(&reviewers, &queued_reviewer_fallbacks);
+        unclassified_reviewer_error_indexes(reviewers, &queued_reviewer_fallbacks);
     for i in unclassified_reviewer_errors.into_iter().rev() {
         if let Some(end_reason) = fail_reviewer_for_unclassified_turn(&db_path, &reviewers[i]).await
         {
