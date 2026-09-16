@@ -524,7 +524,8 @@ pub enum Command {
         /// Comma-separated tool allowlist for spawned agents (overrides built-in default).
         #[arg(long)]
         allowed_tools: Option<String>,
-        /// Directory for per-agent session logs (stream.jsonl, transcript.md, meta.json).
+        /// Directory for daemon and per-agent logs. Daemon messages append to serve.log,
+        /// rotating at 1 MiB and retaining the active file plus two prior files.
         /// Defaults to {quorum_home}/logs when omitted.
         #[arg(long)]
         log_dir: Option<String>,

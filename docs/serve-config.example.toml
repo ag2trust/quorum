@@ -12,6 +12,7 @@ repo_dir = "/home/user/dev/quorum"
 
 # ── paths (under ~/.quorum/serve/<repo>/ — survives reboots, unlike /tmp) ──
 worktree_base = "/home/user/.quorum/serve/quorum/worktrees"
+# Includes per-agent session directories and serve.log (1 MiB rotation; 3 files kept).
 log_dir       = "/home/user/.quorum/serve/quorum/logs"
 
 # ── agent spawn and model routing ─────────────────────────────────────

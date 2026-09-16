@@ -244,9 +244,11 @@ quorum serve \
 ```
 
 Use `quorum serve --help` for provider, model, concurrency, troubleshooting,
-and budget settings. This repo uses `scripts/serve-supervisor.sh` so Quorum can
-rebuild and restart after updating itself. Only one daemon can manage a
-repository database at a time.
+and budget settings. The configured `log_dir` also receives daemon decisions in
+`serve.log`; it rotates at 1 MiB and retains the active file plus two prior
+files. This repo uses `scripts/serve-supervisor.sh` so Quorum can rebuild and
+restart after updating itself. Only one daemon can manage a repository database
+at a time.
 
 ### Branch responsibilities for operators
 
