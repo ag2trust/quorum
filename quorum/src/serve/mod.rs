@@ -29684,14 +29684,13 @@ mod tests {
             tasks::get(&conn, task_id).unwrap().unwrap().status,
             "rework"
         );
-        assert_eq!(
+        assert!(
             conn.query_row(
                 "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
                 [mailbox_id],
                 |row| row.get::<_, bool>(0),
             )
             .unwrap(),
-            true,
             "the deferred verdict must fold rather than become a phantom",
         );
     }
