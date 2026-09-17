@@ -639,6 +639,7 @@ fn preserve_protected_refs(
                     | "cx_not_ready_reason"
                     | "cx_by"
                     | "cx_dup_of"
+                    | "cx_risk_flags"
                     | MERGE_RETRY_REF
             );
             let runner_state =
@@ -677,6 +678,7 @@ fn invalidate_classifier_refs(
         "cx_not_ready_reason",
         "cx_by",
         "cx_dup_of",
+        "cx_risk_flags",
         "cx_flags",
         "cx_tags",
     ] {
@@ -5070,6 +5072,7 @@ pub fn retry_parked(
                      '$.cx_not_ready_reason',
                      '$.cx_by',
                      '$.cx_dup_of',
+                     '$.cx_risk_flags',
                      '$.daemon_parked_unsatisfiable'
                  ),
                  recovery_attempts=CASE WHEN ?3 THEN 0 ELSE recovery_attempts END,
@@ -10071,7 +10074,21 @@ mod tests {
     #[test]
     fn body_update_invalidates_classifier_refs_but_preserves_unrelated_refs() {
         let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        let id = create(
+            &mut c,
+            "boss",
+            "t",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":3,"cx_size":"M","cx_size_reason":"bounded seam","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v4","cx_risk_flags":[{"flag":"public_contract","evidence":"The task changes CLI JSON output."}]}"#,
+            ),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         let t = update(
             &mut c,
@@ -10093,6 +10110,7 @@ mod tests {
         assert!(refs.get("cx_size").is_none());
         assert!(refs.get("cx_size_reason").is_none());
         assert!(refs.get("cx_ready").is_none());
+        assert!(refs.get("cx_risk_flags").is_none());
         assert_eq!(t.status, "working");
     }
 
@@ -10459,7 +10477,7 @@ mod tests {
             None,
             0,
             None,
-            Some(r#"{"cx_est":5,"cx_by":"classifier:v1","pr":41,"merge_commit_sha":"trusted"}"#),
+            Some(r#"{"cx_est":5,"cx_by":"classifier:v1","cx_risk_flags":[{"flag":"many_consumers","evidence":"Three consumers must update together."}],"pr":41,"merge_commit_sha":"trusted"}"#),
             None,
             None,
             1000,
@@ -10477,6 +10495,13 @@ mod tests {
         assert_eq!(refs["ticket"], "ABC");
         assert_eq!(refs["cx_est"], 5);
         assert_eq!(refs["cx_by"], "classifier:v1");
+        assert_eq!(
+            refs["cx_risk_flags"],
+            serde_json::json!([{
+                "flag": "many_consumers",
+                "evidence": "Three consumers must update together."
+            }])
+        );
         assert_eq!(refs[MERGE_COMMIT_SHA_REF], "trusted");
     }
 
@@ -15506,14 +15531,15 @@ mod tests {
         )
         .unwrap();
         c.execute(
-            "UPDATE tasks SET status='failed', refs=json_object(
+            r#"UPDATE tasks SET status='failed', refs=json_object(
                  'daemon_parked', json('true'),
                  'daemon_parked_reason', 'classifier declined',
                  'daemon_resume_status', 'open',
                  'classifier_policy_parked', json('true'),
                  'daemon_parked_unsatisfiable', json('true'),
-                 'cx_est', 3
-             ) WHERE id=?1",
+                 'cx_est', 3,
+                 'cx_risk_flags', json('[{"flag":"public_contract","evidence":"The task changes CLI JSON output."}]')
+             ) WHERE id=?1"#,
             params![id],
         )
         .unwrap();
@@ -15529,6 +15555,7 @@ mod tests {
         );
         assert_eq!(refs[CLASSIFIER_POLICY_PARKED_REF], true);
         assert!(refs.get("cx_est").is_none());
+        assert!(refs.get("cx_risk_flags").is_none());
     }
 
     /// Task #473 review blocker: `set_parked_refs` is the shared builder for
