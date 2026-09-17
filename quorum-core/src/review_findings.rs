@@ -21,6 +21,7 @@ use crate::db::begin_immediate;
 use crate::error::Result;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// A single reviewer-raised finding extracted from a PR's review record.
 ///
@@ -175,6 +176,31 @@ pub fn list_for_pr(conn: &Connection, pr_number: i64) -> Result<Vec<ReviewFindin
         out.push(r?);
     }
     Ok(out)
+}
+
+/// Return the classified flags for tasks with a collector-recorded blocker
+/// after at least two rework rounds. The task join keeps this observational:
+/// the collector's durable finding remains the source of the blocker while
+/// the classifier-owned refs remain the source of the flags.
+pub fn late_blocker_task_flags(conn: &Connection) -> Result<HashMap<i64, Vec<String>>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT t.id,t.refs
+         FROM review_findings f
+         JOIN tasks t ON t.id=f.task_id
+         WHERE f.kind='blocking' AND t.rework_round >= 2",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    let mut flags_by_task = HashMap::new();
+    for row in rows {
+        let (task_id, refs) = row?;
+        flags_by_task.insert(
+            task_id,
+            crate::risk::risk_flag_names(refs.as_deref().unwrap_or("")),
+        );
+    }
+    Ok(flags_by_task)
 }
 
 /// Collection-run outcome for a single PR.
@@ -678,6 +704,49 @@ mod tests {
         let got = list_for_pr(&conn, 100).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].text, "new");
+    }
+
+    #[test]
+    fn late_blocker_flags_require_a_second_rework_round() {
+        let (mut conn, _dir) = test_conn();
+        let refs =
+            r#"{"cx_risk_flags":[{"flag":"public_contract","evidence":"Changes JSON output."}]}"#;
+        for (status, rework_round) in [("done", 2_i64), ("done", 1_i64)] {
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at,refs,rework_round) \
+                 VALUES ('test',?1,'owner',1,1,?2,?3)",
+                params![status, refs, rework_round],
+            )
+            .unwrap();
+        }
+        let late_task = 1;
+        let early_task = 2;
+        replace_for_pr(
+            &mut conn,
+            101,
+            &[ReviewFinding {
+                task_id: Some(late_task),
+                ..mk("blocking", "pulls")
+            }],
+        )
+        .unwrap();
+        replace_for_pr(
+            &mut conn,
+            102,
+            &[ReviewFinding {
+                task_id: Some(early_task),
+                ..mk("blocking", "pulls")
+            }],
+        )
+        .unwrap();
+
+        let late = late_blocker_task_flags(&conn).unwrap();
+        assert_eq!(late.len(), 1);
+        assert_eq!(
+            late.get(&late_task).unwrap(),
+            &vec!["public_contract".to_string()]
+        );
+        assert!(!late.contains_key(&early_task));
     }
 
     #[test]

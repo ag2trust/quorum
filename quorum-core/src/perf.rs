@@ -3,7 +3,7 @@
 //! Computes aggregate metrics from the `tasks` table (terminal tasks only: done, failed,
 //! cancelled). Model/effort resolved from `agent_runs` (earliest worker spawn per task),
 //! falling back to caller-supplied defaults for orphan tasks. Complexity derived from
-//! `complexity:*` labels. The separate facts surface below deliberately has a
+//! `complexity:*` labels and risk flags from classifier-owned task refs. The separate facts surface below deliberately has a
 //! stricter, delivery-evidence-based inclusion policy; it does not affect the
 //! legacy aggregate report.
 
@@ -19,6 +19,7 @@ pub enum PerfCut {
     Default,
     Complexity,
     Reviewer,
+    RiskFlag,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -34,7 +35,14 @@ pub struct PerfRow {
     pub complexity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reviewer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk_flag: Option<String>,
     pub n_tasks: i64,
+    pub merged_count: i64,
+    pub failed_rework_cap_count: i64,
+    pub other_count: i64,
+    pub late_blocker_count: i64,
+    pub late_blocker_rate: f64,
     pub first_pass_pct: f64,
     pub avg_rework: f64,
     pub fail_pct: f64,
@@ -83,9 +91,11 @@ struct TaskRow {
     id: i64,
     status: String,
     labels: Option<String>,
+    refs: Option<String>,
     model: String,
     effort: String,
     rework_round: i64,
+    rework_cap: Option<i64>,
     created_at: i64,
     updated_at: i64,
     reviewer: Option<String>,
@@ -99,7 +109,7 @@ fn load_terminal_tasks(
 ) -> Result<Vec<TaskRow>> {
     let since_val = since.unwrap_or(0);
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.status, t.labels, t.rework_round, t.created_at, t.updated_at, t.reviewer, \
+        "SELECT t.id, t.status, t.labels, t.refs, t.rework_round, t.rework_cap, t.created_at, t.updated_at, t.reviewer, \
                 COALESCE(ar.model, ?1), COALESCE(ar.effort, ?2) \
          FROM tasks t \
          LEFT JOIN ( \
@@ -118,12 +128,14 @@ fn load_terminal_tasks(
                     id: r.get(0)?,
                     status: r.get(1)?,
                     labels: r.get(2)?,
-                    rework_round: r.get(3)?,
-                    created_at: r.get(4)?,
-                    updated_at: r.get(5)?,
-                    reviewer: r.get(6)?,
-                    model: r.get(7)?,
-                    effort: r.get(8)?,
+                    refs: r.get(3)?,
+                    rework_round: r.get(4)?,
+                    rework_cap: r.get(5)?,
+                    created_at: r.get(6)?,
+                    updated_at: r.get(7)?,
+                    reviewer: r.get(8)?,
+                    model: r.get(9)?,
+                    effort: r.get(10)?,
                 })
             },
         )?
@@ -202,10 +214,20 @@ fn median(sorted: &[f64]) -> f64 {
     }
 }
 
-type GroupKey = (String, String, Option<String>, Option<String>);
+type GroupKey = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 struct GroupAccum {
     total: i64,
+    merged: i64,
+    failed_rework_cap: i64,
+    other: i64,
+    late_blockers: i64,
     first_pass: i64,
     rework_sum: i64,
     failed: i64,
@@ -221,6 +243,10 @@ impl GroupAccum {
     fn new() -> Self {
         Self {
             total: 0,
+            merged: 0,
+            failed_rework_cap: 0,
+            other: 0,
+            late_blockers: 0,
             first_pass: 0,
             rework_sum: 0,
             failed: 0,
@@ -233,8 +259,23 @@ impl GroupAccum {
         }
     }
 
-    fn add(&mut self, task: &TaskRow, aux: &AuxData) {
+    fn add(&mut self, task: &TaskRow, aux: &AuxData, late_blocker: bool) {
         self.total += 1;
+        if task.status == "done" {
+            self.merged += 1;
+        } else if task.status == "failed"
+            && task.rework_round
+                >= task
+                    .rework_cap
+                    .unwrap_or(crate::lifecycle::REWORK_CAP as i64)
+        {
+            self.failed_rework_cap += 1;
+        } else {
+            self.other += 1;
+        }
+        if late_blocker {
+            self.late_blockers += 1;
+        }
         if task.status == "done" && task.rework_round == 0 {
             self.first_pass += 1;
         }
@@ -266,6 +307,7 @@ impl GroupAccum {
         effort: String,
         complexity: Option<String>,
         reviewer: Option<String>,
+        risk_flag: Option<String>,
     ) -> PerfRow {
         self.wall_mins
             .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -277,7 +319,17 @@ impl GroupAccum {
             effort,
             complexity,
             reviewer,
+            risk_flag,
             n_tasks: self.total,
+            merged_count: self.merged,
+            failed_rework_cap_count: self.failed_rework_cap,
+            other_count: self.other,
+            late_blocker_count: self.late_blockers,
+            late_blocker_rate: if n > 0.0 {
+                self.late_blockers as f64 / n
+            } else {
+                0.0
+            },
             first_pass_pct: if n > 0.0 {
                 (self.first_pass as f64 / n) * 100.0
             } else {
@@ -342,31 +394,77 @@ pub fn perf_with(
     }
 
     let aux = load_aux_data(conn)?;
+    let late_blocker_flags = crate::review_findings::late_blocker_task_flags(conn)?;
     let mut groups: BTreeMap<GroupKey, GroupAccum> = BTreeMap::new();
 
     for task in &tasks {
-        let (model, effort, complexity, reviewer_col) = match cut {
-            PerfCut::Default => (task.model.clone(), task.effort.clone(), None, None),
+        let (model, effort, complexity, reviewer_col, risk_flags) = match cut {
+            PerfCut::Default => (
+                task.model.clone(),
+                task.effort.clone(),
+                None,
+                None,
+                vec![None],
+            ),
             PerfCut::Complexity => {
                 let cx = extract_complexity(task.labels.as_deref());
-                (task.model.clone(), task.effort.clone(), Some(cx), None)
+                (
+                    task.model.clone(),
+                    task.effort.clone(),
+                    Some(cx),
+                    None,
+                    vec![None],
+                )
             }
             PerfCut::Reviewer => {
                 let rev = task.reviewer.clone().unwrap_or_else(|| "none".to_string());
-                (task.model.clone(), task.effort.clone(), None, Some(rev))
+                (
+                    task.model.clone(),
+                    task.effort.clone(),
+                    None,
+                    Some(rev),
+                    vec![None],
+                )
             }
+            // A risk flag is a task characteristic, not a model-routing
+            // dimension. Keep this cut at the closed flag set plus untagged.
+            PerfCut::RiskFlag => (
+                "all".to_string(),
+                "all".to_string(),
+                None,
+                None,
+                crate::risk::risk_flag_names(task.refs.as_deref().unwrap_or(""))
+                    .into_iter()
+                    .map(Some)
+                    .collect(),
+            ),
         };
 
-        let key = (model, effort, complexity, reviewer_col);
-        groups
-            .entry(key)
-            .or_insert_with(GroupAccum::new)
-            .add(task, &aux);
+        for risk_flag in risk_flags {
+            let late_blocker = risk_flag.as_ref().is_some_and(|flag| {
+                late_blocker_flags
+                    .get(&task.id)
+                    .is_some_and(|flags| flags.iter().any(|late_flag| late_flag == flag))
+            });
+            let key = (
+                model.clone(),
+                effort.clone(),
+                complexity.clone(),
+                reviewer_col.clone(),
+                risk_flag,
+            );
+            groups
+                .entry(key)
+                .or_insert_with(GroupAccum::new)
+                .add(task, &aux, late_blocker);
+        }
     }
 
     let rows = groups
         .into_iter()
-        .map(|((model, effort, cx, rev), acc)| acc.into_row(model, effort, cx, rev))
+        .map(|((model, effort, cx, rev, risk_flag), acc)| {
+            acc.into_row(model, effort, cx, rev, risk_flag)
+        })
         .collect();
 
     Ok(PerfReport { rows })
@@ -449,6 +547,10 @@ pub struct IntentFacts {
     pub merge_provenance: Option<String>,
     pub complexity: Option<serde_json::Value>,
     pub complexity_provenance: Option<serde_json::Value>,
+    /// Classifier-owned execution-surface flags on the lineage root. Empty or
+    /// legacy refs are represented by the same `untagged` bucket as the risk
+    /// cut so consumers never need a missing-value special case.
+    pub risk_flags: Vec<String>,
     pub config_evidence: Option<serde_json::Value>,
     pub final_worker: Option<serde_json::Value>,
     pub contributing_attempts: Option<serde_json::Value>,
@@ -674,6 +776,7 @@ fn new_intent_facts(
         merge_provenance: None,
         complexity: None,
         complexity_provenance: None,
+        risk_flags: vec!["untagged".to_string()],
         config_evidence: None,
         final_worker: None,
         contributing_attempts: None,
@@ -3569,6 +3672,10 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
             intent.complexity_provenance = Some(provenance);
             intent.coverage.complexity = true;
         }
+        if let Some(root_task) = task_evidence_by_id.get(&root) {
+            intent.risk_flags =
+                crate::risk::risk_flag_names(root_task.refs.as_deref().unwrap_or(""));
+        }
         let attribution_members =
             attribution_members_for_intent(root, &members_for_evidence, &lineage);
         populate_attribution(&mut intent, &attribution_members, &attribution);
@@ -3673,6 +3780,29 @@ pub fn render_table(report: &PerfReport) {
 
     let has_complexity = report.rows.iter().any(|r| r.complexity.is_some());
     let has_reviewer = report.rows.iter().any(|r| r.reviewer.is_some());
+    let has_risk_flag = report.rows.iter().any(|r| r.risk_flag.is_some());
+
+    if has_risk_flag {
+        let header = format!(
+            "{:<24} {:>7} {:>8} {:>9} {:>7} {:>9} {:>10}",
+            "RISK_FLAG", "N", "MERGED", "FAIL_CAP", "OTHER", "LATE_BLK", "LATE_RATE"
+        );
+        println!("{header}");
+        println!("{}", "-".repeat(header.len()));
+        for row in &report.rows {
+            println!(
+                "{:<24} {:>7} {:>8} {:>9} {:>7} {:>9} {:>9.1}%",
+                row.risk_flag.as_deref().unwrap_or(""),
+                row.n_tasks,
+                row.merged_count,
+                row.failed_rework_cap_count,
+                row.other_count,
+                row.late_blocker_count,
+                row.late_blocker_rate * 100.0,
+            );
+        }
+        return;
+    }
 
     let mut header = format!("{:<14} {:<8}", "MODEL", "EFFORT");
     if has_complexity {
@@ -4046,6 +4176,112 @@ mod tests {
             .find(|r| r.complexity.as_deref() == Some("untagged"))
             .unwrap();
         assert_eq!(untagged.n_tasks, 1);
+    }
+
+    #[test]
+    fn risk_flag_cut_counts_outcomes_and_late_blockers() {
+        let (_d, mut c) = open_tmp();
+        let grammar_refs =
+            r#"{"cx_risk_flags":[{"flag":"grammar_or_parser","evidence":"Parses a delimiter."}]}"#;
+        let public_refs =
+            r#"{"cx_risk_flags":[{"flag":"public_contract","evidence":"Changes JSON output."}]}"#;
+
+        let merged = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
+        let capped = seed_task(&mut c, "failed", None, 7, None, 1000, 1600);
+        let other = seed_task(&mut c, "cancelled", None, 0, None, 1000, 1600);
+        let late = seed_task(&mut c, "done", None, 2, None, 1000, 1600);
+        let early = seed_task(&mut c, "done", None, 1, None, 1000, 1600);
+        let _untagged = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
+        for task_id in [merged, capped] {
+            c.execute(
+                "UPDATE tasks SET refs=?1 WHERE id=?2",
+                rusqlite::params![grammar_refs, task_id],
+            )
+            .unwrap();
+        }
+        for task_id in [other, late, early] {
+            c.execute(
+                "UPDATE tasks SET refs=?1 WHERE id=?2",
+                rusqlite::params![public_refs, task_id],
+            )
+            .unwrap();
+        }
+        crate::review_findings::replace_for_pr(
+            &mut c,
+            100,
+            &[crate::review_findings::ReviewFinding {
+                id: 0,
+                pr_number: 0,
+                task_id: Some(late),
+                reviewer: "r1".into(),
+                kind: "blocking".into(),
+                author_pushback: false,
+                pushback_accepted: None,
+                severity: None,
+                text: "must fix".into(),
+                source_endpoint: "pulls".into(),
+                addressed_status: None,
+                evidence: vec![],
+                collector_model: None,
+                collector_version: None,
+            }],
+        )
+        .unwrap();
+        crate::review_findings::replace_for_pr(
+            &mut c,
+            101,
+            &[crate::review_findings::ReviewFinding {
+                task_id: Some(early),
+                ..crate::review_findings::ReviewFinding {
+                    id: 0,
+                    pr_number: 0,
+                    task_id: None,
+                    reviewer: "r1".into(),
+                    kind: "blocking".into(),
+                    author_pushback: false,
+                    pushback_accepted: None,
+                    severity: None,
+                    text: "must fix".into(),
+                    source_endpoint: "pulls".into(),
+                    addressed_status: None,
+                    evidence: vec![],
+                    collector_model: None,
+                    collector_version: None,
+                }
+            }],
+        )
+        .unwrap();
+
+        let report = perf(&c, PerfCut::RiskFlag, DM, DE).unwrap();
+        assert_eq!(report.rows.len(), 3, "two known flags plus untagged");
+        let grammar = report
+            .rows
+            .iter()
+            .find(|row| row.risk_flag.as_deref() == Some("grammar_or_parser"))
+            .unwrap();
+        assert_eq!(grammar.merged_count, 1);
+        assert_eq!(grammar.failed_rework_cap_count, 1);
+        assert_eq!(grammar.other_count, 0);
+        assert_eq!(grammar.late_blocker_count, 0);
+
+        let public = report
+            .rows
+            .iter()
+            .find(|row| row.risk_flag.as_deref() == Some("public_contract"))
+            .unwrap();
+        assert_eq!(public.merged_count, 2);
+        assert_eq!(public.failed_rework_cap_count, 0);
+        assert_eq!(public.other_count, 1);
+        assert_eq!(public.late_blocker_count, 1);
+        assert!((public.late_blocker_rate - (1.0 / 3.0)).abs() < f64::EPSILON);
+
+        let no_flags = report
+            .rows
+            .iter()
+            .find(|row| row.risk_flag.as_deref() == Some("untagged"))
+            .unwrap();
+        assert_eq!(no_flags.n_tasks, 1);
+        assert_eq!(no_flags.merged_count, 1);
     }
 
     #[test]
@@ -4430,6 +4666,40 @@ mod tests {
         let (_d, c) = open_tmp();
         let r = perf_facts(&c, false).unwrap();
         assert_eq!(r.facts_version, "perf-facts-v1");
+    }
+
+    #[test]
+    fn facts_expose_root_risk_flag_names_and_untagged() {
+        let (_d, mut c) = open_tmp();
+        let flagged = seed_ordinary(&mut c, 1600);
+        set_refs(
+            &c,
+            flagged,
+            &serde_json::json!({
+                "merge_commit_sha": format!("{flagged:040x}"),
+                "cx_risk_flags": [{
+                    "flag": "public_contract",
+                    "evidence": "Changes JSON output."
+                }],
+            })
+            .to_string(),
+        );
+        let untagged = seed_ordinary(&mut c, 1700);
+
+        let report = perf_facts(&c, false).unwrap();
+        let flags_by_root: HashMap<i64, Vec<String>> = report
+            .intents
+            .into_iter()
+            .map(|intent| (intent.intent_id[7..].parse().unwrap(), intent.risk_flags))
+            .collect();
+        assert_eq!(
+            flags_by_root.get(&flagged),
+            Some(&vec!["public_contract".to_string()])
+        );
+        assert_eq!(
+            flags_by_root.get(&untagged),
+            Some(&vec!["untagged".to_string()])
+        );
     }
 
     #[test]
@@ -8144,6 +8414,7 @@ mod tests {
                 merge_provenance: self.merge_provenance.clone(),
                 complexity: self.complexity.clone(),
                 complexity_provenance: self.complexity_provenance.clone(),
+                risk_flags: self.risk_flags.clone(),
                 config_evidence: self.config_evidence.clone(),
                 final_worker: self.final_worker.clone(),
                 contributing_attempts: self.contributing_attempts.clone(),

@@ -6,6 +6,7 @@
 //! without changing child classification or other dispatch shapes.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 pub const MAX_RISK_FLAGS: usize = 7;
 pub const MAX_RISK_EVIDENCE_BYTES: usize = 280;
@@ -106,6 +107,27 @@ pub fn risk_flags(refs: &str) -> Vec<RiskFlag> {
         .unwrap_or_default()
 }
 
+/// Return the bounded, closed-set flag names for analytics. Legacy or malformed
+/// task refs deliberately share the complexity report's `untagged` bucket.
+pub fn risk_flag_names(refs: &str) -> Vec<String> {
+    let present: HashSet<RiskFlagName> = risk_flags(refs)
+        .into_iter()
+        .map(|risk_flag| risk_flag.flag)
+        .filter(|flag| flag.is_known())
+        .collect();
+    let names: Vec<String> = RUBRIC
+        .iter()
+        .map(|(flag, _)| *flag)
+        .filter(|flag| present.contains(flag))
+        .map(|flag| flag_name(flag).to_string())
+        .collect();
+    if names.is_empty() {
+        vec!["untagged".to_string()]
+    } else {
+        names
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +142,23 @@ mod tests {
         assert_eq!(flags[0].evidence, "The task adds a delimiter parser.");
         assert!(risk_flags(r#"{"cx_est":3}"#).is_empty());
         assert!(risk_flags("not JSON").is_empty());
+    }
+
+    #[test]
+    fn risk_flag_names_are_closed_and_untagged_for_absent_or_unknown_flags() {
+        assert_eq!(
+            risk_flag_names(
+                r#"{"cx_risk_flags":[
+                    {"flag":"public_contract","evidence":"Changes JSON."},
+                    {"flag":"grammar_or_parser","evidence":"Parses syntax."}
+                ]}"#
+            ),
+            vec!["grammar_or_parser", "public_contract"]
+        );
+        assert_eq!(risk_flag_names(r#"{"cx_est":3}"#), vec!["untagged"]);
+        assert_eq!(
+            risk_flag_names(r#"{"cx_risk_flags":[{"flag":"unknown","evidence":"x"}]}"#),
+            vec!["untagged"]
+        );
     }
 }

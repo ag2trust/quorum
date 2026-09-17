@@ -207,7 +207,7 @@ by a single worker-task budget: classifier, planner, collector, follow-up, and
 doctor work are distinct managed responsibilities. Inspect live work with
 `quorum status` or `quorum web`, individual task/run details with
 `quorum task-get --task-id <N>`, and aggregate terminal-task reporting with
-`quorum perf [--by complexity|reviewer]`.
+`quorum perf [--by complexity|reviewer|risk-flag]`.
 
 ## Install
 
@@ -333,6 +333,7 @@ quorum task-get --task-id 42  # full task and notes
 quorum log --refs task#42     # lifecycle events
 quorum tail Agent-42          # one managed session
 quorum perf --by complexity   # terminal-task performance aggregates
+quorum perf --by risk-flag    # outcomes and late blockers by classifier risk flag
 quorum branch-sync --list     # active + last 10 terminal branch-sync rows
 ```
 

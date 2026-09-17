@@ -136,6 +136,7 @@ fn legacy_perf_empty_output_remains_byte_for_byte_compatible() {
         ["perf", "--all"].as_slice(),
         ["perf", "--by", "complexity"].as_slice(),
         ["perf", "--by", "reviewer"].as_slice(),
+        ["perf", "--by", "risk-flag"].as_slice(),
     ] {
         let output = quorum(home.path())
             .args(args)
@@ -151,6 +152,7 @@ fn legacy_perf_empty_output_remains_byte_for_byte_compatible() {
         ["perf", "--json", "--all"].as_slice(),
         ["perf", "--json", "--by", "complexity"].as_slice(),
         ["perf", "--json", "--by", "reviewer"].as_slice(),
+        ["perf", "--json", "--by", "risk-flag"].as_slice(),
     ] {
         let output = quorum(home.path())
             .args(args)

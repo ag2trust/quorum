@@ -586,7 +586,7 @@ pub enum Command {
     /// Performance report: model × effort aggregates over terminal tasks.
     /// Read-only, no mutations.
     Perf {
-        /// Cut dimension: `complexity` or `reviewer`.
+        /// Cut dimension: `complexity`, `reviewer`, or `risk-flag`.
         #[arg(long)]
         by: Option<String>,
         /// Include historical tasks from before the analytics rollout boundary.
