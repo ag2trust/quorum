@@ -1,8 +1,9 @@
 //! Bounded execution-surface signals emitted alongside task classification.
 //!
 //! Risk flags deliberately describe coupling and contract surfaces, not the
-//! reasoning difficulty measured by [`crate::complexity`].  They currently
-//! inform no policy; the durable accessor is for later consumers.
+//! reasoning difficulty measured by [`crate::complexity`]. A flagged L/cx4
+//! root task routes to decomposition; flags also give the planner source seams
+//! without changing child classification or other dispatch shapes.
 
 use serde::{Deserialize, Serialize};
 
@@ -95,8 +96,8 @@ pub fn flag_name(flag: RiskFlagName) -> &'static str {
     }
 }
 
-/// Read deserializable risk flags from task refs. Legacy rows without the key,
-/// and malformed JSON, intentionally read as no flags.
+/// Read deserializable risk flags from task refs for prompt context. Legacy
+/// rows without the key, and malformed JSON, intentionally read as no flags.
 pub fn risk_flags(refs: &str) -> Vec<RiskFlag> {
     serde_json::from_str::<serde_json::Value>(refs)
         .ok()

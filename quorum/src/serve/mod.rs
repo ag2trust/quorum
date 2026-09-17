@@ -2434,11 +2434,12 @@ fn persist_reviewer_pr_target(
     // freeze against its own drain — the same class as the reserve/claim gates.
     if !reservation_active
         || task.status != "in-review"
-        || !tasks::classification_is_dispatchable(
+        || !tasks::classification_is_dispatchable_for_status(
             &task.refs,
             task.review_only,
             task.continue_pr,
             task.terminal_leaf,
+            &task.status,
         )
     {
         tx.commit()?;
@@ -9312,11 +9313,12 @@ async fn reconcile_remediation_retries(
             Ok(tasks::list_dependency_ready_rework(&conn)?
                 .into_iter()
                 .filter(|task| {
-                    tasks::classification_is_dispatchable(
+                    tasks::classification_is_dispatchable_for_status(
                         &task.refs,
                         task.review_only,
                         task.continue_pr,
                         task.terminal_leaf,
+                        &task.status,
                     ) && remediation_retry_feedback(task.refs.as_deref()).is_some()
                 })
                 .collect())
@@ -16055,11 +16057,12 @@ async fn tick(
                     if reviewer_respawn_backoff.blocks(*task_id, *pr, std::time::Instant::now()) {
                         continue;
                     }
-                    if !tasks::classification_is_dispatchable(
+                    if !tasks::classification_is_dispatchable_for_status(
                         task_refs,
                         *review_only,
                         *continue_pr,
                         *terminal_leaf,
+                        "in-review",
                     ) {
                         log(&format!(
                             "task #{task_id} PR #{pr}: awaiting complete dispatchable classification before review dispatch"
@@ -21304,11 +21307,12 @@ async fn spawn_worker(
             if !t.ready || in_flight.contains(&t.id) || poisoned.contains(&t.id) {
                 return false;
             }
-            if !tasks::classification_is_dispatchable(
+            if !tasks::classification_is_dispatchable_for_status(
                 &t.refs,
                 t.review_only,
                 t.continue_pr,
                 t.terminal_leaf,
+                &t.status,
             ) {
                 return false;
             }
