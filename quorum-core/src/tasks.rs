@@ -418,21 +418,36 @@ const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
       )
 ))";
 
+/// SQL shape for the only flagged root route that requires decomposition.
+/// Missing flags are intentionally equivalent to an empty array.
+macro_rules! flagged_large_cx_four_sql {
+    () => {
+        "(json_extract(refs, '$.cx_size')='L'
+          AND json_extract(refs, '$.cx_est')=4
+          AND COALESCE(json_array_length(refs, '$.cx_risk_flags'), 0) >= 1)"
+    };
+}
+
 /// SQL counterpart of the ordinary root-task [`size_is_dispatchable`] policy
 /// over the enclosing `tasks` row. `S`/`M` dispatch at any complexity and `L`
-/// dispatches at complexity 4 or lower. Queries for ordinary root
-/// implementation work interpolate this fragment instead of restating it, so
-/// the SQL and Rust policies cannot drift.
+/// dispatches at complexity 4 or lower unless it carries a risk flag. Queries
+/// for ordinary root implementation work interpolate this fragment instead of
+/// restating it, so the SQL and Rust policies cannot drift.
 macro_rules! size_dispatch_policy_sql {
     () => {
-        "(
+        concat!(
+            "(
     (json_extract(refs, '$.cx_size') IN ('S','M') OR (
         json_extract(refs, '$.cx_size')='L'
         AND json_extract(refs, '$.cx_est') <= 4
+        AND NOT ",
+            flagged_large_cx_four_sql!(),
+            "
     ))
     AND NOT (json_extract(refs, '$.cx_est')=5
              AND json_extract(refs, '$.cx_size')='L')
-)"
+)",
+        )
     };
 }
 pub(crate) const SIZE_DISPATCH_POLICY_SQL: &str = size_dispatch_policy_sql!();
@@ -442,11 +457,28 @@ pub(crate) const SIZE_DISPATCH_POLICY_SQL: &str = size_dispatch_policy_sql!();
 // additionally require `review_only=0`; continuation tasks and terminal leaves
 // remain eligible outside the ordinary size policy. Terminal leaves still reject
 // XL, which is disallowed when a decomposition plan is accepted.
-const DIRECT_DISPATCH_CLAUSE: &str = concat!(
-    "(review_only=1 OR continue_pr IS NOT NULL OR ",
-    "(terminal_leaf=1 AND json_extract(refs, '$.cx_size') != 'XL') OR ",
-    size_dispatch_policy_sql!(),
-    ")"
+macro_rules! direct_dispatch_clause_sql {
+    () => {
+        concat!(
+            "(review_only=1 OR continue_pr IS NOT NULL OR ",
+            "(terminal_leaf=1 AND json_extract(refs, '$.cx_size') != 'XL') OR ",
+            size_dispatch_policy_sql!(),
+            ")"
+        )
+    };
+}
+#[cfg(test)]
+const DIRECT_DISPATCH_CLAUSE: &str = direct_dispatch_clause_sql!();
+
+// The root routing policy applies only before a task starts. A flagged L/cx4
+// task admitted under an older policy must finish its reviewer/rework lifecycle
+// rather than becoming stranded: planner selection accepts open tasks only.
+const STARTED_TASK_DISPATCH_CLAUSE: &str = concat!(
+    "(",
+    direct_dispatch_clause_sql!(),
+    " OR (status != 'open' AND ",
+    flagged_large_cx_four_sql!(),
+    "))"
 );
 
 fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
@@ -1146,7 +1178,7 @@ pub fn claim(
                        AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                        AND json_type(refs, '$.cx_size')='text'
                        AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
-                       AND {DIRECT_DISPATCH_CLAUSE}
+                       AND {STARTED_TASK_DISPATCH_CLAUSE}
                        AND json_type(refs, '$.cx_ready')='true'
                        AND json_type(refs, '$.cx_not_ready_reason')='null'
                        AND {CONTINUE_PR_UNOWNED_CLAUSE}
@@ -1171,7 +1203,7 @@ pub fn claim(
                    AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                    AND json_type(refs, '$.cx_size')='text'
                    AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
-                   AND {DIRECT_DISPATCH_CLAUSE}
+                   AND {STARTED_TASK_DISPATCH_CLAUSE}
                    AND json_type(refs, '$.cx_ready')='true'
                    AND json_type(refs, '$.cx_not_ready_reason')='null'
                    AND {CONTINUE_PR_UNOWNED_CLAUSE}
@@ -1273,7 +1305,7 @@ pub fn claim_provider_retry_rework(
                AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                AND json_type(refs, '$.cx_size')='text'
                AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
-               AND {DIRECT_DISPATCH_CLAUSE}
+               AND {STARTED_TASK_DISPATCH_CLAUSE}
                AND json_type(refs, '$.cx_ready')='true'
                AND json_type(refs, '$.cx_not_ready_reason')='null'
                AND (
@@ -1520,7 +1552,7 @@ pub fn claim_remediation_rework_with_feedback(
                  OR COALESCE(json_extract(refs, '$.cx_size'), '') NOT IN ('S','M','L','XL')
                  OR json_type(refs, '$.cx_ready') IS NOT 'true'
                  OR json_type(refs, '$.cx_not_ready_reason') IS NOT 'null'
-                 OR NOT {DIRECT_DISPATCH_CLAUSE})
+                 OR NOT {STARTED_TASK_DISPATCH_CLAUSE})
          )"
         ),
         params![id],
@@ -1624,7 +1656,7 @@ pub fn reserve_reviewer_provision(
                AND json_extract(t.refs,'$.cx_est') BETWEEN 1 AND 5
                AND json_type(t.refs,'$.cx_size')='text'
                AND json_extract(t.refs,'$.cx_size') IN ('S','M','L','XL')
-               AND {DIRECT_DISPATCH_CLAUSE}
+               AND {STARTED_TASK_DISPATCH_CLAUSE}
                AND json_type(t.refs,'$.cx_ready')='true'
                AND json_type(t.refs,'$.cx_not_ready_reason')='null'
                AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations WHERE task_id=t.id)
@@ -4271,6 +4303,19 @@ pub fn classification_is_dispatchable(
     continue_pr: Option<i64>,
     terminal_leaf: bool,
 ) -> bool {
+    classification_is_dispatchable_for_status(refs, review_only, continue_pr, terminal_leaf, "open")
+}
+
+/// Classification policy for a task in its current lifecycle state. The root
+/// route applies to open tasks; an already-started flagged L/cx4 task remains
+/// eligible only to drain its admitted reviewer or rework lifecycle.
+pub fn classification_is_dispatchable_for_status(
+    refs: &Option<String>,
+    review_only: bool,
+    continue_pr: Option<i64>,
+    terminal_leaf: bool,
+    status: &str,
+) -> bool {
     if !classification_is_complete(refs) {
         return false;
     }
@@ -4286,22 +4331,34 @@ pub fn classification_is_dispatchable(
     let Some(size) = v.get("cx_size").and_then(|v| v.as_str()) else {
         return false;
     };
+    let has_risk_flags = v
+        .get("cx_risk_flags")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|flags| !flags.is_empty());
     let ready = v.get("cx_ready").and_then(|v| v.as_bool()).unwrap_or(false);
     ready
         && (1..=5).contains(&cx)
         && (review_only
             || continue_pr.is_some()
             || (terminal_leaf && size != "XL")
-            || size_is_dispatchable(size, cx))
+            || (status != "open" && is_flagged_large_cx_four(size, cx, has_risk_flags))
+            || size_is_dispatchable(size, cx, has_risk_flags))
 }
 
 /// The ordinary root-task implementation-size dispatch policy: `S`/`M` at any
 /// complexity, or `L` at complexity 4 or lower. `L` at complexity 5 and every
-/// `XL` classification stay outside automatic root dispatch. Generated terminal
-/// leaves use their separate S/M/L plan-acceptance and direct-dispatch policy.
+/// `XL` classification stay outside automatic root dispatch. A flagged L/cx4
+/// root task also stays outside automatic root dispatch for planning. Generated
+/// terminal leaves use their separate S/M/L plan-acceptance and direct-dispatch
+/// policy.
 /// [`SIZE_DISPATCH_POLICY_SQL`] is the SQL counterpart.
-pub fn size_is_dispatchable(size: &str, cx_est: i64) -> bool {
-    matches!(size, "S" | "M") || (size == "L" && cx_est <= 4)
+pub fn size_is_dispatchable(size: &str, cx_est: i64, has_risk_flags: bool) -> bool {
+    matches!(size, "S" | "M")
+        || (size == "L" && cx_est <= 4 && !is_flagged_large_cx_four(size, cx_est, has_risk_flags))
+}
+
+fn is_flagged_large_cx_four(size: &str, cx_est: i64, has_risk_flags: bool) -> bool {
+    size == "L" && cx_est == 4 && has_risk_flags
 }
 
 pub(crate) fn park_classified_task_tx(
@@ -5858,7 +5915,7 @@ pub fn list_implementation_ready_open_limited(conn: &Connection, limit: i64) -> 
                AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                AND json_type(refs, '$.cx_size')='text'
                AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
-               AND {DIRECT_DISPATCH_CLAUSE}
+               AND {STARTED_TASK_DISPATCH_CLAUSE}
                AND json_type(refs, '$.cx_ready')='true'
                AND json_type(refs, '$.cx_not_ready_reason')='null'
            ELSE 0 END
@@ -13900,6 +13957,65 @@ mod tests {
     }
 
     #[test]
+    fn flagged_large_cx_four_started_task_drains_review_and_rework() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "owner",
+            "legacy flagged large task",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":4,"cx_size":"L","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v4","cx_risk_flags":[{"flag":"many_consumers","evidence":"Several consumers change together."}]}"#,
+            ),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        assert!(
+            !classification_is_dispatchable(
+                &get(&c, id).unwrap().unwrap().refs,
+                false,
+                None,
+                false
+            ),
+            "a new flagged L/cx4 root must route to planning"
+        );
+
+        // Simulate a task admitted before the policy existed. It cannot become
+        // a planning candidate once it has left open, so its lifecycle drains.
+        c.execute(
+            "UPDATE tasks SET status='in-review',author='legacy-worker' WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+        let started = get(&c, id).unwrap().unwrap();
+        assert!(classification_is_dispatchable_for_status(
+            &started.refs,
+            started.review_only,
+            started.continue_pr,
+            started.terminal_leaf,
+            &started.status,
+        ));
+
+        assert!(reserve_reviewer_provision(&mut c, id, "r1-token", "r1", 1001).unwrap());
+        assert!(
+            attach_reserved_reviewer(&mut c, id, "r1-token", "r1", "reviewer", TTL, 1002,).unwrap()
+        );
+        assert!(release_reviewer_provision(&mut c, id, "r1-token").unwrap());
+
+        let rework = apply_event(&mut c, "reviewer", id, &Event::VerdictChanges, 1003).unwrap();
+        assert_eq!(rework.task.status, "rework");
+        assert!(
+            claim_remediation_rework(&mut c, "remediation", id, TTL, 1004)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn reserved_r2_attachment_transfers_r1_lease_atomically() {
         let (_d, mut c) = open_tmp();
         let id = create(
@@ -15440,53 +15556,93 @@ mod tests {
     /// in status BLOCKED. The policy branch must strip the marker.
     #[test]
     fn size_policy_table_agrees_between_rust_and_sql() {
-        let table: &[(&str, i64, bool)] = &[
-            ("S", 1, true),
-            ("S", 5, true),
-            ("M", 1, true),
-            ("M", 5, true),
-            ("L", 1, true),
-            ("L", 3, true),
-            ("L", 4, true),
-            ("L", 5, false),
-            ("XL", 1, false),
-            ("XL", 3, false),
-            ("XL", 5, false),
-        ];
-        let conn = Connection::open_in_memory().unwrap();
-        let sql = format!("SELECT {SIZE_DISPATCH_POLICY_SQL} FROM (SELECT ?1 AS refs)");
-        for (size, cx_est, expected) in table {
-            assert_eq!(
-                size_is_dispatchable(size, *cx_est),
-                *expected,
-                "rust policy for {size}/{cx_est}"
-            );
-            let refs = format!(
-                r#"{{"cx_est":{cx_est},"cx_size":"{size}","cx_ready":true,"cx_not_ready_reason":null}}"#
-            );
-            let sql_verdict: bool = conn
-                .query_row(&sql, params![refs], |row| row.get(0))
-                .unwrap();
-            assert_eq!(sql_verdict, *expected, "sql policy for {size}/{cx_est}");
-            assert_eq!(
-                classification_is_dispatchable(&Some(refs.clone()), false, None, false),
-                *expected,
-                "root dispatch policy for {size}/{cx_est}"
-            );
-            // Review-only and continuation work stay eligible at every size.
-            assert!(classification_is_dispatchable(
-                &Some(refs.clone()),
-                true,
-                None,
-                false,
-            ));
-            assert!(classification_is_dispatchable(
-                &Some(refs),
-                false,
-                Some(9),
-                false
-            ));
+        let (_dir, conn) = open_tmp();
+        let size_sql = format!("SELECT {SIZE_DISPATCH_POLICY_SQL} FROM (SELECT ?1 AS refs)");
+        let direct_sql = format!(
+            "SELECT {DIRECT_DISPATCH_CLAUSE} FROM (
+                SELECT ?1 AS refs, 0 AS review_only, NULL AS continue_pr, 0 AS terminal_leaf
+             )"
+        );
+        let started_sql = format!(
+            "SELECT {STARTED_TASK_DISPATCH_CLAUSE} FROM (
+                SELECT ?1 AS refs, 0 AS review_only, NULL AS continue_pr,
+                       0 AS terminal_leaf, 'rework' AS status
+             )"
+        );
+        for size in ["S", "M", "L", "XL"] {
+            for cx_est in 1..=5 {
+                for has_risk_flags in [false, true] {
+                    let expected = matches!(size, "S" | "M")
+                        || (size == "L" && cx_est <= 4 && !(cx_est == 4 && has_risk_flags));
+                    assert_eq!(
+                        size_is_dispatchable(size, cx_est, has_risk_flags),
+                        expected,
+                        "rust policy for {size}/{cx_est}/flags={has_risk_flags}"
+                    );
+                    let flags = if has_risk_flags {
+                        r#"[{"flag":"many_consumers","evidence":"Several consumers change together."}]"#
+                    } else {
+                        "[]"
+                    };
+                    let refs = format!(
+                        r#"{{"cx_est":{cx_est},"cx_size":"{size}","cx_ready":true,"cx_not_ready_reason":null,"cx_risk_flags":{flags}}}"#
+                    );
+                    let size_sql_verdict: bool = conn
+                        .query_row(&size_sql, params![refs], |row| row.get(0))
+                        .unwrap();
+                    assert_eq!(
+                        size_sql_verdict, expected,
+                        "sql policy for {size}/{cx_est}/flags={has_risk_flags}"
+                    );
+                    let direct_sql_verdict: bool = conn
+                        .query_row(&direct_sql, params![refs], |row| row.get(0))
+                        .unwrap();
+                    assert_eq!(
+                        classification_is_dispatchable(&Some(refs.clone()), false, None, false),
+                        direct_sql_verdict,
+                        "root dispatch policy for {size}/{cx_est}/flags={has_risk_flags}"
+                    );
+                    let started_sql_verdict: bool = conn
+                        .query_row(&started_sql, params![refs], |row| row.get(0))
+                        .unwrap();
+                    assert_eq!(
+                        classification_is_dispatchable_for_status(
+                            &Some(refs.clone()),
+                            false,
+                            None,
+                            false,
+                            "rework",
+                        ),
+                        started_sql_verdict,
+                        "started dispatch policy for {size}/{cx_est}/flags={has_risk_flags}"
+                    );
+                    // Review-only and continuation work stay eligible at every size.
+                    assert!(classification_is_dispatchable(
+                        &Some(refs.clone()),
+                        true,
+                        None,
+                        false,
+                    ));
+                    assert!(classification_is_dispatchable(
+                        &Some(refs.clone()),
+                        false,
+                        Some(9),
+                        false
+                    ));
+                    assert_eq!(
+                        classification_is_dispatchable(&Some(refs.clone()), false, None, true,),
+                        size != "XL",
+                        "terminal leaf policy for {size}/{cx_est}/flags={has_risk_flags}"
+                    );
+                }
+            }
         }
+        let missing_flags =
+            r#"{"cx_est":4,"cx_size":"L","cx_ready":true,"cx_not_ready_reason":null}"#;
+        assert!(conn
+            .query_row(&size_sql, params![missing_flags], |row| row
+                .get::<_, bool>(0))
+            .unwrap());
         assert!(DIRECT_DISPATCH_CLAUSE.contains(SIZE_DISPATCH_POLICY_SQL));
     }
 
