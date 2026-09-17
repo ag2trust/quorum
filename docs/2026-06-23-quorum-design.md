@@ -1768,6 +1768,22 @@ restarts and binary upgrades (persisted in SQLite, read on every `perf` call).
 Historical collector artifacts (collection runs, findings, errors) created by a
 prior backfill are retained as audit data but do not affect the default report.
 
+**Risk-flag performance cut (#277):** `quorum perf --by risk-flag` is a
+read-only cut over the classifier-owned `refs.cx_risk_flags` accessor. A task
+contributes once to every known flag it carries; a task without a valid flag set
+contributes once to `untagged`. The report has at most eight rows (the seven
+closed classifier flags plus `untagged`) and does not further split these rows
+by model or effort. Each row reports `merged_count` (`status=done`),
+`failed_rework_cap_count` (`status=failed` at its effective rework cap), and
+`other_count` for all remaining terminal outcomes.
+
+`late_blocker_count` and `late_blocker_rate` are observational joins of those
+task flags with durable collector findings. A task counts once per flag when a
+`review_findings.kind='blocking'` row exists and its persisted `rework_round`
+is at least 2; the rate denominator is the row's task count. This consumes the
+current classifier-owned refs through the shared accessor rather than taking an
+analytics snapshot, and never changes lifecycle or routing state.
+
 **Performance facts report (#249):** `quorum perf --facts --json [--all]` is a
 versioned, read-only evidence surface. `--facts` requires `--json` and conflicts
 with the aggregate-report cut `--by`; invalid combinations are usage errors
@@ -1784,6 +1800,9 @@ intent and contributing-task limits; `counts`, `coverage`, and
 with its identity, contributing task IDs, inclusion reason, evidence fields,
 and per-field coverage flags. Uncollected evidence is represented explicitly as
 JSON `null` with a false coverage flag, rather than fabricated values.
+Each intent also carries its root task's normalized `risk_flags`; absent or
+malformed flag metadata is represented as `['untagged']`, matching the
+aggregate risk-flag cut.
 
 This report only reads durable task evidence. It is not a QPS calculation,
 score or leaderboard, budget/weight definition, or durable analytics snapshot;

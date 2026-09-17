@@ -1946,9 +1946,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 None => quorum_core::perf::PerfCut::Default,
                 Some("complexity") => quorum_core::perf::PerfCut::Complexity,
                 Some("reviewer") => quorum_core::perf::PerfCut::Reviewer,
+                Some("risk-flag" | "risk_flag") => quorum_core::perf::PerfCut::RiskFlag,
                 Some(other) => {
                     return Err(QuorumError::Usage(format!(
-                        "unknown --by value '{other}'; valid: complexity, reviewer"
+                        "unknown --by value '{other}'; valid: complexity, reviewer, risk-flag"
                     )));
                 }
             };
