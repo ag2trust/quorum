@@ -45,6 +45,7 @@ use quorum_core::journal::{self, JournalEntry};
 use quorum_core::lifecycle::{self, Effect, Event};
 use quorum_core::mailbox;
 use quorum_core::pr_targets;
+use quorum_core::risk::{self, RiskFlag};
 use quorum_core::runner_state::{
     self, ContinuationIdentity, ContinuationSlot, InitialWorkerSession, PendingTurn,
 };
@@ -70,11 +71,12 @@ const REVIEW_TASK_NOTE_BODY_LIMIT: i64 = 1_200;
 
 fn load_task_review_contract(db_path: &Path, task_id: i64) -> Result<String> {
     let conn = quorum_core::db::open(db_path)?;
-    let (title, body, depends_on): (String, Option<String>, Option<String>) = conn.query_row(
-        "SELECT title, substr(body, 1, ?2), depends_on FROM tasks WHERE id=?1",
-        rusqlite::params![task_id, REVIEW_TASK_BODY_LIMIT],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
+    let (title, body, depends_on, refs): (String, Option<String>, Option<String>, Option<String>) =
+        conn.query_row(
+            "SELECT title, substr(body, 1, ?2), depends_on, refs FROM tasks WHERE id=?1",
+            rusqlite::params![task_id, REVIEW_TASK_BODY_LIMIT],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
     let mut stmt = conn.prepare(
         "SELECT substr(body, 1, ?2) FROM task_notes
          WHERE task_id=?1 ORDER BY id DESC LIMIT ?3",
@@ -91,7 +93,22 @@ fn load_task_review_contract(db_path: &Path, task_id: i64) -> Result<String> {
         body.as_deref(),
         depends_on.as_deref(),
         &recovery_notes,
+        &risk::risk_flags(refs.as_deref().unwrap_or("")),
     ))
+}
+
+async fn load_task_risk_flags_for_prompt(db_path: &Path, task_id: i64) -> Result<Vec<RiskFlag>> {
+    let db_path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let conn = quorum_core::db::open(&db_path)?;
+        let refs: Option<String> =
+            conn.query_row("SELECT refs FROM tasks WHERE id=?1", [task_id], |row| {
+                row.get(0)
+            })?;
+        Ok(risk::risk_flags(refs.as_deref().unwrap_or("")))
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("task risk context join: {error}")))?
 }
 
 fn load_review_cycle_context(
@@ -8851,6 +8868,7 @@ async fn handle_pre_review_checks_failure(
                         &feedback,
                         workers[worker_index].cost_usd,
                         config.limits.max_task_cost_usd,
+                        &load_task_risk_flags_for_prompt(&config.db_path, task_id).await?,
                     );
                     if let Err(error) =
                         feed_worker_turn(&mut workers[worker_index], &prompt, config).await
@@ -9043,6 +9061,7 @@ async fn resume_reviewer_after_ci(
             .await
             .map_err(|error| QuorumError::Io(format!("graph review context join: {error}")))??
     };
+    let risk_flags = load_task_risk_flags_for_prompt(&config.db_path, task_id).await?;
     let task_contract = {
         let db_path = config.db_path.clone();
         tokio::task::spawn_blocking(move || load_task_review_contract(&db_path, task_id))
@@ -9057,18 +9076,20 @@ async fn resume_reviewer_after_ci(
             .await
             .map_err(|error| QuorumError::Io(format!("review-cycle context join: {error}")))??
     };
-    let rereview_turn = format!(
-        "{}\n\n{}",
-        reviewer::build_rereview_turn_with_context(
-            &reviewers[reviewer_index].agent_name,
-            pr,
-            &workers[worker_index].agent_name,
-            &reviewers[reviewer_index].effort,
-            graph_context.as_deref(),
-            review_cycle,
-        ),
-        task_contract
+    let rereview_prompt = reviewer::build_rereview_turn_with_context(
+        &reviewers[reviewer_index].agent_name,
+        pr,
+        &workers[worker_index].agent_name,
+        &reviewers[reviewer_index].effort,
+        graph_context.as_deref(),
+        review_cycle,
     );
+    let risk_instruction = reviewer::r1_risk_instruction(&risk_flags);
+    let rereview_turn = if risk_instruction.is_empty() {
+        format!("{rereview_prompt}\n\n{task_contract}")
+    } else {
+        format!("{rereview_prompt}\n\n{risk_instruction}\n\n{task_contract}")
+    };
     // Revalidate at the external feed boundary. This second guarded read makes
     // any cancellation/context change during CI/prompt preparation fail loud
     // before the sticky reviewer receives another turn.
@@ -12115,6 +12136,11 @@ async fn tick(
                                                 &rework_msg,
                                                 workers[wi].cost_usd,
                                                 config.limits.max_task_cost_usd,
+                                                &load_task_risk_flags_for_prompt(
+                                                    &config.db_path,
+                                                    workers[wi].task_id,
+                                                )
+                                                .await?,
                                             );
                                             if let Err(e) = feed_worker_turn(
                                                 &mut workers[wi],
@@ -12406,6 +12432,11 @@ async fn tick(
                                                 &rework_msg,
                                                 workers[wi].cost_usd,
                                                 config.limits.max_task_cost_usd,
+                                                &load_task_risk_flags_for_prompt(
+                                                    &config.db_path,
+                                                    workers[wi].task_id,
+                                                )
+                                                .await?,
                                             );
                                             if let Err(e) = feed_worker_turn(
                                                 &mut workers[wi],
@@ -12627,6 +12658,11 @@ async fn tick(
                                                     &rework_msg,
                                                     workers[wi].cost_usd,
                                                     config.limits.max_task_cost_usd,
+                                                    &load_task_risk_flags_for_prompt(
+                                                        &config.db_path,
+                                                        workers[wi].task_id,
+                                                    )
+                                                    .await?,
                                                 );
                                                 if let Err(e) = feed_worker_turn(
                                                     &mut workers[wi],
@@ -12978,6 +13014,11 @@ async fn tick(
                                                 &rework_msg,
                                                 workers[wi].cost_usd,
                                                 config.limits.max_task_cost_usd,
+                                                &load_task_risk_flags_for_prompt(
+                                                    &config.db_path,
+                                                    workers[wi].task_id,
+                                                )
+                                                .await?,
                                             );
                                             if let Err(e) = feed_worker_turn(
                                                 &mut workers[wi],
@@ -13541,6 +13582,11 @@ async fn tick(
                                                             &rework_msg,
                                                             workers[wi].cost_usd,
                                                             config.limits.max_task_cost_usd,
+                                                            &load_task_risk_flags_for_prompt(
+                                                                &config.db_path,
+                                                                workers[wi].task_id,
+                                                            )
+                                                            .await?,
                                                         );
                                                     if let Err(e) = feed_worker_turn(
                                                         &mut workers[wi],
@@ -13834,6 +13880,11 @@ async fn tick(
                                         feedback,
                                         workers[wi].cost_usd,
                                         config.limits.max_task_cost_usd,
+                                        &load_task_risk_flags_for_prompt(
+                                            &config.db_path,
+                                            workers[wi].task_id,
+                                        )
+                                        .await?,
                                     );
                                     if let Err(e) =
                                         feed_worker_turn(&mut workers[wi], &rework_prompt, config)
@@ -20520,6 +20571,7 @@ async fn provision_reviewer_reserved(
         }
     };
     let review_cycle = (review_cycle.rework_round != 0).then_some(review_cycle);
+    let risk_flags = load_task_risk_flags_for_prompt(&config.db_path, worker.task_id).await?;
 
     // Prompt composition remains role- and provider-aware; the runner adapter
     // owns how that neutral prompt reaches the CLI.
@@ -20536,6 +20588,7 @@ async fn provision_reviewer_reserved(
                 &reviewer_effort,
                 graph_context.as_deref(),
                 review_cycle,
+                &risk_flags,
             )
         }
         ReviewRole::R2 { r1_reviewer, .. } => {
@@ -20551,6 +20604,7 @@ async fn provision_reviewer_reserved(
                 &reviewer_effort,
                 graph_context.as_deref(),
                 review_cycle,
+                &risk_flags,
             )
         }
     };
@@ -21907,6 +21961,7 @@ async fn spawn_worker(
                 &task.title,
                 body,
                 config.limits.max_task_cost_usd,
+                &risk::risk_flags(task.refs.as_deref().unwrap_or("")),
             )
         },
         |retry| retry.prompt.clone(),
@@ -25356,6 +25411,7 @@ async fn resume_recovered_dormant_reworks(
             &feedback,
             workers[worker_index].cost_usd,
             config.limits.max_task_cost_usd,
+            &load_task_risk_flags_for_prompt(&config.db_path, task_id).await?,
         );
         if let Err(error) = feed_worker_turn(&mut workers[worker_index], &prompt, config).await {
             log(&format!(
@@ -26613,6 +26669,7 @@ mod tests {
                 "high",
                 None,
                 Some(resumed),
+                &[],
             );
             assert!(prompt.contains("Required cumulative cross-round review ledger"));
             assert!(prompt.contains("### Prior BLOCKING findings"));
@@ -45491,8 +45548,14 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "bounded test classification rationale"
         );
         assert_eq!(child_refs["cx_by"], "decomposition-preclassification:v2");
-        let worker_prompt =
-            reviewer::build_worker_prompt("worker", 7, &children[0].title, &children[0].body, None);
+        let worker_prompt = reviewer::build_worker_prompt(
+            "worker",
+            7,
+            &children[0].title,
+            &children[0].body,
+            None,
+            &[],
+        );
         assert!(worker_prompt.contains(planner::WORKER_WRITABILITY_GUIDANCE));
 
         let mut not_ready = valid.clone();
