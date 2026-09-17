@@ -8684,6 +8684,7 @@ mod tests {
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
+                risk_flags: vec![],
             }],
             "test:v2",
             1004,
@@ -10503,6 +10504,7 @@ mod tests {
             ready: true,
             not_ready_reason: None,
             duplicate_of: Vec::new(),
+            risk_flags: vec![],
         }];
         crate::classify::store_classifications(&mut conn, &classifications, "test:v2", 1001)
             .unwrap();
@@ -12113,6 +12115,7 @@ mod tests {
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
+                risk_flags: vec![],
             }],
             "unit-test:v2",
             10,

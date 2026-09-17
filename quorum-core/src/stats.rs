@@ -3334,6 +3334,7 @@ mod tests {
                     ready: true,
                     not_ready_reason: None,
                     duplicate_of: vec![],
+                    risk_flags: vec![],
                 }],
                 "unit-test:v2",
                 now,
