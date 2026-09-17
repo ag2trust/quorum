@@ -168,8 +168,13 @@ pub const RESPONSE_SHAPES: &str = concat!(
 /// Build one bounded, closed-book planner turn. Retry context is deliberately
 /// limited to structured rejection summaries; provider transcripts and prior
 /// continuation identities never enter a later attempt.
-pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String]) -> String {
+pub fn build_prompt(
+    source: &PlanningSource<'_>,
+    risk_flags: &[quorum_core::risk::RiskFlag],
+    rejection_summaries: &[String],
+) -> String {
     let source_json = serde_json::to_string(source).expect("planning source serializes");
+    let risk_json = serde_json::to_string(risk_flags).expect("source risk flags serialize");
     let retry_json = serde_json::to_string(
         &rejection_summaries
             .iter()
@@ -236,7 +241,10 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          `no_safe_split` BLOCKER with concrete evidence. A single-file composition child that \
          wires together primitives delivered by its sibling prerequisites is expected, not a \
          defect: its size is its own write surface, so do not split it against a stated atomic \
-         boundary merely because it composes many delivered seams.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"
+         boundary merely because it composes many delivered seams. Risks in source identifies \
+         execution-surface seams from the source classifier; split along those seams where the \
+         repository supports an independently deliverable boundary. Children are classified \
+         fresh, so do not copy source risk flags into child contracts.\n\nSOURCE={source_json}\n\nRisks in source:\n{risk_json}\n\nPRIOR_REJECTIONS={retry_json}"
     )
 }
 
@@ -3623,7 +3631,7 @@ mod tests {
             body: Some("preserve atomicity"),
             dependencies: &dependencies,
         };
-        let prompt = build_prompt(&source, &[]);
+        let prompt = build_prompt(&source, &[], &[]);
         assert!(prompt.contains("do not omit, rename, or add fields"));
         assert!(prompt.contains(r#""implementation_delta":"<new-code-or-documentation-change>""#));
         assert!(prompt.contains(r#""affected_paths":["<repo-relative-path-or-narrow-pattern>"]"#));
@@ -3667,6 +3675,29 @@ mod tests {
         assert!(prompt.contains("The daemon adds it deterministically"));
     }
 
+    #[test]
+    fn planner_prompt_includes_source_risks_for_decomposition_seams() {
+        let source = PlanningSource {
+            task_id: 7,
+            revision: 2,
+            title: "large outcome",
+            body: Some("preserve atomicity"),
+            dependencies: &[],
+        };
+        let risks = vec![quorum_core::risk::RiskFlag {
+            flag: quorum_core::risk::RiskFlagName::ManyConsumers,
+            evidence: "Several consumers must change together.".into(),
+        }];
+
+        let prompt = build_prompt(&source, &risks, &[]);
+
+        assert!(prompt.contains("Risks in source:"));
+        assert!(prompt.contains("many_consumers"));
+        assert!(prompt.contains("Several consumers must change together."));
+        assert!(prompt.contains("split along those seams"));
+        assert!(prompt.contains("Children are classified fresh"));
+    }
+
     /// The prompt must send the plan through the tool, not the transcript. The
     /// old "one JSON object" instruction is the failure mode this batch removed:
     /// conversational providers prefixed prose and lost a whole attempt.
@@ -3680,7 +3711,7 @@ mod tests {
             body: Some("preserve atomicity"),
             dependencies: &dependencies,
         };
-        let prompt = build_prompt(&source, &[]);
+        let prompt = build_prompt(&source, &[], &[]);
         assert!(!prompt.contains("Return exactly one valid JSON object"));
         assert!(!prompt.contains("Use no markdown or commentary"));
         assert!(prompt.contains(
@@ -3757,6 +3788,7 @@ mod tests {
         };
         let prompt = build_prompt(
             &source,
+            &[],
             &[
                 "cycle detected".into(),
                 "bad field".into(),

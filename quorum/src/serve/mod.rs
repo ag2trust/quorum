@@ -5131,6 +5131,7 @@ struct PlanningSnapshot {
     body: Option<String>,
     source_bytes: usize,
     dependencies: Vec<i64>,
+    risk_flags: Vec<quorum_core::risk::RiskFlag>,
     rejection_summaries: Vec<String>,
     accepted_proposal: Option<Vec<planner::ProposedTask>>,
     /// The classifier batch durably accepted for `accepted_proposal`. Present
@@ -5192,6 +5193,7 @@ type PlanningSnapshotRow = (
     Option<String>,
     i64,
     Option<String>,
+    Option<String>,
 );
 
 fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<PlanningSnapshot>> {
@@ -5209,7 +5211,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
                     t.depends_on,d.accepted_proposal_json,d.frozen_base_sha,
                     length(CAST(t.title AS BLOB)) +
                         COALESCE(length(CAST(t.body AS BLOB)),0),
-                    d.accepted_classifications_json
+                    d.accepted_classifications_json,t.refs
              FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
              WHERE d.state NOT IN ('held','active','blocked','completed','cancelled')
              ORDER BY d.freeze_active DESC,d.id LIMIT 1",
@@ -5230,6 +5232,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
                     row.get(11)?,
                     row.get(12)?,
                     row.get(13)?,
+                    row.get(14)?,
                 ))
             },
         )
@@ -5249,6 +5252,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
         frozen_base_sha,
         source_bytes,
         accepted_classifications_json,
+        refs,
     )) = row
     else {
         return Ok(None);
@@ -5261,6 +5265,10 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
         .unwrap_or_default();
     let source_bytes = usize::try_from(source_bytes)
         .map_err(|_| QuorumError::Io("invalid planning source byte count".into()))?;
+    let risk_flags = refs
+        .as_deref()
+        .map(quorum_core::risk::risk_flags)
+        .unwrap_or_default();
     let accepted_proposal = accepted_proposal_json
         .map(|json| planner::rehydrate_accepted_proposal(&json))
         .transpose()
@@ -5291,6 +5299,7 @@ fn load_planning_snapshot(conn: &rusqlite::Connection) -> Result<Option<Planning
         body,
         source_bytes,
         dependencies,
+        risk_flags,
         rejection_summaries,
         accepted_proposal,
         accepted_classifications,
@@ -5345,7 +5354,8 @@ fn bounded_planning_prompt(snapshot: &PlanningSnapshot) -> std::result::Result<S
         body: snapshot.body.as_deref(),
         dependencies: &snapshot.dependencies,
     };
-    let prompt = planner::build_prompt(&source, &snapshot.rejection_summaries);
+    let prompt =
+        planner::build_prompt(&source, &snapshot.risk_flags, &snapshot.rejection_summaries);
     if prompt.len() > planner::MAX_PROMPT_BYTES {
         return Err(format!(
             "serialized planner prompt is {} bytes; limit is {} bytes",
@@ -5447,6 +5457,9 @@ fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>>
                  AND json_extract(t.refs,'$.cx_est')=5)
              OR (json_extract(t.refs,'$.cx_size')='XL'
                  AND json_extract(t.refs,'$.cx_est') IN (4,5))
+             OR (json_extract(t.refs,'$.cx_size')='L'
+                 AND json_extract(t.refs,'$.cx_est')=4
+                 AND COALESCE(json_array_length(t.refs, '$.cx_risk_flags'), 0) >= 1)
            )
            AND t.continue_pr IS NULL
            AND NOT EXISTS (SELECT 1 FROM task_decompositions d WHERE d.source_task_id=t.id)
@@ -45101,52 +45114,69 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     fn planning_and_claim_partition_classified_shapes() {
         for size in ["S", "M", "L", "XL"] {
             for cx_est in 1..=5 {
-                for continue_pr in [None, Some(500)] {
-                    let dir = tempfile::tempdir().unwrap();
-                    let mut conn = quorum_core::db::open(&dir.path().join("partition.db")).unwrap();
-                    conn.execute(
-                        "INSERT INTO tasks(
-                            title,status,priority,created_by,created_at,updated_at,refs,
-                            review_only,continue_pr
-                         ) VALUES (
-                            'shape','open',1,'owner',1,1,
-                            json_object(
-                                'cx_est',?1,'cx_size',?2,'cx_ready',json('true'),
-                                'cx_not_ready_reason',json('null')
-                            ),0,?3
-                         )",
-                        rusqlite::params![cx_est, size, continue_pr],
-                    )
-                    .unwrap();
-                    tasks::park_classified_complexity_five(&mut conn, 2).unwrap();
+                for flag_count in [0, 1] {
+                    for continue_pr in [None, Some(500)] {
+                        let dir = tempfile::tempdir().unwrap();
+                        let mut conn =
+                            quorum_core::db::open(&dir.path().join("partition.db")).unwrap();
+                        conn.execute(
+                            "INSERT INTO tasks(
+                                title,status,priority,created_by,created_at,updated_at,refs,
+                                review_only,continue_pr
+                             ) VALUES (
+                                'shape','open',1,'owner',1,1,
+                                json_object(
+                                    'cx_est',?1,'cx_size',?2,'cx_ready',json('true'),
+                                    'cx_not_ready_reason',json('null'),
+                                    'cx_risk_flags',CASE WHEN ?4=1
+                                        THEN json_array(json_object(
+                                            'flag','many_consumers',
+                                            'evidence','Several consumers change together.'
+                                        ))
+                                        ELSE json_array()
+                                    END
+                                ),0,?3
+                             )",
+                            rusqlite::params![cx_est, size, continue_pr, flag_count],
+                        )
+                        .unwrap();
+                        tasks::park_classified_complexity_five(&mut conn, 2).unwrap();
 
-                    let planned = planning_candidate(&conn).unwrap().is_some();
-                    let claimed = tasks::claim(&mut conn, "worker", Some(1), &[], 60, 3)
-                        .unwrap()
-                        .is_some();
-                    let direct = continue_pr.is_some()
-                        || matches!(size, "S" | "M")
-                        || (size == "L" && cx_est <= 4);
-                    let decomposition = continue_pr.is_none()
-                        && ((size == "L" && cx_est >= 5) || (size == "XL" && cx_est >= 4));
-                    let parked = continue_pr.is_none() && size == "XL" && cx_est <= 3;
-                    let shape = format!("size={size} cx_est={cx_est} continue={continue_pr:?}");
-
-                    assert_eq!(claimed, direct, "claim route mismatch for {shape}");
-                    assert_eq!(planned, decomposition, "planner route mismatch for {shape}");
-                    assert!(!(planned && claimed), "double route for {shape}");
-                    assert!(planned || claimed || parked, "starved shape: {shape}");
-
-                    if parked {
-                        let task = tasks::get(&conn, 1).unwrap().unwrap();
-                        assert_eq!(task.status, "failed", "XL mismatch not parked: {shape}");
-                        let refs: serde_json::Value =
-                            serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-                        assert_eq!(
-                            refs[tasks::PARKED_REASON_REF],
-                            tasks::LOW_COMPLEXITY_XL_PARK_REASON,
-                            "wrong XL park reason for {shape}"
+                        let planned = planning_candidate(&conn).unwrap().is_some();
+                        let claimed = tasks::claim(&mut conn, "worker", Some(1), &[], 60, 3)
+                            .unwrap()
+                            .is_some();
+                        let direct = continue_pr.is_some()
+                            || matches!(size, "S" | "M")
+                            || (size == "L" && cx_est <= 4 && !(cx_est == 4 && flag_count == 1));
+                        let decomposition = continue_pr.is_none()
+                            && ((size == "L" && cx_est >= 5)
+                                || (size == "L" && cx_est == 4 && flag_count == 1)
+                                || (size == "XL" && cx_est >= 4));
+                        let parked = continue_pr.is_none() && size == "XL" && cx_est <= 3;
+                        let shape = format!(
+                            "size={size} cx_est={cx_est} flags={flag_count} continue={continue_pr:?}"
                         );
+
+                        assert_eq!(claimed, direct, "claim route mismatch for {shape}");
+                        assert_eq!(planned, decomposition, "planner route mismatch for {shape}");
+                        assert_eq!(
+                            usize::from(planned) + usize::from(claimed) + usize::from(parked),
+                            1,
+                            "route partition mismatch for {shape}"
+                        );
+
+                        if parked {
+                            let task = tasks::get(&conn, 1).unwrap().unwrap();
+                            assert_eq!(task.status, "failed", "XL mismatch not parked: {shape}");
+                            let refs: serde_json::Value =
+                                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+                            assert_eq!(
+                                refs[tasks::PARKED_REASON_REF],
+                                tasks::LOW_COMPLEXITY_XL_PARK_REASON,
+                                "wrong XL park reason for {shape}"
+                            );
+                        }
                     }
                 }
             }
@@ -46253,7 +46283,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             dependencies: &[],
         };
         let retry_json = serde_json::to_string(&vec![summary.clone()]).unwrap();
-        let prompt = planner::build_prompt(&source, std::slice::from_ref(&summary));
+        let prompt = planner::build_prompt(&source, &[], std::slice::from_ref(&summary));
         assert!(
             prompt.ends_with(&format!("PRIOR_REJECTIONS={retry_json}")),
             "planner retry feedback altered the bounded rejection summary: {prompt}"
