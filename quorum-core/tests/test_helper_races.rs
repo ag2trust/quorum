@@ -246,6 +246,7 @@ fn provider_rework_claim_has_exactly_one_winner(rounds: usize, racers: usize) {
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
+                risk_flags: vec![],
             }],
             "integration-test:v2",
             now,

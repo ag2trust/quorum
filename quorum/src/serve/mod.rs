@@ -6509,6 +6509,7 @@ fn synthesize_legacy_plan_snapshot(
             ready: true,
             not_ready_reason: None,
             duplicate_of: Vec::new(),
+            risk_flags: vec![],
         })
         .collect();
     let paired: Vec<(
@@ -6603,6 +6604,7 @@ fn planned_children_from_classified(
                     "cx_ready": result.ready,
                     "cx_not_ready_reason": result.not_ready_reason,
                     "cx_dup_of": result.duplicate_of,
+                    "cx_risk_flags": result.risk_flags,
                     "cx_by": "decomposition-preclassification:v2",
                 })
                 .to_string(),
@@ -7445,6 +7447,7 @@ fn planned_children(
                     "cx_ready": result.ready,
                     "cx_not_ready_reason": result.not_ready_reason,
                     "cx_dup_of": result.duplicate_of,
+                    "cx_risk_flags": result.risk_flags,
                     "cx_by": "decomposition-preclassification:v2",
                 })
                 .to_string(),
@@ -45448,6 +45451,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
+                risk_flags: vec![],
             },
             quorum_core::classify::TaskClassification {
                 task_id: -2,
@@ -45457,6 +45461,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
+                risk_flags: vec![],
             },
         ];
         let children = planned_children(&proposal, &valid).unwrap();
@@ -45775,6 +45780,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
+            risk_flags: vec![],
         };
         for (size, cx_est) in [("S", 5), ("M", 5), ("L", 1), ("L", 4), ("L", 5)] {
             assert!(
@@ -45845,6 +45851,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
+                risk_flags: vec![],
             }
         }
 
@@ -45947,6 +45954,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
+                risk_flags: vec![],
             }
         }
 
@@ -46221,6 +46229,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             ready: false,
             not_ready_reason: Some("é".repeat(4_096)),
             duplicate_of: (1..=1_000).collect(),
+            risk_flags: vec![],
         }];
 
         let summary = planned_children(&proposal, &classifications).unwrap_err();
@@ -46274,6 +46283,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             ready: false,
             not_ready_reason: Some("owner must select the storage format".into()),
             duplicate_of: vec![],
+            risk_flags: vec![],
         }];
         let summary = planned_children(&proposal, &classifications).unwrap_err();
 
@@ -46391,6 +46401,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
+                risk_flags: vec![],
             },
             quorum_core::classify::TaskClassification {
                 task_id: -2,
@@ -46402,6 +46413,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
+                risk_flags: vec![],
             },
         ];
         let summary = planned_children(&proposal, &classifications).unwrap_err();
@@ -46494,6 +46506,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 ready: false,
                 not_ready_reason: Some(format!("ready-{index}-{}", "r".repeat(160))),
                 duplicate_of: vec![700 + index as i64],
+                risk_flags: vec![],
             });
             keys.push(key);
         }
@@ -46795,6 +46808,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     ready: true,
                     not_ready_reason: None,
                     duplicate_of: vec![],
+                    risk_flags: vec![quorum_core::risk::RiskFlag {
+                        flag: quorum_core::risk::RiskFlagName::PublicContract,
+                        evidence: format!("The child {task_id} changes a public contract."),
+                    }],
                 },
             )
             .collect()
@@ -47025,6 +47042,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             assert_eq!(refs["cx_est"], 2, "{key}");
             assert_eq!(refs["cx_ready"], true, "{key}");
             assert_eq!(refs["cx_size_reason"], verdict.size_reason, "{key}");
+            assert_eq!(
+                refs["cx_risk_flags"],
+                serde_json::to_value(&verdict.risk_flags).unwrap(),
+                "{key}"
+            );
         }
         assert_eq!(
             arbiter_gate_attempts(&db_path, graph),
@@ -47291,6 +47313,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(attempts, max_proposal);
         assert!(hold.is_none(), "fallback clears any prior hold code");
         assert_eq!(arbiter_gate_child_count(&db_path, source), (2, 2));
+        for ((key, refs), verdict) in arbiter_gate_child_refs(&db_path, graph)
+            .iter()
+            .zip(arbiter_gate_classifications())
+        {
+            assert_eq!(
+                refs["cx_risk_flags"],
+                serde_json::to_value(&verdict.risk_flags).unwrap(),
+                "{key} terminal fallback must preserve its classified risk flags"
+            );
+        }
 
         // Every rejection round still records its proposal + verdict pair for
         // observability.

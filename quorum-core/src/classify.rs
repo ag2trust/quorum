@@ -4,6 +4,7 @@
 use crate::complexity;
 use crate::db::begin_immediate;
 use crate::error::Result;
+use crate::risk::{RiskFlag, MAX_RISK_EVIDENCE_BYTES, MAX_RISK_FLAGS};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -16,13 +17,15 @@ pub struct TaskClassification {
     pub cx_est: i64,
     pub size: String,
     /// Bounded, artifact-specific rationale for the selected execution size.
-    /// Required for every v3 verdict so a later planning iteration can correct
+    /// Required for every v4 verdict so a later planning iteration can correct
     /// the concrete breadth the classifier observed.
     pub size_reason: String,
     pub ready: bool,
     pub not_ready_reason: Option<String>,
     #[serde(default, alias = "cx_dup_of")]
     pub duplicate_of: Vec<i64>,
+    #[serde(default)]
+    pub risk_flags: Vec<RiskFlag>,
 }
 
 /// Batch response from the classifier agent.
@@ -530,6 +533,15 @@ fn sanitize(result: &TaskClassification) -> TaskClassification {
             .as_ref()
             .map(|s| s.trim().to_string()),
         duplicate_of: result.duplicate_of.clone(),
+        risk_flags: result
+            .risk_flags
+            .iter()
+            .cloned()
+            .map(|mut flag| {
+                flag.evidence = flag.evidence.trim().to_string();
+                flag
+            })
+            .collect(),
     }
 }
 
@@ -547,6 +559,20 @@ pub fn valid(result: &TaskClassification) -> bool {
                 .as_ref()
                 .is_some_and(|s| !s.trim().is_empty() && !s.contains('\0'))
         }
+        && result.risk_flags.len() <= MAX_RISK_FLAGS
+        && result.risk_flags.iter().all(|risk_flag| {
+            risk_flag.flag.is_known()
+                && !risk_flag.evidence.trim().is_empty()
+                && risk_flag.evidence.len() <= MAX_RISK_EVIDENCE_BYTES
+                && !risk_flag.evidence.contains('\0')
+        })
+        && result
+            .risk_flags
+            .iter()
+            .map(|risk_flag| risk_flag.flag)
+            .collect::<HashSet<_>>()
+            .len()
+            == result.risk_flags.len()
 }
 
 /// Validate the semantic contract for one provider response before any result
@@ -638,6 +664,7 @@ fn merge_cx_into_refs(
         serde_json::json!(result.not_ready_reason),
     );
     map.insert("cx_by".into(), serde_json::json!(version));
+    map.insert("cx_risk_flags".into(), serde_json::json!(result.risk_flags));
     map.remove("cx_flags");
     map.remove("cx_tags");
     if !result.duplicate_of.is_empty() {
@@ -757,6 +784,7 @@ pub fn build_prompt_with_recommendations(
 /// Build the classifier rubric text from the shared complexity constants.
 fn classifier_rubric(recommendations: &str) -> String {
     let rubric_lines = crate::complexity::rubric_lines();
+    let risk_rubric_lines = crate::risk::rubric_lines();
     format!(
         r#"You are a task classifier for an AI agent coordination system. For each task, produce:
 
@@ -780,21 +808,24 @@ This is not a cross-vendor benchmark and does not change the required output.
 3. **size_reason**: a required, concrete rationale of at most {MAX_SIZE_REASON_BYTES} UTF-8 bytes tied to this exact task artifact. Name the implementation surfaces or responsibilities that make the selected size fit better than the adjacent sizes; do not merely restate the rubric or task title. For L, name the multiple owned seams or layers that remain one coherent outcome and explain why the artifact is broader than M. For XL, identify independently deliverable outcomes or seams that require decomposition. For S/M, identify the focused or bounded coherent seam. This rationale is durable review feedback for a later planning iteration.
 4. **ready** (boolean): true unless the intended outcome cannot be determined without an unstated product decision or open-ended investigation. Normal repository inspection, finding files, tracing implementation, and bounded engineering judgment are expected. Never reject merely because files, implementation details, or full architecture context are absent. Declared dependencies are scheduler-enforced assumptions whose required outcomes will be satisfied before execution. Use their bounded context to understand assumed outcomes, scope, complexity, and duplication, but never return ready=false merely because a dependency is currently incomplete; dependency ordering is not classifier authority. If false, provide a concrete **not_ready_reason**; if true, it must be null.
 5. **duplicate_of** (optional array): only genuine duplicates among supplied active tasks.
+6. **risk_flags** (array, default empty): bounded execution-surface and coupling signals, separate from complexity and size. Surface/coupling signals go into these flags and must NOT raise complexity. Each item is `{{"flag":"<enum>","evidence":"one task-specific sentence"}}`. Emit at most {MAX_RISK_FLAGS} unique flags; evidence must be non-empty, contain no NUL, and be at most {MAX_RISK_EVIDENCE_BYTES} UTF-8 bytes. Return `[]` when none apply.
+   Risk flags:
+{risk_rubric_lines}
 
 You are closed-book: use only this prompt, do not inspect the repository, Git history, diffs, CI, or external systems.
 
 Output format (JSON array wrapped in an object):
-{{"tasks": [{{"task_id": 1, "complexity": 4, "size": "M", "size_reason": "The artifact owns one atomic orchestration seam plus its focused replay and race tests; dependency-delivered primitives keep it bounded rather than broad.", "ready": true, "not_ready_reason": null, "duplicate_of": []}}]}}"#
+{{"tasks": [{{"task_id": 1, "complexity": 4, "size": "M", "size_reason": "The artifact owns one atomic orchestration seam plus its focused replay and race tests; dependency-delivered primitives keep it bounded rather than broad.", "ready": true, "not_ready_reason": null, "duplicate_of": [], "risk_flags": []}}]}}"#
     )
 }
 
 /// Stable classifier provenance string for `cx_by`.
 ///
 /// The model is part of the identifier so classification quality can be grouped
-/// by the model that actually produced it. `v3` adds the required bounded
-/// rationale for the size verdict to the explicit classification contract.
+/// by the model that actually produced it. `v4` adds bounded risk flags to the
+/// explicit classification contract.
 pub fn classifier_provenance(model: &str) -> String {
-    format!("{model}:v3")
+    format!("{model}:v4")
 }
 
 #[cfg(test)]
@@ -810,6 +841,7 @@ mod tests {
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
+            risk_flags: vec![],
         }
     }
 
@@ -837,8 +869,8 @@ mod tests {
 
     #[test]
     fn classifier_provenance_identifies_the_model() {
-        assert_eq!(classifier_provenance("gpt-5.6-luna"), "gpt-5.6-luna:v3");
-        assert_eq!(classifier_provenance("gpt-5.6-terra"), "gpt-5.6-terra:v3");
+        assert_eq!(classifier_provenance("gpt-5.6-luna"), "gpt-5.6-luna:v4");
+        assert_eq!(classifier_provenance("gpt-5.6-terra"), "gpt-5.6-terra:v4");
     }
 
     #[test]
@@ -883,6 +915,7 @@ mod tests {
         let resp: ClassifierResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.tasks.len(), 1);
         assert_eq!(resp.tasks[0].cx_est, 3);
+        assert!(resp.tasks[0].risk_flags.is_empty());
     }
 
     #[test]
@@ -1039,7 +1072,19 @@ mod tests {
         assert_eq!(unclassified.len(), 1);
         assert_eq!(unclassified[0].id, task_id);
 
-        let results = vec![classified(task_id, 3)];
+        let mut result = classified(task_id, 3);
+        result.risk_flags = vec![
+            RiskFlag {
+                flag: crate::risk::RiskFlagName::GrammarOrParser,
+                evidence: "The task adds a delimiter parser.".into(),
+            },
+            RiskFlag {
+                flag: crate::risk::RiskFlagName::ManyConsumers,
+                evidence: "Three consumers must adopt the parsed tokens together.".into(),
+            },
+        ];
+        assert!(validate_batch(std::slice::from_ref(&result), &[task_id]).is_ok());
+        let results = vec![result];
         let stored = store_classifications(&mut conn, &results, "haiku-45:v1", 2_000_000).unwrap();
         assert_eq!(stored, 1);
 
@@ -1051,12 +1096,118 @@ mod tests {
         assert_eq!(refs["cx_est"], 3);
         assert_eq!(refs["cx_by"], "haiku-45:v1");
         assert_eq!(refs["cx_size"], "M");
+        assert_eq!(
+            refs["cx_risk_flags"],
+            serde_json::json!([
+                {"flag": "grammar_or_parser", "evidence": "The task adds a delimiter parser."},
+                {"flag": "many_consumers", "evidence": "Three consumers must adopt the parsed tokens together."},
+            ])
+        );
 
         let notes = crate::tasks::get_with_notes(&conn, task_id)
             .unwrap()
             .unwrap()
             .notes;
         assert_eq!(notes.len(), 0);
+    }
+
+    #[test]
+    fn missing_risk_flags_deserialize_empty_and_persist_empty_array() {
+        let json = r#"{"tasks":[{"task_id":1,"complexity":3,"size":"M","size_reason":"one bounded seam","ready":true,"not_ready_reason":null,"duplicate_of":[]}]}"#;
+        let response: ClassifierResponse = serde_json::from_str(json).unwrap();
+        assert!(response.tasks[0].risk_flags.is_empty());
+
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "Legacy classifier response", 1);
+        let mut result = response.tasks.into_iter().next().unwrap();
+        result.task_id = task_id;
+        assert_eq!(
+            store_classifications(&mut conn, &[result], "test:v4", 2_000_000).unwrap(),
+            1
+        );
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["cx_risk_flags"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn malformed_risk_flags_reject_batch_without_persistence() {
+        let invalid_flags = vec![
+            (
+                "unknown flag",
+                vec![
+                    serde_json::from_str(
+                        r#"{"flag":"unknown_flag","evidence":"The provider chose an unknown surface signal."}"#,
+                    )
+                    .unwrap(),
+                ],
+            ),
+            (
+                "duplicate flag",
+                vec![
+                    RiskFlag {
+                        flag: crate::risk::RiskFlagName::GrammarOrParser,
+                        evidence: "The task adds syntax.".into(),
+                    },
+                    RiskFlag {
+                        flag: crate::risk::RiskFlagName::GrammarOrParser,
+                        evidence: "The task also changes parser behavior.".into(),
+                    },
+                ],
+            ),
+            (
+                "empty evidence",
+                vec![RiskFlag {
+                    flag: crate::risk::RiskFlagName::PublicContract,
+                    evidence: "".into(),
+                }],
+            ),
+            (
+                "NUL evidence",
+                vec![RiskFlag {
+                    flag: crate::risk::RiskFlagName::PublicContract,
+                    evidence: "API\0contract change".into(),
+                }],
+            ),
+            (
+                "more than seven flags",
+                (0..=MAX_RISK_FLAGS)
+                    .map(|_| RiskFlag {
+                        flag: crate::risk::RiskFlagName::GrammarOrParser,
+                        evidence: "The task changes delimiter parsing.".into(),
+                    })
+                    .collect(),
+            ),
+        ];
+
+        for (index, (case, risk_flags)) in invalid_flags.into_iter().enumerate() {
+            let (_dir, mut conn) = open_tmp();
+            let task_id = create_task(&mut conn, case, index as i64 + 1);
+            let mut result = classified(task_id, 3);
+            result.risk_flags = risk_flags;
+
+            assert!(
+                validate_batch(std::slice::from_ref(&result), &[task_id]).is_err(),
+                "{case} must reject the provider batch"
+            );
+            assert_eq!(
+                store_classifications(&mut conn, &[result], "test:v4", 2_000_000).unwrap(),
+                0,
+                "{case} must not write refs"
+            );
+            assert!(crate::tasks::get(&conn, task_id)
+                .unwrap()
+                .unwrap()
+                .refs
+                .is_none());
+            assert!(
+                unclassified_tasks(&conn)
+                    .unwrap()
+                    .iter()
+                    .any(|task| task.id == task_id),
+                "{case} must leave the task classifier-eligible"
+            );
+        }
     }
 
     #[test]
@@ -1648,8 +1799,8 @@ mod tests {
         };
         let luna_by = cx_by(luna_task);
         let terra_by = cx_by(terra_task);
-        assert_eq!(luna_by, "gpt-5.6-luna:v3");
-        assert_eq!(terra_by, "gpt-5.6-terra:v3");
+        assert_eq!(luna_by, "gpt-5.6-luna:v4");
+        assert_eq!(terra_by, "gpt-5.6-terra:v4");
         assert_ne!(luna_by, terra_by);
     }
 
@@ -2059,6 +2210,18 @@ mod tests {
         assert!(rubric.contains(
             "For XL, identify independently deliverable outcomes or seams that require decomposition"
         ));
+        assert!(rubric.contains(
+            "Surface/coupling signals go into these flags and must NOT raise complexity"
+        ));
+        assert!(rubric.contains("one task-specific sentence"));
+        assert!(rubric.contains("Return `[]` when none apply"));
+        for (flag, _) in crate::risk::RUBRIC {
+            assert!(
+                rubric.contains(crate::risk::flag_name(flag)),
+                "classifier prompt missing risk flag {}",
+                crate::risk::flag_name(flag)
+            );
+        }
     }
 
     #[test]
@@ -2090,6 +2253,7 @@ mod redesigned_tests {
             ready,
             not_ready_reason: reason.map(str::to_string),
             duplicate_of: vec![],
+            risk_flags: vec![],
         }
     }
 
