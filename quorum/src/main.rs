@@ -26,6 +26,8 @@ use serve::merge::MergeExecutor as _;
 
 const EMBEDDED_SKILL: &str = include_str!("../../.claude/skills/quorum/SKILL.md");
 const MIN_EXTERNAL_POLL_INTERVAL_SECS: u64 = 30;
+const REVIEW_DRAFT_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const REVIEW_DRAFT_RESPONSE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(serde::Serialize)]
 struct TaskGetView<'a> {
@@ -499,6 +501,38 @@ fn wait_child_stdout(
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
             Err(_) => return None,
+        }
+    }
+}
+
+/// Wait for the daemon's bounded reassessment response without pinning a WAL
+/// read transaction. Each poll opens and closes its own connection.
+fn wait_for_review_draft_response(db_path: &std::path::Path, mailbox_id: i64) -> Result<String> {
+    let deadline = std::time::Instant::now() + REVIEW_DRAFT_RESPONSE_TIMEOUT;
+    loop {
+        let response = {
+            let conn = quorum_core::db::open(db_path)?;
+            quorum_core::mailbox::review_draft_response(&conn, mailbox_id)?
+        };
+        match response {
+            Some(quorum_core::mailbox::ReviewDraftResponse::Ready(response)) => {
+                return Ok(response);
+            }
+            Some(quorum_core::mailbox::ReviewDraftResponse::Pending)
+                if std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(REVIEW_DRAFT_RESPONSE_POLL);
+            }
+            Some(quorum_core::mailbox::ReviewDraftResponse::Pending) => {
+                return Err(QuorumError::Io(format!(
+                    "timed out waiting for daemon review-draft response (mailbox {mailbox_id})"
+                )));
+            }
+            None => {
+                return Err(QuorumError::Io(format!(
+                    "review-draft mailbox row {mailbox_id} disappeared"
+                )));
+            }
         }
     }
 }
@@ -1307,7 +1341,18 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 payload: verdict::attestation_payload(Some(blocking)),
             };
             let id = quorum_core::mailbox::append(&mut conn, &row)?;
-            output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
+            drop(conn);
+            let response = wait_for_review_draft_response(&db, id)?;
+            let response: serde_json::Value = serde_json::from_str(&response).map_err(|error| {
+                QuorumError::Io(format!(
+                    "daemon returned malformed review-draft response for mailbox {id}: {error}"
+                ))
+            })?;
+            output::emit(&serde_json::json!({
+                "ok": true,
+                "mailbox_id": id,
+                "response": response,
+            }));
             Ok(0)
         }
         cli::Command::TaskClose {

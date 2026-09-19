@@ -15,6 +15,58 @@ pub enum WaitState<T> {
 
 pub const TEST_TICK_PACING_MS: &str = "25";
 
+/// Preserve the production reviewer contract in integration fixtures: every
+/// positive-blocker changes verdict first performs the synchronous,
+/// exact-run review-draft checkpoint. Tests that intentionally exercise the
+/// rejection path should bypass this helper and submit their mailbox row
+/// directly.
+pub fn submit_review_draft_if_changes(
+    quorum_program: &Path,
+    home: &Path,
+    run_id: &str,
+    agent: &str,
+    args: &[&str],
+) {
+    if !args.windows(2).any(|pair| pair == ["--verdict", "changes"]) {
+        return;
+    }
+    let value = |flag| {
+        args.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1])
+    };
+    let pr = value("--pr").expect("changes verdict requires PR");
+    let feedback = value("--feedback").unwrap_or("test blocking feedback");
+    let safe_agent = agent
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    let feedback_path = home.join(format!("review-draft-{safe_agent}.txt"));
+    std::fs::write(&feedback_path, feedback).unwrap();
+    let output = Command::new(quorum_program)
+        .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_RUN_ID", run_id)
+        .args([
+            "review-draft",
+            "--agent",
+            agent,
+            "--pr",
+            pr,
+            "--blocking",
+            "1",
+            "--feedback-file",
+        ])
+        .arg(&feedback_path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "review draft failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Construct a daemon command with the debug-build test pacing override.
 pub fn test_daemon_command(program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);

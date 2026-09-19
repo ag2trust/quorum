@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 78). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 81). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -434,6 +434,34 @@ CREATE TABLE IF NOT EXISTS mailbox (
     consumed_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS mailbox_unconsumed ON mailbox(consumed_at) WHERE consumed_at IS NULL;
+
+-- v80: one universal blocker-reassessment checkpoint per reviewed head and
+-- review role. Rows are prospective only; migration never derives them from
+-- historical reviews or mailbox traffic. The response is returned through
+-- the originating mailbox row's `note` column so the same reviewer turn can
+-- continue after its blocking `review-draft` command completes.
+CREATE TABLE IF NOT EXISTS review_blocker_reassessments (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id          INTEGER NOT NULL REFERENCES tasks(id),
+    pr_number        INTEGER NOT NULL CHECK(pr_number > 0),
+    head_sha         TEXT NOT NULL CHECK(length(head_sha) = 40),
+    review_role      TEXT NOT NULL CHECK(review_role IN ('r1','r2')),
+    reviewer_agent   TEXT NOT NULL,
+    agent_run_id     INTEGER NOT NULL REFERENCES agent_runs(id),
+    draft_mailbox_id INTEGER NOT NULL UNIQUE REFERENCES mailbox(id),
+    blocking_count   INTEGER NOT NULL CHECK(blocking_count > 0),
+    draft_feedback   TEXT NOT NULL
+                     CHECK(length(CAST(draft_feedback AS BLOB)) BETWEEN 1 AND 8192),
+    response_json    TEXT NOT NULL
+                     CHECK(json_valid(response_json)
+                           AND length(CAST(response_json AS BLOB)) <= 16384),
+    created_at       INTEGER NOT NULL,
+    UNIQUE(task_id, pr_number, head_sha, review_role)
+);
+CREATE INDEX IF NOT EXISTS review_blocker_reassessments_task
+    ON review_blocker_reassessments(task_id);
+CREATE INDEX IF NOT EXISTS review_blocker_reassessments_agent_run
+    ON review_blocker_reassessments(agent_run_id);
 
 -- Daemon journal: one row per in-flight agent (worker or reviewer). The daemon upserts
 -- on every lifecycle transition so a restart can resurrect agents via `--resume`. Keyed
@@ -891,6 +919,66 @@ CREATE TABLE IF NOT EXISTS review_followup_assessment_artifacts (
     assessment_id INTEGER NOT NULL REFERENCES review_followup_assessments(id),
     artifact_id   INTEGER NOT NULL UNIQUE REFERENCES review_followup_artifacts(id),
     PRIMARY KEY (assessment_id, artifact_id)
+);
+
+-- v81: prospective-only GitHub issue materialization for review follow-ups.
+-- The planner records bounded intents; the daemon alone performs external
+-- issue creation. The marker makes a retry discoverable after a crash between
+-- GitHub success and the local completion write. Existing dormant task-link
+-- columns above are retained for schema compatibility and are not backfilled.
+CREATE TABLE IF NOT EXISTS review_followup_issue_intents (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    assessment_id      INTEGER NOT NULL REFERENCES review_followup_assessments(id),
+    ordinal            INTEGER NOT NULL,
+    decision           TEXT NOT NULL CHECK(decision IN ('create','link','dismiss','defer')),
+    state              TEXT NOT NULL CHECK(state IN ('pending','backoff','held','completed')),
+    reason             TEXT NOT NULL,
+    title              TEXT,
+    body               TEXT,
+    labels_json        TEXT,
+    issue_number       INTEGER,
+    issue_url          TEXT,
+    dismiss_category   TEXT CHECK(dismiss_category IS NULL OR dismiss_category IN (
+                           'invalid','obsolete','already_resolved','out_of_product')),
+    required_decision  TEXT,
+    plan_json          TEXT NOT NULL,
+    idempotency_marker TEXT NOT NULL UNIQUE,
+    attempts           INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 3),
+    last_attempt_at    INTEGER,
+    last_error         TEXT,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    UNIQUE(assessment_id, ordinal),
+    CHECK(
+        CASE decision
+            WHEN 'create' THEN title IS NOT NULL AND body IS NOT NULL
+                 AND labels_json IS NOT NULL AND dismiss_category IS NULL
+                 AND required_decision IS NULL
+                 AND ((state IN ('pending','backoff','held')
+                       AND issue_number IS NULL AND issue_url IS NULL)
+                      OR (state='completed' AND issue_number > 0 AND issue_url IS NOT NULL))
+            WHEN 'link' THEN state='completed' AND title IS NULL AND body IS NULL
+                 AND labels_json IS NULL AND issue_number > 0 AND issue_url IS NOT NULL
+                 AND dismiss_category IS NULL AND required_decision IS NULL
+            WHEN 'dismiss' THEN state='completed' AND title IS NULL AND body IS NULL
+                 AND labels_json IS NULL AND issue_number IS NULL AND issue_url IS NULL
+                 AND dismiss_category IS NOT NULL AND required_decision IS NULL
+            WHEN 'defer' THEN state='completed' AND title IS NULL AND body IS NULL
+                 AND labels_json IS NULL AND issue_number IS NULL AND issue_url IS NULL
+                 AND dismiss_category IS NULL AND required_decision IS NOT NULL
+            ELSE 0
+        END
+    )
+);
+CREATE INDEX IF NOT EXISTS review_followup_issue_intents_assessment
+    ON review_followup_issue_intents(assessment_id);
+CREATE INDEX IF NOT EXISTS review_followup_issue_intents_pending
+    ON review_followup_issue_intents(state, id) WHERE state='pending';
+
+CREATE TABLE IF NOT EXISTS review_followup_issue_intent_artifacts (
+    intent_id   INTEGER NOT NULL REFERENCES review_followup_issue_intents(id),
+    artifact_id INTEGER NOT NULL UNIQUE REFERENCES review_followup_artifacts(id),
+    PRIMARY KEY(intent_id, artifact_id)
 );
 
 -- v45: memberships are append-once at the storage boundary. These triggers

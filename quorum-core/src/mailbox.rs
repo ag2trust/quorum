@@ -6,7 +6,7 @@
 use crate::clock;
 use crate::db::begin_immediate;
 use crate::error::Result;
-use rusqlite::{params, types::Type, Connection, Row};
+use rusqlite::{params, types::Type, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +122,55 @@ pub fn poll_unconsumed(conn: &Connection) -> Result<Vec<(i64, MailboxRow)>> {
         result.push(r?);
     }
     Ok(result)
+}
+
+/// Response state for the synchronous `review-draft` request/response seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewDraftResponse {
+    Pending,
+    Ready(String),
+}
+
+/// Read one review-draft response without holding a transaction across polls.
+/// The daemon completes the row by setting both `note` and `consumed_at` in
+/// the checkpoint transaction.
+pub fn review_draft_response(
+    conn: &Connection,
+    mailbox_id: i64,
+) -> Result<Option<ReviewDraftResponse>> {
+    if mailbox_id <= 0 {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT consumed_at,note FROM mailbox WHERE id=?1 AND kind='review_draft'",
+        [mailbox_id],
+        |row| {
+            let consumed_at: Option<i64> = row.get(0)?;
+            let note: Option<String> = row.get(1)?;
+            Ok(match (consumed_at, note) {
+                (Some(_), Some(response)) => ReviewDraftResponse::Ready(response),
+                _ => ReviewDraftResponse::Pending,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Complete a review-draft request without creating a reassessment checkpoint.
+/// Used for deterministic stale/invalid authority responses so the calling
+/// reviewer is not left waiting. Transient daemon/DB failures must not call
+/// this helper; leaving the row unconsumed preserves retry authority.
+pub fn reject_review_draft(conn: &mut Connection, mailbox_id: i64, response: &str) -> Result<bool> {
+    let now = clock::now();
+    let tx = begin_immediate(conn)?;
+    let updated = tx.execute(
+        "UPDATE mailbox SET note=?1,consumed_at=?2
+         WHERE id=?3 AND kind='review_draft' AND consumed_at IS NULL",
+        params![response, now, mailbox_id],
+    )?;
+    tx.commit()?;
+    Ok(updated == 1)
 }
 
 /// True if `agent` has at least one unconsumed row of `kind` waiting for the
@@ -363,6 +412,41 @@ mod tests {
         assert_eq!(unconsumed.len(), 1);
         assert_eq!(unconsumed[0].1.kind, MailboxKind::ReviewDraft);
         assert_ne!(unconsumed[0].1.kind, MailboxKind::Done);
+    }
+
+    #[test]
+    fn review_draft_response_is_pending_then_returns_daemon_response() {
+        let (mut conn, _dir) = test_conn();
+        let id = append(
+            &mut conn,
+            &MailboxRow {
+                agent: "Reviewer1".into(),
+                kind: MailboxKind::ReviewDraft,
+                task_id: Some(42),
+                pr: Some(77),
+                verdict: None,
+                feedback: Some("possible blocker".into()),
+                note: None,
+                to_agent: None,
+                payload: Some("{\"blocking\":1}".into()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            review_draft_response(&conn, id).unwrap(),
+            Some(ReviewDraftResponse::Pending)
+        );
+        assert!(
+            reject_review_draft(&mut conn, id, r#"{"accepted":false,"guidance":"stale"}"#).unwrap()
+        );
+        assert_eq!(
+            review_draft_response(&conn, id).unwrap(),
+            Some(ReviewDraftResponse::Ready(
+                r#"{"accepted":false,"guidance":"stale"}"#.into()
+            ))
+        );
+        assert!(!reject_review_draft(&mut conn, id, "replacement").unwrap());
     }
 
     #[test]

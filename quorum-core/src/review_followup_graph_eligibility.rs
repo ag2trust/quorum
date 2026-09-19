@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 /// Maximum artifact membership a valid graph can expose in one assessment.
 pub const MAX_GRAPH_FOLLOWUP_ARTIFACTS: usize = MAX_CHILDREN * MAX_FOLLOWUP_ARTIFACTS;
 
-/// The dormant assessment disposition of one graph scope.
+/// The assessment eligibility disposition of one graph scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphAssessmentEligibility {
     /// The graph is absent, non-terminal, has no merged child, lacks durable

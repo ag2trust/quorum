@@ -1,10 +1,9 @@
-//! Dormant storage authority for review follow-up assessments.
+//! Storage authority for review follow-up assessments.
 //!
 //! The types in this module map every column in the assessment and membership
 //! tables while keeping persisted enum and boolean values closed. Assessment
-//! materialization and every state change are guarded core writes. Nothing in
-//! this module schedules work, invokes a provider, applies dispositions, or
-//! otherwise activates follow-up planning.
+//! materialization and every state change are guarded core writes. Provider
+//! scheduling and external issue creation remain daemon responsibilities.
 
 use crate::db::{begin_immediate, map_sql_err};
 use crate::error::{QuorumError, Result};
@@ -13,6 +12,16 @@ use rusqlite::{params, Connection, Error as SqlError, OptionalExtension, Row, Tr
 use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
+
+const MAX_GRAPH_ASSESSMENT_ARTIFACTS: usize =
+    crate::review_followup_graph_eligibility::MAX_GRAPH_FOLLOWUP_ARTIFACTS;
+
+fn membership_limit(scope_kind: FollowupScopeKind) -> usize {
+    match scope_kind {
+        FollowupScopeKind::Task => MAX_FOLLOWUP_ARTIFACTS,
+        FollowupScopeKind::Graph => MAX_GRAPH_ASSESSMENT_ARTIFACTS,
+    }
+}
 
 /// Independent retry caps. The attempt that reaches the cap moves the
 /// assessment to `held`; a fourth attempt can never be persisted.
@@ -379,9 +388,10 @@ impl NewReviewFollowupAssessment {
                 "follow-up assessment source task id must be positive".into(),
             ));
         }
-        if artifact_ids.is_empty() || artifact_ids.len() > MAX_FOLLOWUP_ARTIFACTS {
+        let limit = membership_limit(scope_kind);
+        if artifact_ids.is_empty() || artifact_ids.len() > limit {
             return Err(QuorumError::Usage(format!(
-                "follow-up assessment membership must contain 1..={MAX_FOLLOWUP_ARTIFACTS} artifacts"
+                "follow-up assessment membership must contain 1..={limit} artifacts"
             )));
         }
         let mut unique = HashSet::with_capacity(artifact_ids.len());
@@ -593,7 +603,8 @@ fn eligible_artifact_ids(
             let complete: bool = tx
                 .query_row(
                     "WITH graph AS (
-                         SELECT id,state,source_task_id FROM task_decompositions
+                         SELECT id,state,source_task_id,accepted_plan_revision
+                         FROM task_decompositions
                          WHERE id=?1 AND source_task_id=?2
                            AND state IN ('completed','cancelled')
                      ),
@@ -602,6 +613,7 @@ fn eligible_artifact_ids(
                                 CAST(json_extract(t.refs,'$.pr') AS TEXT) AS pr_number
                          FROM graph g
                          JOIN task_graph_members m ON m.graph_id=g.id
+                           AND m.plan_revision=g.accepted_plan_revision
                          JOIN tasks t ON t.id=m.task_id
                          WHERE t.status='done'
                            AND t.completion_provenance='merged'
@@ -634,6 +646,7 @@ fn eligible_artifact_ids(
                         AND NOT EXISTS (
                             SELECT 1 FROM graph g
                             JOIN task_graph_members m ON m.graph_id=g.id
+                              AND m.plan_revision=g.accepted_plan_revision
                             JOIN tasks t ON t.id=m.task_id
                             WHERE (g.state='completed' AND (
                                       t.status!='done'
@@ -685,7 +698,7 @@ fn eligible_artifact_ids(
     let artifact_ids = statement
         .query_map([scope_value], |row| row.get::<_, i64>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if artifact_ids.is_empty() || artifact_ids.len() > MAX_FOLLOWUP_ARTIFACTS {
+    if artifact_ids.is_empty() || artifact_ids.len() > membership_limit(value.scope_kind) {
         return Ok(None);
     }
     Ok(Some(artifact_ids))
@@ -711,7 +724,17 @@ pub fn assessment_artifact_ids(conn: &Connection, assessment_id: i64) -> Result<
             "follow-up assessment id must be positive".into(),
         ));
     }
-    let limit = i64::try_from(MAX_FOLLOWUP_ARTIFACTS + 1)
+    let scope_kind = conn
+        .query_row(
+            "SELECT scope_kind FROM review_followup_assessments WHERE id=?1",
+            [assessment_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| QuorumError::Usage("follow-up assessment does not exist".into()))?
+        .parse()?;
+    let max_membership = membership_limit(scope_kind);
+    let limit = i64::try_from(max_membership + 1)
         .map_err(|_| QuorumError::Usage("follow-up artifact bound is invalid".into()))?;
     let mut stmt = conn.prepare(
         "SELECT artifact_id FROM review_followup_assessment_artifacts
@@ -720,7 +743,7 @@ pub fn assessment_artifact_ids(conn: &Connection, assessment_id: i64) -> Result<
     let ids = stmt
         .query_map(params![assessment_id, limit], |row| row.get::<_, i64>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if ids.len() > MAX_FOLLOWUP_ARTIFACTS {
+    if ids.len() > max_membership {
         return Err(QuorumError::Usage(
             "stored follow-up assessment membership exceeds its bound".into(),
         ));
@@ -1039,8 +1062,8 @@ mod tests {
              UPDATE tasks SET refs='{\"pr\":301}',completion_provenance='merged' WHERE id=5;
              INSERT INTO task_decompositions(
                  id,source_task_id,state,active,freeze_active,planned_source_revision,
-                 created_at,updated_at)
-             VALUES (9,3,'completed',0,0,1,1,1);
+                 accepted_plan_revision,created_at,updated_at)
+             VALUES (9,3,'completed',0,0,1,1,1,1);
              INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
              VALUES (9,4,'child-one',1,1),(9,5,'child-two',1,1);
              INSERT INTO review_followup_batches(

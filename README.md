@@ -98,6 +98,10 @@ hosted service or a general-purpose workflow system.
    own allocation and review responsibility; the safe default makes R2
    mandatory, while deterministic R2 sampling can be configured for later
    steady-state coverage. Neither reviewer is the author or merge authority.
+   If either reviewer finds candidate blockers, it sends a non-authoritative
+   `review-draft`, receives neutral second-assessment guidance in the same
+   turn, updates any blocker/follow-up dispositions, and only then submits the
+   final verdict. Rework cannot start from the draft.
 5. **Rework and renewed review.** Blocking review feedback returns the same
    Proposed Change to a rework turn. The reviewer responsible for the changes
    verdict re-reviews the updated head in that same stage: R1 resumes R1, while
@@ -106,10 +110,12 @@ hosted service or a general-purpose workflow system.
    worker. Prior approval is not reused for changed code.
 6. **Merge and collection.** Once the daemon has the required approvals and
    merge gates, it performs the merge. A detached collector then records
-   post-merge review analytics. Collection failures are visible and have a
-   bounded retry path. Qualifying, evidence-backed follow-up material is
-   prepared for the separately bounded follow-up-planning path when that path
-   is activated; it never reopens the merged task.
+   post-merge review analytics and immutable follow-up artifacts. Collection
+   failures are visible and have a bounded retry path. Qualifying artifacts go
+   through a tool-free planning turn that creates, links, dismisses, or defers
+   durable intents. Quorum alone materializes create intents as GitHub issues
+   with controlled labels; this never reopens the merged task. Activation is
+   prospective and does not backfill historical reviews or databases.
 7. **Optional troubleshooting.** When enabled, a one-shot doctor turn can
    investigate a stalled task with no active worker or reviewer. It reports
    evidence; it does not take lifecycle authority.
@@ -126,14 +132,16 @@ independent authorities:
 - **Classifier** assesses task complexity, execution size, readiness, and
   duplicate hints; it also assesses proposed decomposition children.
 - **Planner** turns a qualifying large outcome into a bounded dependency DAG of
-  S/M children or records why it cannot safely split it.
+  S/M children, and separately reconciles post-merge follow-up artifacts into
+  closed GitHub issue decisions. The follow-up turn has no tools or GitHub
+  authority.
 - **Worker** implements and publishes the Proposed Change; its rework turns
   continue that same change.
 - **R1** performs the first independent review of a PR head.
 - **R2** performs a separately assigned second review when the review policy
   requires it; it is not an extension of the worker or R1 session.
-- **Collector** performs post-merge, analytics-only extraction of review
-  findings and possible follow-up material.
+- **Collector** performs post-merge extraction of review analytics and
+  evidence-backed immutable follow-up artifacts.
 - **Doctor** is optional, off by default, and only troubleshoots an eligible
   stalled task.
 
@@ -365,8 +373,8 @@ This is a non-binding view of ongoing directions, not a release schedule:
   dormant execution states.
 - Provider failover across eligible routing alternatives and durable per-task
   base branches are active design directions.
-- Qualifying, evidence-backed review follow-ups have bounded planning and
-  storage foundations; their lifecycle activation remains separate work.
+- Qualifying, evidence-backed review follow-ups use bounded planning and a
+  daemon-owned, marker-idempotent GitHub issue outbox.
 - The self-hostable container/runtime foundation is being matured; it is not a
   hosted Quorum service.
 - The existing loopback-only, read-only web dashboard may expand as local

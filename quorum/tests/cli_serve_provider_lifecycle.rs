@@ -1146,6 +1146,13 @@ fi
                 index += 1;
             }
         }
+        common::submit_review_draft_if_changes(
+            &cargo_bin("quorum"),
+            self.home.path(),
+            &run_id,
+            agent,
+            args,
+        );
         command
             .env("QUORUM_HOME", self.home.path())
             .env("QUORUM_REPO", "test/repo")
@@ -1164,6 +1171,19 @@ fi
     /// Append a Done row for recovery tests that intentionally signal while
     /// the endpoint is unavailable or the pre-restart capability is revoked.
     fn append_done(&self, agent: &str, args: &[&str]) {
+        if args.windows(2).any(|pair| pair == ["--verdict", "changes"]) {
+            let run_id = quorum_core::capabilities::active_for_agent(&self.db(), agent)
+                .unwrap()
+                .expect("changes verdict requires an active reviewer capability")
+                .run_id;
+            common::submit_review_draft_if_changes(
+                &cargo_bin("quorum"),
+                self.home.path(),
+                &run_id,
+                agent,
+                args,
+            );
+        }
         let value = |flag| {
             args.iter()
                 .zip(args.iter().skip(1))

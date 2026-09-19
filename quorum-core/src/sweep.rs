@@ -324,6 +324,7 @@ const DURABLE_AGENT_RUN_REF_TABLES: &[(&str, &str)] = &[
     ("fallback_launch_intents", "failed_agent_run_id"),
     ("routing_attempts", "failed_agent_run_id"),
     ("agent_runs", "failed_agent_run_id"),
+    ("review_blocker_reassessments", "agent_run_id"),
 ];
 
 fn agent_run_ref_guard_predicates() -> String {
@@ -457,6 +458,7 @@ const DURABLE_TASK_REF_TABLES: &[(&str, &str)] = &[
     // descriptor must retain the owning task until an explicit lifecycle path
     // clears the durable intent in a future change.
     ("fallback_launch_intents", "task_id"),
+    ("review_blocker_reassessments", "task_id"),
     ("review_followup_batches", "task_id"),
     ("review_followup_batches", "source_task_id"),
     ("review_followup_artifacts", "linked_task_id"),

@@ -233,6 +233,7 @@ pub struct CollectionRun {
     pub collector_effort: Option<String>,
     pub collector_version: String,
     pub findings_count: i64,
+    pub followup_count: i64,
     pub attempted_at: i64,
     pub completed_at: Option<i64>,
     /// Durable routing decision for the collector responsibility, when managed.
@@ -247,9 +248,9 @@ pub fn record_run(conn: &Connection, run: &CollectionRun) -> Result<()> {
 
 const COLLECTION_RUN_INSERT: &str = "INSERT INTO review_collection_runs(
         pr_number,task_id,status,error,collector_model,collector_version,
-        findings_count,attempted_at,completed_at,role_assignment_id)
+        findings_count,followup_count,attempted_at,completed_at,role_assignment_id)
     SELECT :pr_number,:task_id,:status,:error,:collector_model,:collector_version,
-        :findings_count,:attempted_at,:completed_at,:quorum_assignment_id
+        :findings_count,:followup_count,:attempted_at,:completed_at,:quorum_assignment_id
     /* quorum-role-assignment-guard */
       AND (:quorum_assignment_id IS NULL OR EXISTS(
           SELECT 1 FROM role_assignments AS collector_assignment
@@ -265,6 +266,7 @@ const COLLECTION_RUN_INSERT: &str = "INSERT INTO review_collection_runs(
         collector_model=excluded.collector_model,
         collector_version=excluded.collector_version,
         findings_count=excluded.findings_count,
+        followup_count=excluded.followup_count,
         attempted_at=excluded.attempted_at,
         completed_at=excluded.completed_at,
         role_assignment_id=excluded.role_assignment_id";
@@ -295,6 +297,7 @@ fn record_run_inner(conn: &Connection, run: &CollectionRun) -> Result<()> {
             (":collector_model", &run.collector_model),
             (":collector_version", &run.collector_version),
             (":findings_count", &run.findings_count),
+            (":followup_count", &run.followup_count),
             (":attempted_at", &run.attempted_at),
             (":completed_at", &run.completed_at),
         ],
@@ -321,12 +324,45 @@ pub fn replace_for_pr_and_record_run(
     Ok(())
 }
 
+/// Replace analytics, insert the first immutable follow-up snapshot when one
+/// is supplied, and record the successful run as one transaction.
+///
+/// Re-interpretation may replace analytics but never mutates a previously
+/// stored follow-up batch.
+pub fn replace_for_pr_record_run_and_followups(
+    conn: &mut Connection,
+    pr_number: i64,
+    findings: &[ReviewFinding],
+    run: &CollectionRun,
+    followups: Option<&crate::review_followup_writes::NewReviewFollowupBatch>,
+) -> Result<crate::review_followup_writes::InsertReviewFollowupBatchOutcome> {
+    if run.pr_number != pr_number {
+        return Err(crate::role_assignments::evidence_mismatch("collector PR"));
+    }
+    if followups.is_some_and(|batch| batch.batch().pr_number() != pr_number) {
+        return Err(crate::role_assignments::evidence_mismatch(
+            "collector follow-up PR",
+        ));
+    }
+
+    let now = clock::now();
+    let tx = begin_immediate(conn)?;
+    replace_for_pr_inner(&tx, pr_number, findings, now)?;
+    let outcome = match followups {
+        Some(batch) => crate::review_followup_writes::insert_batch_if_absent_inner(&tx, batch)?,
+        None => crate::review_followup_writes::InsertReviewFollowupBatchOutcome::AlreadyExists,
+    };
+    record_run_inner(&tx, run)?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
 /// Read the run record for a PR (None if never collected).
 pub fn get_run(conn: &Connection, pr_number: i64) -> Result<Option<CollectionRun>> {
     let mut stmt = conn.prepare(
         "SELECT r.pr_number,r.task_id,r.status,r.error,r.collector_model,
-                r.collector_version,r.findings_count,r.attempted_at,r.completed_at,
-                r.role_assignment_id,a.provider,a.runner,a.effort
+                r.collector_version,r.findings_count,r.followup_count,
+                r.attempted_at,r.completed_at,r.role_assignment_id,a.provider,a.runner,a.effort
          FROM review_collection_runs r
          LEFT JOIN role_assignments a ON a.id=r.role_assignment_id
          WHERE r.pr_number = ?1",
@@ -344,14 +380,15 @@ pub fn get_run(conn: &Connection, pr_number: i64) -> Result<Option<CollectionRun
             status,
             error: row.get(3)?,
             collector_model: row.get(4)?,
-            collector_provider: row.get(10)?,
-            collector_runner: row.get(11)?,
-            collector_effort: row.get(12)?,
+            collector_provider: row.get(11)?,
+            collector_runner: row.get(12)?,
+            collector_effort: row.get(13)?,
             collector_version: row.get(5)?,
             findings_count: row.get(6)?,
-            attempted_at: row.get(7)?,
-            completed_at: row.get(8)?,
-            role_assignment_id: row.get(9)?,
+            followup_count: row.get(7)?,
+            attempted_at: row.get(8)?,
+            completed_at: row.get(9)?,
+            role_assignment_id: row.get(10)?,
         }))
     } else {
         Ok(None)
@@ -857,6 +894,7 @@ mod tests {
             collector_effort: Some("high".into()),
             collector_version: "v1".into(),
             findings_count: 3,
+            followup_count: 2,
             attempted_at: now,
             completed_at: Some(now + 1),
             role_assignment_id: Some(77),
@@ -865,6 +903,7 @@ mod tests {
         let got = get_run(&conn, 500).unwrap().unwrap();
         assert_eq!(got.status, RunStatus::Success);
         assert_eq!(got.findings_count, 3);
+        assert_eq!(got.followup_count, 2);
         assert_eq!(got.error, None);
         assert_eq!(got.role_assignment_id, Some(77));
         assert_eq!(got.collector_provider.as_deref(), Some("claude"));
@@ -899,6 +938,7 @@ mod tests {
             collector_effort: None,
             collector_version: "v1".into(),
             findings_count: 0,
+            followup_count: 0,
             attempted_at: 1,
             completed_at: Some(2),
             role_assignment_id: None,
@@ -963,6 +1003,7 @@ mod tests {
             collector_effort: None,
             collector_version: "v1".into(),
             findings_count: 0,
+            followup_count: 0,
             attempted_at: now,
             completed_at: None,
             role_assignment_id: None,

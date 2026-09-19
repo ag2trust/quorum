@@ -1,7 +1,9 @@
 //! MergeExecutor — seam for PR merge so tests can mock the `gh` call.
 
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// Reviewer lineage passed to the merge executor so the formal GitHub approval
@@ -82,6 +84,13 @@ pub struct MergeResult {
     pub success: bool,
     pub message: String,
     pub failure_kind: Option<MergeFailureKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowupIssueResult {
+    pub number: i64,
+    pub url: String,
+    pub created: bool,
 }
 
 /// Bounded retries after a merge policy reports a transient pending state.
@@ -253,6 +262,32 @@ pub trait MergeExecutor: Send + Sync {
     /// identity, so formal review state stays with the daemon's merge account.
     fn ensure_changes_requested(&self, _pr: i64, _repo_dir: &Path, _body: &str) {
         // Default no-op; real executor posts via `gh pr review --request-changes`.
+    }
+
+    /// Find or create the daemon-owned GitHub issue for one durable follow-up
+    /// intent. The marker is embedded in the issue body and searched before
+    /// creation so restart recovery can converge after an external success
+    /// that preceded the local completion write.
+    fn ensure_followup_issue(
+        &self,
+        _repo_dir: &Path,
+        _title: &str,
+        _body: &str,
+        _labels: &[String],
+        _marker: &str,
+    ) -> std::result::Result<FollowupIssueResult, String> {
+        Err("follow-up issue creation is unavailable for this executor".into())
+    }
+
+    /// Return the bounded repository issue inventory supplied to the
+    /// follow-up planner for exact link validation. The daemon treats this as
+    /// untrusted external input and core validation requires both number and
+    /// canonical URL to match the inventory.
+    fn followup_issue_inventory(
+        &self,
+        _repo_dir: &Path,
+    ) -> std::result::Result<Vec<quorum_core::review_followup_issues::ExistingIssue>, String> {
+        Ok(Vec::new())
     }
 }
 
@@ -593,6 +628,142 @@ impl GhMergeExecutor {
                 failure_kind: Some(MergeFailureKind::PolicyBlocked),
             },
         }
+    }
+
+    fn find_followup_issue(
+        &self,
+        repo_dir: &Path,
+        marker: &str,
+    ) -> std::result::Result<Option<FollowupIssueResult>, String> {
+        let mut command = self.build_gh_cmd(
+            &[
+                "issue",
+                "list",
+                "--state",
+                "all",
+                "--limit",
+                "1000",
+                "--json",
+                "number,url,body",
+            ],
+            repo_dir,
+        );
+        let output = command
+            .output()
+            .map_err(|error| format!("failed to list GitHub issues: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "GitHub issue lookup failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let issues: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("GitHub issue lookup returned invalid JSON: {error}"))?;
+        for issue in issues {
+            if !issue
+                .get("body")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|body| body.contains(marker))
+            {
+                continue;
+            }
+            let number = issue
+                .get("number")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|number| *number > 0)
+                .ok_or_else(|| "matching GitHub issue has no positive number".to_string())?;
+            let url = issue
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .filter(|url| url.starts_with("https://github.com/") && url.contains("/issues/"))
+                .ok_or_else(|| "matching GitHub issue has no canonical URL".to_string())?;
+            return Ok(Some(FollowupIssueResult {
+                number,
+                url: url.to_string(),
+                created: false,
+            }));
+        }
+        Ok(None)
+    }
+
+    fn ensure_followup_label(&self, repo_dir: &Path) -> std::result::Result<(), String> {
+        let mut command = self.build_gh_cmd(
+            &[
+                "label",
+                "create",
+                quorum_core::review_followup_issues::REVIEW_FOLLOWUP_LABEL,
+                "--color",
+                "6f42c1",
+                "--description",
+                "Post-merge work extracted from managed review",
+                "--force",
+            ],
+            repo_dir,
+        );
+        let output = command
+            .output()
+            .map_err(|error| format!("failed to ensure GitHub follow-up label: {error}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "GitHub follow-up label failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    }
+
+    fn create_followup_issue(
+        &self,
+        repo_dir: &Path,
+        title: &str,
+        body: &str,
+        labels: &[String],
+    ) -> std::result::Result<FollowupIssueResult, String> {
+        let mut command = self.build_gh_cmd(
+            &["issue", "create", "--title", title, "--body-file", "-"],
+            repo_dir,
+        );
+        for label in labels {
+            command.args(["--label", label]);
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("failed to create GitHub issue: {error}"))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| "GitHub issue stdin was unavailable".to_string())?
+            .write_all(body.as_bytes())
+            .map_err(|error| format!("failed to write GitHub issue body: {error}"))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("failed waiting for GitHub issue creation: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "GitHub issue creation failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let number = url
+            .rsplit('/')
+            .next()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|number| *number > 0)
+            .ok_or_else(|| "GitHub issue creation returned no canonical issue URL".to_string())?;
+        if !url.starts_with("https://github.com/") || !url.contains("/issues/") {
+            return Err("GitHub issue creation returned no canonical issue URL".into());
+        }
+        Ok(FollowupIssueResult {
+            number,
+            url,
+            created: true,
+        })
     }
 
     fn live_base_branch(&self, pr: i64, repo_dir: &Path) -> std::result::Result<String, String> {
@@ -1411,6 +1582,87 @@ impl MergeExecutor for GhMergeExecutor {
                 )
                 .output();
         }
+    }
+
+    fn ensure_followup_issue(
+        &self,
+        repo_dir: &Path,
+        title: &str,
+        body: &str,
+        labels: &[String],
+        marker: &str,
+    ) -> std::result::Result<FollowupIssueResult, String> {
+        if let Some(existing) = self.find_followup_issue(repo_dir, marker)? {
+            return Ok(existing);
+        }
+        self.ensure_followup_label(repo_dir)?;
+        self.create_followup_issue(repo_dir, title, body, labels)
+    }
+
+    fn followup_issue_inventory(
+        &self,
+        repo_dir: &Path,
+    ) -> std::result::Result<Vec<quorum_core::review_followup_issues::ExistingIssue>, String> {
+        let limit = quorum_core::review_followup_issues::MAX_EXISTING_ISSUES.to_string();
+        let output = self
+            .build_gh_cmd(
+                &[
+                    "issue",
+                    "list",
+                    "--state",
+                    "all",
+                    "--limit",
+                    &limit,
+                    "--json",
+                    "number,title,url",
+                ],
+                repo_dir,
+            )
+            .output()
+            .map_err(|error| format!("failed to list GitHub issue inventory: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "GitHub issue inventory failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let raw: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("GitHub issue inventory returned invalid JSON: {error}"))?;
+        if raw.len() > quorum_core::review_followup_issues::MAX_EXISTING_ISSUES {
+            return Err("GitHub issue inventory exceeded its bound".into());
+        }
+        raw.into_iter()
+            .map(|issue| {
+                let number = issue
+                    .get("number")
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|number| *number > 0)
+                    .ok_or_else(|| "GitHub issue inventory has an invalid number".to_string())?;
+                let title = issue
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|title| {
+                        !title.is_empty()
+                            && !title.contains('\0')
+                            && title.len() <= quorum_core::review_followups::MAX_FOLLOWUP_TEXT_BYTES
+                    })
+                    .ok_or_else(|| "GitHub issue inventory has an invalid title".to_string())?;
+                let url = issue
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|url| {
+                        url.starts_with("https://github.com/")
+                            && url.contains("/issues/")
+                            && url.len() <= quorum_core::review_followups::MAX_FOLLOWUP_TEXT_BYTES
+                    })
+                    .ok_or_else(|| "GitHub issue inventory has an invalid URL".to_string())?;
+                Ok(quorum_core::review_followup_issues::ExistingIssue {
+                    number,
+                    url: url.to_string(),
+                    title: title.to_string(),
+                })
+            })
+            .collect()
     }
 }
 

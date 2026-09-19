@@ -5963,6 +5963,7 @@ mod tests {
             collector_effort: None,
             collector_version: "v1".into(),
             findings_count: 0,
+            followup_count: 0,
             attempted_at: 1_700,
             completed_at: None,
             role_assignment_id: None,

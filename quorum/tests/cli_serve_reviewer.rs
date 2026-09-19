@@ -514,6 +514,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
         "worker"
     };
     let run_id = resolve_run_id(home, agent, role);
+    common::submit_review_draft_if_changes(&cargo_bin("quorum"), home, &run_id, agent, args);
     let mut cmd_args = vec!["done"];
     if role == "worker" {
         let mut index = 0;
@@ -1570,11 +1571,12 @@ fn no_verdict_reviewer_replacement_preserves_pr_for_rework() {
 
 /// #206: an `approved` verdict that did NOT come through the validated CLI —
 /// no zero-blocking attestation payload on the mailbox row — must be demoted
-/// to `changes` at the daemon boundary and fed back as rework, never merged.
+/// to `changes` at the daemon boundary and rejected by the reassessment gate,
+/// never merged or fed into rework without a blocker checkpoint.
 /// This replays the #198 shape (a merge-caliber verdict the review's own
 /// findings contradicted) at the mailbox level.
 #[test]
-fn unattested_approved_verdict_is_demoted_to_changes() {
+fn unattested_approved_verdict_cannot_bypass_blocker_reassessment() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -1632,20 +1634,26 @@ fn unattested_approved_verdict_is_demoted_to_changes() {
     )
     .unwrap();
 
-    // The gate must demote and route to rework instead of merging.
+    // The verdict gate demotes the signal, but the reassessment gate must then
+    // reject it and provision a fresh reviewer instead of entering rework.
     assert!(
         handle.wait_for("VERDICT GATE", 15),
         "verdict-gate demotion log not seen. Lines: {:?}",
         handle.lines
     );
     assert!(
-        handle.wait_for("rework", 15),
-        "demoted verdict did not produce a rework turn. Lines: {:?}",
+        handle.wait_for("REASSESSMENT GATE", 15),
+        "demoted verdict bypassed blocker reassessment. Lines: {:?}",
         handle.lines
     );
     assert!(
-        wait_for_task_status(home.path(), 1, "rework", 15),
-        "demoted verdict rework turn arrived before the task state transition"
+        handle.wait_for("R1: reviewer Agent2 spawned", 15),
+        "a fresh reviewer was not provisioned after rejection. Lines: {:?}",
+        handle.lines
+    );
+    assert!(
+        wait_for_task_status(home.path(), 1, "in-review", 15),
+        "rejected demotion did not keep the task in review"
     );
 
     while let Ok(line) = handle.rx.try_recv() {
@@ -1658,8 +1666,8 @@ fn unattested_approved_verdict_is_demoted_to_changes() {
     );
 
     // State assertion (review #226 finding 2): merge-absence must hold in the
-    // DB, not just the log stream — a merged task would be closed; a demoted
-    // one stays claimed by the same worker for the rework round.
+    // DB, not just the log stream — a merged task would be closed and a
+    // reassessment bypass would put it into rework.
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
@@ -1671,13 +1679,13 @@ fn unattested_approved_verdict_is_demoted_to_changes() {
     let task: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
         task["status"].as_str(),
-        Some("rework"),
-        "demoted verdict must leave the task in rework, not done: {stdout}"
+        Some("in-review"),
+        "demoted verdict without reassessment must stay in review: {stdout}"
     );
     assert_eq!(
         task["assignee"].as_str(),
-        task["author"].as_str(),
-        "during rework, assignee must be the worker (restored by ResumeWorker): {stdout}"
+        Some("Agent2"),
+        "fresh review must transfer the lease to the replacement reviewer: {stdout}"
     );
 
     handle.stop();

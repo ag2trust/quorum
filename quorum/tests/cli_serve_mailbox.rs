@@ -960,6 +960,22 @@ fn rework_feed_failure_releases_task() {
         handle.lines
     );
 
+    let reviewer_run_id = resolve_run_id(home.path(), &reviewer_name, "reviewer");
+    common::submit_review_draft_if_changes(
+        &cargo_bin("quorum"),
+        home.path(),
+        &reviewer_run_id,
+        &reviewer_name,
+        &[
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--feedback",
+            "Fix the tests",
+        ],
+    );
+
     // A message to an absent agent is handled in Phase 4c, after Phase 4b.
     // Its log precedes the marker-consumption write, so first observe the log,
     // then serialize behind that write before suspending the daemon.

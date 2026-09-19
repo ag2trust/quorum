@@ -26,11 +26,13 @@ use quorum_core::review_findings::{
     self, AgentRunSummary, CollectionRun, CollectorInputs, ReviewFinding, RunStatus, TaskContext,
     VerdictSummary,
 };
+use quorum_core::review_followup_writes::{NewReviewFollowupArtifact, NewReviewFollowupBatch};
 use quorum_core::review_followups::{
     EvidenceKind, FollowupEvidenceIds, ReviewFollowupArtifact, ReviewFollowupEvidenceId,
     ScopeRelationship, TechnicalImpact, VerificationExpectations, MAX_FOLLOWUP_ARTIFACTS,
     MAX_FOLLOWUP_EVIDENCE_IDS, MAX_FOLLOWUP_TEXT_BYTES,
 };
+use rusqlite::{Connection, OptionalExtension};
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -1011,6 +1013,69 @@ pub struct CollectionOutcome {
     pub error: Option<String>,
 }
 
+/// Convert one validated classifier response into the immutable batch shape
+/// owned by the merged task. Manual interpretation without a task association
+/// deliberately remains analytics-only.
+fn followup_batch_for_task(
+    conn: &Connection,
+    pr_number: i64,
+    task_id: Option<i64>,
+    artifacts: Vec<ReviewFollowupArtifact>,
+    collector_version: &str,
+    created_at: i64,
+) -> Result<Option<NewReviewFollowupBatch>> {
+    let Some(task_id) = task_id else {
+        return Ok(None);
+    };
+
+    let (graph_id, source_task_id) = conn
+        .query_row(
+            "SELECT member.graph_id,COALESCE(graph.source_task_id,task.id)
+             FROM tasks AS task
+             LEFT JOIN task_graph_members AS member ON member.task_id=task.id
+             LEFT JOIN task_decompositions AS graph ON graph.id=member.graph_id
+             WHERE task.id=?1",
+            [task_id],
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            QuorumError::Usage(format!(
+                "collector task {task_id} does not exist for follow-up persistence"
+            ))
+        })?;
+
+    let artifacts = artifacts
+        .into_iter()
+        .map(|artifact| {
+            NewReviewFollowupArtifact::new(
+                pr_number,
+                artifact.ordinal(),
+                artifact.technical_impact(),
+                artifact.scope_relationship(),
+                artifact.concern().to_string(),
+                artifact.non_blocking_reason().to_string(),
+                artifact.affected_behavior().to_string(),
+                artifact.desired_outcome().to_string(),
+                &artifact.verification_expectations().to_json()?,
+                &artifact.evidence_ids().to_json()?,
+                created_at,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    NewReviewFollowupBatch::new(
+        pr_number,
+        task_id,
+        graph_id,
+        source_task_id,
+        collector_version.to_string(),
+        artifacts,
+        created_at,
+    )
+    .map(Some)
+}
+
 struct ClassifierTurnOutcome {
     response: Result<String>,
     usage: super::runner::TokenUsage,
@@ -1130,10 +1195,7 @@ pub async fn run_collection_with_inputs(
         }
     };
     let findings = validated.findings;
-    // Persistence of the already validated immutable artifact batch belongs to
-    // the later atomic-success slice. Keep this parser-only change from
-    // altering existing success writes.
-    let _followup_artifacts = validated.followup_artifacts;
+    let followup_artifacts = validated.followup_artifacts;
 
     // 4) Persist findings + success run row.
     let pr = request.pr_number;
@@ -1146,10 +1208,23 @@ pub async fn run_collection_with_inputs(
     let role_assignment_id = request.role_assignment_id;
     let run_error = success_error.clone();
     let count = findings.len() as i64;
+    let followup_count = if task_id.is_some() {
+        followup_artifacts.len() as i64
+    } else {
+        0
+    };
     let write_result = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&db_path)?;
         let now = clock::now();
-        review_findings::replace_for_pr_and_record_run(
+        let followup_batch = followup_batch_for_task(
+            &conn,
+            pr,
+            task_id,
+            followup_artifacts,
+            COLLECTOR_VERSION,
+            now,
+        )?;
+        review_findings::replace_for_pr_record_run_and_followups(
             &mut conn,
             pr,
             &findings,
@@ -1164,10 +1239,12 @@ pub async fn run_collection_with_inputs(
                 collector_effort: Some(collector_effort),
                 collector_version: COLLECTOR_VERSION.to_string(),
                 findings_count: count,
+                followup_count,
                 attempted_at,
                 completed_at: Some(now),
                 role_assignment_id,
             },
+            followup_batch.as_ref(),
         )?;
         Ok(())
     })
@@ -1279,6 +1356,7 @@ async fn record_failure(request: &CollectionRequest, error: &str, attempted_at: 
                 collector_effort: Some(collector_effort),
                 collector_version: COLLECTOR_VERSION.to_string(),
                 findings_count: 0,
+                followup_count: 0,
                 attempted_at,
                 completed_at: Some(now),
                 role_assignment_id,
@@ -3022,6 +3100,16 @@ mod tests {
         task_id: Option<i64>,
         force_fail: bool,
     ) -> CollectionRequest {
+        if let Some(task_id) = task_id {
+            let conn = db::open(db).unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO tasks(
+                     id,title,status,created_by,created_at,updated_at)
+                 VALUES (?1,'collector fixture','done','test',1,1)",
+                [task_id],
+            )
+            .unwrap();
+        }
         let mut env_vars = Vec::new();
         if force_fail {
             env_vars.push(("FAKE_AGENT_COLLECTOR_FAIL".to_string(), "1".to_string()));
@@ -3089,6 +3177,7 @@ mod tests {
         let run = review_findings::get_run(&conn, 410).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Success);
         assert_eq!(run.findings_count, 1);
+        assert_eq!(run.followup_count, 0);
         assert!(run.error.is_none());
     }
 
@@ -3171,6 +3260,7 @@ mod tests {
         let run = review_findings::get_run(&conn, 411).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Success);
         assert_eq!(run.findings_count, 1);
+        assert_eq!(run.followup_count, 1);
         assert_eq!(run.error.as_deref(), outcome.error.as_deref());
         assert_eq!(review_findings::list_for_pr(&conn, 411).unwrap().len(), 1);
     }
@@ -3201,6 +3291,7 @@ mod tests {
         let run = review_findings::get_run(&conn, 412).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Failed);
         assert_eq!(run.findings_count, 0);
+        assert_eq!(run.followup_count, 0);
         assert!(run
             .error
             .as_deref()
@@ -3237,6 +3328,7 @@ mod tests {
         let run = review_findings::get_run(&conn, 42).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Success);
         assert_eq!(run.findings_count, 2);
+        assert_eq!(run.followup_count, 0);
         assert!(run.error.is_none());
         assert_eq!(run.collector_version, COLLECTOR_VERSION);
         assert_eq!(run.role_assignment_id, Some(77));
@@ -3263,6 +3355,135 @@ mod tests {
         assert_eq!(findings[1].pushback_accepted, Some(true));
         assert_eq!(findings[1].evidence[0].kind, "issue_comment");
         assert_eq!(findings[1].evidence[0].id, 202);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_success_persists_first_followup_batch_and_never_replaces_it() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let mut request = live_request(dir.path(), &db, 420, Some(7), false);
+        let first_response = response(vec![finding("suggestion", 101)], vec![artifact(101)]);
+        request
+            .env_vars
+            .push(("FAKE_AGENT_COLLECTOR_RESPONSE".to_string(), first_response));
+
+        run_live(&request).await.unwrap();
+
+        let conn = db::open(&db).unwrap();
+        let first = quorum_core::review_followup_reads::get_batch(&conn, 420)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.batch().task_id(), 7);
+        assert_eq!(first.batch().source_task_id(), 7);
+        assert_eq!(first.batch().artifact_count(), 1);
+        assert_eq!(first.artifacts().len(), 1);
+        assert!(first.artifacts()[0]
+            .concern()
+            .contains("loses the pending operation"));
+        assert_eq!(
+            review_findings::get_run(&conn, 420)
+                .unwrap()
+                .unwrap()
+                .followup_count,
+            1
+        );
+        drop(conn);
+
+        let mut replacement_artifact = artifact(101);
+        replacement_artifact["concern"]["failure_mode"] =
+            serde_json::json!("replacement concern must not win");
+        let mut retry = live_request(dir.path(), &db, 420, Some(7), false);
+        retry.env_vars.push((
+            "FAKE_AGENT_COLLECTOR_RESPONSE".to_string(),
+            response(vec![finding("suggestion", 101)], vec![replacement_artifact]),
+        ));
+
+        run_live(&retry).await.unwrap();
+
+        let conn = db::open(&db).unwrap();
+        let retained = quorum_core::review_followup_reads::get_batch(&conn, 420)
+            .unwrap()
+            .unwrap();
+        assert!(retained.artifacts()[0]
+            .concern()
+            .contains("loses the pending operation"));
+        assert!(!retained.artifacts()[0]
+            .concern()
+            .contains("replacement concern"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM review_followup_batches WHERE pr_number=420",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manual_interpretation_does_not_create_followup_batch() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let mut request = live_request(dir.path(), &db, 421, None, false);
+        request.env_vars.push((
+            "FAKE_AGENT_COLLECTOR_RESPONSE".to_string(),
+            response(vec![finding("suggestion", 101)], vec![artifact(101)]),
+        ));
+
+        run_live(&request).await.unwrap();
+
+        let conn = db::open(&db).unwrap();
+        assert!(quorum_core::review_followup_reads::get_batch(&conn, 421)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            review_findings::get_run(&conn, 421)
+                .unwrap()
+                .unwrap()
+                .followup_count,
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_guarded_run_insert_rolls_back_findings_and_followup_batch() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let conn = db::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+             VALUES (7,'collector fixture','done','test',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,pr_number,role,profile_id,
+                 provider,runner,model,effort,pool_key,policy_generation,created_at)
+             VALUES (78,'collector:pr:999',7,999,'collector','profile',
+                     'claude','claude',?1,?2,'collector','g1',1)",
+            rusqlite::params![CLASSIFIER_MODEL, CLASSIFIER_EFFORT],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut request = live_request(dir.path(), &db, 422, Some(7), false);
+        request.role_assignment_id = Some(78);
+        request.env_vars.push((
+            "FAKE_AGENT_COLLECTOR_RESPONSE".to_string(),
+            response(vec![finding("suggestion", 101)], vec![artifact(101)]),
+        ));
+
+        assert!(run_live(&request).await.is_err());
+
+        let conn = db::open(&db).unwrap();
+        assert!(review_findings::list_for_pr(&conn, 422).unwrap().is_empty());
+        assert!(quorum_core::review_followup_reads::get_batch(&conn, 422)
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3307,6 +3528,7 @@ mod tests {
         let run = review_findings::get_run(&conn, 88).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Failed);
         assert_eq!(run.findings_count, 0);
+        assert_eq!(run.followup_count, 0);
         assert!(run.error.is_some());
 
         // No findings written on failure — the analytics table stays clean.
