@@ -460,6 +460,8 @@ CREATE TABLE IF NOT EXISTS review_blocker_reassessments (
 );
 CREATE INDEX IF NOT EXISTS review_blocker_reassessments_task
     ON review_blocker_reassessments(task_id);
+CREATE INDEX IF NOT EXISTS review_blocker_reassessments_agent_run
+    ON review_blocker_reassessments(agent_run_id);
 
 -- Daemon journal: one row per in-flight agent (worker or reviewer). The daemon upserts
 -- on every lifecycle transition so a restart can resurrect agents via `--resume`. Keyed
