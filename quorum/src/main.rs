@@ -1213,18 +1213,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 payload: Some(payload),
             };
             let id = quorum_core::mailbox::append(&mut conn, &row)?;
-            drop(conn);
-            let response = wait_for_review_draft_response(&db, id)?;
-            let response: serde_json::Value = serde_json::from_str(&response).map_err(|error| {
-                QuorumError::Io(format!(
-                    "daemon returned malformed review-draft response for mailbox {id}: {error}"
-                ))
-            })?;
-            output::emit(&serde_json::json!({
-                "ok": true,
-                "mailbox_id": id,
-                "response": response,
-            }));
+            output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
             Ok(0)
         }
         cli::Command::React {
@@ -1352,7 +1341,18 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 payload: verdict::attestation_payload(Some(blocking)),
             };
             let id = quorum_core::mailbox::append(&mut conn, &row)?;
-            output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
+            drop(conn);
+            let response = wait_for_review_draft_response(&db, id)?;
+            let response: serde_json::Value = serde_json::from_str(&response).map_err(|error| {
+                QuorumError::Io(format!(
+                    "daemon returned malformed review-draft response for mailbox {id}: {error}"
+                ))
+            })?;
+            output::emit(&serde_json::json!({
+                "ok": true,
+                "mailbox_id": id,
+                "response": response,
+            }));
             Ok(0)
         }
         cli::Command::TaskClose {

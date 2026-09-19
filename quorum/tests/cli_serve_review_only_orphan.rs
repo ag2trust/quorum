@@ -285,6 +285,7 @@ fn quorum_done(home: &std::path::Path, args: &[&str]) {
         "worker"
     };
     let run_id = resolve_run_id(home, agent, role);
+    common::submit_review_draft_if_changes(&cargo_bin("quorum"), home, &run_id, agent, args);
     let mut cmd_args = vec!["done"];
     if role == "worker" {
         let mut index = 0;
