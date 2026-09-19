@@ -435,6 +435,32 @@ CREATE TABLE IF NOT EXISTS mailbox (
 );
 CREATE INDEX IF NOT EXISTS mailbox_unconsumed ON mailbox(consumed_at) WHERE consumed_at IS NULL;
 
+-- v80: one universal blocker-reassessment checkpoint per reviewed head and
+-- review role. Rows are prospective only; migration never derives them from
+-- historical reviews or mailbox traffic. The response is returned through
+-- the originating mailbox row's `note` column so the same reviewer turn can
+-- continue after its blocking `review-draft` command completes.
+CREATE TABLE IF NOT EXISTS review_blocker_reassessments (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id          INTEGER NOT NULL REFERENCES tasks(id),
+    pr_number        INTEGER NOT NULL CHECK(pr_number > 0),
+    head_sha         TEXT NOT NULL CHECK(length(head_sha) = 40),
+    review_role      TEXT NOT NULL CHECK(review_role IN ('r1','r2')),
+    reviewer_agent   TEXT NOT NULL,
+    agent_run_id     INTEGER NOT NULL REFERENCES agent_runs(id),
+    draft_mailbox_id INTEGER NOT NULL UNIQUE REFERENCES mailbox(id),
+    blocking_count   INTEGER NOT NULL CHECK(blocking_count > 0),
+    draft_feedback   TEXT NOT NULL
+                     CHECK(length(CAST(draft_feedback AS BLOB)) BETWEEN 1 AND 8192),
+    response_json    TEXT NOT NULL
+                     CHECK(json_valid(response_json)
+                           AND length(CAST(response_json AS BLOB)) <= 16384),
+    created_at       INTEGER NOT NULL,
+    UNIQUE(task_id, pr_number, head_sha, review_role)
+);
+CREATE INDEX IF NOT EXISTS review_blocker_reassessments_task
+    ON review_blocker_reassessments(task_id);
+
 -- Daemon journal: one row per in-flight agent (worker or reviewer). The daemon upserts
 -- on every lifecycle transition so a restart can resurrect agents via `--resume`. Keyed
 -- by agent name (one process per name at any time). Deleted on terminal transitions.

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 79;
+pub const SCHEMA_VERSION: i64 = 80;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1556,6 +1556,9 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                      ON agent_runs(failed_agent_run_id)",
             )?;
         }
+        // v80 adds the prospective-only blocker reassessment checkpoint table
+        // through SCHEMA_SQL. No historical reviews or mailbox rows are
+        // interpreted or backfilled.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -5886,6 +5889,69 @@ END;
             .unwrap();
         assert_eq!(title, "pre-v9");
         assert_eq!(status, "open");
+    }
+
+    #[test]
+    fn populated_v79_migration_adds_empty_reassessment_storage_without_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v79-reassessment.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(id,title,status,created_by,reviewer,created_at,updated_at)
+                 VALUES (7,'existing review','in-review','owner','R1',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO mailbox(
+                     id,agent,kind,task_id,pr,feedback,payload,created_at,consumed_at)
+                 VALUES (8,'R1','review_draft',7,42,'legacy blocker',
+                         '{\"blocking\":1}',2,3)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "DROP TABLE review_blocker_reassessments;
+                 PRAGMA user_version=79;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert!(table_exists(&conn, "review_blocker_reassessments").unwrap());
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM review_blocker_reassessments",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "migration must not reinterpret historical review drafts"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT title || ':' || status || ':' || reviewer FROM tasks WHERE id=7",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "existing review:in-review:R1"
+        );
+        assert_eq!(
+            conn.query_row("SELECT feedback FROM mailbox WHERE id=8", [], |row| row
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+            "legacy blocker"
+        );
     }
 
     #[test]

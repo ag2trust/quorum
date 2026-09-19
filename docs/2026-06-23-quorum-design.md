@@ -1095,6 +1095,18 @@ from comment text. Concretely:
   FOLLOW-UP when the primary outcome can remain accurate without cataloguing or
   fixing it. Follow-ups are recorded on the PR but never increase `--blocking`
   or prevent an otherwise valid approval.
+  If the complete audit has one or more candidate blockers, the reviewer must
+  first send `quorum review-draft --blocking N --feedback ...`. This is a
+  synchronous, non-authoritative checkpoint: the daemon binds it to the exact
+  managed reviewer run, role, PR, and reviewed head, then returns neutral
+  guidance asking the same reviewer to reassess every candidate against task
+  scope, repository invariants, supported behavior, sibling paths, and the
+  follow-up boundary. The reviewer updates the PR review if that second pass
+  changes a disposition and only then submits one final verdict. A draft never
+  changes lifecycle, posts a formal GitHub verdict, or starts rework. Every
+  positive-blocker `changes` verdict requires the matching durable checkpoint;
+  a missing, stale, cross-run, cross-role, or old-head checkpoint fails closed.
+  Zero-blocker approvals do not need a draft.
 - **Author/rework agents** address findings on the PR. If disagreeing with a finding,
   the author replies to it on the PR with concrete evidence rather than silently
   ignoring it. The final PR history must let a later collector determine, for each

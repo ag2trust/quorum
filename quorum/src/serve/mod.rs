@@ -58,6 +58,8 @@ use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
+use crate::verdict;
+
 fn load_graph_review_context(db_path: &Path, task_id: i64) -> Result<Option<String>> {
     let conn = quorum_core::db::open(db_path)?;
     quorum_core::decomposition_review::load(&conn, task_id)?
@@ -11192,10 +11194,11 @@ async fn tick(
             continue;
         }
 
-        // A review draft is intentionally non-authoritative continuation context.
-        // Consume it without entering any verdict, teardown, or lifecycle path.
+        // A review draft is a non-authoritative synchronous checkpoint. The
+        // daemon replies into the same CLI call; only a later ordinary verdict
+        // may enter lifecycle handling.
         if row.kind == mailbox::MailboxKind::ReviewDraft {
-            if !consume_review_draft(&db_path, *id, row).await {
+            if !consume_review_draft(config, reviewers, *id, row).await {
                 break;
             }
             continue;
@@ -13756,6 +13759,82 @@ async fn tick(
                     }
                 }
                 Some("changes") => {
+                    // Every ordinary positive-blocker verdict must be preceded
+                    // by the exact run/head/role reassessment checkpoint. A
+                    // forged, stale, or legacy direct changes signal cannot
+                    // start rework.
+                    let role = if reviewers[ri].r2_origin { "r2" } else { "r1" };
+                    let checkpoint_valid =
+                        if let (Some(pr_num), Some(head_sha), Some(agent_run_id)) = (
+                            row.pr,
+                            reviewers[ri].reviewed_head_sha.clone(),
+                            reviewers[ri].agent_run_id,
+                        ) {
+                            let repo = config.repo_dir.clone();
+                            let executor = Arc::clone(&config.merge_executor);
+                            let current_head = tokio::task::spawn_blocking(move || {
+                                executor.head_sha(pr_num, &repo)
+                            })
+                            .await
+                            .ok()
+                            .flatten();
+                            if current_head.as_deref() != Some(head_sha.as_str()) {
+                                false
+                            } else {
+                                let path = db_path.clone();
+                                let reviewer_agent = reviewers[ri].agent_name.clone();
+                                let role = role.to_string();
+                                tokio::task::spawn_blocking(move || -> Result<bool> {
+                                let conn = quorum_core::db::open(&path)?;
+                                quorum_core::review_blocker_reassessments::exists_for_final_changes(
+                                    &conn,
+                                    reviewer_task_id,
+                                    pr_num,
+                                    &head_sha,
+                                    &role,
+                                    &reviewer_agent,
+                                    agent_run_id,
+                                )
+                            })
+                            .await
+                            .map_err(|error| {
+                                QuorumError::Io(format!(
+                                    "review reassessment gate join failed: {error}"
+                                ))
+                            })??
+                            }
+                        } else {
+                            false
+                        };
+                    if !checkpoint_valid {
+                        let reviewer_name = reviewers[ri].agent_name.clone();
+                        log(&format!(
+                            "REASSESSMENT GATE: rejecting changes verdict from {reviewer_name} for task #{reviewer_task_id}; no current exact-run checkpoint"
+                        ));
+                        let reviewer = reviewers.remove(ri);
+                        fire_event(
+                            &db_path,
+                            &reviewer_name,
+                            reviewer_task_id,
+                            &Event::AgentFailed {
+                                reason: "changes verdict rejected: mandatory blocker reassessment checkpoint missing or stale".into(),
+                            },
+                        )
+                        .await;
+                        teardown_reviewer_after_recorded_outcome(
+                            config,
+                            wt_mgr,
+                            name_pool,
+                            reviewer,
+                            "missing-reassessment",
+                        )
+                        .await;
+                        if !consume_mailbox_row(&db_path, *id).await {
+                            break;
+                        }
+                        continue;
+                    }
+
                     // On a #206 demotion the demotion reason leads, but any
                     // feedback the row carried is appended — never dropped —
                     // so the worker still sees the reviewer's actual notes.
@@ -13799,7 +13878,6 @@ async fn tick(
                             .find(|w| w.task_id == reviewer_task_id)
                             .map(|w| w.agent_name.clone())
                             .unwrap_or_default();
-                        let role = if reviewers[ri].r2_origin { "r2" } else { "r1" };
                         let blocking = gated.blocking_count.unwrap_or(0) as i64;
                         let p = db_path.clone();
                         let record = quorum_core::approvals::Approval {
@@ -16662,17 +16740,158 @@ async fn tick(
     Ok(())
 }
 
-/// Consume a non-authoritative reviewer draft without changing lifecycle state.
+/// Validate and answer a non-authoritative reviewer draft without changing
+/// lifecycle state. Deterministic stale/invalid requests receive a rejection
+/// response so the synchronous caller does not hang; transient DB failures
+/// leave the row pending for the next tick.
 async fn consume_review_draft(
-    db_path: &std::path::Path,
+    config: &ServeConfig,
+    reviewers: &[SlotState],
     id: i64,
     row: &mailbox::MailboxRow,
 ) -> bool {
-    log(&format!(
-        "review-draft from {} (task {:?}, pr {:?}, blocking={:?}) consumed without lifecycle action",
-        row.agent, row.task_id, row.pr, row.payload
-    ));
-    consume_mailbox_row(db_path, id).await
+    let reject = |reason: String| async move {
+        let response = serde_json::json!({
+            "accepted": false,
+            "guidance": reason,
+        })
+        .to_string();
+        let path = config.db_path.clone();
+        match tokio::task::spawn_blocking(move || -> Result<bool> {
+            let mut conn = quorum_core::db::open(&path)?;
+            mailbox::reject_review_draft(&mut conn, id, &response)
+        })
+        .await
+        {
+            Ok(Ok(true)) => true,
+            Ok(Ok(false)) => true,
+            Ok(Err(error)) => {
+                log(&format!(
+                    "review-draft rejection write failed for mailbox {id}: {error}"
+                ));
+                false
+            }
+            Err(error) => {
+                log(&format!(
+                    "review-draft rejection join failed for mailbox {id}: {error}"
+                ));
+                false
+            }
+        }
+    };
+
+    let Some(task_id) = row.task_id else {
+        return reject("Review draft rejected: missing managed task identity.".into()).await;
+    };
+    let Some(pr) = row.pr.filter(|pr| *pr > 0) else {
+        return reject("Review draft rejected: missing positive PR identity.".into()).await;
+    };
+    let gated = verdict::gate(None, row.payload.as_deref());
+    let Some(blocking_count) = gated.blocking_count.filter(|count| *count > 0) else {
+        return reject("Review draft rejected: missing positive blocker attestation.".into()).await;
+    };
+    let Some(feedback) = row.feedback.as_deref() else {
+        return reject("Review draft rejected: missing blocker summary.".into()).await;
+    };
+    if let Err(error) = verdict::validate_review_draft(blocking_count, feedback) {
+        return reject(format!("Review draft rejected: {error}")).await;
+    }
+
+    let Some(reviewer) = reviewers.iter().find(|reviewer| {
+        reviewer.agent_name == row.agent && reviewer.task_id == task_id && reviewer.pr == Some(pr)
+    }) else {
+        return reject(
+            "Review draft rejected: this process no longer owns the active review. Do not submit a verdict from this stale run."
+                .into(),
+        )
+        .await;
+    };
+    let Some(agent_run_id) = reviewer.agent_run_id else {
+        return reject(
+            "Review draft rejected: the active reviewer run has no durable run identity. Do not submit a verdict."
+                .into(),
+        )
+        .await;
+    };
+    let Some(reviewed_head_sha) = reviewer.reviewed_head_sha.clone() else {
+        return reject(
+            "Review draft rejected: the active reviewer has no recorded PR head. Do not submit a verdict."
+                .into(),
+        )
+        .await;
+    };
+
+    let repo = config.repo_dir.clone();
+    let executor = Arc::clone(&config.merge_executor);
+    let current_head = tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+        .await
+        .ok()
+        .flatten();
+    if current_head.as_deref() != Some(reviewed_head_sha.as_str()) {
+        return reject(format!(
+            "Review draft rejected: PR #{pr} no longer has the reviewed head. Do not submit a verdict for the stale diff."
+        ))
+        .await;
+    }
+
+    let review_role = if reviewer.r2_origin { "r2" } else { "r1" };
+    let guidance = reviewer::build_blocker_reassessment_guidance(blocking_count, feedback);
+    let response = serde_json::json!({
+        "accepted": true,
+        "review_role": review_role,
+        "blocking_draft": blocking_count,
+        "guidance": guidance,
+    })
+    .to_string();
+    let authority = quorum_core::review_blocker_reassessments::ReviewDraftAuthority {
+        task_id,
+        pr_number: pr,
+        head_sha: reviewed_head_sha,
+        review_role: review_role.into(),
+        reviewer_agent: row.agent.clone(),
+        agent_run_id,
+        blocking_count,
+        draft_feedback: feedback.to_string(),
+    };
+    let path = config.db_path.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut conn = quorum_core::db::open(&path)?;
+        quorum_core::review_blocker_reassessments::record_and_respond(
+            &mut conn,
+            id,
+            &authority,
+            &response,
+            now_unix(),
+        )
+    })
+    .await;
+    match outcome {
+        Ok(Ok(outcome)) => {
+            log(&format!(
+                "review-draft checkpoint {outcome:?} for {} task #{} PR #{} {} ({} blocker(s)); lifecycle unchanged",
+                row.agent, task_id, pr, review_role.to_uppercase(), blocking_count
+            ));
+            true
+        }
+        Ok(Err(QuorumError::Usage(error))) => {
+            reject(format!(
+                "Review draft rejected after authority revalidation: {error}. Do not submit a verdict from this stale run."
+            ))
+            .await
+        }
+        Ok(Err(error)) => {
+            log(&format!(
+                "review-draft checkpoint write failed for mailbox {id}: {error}"
+            ));
+            false
+        }
+        Err(error) => {
+            log(&format!(
+                "review-draft checkpoint join failed for mailbox {id}: {error}"
+            ));
+            false
+        }
+    }
 }
 
 /// Consume a mailbox row. Returns false on failure (caller should break and retry next tick).
@@ -26490,6 +26709,165 @@ mod tests {
 
     const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
+    #[tokio::test]
+    async fn review_draft_returns_same_turn_guidance_without_lifecycle_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("review-draft.db");
+        let (task_id, agent_run_id, mailbox_id, row) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "review draft fixture",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='in-review',assignee='Worker',reviewer='R1',rework_round=2 WHERE id=?1",
+                [task_id],
+            )
+            .unwrap();
+            let agent_run_id = conn
+                .query_row(
+                    "INSERT INTO agent_runs(
+                         task_id,agent_name,role,model,effort,spawned_at,sub_role,
+                         review_pr,review_head_sha)
+                     VALUES (?1,'R1','reviewer','model','high',1,NULL,77,?2)
+                     RETURNING id",
+                    rusqlite::params![task_id, REVIEW_SHA],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            let row = mailbox::MailboxRow {
+                agent: "R1".into(),
+                kind: mailbox::MailboxKind::ReviewDraft,
+                task_id: Some(task_id),
+                pr: Some(77),
+                verdict: None,
+                feedback: Some("Cancellation can lose the pending operation.".into()),
+                note: None,
+                to_agent: None,
+                payload: Some("{\"blocking\":1}".into()),
+            };
+            let mailbox_id = mailbox::append(&mut conn, &row).unwrap();
+            (task_id, agent_run_id, mailbox_id, row)
+        };
+
+        let mut config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
+        config.merge_executor = Arc::new(ResumeHeadPollingExecutor {
+            heads: std::sync::Mutex::new([Some(REVIEW_SHA.to_string())].into()),
+            head_calls: std::sync::atomic::AtomicUsize::new(0),
+            wait_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let now = std::time::Instant::now();
+        let reviewers = vec![SlotState {
+            agent_name: "R1".into(),
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Claude,
+            },
+            task_id,
+            session_id: "review-session".into(),
+            model: "model".into(),
+            effort: "high".into(),
+            worktree_path: dir.path().to_path_buf(),
+            branch: "review/r1".into(),
+            remote_branch: "review/r1".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: Some(77),
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            fallback_install_error_count: 0,
+            last_error_text: None,
+            agent_run_id: Some(agent_run_id),
+            cap_run_id: Some("cap-r1".into()),
+            r2_origin: false,
+            reviewed_head_sha: Some(REVIEW_SHA.into()),
+            continuation_id: None,
+            pending_prompt: "initial review".into(),
+            pending_turn_kind: "initial".into(),
+        }];
+
+        let before = {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.query_row(
+                "SELECT status,reviewer,rework_round FROM tasks WHERE id=?1",
+                [task_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+
+        assert!(consume_review_draft(&config, &reviewers, mailbox_id, &row).await);
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT status,reviewer,rework_round FROM tasks WHERE id=?1",
+                [task_id],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?
+                ))
+            )
+            .unwrap(),
+            before
+        );
+        let response = mailbox::review_draft_response(&conn, mailbox_id)
+            .unwrap()
+            .unwrap();
+        let mailbox::ReviewDraftResponse::Ready(response) = response else {
+            panic!("review draft response must be ready")
+        };
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["accepted"], true);
+        assert!(response["guidance"]
+            .as_str()
+            .unwrap()
+            .contains("neutral second assessment"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM review_blocker_reassessments WHERE task_id=?1",
+                [task_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM approvals", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
     /// The backstop counts only *consecutive* unrecordable strikes: one strike
     /// that does record clears it, so a transient write-lock holder can never
     /// accumulate three and park a task.
@@ -26513,131 +26891,6 @@ mod tests {
             "counting restarts after a success"
         );
         assert_eq!(strikes.count(7, 99), 1, "clearing one key leaves others");
-    }
-
-    #[tokio::test]
-    async fn review_draft_consumption_is_lifecycle_inert() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("review-draft.db");
-        let (task_id, mailbox_id, row) = {
-            let mut conn = quorum_core::db::open(&db_path).unwrap();
-            let task_id = tasks::create(
-                &mut conn,
-                "owner",
-                "review draft fixture",
-                None,
-                0,
-                None,
-                None,
-                None,
-                None,
-                1,
-            )
-            .unwrap();
-            conn.execute(
-                "UPDATE tasks SET status='in-review', assignee='Worker', reviewer='R1', rework_round=2 WHERE id=?1",
-                [task_id],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO claims(target,holder,ts,expires_at,active) VALUES (?1,'R1',1,?2,1)",
-                rusqlite::params![format!("task#{task_id}"), now_unix() + 60],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO journal(agent,role,task_id,session_id,phase,pr,updated_at)
-                 VALUES ('R1','reviewer',?1,'session-r1','reviewing',77,1)",
-                [task_id],
-            )
-            .unwrap();
-            let row = mailbox::MailboxRow {
-                agent: "R1".into(),
-                kind: mailbox::MailboxKind::ReviewDraft,
-                task_id: Some(task_id),
-                pr: Some(77),
-                verdict: None,
-                feedback: Some("Need a second analysis turn for cancellation.".into()),
-                note: None,
-                to_agent: None,
-                payload: Some("{\"blocking\":1}".into()),
-            };
-            let mailbox_id = mailbox::append(&mut conn, &row).unwrap();
-            (task_id, mailbox_id, row)
-        };
-
-        let snapshot = |conn: &quorum_core::Connection,
-                        task_id|
-         -> (
-            String,
-            Option<String>,
-            Option<String>,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-        ) {
-            let task = conn
-                .query_row(
-                    "SELECT status,assignee,reviewer,rework_round FROM tasks WHERE id=?1",
-                    [task_id],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                )
-                .unwrap();
-            let approvals = conn
-                .query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get(0))
-                .unwrap();
-            let active_claims = conn
-                .query_row("SELECT COUNT(*) FROM claims WHERE active=1", [], |r| {
-                    r.get(0)
-                })
-                .unwrap();
-            let reviewer_slots = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM journal WHERE agent='R1' AND role='reviewer'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            let worker_notifications = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM messages WHERE recipient='Worker'",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            (
-                task.0,
-                task.1,
-                task.2,
-                task.3,
-                approvals,
-                active_claims,
-                reviewer_slots,
-                worker_notifications,
-            )
-        };
-        let before = {
-            let conn = quorum_core::db::open(&db_path).unwrap();
-            snapshot(&conn, task_id)
-        };
-
-        assert!(consume_review_draft(&db_path, mailbox_id, &row).await);
-
-        let conn = quorum_core::db::open(&db_path).unwrap();
-        assert_eq!(
-            snapshot(&conn, task_id),
-            before,
-            "draft must not mutate lifecycle authority"
-        );
-        let consumed: bool = conn
-            .query_row(
-                "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
-                [mailbox_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(consumed, "draft must be safely consumed");
     }
 
     #[test]
@@ -35782,6 +36035,44 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 now + 2,
             )
             .unwrap();
+            let reviewed_head = "0123456789abcdef0123456789abcdef01234567";
+            conn.execute(
+                "UPDATE agent_runs SET review_pr=464,review_head_sha=?1 WHERE id=?2",
+                rusqlite::params![reviewed_head, run_id],
+            )
+            .unwrap();
+            let draft_mailbox_id = mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "Phase2Reviewer".into(),
+                    kind: mailbox::MailboxKind::ReviewDraft,
+                    task_id: Some(task_id),
+                    pr: Some(464),
+                    verdict: None,
+                    feedback: Some("fix the blocker".into()),
+                    note: None,
+                    to_agent: None,
+                    payload: Some("{\"blocking\":1}".into()),
+                },
+            )
+            .unwrap();
+            quorum_core::review_blocker_reassessments::record_and_respond(
+                &mut conn,
+                draft_mailbox_id,
+                &quorum_core::review_blocker_reassessments::ReviewDraftAuthority {
+                    task_id,
+                    pr_number: 464,
+                    head_sha: reviewed_head.into(),
+                    review_role: "r1".into(),
+                    reviewer_agent: "Phase2Reviewer".into(),
+                    agent_run_id: run_id,
+                    blocking_count: 1,
+                    draft_feedback: "fix the blocker".into(),
+                },
+                r#"{"accepted":true,"guidance":"reassess"}"#,
+                now + 3,
+            )
+            .unwrap();
             let mailbox_id = mailbox::append(
                 &mut conn,
                 &mailbox::MailboxRow {
@@ -35800,6 +36091,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             (task_id, run_id, mailbox_id)
         };
         let mut config = pre_review_ci_test_config(db_path.clone(), repo_dir.clone());
+        config.merge_executor = Arc::new(FallbackHeadExecutor(
+            "0123456789abcdef0123456789abcdef01234567".into(),
+        ));
         config.limits = CostLimits {
             max_task_tokens: Some(100),
             ..Default::default()
@@ -35817,7 +36111,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 task_id,
                 reviewer_run_id,
                 agent: "Phase2Reviewer".into(),
-                reviewed_head_sha: None,
+                reviewed_head_sha: Some("0123456789abcdef0123456789abcdef01234567".into()),
             },
         );
 
