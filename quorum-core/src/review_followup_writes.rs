@@ -171,11 +171,23 @@ pub fn insert_batch_if_absent(
     conn: &mut Connection,
     value: &NewReviewFollowupBatch,
 ) -> Result<InsertReviewFollowupBatchOutcome> {
+    let tx = begin_immediate(conn)?;
+    let outcome = insert_batch_if_absent_inner(&tx, value)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(outcome)
+}
+
+/// Insert one immutable batch inside a transaction owned by a wider atomic
+/// operation. The caller is responsible for beginning and committing the
+/// transaction.
+pub(crate) fn insert_batch_if_absent_inner(
+    conn: &Connection,
+    value: &NewReviewFollowupBatch,
+) -> Result<InsertReviewFollowupBatchOutcome> {
     let batch = value.batch();
     let artifact_count = i64::try_from(batch.artifact_count())
         .map_err(|_| QuorumError::Usage("follow-up artifact count is not representable".into()))?;
-    let tx = begin_immediate(conn)?;
-    let inserted = tx
+    let inserted = conn
         .execute(
             "INSERT INTO review_followup_batches(
                  pr_number,task_id,graph_id,source_task_id,collector_version,
@@ -197,13 +209,12 @@ pub fn insert_batch_if_absent(
         .map_err(map_sql_err)?;
 
     if inserted == 0 {
-        tx.commit().map_err(map_sql_err)?;
         return Ok(InsertReviewFollowupBatchOutcome::AlreadyExists);
     }
 
     for value in value.artifacts() {
         let artifact = value.artifact();
-        tx.execute(
+        conn.execute(
             "INSERT INTO review_followup_artifacts(
                  pr_number,ordinal,technical_impact,scope_relationship,concern,
                  non_blocking_reason,affected_behavior,desired_outcome,
@@ -228,7 +239,6 @@ pub fn insert_batch_if_absent(
         .map_err(map_sql_err)?;
     }
 
-    tx.commit().map_err(map_sql_err)?;
     Ok(InsertReviewFollowupBatchOutcome::Inserted)
 }
 
