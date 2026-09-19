@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 80;
+pub const SCHEMA_VERSION: i64 = 81;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1559,6 +1559,8 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
         // v80 adds the prospective-only blocker reassessment checkpoint table
         // through SCHEMA_SQL. No historical reviews or mailbox rows are
         // interpreted or backfilled.
+        // v81 likewise adds prospective-only follow-up GitHub issue intents.
+        // Dormant historical artifact rows are neither staged nor backfilled.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -5951,6 +5953,71 @@ END;
             ))
             .unwrap(),
             "legacy blocker"
+        );
+    }
+
+    #[test]
+    fn populated_v80_migration_adds_empty_issue_intents_without_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v80-followup-issues.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (7,'merged source','done','owner',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO review_followup_batches(
+                     pr_number,task_id,source_task_id,collector_version,artifact_count,
+                     state,created_at,updated_at)
+                 VALUES (42,7,7,'v1',1,'collected',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO review_followup_artifacts(
+                     pr_number,ordinal,technical_impact,scope_relationship,concern,
+                     non_blocking_reason,affected_behavior,desired_outcome,
+                     verification_expectations,evidence_ids,created_at,updated_at)
+                 VALUES (42,0,'minor','out_of_scope','legacy concern','safe to defer',
+                         'behavior','outcome','[\"verify\"]',
+                         '[{\"kind\":\"review\",\"id\":1}]',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "DROP TABLE review_followup_issue_intent_artifacts;
+                 DROP TABLE review_followup_issue_intents;
+                 PRAGMA user_version=80;",
+            )
+            .unwrap();
+        }
+
+        let conn = open(&path).unwrap();
+        for table in [
+            "review_followup_issue_intents",
+            "review_followup_issue_intent_artifacts",
+        ] {
+            assert!(table_exists(&conn, table).unwrap());
+            assert_eq!(
+                conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+                0,
+                "migration must not stage historical follow-up work"
+            );
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT concern FROM review_followup_artifacts WHERE pr_number=42",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "legacy concern"
         );
     }
 

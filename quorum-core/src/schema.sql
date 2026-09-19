@@ -919,6 +919,65 @@ CREATE TABLE IF NOT EXISTS review_followup_assessment_artifacts (
     PRIMARY KEY (assessment_id, artifact_id)
 );
 
+-- v81: prospective-only GitHub issue materialization for review follow-ups.
+-- The planner records bounded intents; the daemon alone performs external
+-- issue creation. The marker makes a retry discoverable after a crash between
+-- GitHub success and the local completion write. Existing dormant task-link
+-- columns above are retained for schema compatibility and are not backfilled.
+CREATE TABLE IF NOT EXISTS review_followup_issue_intents (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    assessment_id      INTEGER NOT NULL REFERENCES review_followup_assessments(id),
+    ordinal            INTEGER NOT NULL,
+    decision           TEXT NOT NULL CHECK(decision IN ('create','link','dismiss','defer')),
+    state              TEXT NOT NULL CHECK(state IN ('pending','backoff','held','completed')),
+    reason             TEXT NOT NULL,
+    title              TEXT,
+    body               TEXT,
+    labels_json        TEXT,
+    issue_number       INTEGER,
+    issue_url          TEXT,
+    dismiss_category   TEXT CHECK(dismiss_category IS NULL OR dismiss_category IN (
+                           'invalid','obsolete','already_resolved','out_of_product')),
+    required_decision  TEXT,
+    idempotency_marker TEXT NOT NULL UNIQUE,
+    attempts           INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 3),
+    last_attempt_at    INTEGER,
+    last_error         TEXT,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    UNIQUE(assessment_id, ordinal),
+    CHECK(
+        CASE decision
+            WHEN 'create' THEN title IS NOT NULL AND body IS NOT NULL
+                 AND labels_json IS NOT NULL AND dismiss_category IS NULL
+                 AND required_decision IS NULL
+                 AND ((state IN ('pending','backoff','held')
+                       AND issue_number IS NULL AND issue_url IS NULL)
+                      OR (state='completed' AND issue_number > 0 AND issue_url IS NOT NULL))
+            WHEN 'link' THEN state='completed' AND title IS NULL AND body IS NULL
+                 AND labels_json IS NULL AND issue_number > 0 AND issue_url IS NOT NULL
+                 AND dismiss_category IS NULL AND required_decision IS NULL
+            WHEN 'dismiss' THEN state='completed' AND title IS NULL AND body IS NULL
+                 AND labels_json IS NULL AND issue_number IS NULL AND issue_url IS NULL
+                 AND dismiss_category IS NOT NULL AND required_decision IS NULL
+            WHEN 'defer' THEN state='completed' AND title IS NULL AND body IS NULL
+                 AND labels_json IS NULL AND issue_number IS NULL AND issue_url IS NULL
+                 AND dismiss_category IS NULL AND required_decision IS NOT NULL
+            ELSE 0
+        END
+    )
+);
+CREATE INDEX IF NOT EXISTS review_followup_issue_intents_assessment
+    ON review_followup_issue_intents(assessment_id);
+CREATE INDEX IF NOT EXISTS review_followup_issue_intents_pending
+    ON review_followup_issue_intents(state, id) WHERE state='pending';
+
+CREATE TABLE IF NOT EXISTS review_followup_issue_intent_artifacts (
+    intent_id   INTEGER NOT NULL REFERENCES review_followup_issue_intents(id),
+    artifact_id INTEGER NOT NULL UNIQUE REFERENCES review_followup_artifacts(id),
+    PRIMARY KEY(intent_id, artifact_id)
+);
+
 -- v45: memberships are append-once at the storage boundary. These triggers
 -- also retrofit immutability onto v44 databases without recreating the table.
 CREATE TRIGGER IF NOT EXISTS review_followup_membership_no_update

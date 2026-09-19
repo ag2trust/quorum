@@ -4682,9 +4682,9 @@ async fn fold_late_reviewer_verdict(
             (None, None) => "Changes requested.".to_string(),
         }
     });
-    // A changed PR invalidates an approval, not a changes verdict. Changes
-    // must still enter durable rework before stateless recovery discards
-    // the reviewer journal identity; no approval is being stamped.
+    // Both verdicts are bound to the exact reviewed head. Approvals already
+    // used the worktree witness; changes additionally require the durable
+    // blocker-reassessment checkpoint from the exact managed run.
     let reviewed_sha = if verdict == tasks::LateReviewerVerdict::Approved {
         let p = config.db_path.clone();
         let agent = row.agent.clone();
@@ -4729,7 +4729,59 @@ async fn fold_late_reviewer_verdict(
         }
         reviewed_sha
     } else {
-        String::new()
+        let p = config.db_path.clone();
+        let agent = row.agent.clone();
+        let authority = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let conn = quorum_core::db::open(&p)?;
+            let run: Option<(i64, Option<String>, Option<String>)> = conn
+                .query_row(
+                    "SELECT id,sub_role,review_head_sha FROM agent_runs
+                     WHERE task_id=?1 AND agent_name=?2 AND role='reviewer'
+                       AND review_pr=?3 ORDER BY id DESC LIMIT 1",
+                    rusqlite::params![task_id, agent, pr],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((run_id, sub_role, Some(head_sha))) = run else {
+                return Ok(None);
+            };
+            let role = if sub_role.as_deref() == Some("r2") {
+                "r2"
+            } else {
+                "r1"
+            };
+            Ok(
+                quorum_core::review_blocker_reassessments::exists_for_final_changes(
+                    &conn, task_id, pr, &head_sha, role, &agent, run_id,
+                )?
+                .then_some(head_sha),
+            )
+        })
+        .await
+        .map_err(|error| {
+            QuorumError::Io(format!("late changes reassessment join failed: {error}"))
+        })??;
+        let Some(reviewed_sha) = authority else {
+            log(&format!(
+                "startup verdict recovery: changes from {} for task #{} lacks an exact blocker reassessment checkpoint; retaining for fresh review",
+                row.agent, task_id
+            ));
+            return Ok(None);
+        };
+        let repo = config.repo_dir.clone();
+        let executor = Arc::clone(&config.merge_executor);
+        let current_sha = tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+            .await
+            .ok()
+            .flatten();
+        if current_sha.as_deref() != Some(reviewed_sha.as_str()) {
+            log(&format!(
+                "startup verdict recovery: PR #{pr} changed since {} reassessed blockers; retaining changes verdict for fresh review",
+                row.agent
+            ));
+            return Ok(None);
+        }
+        reviewed_sha
     };
     let p = config.db_path.clone();
     let agent = row.agent.clone();
@@ -16630,6 +16682,14 @@ async fn tick(
         }
     }
 
+    // ── Phase 7.6: daemon-owned review follow-up issue outbox ────────
+    // The planner only stages durable intents. External GitHub mutation runs
+    // here with no DB transaction open, then the exact intent is completed in
+    // a second short transaction. Marker lookup makes crash replay converge.
+    if !drain_state.draining && !decomposition_freeze {
+        reconcile_followup_issue_intent(config).await?;
+    }
+
     // ── Phase 8: Doctor agent ────────────────────────────────────────
     // 8a: Drain events from in-flight doctor.
     if let Some(slot) = doctor_slot.as_mut() {
@@ -16737,6 +16797,102 @@ async fn tick(
     }
 
     tokio::time::sleep(tick_pacing()).await;
+    Ok(())
+}
+
+async fn reconcile_followup_issue_intent(config: &ServeConfig) -> Result<()> {
+    let path = config.db_path.clone();
+    let now = now_unix();
+    let intent = tokio::task::spawn_blocking(move || -> Result<_> {
+        let conn = quorum_core::db::open(&path)?;
+        Ok(
+            quorum_core::review_followup_issues::pending_issue_intents(&conn, 1, now)?
+                .into_iter()
+                .next(),
+        )
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("follow-up issue read join failed: {error}")))??;
+    let Some(intent) = intent else {
+        return Ok(());
+    };
+
+    let executor = Arc::clone(&config.merge_executor);
+    let repo = config.repo_dir.clone();
+    let title = intent.title.clone();
+    let body = intent.body.clone();
+    let labels = intent.labels.clone();
+    let marker = intent.idempotency_marker.clone();
+    let external = tokio::task::spawn_blocking(move || {
+        executor.ensure_followup_issue(&repo, &title, &body, &labels, &marker)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("follow-up issue executor join failed: {error}")))?;
+
+    match external {
+        Ok(issue) => {
+            let path = config.db_path.clone();
+            let issue_url = issue.url.clone();
+            let intent_id = intent.id;
+            let assessment_id = intent.assessment_id;
+            let completed = tokio::task::spawn_blocking(move || -> Result<(bool, bool)> {
+                let mut conn = quorum_core::db::open(&path)?;
+                let completed = quorum_core::review_followup_issues::complete_issue_intent(
+                    &mut conn,
+                    intent_id,
+                    issue.number,
+                    &issue_url,
+                    now_unix(),
+                )?;
+                let finalized = quorum_core::review_followup_issues::finalize_assessment(
+                    &mut conn,
+                    assessment_id,
+                    now_unix(),
+                )?;
+                Ok((completed, finalized))
+            })
+            .await
+            .map_err(|error| {
+                QuorumError::Io(format!("follow-up issue completion join failed: {error}"))
+            })??;
+            log(&format!(
+                "follow-up issue: {} #{} for assessment #{} intent #{} (recorded={}, assessment_complete={})",
+                if issue.created { "created" } else { "recovered" },
+                issue.number,
+                intent.assessment_id,
+                intent.id,
+                completed.0,
+                completed.1,
+            ));
+        }
+        Err(error) => {
+            let summary = truncate_utf8_bytes(
+                &error,
+                quorum_core::review_followups::MAX_FOLLOWUP_TEXT_BYTES,
+            )
+            .to_string();
+            let path = config.db_path.clone();
+            let intent_id = intent.id;
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = quorum_core::db::open(&path)?;
+                quorum_core::review_followup_issues::record_issue_failure(
+                    &mut conn,
+                    intent_id,
+                    &summary,
+                    now_unix(),
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|join| {
+                QuorumError::Io(format!("follow-up issue failure join failed: {join}"))
+            })??;
+            log(&format!(
+                "follow-up issue: intent #{} failed and entered bounded retry: {}",
+                intent.id, error
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -26868,6 +27024,164 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct FollowupIssueExecutor {
+        calls: Mutex<Vec<(String, String, Vec<String>, String)>>,
+    }
+
+    impl merge::MergeExecutor for FollowupIssueExecutor {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: false,
+                message: "not used".into(),
+                failure_kind: Some(merge::MergeFailureKind::PolicyBlocked),
+            }
+        }
+
+        fn ensure_followup_issue(
+            &self,
+            _repo_dir: &Path,
+            title: &str,
+            body: &str,
+            labels: &[String],
+            marker: &str,
+        ) -> std::result::Result<merge::FollowupIssueResult, String> {
+            self.calls.lock().unwrap().push((
+                title.into(),
+                body.into(),
+                labels.to_vec(),
+                marker.into(),
+            ));
+            Ok(merge::FollowupIssueResult {
+                number: 123,
+                url: "https://github.com/o/r/issues/123".into(),
+                created: true,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_materializes_staged_followup_issue_and_completes_assessment() {
+        use quorum_core::review_followup_issues::{
+            AssessmentOutcome, FollowupIssuePlan, IssueDecision, IssueType, ProposedIssue,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("followup-issue-daemon.db");
+        let artifact_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (1,'source','done','owner',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO review_followup_batches(
+                     pr_number,task_id,source_task_id,collector_version,artifact_count,
+                     state,created_at,updated_at)
+                 VALUES (42,1,1,'v1',1,'assessing',1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO review_followup_artifacts(
+                     pr_number,ordinal,technical_impact,scope_relationship,concern,
+                     non_blocking_reason,affected_behavior,desired_outcome,
+                     verification_expectations,evidence_ids,created_at,updated_at)
+                 VALUES (42,0,'minor','out_of_scope','failure','safe to defer','behavior',
+                         'desired','[\"verify\"]','[{\"kind\":\"review\",\"id\":1}]',1,1)",
+                [],
+            )
+            .unwrap();
+            let artifact_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO review_followup_assessments(
+                     id,target,scope_kind,scope_id,source_task_id,state,active,
+                     membership_sealed,created_at,updated_at)
+                 VALUES (7,'followup:task:1','task',1,1,'pending',0,0,1,1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO review_followup_assessment_artifacts(assessment_id,artifact_id)
+                 VALUES (7,?1)",
+                [artifact_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE review_followup_assessments
+                 SET membership_sealed=1,state='planning',active=1 WHERE id=7",
+                [],
+            )
+            .unwrap();
+            let plan = FollowupIssuePlan {
+                outcome: AssessmentOutcome::Assessment,
+                decisions: vec![IssueDecision::Create {
+                    artifact_ids: vec![artifact_id],
+                    reason: "separate post-merge work".into(),
+                    issue: ProposedIssue {
+                        title: "Harden shutdown".into(),
+                        issue_type: IssueType::Bug,
+                        observable_outcome: "Pending work survives shutdown".into(),
+                        acceptance_criteria: vec!["Pending work completes".into()],
+                        source_constraints: vec!["Preserve the API".into()],
+                        verification_expectations: vec!["Concurrency test".into()],
+                    },
+                }],
+            };
+            quorum_core::review_followup_issues::stage_plan(&mut conn, 7, &plan, &[], 2).unwrap();
+            artifact_id
+        };
+
+        let executor = Arc::new(FollowupIssueExecutor::default());
+        let mut config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
+        config.merge_executor = executor.clone();
+        reconcile_followup_issue_intent(&config).await.unwrap();
+
+        let calls = executor.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "Harden shutdown");
+        assert!(calls[0].1.contains("PR #42"));
+        assert_eq!(calls[0].2, ["review-followup", "bug", "priority:medium"]);
+        assert_eq!(calls[0].3, "quorum-review-followup:7:0");
+        drop(calls);
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT state || ':' || issue_number FROM review_followup_issue_intents",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "completed:123"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT state || ':' || active FROM review_followup_assessments WHERE id=7",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "completed:0"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM review_followup_issue_intent_artifacts WHERE artifact_id=?1",
+                [artifact_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
     /// The backstop counts only *consecutive* unrecordable strikes: one strike
     /// that does record clears it, so a transient write-lock holder can never
     /// accumulate three and park a task.
@@ -29921,7 +30235,10 @@ mod tests {
     async fn racing_reviewer_verdict_wins_over_fallback_conflict_failure() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("reviewer-fallback-verdict-race.db");
-        let (config, task_id, run_id, agent) = seed_reviewer_fallback_failure_fixture(&db_path);
+        let (mut config, task_id, run_id, agent) = seed_reviewer_fallback_failure_fixture(&db_path);
+        config.merge_executor = Arc::new(FallbackHeadExecutor(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        ));
         let mut slot = failed_reviewer_fallback_test_slot(task_id, run_id, agent.clone());
 
         // Mirror the real interleaving: Phase 1 has already taken an empty
@@ -29956,6 +30273,38 @@ mod tests {
                 mailbox::poll_unconsumed(&conn).unwrap().is_empty(),
                 "the Phase 1 snapshot precedes the reviewer submission"
             );
+            let draft_id = mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: agent.clone(),
+                    kind: mailbox::MailboxKind::ReviewDraft,
+                    task_id: Some(task_id),
+                    pr: Some(77),
+                    verdict: None,
+                    feedback: Some("fix the conflict".into()),
+                    note: None,
+                    to_agent: None,
+                    payload: Some(r#"{"blocking":1}"#.into()),
+                },
+            )
+            .unwrap();
+            quorum_core::review_blocker_reassessments::record_and_respond(
+                &mut conn,
+                draft_id,
+                &quorum_core::review_blocker_reassessments::ReviewDraftAuthority {
+                    task_id,
+                    pr_number: 77,
+                    head_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                    review_role: "r1".into(),
+                    reviewer_agent: agent.clone(),
+                    agent_run_id: run_id,
+                    blocking_count: 1,
+                    draft_feedback: "fix the conflict".into(),
+                },
+                r#"{"accepted":true,"guidance":"reassess"}"#,
+                now_unix(),
+            )
+            .unwrap();
             mailbox::append(
                 &mut conn,
                 &mailbox::MailboxRow {
@@ -43758,6 +44107,50 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             now,
         )
         .unwrap();
+        if verdict == Some("changes") {
+            conn.execute(
+                "UPDATE agent_runs SET review_pr=?1,review_head_sha=?2 WHERE id=?3",
+                rusqlite::params![DRAIN_PR, REVIEW_SHA, reviewer_run_id],
+            )
+            .unwrap();
+            let blocker_count = verdict::gate(None, payload)
+                .blocking_count
+                .filter(|count| *count > 0)
+                .expect("changes fixture needs a positive blocker attestation");
+            let draft_feedback = feedback.unwrap_or("changes requested");
+            let draft_id = mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: DRAIN_REVIEWER.into(),
+                    kind: mailbox::MailboxKind::ReviewDraft,
+                    task_id: Some(task_id),
+                    pr: Some(DRAIN_PR),
+                    verdict: None,
+                    feedback: Some(draft_feedback.into()),
+                    note: None,
+                    to_agent: None,
+                    payload: Some(format!(r#"{{"blocking":{blocker_count}}}"#)),
+                },
+            )
+            .unwrap();
+            quorum_core::review_blocker_reassessments::record_and_respond(
+                &mut conn,
+                draft_id,
+                &quorum_core::review_blocker_reassessments::ReviewDraftAuthority {
+                    task_id,
+                    pr_number: DRAIN_PR,
+                    head_sha: REVIEW_SHA.into(),
+                    review_role: "r1".into(),
+                    reviewer_agent: DRAIN_REVIEWER.into(),
+                    agent_run_id: reviewer_run_id,
+                    blocking_count: blocker_count,
+                    draft_feedback: draft_feedback.into(),
+                },
+                r#"{"accepted":true,"guidance":"reassess"}"#,
+                now,
+            )
+            .unwrap();
+        }
         quorum_core::capabilities::issue(
             &mut conn,
             DRAIN_REVIEWER_CAP,
@@ -43909,7 +44302,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             Some(r#"{"blocking":1}"#),
             Some("fix the lock ordering"),
         );
-        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.merge_executor = Arc::new(FallbackHeadExecutor(REVIEW_SHA.into()));
         let wt_mgr = WorktreeManager::new();
         let mut name_pool = Pool::new_generated();
         let mut workers: Vec<SlotState> = Vec::new();
@@ -43969,6 +44363,47 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let task = tasks::get(&conn, fx.task_id).unwrap().unwrap();
         assert_eq!(task.status, "rework");
         assert_eq!(task.rework_round, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn late_changes_without_reassessment_cannot_enter_rework() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("late-changes-no-reassessment.db");
+        let worktree = dir.path().join("reviewer-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let fx = seed_drain_verdict_fixture(
+            &db_path,
+            &worktree,
+            Some("changes"),
+            Some(r#"{"blocking":1}"#),
+            Some("candidate blocker"),
+        );
+        let row = {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute("DELETE FROM review_blocker_reassessments", [])
+                .unwrap();
+            mailbox::poll_unconsumed(&conn)
+                .unwrap()
+                .into_iter()
+                .find(|(id, _)| *id == fx.mailbox_id)
+                .unwrap()
+                .1
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.merge_executor = Arc::new(FallbackHeadExecutor(REVIEW_SHA.into()));
+
+        assert_eq!(
+            fold_late_reviewer_verdict(&config, fx.mailbox_id, &row)
+                .await
+                .unwrap(),
+            None
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, fx.task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(task.rework_round, 0);
+        assert_eq!(mailbox_consumption(&conn, fx.mailbox_id), (0, 1));
     }
 
     #[cfg(unix)]
@@ -44088,7 +44523,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             Some(r#"{"blocking":2}"#),
             Some("two blockers"),
         );
-        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.merge_executor = Arc::new(FallbackHeadExecutor(REVIEW_SHA.into()));
         let wt_mgr = WorktreeManager::new();
         let mut name_pool = Pool::new_generated();
         let mut workers = vec![
