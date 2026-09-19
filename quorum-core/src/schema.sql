@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 78). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 81). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -939,6 +939,7 @@ CREATE TABLE IF NOT EXISTS review_followup_issue_intents (
     dismiss_category   TEXT CHECK(dismiss_category IS NULL OR dismiss_category IN (
                            'invalid','obsolete','already_resolved','out_of_product')),
     required_decision  TEXT,
+    plan_json          TEXT NOT NULL,
     idempotency_marker TEXT NOT NULL UNIQUE,
     attempts           INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 3),
     last_attempt_at    INTEGER,

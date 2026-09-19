@@ -278,6 +278,17 @@ pub trait MergeExecutor: Send + Sync {
     ) -> std::result::Result<FollowupIssueResult, String> {
         Err("follow-up issue creation is unavailable for this executor".into())
     }
+
+    /// Return the bounded repository issue inventory supplied to the
+    /// follow-up planner for exact link validation. The daemon treats this as
+    /// untrusted external input and core validation requires both number and
+    /// canonical URL to match the inventory.
+    fn followup_issue_inventory(
+        &self,
+        _repo_dir: &Path,
+    ) -> std::result::Result<Vec<quorum_core::review_followup_issues::ExistingIssue>, String> {
+        Ok(Vec::new())
+    }
 }
 
 fn gh_pr_state_is_merged(json_output: &str) -> bool {
@@ -1586,6 +1597,72 @@ impl MergeExecutor for GhMergeExecutor {
         }
         self.ensure_followup_label(repo_dir)?;
         self.create_followup_issue(repo_dir, title, body, labels)
+    }
+
+    fn followup_issue_inventory(
+        &self,
+        repo_dir: &Path,
+    ) -> std::result::Result<Vec<quorum_core::review_followup_issues::ExistingIssue>, String> {
+        let limit = quorum_core::review_followup_issues::MAX_EXISTING_ISSUES.to_string();
+        let output = self
+            .build_gh_cmd(
+                &[
+                    "issue",
+                    "list",
+                    "--state",
+                    "all",
+                    "--limit",
+                    &limit,
+                    "--json",
+                    "number,title,url",
+                ],
+                repo_dir,
+            )
+            .output()
+            .map_err(|error| format!("failed to list GitHub issue inventory: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "GitHub issue inventory failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let raw: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("GitHub issue inventory returned invalid JSON: {error}"))?;
+        if raw.len() > quorum_core::review_followup_issues::MAX_EXISTING_ISSUES {
+            return Err("GitHub issue inventory exceeded its bound".into());
+        }
+        raw.into_iter()
+            .map(|issue| {
+                let number = issue
+                    .get("number")
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|number| *number > 0)
+                    .ok_or_else(|| "GitHub issue inventory has an invalid number".to_string())?;
+                let title = issue
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|title| {
+                        !title.is_empty()
+                            && !title.contains('\0')
+                            && title.len() <= quorum_core::review_followups::MAX_FOLLOWUP_TEXT_BYTES
+                    })
+                    .ok_or_else(|| "GitHub issue inventory has an invalid title".to_string())?;
+                let url = issue
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|url| {
+                        url.starts_with("https://github.com/")
+                            && url.contains("/issues/")
+                            && url.len() <= quorum_core::review_followups::MAX_FOLLOWUP_TEXT_BYTES
+                    })
+                    .ok_or_else(|| "GitHub issue inventory has an invalid URL".to_string())?;
+                Ok(quorum_core::review_followup_issues::ExistingIssue {
+                    number,
+                    url: url.to_string(),
+                    title: title.to_string(),
+                })
+            })
+            .collect()
     }
 }
 

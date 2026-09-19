@@ -6010,6 +6010,7 @@ END;
                 "migration must not stage historical follow-up work"
             );
         }
+        assert!(column_exists(&conn, "review_followup_issue_intents", "plan_json").unwrap());
         assert_eq!(
             conn.query_row(
                 "SELECT concern FROM review_followup_artifacts WHERE pr_number=42",

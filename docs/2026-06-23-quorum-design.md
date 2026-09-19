@@ -1665,8 +1665,11 @@ that classifies the finished PR into structured `review_findings` and an immutab
 set of evidence-backed Follow-up Artifacts. The collector runs **after**
 `MergeSucceeded` fires — the task is already `done` and the verdict is final — so
 nothing it does can undo the merge or change the originating task or Task Graph.
-Follow-up Artifacts may later produce separate future Managed Tasks through the
-Planning Agent and daemon-owned materialization described in
+Current-generation Follow-up Artifacts are assessed by the configured Planning Agent against a
+bounded GitHub issue inventory. Quorum atomically stages create/link/dismiss/defer decisions, then
+the daemon alone creates marker-idempotent GitHub issues with controlled provenance, type, and
+impact-derived priority labels. Neither reviewer nor planner receives issue-creation authority.
+No historical follow-up rows are backfilled. The complete contract is described in
 `docs/2026-08-07-review-followup-planning-technical-spec.md`.
 
 **Pipeline:**

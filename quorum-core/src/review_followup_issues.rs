@@ -13,9 +13,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 pub const MAX_CREATED_ISSUES: usize = 8;
+pub const MAX_EXISTING_ISSUES: usize = 128;
 pub const MAX_ISSUE_ATTEMPTS: i64 = 3;
 pub const MAX_ISSUE_BODY_BYTES: usize = 64 * 1024;
 pub const REVIEW_FOLLOWUP_LABEL: &str = "review-followup";
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExistingIssue {
+    pub number: i64,
+    pub url: String,
+    pub title: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -149,7 +158,7 @@ pub enum StageOutcome {
 pub fn parse_and_validate_plan(
     json: &str,
     expected_artifact_ids: &[i64],
-    allowed_issue_numbers: &[i64],
+    allowed_issues: &[ExistingIssue],
 ) -> Result<FollowupIssuePlan> {
     if json.is_empty() || json.len() > MAX_ISSUE_BODY_BYTES || json.contains('\0') {
         return Err(QuorumError::Usage(
@@ -159,14 +168,14 @@ pub fn parse_and_validate_plan(
     let plan: FollowupIssuePlan = serde_json::from_str(json).map_err(|error| {
         QuorumError::Usage(format!("invalid follow-up issue assessment: {error}"))
     })?;
-    validate_plan(&plan, expected_artifact_ids, allowed_issue_numbers)?;
+    validate_plan(&plan, expected_artifact_ids, allowed_issues)?;
     Ok(plan)
 }
 
 pub fn validate_plan(
     plan: &FollowupIssuePlan,
     expected_artifact_ids: &[i64],
-    allowed_issue_numbers: &[i64],
+    allowed_issues: &[ExistingIssue],
 ) -> Result<()> {
     if plan.decisions.is_empty() || plan.decisions.len() > MAX_FOLLOWUP_ARTIFACTS {
         return Err(usage("follow-up assessment must contain 1..=32 decisions"));
@@ -178,9 +187,9 @@ pub fn validate_plan(
     if expected.len() != expected_artifact_ids.len() || expected.iter().any(|id| *id <= 0) {
         return Err(usage("expected follow-up artifact membership is invalid"));
     }
-    let allowed_issues = allowed_issue_numbers
+    let allowed_issues = allowed_issues
         .iter()
-        .copied()
+        .map(|issue| (issue.number, issue.url.as_str()))
         .collect::<HashSet<_>>();
     let mut observed = HashSet::new();
     let mut create_count = 0usize;
@@ -206,7 +215,8 @@ pub fn validate_plan(
                 ..
             } => {
                 if *existing_issue_number <= 0
-                    || !allowed_issues.contains(existing_issue_number)
+                    || !allowed_issues
+                        .contains(&(*existing_issue_number, existing_issue_url.as_str()))
                     || !valid_issue_url(existing_issue_url)
                 {
                     return Err(usage(
@@ -272,7 +282,7 @@ pub fn stage_plan(
     conn: &mut Connection,
     assessment_id: i64,
     plan: &FollowupIssuePlan,
-    allowed_issue_numbers: &[i64],
+    allowed_issues: &[ExistingIssue],
     now: i64,
 ) -> Result<StageOutcome> {
     if assessment_id <= 0 || now < 0 {
@@ -280,15 +290,29 @@ pub fn stage_plan(
     }
     let tx = begin_immediate(conn)?;
     let membership = assessment_membership(&tx, assessment_id)?;
-    validate_plan(plan, &membership, allowed_issue_numbers)?;
+    validate_plan(plan, &membership, allowed_issues)?;
+    let plan_json = serde_json::to_string(plan)
+        .map_err(|error| QuorumError::Io(format!("serialize follow-up issue plan: {error}")))?;
     let existing: i64 = tx.query_row(
         "SELECT count(*) FROM review_followup_issue_intents WHERE assessment_id=?1",
         [assessment_id],
         |row| row.get(0),
     )?;
     if existing > 0 {
+        let stored_plan: Option<String> = tx.query_row(
+            "SELECT min(plan_json) FROM review_followup_issue_intents WHERE assessment_id=?1",
+            [assessment_id],
+            |row| row.get(0),
+        )?;
+        let distinct_plans: i64 = tx.query_row(
+            "SELECT count(DISTINCT plan_json) FROM review_followup_issue_intents WHERE assessment_id=?1",
+            [assessment_id],
+            |row| row.get(0),
+        )?;
         if existing as usize == plan.decisions.len()
             && intent_membership(&tx, assessment_id)? == membership
+            && distinct_plans == 1
+            && stored_plan.as_deref() == Some(plan_json.as_str())
         {
             tx.commit().map_err(map_sql_err)?;
             return Ok(StageOutcome::AlreadyStaged);
@@ -317,8 +341,8 @@ pub fn stage_plan(
             "INSERT INTO review_followup_issue_intents(
                  assessment_id,ordinal,decision,state,reason,title,body,labels_json,
                  issue_number,issue_url,dismiss_category,required_decision,
-                 idempotency_marker,created_at,updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14)",
+                 plan_json,idempotency_marker,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
             params![
                 assessment_id,
                 ordinal as i64,
@@ -332,6 +356,7 @@ pub fn stage_plan(
                 issue_url,
                 category,
                 required,
+                plan_json,
                 marker,
                 now,
             ],
@@ -523,12 +548,16 @@ pub fn pending_issue_intents(
         return Err(usage("pending issue intent time cannot be negative"));
     }
     let mut stmt = conn.prepare(
-        "SELECT id,assessment_id,ordinal,title,body,labels_json,idempotency_marker
-         FROM review_followup_issue_intents
-         WHERE decision='create' AND state IN ('pending','backoff')
-           AND attempts < 3
-           AND (last_attempt_at IS NULL OR last_attempt_at + attempts * 60 <= ?2)
-         ORDER BY id LIMIT ?1",
+        "SELECT intent.id,intent.assessment_id,intent.ordinal,intent.title,intent.body,
+                intent.labels_json,intent.idempotency_marker
+         FROM review_followup_issue_intents intent
+         JOIN review_followup_assessments assessment ON assessment.id=intent.assessment_id
+         WHERE intent.decision='create' AND intent.state IN ('pending','backoff')
+           AND intent.attempts < 3
+           AND assessment.state='planning' AND assessment.active=1
+           AND (intent.last_attempt_at IS NULL
+                OR intent.last_attempt_at + intent.attempts * 60 <= ?2)
+         ORDER BY intent.id LIMIT ?1",
     )?;
     let rows = stmt.query_map(params![limit as i64, now], |row| {
         Ok((
@@ -599,8 +628,32 @@ pub fn record_issue_failure(
            AND attempts < 3",
         params![intent_id, error, now],
     )?;
+    if updated == 1 {
+        let hold_summary = truncate_utf8(error, 2048);
+        tx.execute(
+            "UPDATE review_followup_assessments
+             SET state='held',active=0,hold_code='issue-materialization',
+                 hold_summary=?2,updated_at=?3
+             WHERE id=(SELECT assessment_id FROM review_followup_issue_intents WHERE id=?1)
+               AND state='planning' AND active=1
+               AND EXISTS(SELECT 1 FROM review_followup_issue_intents
+                          WHERE id=?1 AND state='held')",
+            params![intent_id, hold_summary, now],
+        )?;
+    }
     tx.commit().map_err(map_sql_err)?;
     Ok(updated == 1)
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &value[..boundary]
 }
 
 pub fn finalize_assessment(conn: &mut Connection, assessment_id: i64, now: i64) -> Result<bool> {
@@ -650,6 +703,16 @@ pub fn finalize_assessment(conn: &mut Connection, assessment_id: i64, now: i64) 
 }
 
 fn assessment_membership(tx: &Transaction<'_>, assessment_id: i64) -> Result<Vec<i64>> {
+    let scope_kind: String = tx.query_row(
+        "SELECT scope_kind FROM review_followup_assessments WHERE id=?1",
+        [assessment_id],
+        |row| row.get(0),
+    )?;
+    let max_membership = match scope_kind.as_str() {
+        "task" => MAX_FOLLOWUP_ARTIFACTS,
+        "graph" => crate::review_followup_graph_eligibility::MAX_GRAPH_FOLLOWUP_ARTIFACTS,
+        _ => return Err(usage("stored follow-up assessment scope is invalid")),
+    };
     let mut stmt = tx.prepare(
         "SELECT m.artifact_id
          FROM review_followup_assessment_artifacts m
@@ -658,12 +721,11 @@ fn assessment_membership(tx: &Transaction<'_>, assessment_id: i64) -> Result<Vec
          ORDER BY m.artifact_id LIMIT ?2",
     )?;
     let ids = stmt
-        .query_map(
-            params![assessment_id, (MAX_FOLLOWUP_ARTIFACTS + 1) as i64],
-            |row| row.get::<_, i64>(0),
-        )?
+        .query_map(params![assessment_id, (max_membership + 1) as i64], |row| {
+            row.get::<_, i64>(0)
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if ids.is_empty() || ids.len() > MAX_FOLLOWUP_ARTIFACTS {
+    if ids.is_empty() || ids.len() > max_membership {
         return Err(usage("follow-up issue assessment membership is invalid"));
     }
     Ok(ids)
@@ -770,6 +832,14 @@ mod tests {
         }
     }
 
+    fn existing_issue(number: i64) -> ExistingIssue {
+        ExistingIssue {
+            number,
+            url: format!("https://github.com/o/r/issues/{number}"),
+            title: "Existing tracking issue".into(),
+        }
+    }
+
     #[test]
     fn validation_requires_exact_membership_and_inventory_links() {
         let ids = [10, 11];
@@ -785,7 +855,17 @@ mod tests {
             }],
         };
         assert!(validate_plan(&linked, &ids, &[]).is_err());
-        assert!(validate_plan(&linked, &ids, &[9]).is_ok());
+        assert!(validate_plan(&linked, &ids, &[existing_issue(9)]).is_ok());
+        assert!(validate_plan(
+            &linked,
+            &ids,
+            &[ExistingIssue {
+                number: 9,
+                url: "https://github.com/other/repo/issues/9".into(),
+                title: "Wrong repository".into(),
+            }]
+        )
+        .is_err());
     }
 
     #[test]
@@ -839,6 +919,38 @@ mod tests {
     }
 
     #[test]
+    fn replay_rejects_a_different_plan_with_the_same_shape_and_membership() {
+        let (_dir, mut conn, assessment_id, ids) = fixture();
+        let original = plan(&ids);
+        stage_plan(&mut conn, assessment_id, &original, &[], 2).unwrap();
+        let mut changed = plan(&ids);
+        let IssueDecision::Create { reason, .. } = &mut changed.decisions[0] else {
+            unreachable!()
+        };
+        *reason = "a different grouping rationale".into();
+        let error = stage_plan(&mut conn, assessment_id, &changed, &[], 3).unwrap_err();
+        assert!(error.to_string().contains("partial or inconsistent"));
+    }
+
+    #[test]
+    fn link_only_plan_completes_without_an_issue_outbox_call() {
+        let (_dir, mut conn, assessment_id, ids) = fixture();
+        let issue = existing_issue(9);
+        let plan = FollowupIssuePlan {
+            outcome: AssessmentOutcome::Assessment,
+            decisions: vec![IssueDecision::Link {
+                artifact_ids: ids,
+                reason: "the existing issue owns the same outcome".into(),
+                existing_issue_number: issue.number,
+                existing_issue_url: issue.url.clone(),
+            }],
+        };
+        stage_plan(&mut conn, assessment_id, &plan, &[issue], 2).unwrap();
+        assert!(pending_issue_intents(&conn, 1, 2).unwrap().is_empty());
+        assert!(finalize_assessment(&mut conn, assessment_id, 3).unwrap());
+    }
+
+    #[test]
     fn external_failures_back_off_and_hold_at_the_bound() {
         let (_dir, mut conn, assessment_id, ids) = fixture();
         stage_plan(&mut conn, assessment_id, &plan(&ids), &[], 2).unwrap();
@@ -862,6 +974,16 @@ mod tests {
             )
             .unwrap(),
             "held:3"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT state || ':' || active || ':' || hold_code
+                 FROM review_followup_assessments WHERE id=?1",
+                [assessment_id],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "held:0:issue-materialization"
         );
         assert!(!finalize_assessment(&mut conn, assessment_id, 191).unwrap());
     }

@@ -20,6 +20,7 @@ pub mod fallback;
 pub mod fallback_establish;
 pub mod fallback_preflight;
 pub mod fallback_retire;
+pub mod followup_planner;
 pub mod grok_agent;
 pub mod merge;
 pub mod merged_continuation;
@@ -5087,6 +5088,12 @@ struct DecompositionCoordinator {
     arbiter_source_task_id: Option<i64>,
     planner_view: Option<tempfile::TempDir>,
     writable_path_resolver: planner::WritablePathResolver,
+    /// Restricted response-only post-merge planner. It shares the configured
+    /// planner pool but has no repository, MCP, GitHub, or DB tools.
+    followup_slot: Option<classifier::ClassifierSlot>,
+    followup_assessment_id: Option<i64>,
+    followup_source_task_id: Option<i64>,
+    followup_allowed_issues: Vec<quorum_core::review_followup_issues::ExistingIssue>,
 }
 
 /// Close one planner run's `submit_plan` authority and read whatever it
@@ -5190,6 +5197,39 @@ async fn reap_decomposition_classifier_with_usage(
     }
 }
 
+async fn reap_followup_planner_with_usage(
+    db_path: &Path,
+    coordinator: &mut DecompositionCoordinator,
+) {
+    let assessment_id = coordinator.followup_assessment_id.take();
+    let source_task_id = coordinator.followup_source_task_id.take();
+    coordinator.followup_allowed_issues.clear();
+    if let Some(slot) = coordinator.followup_slot.take() {
+        match source_task_id {
+            Some(task_id) => record_followup_planner_usage(db_path, slot, task_id).await,
+            None => {
+                log("follow-up planner usage has no source-task attribution");
+                slot.kill_and_reap().await;
+            }
+        }
+    }
+    if let Some(assessment_id) = assessment_id {
+        if let Err(error) = record_followup_failure(
+            db_path,
+            assessment_id,
+            false,
+            "daemon-shutdown",
+            "daemon stopped before the follow-up planner turn completed",
+        )
+        .await
+        {
+            log(&format!(
+                "follow-up planner shutdown recovery failed for assessment #{assessment_id}: {error}"
+            ));
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PlanningSnapshot {
     graph_id: i64,
@@ -5233,6 +5273,7 @@ struct DecompositionLiveWork {
     ordinary_classifier: bool,
     doctor: bool,
     pre_review_checks: bool,
+    followup_planner: bool,
 }
 
 fn decomposition_drain_ready(
@@ -5249,6 +5290,7 @@ fn decomposition_drain_ready(
         && !live.ordinary_classifier
         && !live.doctor
         && !live.pre_review_checks
+        && !live.followup_planner
 }
 type PlanningSnapshotRow = (
     i64,
@@ -10632,6 +10674,7 @@ async fn tick_loop(
                 &mut decomposition_coordinator,
             )
             .await;
+            reap_followup_planner_with_usage(&config.db_path, &mut decomposition_coordinator).await;
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
             }
@@ -10664,6 +10707,7 @@ async fn tick_loop(
                 &mut decomposition_coordinator,
             )
             .await;
+            reap_followup_planner_with_usage(&config.db_path, &mut decomposition_coordinator).await;
             for r in reviewers.drain(..) {
                 teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "shutdown").await;
             }
@@ -10704,6 +10748,8 @@ async fn tick_loop(
                     &mut decomposition_coordinator,
                 )
                 .await;
+                reap_followup_planner_with_usage(&config.db_path, &mut decomposition_coordinator)
+                    .await;
                 for r in reviewers.drain(..) {
                     let agent_name = r.agent_name.clone();
                     let _terminal_output = r.kill_and_reap().await;
@@ -10814,6 +10860,8 @@ async fn tick_loop(
                     &mut decomposition_coordinator,
                 )
                 .await;
+                reap_followup_planner_with_usage(&config.db_path, &mut decomposition_coordinator)
+                    .await;
                 return Ok(exit);
             }
 
@@ -10844,6 +10892,8 @@ async fn tick_loop(
                     &mut decomposition_coordinator,
                 )
                 .await;
+                reap_followup_planner_with_usage(&config.db_path, &mut decomposition_coordinator)
+                    .await;
                 for r in reviewers.drain(..) {
                     teardown_reviewer(config, &wt_mgr, &mut name_pool, r, "drain").await;
                 }
@@ -10969,6 +11019,11 @@ async fn tick_loop(
                         &mut decomposition_coordinator,
                     )
                     .await;
+                    reap_followup_planner_with_usage(
+                        &config.db_path,
+                        &mut decomposition_coordinator,
+                    )
+                    .await;
                     for r in reviewers.drain(..) {
                         let agent_name = r.agent_name.clone();
                         let _terminal_output = r.kill_and_reap().await;
@@ -11079,6 +11134,7 @@ async fn tick(
             pre_review_checks: pre_review_checks.values().any(|entry| {
                 matches!(&entry.state, PreReviewChecksState::Waiting(handle) if !handle.is_finished())
             }),
+            followup_planner: decomposition_coordinator.followup_slot.is_some(),
         },
     )
     .await?;
@@ -16682,10 +16738,16 @@ async fn tick(
         }
     }
 
-    // ── Phase 7.6: daemon-owned review follow-up issue outbox ────────
-    // The planner only stages durable intents. External GitHub mutation runs
-    // here with no DB transaction open, then the exact intent is completed in
-    // a second short transaction. Marker lookup makes crash replay converge.
+    // ── Phase 7.6: post-merge follow-up planning and issue outbox ─────
+    // A restricted, response-only planner proposes a complete closed plan.
+    // Core validates and stages it; only the daemon performs GitHub writes.
+    tick_followup_planning(
+        config,
+        decomposition_coordinator,
+        drain_state.draining,
+        decomposition_freeze,
+    )
+    .await?;
     if !drain_state.draining && !decomposition_freeze {
         reconcile_followup_issue_intent(config).await?;
     }
@@ -16797,6 +16859,491 @@ async fn tick(
     }
 
     tokio::time::sleep(tick_pacing()).await;
+    Ok(())
+}
+
+struct FollowupPlanningContext {
+    assessment: quorum_core::review_followup_assessments::ReviewFollowupAssessment,
+    source: quorum_core::tasks::Task,
+    artifacts: Vec<quorum_core::review_followups::ReviewFollowupArtifact>,
+}
+
+/// Materialize at most one current-generation assessment. There is no scan of
+/// historic GitHub records and no synthesis/backfill: only immutable batches
+/// already written by the current collector generation are candidates.
+fn materialize_one_followup_assessment(
+    conn: &mut rusqlite::Connection,
+    now: i64,
+) -> Result<Option<i64>> {
+    use quorum_core::review_followup_assessments::{
+        FollowupScopeKind, NewReviewFollowupAssessment,
+    };
+    use quorum_core::review_followup_graph_eligibility::GraphAssessmentEligibility;
+
+    let graph_ids = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT batch.graph_id
+             FROM review_followup_batches batch
+             JOIN task_decompositions graph ON graph.id=batch.graph_id
+             WHERE batch.graph_id IS NOT NULL
+               AND batch.collector_version=?1 AND batch.artifact_count>0
+               AND graph.state IN ('completed','cancelled')
+               AND NOT EXISTS(SELECT 1 FROM review_followup_assessments assessment
+                              WHERE assessment.scope_kind='graph'
+                                AND assessment.scope_id=batch.graph_id)
+             ORDER BY batch.graph_id LIMIT 16",
+        )?;
+        let values = stmt
+            .query_map([collector::COLLECTOR_VERSION], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        values
+    };
+    for graph_id in graph_ids {
+        if let GraphAssessmentEligibility::Eligible(scope) =
+            quorum_core::review_followup_graph_eligibility::classify_graph_assessment(
+                conn,
+                graph_id,
+                collector::COLLECTOR_VERSION,
+            )?
+        {
+            let value = NewReviewFollowupAssessment::new(
+                FollowupScopeKind::Graph,
+                scope.graph_id(),
+                scope.source_task_id(),
+                scope.artifact_ids().to_vec(),
+                now,
+            )?;
+            if let Some(assessment) =
+                quorum_core::review_followup_assessments::materialize_assessment(conn, &value)?
+            {
+                return Ok(Some(assessment.id()));
+            }
+        }
+    }
+
+    let ordinary = {
+        let mut stmt = conn.prepare(
+            "SELECT batch.task_id,batch.pr_number
+             FROM review_followup_batches batch
+             WHERE batch.graph_id IS NULL AND batch.source_task_id=batch.task_id
+               AND batch.collector_version=?1 AND batch.state='collected'
+               AND batch.artifact_count>0
+               AND NOT EXISTS(SELECT 1 FROM review_followup_assessments assessment
+                              WHERE assessment.scope_kind='task'
+                                AND assessment.scope_id=batch.task_id)
+             ORDER BY batch.created_at,batch.task_id LIMIT 16",
+        )?;
+        let values = stmt
+            .query_map([collector::COLLECTOR_VERSION], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        values
+    };
+    for (task_id, pr_number) in ordinary {
+        if !quorum_core::review_followup_eligibility::ordinary_task_done_through_merge(
+            conn, task_id,
+        )? {
+            continue;
+        }
+        let Some(batch) = quorum_core::review_followup_reads::get_batch(conn, pr_number)? else {
+            continue;
+        };
+        let artifact_ids = batch
+            .artifacts()
+            .iter()
+            .filter_map(|artifact| artifact.id())
+            .collect::<Vec<_>>();
+        let value = NewReviewFollowupAssessment::new(
+            FollowupScopeKind::Task,
+            task_id,
+            task_id,
+            artifact_ids,
+            now,
+        )?;
+        if let Some(assessment) =
+            quorum_core::review_followup_assessments::materialize_assessment(conn, &value)?
+        {
+            return Ok(Some(assessment.id()));
+        }
+    }
+    Ok(None)
+}
+
+fn next_followup_planning_context(
+    conn: &rusqlite::Connection,
+    now: i64,
+) -> Result<Option<FollowupPlanningContext>> {
+    let assessment_id = conn
+        .query_row(
+            "SELECT id FROM review_followup_assessments
+             WHERE active=0 AND membership_sealed=1
+               AND (state='pending' OR
+                    (state='provider-backoff'
+                     AND updated_at + provider_failures * 60 <= ?1))
+             ORDER BY id LIMIT 1",
+            [now],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(assessment_id) = assessment_id else {
+        return Ok(None);
+    };
+    let assessment = quorum_core::review_followup_assessments::get_assessment(conn, assessment_id)?
+        .ok_or_else(|| QuorumError::Io("follow-up assessment disappeared during read".into()))?;
+    let source = quorum_core::tasks::get(conn, assessment.source_task_id())?
+        .ok_or_else(|| QuorumError::Io("follow-up assessment source task is missing".into()))?;
+    let artifact_ids =
+        quorum_core::review_followup_assessments::assessment_artifact_ids(conn, assessment_id)?;
+    let mut artifacts = Vec::with_capacity(artifact_ids.len());
+    for artifact_id in artifact_ids {
+        artifacts.push(
+            quorum_core::review_followup_reads::get_artifact(conn, artifact_id)?.ok_or_else(
+                || QuorumError::Io(format!("follow-up artifact #{artifact_id} is missing")),
+            )?,
+        );
+    }
+    Ok(Some(FollowupPlanningContext {
+        assessment,
+        source,
+        artifacts,
+    }))
+}
+
+async fn record_followup_planner_usage(
+    db_path: &Path,
+    slot: classifier::ClassifierSlot,
+    source_task_id: i64,
+) {
+    let provider = slot.provider.clone();
+    let model = slot.model.clone();
+    let effort = slot.effort.clone();
+    let usage = slot.kill_and_reap().await;
+    record_usage_best_effort(
+        db_path,
+        UsageWriteRecord {
+            agent_run_id: None,
+            purpose: "planner".into(),
+            task_ids: vec![source_task_id],
+            pr_number: None,
+            provider,
+            model,
+            effort,
+            usage,
+        },
+    )
+    .await;
+}
+
+async fn record_followup_failure(
+    db_path: &Path,
+    assessment_id: i64,
+    semantic: bool,
+    code: &'static str,
+    summary: &str,
+) -> Result<()> {
+    let path = db_path.to_path_buf();
+    let summary = truncate_utf8_bytes(
+        summary,
+        quorum_core::review_followups::MAX_FOLLOWUP_TEXT_BYTES.min(2048),
+    )
+    .to_string();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        let updated = if semantic {
+            quorum_core::review_followup_assessments::record_semantic_rejection(
+                &mut conn,
+                assessment_id,
+                code,
+                &summary,
+                now_unix(),
+            )?
+        } else {
+            quorum_core::review_followup_assessments::record_provider_failure(
+                &mut conn,
+                assessment_id,
+                code,
+                &summary,
+                now_unix(),
+            )?
+        };
+        if updated.is_none() {
+            log(&format!(
+                "follow-up assessment #{assessment_id} lost failure-record authority cleanly"
+            ));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("follow-up failure write join: {error}")))??;
+    Ok(())
+}
+
+async fn tick_followup_planning(
+    config: &ServeConfig,
+    coordinator: &mut DecompositionCoordinator,
+    draining: bool,
+    decomposition_freeze: bool,
+) -> Result<()> {
+    if let Some(slot) = coordinator.followup_slot.as_mut() {
+        if let Some(result) = classifier::drain_classifier_events(slot).await {
+            let assessment_id = coordinator
+                .followup_assessment_id
+                .take()
+                .ok_or_else(|| QuorumError::Io("follow-up planner lost assessment id".into()))?;
+            let source_task_id = coordinator
+                .followup_source_task_id
+                .take()
+                .ok_or_else(|| QuorumError::Io("follow-up planner lost source task id".into()))?;
+            let allowed_issues = std::mem::take(&mut coordinator.followup_allowed_issues);
+            let slot = coordinator
+                .followup_slot
+                .take()
+                .expect("follow-up planner slot exists");
+            record_followup_planner_usage(&config.db_path, slot, source_task_id).await;
+            match result {
+                classifier::ClassifierResult::Done(response) => {
+                    let membership = {
+                        let conn = quorum_core::db::open(&config.db_path)?;
+                        quorum_core::review_followup_assessments::assessment_artifact_ids(
+                            &conn,
+                            assessment_id,
+                        )?
+                    };
+                    match quorum_core::review_followup_issues::parse_and_validate_plan(
+                        &response,
+                        &membership,
+                        &allowed_issues,
+                    ) {
+                        Ok(plan) => {
+                            let path = config.db_path.clone();
+                            let staged =
+                                tokio::task::spawn_blocking(move || -> Result<(String, bool)> {
+                                    let mut conn = quorum_core::db::open(&path)?;
+                                    let outcome = quorum_core::review_followup_issues::stage_plan(
+                                        &mut conn,
+                                        assessment_id,
+                                        &plan,
+                                        &allowed_issues,
+                                        now_unix(),
+                                    )?;
+                                    let finalized =
+                                        quorum_core::review_followup_issues::finalize_assessment(
+                                            &mut conn,
+                                            assessment_id,
+                                            now_unix(),
+                                        )?;
+                                    Ok((format!("{outcome:?}"), finalized))
+                                })
+                                .await
+                                .map_err(|error| {
+                                    QuorumError::Io(format!("follow-up plan stage join: {error}"))
+                                })??;
+                            log(&format!(
+                                "follow-up planner: assessment #{assessment_id} {} (terminal_without_create={})",
+                                staged.0, staged.1
+                            ));
+                        }
+                        Err(error) => {
+                            record_followup_failure(
+                                &config.db_path,
+                                assessment_id,
+                                true,
+                                "invalid-plan",
+                                &error.to_string(),
+                            )
+                            .await?;
+                            log(&format!(
+                                "follow-up planner: assessment #{assessment_id} rejected: {error}"
+                            ));
+                        }
+                    }
+                }
+                classifier::ClassifierResult::Error(error) => {
+                    record_followup_failure(
+                        &config.db_path,
+                        assessment_id,
+                        false,
+                        "provider-failure",
+                        &error,
+                    )
+                    .await?;
+                    log(&format!(
+                        "follow-up planner: assessment #{assessment_id} provider failure: {error}"
+                    ));
+                }
+            }
+        }
+    }
+    if coordinator.followup_slot.is_some() || draining {
+        return Ok(());
+    }
+
+    // An active planning row with no staged intents and no live process is an
+    // interrupted provider turn. Recover it before admitting another turn.
+    let interrupted = {
+        let conn = quorum_core::db::open(&config.db_path)?;
+        conn.query_row(
+            "SELECT assessment.id FROM review_followup_assessments assessment
+             WHERE assessment.state='planning' AND assessment.active=1
+               AND NOT EXISTS(SELECT 1 FROM review_followup_issue_intents intent
+                              WHERE intent.assessment_id=assessment.id)
+             ORDER BY assessment.id LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    };
+    if let Some(assessment_id) = interrupted {
+        record_followup_failure(
+            &config.db_path,
+            assessment_id,
+            false,
+            "interrupted-turn",
+            "daemon restarted after planning authority was acquired and before a plan was staged",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let materialized = {
+        let mut conn = quorum_core::db::open(&config.db_path)?;
+        materialize_one_followup_assessment(&mut conn, now_unix())?
+    };
+    if let Some(assessment_id) = materialized {
+        log(&format!(
+            "follow-up planner: materialized assessment #{assessment_id}"
+        ));
+    }
+
+    // Decomposition is higher-priority planner work. Once a follow-up turn is
+    // live, decomposition drain sees it through DecompositionLiveWork and
+    // waits; before spawn, any live decomposition phase wins this tick.
+    if decomposition_freeze
+        || coordinator.planner_slot.is_some()
+        || coordinator.classifier_slot.is_some()
+        || coordinator.arbiter_slot.is_some()
+    {
+        return Ok(());
+    }
+    let Some(context) = ({
+        let conn = quorum_core::db::open(&config.db_path)?;
+        next_followup_planning_context(&conn, now_unix())?
+    }) else {
+        return Ok(());
+    };
+    let assessment_id = context.assessment.id();
+    let source_task_id = context.source.id;
+    let assignment = assign_role(
+        config,
+        quorum_core::role_assignments::AssignmentRequest {
+            responsibility_key: format!("followup:assessment:{assessment_id}"),
+            task_id: Some(source_task_id),
+            pr_number: None,
+            role: "planner".into(),
+            review_stage: None,
+            complexity: None,
+        },
+        None,
+    )?;
+    let base_sha = repository_head_sha(&config.repo_dir).await?;
+    let began = {
+        let mut conn = quorum_core::db::open(&config.db_path)?;
+        quorum_core::review_followup_assessments::begin_planning(
+            &mut conn,
+            assessment_id,
+            &quorum_core::review_followup_assessments::FollowupPlanningInput {
+                provider: &assignment.provider,
+                model: &assignment.model,
+                assignment_id: Some(assignment.id),
+                base_sha: &base_sha,
+                now: now_unix(),
+            },
+        )?
+    };
+    if began.is_none() {
+        return Ok(());
+    }
+
+    let executor = Arc::clone(&config.merge_executor);
+    let repo = config.repo_dir.clone();
+    let allowed_issues =
+        match tokio::task::spawn_blocking(move || executor.followup_issue_inventory(&repo))
+            .await
+            .map_err(|error| QuorumError::Io(format!("follow-up inventory join: {error}")))?
+        {
+            Ok(issues) => issues,
+            Err(error) => {
+                record_followup_failure(
+                    &config.db_path,
+                    assessment_id,
+                    false,
+                    "issue-inventory",
+                    &error,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+    let prompt = match followup_planner::build_prompt(
+        &context.assessment,
+        &context.source.title,
+        context.source.body.as_deref(),
+        &context.artifacts,
+        &allowed_issues,
+    ) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            let path = config.db_path.clone();
+            let summary = truncate_utf8_bytes(&error.to_string(), 2048).to_string();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = quorum_core::db::open(&path)?;
+                quorum_core::review_followup_assessments::hold_assessment(
+                    &mut conn,
+                    assessment_id,
+                    quorum_core::review_followup_assessments::FollowupAssessmentState::Planning,
+                    "input-too-large",
+                    &summary,
+                    now_unix(),
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|join| QuorumError::Io(format!("follow-up hold join: {join}")))??;
+            return Ok(());
+        }
+    };
+    let kind = resolve_provider(&assignment.model)?;
+    match classifier::spawn_restricted_response_configured(
+        &prompt,
+        agent_bin_for_kind(config, kind),
+        config.bare_agent,
+        &assignment.model,
+        &assignment.effort,
+        &config.codex_sandbox,
+    )
+    .await
+    {
+        Ok(slot) => {
+            coordinator.followup_slot = Some(slot);
+            coordinator.followup_assessment_id = Some(assessment_id);
+            coordinator.followup_source_task_id = Some(source_task_id);
+            coordinator.followup_allowed_issues = allowed_issues;
+            log(&format!(
+                "follow-up planner: spawned assessment #{assessment_id} for task #{source_task_id}"
+            ));
+        }
+        Err(error) => {
+            record_followup_failure(
+                &config.db_path,
+                assessment_id,
+                false,
+                "spawn-failure",
+                &error.to_string(),
+            )
+            .await?;
+        }
+    }
     Ok(())
 }
 
@@ -27180,6 +27727,202 @@ mod tests {
             .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn activation_materializes_only_current_generation_without_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("followup-activation.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute_batch(&format!(
+            "INSERT INTO tasks(id,title,status,created_by,refs,completion_provenance,created_at,updated_at)
+             VALUES
+               (1,'current source','done','owner','{{\"pr\":41}}','merged',1,1),
+               (2,'historic source','done','owner','{{\"pr\":42}}','merged',1,1);
+             INSERT INTO review_collection_runs(
+               pr_number,task_id,status,collector_model,collector_version,
+               findings_count,followup_count,attempted_at,completed_at)
+             VALUES
+               (41,1,'success','collector','{}',0,1,1,1),
+               (42,2,'success','collector','old-generation',0,1,1,1);
+             INSERT INTO review_followup_batches(
+               pr_number,task_id,source_task_id,collector_version,artifact_count,state,created_at,updated_at)
+             VALUES
+               (41,1,1,'{}',1,'collected',1,1),
+               (42,2,2,'old-generation',1,'collected',1,1);
+             INSERT INTO review_followup_artifacts(
+               pr_number,ordinal,technical_impact,scope_relationship,concern,
+               non_blocking_reason,affected_behavior,desired_outcome,
+               verification_expectations,evidence_ids,created_at,updated_at)
+             VALUES
+               (41,0,'major','out_of_scope','current concern','safe','behavior','outcome',
+                '[\"verify\"]','[{{\"kind\":\"review\",\"id\":1}}]',1,1),
+               (42,0,'major','out_of_scope','historic concern','safe','behavior','outcome',
+                '[\"verify\"]','[{{\"kind\":\"review\",\"id\":2}}]',1,1);",
+            collector::COLLECTOR_VERSION,
+            collector::COLLECTOR_VERSION,
+        ))
+        .unwrap();
+
+        let assessment_id = materialize_one_followup_assessment(&mut conn, 10)
+            .unwrap()
+            .expect("current-generation batch should materialize");
+        let context = next_followup_planning_context(&conn, 10)
+            .unwrap()
+            .expect("new assessment should be ready");
+        assert_eq!(context.assessment.id(), assessment_id);
+        assert_eq!(context.source.id, 1);
+        assert_eq!(context.artifacts[0].concern(), "current concern");
+        assert_eq!(
+            materialize_one_followup_assessment(&mut conn, 11).unwrap(),
+            None
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM review_followup_assessments WHERE scope_id=2",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "historic generations are not backfilled"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn followup_planner_turn_stages_and_daemon_creates_issue() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "Test"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(repo.join("README.md"), "fixture\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .args(["commit", "-m", "fixture"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+
+        let plan = serde_json::json!({
+            "outcome": "assessment",
+            "decisions": [{
+                "decision": "create",
+                "artifact_ids": [11],
+                "reason": "separate post-merge outcome",
+                "issue": {
+                    "title": "Preserve pending work during shutdown",
+                    "issue_type": "bug",
+                    "observable_outcome": "Pending work survives shutdown",
+                    "acceptance_criteria": ["Pending work completes"],
+                    "source_constraints": ["Preserve the public API"],
+                    "verification_expectations": ["Exercise concurrent shutdown"]
+                }
+            }]
+        })
+        .to_string();
+        let message = serde_json::json!({
+            "type": "item.completed",
+            "item": {"type":"agent_message","id":"followup","text":plan}
+        })
+        .to_string();
+        let runner = dir.path().join("codex");
+        std::fs::write(
+            &runner,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"followup-thread\"}}'\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n",
+                message
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let db_path = dir.path().join("followup-planner.db");
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute_batch(&format!(
+                "INSERT INTO tasks(id,title,status,created_by,refs,completion_provenance,created_at,updated_at)
+                 VALUES (1,'source','done','owner','{{\"pr\":41}}','merged',1,1);
+                 INSERT INTO review_collection_runs(
+                   pr_number,task_id,status,collector_model,collector_version,
+                   findings_count,followup_count,attempted_at,completed_at)
+                 VALUES (41,1,'success','collector','{}',0,1,1,1);
+                 INSERT INTO review_followup_batches(
+                   pr_number,task_id,source_task_id,collector_version,artifact_count,state,created_at,updated_at)
+                 VALUES (41,1,1,'{}',1,'collected',1,1);
+                 INSERT INTO review_followup_artifacts(
+                   id,pr_number,ordinal,technical_impact,scope_relationship,concern,
+                   non_blocking_reason,affected_behavior,desired_outcome,
+                   verification_expectations,evidence_ids,created_at,updated_at)
+                 VALUES (11,41,0,'major','out_of_scope','shutdown can lose pending work',
+                   'outside the merged scope','shutdown behavior','pending work completes',
+                   '[\"concurrent shutdown test\"]','[{{\"kind\":\"review\",\"id\":1}}]',1,1);",
+                collector::COLLECTOR_VERSION,
+                collector::COLLECTOR_VERSION,
+            ))
+            .unwrap();
+        }
+        let executor = Arc::new(FollowupIssueExecutor::default());
+        let mut config = pre_review_checks_config(db_path.clone(), repo.clone());
+        config.agent_bin = Some(runner.to_string_lossy().into_owned());
+        config.merge_executor = executor.clone();
+        config.model_profiles.get_mut("test").unwrap().runner = "codex".into();
+        config.model_profiles.get_mut("test").unwrap().model = "gpt-5.6-terra".into();
+        let mut coordinator = DecompositionCoordinator::default();
+
+        tick_followup_planning(&config, &mut coordinator, false, false)
+            .await
+            .unwrap();
+        assert!(coordinator.followup_slot.is_some());
+        for _ in 0..4 {
+            tick_followup_planning(&config, &mut coordinator, false, false)
+                .await
+                .unwrap();
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            if conn
+                .query_row(
+                    "SELECT count(*) FROM review_followup_issue_intents",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                == 1
+            {
+                break;
+            }
+        }
+        reconcile_followup_issue_intent(&config).await.unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT state || ':' || issue_number FROM review_followup_issue_intents",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "completed:123"
+        );
+        assert_eq!(executor.calls.lock().unwrap().len(), 1);
     }
 
     /// The backstop counts only *consecutive* unrecordable strikes: one strike
@@ -49600,6 +50343,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             arbiter_source_task_id: None,
             planner_view: None,
             writable_path_resolver: planner::WritablePathResolver::default(),
+            ..DecompositionCoordinator::default()
         };
 
         // An accepted pre-materialization edit removes the aggregate, so the
