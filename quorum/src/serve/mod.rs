@@ -27571,9 +27571,11 @@ mod tests {
         );
     }
 
+    type FollowupIssueCall = (String, String, Vec<String>, String);
+
     #[derive(Default)]
     struct FollowupIssueExecutor {
-        calls: Mutex<Vec<(String, String, Vec<String>, String)>>,
+        calls: Mutex<Vec<FollowupIssueCall>>,
     }
 
     impl merge::MergeExecutor for FollowupIssueExecutor {

@@ -462,15 +462,13 @@ mod tests {
             10,
         )
         .is_err());
-        assert_eq!(
-            conn.query_row(
+        assert!(conn
+            .query_row(
                 "SELECT consumed_at IS NULL FROM mailbox WHERE id=?1",
                 [mailbox_id],
                 |row| row.get::<_, bool>(0)
             )
-            .unwrap(),
-            true
-        );
+            .unwrap());
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM review_blocker_reassessments",
