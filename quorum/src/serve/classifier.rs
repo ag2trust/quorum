@@ -9,6 +9,10 @@ pub const CLASSIFIER_EFFORT: &str = "low";
 pub const CLASSIFIER_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_CLASSIFIER_STDOUT_BYTES: usize = 256 * 1024;
 pub const MAX_CLASSIFIER_RESPONSE_BYTES: usize = 64 * 1024;
+/// Absolute UTF-8 ceiling for a classifier turn. The existing per-field and
+/// batch limits keep production prompts well below this value, while the
+/// four-byte-per-character allowance preserves their established contract.
+pub const MAX_CLASSIFIER_PROMPT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CLASSIFIER_LINES_PER_POLL: usize = 64;
 
 /// In-flight classifier state, persisted across daemon ticks.
@@ -127,6 +131,7 @@ async fn spawn_classifier_configured_with_timeout(
         model,
         effort,
         codex_sandbox,
+        MAX_CLASSIFIER_PROMPT_BYTES,
         turn_timeout,
     )
     .await
@@ -144,6 +149,7 @@ pub async fn spawn_restricted_response_configured(
     model: &str,
     effort: &str,
     codex_sandbox: &str,
+    max_prompt_bytes: usize,
 ) -> std::io::Result<ClassifierSlot> {
     spawn_restricted_response_configured_with_timeout(
         prompt,
@@ -154,6 +160,7 @@ pub async fn spawn_restricted_response_configured(
         model,
         effort,
         codex_sandbox,
+        max_prompt_bytes,
         CLASSIFIER_TIMEOUT,
     )
     .await
@@ -169,15 +176,19 @@ async fn spawn_restricted_response_configured_with_timeout(
     model: &str,
     effort: &str,
     codex_sandbox: &str,
+    max_prompt_bytes: usize,
     turn_timeout: Duration,
 ) -> std::io::Result<ClassifierSlot> {
-    if prompt.is_empty()
-        || prompt.len() > MAX_CLASSIFIER_RESPONSE_BYTES * 2
+    if max_prompt_bytes == 0
+        || prompt.is_empty()
+        || prompt.len() > max_prompt_bytes
         || prompt.contains('\0')
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "restricted response prompt must contain 1..=128 KiB of NUL-free UTF-8",
+            format!(
+                "restricted response prompt must contain 1..={max_prompt_bytes} bytes of NUL-free UTF-8"
+            ),
         ));
     }
     let dir = tempfile::tempdir()?;

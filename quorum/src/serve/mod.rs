@@ -17321,6 +17321,7 @@ async fn tick_followup_planning(
         &assignment.model,
         &assignment.effort,
         &config.codex_sandbox,
+        followup_planner::MAX_FOLLOWUP_PLANNER_PROMPT_BYTES,
     )
     .await
     {
