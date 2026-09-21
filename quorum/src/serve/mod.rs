@@ -10890,13 +10890,11 @@ async fn tick_loop(
                          schema; exiting {EXIT_SELF_UPDATE} so the supervisor rebuilds and \
                          relaunches on a current binary"
                     ));
-                    // Force-kill in-flight agents before exiting. They run in their own
-                    // process groups (setpgid, no Drop), so a bare return orphans them —
-                    // the relaunched daemon would re-adopt the same tasks and race
-                    // live-but-unsupervised agents on the same worktrees/branches. We
-                    // can't gracefully teardown (that writes to the DB, which also fails
-                    // against a too-new schema); just reap the processes and release their
-                    // names. Journal recovery reclaims the tasks on restart.
+                    // Force-kill and reap in-flight agents before exiting. Proc Drop guards
+                    // kill their groups on an unexpected return, but this boundary waits for
+                    // each leader before relaunching work from journal recovery. We cannot
+                    // gracefully teardown (that writes to the DB, which also fails against a
+                    // too-new schema); just reap the processes and release their names.
                     if let Some(slot) = classifier_slot.take() {
                         reap_classifier_with_usage(&config.db_path, slot, None).await;
                     }
