@@ -36,6 +36,11 @@ pub fn new_session_id() -> String {
 pub struct AgentProc {
     child: Child,
     process_group_id: libc::pid_t,
+    // A successful wait releases the pid namespace entry. Do not signal that
+    // numeric process group again after it could have been recycled.
+    process_group_reaped: bool,
+    #[cfg(test)]
+    killpg_calls: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     stdin: tokio::process::ChildStdin,
     reader: BufReader<tokio::process::ChildStdout>,
     line_buffer: Vec<u8>,
@@ -645,6 +650,9 @@ impl AgentProc {
         Ok(Self {
             child,
             process_group_id,
+            process_group_reaped: false,
+            #[cfg(test)]
+            killpg_calls: None,
             stdin,
             reader,
             line_buffer: Vec::new(),
@@ -733,9 +741,11 @@ impl AgentProc {
         // The leader was reaped by `try_wait`, so `child.id()` is now None.
         // The spawn-time group ID still reaches any launcher or MCP
         // descendant holding the pipes open.
-        unsafe {
-            libc::killpg(self.process_group_id, libc::SIGKILL);
-        }
+        self.kill_process_group();
+        // `try_wait` above reaped the leader, and this signal covered every
+        // remaining member of its spawn-time group. A later Drop must not
+        // signal a process group whose numeric ID may now be reused.
+        self.process_group_reaped = true;
         let stderr_complete = self.finish_stderr_until(deadline).await;
         let stderr_tail = first_turn_stderr_tail(self.drain_diagnostics());
         let disposition = self
@@ -843,6 +853,26 @@ impl AgentProc {
         self.process_group_id
     }
 
+    fn kill_process_group(&self) {
+        if self.process_group_id == 0 {
+            return;
+        }
+        #[cfg(test)]
+        if let Some(calls) = &self.killpg_calls {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        unsafe {
+            libc::killpg(self.process_group_id, libc::SIGKILL);
+        }
+    }
+
+    #[cfg(test)]
+    fn track_killpg_calls(&mut self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.killpg_calls = Some(calls.clone());
+        calls
+    }
+
     /// Non-blocking check for child exit. Returns `Some(status)` if the child
     /// has already terminated, `None` if still running. `try_wait` also reaps
     /// the child on the caller's behalf when it has exited.
@@ -860,12 +890,14 @@ impl AgentProc {
         stdin: tokio::process::ChildStdin,
         reader: BufReader<tokio::process::ChildStdout>,
     ) -> Self {
-        let process_group_id = child.id().map_or(0, |id| id as libc::pid_t);
         let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Claude);
         let failures = diagnostics.failures();
         Self {
             child,
-            process_group_id,
+            // Test-only callers do not create a process group.
+            process_group_id: 0,
+            process_group_reaped: false,
+            killpg_calls: None,
             stdin,
             reader,
             line_buffer: Vec::new(),
@@ -879,13 +911,11 @@ impl AgentProc {
         // Always target the spawn-time process group, even when `try_wait`
         // already observed and reaped the leader. Descendants can otherwise
         // retain stdout/stderr and make the drains below wait forever.
-        if self.process_group_id != 0 {
-            unsafe {
-                libc::killpg(self.process_group_id, libc::SIGKILL);
-            }
-        }
+        self.kill_process_group();
         // Reap the child to avoid zombie accumulation
-        let _ = self.child.wait().await;
+        if self.child.wait().await.is_ok() {
+            self.process_group_reaped = true;
+        }
         let mut terminal = Vec::new();
         while let Ok(Some(line)) = self.read_raw_line(None).await {
             terminal.push(CapturedOutput::Stdout(line));
@@ -896,6 +926,14 @@ impl AgentProc {
         }
         terminal.extend(diagnostics.drain());
         terminal
+    }
+}
+
+impl Drop for AgentProc {
+    fn drop(&mut self) {
+        if !self.process_group_reaped {
+            self.kill_process_group();
+        }
     }
 }
 
@@ -1145,6 +1183,8 @@ mod tests {
         AgentProc {
             child,
             process_group_id,
+            process_group_reaped: false,
+            killpg_calls: None,
             stdin,
             reader,
             line_buffer: Vec::new(),
@@ -1901,6 +1941,42 @@ while IFS= read -r _line; do :; done
             }
         }
         assert!(group_gone, "Claude descendant process group was not reaped");
+    }
+
+    #[tokio::test]
+    async fn drop_kills_process_group() {
+        let mut proc = shell_proc("sleep 300 & printf 'ready\\n'; wait").await;
+        assert_eq!(proc.next_raw_line().await.as_deref(), Some("ready"));
+        let process_group_id = proc.process_group_id;
+
+        drop(proc);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if unsafe { libc::killpg(process_group_id, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Drop did not kill the Claude process group");
+    }
+
+    #[tokio::test]
+    async fn kill_and_reap_disarms_drop_kill_guard() {
+        let mut proc = shell_proc("exec sleep 300").await;
+        let calls = proc.track_killpg_calls();
+
+        proc.kill_and_reap().await;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "Drop must not signal a process group after kill_and_reap reaped its leader"
+        );
     }
 
     /// #206: reviewers are instructed to invoke the pinned `pr-review` skill;
