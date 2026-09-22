@@ -639,13 +639,21 @@ enum ProvisionDecision {
 /// Result of a reviewer provisioning attempt after its reservation has been
 /// released. `Unavailable` is an expected no-op: the caller no longer had
 /// authority, or another guard made the reviewer ineligible to attach.
-/// `Failed` preserves an operational provisioning error for R2 telemetry while
-/// allowing the ordinary retry path to continue; unexpected DB/join failures
-/// remain `Err`.
+/// `HeadMoved` is a clean synchronization miss that invalidates the CI gate
+/// without charging a strike. `Failed` preserves an operational provisioning
+/// error for R2 telemetry while allowing the ordinary retry path to continue;
+/// unexpected DB/join failures remain `Err`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReviewerProvisionOutcome {
     Attached,
     Unavailable,
+    /// The PR API still reported the gated head while the freshly fetched
+    /// branch had already advanced. This is synchronization, not a reviewer
+    /// provisioning failure: discard the gate and consume no strike.
+    HeadMoved {
+        gated: String,
+        fetched: String,
+    },
     Failed(String),
 }
 
@@ -678,7 +686,9 @@ fn r2_provision_disposition(
     }
     match result {
         Ok(ReviewerProvisionOutcome::Attached) => R2ProvisionDisposition::Attached,
-        Ok(ReviewerProvisionOutcome::Unavailable) => R2ProvisionDisposition::Unavailable,
+        Ok(ReviewerProvisionOutcome::Unavailable | ReviewerProvisionOutcome::HeadMoved { .. }) => {
+            R2ProvisionDisposition::Unavailable
+        }
         Ok(ReviewerProvisionOutcome::Failed(_)) => R2ProvisionDisposition::Error,
         Err(_) => R2ProvisionDisposition::Error,
     }
@@ -8654,6 +8664,25 @@ fn take_pre_review_post_gate_validation_slot(
     true
 }
 
+/// A fetched branch that is newer than GitHub's just-read PR metadata proves
+/// the ready gate stale, but does not authorize adopting the fetched SHA. Keep
+/// the entry in a bounded retry state until the next configured head poll.
+fn defer_pre_review_after_head_move(
+    waits: &mut HashMap<i64, PreReviewChecksEntry>,
+    task_id: i64,
+    pr: i64,
+) {
+    let Some(entry) = waits.get_mut(&task_id) else {
+        return;
+    };
+    if entry.pr != pr {
+        return;
+    }
+    entry.state = PreReviewChecksState::Retry;
+    entry.last_head_poll = Some(std::time::Instant::now());
+    entry.post_gate_validation_attempted = true;
+}
+
 /// Share one per-PR cadence for pre-review GitHub reads across normal, orphan,
 /// and resumed-reviewer reconciliation.
 async fn poll_pre_review_mergeability_if_due(
@@ -11660,7 +11689,18 @@ async fn tick(
                                             false,
                                         )
                                         .await;
-                                        pre_review_checks.remove(&reviewer_task_id);
+                                        if matches!(
+                                            &r2_provision,
+                                            Ok(ReviewerProvisionOutcome::HeadMoved { .. })
+                                        ) {
+                                            defer_pre_review_after_head_move(
+                                                pre_review_checks,
+                                                reviewer_task_id,
+                                                pr_num,
+                                            );
+                                        } else {
+                                            pre_review_checks.remove(&reviewer_task_id);
+                                        }
                                         let r2_added = reviewers.len() > reviewer_count_before;
                                         match r2_provision_disposition(r2_added, &r2_provision) {
                                             R2ProvisionDisposition::Attached => {
@@ -15798,8 +15838,19 @@ async fn tick(
                             TickErrorAction::ExitSelfUpdate => return Err(e),
                         },
                     };
-                    if provision_outcome == ReviewerProvisionOutcome::Attached {
-                        pre_review_checks.remove(task_id);
+                    match provision_outcome {
+                        ReviewerProvisionOutcome::Attached => {
+                            pre_review_checks.remove(task_id);
+                        }
+                        ReviewerProvisionOutcome::HeadMoved { gated, fetched } => {
+                            log(&format!(
+                                "task #{task_id} PR #{pr}: fetched head moved from {gated} to \
+                                 {fetched}; restarting pre-review checks"
+                            ));
+                            defer_pre_review_after_head_move(pre_review_checks, *task_id, *pr);
+                        }
+                        ReviewerProvisionOutcome::Unavailable
+                        | ReviewerProvisionOutcome::Failed(_) => {}
                     }
                 }
                 Err(e) => {
@@ -16213,8 +16264,19 @@ async fn tick(
                             TickErrorAction::ExitSelfUpdate => return Err(e),
                         },
                     };
-                    if provision_outcome == ReviewerProvisionOutcome::Attached {
-                        pre_review_checks.remove(task_id);
+                    match provision_outcome {
+                        ReviewerProvisionOutcome::Attached => {
+                            pre_review_checks.remove(task_id);
+                        }
+                        ReviewerProvisionOutcome::HeadMoved { gated, fetched } => {
+                            log(&format!(
+                                "orphan task #{task_id} PR #{pr}: fetched head moved from {gated} \
+                                 to {fetched}; restarting pre-review checks"
+                            ));
+                            defer_pre_review_after_head_move(pre_review_checks, *task_id, *pr);
+                        }
+                        ReviewerProvisionOutcome::Unavailable
+                        | ReviewerProvisionOutcome::Failed(_) => {}
                     }
                 }
                 Err(e) => {
@@ -20326,29 +20388,60 @@ async fn provision_reviewer_reserved(
             .await
     };
     let provision_failure = match provision_result {
-        Ok(_) => match wt_mgr.verify_head_sha(&wt_path, head_sha).await {
+        Ok(_) => match wt_mgr.head_sha(&wt_path).await {
+            Ok(fetched_head_sha) if fetched_head_sha != head_sha => {
+                cleanup_failed_reviewer_provision(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    &reviewer_name,
+                    &wt_path,
+                    &branch,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+                let path = config.db_path.clone();
+                let stale_head = head_sha.to_string();
+                let task_id = worker.task_id;
+                tokio::task::spawn_blocking(move || -> Result<()> {
+                    let conn = quorum_core::db::open(&path)?;
+                    quorum_core::pr_targets::delete_if_head(&conn, task_id, pr, &stale_head)?;
+                    Ok(())
+                })
+                .await
+                .map_err(|error| {
+                    QuorumError::Io(format!(
+                        "stale reviewer target invalidation join for task #{task_id}: {error}"
+                    ))
+                })??;
+                log(&format!(
+                    "{}: PR #{pr} branch advanced while GitHub still reported the gated head \
+                     (gated {head_sha}, fetched {fetched_head_sha}) — discarding the CI gate \
+                     without charging a reviewer provision strike",
+                    role.as_str().to_uppercase()
+                ));
+                return Ok(ReviewerProvisionOutcome::HeadMoved {
+                    gated: head_sha.to_string(),
+                    fetched: fetched_head_sha,
+                });
+            }
             // Reviewers read code and post GitHub comments — they never push.
             // Defense in depth, not an authority boundary (an explicit remote
             // URL or `gh` still works); a failed lockout means a broken
             // assumption about the worktree, so abort rather than proceed.
-            Ok(()) => match wt_mgr.disable_push(&wt_path).await {
+            Ok(_) => match wt_mgr.disable_push(&wt_path).await {
                 Ok(()) => None,
                 Err(e) => {
                     let reason = format!("reviewer push lockout failed for PR #{pr}: {e}");
                     log(&format!("{reason} — tearing down worktree"));
-                    wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                    wt_mgr.delete_branch(task_repo_dir, &branch).await;
                     Some(reason)
                 }
             },
-            Err(e) => {
-                let reason =
-                    format!("reviewer worktree does not match gated HEAD for PR #{pr}: {e}");
-                log(&reason);
-                wt_mgr.remove(task_repo_dir, &wt_path).await.ok();
-                wt_mgr.delete_branch(task_repo_dir, &branch).await;
-                Some(reason)
-            }
+            Err(e) => Some(format!(
+                "reviewer worktree HEAD unavailable for PR #{pr}: {e}"
+            )),
         },
         Err(e) => {
             let reason = format!("reviewer worktree provision failed for PR #{pr}: {e}");
@@ -26872,6 +26965,34 @@ mod tests {
             grok: Default::default(),
             pr_target_program: None,
         }
+    }
+
+    #[test]
+    fn fetched_head_move_defers_gate_until_next_configured_poll() {
+        const TASK_ID: i64 = 376;
+        const PR: i64 = 548;
+        let mut waits = HashMap::from([(
+            TASK_ID,
+            PreReviewChecksEntry {
+                pr: PR,
+                head_sha: "stale-head".into(),
+                last_head_poll: Some(std::time::Instant::now() - Duration::from_secs(60)),
+                post_gate_validation_attempted: true,
+                state: PreReviewChecksState::Ready,
+                consecutive_timeouts: 0,
+                timeout_alerted: false,
+            },
+        )]);
+
+        defer_pre_review_after_head_move(&mut waits, TASK_ID, PR);
+
+        let entry = &waits[&TASK_ID];
+        assert!(matches!(entry.state, PreReviewChecksState::Retry));
+        assert!(entry.post_gate_validation_attempted);
+        assert!(
+            entry.last_head_poll.unwrap().elapsed() < Duration::from_secs(1),
+            "the stale gate must wait for a fresh poll instead of retrying every serve tick"
+        );
     }
 
     #[tokio::test]
@@ -38038,6 +38159,17 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(
             r2_provision_disposition(false, &reservation_miss).end_reason(),
             "r2-provision-unavailable"
+        );
+
+        let stale_gate: Result<ReviewerProvisionOutcome> =
+            Ok(ReviewerProvisionOutcome::HeadMoved {
+                gated: "c4375da".into(),
+                fetched: "9272889".into(),
+            });
+        assert_eq!(
+            r2_provision_disposition(false, &stale_gate),
+            R2ProvisionDisposition::Unavailable,
+            "a fetched newer head is a retriable synchronization miss, not a provision error"
         );
 
         let spawn_failure: Result<ReviewerProvisionOutcome> = Ok(ReviewerProvisionOutcome::Failed(

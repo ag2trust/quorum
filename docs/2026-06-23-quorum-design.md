@@ -922,14 +922,19 @@ a durable parked state. Parking atomically:
 - excludes the task from automatic worker/reviewer provisioning.
 
 This applies to exhausted crash recovery, repeated instant worker death, merge-policy
-blocks, reviewer repository mismatch, reviewer provision exhaustion, and terminal
-not-done dependencies. The dependency cascade parks the dependent with resume status
-`open`; readiness remains false until all dependencies are `done`. The cascade also
-distinguishes a merely-`failed` dependency (recoverable — the dep itself may still
-retry to `done`) from a `cancelled` dependency (terminal-terminal — no path exists
-back to `done` without a `depends_on` edit or closing the dependent). The park reason
-names the specific failing dep — a `cancelled` dep is preferred over a `failed`
-sibling because it drives the operator disposition — and the durable
+blocks, reviewer repository mismatch, reviewer provision exhaustion, and genuinely
+terminal not-done dependencies. Although parking retains `failed` as its storage
+representation, `daemon_parked=true` plus a resume status is a logically distinct,
+nonterminal hold. A dependent of such a task stays `open` but unready; it is never
+cascade-parked merely because its prerequisite awaits `task-retry`, and it becomes
+ready normally when that prerequisite reaches `done`.
+
+The dependency cascade therefore considers only an unparked `failed` task or a
+`cancelled` task terminal-not-done. It parks the dependent with resume status `open`.
+A `cancelled` dependency is terminal-terminal — no path exists back to `done` without
+a `depends_on` edit or closing the dependent — and wins over a genuinely failed
+sibling because it drives the operator disposition. The park reason names the
+specific terminal dependency, and the durable
 `daemon_parked_unsatisfiable=true` bit records the distinction in refs. Every other
 park path (`set_parked_refs`) clears any stale value so the marker is authoritative
 for the current park only. `quorum status` includes `daemon_parked_unsatisfiable=1`
@@ -1234,8 +1239,11 @@ provisioning and merge.
 - Immediately before acquiring or feeding a reviewer, the daemon re-resolves the
   authoritative PR head and requires it still equals the gated SHA. Reviewer worktree
   provisioning then verifies the fetched `HEAD` is that exact SHA. A mismatch discards
-  the cached result and restarts gating without spawning a reviewer; the SHA recorded for
-  stale-verdict detection is the same SHA that passed both checks.
+  the cached result and any persisted tuple for the disproven head, then restarts gating
+  without spawning a reviewer or consuming a provisioning strike. This also covers a short
+  propagation window where PR API metadata repeats the old SHA while the fetched branch is
+  already newer. The SHA recorded for stale-verdict detection is the same SHA that passed
+  both checks.
 - Before `ChecksFailed` commits `in-review → rework`, the daemon atomically persists the
   exact CI remediation PR, head SHA, failing checks, feedback, and bounded provision
   attempt count in task refs. Reaper and restart recovery preserve this rework intent,
@@ -2577,8 +2585,12 @@ reserve no idle capacity and never interrupt active unrelated work. Active sibli
 after another child fails; no later child may start.
 
 A reviewer may submit a capability-bound, closed graph-blocker verdict only for a genuine safety
-or authority boundary violation: a change that would grant authority, break restricted-role or
-phase isolation, escape the managed repository, or expose secrets. A correct, safe change that
+or authority boundary violation where continuing the materialized graph would itself grant
+authority, break restricted-role or phase isolation, escape the managed repository, or expose
+secrets and no safe repair can be expressed on the current PR. A repairable source-code defect,
+including one that could expose a secret if merged, receives a BLOCKING `changes` verdict and a
+separate redacted critical owner notification; notification urgency never decides graph validity.
+A correct, safe change that
 requires a bounded edit outside a generated child's `write` deliverables, including a
 `read_only_reference` path, instead receives a BLOCKING `changes` verdict. That feedback names the
 specific required edit and explicitly authorizes the rework worker to make the minimal, justified
