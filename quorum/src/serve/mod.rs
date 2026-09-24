@@ -1235,6 +1235,8 @@ async fn run_publication_gh_command_with_limit(
     label: &str,
 ) -> std::result::Result<std::process::Output, String> {
     command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -3837,6 +3839,7 @@ pub const EXIT_SELF_UPDATE: i32 = 75;
 const DAEMON_LOCK_STALE_SECS: i64 = 30;
 const DRIFT_CHECK_INTERVAL_SECS: u64 = 15 * 60;
 const PUBLICATION_REF_RECONCILE_INTERVAL_SECS: u64 = 60;
+const WORKTREE_PRUNE_INTERVAL_SECS: u64 = 60 * 60;
 const PUBLICATION_REF_RECONCILE_BATCH_SIZE: i64 = 64;
 
 pub fn run_serve(config: ServeConfig) -> Result<i32> {
@@ -4724,6 +4727,8 @@ async fn fold_late_reviewer_verdict(
             let output = std::process::Command::new("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(worktree)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_OPTIONAL_LOCKS", "0")
                 .output()
                 .ok()?;
             output
@@ -4873,6 +4878,8 @@ fn poll_origin_self_update_sha(
     let mut child = std::process::Command::new("git")
         .args(["ls-remote", "origin", &refspec])
         .current_dir(repo_dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -4933,6 +4940,8 @@ fn run_drift_check(db_path: &std::path::Path, repo: &str) -> Result<()> {
             "--limit",
             "100",
         ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
         .map_err(|e| QuorumError::Io(format!("gh pr list: {e}")))?;
     if !output.status.success() {
@@ -10510,6 +10519,7 @@ async fn tick_loop(
         )
         .await?;
     }
+    let mut last_worktree_prune = Some(std::time::Instant::now());
     resume_pending_fallbacks(
         config,
         &wt_mgr,
@@ -10933,6 +10943,17 @@ async fn tick_loop(
                     "publication ref periodic reconciliation failed: {e} — continuing"
                 )),
             }
+        }
+
+        let should_prune_worktrees = match last_worktree_prune {
+            None => true,
+            Some(last) => last.elapsed().as_secs() >= WORKTREE_PRUNE_INTERVAL_SECS,
+        };
+        if should_prune_worktrees {
+            last_worktree_prune = Some(std::time::Instant::now());
+            wt_mgr
+                .prune_stale_initializing(&config.repo_dir, &config.worktree_base)
+                .await;
         }
 
         if let Err(e) = tick(
@@ -41862,6 +41883,23 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             .unwrap()
             .success();
         assert!(!still_alive, "timed-out GitHub child was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_gh_command_sets_noninteractive_git_environment() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf '%s,%s' \"$GIT_TERMINAL_PROMPT\" \"$GIT_OPTIONAL_LOCKS\"",
+        ]);
+
+        let output = run_publication_gh_command(command, Duration::from_secs(1), "gh environment")
+            .await
+            .expect("command should run");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"0,0");
     }
 
     #[cfg(unix)]
