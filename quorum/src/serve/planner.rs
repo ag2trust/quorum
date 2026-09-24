@@ -3288,6 +3288,83 @@ mod tests {
             slot.kill_and_reap().await;
             assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
         }
+
+        // `try_wait` reaps the shell leader, which makes `Child::id()` return
+        // `None`. Its background child still owns the group's stdout/stderr,
+        // so teardown must use the spawn-time process-group ID rather than
+        // the reaped leader's ID.
+        let dir = tempfile::tempdir().unwrap();
+        let child_pid_path = dir.path().join("codex-child.pid");
+        let runner = executable_script(
+            dir.path(),
+            "codex",
+            &format!(
+                "sleep 30 &\nprintf '%s\\n' \"$!\" > '{}'\nexit 0",
+                child_pid_path.display()
+            ),
+        );
+        let mut slot = spawn_planner(
+            AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        let child_pid = tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&child_pid_path) {
+                    if let Ok(pid) = pid.trim().parse::<libc::pid_t>() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Codex fixture did not record its child PID");
+        tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, async {
+            loop {
+                if slot.proc.try_wait().unwrap().is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Codex fixture leader did not exit");
+        assert_eq!(
+            unsafe { libc::kill(child_pid, 0) },
+            0,
+            "fixture child exited early"
+        );
+
+        if tokio::time::timeout(Duration::from_secs(5), slot.kill_and_reap())
+            .await
+            .is_err()
+        {
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+            }
+            panic!("Codex teardown did not promptly kill the leader's child");
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if unsafe { libc::kill(child_pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Codex teardown left the leader's child running");
     }
 
     #[tokio::test]
