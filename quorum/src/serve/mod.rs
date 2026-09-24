@@ -8057,6 +8057,12 @@ async fn tick_decomposition(
 
     if snapshot.state == "provider-backoff" {
         if now_unix() - snapshot.updated_at >= DECOMPOSITION_PROVIDER_BACKOFF_SECS {
+            // A provider failure released this graph's freeze and cleared its
+            // SHA. The cached archive can no longer be reused, and its
+            // durable recovery marker must not count as in-flight work while
+            // the next freeze drains the repository.
+            coordinator.release_frozen_view();
+            delete_decomposition_process(config, snapshot.graph_id, "frozen-view").await?;
             let path = config.db_path.clone();
             let graph_id = snapshot.graph_id;
             let reacquired = tokio::task::spawn_blocking(move || -> Result<bool> {
@@ -48116,6 +48122,88 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             reap_decomposition_arbiter_with_usage(&self.db_path, coordinator).await;
             reap_decomposition_classifier_with_usage(&self.db_path, coordinator).await;
         }
+    }
+
+    /// A provider failure clears the frozen SHA before the next drain. Its
+    /// graph-owned cache marker must be released too, or it would count as
+    /// durable in-flight work and prevent `draining` from capturing that new
+    /// SHA forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_backoff_releases_cached_view_before_refreezing() {
+        let harness = lifecycle_harness("provider-backoff-releases-view");
+        let snapshot = {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            load_planning_snapshot(&conn).unwrap().unwrap()
+        };
+        let mut coordinator = DecompositionCoordinator::default();
+        let view = retain_cached_frozen_planner_view(&harness.config, &mut coordinator, &snapshot)
+            .await
+            .unwrap();
+        assert!(view.exists());
+        {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            let markers: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM journal WHERE role='frozen-view'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(markers, 1);
+        }
+
+        {
+            let mut conn = quorum_core::db::open(&harness.db_path).unwrap();
+            assert!(quorum_core::decomposition::record_attempt(
+                &mut conn,
+                harness.graph,
+                "provider",
+                "planner-provider",
+                "bounded provider failure",
+                5,
+            )
+            .unwrap()
+            .is_some());
+        }
+
+        // `updated_at=5` is safely past the bounded backoff window. The first
+        // tick releases both cache ownership forms before reacquiring freeze.
+        assert!(harness.tick(&mut coordinator).await);
+        assert!(coordinator.frozen_view.is_none());
+        assert!(!view.exists());
+        {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            let state: (String, bool, Option<String>, i64) = conn
+                .query_row(
+                    "SELECT state,freeze_active,frozen_base_sha,
+                            (SELECT count(*) FROM journal)
+                     FROM task_decompositions WHERE id=?1",
+                    [harness.graph],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(state, ("freeze-requested".into(), true, None, 0));
+        }
+
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(
+            arbiter_gate_state(&harness.db_path, harness.graph).0,
+            "draining"
+        );
+
+        assert!(harness.tick(&mut coordinator).await);
+        let expected_sha = repository_head_sha(&harness.config.repo_dir).await.unwrap();
+        let conn = quorum_core::db::open(&harness.db_path).unwrap();
+        let state: (String, bool, Option<String>) = conn
+            .query_row(
+                "SELECT state,freeze_active,frozen_base_sha
+                 FROM task_decompositions WHERE id=?1",
+                [harness.graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("planning".into(), true, Some(expected_sha)));
     }
 
     /// A classifier rejection returns the proposal to the planner retry path
