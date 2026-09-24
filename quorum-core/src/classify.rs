@@ -274,59 +274,27 @@ fn enrich_task(
     Ok(task)
 }
 
-/// Retain at most `max` characters and make every cut explicit. DB loaders
-/// provide a one-character lookahead, so `original exceeds` remains accurate
-/// even when the complete source length was deliberately not loaded.
-pub fn truncate_for_prompt(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    format!(
-        "{}… [TRUNCATED: retained {max} characters; original exceeds {max}]",
-        s.chars().take(max).collect::<String>()
-    )
-}
-
-/// Check whether a specific task lacks cx_est in refs.
-pub fn task_missing_cx(conn: &Connection, task_id: i64) -> Result<Option<TaskForClassification>> {
-    let query = format!(
-        "SELECT id, revision, substr(title, 1, ?2), substr(body, 1, ?3) FROM tasks
-         WHERE id = ?1
-         AND {INCOMPLETE_CLASSIFICATION_PREDICATE}"
-    );
-    conn.query_row(
-        &query,
-        params![
-            task_id,
-            with_truncation_lookahead(TITLE_CHAR_LIMIT),
-            with_truncation_lookahead(BODY_CHAR_LIMIT)
-        ],
-        |row| {
-            Ok(TaskForClassification {
-                id: row.get(0)?,
-                revision: row.get(1)?,
-                title: row.get(2)?,
-                body: row.get(3)?,
-                dependencies: vec![],
-                recovery_notes: vec![],
-                body_char_limit: BODY_CHAR_LIMIT,
-            })
-        },
-    )
-    .optional()
-    .map_err(Into::into)
-}
-
-/// Read the exact bounded classifier input for one task, regardless of whether
-/// it is currently eligible.  Persistence uses this inside its write
-/// transaction to reject an input that changed while a provider turn ran.
-fn classifier_input_for_task(
+/// Load the bounded classifier input for one persisted task, then add the
+/// bounded coordination context that is part of its rendered contract.  The
+/// targeted snapshot and the persistence reload must share this path so their
+/// fingerprints cover precisely the same dependency and recovery-note input.
+fn load_bounded_enriched_classifier_task(
     conn: &Connection,
     task_id: i64,
+    require_incomplete_classification: bool,
 ) -> Result<Option<TaskForClassification>> {
+    let incomplete_predicate = if require_incomplete_classification {
+        format!(" AND {INCOMPLETE_CLASSIFICATION_PREDICATE}")
+    } else {
+        String::new()
+    };
+    let query = format!(
+        "SELECT id, revision, substr(title, 1, ?2), substr(body, 1, ?3) FROM tasks \
+         WHERE id=?1{incomplete_predicate}"
+    );
     let task = conn
         .query_row(
-            "SELECT id, revision, substr(title, 1, ?2), substr(body, 1, ?3) FROM tasks WHERE id=?1",
+            &query,
             params![
                 task_id,
                 with_truncation_lookahead(TITLE_CHAR_LIMIT),
@@ -346,6 +314,34 @@ fn classifier_input_for_task(
         )
         .optional()?;
     task.map(|task| enrich_task(conn, task)).transpose()
+}
+
+/// Retain at most `max` characters and make every cut explicit. DB loaders
+/// provide a one-character lookahead, so `original exceeds` remains accurate
+/// even when the complete source length was deliberately not loaded.
+pub fn truncate_for_prompt(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    format!(
+        "{}… [TRUNCATED: retained {max} characters; original exceeds {max}]",
+        s.chars().take(max).collect::<String>()
+    )
+}
+
+/// Check whether a specific task lacks cx_est in refs.
+pub fn task_missing_cx(conn: &Connection, task_id: i64) -> Result<Option<TaskForClassification>> {
+    load_bounded_enriched_classifier_task(conn, task_id, true)
+}
+
+/// Read the exact bounded classifier input for one task, regardless of whether
+/// it is currently eligible.  Persistence uses this inside its write
+/// transaction to reject an input that changed while a provider turn ran.
+fn classifier_input_for_task(
+    conn: &Connection,
+    task_id: i64,
+) -> Result<Option<TaskForClassification>> {
+    load_bounded_enriched_classifier_task(conn, task_id, false)
 }
 
 /// All open/working tasks (for dup-detection context).
@@ -1067,6 +1063,60 @@ mod tests {
         let prompt = build_prompt(&unclassified_tasks(&conn).unwrap(), &[]);
         assert!(prompt.contains("[TRUNCATED: retained 4096 characters; original exceeds 4096]"));
         assert!(!prompt.contains("HIDDEN_RECOVERY_SUFFIX"));
+    }
+
+    #[test]
+    fn targeted_snapshot_and_reload_share_bounded_recovery_context() {
+        let (_dir, mut conn) = open_tmp();
+        let dependency = create_task(&mut conn, "scheduler prerequisite", 1);
+        let task_id = create_dependent_task(
+            &mut conn,
+            "Recovered targeted task",
+            "Classify this contract with its bounded recovery context.",
+            dependency,
+            2,
+        );
+        conn.execute(
+            "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, 3, 'daemon', ?2)",
+            params![
+                task_id,
+                format!(
+                    "{}HIDDEN_TARGETED_RECOVERY_SUFFIX",
+                    "R".repeat(RECOVERY_NOTE_CHAR_LIMIT)
+                )
+            ],
+        )
+        .unwrap();
+
+        let targeted = task_missing_cx(&conn, task_id).unwrap().unwrap();
+        assert_eq!(
+            targeted.dependencies,
+            vec![format!("#{dependency} scheduler prerequisite")]
+        );
+        let targeted_prompt = build_prompt(std::slice::from_ref(&targeted), &[]);
+        assert!(targeted_prompt
+            .contains("[TRUNCATED: retained 4096 characters; original exceeds 4096]"));
+        assert!(!targeted_prompt.contains("HIDDEN_TARGETED_RECOVERY_SUFFIX"));
+
+        let snapshot = classification_inputs(std::slice::from_ref(&targeted));
+        let reloaded = classifier_input_for_task(&conn, task_id).unwrap().unwrap();
+        assert_eq!(
+            snapshot,
+            classification_inputs(std::slice::from_ref(&reloaded)),
+            "an unchanged targeted input must have the same enriched fingerprint on reload"
+        );
+        assert_eq!(
+            store_classifications_for_inputs(
+                &mut conn,
+                &[classified(task_id, 3)],
+                &snapshot,
+                "test:v2",
+                2_000_000,
+            )
+            .unwrap(),
+            1,
+            "the unchanged targeted result must survive the persistence fingerprint check"
+        );
     }
 
     #[test]
