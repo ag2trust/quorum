@@ -551,7 +551,9 @@ impl GhMergeExecutor {
 impl GhMergeExecutor {
     fn build_gh_cmd(&self, args: &[&str], repo_dir: &Path) -> Command {
         let mut cmd = Command::new("gh");
-        cmd.args(args);
+        cmd.args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0");
         if let Some(ref nwo) = self.gh_repo {
             cmd.args(["-R", nwo]);
         } else {
@@ -647,7 +649,9 @@ impl GhMergeExecutor {
     /// cwd behavior, with the only difference being the slug is passed positionally.
     fn repo_view_default_branch_cmd(&self, repo_dir: &Path) -> Command {
         let mut cmd = Command::new("gh");
-        cmd.args(["repo", "view"]);
+        cmd.args(["repo", "view"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0");
         if let Some(ref nwo) = self.gh_repo {
             cmd.arg(nwo);
         } else {
@@ -1498,6 +1502,8 @@ impl MergeExecutor for CommandMergeExecutor {
         let output = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(repo_dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .output()
             .ok()?;
         if !output.status.success() {
@@ -1533,6 +1539,8 @@ impl MergeExecutor for CommandMergeExecutor {
         let output = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(repo_dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .output()
             .ok()?;
         if output.status.success() {
@@ -2376,6 +2384,33 @@ mod tests {
         let argv = repo_view_argv(&exec, repo_dir);
         assert_eq!(argv, vec!["repo", "view", "--json", "defaultBranchRef"]);
         assert!(!argv.iter().any(|a| a == "-R"));
+    }
+
+    #[test]
+    fn gh_commands_disable_git_prompts_and_optional_locks() {
+        let exec = GhMergeExecutor {
+            token_file: None,
+            gh_repo: None,
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
+        };
+        for cmd in [
+            exec.build_gh_cmd(&["pr", "view", "1"], Path::new("/tmp")),
+            exec.repo_view_default_branch_cmd(Path::new("/tmp")),
+        ] {
+            let env: std::collections::HashMap<_, _> = cmd
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value)))
+                .collect();
+            assert_eq!(
+                env.get(std::ffi::OsStr::new("GIT_TERMINAL_PROMPT")),
+                Some(&std::ffi::OsStr::new("0"))
+            );
+            assert_eq!(
+                env.get(std::ffi::OsStr::new("GIT_OPTIONAL_LOCKS")),
+                Some(&std::ffi::OsStr::new("0"))
+            );
+        }
     }
 
     fn gh_available() -> bool {

@@ -1220,6 +1220,8 @@ async fn run_publication_gh_command_with_limit(
     label: &str,
 ) -> std::result::Result<std::process::Output, String> {
     command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -4710,6 +4712,8 @@ async fn fold_late_reviewer_verdict(
             let output = std::process::Command::new("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(worktree)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_OPTIONAL_LOCKS", "0")
                 .output()
                 .ok()?;
             output
@@ -4859,6 +4863,8 @@ fn poll_origin_self_update_sha(
     let mut child = std::process::Command::new("git")
         .args(["ls-remote", "origin", &refspec])
         .current_dir(repo_dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -4919,6 +4925,8 @@ fn run_drift_check(db_path: &std::path::Path, repo: &str) -> Result<()> {
             "--limit",
             "100",
         ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
         .map_err(|e| QuorumError::Io(format!("gh pr list: {e}")))?;
     if !output.status.success() {
@@ -41754,6 +41762,23 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             .unwrap()
             .success();
         assert!(!still_alive, "timed-out GitHub child was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_gh_command_sets_noninteractive_git_environment() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf '%s,%s' \"$GIT_TERMINAL_PROMPT\" \"$GIT_OPTIONAL_LOCKS\"",
+        ]);
+
+        let output = run_publication_gh_command(command, Duration::from_secs(1), "gh environment")
+            .await
+            .expect("command should run");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"0,0");
     }
 
     #[cfg(unix)]
