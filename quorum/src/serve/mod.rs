@@ -5050,8 +5050,41 @@ struct DecompositionCoordinator {
     /// classifier slots.
     arbiter_slot: Option<arbiter::ArbiterSlot>,
     arbiter_source_task_id: Option<i64>,
-    planner_view: Option<tempfile::TempDir>,
+    /// One extracted frozen tree per active graph. The cache key includes the
+    /// repository path as well as the frozen SHA, so planner retries and the
+    /// later Arbiter share an exact immutable tree without cross-repository
+    /// reuse.
+    frozen_view: Option<CachedFrozenPlannerView>,
     writable_path_resolver: planner::WritablePathResolver,
+}
+
+/// An extracted planner tree and the immutable source it represents.
+///
+/// This stays in the coordinator rather than the worktree manager: it is a
+/// temporary `git archive` tree, never a Git worktree, and therefore remains
+/// outside worktree-GC ownership.
+struct CachedFrozenPlannerView {
+    repo: PathBuf,
+    frozen_sha: String,
+    directory: tempfile::TempDir,
+}
+
+impl CachedFrozenPlannerView {
+    fn matches(&self, repo: &Path, frozen_sha: &str) -> bool {
+        self.repo == repo && self.frozen_sha == frozen_sha
+    }
+
+    fn path(&self) -> &Path {
+        self.directory.path()
+    }
+}
+
+impl DecompositionCoordinator {
+    /// Drop the one graph-owned archive. Called only when that graph has left
+    /// all frozen planning phases (completion, cancellation, or source edit).
+    fn release_frozen_view(&mut self) {
+        self.frozen_view = None;
+    }
 }
 
 /// Close one planner run's `submit_plan` authority and read whatever it
@@ -5523,6 +5556,36 @@ async fn frozen_planner_view(repo: &Path, frozen_sha: &str) -> Result<tempfile::
         PLANNER_ARCHIVE_MAX_BYTES,
     )
     .await
+}
+
+/// Return this coordinator's frozen archive for `(repo, frozen_sha)`, creating
+/// it only when that immutable source has changed. A coordinator advances one
+/// graph at a time, which bounds this cache to one temporary archive.
+async fn cached_frozen_planner_view(
+    coordinator: &mut DecompositionCoordinator,
+    repo: &Path,
+    frozen_sha: &str,
+) -> Result<PathBuf> {
+    if let Some(view) = coordinator
+        .frozen_view
+        .as_ref()
+        .filter(|view| view.matches(repo, frozen_sha))
+    {
+        return Ok(view.path().to_path_buf());
+    }
+
+    // A different frozen base cannot share this tree. Drop the prior archive
+    // before extracting its replacement so an active coordinator owns at most
+    // one view even if a graph is re-frozen at a new SHA.
+    coordinator.release_frozen_view();
+    let directory = frozen_planner_view(repo, frozen_sha).await?;
+    let path = directory.path().to_path_buf();
+    coordinator.frozen_view = Some(CachedFrozenPlannerView {
+        repo: repo.to_path_buf(),
+        frozen_sha: frozen_sha.to_owned(),
+        directory,
+    });
+    Ok(path)
 }
 
 async fn frozen_planner_view_with_options(
@@ -6028,6 +6091,40 @@ async fn delete_decomposition_process_at(db_path: &Path, graph_id: i64, role: &s
     Ok(())
 }
 
+/// Keep a durable recovery marker for the coordinator-owned archive even
+/// between provider attempts. A planner, classifier, or Arbiter journal row
+/// covers a live process, but the cached view intentionally outlives each one.
+async fn retain_cached_frozen_planner_view(
+    config: &ServeConfig,
+    coordinator: &mut DecompositionCoordinator,
+    snapshot: &PlanningSnapshot,
+) -> Result<PathBuf> {
+    let view = cached_frozen_planner_view(coordinator, &config.repo_dir, &snapshot.frozen_base_sha)
+        .await?;
+    if let Err(error) = journal_decomposition_process(
+        config,
+        snapshot.graph_id,
+        snapshot.source_task_id,
+        "frozen-view",
+        None,
+        Some(&view),
+        DecompositionProcessSession {
+            id: &snapshot.frozen_base_sha,
+            log_dir: None,
+            provider: None,
+        },
+    )
+    .await
+    {
+        // Without the marker, a crash in the gap between attempts could leave
+        // an untracked temporary archive behind. Dropping it is safer than
+        // accepting a cache that recovery cannot prove it owns.
+        coordinator.release_frozen_view();
+        return Err(error);
+    }
+    Ok(view)
+}
+
 /// Settle provider authority when a legal concurrent source edit removes the
 /// pre-materialization aggregate. The graph identity is retained until both
 /// process journals have been deleted, so a transient DB failure is retried on
@@ -6048,7 +6145,7 @@ async fn discard_removed_decomposition(
     reap_decomposition_planner_with_usage(db_path, coordinator).await;
     reap_decomposition_arbiter_with_usage(db_path, coordinator).await;
     reap_decomposition_classifier_with_usage(db_path, coordinator).await;
-    coordinator.planner_view = None;
+    coordinator.release_frozen_view();
     coordinator.proposal = None;
     coordinator.classifications = None;
     if let Some(graph_id) = graph_id {
@@ -6058,6 +6155,7 @@ async fn discard_removed_decomposition(
         delete_decomposition_process_at(db_path, graph_id, "planner").await?;
         delete_decomposition_process_at(db_path, graph_id, "arbiter").await?;
         delete_decomposition_process_at(db_path, graph_id, "classifier").await?;
+        delete_decomposition_process_at(db_path, graph_id, "frozen-view").await?;
     }
     Ok(())
 }
@@ -7163,7 +7261,7 @@ async fn spawn_arbiter_review(
         None,
     )?;
     let arbiter_kind = resolve_provider(&assignment.model)?;
-    let view = match frozen_planner_view(&config.repo_dir, &snapshot.frozen_base_sha).await {
+    let view = match retain_cached_frozen_planner_view(config, coordinator, snapshot).await {
         Ok(view) => view,
         Err(error) => {
             record_decomposition_attempt(
@@ -7183,7 +7281,7 @@ async fn spawn_arbiter_review(
         arbiter_kind,
         &assignment.model,
         &assignment.effort,
-        view.path(),
+        &view,
         &prompt,
         config.bare_agent,
         agent_bin_for_kind(config, arbiter_kind),
@@ -7209,7 +7307,7 @@ async fn spawn_arbiter_review(
                 snapshot.source_task_id,
                 "arbiter",
                 slot.pid(),
-                Some(view.path()),
+                Some(&view),
                 DecompositionProcessSession {
                     id: &session_id,
                     log_dir: slot.log_dir(),
@@ -7221,7 +7319,6 @@ async fn spawn_arbiter_review(
                 slot.kill_and_reap().await;
                 return Err(error);
             }
-            coordinator.planner_view = Some(view);
             coordinator.arbiter_source_task_id = Some(snapshot.source_task_id);
             coordinator.arbiter_slot = Some(slot);
         }
@@ -7569,7 +7666,6 @@ async fn tick_decomposition(
                     None
                 }
             };
-            coordinator.planner_view = None;
             let graph_id = coordinator
                 .graph_id
                 .ok_or_else(|| QuorumError::Io("planner lost graph identity".into()))?;
@@ -7663,7 +7759,6 @@ async fn tick_decomposition(
                     None
                 }
             };
-            coordinator.planner_view = None;
             let graph_id = coordinator
                 .graph_id
                 .ok_or_else(|| QuorumError::Io("arbiter lost graph identity".into()))?;
@@ -8070,7 +8165,7 @@ async fn tick_decomposition(
             },
             None,
         )?;
-        let view = match frozen_planner_view(&config.repo_dir, &snapshot.frozen_base_sha).await {
+        let view = match retain_cached_frozen_planner_view(config, coordinator, &snapshot).await {
             Ok(view) => view,
             Err(error) => {
                 record_decomposition_attempt(
@@ -8129,7 +8224,7 @@ async fn tick_decomposition(
             planner_kind,
             &assignment.model,
             &assignment.effort,
-            view.path(),
+            &view,
             &prompt,
             config.bare_agent,
             agent_bin_for_kind(config, planner_kind),
@@ -8155,7 +8250,7 @@ async fn tick_decomposition(
                     snapshot.source_task_id,
                     "planner",
                     slot.pid(),
-                    Some(view.path()),
+                    Some(&view),
                     DecompositionProcessSession {
                         id: &session_id,
                         log_dir: slot.log_dir(),
@@ -8168,7 +8263,6 @@ async fn tick_decomposition(
                     revoke_planner_run(&config.db_path, session_id).await;
                     return Err(error);
                 }
-                coordinator.planner_view = Some(view);
                 coordinator.planner_source_task_id = Some(snapshot.source_task_id);
                 coordinator.planner_run_id = Some(session_id);
                 coordinator.planner_slot = Some(slot);
@@ -8268,7 +8362,7 @@ async fn tick_decomposition(
                     snapshot.source_task_id,
                     "classifier",
                     slot.proc.pid(),
-                    coordinator.planner_view.as_ref().map(|view| view.path()),
+                    coordinator.frozen_view.as_ref().map(|view| view.path()),
                     DecompositionProcessSession {
                         id: &session_id,
                         log_dir: None,
@@ -49036,7 +49130,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             classifications: None,
             arbiter_slot: None,
             arbiter_source_task_id: None,
-            planner_view: None,
+            frozen_view: None,
             writable_path_resolver: planner::WritablePathResolver::default(),
         };
 
@@ -49984,6 +50078,70 @@ exec /bin/cat '{stdout}'
 
         let not_a_repo = tempfile::tempdir().unwrap();
         assert!(repository_head_sha(not_a_repo.path()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cached_planner_view_reuses_a_frozen_sha_replaces_a_new_sha_and_releases() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?} failed", args);
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.path().join("state.txt"), "first").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "first"]);
+        let first_sha = git(&["rev-parse", "HEAD"]);
+
+        let mut coordinator = DecompositionCoordinator::default();
+        let first_view = cached_frozen_planner_view(&mut coordinator, repo.path(), &first_sha)
+            .await
+            .unwrap();
+        let retry_view = cached_frozen_planner_view(&mut coordinator, repo.path(), &first_sha)
+            .await
+            .unwrap();
+        assert_eq!(
+            retry_view, first_view,
+            "a retry against one frozen SHA must retain the extracted directory"
+        );
+
+        std::fs::write(repo.path().join("state.txt"), "second").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "second"]);
+        let second_sha = git(&["rev-parse", "HEAD"]);
+        let second_view = cached_frozen_planner_view(&mut coordinator, repo.path(), &second_sha)
+            .await
+            .unwrap();
+        assert_ne!(second_view, first_view);
+        assert!(
+            !first_view.exists(),
+            "the one-view cache drops the prior SHA before replacing it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second_view.join("state.txt")).unwrap(),
+            "second"
+        );
+
+        // A completed, cancelled, or edited-away graph reaches this common
+        // settlement path after its planning snapshot disappears.
+        coordinator.graph_id = Some(1);
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("decomposition.db");
+        quorum_core::db::open(&db_path).unwrap();
+        discard_removed_decomposition(&db_path, &mut coordinator)
+            .await
+            .unwrap();
+        assert!(
+            !second_view.exists(),
+            "terminal graph settlement must remove its cached frozen view"
+        );
     }
 
     #[cfg(unix)]

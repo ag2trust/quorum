@@ -783,7 +783,10 @@ async fn await_process_exit(pid: i32, timeout: std::time::Duration) -> bool {
 
 fn remove_journaled_decomposition_views(entries: &[JournalEntry]) {
     for entry in entries {
-        if !matches!(entry.role.as_str(), "planner" | "classifier") {
+        if !matches!(
+            entry.role.as_str(),
+            "planner" | "classifier" | "arbiter" | "frozen-view"
+        ) {
             continue;
         }
         let Some(view) = entry.worktree.as_deref().map(std::path::Path::new) else {
@@ -886,8 +889,9 @@ pub(crate) async fn recover(
     reserve_dormant_names(&pending_entries, name_pool, workers)?;
 
     // Decomposition planner views are ordinary temporary archives rather
-    // than Git worktrees. Their exact path is journaled with the provider
-    // process so abrupt daemon death cannot leak the frozen repository view.
+    // than Git worktrees. Their exact path is journaled with every provider
+    // and a graph-owned cache marker, so abrupt daemon death cannot leak the
+    // frozen repository tree between attempts.
     remove_journaled_decomposition_views(&entries);
 
     let dispositions = {
@@ -3559,7 +3563,7 @@ exec sleep 30
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn journaled_planner_and_classifier_process_groups_are_reaped_with_frozen_views() {
+    async fn journaled_decomposition_process_groups_are_reaped_with_frozen_views() {
         use std::os::unix::process::CommandExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -3596,7 +3600,7 @@ exec sleep 30
 
         let mut children = Vec::new();
         let mut view_paths = Vec::new();
-        for role in ["planner", "classifier"] {
+        for role in ["planner", "classifier", "arbiter"] {
             let view = tempfile::Builder::new()
                 .prefix("quorum-planner-")
                 .tempdir()
@@ -3635,8 +3639,38 @@ exec sleep 30
             children.push((child, pid));
             view_paths.push(view);
         }
+        let orphaned_view = tempfile::Builder::new()
+            .prefix("quorum-planner-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        std::fs::write(orphaned_view.join("frozen.txt"), "cached between attempts").unwrap();
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: format!("decomposition-frozen-view-{graph_id}"),
+                role: "frozen-view".into(),
+                task_id: Some(1),
+                session_id: "frozen-sha".into(),
+                worktree: Some(orphaned_view.to_string_lossy().into_owned()),
+                branch: None,
+                phase: "frozen-view".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+        view_paths.push(orphaned_view);
         let entries = journal::list_in_flight(&conn).unwrap();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 4);
         for entry in &entries {
             kill_stale_process_group(entry.pid);
         }
