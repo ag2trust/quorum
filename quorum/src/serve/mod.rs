@@ -67,14 +67,16 @@ fn load_graph_review_context(db_path: &Path, task_id: i64) -> Result<Option<Stri
 
 const REVIEW_TASK_BODY_LIMIT: i64 = 16_000;
 const REVIEW_TASK_NOTE_LIMIT: i64 = 4;
-const REVIEW_TASK_NOTE_BODY_LIMIT: i64 = 1_200;
+/// Recovery notes may amend the task contract, so reviewers receive at least
+/// the same semantic-context envelope used by classification.
+const REVIEW_TASK_NOTE_BODY_LIMIT: i64 = 4 * 1024;
 
 fn load_task_review_contract(db_path: &Path, task_id: i64) -> Result<String> {
     let conn = quorum_core::db::open(db_path)?;
     let (title, body, depends_on, refs): (String, Option<String>, Option<String>, Option<String>) =
         conn.query_row(
             "SELECT title, substr(body, 1, ?2), depends_on, refs FROM tasks WHERE id=?1",
-            rusqlite::params![task_id, REVIEW_TASK_BODY_LIMIT],
+            rusqlite::params![task_id, REVIEW_TASK_BODY_LIMIT + 1],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
     let mut stmt = conn.prepare(
@@ -83,10 +85,23 @@ fn load_task_review_contract(db_path: &Path, task_id: i64) -> Result<String> {
     )?;
     let recovery_notes = stmt
         .query_map(
-            rusqlite::params![task_id, REVIEW_TASK_NOTE_BODY_LIMIT, REVIEW_TASK_NOTE_LIMIT],
+            rusqlite::params![
+                task_id,
+                REVIEW_TASK_NOTE_BODY_LIMIT + 1,
+                REVIEW_TASK_NOTE_LIMIT
+            ],
             |row| row.get::<_, String>(0),
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let body = body.map(|body| {
+        quorum_core::classify::truncate_for_prompt(&body, REVIEW_TASK_BODY_LIMIT as usize)
+    });
+    let recovery_notes = recovery_notes
+        .into_iter()
+        .map(|note| {
+            quorum_core::classify::truncate_for_prompt(&note, REVIEW_TASK_NOTE_BODY_LIMIT as usize)
+        })
+        .collect::<Vec<_>>();
     Ok(reviewer::task_review_contract(
         task_id,
         &title,
@@ -7249,29 +7264,49 @@ async fn spawn_arbiter_review(
 /// separately so no single oversized field can push the rest out of the
 /// classifier's envelope.
 fn planned_child_body_json(task: &planner::ProposedTask, text_limit: Option<usize>) -> String {
+    const CLASSIFIER_TRUNCATION_MARKER: &str = "[TRUNCATED]";
+
+    fn bound_classifier_text(value: &str, limit: usize) -> String {
+        if value.len() <= limit {
+            return value.to_owned();
+        }
+        let separator = " ";
+        let retained_limit =
+            limit.saturating_sub(separator.len() + CLASSIFIER_TRUNCATION_MARKER.len());
+        let prefix = truncate_utf8_bytes(value, retained_limit);
+        format!("{prefix}{separator}{CLASSIFIER_TRUNCATION_MARKER}")
+    }
+
     fn bound_text(value: &str, limit: Option<usize>) -> String {
         match limit {
-            Some(limit) => bounded_with_ellipsis(value, limit),
+            Some(limit) => bound_classifier_text(value, limit),
             None => value.to_owned(),
         }
     }
-    // Bound a list by cumulative bytes: items past the budget are replaced by
-    // one ellipsis item rather than silently dropped.
+    // Bound a list by cumulative bytes. Reserve room for an explicit marker so
+    // omitted items can never look like a complete authored list.
     fn bound_list(values: &[String], limit: Option<usize>) -> Vec<String> {
         let Some(limit) = limit else {
             return values.to_vec();
         };
+        if values.iter().map(String::len).sum::<usize>() <= limit {
+            return values.to_vec();
+        }
+        let retained_limit = limit.saturating_sub(CLASSIFIER_TRUNCATION_MARKER.len());
         let mut used = 0usize;
         let mut bounded = Vec::with_capacity(values.len());
         for value in values {
-            if used + value.len() > limit {
-                let remaining = limit.saturating_sub(used);
-                bounded.push(bounded_with_ellipsis(value, remaining.max("…".len())));
+            if used + value.len() > retained_limit {
+                let remaining = retained_limit.saturating_sub(used);
+                if remaining > 0 {
+                    bounded.push(truncate_utf8_bytes(value, remaining).to_owned());
+                }
                 break;
             }
             used += value.len();
             bounded.push(value.clone());
         }
+        bounded.push(CLASSIFIER_TRUNCATION_MARKER.to_owned());
         bounded
     }
     // Deliverables are bounded by cumulative path bytes like any other list;
@@ -7285,6 +7320,20 @@ fn planned_child_body_json(task: &planner::ProposedTask, text_limit: Option<usiz
         let Some(limit) = limit else {
             return deliverables.clone();
         };
+        let paths_bytes = deliverables
+            .0
+            .iter()
+            .map(|deliverable| match deliverable {
+                quorum_core::decomposition::ChildDeliverable::Write { path }
+                | quorum_core::decomposition::ChildDeliverable::ReadOnlyReference { path } => {
+                    path.len()
+                }
+            })
+            .sum::<usize>();
+        if paths_bytes <= limit {
+            return deliverables.clone();
+        }
+        let retained_limit = limit.saturating_sub(CLASSIFIER_TRUNCATION_MARKER.len());
         let mut used = 0usize;
         let mut bounded = Vec::with_capacity(deliverables.0.len());
         for deliverable in &deliverables.0 {
@@ -7294,12 +7343,12 @@ fn planned_child_body_json(task: &planner::ProposedTask, text_limit: Option<usiz
                     (path, |path| ChildDeliverable::ReadOnlyReference { path })
                 }
             };
-            if used + path.len() > limit {
-                let remaining = limit.saturating_sub(used);
-                bounded.push(rebuild(bounded_with_ellipsis(
-                    path,
-                    remaining.max("…".len()),
-                )));
+            if used + path.len() > retained_limit {
+                let remaining = retained_limit.saturating_sub(used);
+                if remaining > 0 {
+                    bounded.push(rebuild(truncate_utf8_bytes(path, remaining).to_owned()));
+                }
+                bounded.push(rebuild(CLASSIFIER_TRUNCATION_MARKER.to_owned()));
                 break;
             }
             used += path.len();
@@ -26601,6 +26650,78 @@ mod tests {
     use super::*;
 
     const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn task_review_contract_preserves_recovery_context_beyond_twelve_hundred_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("review-contract.db");
+        let sentinel = "REVIEW_RECOVERY_CORRECTION_AFTER_1200";
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "review recovered task",
+            Some("authoritative outcome"),
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, 2, 'daemon', ?2)",
+            rusqlite::params![task_id, format!("{}{}", "R".repeat(1_500), sentinel)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let contract = load_task_review_contract(&db_path, task_id).unwrap();
+        assert!(contract.contains(sentinel));
+        assert!(!contract.contains("[TRUNCATED:"));
+    }
+
+    #[test]
+    fn task_review_contract_marks_oversized_body_and_recovery_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("oversized-review-contract.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "oversized review contract",
+            Some(&format!(
+                "{}HIDDEN_BODY_SUFFIX",
+                "B".repeat(REVIEW_TASK_BODY_LIMIT as usize)
+            )),
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, 2, 'daemon', ?2)",
+            rusqlite::params![
+                task_id,
+                format!(
+                    "{}HIDDEN_NOTE_SUFFIX",
+                    "R".repeat(REVIEW_TASK_NOTE_BODY_LIMIT as usize)
+                )
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let contract = load_task_review_contract(&db_path, task_id).unwrap();
+        assert!(contract.contains("[TRUNCATED: retained 16000 characters; original exceeds 16000]"));
+        assert!(contract.contains("[TRUNCATED: retained 4096 characters; original exceeds 4096]"));
+        assert!(!contract.contains("HIDDEN_BODY_SUFFIX"));
+        assert!(!contract.contains("HIDDEN_NOTE_SUFFIX"));
+    }
 
     /// The backstop counts only *consecutive* unrecordable strikes: one strike
     /// that does record clears it, so a transient write-lock holder can never
@@ -45915,15 +46036,15 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
         let delta = parsed["implementation_delta"].as_str().unwrap();
         assert!(delta.len() <= PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES);
-        assert!(delta.ends_with('…'));
+        assert!(delta.ends_with("[TRUNCATED]"));
         let criteria = parsed["acceptance_criteria"].as_array().unwrap();
         let criteria_bytes: usize = criteria
             .iter()
             .map(|value| value.as_str().unwrap().len())
             .sum();
-        assert!(criteria_bytes <= PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES + "…".len());
+        assert!(criteria_bytes <= PLANNED_CHILD_CLASSIFIER_FIELD_MAX_BYTES);
         assert!(criteria.len() < 40);
-        assert!(criteria.last().unwrap().as_str().unwrap().ends_with('…'));
+        assert_eq!(criteria.last().unwrap().as_str().unwrap(), "[TRUNCATED]");
         // Later fields survive the oversized earlier ones.
         assert_eq!(
             parsed["non_goals"][0],

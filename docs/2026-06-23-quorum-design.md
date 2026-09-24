@@ -1055,7 +1055,10 @@ from comment text. Concretely:
   `--blocking` count covers that complete blocker set. Before a verdict,
   reviewers derive a bounded, task-specific affected-path model from the
   embedded managed-task contract when provided and the mechanisms changed by
-  the PR. They choose a useful representation — a short matrix, checklist,
+  the PR. That contract retains up to 16,000 task-body characters and at least
+  4,096 characters from each of four recent recovery notes; a bounded database
+  lookahead makes every cut visible with an explicit truncation marker. They
+  choose a useful representation — a short matrix, checklist,
   state/event map, or equivalent — to review applicable related lifecycle and
   compatibility paths together and determine whether the proposed remedy
   closes each relevant path. This does not prescribe a fixed format, require
@@ -2756,6 +2759,13 @@ labels are ignored.
   does not inspect source, Git, CI, or external systems. Readiness is permissive: ordinary
   repository discovery and bounded engineering choices are execution work, not a reason to
   reject the task.
+- The classifier input envelope retains at least 4,096 characters from each authoritative root
+  task body and recovery note. Database reads include one bounded lookahead character so any cut
+  is rendered with an explicit truncation marker; structural titles, dependency labels, and
+  duplicate-detection snippets keep their smaller independent bounds. Before provider launch the
+  complete serialized prompt is limited to 512 KiB. An oversized prompt is rejected as a loud
+  classifier error with its measured and allowed byte counts; requested tasks and duplicate
+  context are never silently removed to make the batch fit.
 - Direct dispatch and decomposition partition admission-ready implementation work. S/M root tasks
   dispatch directly for every valid `cx_est`; non-continuation L root tasks dispatch directly at
   `cx_est` 1–4 and decompose at 5; non-continuation XL root tasks decompose at 4–5 and park at
