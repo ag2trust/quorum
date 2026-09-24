@@ -1,4 +1,4 @@
-//! Short, read-only eligibility checks for dormant review follow-up assessment.
+//! Short, read-only eligibility checks for review follow-up assessment.
 //!
 //! These queries classify existing task/decomposition state only. They do not
 //! create assessment aggregates, materialize memberships, or schedule work.

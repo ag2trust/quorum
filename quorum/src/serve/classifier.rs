@@ -9,6 +9,10 @@ pub const CLASSIFIER_EFFORT: &str = "low";
 pub const CLASSIFIER_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_CLASSIFIER_STDOUT_BYTES: usize = 256 * 1024;
 pub const MAX_CLASSIFIER_RESPONSE_BYTES: usize = 64 * 1024;
+/// Absolute UTF-8 ceiling for a classifier turn. The existing per-field and
+/// batch limits keep production prompts well below this value, while the
+/// four-byte-per-character allowance preserves their established contract.
+pub const MAX_CLASSIFIER_PROMPT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CLASSIFIER_LINES_PER_POLL: usize = 64;
 
 /// In-flight classifier state, persisted across daemon ticks.
@@ -117,10 +121,77 @@ async fn spawn_classifier_configured_with_timeout(
             ),
         ));
     }
-    let pending_task_ids = tasks.iter().map(|t| t.id).collect();
-    let pending_inputs = classify::classification_inputs(tasks);
-    let dir = tempfile::tempdir()?;
     let prompt = classify::build_prompt_with_recommendations(tasks, dup_context, recommendations);
+    spawn_restricted_response_configured_with_timeout(
+        &prompt,
+        tasks.iter().map(|task| task.id).collect(),
+        classify::classification_inputs(tasks),
+        agent_bin,
+        bare,
+        model,
+        effort,
+        codex_sandbox,
+        MAX_CLASSIFIER_PROMPT_BYTES,
+        turn_timeout,
+    )
+    .await
+}
+
+/// Spawn a bounded, tool-free response turn using the same hardened provider
+/// boundary as classification. Callers retain their own semantic parser and
+/// durable state machine; this helper only owns isolation, output bounds,
+/// timeout, provider normalization, and usage capture.
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_restricted_response_configured(
+    prompt: &str,
+    agent_bin: Option<&str>,
+    bare: bool,
+    model: &str,
+    effort: &str,
+    codex_sandbox: &str,
+    max_prompt_bytes: usize,
+) -> std::io::Result<ClassifierSlot> {
+    spawn_restricted_response_configured_with_timeout(
+        prompt,
+        Vec::new(),
+        Vec::new(),
+        agent_bin,
+        bare,
+        model,
+        effort,
+        codex_sandbox,
+        max_prompt_bytes,
+        CLASSIFIER_TIMEOUT,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_restricted_response_configured_with_timeout(
+    prompt: &str,
+    pending_task_ids: Vec<i64>,
+    pending_inputs: Vec<classify::ClassificationInput>,
+    agent_bin: Option<&str>,
+    bare: bool,
+    model: &str,
+    effort: &str,
+    codex_sandbox: &str,
+    max_prompt_bytes: usize,
+    turn_timeout: Duration,
+) -> std::io::Result<ClassifierSlot> {
+    if max_prompt_bytes == 0
+        || prompt.is_empty()
+        || prompt.len() > max_prompt_bytes
+        || prompt.contains('\0')
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "restricted response prompt must contain 1..={max_prompt_bytes} bytes of NUL-free UTF-8"
+            ),
+        ));
+    }
+    let dir = tempfile::tempdir()?;
     let started_at = tokio::time::Instant::now();
     let deadline = started_at + turn_timeout;
     // `--setting-sources ""` retains Claude's configured auth path while
@@ -133,7 +204,7 @@ async fn spawn_classifier_configured_with_timeout(
             model,
             effort,
             worktree: dir.path(),
-            prompt: &prompt,
+            prompt,
             environment: &[],
             mode: LaunchMode::Restricted,
             continuation_id: None,

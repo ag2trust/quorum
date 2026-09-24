@@ -1,7 +1,7 @@
 # Review Follow-up Planning — Technical Specification
 
 **Date:** 2026-08-07  
-**Status:** Proposed  
+**Status:** Implemented prospectively
 **Product source:** `ag2trust/quorum-pml` PR #1  
 **Implementation base:** `origin/main` / `origin/develop` at `7b38ac8c`
 
@@ -15,9 +15,9 @@ defects but can turn valid adjacent hardening observations into repeated rework 
 
 The post-merge collector already normalizes review findings into durable analytics. Those rows
 are replaced on re-interpretation and have no downstream lifecycle. Quorum needs a separate,
-durable path that preserves substantive non-blocking evidence, lets the existing Planning Agent
-assess it against source intent and existing work, and creates only bounded execution-ready
-Managed Tasks through daemon authority.
+durable path that preserves substantive non-blocking evidence, lets the configured Planning Agent
+assess it against source intent and existing GitHub issues, and creates only bounded,
+execution-ready GitHub issues through daemon authority.
 
 ## Scope and non-goals
 
@@ -28,8 +28,9 @@ This feature adds:
 - durable artifact batches and assessment jobs;
 - ordinary-task and Task Graph assessment eligibility;
 - a second closed Planning Agent operation for follow-up assessment;
-- daemon validation and atomic create/link/dismiss/defer application; and
-- read-only inspection of artifacts, decisions, provenance, and created-task relationships.
+- daemon validation and atomic create/link/dismiss/defer intent staging;
+- daemon-owned, marker-idempotent GitHub issue creation; and
+- durable inspection data for artifacts, decisions, provenance, and issue relationships.
 
 It does not add:
 
@@ -40,7 +41,8 @@ It does not add:
 - a semantic fingerprint or identity-deduplication table;
 - manual artifact editing, manual assessment, reassessment, pruning, or ticket triage;
 - historical backfill for PRs merged before this collector generation; or
-- a second planning role, live planner-session retention, or general workflow engine.
+- a second planning role, live planner-session retention, direct issue-creation MCP authority, or
+  a general workflow engine.
 
 The authoritative final review record remains the current PR record. A separate agent-interface
 workstream may later change how managed agents write that record without changing the artifact,
@@ -98,7 +100,16 @@ For each finding:
 ```
 
 Only BLOCKING findings contribute to `--blocking`. A review with zero blockers and one or more
-follow-ups submits `approved --blocking 0`. Reviewers never create or modify Managed Tasks.
+follow-ups submits `approved --blocking 0`. Reviewers never create or modify follow-up issues.
+
+When a complete audit has any candidate blocker, every R1/R2 reviewer first calls synchronous
+`quorum review-draft --blocking N --feedback ...`. The daemon binds the draft to the exact task,
+PR, reviewed head, role, reviewer, and run, then returns neutral second-assessment guidance in the
+same turn. The reviewer rechecks every candidate against task scope, repository invariants,
+supported behavior, sibling paths, and the follow-up boundary, updates the PR review when a
+disposition changes, and only then submits the final verdict. The draft is non-authoritative and
+does not start rework. A positive-blocker `changes` verdict without that exact durable checkpoint
+fails closed; zero-blocker approvals do not require one.
 
 ## Collector protocol
 
@@ -347,17 +358,16 @@ and exits cleanly without errors.
 Follow-up planning is a fresh bounded turn. Availability or memory of the decomposition planner
 session is never required. The daemon reconstructs:
 
-- source task title, body, creator, priority, labels, and revision;
-- originating PR/task and immutable artifact evidence;
-- for graphs: accepted plan revision, generated task outcomes, dependencies, and originating PRs;
-- every active Managed Task as bounded title/body/status/labels summaries;
-- up to 50 most recently done tasks whose non-daemon labels overlap the source or originating child;
-- current repository instructions; and
-- a read-only archive of the current configured base SHA.
+- source task title and body;
+- the sealed ordinary-task or accepted-graph artifact membership;
+- every artifact's originating PR, technical impact, scope relationship, concern,
+  non-blocking rationale, desired outcome, verification expectations, and evidence IDs; and
+- up to 128 existing GitHub issues, with exact number, canonical URL, and title.
 
-Each task summary is capped at 8 KiB and each list is deterministically ordered. If every active
-task plus required lineage cannot fit the 128 KiB planner prompt, the daemon does not spawn the
-planner and holds the assessment as `input-too-large`. It never silently omits an active task.
+The complete prompt is capped at 128 KiB and deterministically ordered. If the required sealed
+membership cannot fit, the daemon does not spawn the planner and holds the assessment as
+`input-too-large`; it never silently drops an artifact. The issue inventory is fetched outside a
+database transaction and link validation later requires both the supplied number and URL.
 
 The captured `base_sha` is provenance, not a merge gate: follow-up tasks express product outcomes
 and pass through fresh admission/classification. Base movement during the turn does not invalidate
@@ -365,19 +375,11 @@ an otherwise valid assessment and does not freeze managed delivery.
 
 ## Planner operation and response
 
-`planner.rs` gains an explicit operation boundary rather than one mixed prompt:
-
-```rust
-enum PlannerOperation {
-    DecomposeSource,
-    ReconcileReviewFollowups,
-}
-```
-
-Both use the configured `planner` routing pool, read-only repository view, no network, no Quorum
-or database capability, existing 600-second timeout, 64 KiB response cap, and 256 KiB stdout cap.
-Follow-up assessment does not acquire the decomposition delivery freeze and does not retain a live
-session. Decomposition candidates have scheduling priority over pending follow-up assessments.
+Follow-up assessment uses the configured `planner` routing pool through the hardened restricted
+response boundary: an empty temporary workspace, no tools, no network or GitHub capability, no
+Quorum/database capability, a 120-second timeout, 64 KiB response cap, and 256 KiB stdout cap.
+It does not acquire the decomposition delivery freeze or retain a provider continuation.
+Decomposition candidates have scheduling priority over pending follow-up assessments.
 
 The closed follow-up response is:
 
@@ -389,8 +391,9 @@ The closed follow-up response is:
       "decision": "create",
       "artifact_ids": [10, 11],
       "reason": "One root concern and desired outcome",
-      "task": {
+      "issue": {
         "title": "Define and enforce the supported state-write threat boundary",
+        "issue_type": "documentation",
         "observable_outcome": "The supported threat boundary is explicit and enforced",
         "acceptance_criteria": ["..."],
         "source_constraints": ["..."],
@@ -401,7 +404,8 @@ The closed follow-up response is:
       "decision": "link",
       "artifact_ids": [12],
       "reason": "Existing work has the same concern and outcome",
-      "existing_task_id": 42
+      "existing_issue_number": 42,
+      "existing_issue_url": "https://github.com/owner/repo/issues/42"
     },
     {
       "decision": "dismiss",
@@ -420,24 +424,24 @@ The closed follow-up response is:
 ```
 
 Dismiss categories are `invalid`, `obsolete`, `already_resolved`, and `out_of_product`.
-One create decision produces exactly one task; an artifact cannot produce multiple tasks. Work that
-needs decomposition is proposed as one complete L/XL outcome and enters ordinary decomposition
-after classification.
+One create decision produces exactly one issue; an artifact cannot produce multiple issues. Issue
+types are exactly `bug`, `enhancement`, `documentation`, `tests`, or `cleanup`.
 
 Deterministic validation requires:
 
 - one through 32 decisions and no unknown fields;
 - every member artifact exactly once across all `artifact_ids`;
 - each decision has one through 32 unique artifact IDs and a bounded reason;
-- a created task has all execution-ready fields, no prerequisites, and no routing metadata;
-- no more than eight created tasks per assessment;
-- a linked task was in the supplied inventory and is active or `done`, never failed/cancelled;
+- a created issue has title, type, observable outcome, one through eight acceptance criteria,
+  source constraints, and verification expectations;
+- no more than eight created issues per assessment;
+- a linked issue's positive number and canonical URL exactly match the supplied inventory;
 - dismiss and defer carry their required closed fields; and
 - no decision mixes created/linked IDs or embeds lifecycle state.
 
 The planner performs semantic grouping and comparison. There is deliberately no deterministic
-title fingerprint or embedding dedupe. The classifier remains an independent second semantic layer:
-new tasks enter ordinary admission and may be held as duplicates or not-ready.
+title fingerprint or embedding dedupe. The `review-followup` provenance label, one closed type
+label, and impact-derived `priority:high|medium|low` label are computed by Quorum, not the model.
 
 ## Retry and failure budgets
 
@@ -455,27 +459,26 @@ Exhaustion moves the assessment to `held`, clears `active`, retains the final bo
 emits a health alert. Artifacts remain undisposed and the originating delivery remains terminal.
 There is no manual retry command in this feature.
 
-## Atomic assessment application
+## Atomic plan staging and daemon issue application
 
 The daemon parses and validates the whole response before opening the write transaction. One
 `BEGIN IMMEDIATE` transaction then:
 
 1. rechecks assessment state, active authority, scope, and complete immutable membership;
-2. rechecks every artifact is undisposed and every linked task still exists in an allowed state;
-3. validates every proposed task again at the core boundary;
-4. creates each proposed task with the source task's creator and priority, no classifier-owned
-   labels/refs, and a body containing observed concern, desired outcome, acceptance criteria,
-   applicable constraints, verification, and PR/artifact provenance;
-5. records `created`, `linked`, `dismissed`, or `deferred` plus reason and relationship on every
-   artifact;
-6. marks every contributing PR batch `resolved` when all its artifacts are disposed;
-7. marks the assessment `completed`, clears `active`, and emits bounded events; and
-8. commits.
+2. validates every decision again and rechecks exact inventory identity for links;
+3. writes one durable decision intent per planner decision and exact intent/artifact memberships;
+4. stores the canonical complete plan on every intent so only a byte-equivalent semantic replay is
+   an idempotent success; and
+5. commits without any network call.
 
-Any failure rolls back all tasks and dispositions. Repeated application loses cleanly because the
-assessment is no longer active and artifacts are already disposed. Created tasks are ordinary open
-tasks and enter the existing classifier. The planner never assigns complexity, size, model, effort,
-labels, assignee, or lifecycle status.
+Link, dismiss, and defer intents are immediately complete. Create intents enter a bounded outbox.
+For each create intent the daemon, outside every DB transaction, searches GitHub for its stable
+`quorum-review-followup:<assessment>:<ordinal>` body marker, ensures the `review-followup` label,
+and creates the issue through `gh issue create` only when no marker match exists. It then records
+the positive issue number and canonical URL in a second short transaction. Failures back off and
+hold after three attempts. When all intents are complete, one transaction marks every contributing
+batch `resolved` and the assessment `completed`. This preserves durable create/link/dismiss/defer
+decisions without giving the planner external mutation authority.
 
 ## Scheduling and recovery
 
@@ -484,7 +487,7 @@ Follow-up work is background portfolio maintenance:
 1. merge/review/rework/approval lifecycle;
 2. decomposition needed to admit source work;
 3. collector retries required to complete interpretation;
-4. follow-up assessment.
+4. follow-up assessment and issue outbox.
 
 It consumes planner capacity only during a provider turn and never reserves worker/reviewer slots.
 The daemon runs at most one follow-up planner turn at a time. It may coexist with ordinary managed
@@ -496,8 +499,9 @@ On restart:
 - `planning` with no live matching process is charged one provider failure and enters backoff;
 - `provider-backoff` waits until eligible;
 - `completed` is inert;
-- inconsistent membership, disposed artifacts in an active assessment, or missing source lineage
-  is held loudly and creates nothing.
+- `planning` with staged intents resumes only the issue outbox;
+- marker lookup recovers an issue created before a crash that preceded the local completion write;
+- inconsistent membership or missing source lineage fails loudly and creates nothing.
 
 No network/model call occurs inside a database transaction. Reads open and close their connection
 per reconciliation tick. Provider calls and repository archive creation are bounded and
@@ -505,16 +509,12 @@ cancellation-safe; shutdown kills/reaps the planner without applying partial out
 
 ## Inspection
 
-Existing read surfaces gain bounded projections:
-
-- `inspect task <id>`: originating/follow-up artifacts, assessment, and created/linked tasks;
-- `inspect pr <n>`: interpretation run, immutable batch, artifacts, and dispositions;
-- status/cockpit: pending, waiting-interpretation, planning, backoff, held, and completed counts;
-- health alerts: collector exhaustion, assessment exhaustion, invalid recovery state, and oversized
-  planning input.
-
-No artifact or assessment mutation command is added. Full prompts and model transcripts are never
-persisted.
+The SQLite source of record retains immutable batches/artifacts, sealed assessment membership,
+bounded failure counters and hold reasons, every decision intent, exact artifact membership,
+idempotency markers, and created/linked issue number/URL. Existing bounded core batch/artifact
+reads remain available; a broader human-facing inspection command is not introduced by this
+activation. No artifact or assessment mutation command is added. Full prompts and model
+transcripts are never persisted.
 
 ## Design integration
 
@@ -530,17 +530,17 @@ does not mean its artifacts can never produce separate future work.
    artifact/batch reads, and inspection projections.
 2. **Collector:** prompt/protocol extension, evidence validation, artifact limits, and current-
    generation zero-artifact markers.
-3. **Assessment core:** eligibility, immutable membership, guarded claims, budgets, recovery, and
-   atomic create/link/dismiss/defer application.
-4. **Planner boundary:** explicit operation enum, follow-up prompt/response parser, real provider
-   argument/sandbox tests, and no-session-continuation behavior.
+3. **Assessment core:** eligibility, immutable membership, guarded claims, independent budgets,
+   and recovery.
+4. **Planner boundary:** restricted follow-up prompt/response turn, closed core parser, exact issue
+   inventory validation, and no-session-continuation behavior.
 5. **Daemon orchestration:** ordinary/graph reconciliation, scheduling priority, shutdown/restart,
-   alerts, and classifier handoff.
+   durable issue intents, marker-based GitHub recovery, and completion.
 6. **Reviewer calibration:** all R1/R2/rereview prompt variants and tests for scope, threat-model,
    impact, disposition, and zero-blocker-with-follow-ups approval.
 
-These seams may merge independently only when dormant schema/state cannot schedule follow-up work
-before the complete authority and recovery path exists. Activation lands last.
+Activation is prospective: no historical PR, batch, artifact, assessment, or issue intent is
+backfilled. Only immutable batches produced by the current collector generation are admitted.
 
 ## Required evidence
 
@@ -548,13 +548,14 @@ before the complete authority and recovery path exists. Activation lands last.
 - Collector parser tests for every enum, evidence mismatch, artifact bound, zero artifacts, and
   atomic preservation of a prior successful batch on failure/re-interpretation.
 - Real SQLite repeated concurrent processes proving one assessment/membership per scope and no
-  duplicate materialized tasks.
-- Fault injection at every application step proving no partial task or disposition rows.
+  duplicate staged intents.
+- Fault injection around intent staging, external issue creation, and local completion proving
+  marker-idempotent recovery and no partial plan rows.
 - Ordinary-task, completed-graph, cancelled-partial-graph, zero-artifact, waiting-interpretation,
   and collector-exhaustion lifecycle tests.
 - Restart tests for pending, planning, backoff, held, completed, and inconsistent assessment state.
-- Planner closed-protocol, prompt/output/timeout, no-network/read-only, and provider-binary argument
-  tests for Claude and Codex.
+- Planner closed-protocol, prompt/output/timeout, tool-free isolation, and provider-binary argument
+  tests, plus an end-to-end restricted-turn-to-GitHub-outbox test.
 - Reviewer prompt contract tests proving technical severity does not itself force BLOCKING and
   follow-ups do not increase `--blocking`.
 - Full `rtk proxy ./preflight.sh` before submission.

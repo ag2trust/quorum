@@ -637,6 +637,16 @@ fn quorum_done_with_run_id(home: &std::path::Path, run_id: &str, args: &[&str]) 
         }
     } else {
         cmd_args.extend_from_slice(args);
+        common::submit_review_draft_if_changes(
+            &cargo_bin("quorum"),
+            home,
+            run_id,
+            args.windows(2)
+                .find(|pair| pair[0] == "--agent")
+                .map(|pair| pair[1])
+                .expect("reviewer completion requires agent"),
+            args,
+        );
     }
     let out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home)
