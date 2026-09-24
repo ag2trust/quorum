@@ -620,12 +620,12 @@ pub fn cascade_dead_deps(conn: &Connection, now: i64, limit: usize) -> Result<us
 }
 
 fn cascade_dead_deps_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<usize> {
-    // Pick the failing dep to name in the park reason. A cancelled dep is
-    // terminal-terminal — the dependent can never dispatch without operator
-    // disposition — so it wins over a merely-failed dep, which may still be
-    // retried into `done`. Selecting a specific failed/cancelled dep also
-    // avoids the pre-existing hazard of naming a `done` sibling dep just
-    // because it happened to come first in the json_each iteration.
+    // Pick the failing dep to name in the park reason. A daemon-parked task is
+    // a first-class retryable hold even though its storage status is `failed`;
+    // it keeps dependents open and unready instead of cascading another park.
+    // A cancelled dep is terminal-terminal and wins over a genuinely failed
+    // sibling. Selecting a specific terminal dep also avoids naming a `done`
+    // sibling merely because it happened to come first in json_each order.
     let doomed: Vec<(i64, Option<i64>, Option<i64>, String)> = {
         let mut stmt = conn.prepare(
             "SELECT t.id,
@@ -635,7 +635,12 @@ fn cascade_dead_deps_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                      ORDER BY j.value LIMIT 1) AS cancelled_dep,
                     (SELECT j.value FROM json_each(t.depends_on) j
                      JOIN tasks d ON d.id = j.value
-                     WHERE d.status IN ('failed')
+                     WHERE d.status='failed'
+                       AND NOT (
+                           json_valid(COALESCE(d.refs, '{}'))
+                           AND json_extract(d.refs, '$.daemon_parked')=1
+                           AND json_extract(d.refs, '$.daemon_resume_status') IS NOT NULL
+                       )
                      ORDER BY j.value LIMIT 1) AS failed_dep,
                     t.status
              FROM tasks t
@@ -650,13 +655,27 @@ fn cascade_dead_deps_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                    SELECT 1 FROM json_each(t.depends_on) j2
                    LEFT JOIN tasks d ON d.id = j2.value
                    WHERE d.status NOT IN ('done','failed','cancelled')
+                      OR (
+                          d.status='failed'
+                          AND json_valid(COALESCE(d.refs, '{}'))
+                          AND json_extract(d.refs, '$.daemon_parked')=1
+                          AND json_extract(d.refs, '$.daemon_resume_status') IS NOT NULL
+                      )
                       OR d.id IS NULL
                )
                -- … and at least one dep is NOT done
                AND EXISTS (
                    SELECT 1 FROM json_each(t.depends_on) j3
                    JOIN tasks d ON d.id = j3.value
-                   WHERE d.status IN ('failed','cancelled')
+                   WHERE d.status IN ('cancelled')
+                      OR (
+                          d.status='failed'
+                          AND NOT (
+                              json_valid(COALESCE(d.refs, '{}'))
+                              AND json_extract(d.refs, '$.daemon_parked')=1
+                              AND json_extract(d.refs, '$.daemon_resume_status') IS NOT NULL
+                          )
+                      )
                )
              LIMIT ?2",
         )?;
@@ -1795,6 +1814,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retryable_parked_dependency_keeps_dependent_open_until_resume() {
+        let (_d, mut c) = open_tmp();
+        let dependency = crate::tasks::create(
+            &mut c,
+            "owner",
+            "review awaiting retry",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let dependent = crate::tasks::create(
+            &mut c,
+            "owner",
+            "later work",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dependency}]")),
+            None,
+            101,
+        )
+        .unwrap();
+
+        crate::tasks::park(
+            &mut c,
+            dependency,
+            "reviewer provision exhausted",
+            "in-review",
+            102,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(cascade_dead_deps(&c, 103, SWEEP_LIMIT).unwrap(), 0);
+        let waiting = crate::tasks::get(&c, dependent).unwrap().unwrap();
+        assert_eq!(waiting.status, "open");
+        assert!(
+            !waiting.ready,
+            "the parked prerequisite still gates dispatch"
+        );
+        let child_parks: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events
+                 WHERE kind='task_parked' AND subject=?1",
+                [format!("task#{dependent}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_parks, 0, "a retryable hold must not cascade failure");
+
+        let resumed = crate::tasks::retry_parked(&mut c, dependency, "owner", true, 104)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.status, "in-review");
+        c.execute(
+            "UPDATE tasks SET status='done',updated_at=105 WHERE id=?1",
+            [dependency],
+        )
+        .unwrap();
+        assert!(
+            crate::tasks::get(&c, dependent).unwrap().unwrap().ready,
+            "the same dependent becomes ready when the parked prerequisite completes"
+        );
+    }
+
     /// Task #473 R6: the runtime convergence for
     /// failed→open→cancelled deps is exercised by
     /// `tasks::converge_parked_dependents_of_cancelled` — see
@@ -2197,7 +2288,7 @@ mod tests {
     }
 
     #[test]
-    fn cascade_is_transitive() {
+    fn cascade_stops_at_first_retryable_park() {
         let (_d, mut c) = open_tmp();
         let a = crate::tasks::create(&mut c, "boss", "a", None, 0, None, None, None, None, 100)
             .unwrap();
@@ -2236,10 +2327,12 @@ mod tests {
         // First cascade: b parked.
         cascade_dead_deps(&c, 300, 100).unwrap();
         assert_eq!(crate::tasks::get(&c, b).unwrap().unwrap().status, "failed");
-        // c still open (b just became failed, need another sweep).
-        // Second cascade: c parked.
-        cascade_dead_deps(&c, 400, 100).unwrap();
-        assert_eq!(crate::tasks::get(&c, ch).unwrap().unwrap().status, "failed");
+        // b's daemon park is a retryable hold, so it remains a normal unmet
+        // prerequisite instead of propagating failure through the chain.
+        assert_eq!(cascade_dead_deps(&c, 400, 100).unwrap(), 0);
+        let c_task = crate::tasks::get(&c, ch).unwrap().unwrap();
+        assert_eq!(c_task.status, "open");
+        assert!(!c_task.ready);
     }
 
     // ── Review-only reaper recovery (table-driven) ─────────────────
