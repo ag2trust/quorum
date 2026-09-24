@@ -1108,6 +1108,11 @@ impl BoundedStdout {
 pub struct GrokProc {
     child: Child,
     process_group_id: libc::pid_t,
+    // A successful wait releases the pid namespace entry. Do not signal that
+    // numeric process group again after it could have been recycled.
+    process_group_reaped: bool,
+    #[cfg(test)]
+    killpg_calls: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     reader: BoundedStdout,
     diagnostics: DiagnosticBuffer,
     failures: FailureTracker,
@@ -1255,6 +1260,9 @@ impl GrokProc {
         Ok(Self {
             child,
             process_group_id,
+            process_group_reaped: false,
+            #[cfg(test)]
+            killpg_calls: None,
             reader,
             diagnostics,
             failures,
@@ -1327,6 +1335,9 @@ impl GrokProc {
             Self {
                 child,
                 process_group_id,
+                process_group_reaped: false,
+                #[cfg(test)]
+                killpg_calls: None,
                 reader,
                 diagnostics,
                 failures,
@@ -1604,6 +1615,23 @@ impl GrokProc {
         self.process_group_id
     }
 
+    fn kill_process_group(&self) {
+        #[cfg(test)]
+        if let Some(calls) = &self.killpg_calls {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        unsafe {
+            libc::killpg(self.process_group_id, libc::SIGKILL);
+        }
+    }
+
+    #[cfg(test)]
+    fn track_killpg_calls(&mut self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.killpg_calls = Some(calls.clone());
+        calls
+    }
+
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.child.try_wait()
     }
@@ -1616,10 +1644,10 @@ impl GrokProc {
         // Always target the spawn-time process group, even when `try_wait`
         // already observed and reaped the leader. Descendants can otherwise
         // retain stdout/stderr and make the drains below wait forever.
-        unsafe {
-            libc::killpg(self.process_group_id, libc::SIGKILL);
+        self.kill_process_group();
+        if self.child.wait().await.is_ok() {
+            self.process_group_reaped = true;
         }
-        let _ = self.child.wait().await;
 
         let mut terminal = VecDeque::new();
         let mut dropped = 0usize;
@@ -1641,6 +1669,14 @@ impl GrokProc {
         output.extend(terminal);
         output.extend(diagnostics.drain());
         output
+    }
+}
+
+impl Drop for GrokProc {
+    fn drop(&mut self) {
+        if !self.process_group_reaped {
+            self.kill_process_group();
+        }
     }
 }
 
@@ -2516,6 +2552,8 @@ mod tests {
         GrokProc {
             child,
             process_group_id,
+            process_group_reaped: false,
+            killpg_calls: None,
             reader,
             diagnostics,
             failures,
@@ -2626,6 +2664,42 @@ mod tests {
         })
         .await
         .expect("Grok descendant process group was not reaped");
+    }
+
+    #[tokio::test]
+    async fn drop_kills_process_group() {
+        let mut proc = shell_proc("sleep 300 & printf 'ready\\n'; wait").await;
+        assert_eq!(proc.next_raw_line().await.as_deref(), Some("ready"));
+        let process_group_id = proc.process_group_id;
+
+        drop(proc);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if unsafe { libc::killpg(process_group_id, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Drop did not kill the Grok process group");
+    }
+
+    #[tokio::test]
+    async fn kill_and_reap_disarms_drop_kill_guard() {
+        let mut proc = shell_proc("exec sleep 300").await;
+        let calls = proc.track_killpg_calls();
+
+        proc.kill_and_reap().await;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "Drop must not signal a process group after kill_and_reap reaped its leader"
+        );
     }
 
     fn grok_available() -> bool {

@@ -156,13 +156,16 @@ worsened, adjacent/out of scope, defense-in-depth, a future requirement, or need
 stronger threat model, unless the current contract makes it BLOCKING; prefer it for pre-existing \
 edge behavior merely revealed when the primary outcome remains accurate without cataloguing or \
 fixing that behavior.\n\n\
-Post both dispositions to the PR. Each finding needs a concrete code path (file:line or \
-function), demonstrated failure and assumptions, and affected product behavior. A BLOCKING \
+Post both. Findings need a concrete code path, failure/assumptions, and product impact. \
+A BLOCKING \
 finding must say why this PR cannot merge, name the exact violated invariant (or assigned \
 outcome left false/supported behavior worsened), and the broader affected path left unsafe. A \
 FOLLOW-UP must say why deferral is safe, its scope relationship (pre-existing, \
 out-of-scope/adjacent, threat-model expansion, defense-in-depth, future requirement, or design \
 debt), and desired future outcome and verification, with context for later collector extraction.\n\
+Fixable secret bugs: `changes`, not graph-blocker. If secrets could escape, run \
+`quorum post --agent YOUR_NAME --kind critical --to owner --body-stdin `. Body: task/PR, rotation; \
+omit secrets.\n\
 The summary must report `BLOCKING: <N>` and `FOLLOW-UP: <N>` and each finding's impact, \
 disposition, failure/assumptions, scope relationship, and blocking or safe-deferral reason. Only \
 BLOCKING findings contribute to `--blocking`; FOLLOW-UP findings never do or force changes. With \
@@ -358,9 +361,11 @@ pub(super) fn graph_review_contract(reviewer: &str, pr: i64, context: Option<&st
          in the named file(s), treating the assigned file list as advisory for this remediation. \
          FOLLOW-UP findings follow the contract above and never trigger a graph-blocker verdict. \
          Reserve the distinct `--verdict graph-blocker` for genuine safety or authority boundary \
-         violations: a change that would grant authority, break restricted-role or phase isolation, \
-         escape the managed repository, or expose secrets. Do not use graph-blocker merely because \
-         a correct, safe fix crosses the declared file scope. The only supported category is \
+         violations where continuing this graph itself would grant authority, break restricted-role \
+         or phase isolation, escape the managed repository, or expose secrets, with no safe repair \
+         on the current PR. A fixable source defect, including potential secret exposure, uses \
+         BLOCKING `changes` plus the redacted critical alert above. Do not use graph-blocker merely \
+         because a correct, safe fix crosses the declared file scope. The only supported category is \
          `{category}`. Signal it with this exact closed payload shape:\n\
          `quorum submit --agent {reviewer} --pr {pr} --verdict graph-blocker --feedback-json '{payload}'`\n\
          Replace affected_task with this context's task_id and replace both placeholders with \
@@ -1382,6 +1387,15 @@ mod tests {
                 prompt.contains("Only BLOCKING findings contribute to `--blocking`")
                     && prompt.contains("FOLLOW-UP findings never do or force changes"),
                 "{name} must exclude follow-ups from lifecycle blocking"
+            );
+            assert!(
+                prompt.contains("Fixable secret bugs: `changes`")
+                    && prompt.contains(
+                        "`quorum post --agent YOUR_NAME --kind critical --to owner --body-stdin `"
+                    )
+                    && prompt.contains("omit secrets")
+                    && prompt.contains("not graph-blocker"),
+                "{name} must separate urgent secret notification from repairable review disposition"
             );
             assert!(
                 prompt.contains("zero BLOCKING findings and one or more FOLLOW-UP findings")
@@ -2484,6 +2498,10 @@ mod tests {
         assert!(graph_contract.contains(
             "grant authority, break restricted-role or phase isolation, escape the managed repository, or expose secrets"
         ));
+        assert!(graph_contract.contains(
+            "A fixable source defect, including potential secret exposure, uses BLOCKING `changes`"
+        ));
+        assert!(graph_contract.contains("with no safe repair on the current PR"));
         assert!(graph_contract.contains(
             "otherwise correct and safe but requires a bounded edit outside the child's `write` deliverables"
         ));
