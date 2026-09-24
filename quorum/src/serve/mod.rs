@@ -429,10 +429,14 @@ impl PoisonTracker {
         }
     }
 
-    fn record_strike(&mut self, task_id: i64) -> u32 {
+    fn record_strike(&mut self, task_id: i64, retry_generation: i64) -> u32 {
         let state = self.strikes.entry(task_id).or_insert(PoisonState {
             strikes: 0,
-            retry_generation: 0,
+            // A tracker may be empty after either successful output or a
+            // daemon restart. Seed the new budget from the durable retry
+            // generation so old owner authority cannot clear its first
+            // strike on the following admission tick.
+            retry_generation,
         });
         state.strikes += 1;
         state.strikes
@@ -14972,7 +14976,9 @@ async fn tick(
         ));
         let instant_death = dead.cost_tokens == 0;
         if instant_death {
-            let strikes = poison_tracker.record_strike(dead.task_id);
+            let retry_generation =
+                load_task_poison_retry_generation(&db_path, dead.task_id).await?;
+            let strikes = poison_tracker.record_strike(dead.task_id, retry_generation);
             if strikes >= MAX_POISON_STRIKES {
                 let task_id = dead.task_id;
                 park_task(
@@ -21368,7 +21374,10 @@ async fn spawn_worker(
                 guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
                 return Ok(false);
             }
-            let strikes = poison_tracker.record_strike(task.id);
+            let strikes = poison_tracker.record_strike(
+                task.id,
+                tasks::poison_retry_generation(task.refs.as_deref()),
+            );
             if strikes >= MAX_POISON_STRIKES {
                 poison_task(&db_path, &agent_name, task.id, strikes, Some(&cause)).await;
             } else {
@@ -21387,7 +21396,10 @@ async fn spawn_worker(
         let cause =
             classified_provisioning_cause(&format!("initial worker push lockout failed: {e}"));
         persist_provisioning_failure(&db_path, task.id, &cause).await;
-        let strikes = poison_tracker.record_strike(task.id);
+        let strikes = poison_tracker.record_strike(
+            task.id,
+            tasks::poison_retry_generation(task.refs.as_deref()),
+        );
         if strikes >= MAX_POISON_STRIKES {
             poison_task(&db_path, &agent_name, task.id, strikes, Some(&cause)).await;
         } else {
@@ -21791,7 +21803,10 @@ async fn spawn_worker(
                     WorkerFallbackActivation::NotInstalled => {}
                 }
             }
-            let strikes = poison_tracker.record_strike(task.id);
+            let strikes = poison_tracker.record_strike(
+                task.id,
+                tasks::poison_retry_generation(task.refs.as_deref()),
+            );
             if strikes >= MAX_POISON_STRIKES {
                 poison_task(&db_path, &agent_name, task.id, strikes, None).await;
             } else {
@@ -21803,6 +21818,25 @@ async fn spawn_worker(
     }
 
     Ok(true)
+}
+
+/// Read the generation that authorizes the worker whose zero-output exit is
+/// being processed. A freshly restarted daemon has no poison entry yet, so
+/// this durable value must seed the first post-spawn strike rather than the
+/// legacy generation zero.
+async fn load_task_poison_retry_generation(db_path: &Path, task_id: i64) -> Result<i64> {
+    let db_path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<i64> {
+        let conn = quorum_core::db::open(&db_path)?;
+        let task = tasks::get(&conn, task_id)?.ok_or_else(|| {
+            QuorumError::Io(format!(
+                "task #{task_id} disappeared while reading poison retry generation"
+            ))
+        })?;
+        Ok(tasks::poison_retry_generation(task.refs.as_deref()))
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("poison retry generation join: {error}")))?
 }
 
 async fn release_task(db_path: &std::path::Path, agent: &str, task_id: i64) {
@@ -35724,9 +35758,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     #[test]
     fn poison_tracker_records_strikes() {
         let mut tracker = PoisonTracker::new();
-        assert_eq!(tracker.record_strike(1), 1);
-        assert_eq!(tracker.record_strike(1), 2);
-        assert_eq!(tracker.record_strike(1), 3);
+        assert_eq!(tracker.record_strike(1, 0), 1);
+        assert_eq!(tracker.record_strike(1, 0), 2);
+        assert_eq!(tracker.record_strike(1, 0), 3);
         assert_eq!(tracker.strikes(1), 3);
     }
 
@@ -35734,18 +35768,18 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     fn poison_tracker_poisoned_at_threshold() {
         let mut tracker = PoisonTracker::new();
         for _ in 0..MAX_POISON_STRIKES - 1 {
-            tracker.record_strike(1);
+            tracker.record_strike(1, 0);
         }
         assert!(!tracker.is_poisoned(1));
-        tracker.record_strike(1);
+        tracker.record_strike(1, 0);
         assert!(tracker.is_poisoned(1));
     }
 
     #[test]
     fn poison_tracker_clear_resets() {
         let mut tracker = PoisonTracker::new();
-        tracker.record_strike(1);
-        tracker.record_strike(1);
+        tracker.record_strike(1, 0);
+        tracker.record_strike(1, 0);
         tracker.clear(1);
         assert_eq!(tracker.strikes(1), 0);
         assert!(!tracker.is_poisoned(1));
@@ -35754,9 +35788,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     #[test]
     fn poison_tracker_independent_tasks() {
         let mut tracker = PoisonTracker::new();
-        tracker.record_strike(1);
-        tracker.record_strike(1);
-        tracker.record_strike(2);
+        tracker.record_strike(1, 0);
+        tracker.record_strike(1, 0);
+        tracker.record_strike(2, 0);
         assert_eq!(tracker.strikes(1), 2);
         assert_eq!(tracker.strikes(2), 1);
         assert!(!tracker.is_poisoned(1));
@@ -35766,8 +35800,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     #[test]
     fn poison_tracker_clear_does_not_affect_other_tasks() {
         let mut tracker = PoisonTracker::new();
-        tracker.record_strike(1);
-        tracker.record_strike(2);
+        tracker.record_strike(1, 0);
+        tracker.record_strike(2, 0);
         tracker.clear(1);
         assert_eq!(tracker.strikes(1), 0);
         assert_eq!(tracker.strikes(2), 1);
@@ -35777,8 +35811,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     fn poison_tracker_consumes_each_task_retry_generation_once() {
         let mut tracker = PoisonTracker::new();
         for _ in 0..MAX_POISON_STRIKES {
-            tracker.record_strike(1);
-            tracker.record_strike(2);
+            tracker.record_strike(1, 0);
+            tracker.record_strike(2, 0);
         }
         assert!(tracker.is_poisoned(1));
         assert!(tracker.is_poisoned(2));
@@ -35793,7 +35827,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         // A replay of the durable generation cannot erase a fresh poison
         // budget accrued by the retried task (including post-spawn deaths).
         for _ in 0..MAX_POISON_STRIKES {
-            tracker.record_strike(1);
+            tracker.record_strike(1, 1);
         }
         assert!(tracker.is_poisoned(1));
         assert!(!tracker.consume_retry_generation(1, 1));
@@ -35802,6 +35836,31 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(tracker.consume_retry_generation(1, 2));
         assert!(!tracker.is_poisoned(1));
         assert!(tracker.is_poisoned(2));
+    }
+
+    #[test]
+    fn poison_tracker_seeds_new_strikes_from_durable_retry_generation() {
+        let mut tracker = PoisonTracker::new();
+        for _ in 0..MAX_POISON_STRIKES {
+            tracker.record_strike(1, 0);
+        }
+        assert!(tracker.consume_retry_generation(1, 1));
+
+        // Successful output clears the in-memory counter. The next
+        // zero-output failure must start at the already-consumed generation,
+        // so the stale retry cannot discard it.
+        tracker.clear(1);
+        assert_eq!(tracker.record_strike(1, 1), 1);
+        assert!(!tracker.consume_retry_generation(1, 1));
+        assert_eq!(tracker.strikes(1), 1);
+
+        // Restart has the same shape: no tracker entry, but the task still
+        // carries generation one. Initializing the first new strike from that
+        // durable value prevents replaying the old retry after restart.
+        let mut restarted = PoisonTracker::new();
+        assert_eq!(restarted.record_strike(1, 1), 1);
+        assert!(!restarted.consume_retry_generation(1, 1));
+        assert_eq!(restarted.strikes(1), 1);
     }
 
     #[test]
