@@ -55,6 +55,36 @@ pub struct TaskForClassification {
     pub body_char_limit: usize,
 }
 
+#[derive(Serialize)]
+struct RenderedTaskContext {
+    title: String,
+    body: Option<String>,
+    dependencies: Vec<String>,
+    recovery_notes: Vec<String>,
+}
+
+fn rendered_task_context(task: &TaskForClassification) -> RenderedTaskContext {
+    RenderedTaskContext {
+        title: truncate_for_prompt(&task.title, TITLE_CHAR_LIMIT),
+        body: task
+            .body
+            .as_deref()
+            .map(|body| truncate_for_prompt(body, task.body_char_limit)),
+        dependencies: task
+            .dependencies
+            .iter()
+            .take(DEPENDENCY_LIMIT)
+            .map(|dependency| truncate_for_prompt(dependency, DEPENDENCY_RENDER_CHAR_LIMIT))
+            .collect(),
+        recovery_notes: task
+            .recovery_notes
+            .iter()
+            .take(RECOVERY_NOTE_LIMIT)
+            .map(|note| truncate_for_prompt(note, RECOVERY_NOTE_CHAR_LIMIT))
+            .collect(),
+    }
+}
+
 fn default_body_char_limit() -> usize {
     BODY_CHAR_LIMIT
 }
@@ -74,15 +104,17 @@ pub struct ClassificationInput {
 pub fn classification_inputs(tasks: &[TaskForClassification]) -> Vec<ClassificationInput> {
     tasks
         .iter()
-        .map(|task| ClassificationInput {
-            task_id: task.id,
-            revision: task.revision,
-            // `TaskForClassification` is a struct (not a map), so serde emits
-            // a stable field order.  Keep the entire bounded prompt input,
-            // including stable dependency context and recovery notes, in the
-            // identity rather than relying on generic `updated_at`.
-            fingerprint: serde_json::to_string(task)
-                .expect("TaskForClassification always serializes"),
+        .map(|task| {
+            // The tuple has a stable serialized order. Fingerprint the exact
+            // rendered context (including truncation markers), not the DB
+            // lookahead character that only detects whether a cut occurred.
+            let rendered = rendered_task_context(task);
+            ClassificationInput {
+                task_id: task.id,
+                revision: task.revision,
+                fingerprint: serde_json::to_string(&(task.id, task.revision, rendered))
+                    .expect("rendered classifier input always serializes"),
+            }
         })
         .collect()
 }
@@ -93,7 +125,7 @@ pub const CLASSIFICATION_BATCH_LIMIT: usize = 20;
 pub const DUP_CONTEXT_LIMIT: usize = 60;
 const TITLE_CHAR_LIMIT: usize = 300;
 /// Prompt body bound for DB-sourced root tasks.
-pub const BODY_CHAR_LIMIT: usize = 2_000;
+pub const BODY_CHAR_LIMIT: usize = 4 * 1024;
 /// Per-field byte bound the daemon applies to each of a planned child's
 /// contract fields (text, list, and deliverable paths, cumulatively per
 /// field) before assembling the classifier body.
@@ -113,9 +145,18 @@ pub const DEPENDENCY_TITLE_CHAR_LIMIT: usize = 240;
 /// child keys are at most 64 bytes) followed by a bounded title.
 const DEPENDENCY_RENDER_CHAR_LIMIT: usize = DEPENDENCY_TITLE_CHAR_LIMIT + 96;
 const DEPENDENCY_LIMIT: usize = 8;
-const RECOVERY_NOTE_CHAR_LIMIT: usize = 600;
+/// Recovery notes can carry corrections to the original contract. Keep the
+/// same minimum semantic-context envelope as a root task body.
+const RECOVERY_NOTE_CHAR_LIMIT: usize = 4 * 1024;
 const RECOVERY_NOTE_LIMIT: usize = 4;
 const DUP_BODY_CHAR_LIMIT: usize = 200;
+
+/// Load one character past a prompt field's retained bound. The renderer uses
+/// that lookahead to distinguish an exact-boundary value from a truncated one
+/// without loading an unbounded DB value into memory.
+const fn with_truncation_lookahead(limit: usize) -> i64 {
+    (limit + 1) as i64
+}
 
 /// SQL counterpart of [`crate::tasks::classification_is_complete`]. Keep this
 /// predicate strict: malformed and partial v2 refs must remain classifier
@@ -158,8 +199,8 @@ pub fn unclassified_tasks(conn: &Connection) -> Result<Vec<TaskForClassification
     let tasks = stmt
         .query_map(
             params![
-                TITLE_CHAR_LIMIT as i64,
-                BODY_CHAR_LIMIT as i64,
+                with_truncation_lookahead(TITLE_CHAR_LIMIT),
+                with_truncation_lookahead(BODY_CHAR_LIMIT),
                 CLASSIFICATION_BATCH_LIMIT as i64
             ],
             |row| {
@@ -202,14 +243,15 @@ fn enrich_task(
             .query_map(
                 params![
                     deps,
-                    DEPENDENCY_TITLE_CHAR_LIMIT as i64,
+                    with_truncation_lookahead(DEPENDENCY_TITLE_CHAR_LIMIT),
                     DEPENDENCY_LIMIT as i64
                 ],
                 |r| {
+                    let title = r.get::<_, String>(1)?;
                     Ok(format!(
                         "#{} {}",
                         r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?
+                        truncate_for_prompt(&title, DEPENDENCY_TITLE_CHAR_LIMIT)
                     ))
                 },
             )?
@@ -223,7 +265,7 @@ fn enrich_task(
         .query_map(
             params![
                 task.id,
-                RECOVERY_NOTE_CHAR_LIMIT as i64,
+                with_truncation_lookahead(RECOVERY_NOTE_CHAR_LIMIT),
                 RECOVERY_NOTE_LIMIT as i64
             ],
             |r| r.get::<_, String>(0),
@@ -232,11 +274,17 @@ fn enrich_task(
     Ok(task)
 }
 
-fn truncate(s: &str, max: usize) -> String {
+/// Retain at most `max` characters and make every cut explicit. DB loaders
+/// provide a one-character lookahead, so `original exceeds` remains accurate
+/// even when the complete source length was deliberately not loaded.
+pub fn truncate_for_prompt(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
-    format!("{}…", s.chars().take(max).collect::<String>())
+    format!(
+        "{}… [TRUNCATED: retained {max} characters; original exceeds {max}]",
+        s.chars().take(max).collect::<String>()
+    )
 }
 
 /// Check whether a specific task lacks cx_est in refs.
@@ -248,7 +296,11 @@ pub fn task_missing_cx(conn: &Connection, task_id: i64) -> Result<Option<TaskFor
     );
     conn.query_row(
         &query,
-        params![task_id, TITLE_CHAR_LIMIT as i64, BODY_CHAR_LIMIT as i64],
+        params![
+            task_id,
+            with_truncation_lookahead(TITLE_CHAR_LIMIT),
+            with_truncation_lookahead(BODY_CHAR_LIMIT)
+        ],
         |row| {
             Ok(TaskForClassification {
                 id: row.get(0)?,
@@ -275,7 +327,11 @@ fn classifier_input_for_task(
     let task = conn
         .query_row(
             "SELECT id, revision, substr(title, 1, ?2), substr(body, 1, ?3) FROM tasks WHERE id=?1",
-            params![task_id, TITLE_CHAR_LIMIT as i64, BODY_CHAR_LIMIT as i64],
+            params![
+                task_id,
+                with_truncation_lookahead(TITLE_CHAR_LIMIT),
+                with_truncation_lookahead(BODY_CHAR_LIMIT)
+            ],
             |row| {
                 Ok(TaskForClassification {
                     id: row.get(0)?,
@@ -303,8 +359,8 @@ pub fn dup_context_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>
     let tasks = stmt
         .query_map(
             params![
-                TITLE_CHAR_LIMIT as i64,
-                DUP_BODY_CHAR_LIMIT as i64,
+                with_truncation_lookahead(TITLE_CHAR_LIMIT),
+                with_truncation_lookahead(DUP_BODY_CHAR_LIMIT),
                 DUP_CONTEXT_LIMIT as i64
             ],
             |row| {
@@ -336,8 +392,8 @@ pub fn tasks_missing_cx_all(conn: &Connection) -> Result<Vec<TaskForClassificati
     let tasks = stmt
         .query_map(
             params![
-                TITLE_CHAR_LIMIT as i64,
-                BODY_CHAR_LIMIT as i64,
+                with_truncation_lookahead(TITLE_CHAR_LIMIT),
+                with_truncation_lookahead(BODY_CHAR_LIMIT),
                 CLASSIFICATION_BATCH_LIMIT as i64
             ],
             |row| {
@@ -726,36 +782,23 @@ pub fn build_prompt_with_recommendations(
 
     prompt.push_str("\n\n## Tasks to classify\n\n");
     for t in tasks.iter().take(CLASSIFICATION_BATCH_LIMIT) {
+        let rendered = rendered_task_context(t);
         prompt.push_str(&format!("### Task #{}\n", t.id));
-        prompt.push_str(&format!(
-            "**Title:** {}\n",
-            truncate(&t.title, TITLE_CHAR_LIMIT)
-        ));
-        if let Some(body) = &t.body {
-            let truncated = truncate(body, t.body_char_limit);
-            prompt.push_str(&format!("**Body:**\n{truncated}\n"));
+        prompt.push_str(&format!("**Title:** {}\n", rendered.title));
+        if let Some(body) = rendered.body {
+            prompt.push_str(&format!("**Body:**\n{body}\n"));
         }
         prompt.push('\n');
-        if !t.dependencies.is_empty() {
+        if !rendered.dependencies.is_empty() {
             prompt.push_str(&format!(
                 "**Dependencies (scheduler-enforced assumptions):** {}\n",
-                t.dependencies
-                    .iter()
-                    .take(DEPENDENCY_LIMIT)
-                    .map(|dependency| truncate(dependency, DEPENDENCY_RENDER_CHAR_LIMIT))
-                    .collect::<Vec<_>>()
-                    .join("; ")
+                rendered.dependencies.join("; ")
             ));
         }
-        if !t.recovery_notes.is_empty() {
+        if !rendered.recovery_notes.is_empty() {
             prompt.push_str(&format!(
                 "**Recovery context:** {}\n",
-                t.recovery_notes
-                    .iter()
-                    .take(RECOVERY_NOTE_LIMIT)
-                    .map(|note| truncate(note, RECOVERY_NOTE_CHAR_LIMIT))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                rendered.recovery_notes.join("\n")
             ));
         }
     }
@@ -766,12 +809,12 @@ pub fn build_prompt_with_recommendations(
             let snippet = t
                 .body
                 .as_deref()
-                .map(|body| truncate(body, DUP_BODY_CHAR_LIMIT))
+                .map(|body| truncate_for_prompt(body, DUP_BODY_CHAR_LIMIT))
                 .unwrap_or_default();
             prompt.push_str(&format!(
                 "- #{}: {} — {snippet}\n",
                 t.id,
-                truncate(&t.title, TITLE_CHAR_LIMIT)
+                truncate_for_prompt(&t.title, TITLE_CHAR_LIMIT)
             ));
         }
     }
@@ -944,6 +987,115 @@ mod tests {
         assert!(prompt.contains("Dependencies (scheduler-enforced assumptions)"));
         assert!(prompt.contains("#3 Establish prerequisite"));
         assert!(prompt.contains("#2: Other task"));
+        assert!(!prompt.contains("[TRUNCATED:"));
+    }
+
+    #[test]
+    fn prompt_truncation_marker_starts_only_beyond_the_boundary() {
+        let exact = "B".repeat(BODY_CHAR_LIMIT);
+        assert_eq!(truncate_for_prompt(&exact, BODY_CHAR_LIMIT), exact);
+
+        let oversized = format!("{exact}X");
+        let rendered = truncate_for_prompt(&oversized, BODY_CHAR_LIMIT);
+        assert!(rendered.starts_with(&exact));
+        assert!(rendered.ends_with("[TRUNCATED: retained 4096 characters; original exceeds 4096]"));
+        assert!(!rendered.ends_with('X'));
+    }
+
+    #[test]
+    fn classifier_prompt_preserves_pml_35_sized_contract_intact() {
+        let (_dir, mut conn) = open_tmp();
+        let sentinel = "EXPECTED_GRAPH_BEHAVIOR_AFTER_FORMER_2K_BOUNDARY";
+        let body = format!(
+            "{}{}{}",
+            "B".repeat(2_500),
+            sentinel,
+            "C".repeat(3_412 - 2_500 - sentinel.len())
+        );
+        assert_eq!(body.chars().count(), 3_412);
+        let task_id = create_task(&mut conn, "Large but bounded contract", 1);
+        conn.execute(
+            "UPDATE tasks SET body=?2 WHERE id=?1",
+            params![task_id, body],
+        )
+        .unwrap();
+
+        let prompt = build_prompt(&unclassified_tasks(&conn).unwrap(), &[]);
+        assert!(prompt.contains(&body));
+        assert!(!prompt.contains("[TRUNCATED:"));
+    }
+
+    #[test]
+    fn classifier_db_paths_mark_bodies_exceeding_the_limit() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "Oversized contract", 1);
+        conn.execute(
+            "UPDATE tasks SET body=?2 WHERE id=?1",
+            params![
+                task_id,
+                format!("{}HIDDEN_SUFFIX", "B".repeat(BODY_CHAR_LIMIT))
+            ],
+        )
+        .unwrap();
+
+        let live = unclassified_tasks(&conn).unwrap();
+        let targeted = task_missing_cx(&conn, task_id).unwrap().unwrap();
+        let backfill = tasks_missing_cx_all(&conn).unwrap();
+        for task in [live[0].clone(), targeted, backfill[0].clone()] {
+            let prompt = build_prompt(&[task], &[]);
+            assert!(prompt.contains("[TRUNCATED: retained 4096 characters; original exceeds 4096]"));
+            assert!(!prompt.contains("HIDDEN_SUFFIX"));
+        }
+    }
+
+    #[test]
+    fn classifier_prompt_marks_oversized_recovery_context() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "Recovered task", 1);
+        conn.execute(
+            "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, 2, 'daemon', ?2)",
+            params![
+                task_id,
+                format!(
+                    "{}HIDDEN_RECOVERY_SUFFIX",
+                    "R".repeat(RECOVERY_NOTE_CHAR_LIMIT)
+                )
+            ],
+        )
+        .unwrap();
+
+        let prompt = build_prompt(&unclassified_tasks(&conn).unwrap(), &[]);
+        assert!(prompt.contains("[TRUNCATED: retained 4096 characters; original exceeds 4096]"));
+        assert!(!prompt.contains("HIDDEN_RECOVERY_SUFFIX"));
+    }
+
+    #[test]
+    fn classifier_identity_matches_the_rendered_truncated_context() {
+        let base = TaskForClassification {
+            id: 1,
+            revision: 1,
+            title: "bounded identity".into(),
+            body: Some(format!("{}X", "B".repeat(BODY_CHAR_LIMIT))),
+            dependencies: vec![],
+            recovery_notes: vec![],
+            body_char_limit: BODY_CHAR_LIMIT,
+        };
+        let changed_only_beyond_the_rendered_bound = TaskForClassification {
+            body: Some(format!("{}Y", "B".repeat(BODY_CHAR_LIMIT))),
+            ..base.clone()
+        };
+
+        assert_eq!(
+            build_prompt(std::slice::from_ref(&base), &[]),
+            build_prompt(
+                std::slice::from_ref(&changed_only_beyond_the_rendered_bound),
+                &[]
+            )
+        );
+        assert_eq!(
+            classification_inputs(&[base]),
+            classification_inputs(&[changed_only_beyond_the_rendered_bound])
+        );
     }
 
     #[test]
@@ -2150,13 +2302,18 @@ mod tests {
         let batch = unclassified_tasks(&conn).unwrap();
         assert_eq!(batch.len(), CLASSIFICATION_BATCH_LIMIT);
         assert!(batch.windows(2).all(|pair| pair[0].id < pair[1].id));
-        assert!(batch[0].title.chars().count() <= TITLE_CHAR_LIMIT);
-        assert!(batch[0].body.as_deref().unwrap().chars().count() <= BODY_CHAR_LIMIT);
+        assert!(batch[0].title.chars().count() <= TITLE_CHAR_LIMIT + 1);
+        assert!(batch[0].body.as_deref().unwrap().chars().count() <= BODY_CHAR_LIMIT + 1);
+        let prompt = build_prompt(std::slice::from_ref(&batch[0]), &[]);
+        assert!(prompt.contains("[TRUNCATED: retained 300 characters"));
+        assert!(prompt.contains("[TRUNCATED: retained 4096 characters"));
 
         let dup_context = dup_context_tasks(&conn).unwrap();
         assert_eq!(dup_context.len(), DUP_CONTEXT_LIMIT);
         assert!(dup_context.windows(2).all(|pair| pair[0].id < pair[1].id));
-        assert!(dup_context[0].body.as_deref().unwrap().chars().count() <= DUP_BODY_CHAR_LIMIT);
+        assert!(dup_context[0].body.as_deref().unwrap().chars().count() <= DUP_BODY_CHAR_LIMIT + 1);
+        assert!(build_prompt(&[], std::slice::from_ref(&dup_context[0]))
+            .contains("[TRUNCATED: retained 200 characters"));
     }
 
     #[test]

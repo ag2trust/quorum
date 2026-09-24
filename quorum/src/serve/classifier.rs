@@ -9,6 +9,11 @@ pub const CLASSIFIER_EFFORT: &str = "low";
 pub const CLASSIFIER_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_CLASSIFIER_STDOUT_BYTES: usize = 256 * 1024;
 pub const MAX_CLASSIFIER_RESPONSE_BYTES: usize = 64 * 1024;
+/// Complete serialized classifier-input envelope. Per-field bounds prevent one
+/// value from dominating the turn; this aggregate bound prevents a valid-size
+/// batch from growing without limit as those fields evolve. The whole request
+/// is rejected rather than silently dropping tasks or duplicate context.
+pub const MAX_CLASSIFIER_PROMPT_BYTES: usize = 512 * 1024;
 const MAX_CLASSIFIER_LINES_PER_POLL: usize = 64;
 
 /// In-flight classifier state, persisted across daemon ticks.
@@ -97,30 +102,10 @@ async fn spawn_classifier_configured_with_timeout(
     recommendations: &str,
     turn_timeout: Duration,
 ) -> std::io::Result<ClassifierSlot> {
-    if tasks.len() > classify::CLASSIFICATION_BATCH_LIMIT {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "classifier batch has {} tasks; limit is {}",
-                tasks.len(),
-                classify::CLASSIFICATION_BATCH_LIMIT
-            ),
-        ));
-    }
-    if dup_context.len() > classify::DUP_CONTEXT_LIMIT {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "classifier duplicate context has {} tasks; limit is {}",
-                dup_context.len(),
-                classify::DUP_CONTEXT_LIMIT
-            ),
-        ));
-    }
+    let prompt = bounded_classifier_prompt(tasks, dup_context, recommendations)?;
     let pending_task_ids = tasks.iter().map(|t| t.id).collect();
     let pending_inputs = classify::classification_inputs(tasks);
     let dir = tempfile::tempdir()?;
-    let prompt = classify::build_prompt_with_recommendations(tasks, dup_context, recommendations);
     let started_at = tokio::time::Instant::now();
     let deadline = started_at + turn_timeout;
     // `--setting-sources ""` retains Claude's configured auth path while
@@ -163,6 +148,47 @@ async fn spawn_classifier_configured_with_timeout(
         stdout_bytes: 0,
         usage: super::runner::TokenUsage::default(),
     })
+}
+
+fn bounded_classifier_prompt(
+    tasks: &[TaskForClassification],
+    dup_context: &[TaskForClassification],
+    recommendations: &str,
+) -> std::io::Result<String> {
+    if tasks.len() > classify::CLASSIFICATION_BATCH_LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "classifier batch has {} tasks; limit is {}",
+                tasks.len(),
+                classify::CLASSIFICATION_BATCH_LIMIT
+            ),
+        ));
+    }
+    if dup_context.len() > classify::DUP_CONTEXT_LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "classifier duplicate context has {} tasks; limit is {}",
+                dup_context.len(),
+                classify::DUP_CONTEXT_LIMIT
+            ),
+        ));
+    }
+    let prompt = classify::build_prompt_with_recommendations(tasks, dup_context, recommendations);
+    if prompt.len() > MAX_CLASSIFIER_PROMPT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "classifier prompt is {} bytes; limit is {} bytes ({} requested tasks, {} duplicate-context tasks)",
+                prompt.len(),
+                MAX_CLASSIFIER_PROMPT_BYTES,
+                tasks.len(),
+                dup_context.len()
+            ),
+        ));
+    }
+    Ok(prompt)
 }
 
 /// Build the user turn for the classifier prompt.
@@ -387,6 +413,47 @@ mod tests {
     // ordinary CI scheduling delay for a boundary regression.
     const TEST_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(15);
     const TEST_STDIN_FEED_TIMEOUT: Duration = Duration::from_secs(15);
+
+    fn prompt_task(body: Option<String>) -> TaskForClassification {
+        TaskForClassification {
+            id: 7,
+            revision: 1,
+            title: "classify me".into(),
+            body,
+            dependencies: vec![],
+            recovery_notes: vec![],
+            body_char_limit: usize::MAX,
+        }
+    }
+
+    #[test]
+    fn aggregate_prompt_budget_rejects_the_complete_batch_deterministically() {
+        let tasks = [prompt_task(Some("X".repeat(MAX_CLASSIFIER_PROMPT_BYTES)))];
+        let first = bounded_classifier_prompt(&tasks, &[], "")
+            .unwrap_err()
+            .to_string();
+        let second = bounded_classifier_prompt(&tasks, &[], "")
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(first, second);
+        assert!(first.contains("classifier prompt is"), "{first}");
+        assert!(
+            first.contains(&format!("limit is {MAX_CLASSIFIER_PROMPT_BYTES} bytes")),
+            "{first}"
+        );
+        assert!(first.contains("1 requested tasks"), "{first}");
+    }
+
+    #[test]
+    fn aggregate_prompt_budget_leaves_short_inputs_unchanged() {
+        let tasks = [prompt_task(Some("short body".into()))];
+        let expected = classify::build_prompt_with_recommendations(&tasks, &[], "routing");
+        assert_eq!(
+            bounded_classifier_prompt(&tasks, &[], "routing").unwrap(),
+            expected
+        );
+    }
 
     #[cfg(unix)]
     async fn spawn_scripted_classifier(
