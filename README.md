@@ -207,7 +207,7 @@ by a single worker-task budget: classifier, planner, collector, follow-up, and
 doctor work are distinct managed responsibilities. Inspect live work with
 `quorum status` or `quorum web`, individual task/run details with
 `quorum task-get --task-id <N>`, and aggregate terminal-task reporting with
-`quorum perf [--by complexity|reviewer]`.
+`quorum perf [--by complexity|reviewer|risk-flag]`.
 
 ## Install
 
@@ -244,9 +244,11 @@ quorum serve \
 ```
 
 Use `quorum serve --help` for provider, model, concurrency, troubleshooting,
-and budget settings. This repo uses `scripts/serve-supervisor.sh` so Quorum can
-rebuild and restart after updating itself. Only one daemon can manage a
-repository database at a time.
+and budget settings. The configured `log_dir` also receives daemon decisions in
+`serve.log`; it rotates at 1 MiB and retains the active file plus two prior
+files. This repo uses `scripts/serve-supervisor.sh` so Quorum can rebuild and
+restart after updating itself. Only one daemon can manage a repository database
+at a time.
 
 ### Branch responsibilities for operators
 
@@ -331,6 +333,7 @@ quorum task-get --task-id 42  # full task and notes
 quorum log --refs task#42     # lifecycle events
 quorum tail Agent-42          # one managed session
 quorum perf --by complexity   # terminal-task performance aggregates
+quorum perf --by risk-flag    # outcomes and late blockers by classifier risk flag
 quorum branch-sync --list     # active + last 10 terminal branch-sync rows
 ```
 

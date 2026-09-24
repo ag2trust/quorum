@@ -537,6 +537,7 @@ impl Case {
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: Vec::new(),
+                risk_flags: vec![],
             }],
             "test-classifier:v1",
             1,

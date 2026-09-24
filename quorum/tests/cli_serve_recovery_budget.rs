@@ -449,6 +449,7 @@ fn seed_task(home: &std::path::Path, title: &str) {
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
+            risk_flags: vec![],
         }],
         "test-classifier:v2",
         quorum_core::clock::now(),

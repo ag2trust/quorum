@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 77;
+pub const SCHEMA_VERSION: i64 = 79;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1252,6 +1252,10 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
         // idempotent for re-run under the same migration transaction and matches
         // the shape SCHEMA_SQL applies to a fresh DB.
         if current < 66 {
+            // v79 later widens this index to include `failed_agent_run_id`;
+            // when migrating from a schema at or below v66 that column does
+            // not yet exist, so create the v66-shaped index first and let the
+            // v79 block below DROP+RECREATE it with the wider key.
             conn.execute_batch(
                 "CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_configured_route
                      ON agent_runs(role_assignment_id, configured_profile_id)
@@ -1423,6 +1427,133 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 "CREATE INDEX IF NOT EXISTS branch_syncs_checks_due
                      ON branch_syncs(ci_next_attempt_at, updated_at, id)
                      WHERE active = 1 AND phase = 'checks'",
+            )?;
+        }
+        // v78 indexes the second durable FK into agent_runs. Opportunistic
+        // sweep probes this column for each bounded raw run candidate, so the
+        // lookup must not scan the retained fallback-intent ledger. This is
+        // v78 on develop because that line had already shipped schema v77
+        // before the main hotfix was synchronized.
+        if current < 78 {
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS fallback_launch_intents_agent_run
+                     ON fallback_launch_intents(agent_run_id)",
+            )?;
+        }
+        // v79 keys fallback launch identity to the exact failed agent_run.
+        // Before v79 the routing_attempts UNIQUE(role_assignment_id,
+        // profile_id) collapsed a second same-profile failure into a replay of
+        // the first attempt, and fallback_launch_intents.UNIQUE(responsibility
+        // _key, routing_attempt_id) returned that first generation's intent,
+        // whose stale worktree/head then failed `replay_matches`. v79 adds a
+        // nullable `failed_agent_run_id` column to both tables and widens the
+        // routing_attempts UNIQUE to include it, so a distinct failed run gets
+        // its own attempt and its own fallback launch intent. Existing rows
+        // grandfather to NULL and remain readable, immutable evidence.
+        //
+        // routing_attempts requires a table rebuild because the UNIQUE
+        // constraint is inline (an implicit index) and SQLite cannot ALTER a
+        // UNIQUE. Foreign-key enforcement is already disabled by the outer
+        // `migrate` straddle; `fallback_launch_intents.routing_attempt_id`
+        // preserves its integer values across the rename because the DROP+
+        // RENAME does not renumber rows. The `no_update` and `no_delete`
+        // triggers are recreated by SCHEMA_SQL when re-entering the migration,
+        // but SCHEMA_SQL runs before this block, so re-issue them explicitly
+        // here (their `IF NOT EXISTS` guard makes the recreation idempotent).
+        if current < 79 && !column_exists(conn, "routing_attempts", "failed_agent_run_id")? {
+            conn.pragma_update(None, "legacy_alter_table", true)?;
+            conn.execute_batch(
+                "CREATE TABLE routing_attempts_new (
+                     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                     role_assignment_id    INTEGER NOT NULL REFERENCES role_assignments(id),
+                     responsibility_key    TEXT NOT NULL,
+                     profile_id            TEXT NOT NULL,
+                     provider              TEXT NOT NULL,
+                     runner                TEXT NOT NULL,
+                     model                 TEXT NOT NULL,
+                     effort                TEXT NOT NULL,
+                     pool_key              TEXT NOT NULL,
+                     policy_generation     TEXT NOT NULL,
+                     failure_disposition   TEXT CHECK(failure_disposition IS NULL OR
+                                               failure_disposition IN (
+                                                   'provider-unavailable',
+                                                   'profile-unavailable',
+                                                   'retryable-same-route',
+                                                   'non-failover',
+                                                   'unclassified')),
+                     failed_agent_run_id   INTEGER REFERENCES agent_runs(id),
+                     recorded_at           INTEGER NOT NULL,
+                     UNIQUE(role_assignment_id, profile_id, failed_agent_run_id)
+                 );
+                 INSERT INTO routing_attempts_new(
+                     id, role_assignment_id, responsibility_key, profile_id, provider,
+                     runner, model, effort, pool_key, policy_generation,
+                     failure_disposition, failed_agent_run_id, recorded_at)
+                     SELECT id, role_assignment_id, responsibility_key, profile_id, provider,
+                            runner, model, effort, pool_key, policy_generation,
+                            failure_disposition, NULL, recorded_at
+                     FROM routing_attempts;
+                 DROP TABLE routing_attempts;
+                 ALTER TABLE routing_attempts_new RENAME TO routing_attempts;
+                 CREATE INDEX IF NOT EXISTS routing_attempts_responsibility
+                     ON routing_attempts(responsibility_key, id);
+                 CREATE TRIGGER IF NOT EXISTS routing_attempts_assignment_guard
+                 BEFORE INSERT ON routing_attempts
+                 WHEN NOT EXISTS (
+                     SELECT 1 FROM role_assignments AS assignment
+                     WHERE assignment.id=NEW.role_assignment_id
+                       AND assignment.responsibility_key=NEW.responsibility_key
+                       AND assignment.pool_key=NEW.pool_key
+                       AND assignment.policy_generation=NEW.policy_generation
+                 )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'routing attempt does not match role assignment');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS routing_attempts_no_update
+                 BEFORE UPDATE ON routing_attempts
+                 BEGIN
+                     SELECT RAISE(ABORT, 'routing attempt evidence is immutable');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS routing_attempts_no_delete
+                 BEFORE DELETE ON routing_attempts
+                 BEGIN
+                     SELECT RAISE(ABORT, 'routing attempt evidence is immutable');
+                 END;",
+            )?;
+            conn.pragma_update(None, "legacy_alter_table", false)?;
+        }
+        if current < 79 && !column_exists(conn, "fallback_launch_intents", "failed_agent_run_id")? {
+            conn.execute(
+                "ALTER TABLE fallback_launch_intents
+                     ADD COLUMN failed_agent_run_id INTEGER REFERENCES agent_runs(id)",
+                [],
+            )?;
+        }
+        // The alternate agent_run is likewise keyed by the failed run it
+        // replaces. The v66 partial UNIQUE index that enforces one alternate
+        // per (assignment, profile) is dropped and replaced by one that also
+        // includes `failed_agent_run_id`, so distinct failed runs get their
+        // own alternate row while legacy (assignment, profile) reuse remains
+        // idempotent for NULL rows.
+        if current < 79 && !column_exists(conn, "agent_runs", "failed_agent_run_id")? {
+            conn.execute(
+                "ALTER TABLE agent_runs
+                     ADD COLUMN failed_agent_run_id INTEGER REFERENCES agent_runs(id)",
+                [],
+            )?;
+        }
+        if current < 79 {
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS agent_runs_configured_route;
+                 CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_configured_route
+                     ON agent_runs(role_assignment_id, configured_profile_id, failed_agent_run_id)
+                     WHERE configured_profile_id IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS fallback_launch_intents_failed_agent_run
+                     ON fallback_launch_intents(failed_agent_run_id);
+                 CREATE INDEX IF NOT EXISTS routing_attempts_failed_agent_run
+                     ON routing_attempts(failed_agent_run_id);
+                 CREATE INDEX IF NOT EXISTS agent_runs_failed_agent_run
+                     ON agent_runs(failed_agent_run_id)",
             )?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -1992,16 +2123,28 @@ mod tests {
             )
             .unwrap();
 
-        // A duplicate populated configured route for the same assignment is
-        // rejected by the partial UNIQUE index.
+        // Two alternates for the same (assignment, profile) authorized by
+        // distinct failed managed runs are permitted post-v79. A duplicate
+        // (assignment, profile, failed_agent_run_id) is still rejected.
         reopened
             .execute(
                 "INSERT INTO agent_runs(
                      task_id,agent_name,role,model,effort,provider,spawned_at,
                      role_assignment_id,configured_profile_id,configured_provider,
-                     configured_model,configured_effort)
+                     configured_model,configured_effort,failed_agent_run_id)
                  VALUES (7,'alt-1','worker','sol','high','codex',4,42,
-                         'sol','codex','sol','high')",
+                         'sol','codex','sol','high',1)",
+                [],
+            )
+            .unwrap();
+        reopened
+            .execute(
+                "INSERT INTO agent_runs(
+                     task_id,agent_name,role,model,effort,provider,spawned_at,
+                     role_assignment_id,configured_profile_id,configured_provider,
+                     configured_model,configured_effort,failed_agent_run_id)
+                 VALUES (7,'alt-2','worker','sol','high','codex',5,42,
+                         'sol','codex','sol','high',2)",
                 [],
             )
             .unwrap();
@@ -2009,12 +2152,15 @@ mod tests {
             "INSERT INTO agent_runs(
                  task_id,agent_name,role,model,effort,provider,spawned_at,
                  role_assignment_id,configured_profile_id,configured_provider,
-                 configured_model,configured_effort)
-             VALUES (7,'alt-2','worker','sol','high','codex',5,42,
-                     'sol','codex','sol','high')",
+                 configured_model,configured_effort,failed_agent_run_id)
+             VALUES (7,'alt-3','worker','sol','high','codex',6,42,
+                     'sol','codex','sol','high',1)",
             [],
         );
-        assert!(dup.is_err(), "duplicate configured route must fail closed");
+        assert!(
+            dup.is_err(),
+            "duplicate (assignment, profile, failed_agent_run_id) must fail closed"
+        );
     }
 
     #[test]
@@ -2213,6 +2359,53 @@ mod tests {
                 .unwrap(),
             SCHEMA_VERSION,
             "a second migration-open must be a no-op"
+        );
+    }
+
+    #[test]
+    fn v77_to_v78_indexes_fallback_intent_agent_run_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v77-fallback-agent-run-index.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "DROP INDEX fallback_launch_intents_agent_run;
+                 PRAGMA user_version=77;",
+            )
+            .unwrap();
+        }
+
+        let upgraded = open(&path).unwrap();
+        let indexed_column: String = upgraded
+            .query_row(
+                "SELECT name FROM pragma_index_info('fallback_launch_intents_agent_run')
+                 WHERE seqno=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed_column, "agent_run_id");
+        assert_eq!(
+            upgraded
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(upgraded);
+
+        let reopened = open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .query_row(
+                    "SELECT count(*) FROM pragma_index_info(
+                         'fallback_launch_intents_agent_run'
+                     ) WHERE seqno=0 AND name='agent_run_id'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "a second migration-open must preserve the lookup index"
         );
     }
 

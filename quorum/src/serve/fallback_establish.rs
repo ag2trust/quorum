@@ -29,6 +29,10 @@ pub struct FallbackEstablishInput<'a> {
     pub agent: &'a str,
     /// Fresh daemon-issued capability identity for that process.
     pub capability_run_id: &'a str,
+    /// The exact failed managed-run identity this alternate is replacing.
+    /// Distinct values produce distinct alternate agent_runs even when the
+    /// (assignment, profile) tuple is otherwise unchanged.
+    pub failed_agent_run_id: Option<i64>,
     /// Exact reviewer PR/head authority, required for reviewer fallbacks.
     pub reviewer_launch: Option<ReviewerLaunchEvidence<'a>>,
     /// Timestamp for the immutable `agent_runs` row.
@@ -150,6 +154,7 @@ fn establish_inner(
         tx,
         &token,
         input.agent,
+        input.failed_agent_run_id,
         input.spawned_at,
     )?;
     let Some(capability) = capabilities::issue_attributed_alternate_tx(
@@ -297,6 +302,7 @@ mod tests {
                 responsibility_key: &assignment.responsibility_key,
                 profile: &pool.profiles[profile_index].profile,
                 failure_disposition: Some(disposition),
+                failed_agent_run_id: None,
                 recorded_at: 9,
             },
             pool,
@@ -322,6 +328,7 @@ mod tests {
             exclusions,
             agent: "Alternate-yg68",
             capability_run_id: "fallback-capability-1",
+            failed_agent_run_id: None,
             reviewer_launch: None,
             spawned_at: 10,
             issued_at: 11,

@@ -24,6 +24,7 @@
 use super::rereview_builder::review_round_contract;
 use super::review_cycle_context::ReviewCycleContext;
 use super::runner::AgentKind;
+use quorum_core::risk::{self, RiskFlag};
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -42,6 +43,7 @@ pub fn task_review_contract(
     body: Option<&str>,
     depends_on: Option<&str>,
     recovery_notes: &[String],
+    risk_flags: &[RiskFlag],
 ) -> String {
     let body = body.unwrap_or("<no task body>");
     let depends_on = depends_on.unwrap_or("[]");
@@ -64,8 +66,59 @@ pub fn task_review_contract(
          Review the PR against this task context, not the generic PR title or body. The task body \
          defines the assigned outcome, constraints, and verification expectations; dependencies \
          are scheduler-enforced assumptions, and recovery notes are bounded operational context.\n\n\
-             {context}\n"
+             {context}{risks}\n",
+        risks = task_risk_section(risk_flags),
     )
+}
+
+/// Bounded classifier context is advisory only. Keep every rendered verdict
+/// to one line so task-controlled evidence cannot expand a prompt unexpectedly.
+pub fn task_risk_section(risk_flags: &[RiskFlag]) -> String {
+    let flags = risk_flags
+        .iter()
+        .filter(|risk| risk.flag.is_known())
+        .take(risk::MAX_RISK_FLAGS)
+        .map(|risk| {
+            let mut end = risk.evidence.len().min(risk::MAX_RISK_EVIDENCE_BYTES);
+            while end > 0 && !risk.evidence.is_char_boundary(end) {
+                end -= 1;
+            }
+            let evidence = risk.evidence[..end]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("- {}: {evidence}", risk::flag_name(risk.flag))
+        })
+        .collect::<Vec<_>>();
+    if flags.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n## Risks\n\n{}", flags.join("\n"))
+    }
+}
+
+fn worker_risk_instruction(risk_flags: &[RiskFlag]) -> &'static str {
+    if task_risk_section(risk_flags).is_empty() {
+        ""
+    } else {
+        "For each listed risk, state in the PR body how the change mitigates it or why it does not apply."
+    }
+}
+
+pub fn r1_risk_instruction(risk_flags: &[RiskFlag]) -> &'static str {
+    if task_risk_section(risk_flags).is_empty() {
+        ""
+    } else {
+        "Confirm each listed risk is mitigated or file a BLOCKING finding naming the risk. When any risk is listed, produce one consolidated affected-path and edge-case audit in this round."
+    }
+}
+
+fn r2_risk_instruction(risk_flags: &[RiskFlag]) -> &'static str {
+    if task_risk_section(risk_flags).is_empty() {
+        ""
+    } else {
+        "Confirm each listed risk is mitigated or file a BLOCKING finding naming the risk. R2 verifies R1's audit covered each risk."
+    }
 }
 
 /// Reviewers must finish the planned audit for a SHA before their lifecycle
@@ -103,13 +156,16 @@ worsened, adjacent/out of scope, defense-in-depth, a future requirement, or need
 stronger threat model, unless the current contract makes it BLOCKING; prefer it for pre-existing \
 edge behavior merely revealed when the primary outcome remains accurate without cataloguing or \
 fixing that behavior.\n\n\
-Post both dispositions to the PR. Each finding needs a concrete code path (file:line or \
-function), demonstrated failure and assumptions, and affected product behavior. A BLOCKING \
+Post both. Findings need a concrete code path, failure/assumptions, and product impact. \
+A BLOCKING \
 finding must say why this PR cannot merge, name the exact violated invariant (or assigned \
 outcome left false/supported behavior worsened), and the broader affected path left unsafe. A \
 FOLLOW-UP must say why deferral is safe, its scope relationship (pre-existing, \
 out-of-scope/adjacent, threat-model expansion, defense-in-depth, future requirement, or design \
 debt), and desired future outcome and verification, with context for later collector extraction.\n\
+Fixable secret bugs: `changes`, not graph-blocker. If secrets could escape, run \
+`quorum post --agent YOUR_NAME --kind critical --to owner --body-stdin `. Body: task/PR, rotation; \
+omit secrets.\n\
 The summary must report `BLOCKING: <N>` and `FOLLOW-UP: <N>` and each finding's impact, \
 disposition, failure/assumptions, scope relationship, and blocking or safe-deferral reason. Only \
 BLOCKING findings contribute to `--blocking`; FOLLOW-UP findings never do or force changes. With \
@@ -228,7 +284,14 @@ pub fn build_review_prompt_for_kind_with_context(
     effort: &str,
     graph_context: Option<&str>,
 ) -> String {
-    build_review_prompt_for_kind_with_context_and_cycle(kind, spec, effort, graph_context, None)
+    build_review_prompt_for_kind_with_context_and_cycle(
+        kind,
+        spec,
+        effort,
+        graph_context,
+        None,
+        &[],
+    )
 }
 
 /// Build an R1 prompt with optional persisted re-review lifecycle context.
@@ -240,18 +303,25 @@ pub fn build_review_prompt_for_kind_with_context_and_cycle(
     effort: &str,
     graph_context: Option<&str>,
     review_cycle: Option<ReviewCycleContext>,
+    risk_flags: &[RiskFlag],
 ) -> String {
     let review_cycle_contract = review_cycle
         .map(|context| review_round_contract(spec.pr, context))
         .unwrap_or_default();
+    let risk_instruction = r1_risk_instruction(risk_flags);
+    let risk_instruction = if risk_instruction.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{risk_instruction}")
+    };
     match kind {
         AgentKind::Claude => format!(
-            "{}{review_cycle_contract}{}",
+            "{}{review_cycle_contract}{risk_instruction}{}",
             build_review_prompt(spec, effort),
             graph_review_contract(spec.reviewer_name.as_str(), spec.pr, graph_context)
         ),
         AgentKind::Codex => format!(
-            "{}{review_cycle_contract}{}",
+            "{}{review_cycle_contract}{risk_instruction}{}",
             build_codex_review_prompt(spec, effort),
             graph_review_contract(spec.reviewer_name.as_str(), spec.pr, graph_context)
         ),
@@ -291,9 +361,11 @@ pub(super) fn graph_review_contract(reviewer: &str, pr: i64, context: Option<&st
          in the named file(s), treating the assigned file list as advisory for this remediation. \
          FOLLOW-UP findings follow the contract above and never trigger a graph-blocker verdict. \
          Reserve the distinct `--verdict graph-blocker` for genuine safety or authority boundary \
-         violations: a change that would grant authority, break restricted-role or phase isolation, \
-         escape the managed repository, or expose secrets. Do not use graph-blocker merely because \
-         a correct, safe fix crosses the declared file scope. The only supported category is \
+         violations where continuing this graph itself would grant authority, break restricted-role \
+         or phase isolation, escape the managed repository, or expose secrets, with no safe repair \
+         on the current PR. A fixable source defect, including potential secret exposure, uses \
+         BLOCKING `changes` plus the redacted critical alert above. Do not use graph-blocker merely \
+         because a correct, safe fix crosses the declared file scope. The only supported category is \
          `{category}`. Signal it with this exact closed payload shape:\n\
          `quorum submit --agent {reviewer} --pr {pr} --verdict graph-blocker --feedback-json '{payload}'`\n\
          Replace affected_task with this context's task_id and replace both placeholders with \
@@ -337,7 +409,14 @@ pub fn build_r2_review_prompt_for_kind_with_context(
     effort: &str,
     graph_context: Option<&str>,
 ) -> String {
-    build_r2_review_prompt_for_kind_with_context_and_cycle(kind, spec, effort, graph_context, None)
+    build_r2_review_prompt_for_kind_with_context_and_cycle(
+        kind,
+        spec,
+        effort,
+        graph_context,
+        None,
+        &[],
+    )
 }
 
 /// Build an R2 prompt with optional persisted re-review lifecycle context.
@@ -347,18 +426,25 @@ pub fn build_r2_review_prompt_for_kind_with_context_and_cycle(
     effort: &str,
     graph_context: Option<&str>,
     review_cycle: Option<ReviewCycleContext>,
+    risk_flags: &[RiskFlag],
 ) -> String {
     let review_cycle_contract = review_cycle
         .map(|context| review_round_contract(spec.pr, context))
         .unwrap_or_default();
+    let risk_instruction = r2_risk_instruction(risk_flags);
+    let risk_instruction = if risk_instruction.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{risk_instruction}")
+    };
     match kind {
         AgentKind::Claude => format!(
-            "{}{review_cycle_contract}{}",
+            "{}{review_cycle_contract}{risk_instruction}{}",
             build_r2_review_prompt(spec, effort),
             graph_review_contract(spec.r2_name.as_str(), spec.pr, graph_context)
         ),
         AgentKind::Codex => format!(
-            "{}{review_cycle_contract}{}",
+            "{}{review_cycle_contract}{risk_instruction}{}",
             build_codex_r2_review_prompt(spec, effort),
             graph_review_contract(spec.r2_name.as_str(), spec.pr, graph_context)
         ),
@@ -465,10 +551,17 @@ pub fn build_worker_prompt(
     title: &str,
     body: &str,
     max_task_cost_usd: Option<f64>,
+    risk_flags: &[RiskFlag],
 ) -> String {
+    let risk_section = task_risk_section(risk_flags);
+    let risk_guidance = if risk_section.is_empty() {
+        String::new()
+    } else {
+        format!("{risk_section}\n\n{}", worker_risk_instruction(risk_flags))
+    };
     format!(
         "You are agent {agent}. Task #{task_id}: {title}\n\n\
-         {body}\n\n\
+         {body}{risk_guidance}\n\n\
          {working_style}\n\n\
          {evidence_economy}\n\n\
          {note_guidance}{budget}\n\n\
@@ -483,6 +576,7 @@ pub fn build_worker_prompt(
         task_id = task_id,
         title = title,
         body = body,
+        risk_guidance = risk_guidance,
         working_style = WORKING_STYLE,
         evidence_economy = EVIDENCE_ECONOMY_RULE,
         note_guidance = EXCEPTIONAL_NOTE_GUIDANCE,
@@ -505,6 +599,7 @@ pub fn build_worker_turn(
         title,
         body,
         max_task_cost_usd,
+        &[],
     ))
 }
 
@@ -515,12 +610,19 @@ pub fn build_rework_prompt(
     feedback: &str,
     spent_usd: f64,
     max_task_cost_usd: Option<f64>,
+    risk_flags: &[RiskFlag],
 ) -> String {
+    let risk_section = task_risk_section(risk_flags);
+    let risk_guidance = if risk_section.is_empty() {
+        String::new()
+    } else {
+        format!("{risk_section}\n\n{}", worker_risk_instruction(risk_flags))
+    };
     format!(
         "REVIEW FAILED — the reviewer requested changes. The reviewer's blocking findings \
          (summary below) also live on PR #{pr} as review comments — read the PR to see the \
          full context, inline anchors, and any advisory notes.\n\n\
-         Reviewer feedback summary:\n{feedback}\n\n\
+         Reviewer feedback summary:\n{feedback}{risk_guidance}\n\n\
          The PR is the source of truth for this review — address findings there:\n\
          - For each blocking finding, either fix it and commit, or, if you disagree, reply \
          to the finding on the PR with concrete evidence (a citation, a test result, a \
@@ -543,6 +645,7 @@ pub fn build_rework_prompt(
          Do NOT mark the task done yourself — the daemon handles task lifecycle.\n\
          {terminal_signal}",
         feedback = feedback,
+        risk_guidance = risk_guidance,
         agent = agent_name,
         pr = pr,
         evidence_economy = EVIDENCE_ECONOMY_RULE,
@@ -568,6 +671,7 @@ pub fn build_rework_turn(
         feedback,
         spent_usd,
         max_task_cost_usd,
+        &[],
     ))
 }
 
@@ -676,6 +780,7 @@ mod tests {
             Some("Expected\nCancelled dependency parks are visible."),
             Some("[461,462]"),
             &["recovery attempt preserved PR #618".into()],
+            &[],
         );
         assert!(contract.contains("Authoritative managed-task contract"));
         assert!(contract.contains("task_id: 473"));
@@ -684,6 +789,116 @@ mod tests {
         assert!(contract.contains("Cancelled dependency parks are visible."));
         assert!(contract.contains("recovery attempt preserved PR #618"));
         assert!(contract.contains("not the generic PR title or body"));
+    }
+
+    #[test]
+    fn task_risks_are_rendered_for_every_role_and_omitted_when_absent() {
+        let risks = vec![
+            RiskFlag {
+                flag: quorum_core::risk::RiskFlagName::PublicContract,
+                evidence: "The CLI JSON output changes.".into(),
+            },
+            RiskFlag {
+                flag: quorum_core::risk::RiskFlagName::ManyConsumers,
+                evidence: "Three consumers must update together.".into(),
+            },
+        ];
+        let contract = task_review_contract(42, "risk task", Some("body"), None, &[], &risks);
+        let r1_spec = ReviewerSpec {
+            pr: 99,
+            worker_agent: "W-1".into(),
+            reviewer_name: "R1".into(),
+        };
+        let r2_spec = R2ReviewSpec {
+            pr: 99,
+            worker_agent: "W-1".into(),
+            r1_reviewer: "R1".into(),
+            r2_name: "R2".into(),
+        };
+        let prompts = [
+            (
+                "worker",
+                build_worker_prompt("W-1", 42, "risk task", "body", None, &risks),
+                "For each listed risk, state in the PR body",
+            ),
+            (
+                "R1",
+                format!(
+                    "{}\n\n{contract}",
+                    build_review_prompt_for_kind_with_context_and_cycle(
+                        AgentKind::Codex,
+                        &r1_spec,
+                        "high",
+                        None,
+                        None,
+                        &risks,
+                    )
+                ),
+                "produce one consolidated affected-path and edge-case audit",
+            ),
+            (
+                "R2",
+                format!(
+                    "{}\n\n{contract}",
+                    build_r2_review_prompt_for_kind_with_context_and_cycle(
+                        AgentKind::Codex,
+                        &r2_spec,
+                        "high",
+                        None,
+                        None,
+                        &risks,
+                    )
+                ),
+                "R2 verifies R1's audit covered each risk.",
+            ),
+            (
+                "rework",
+                build_rework_prompt("W-1", 42, 99, "fix it", 0.0, None, &risks),
+                "For each listed risk, state in the PR body",
+            ),
+        ];
+        for (role, prompt, instruction) in prompts {
+            assert!(
+                prompt.contains("## Risks"),
+                "{role} missing risks: {prompt}"
+            );
+            assert!(prompt.contains("public_contract: The CLI JSON output changes."));
+            assert!(prompt.contains("many_consumers: Three consumers must update together."));
+            assert!(
+                prompt.contains(instruction),
+                "{role} missing instruction: {prompt}"
+            );
+        }
+
+        let no_risks = [
+            build_worker_prompt("W-1", 42, "risk task", "body", None, &[]),
+            build_review_prompt_for_kind_with_context_and_cycle(
+                AgentKind::Codex,
+                &r1_spec,
+                "high",
+                None,
+                None,
+                &[],
+            ),
+            build_r2_review_prompt_for_kind_with_context_and_cycle(
+                AgentKind::Codex,
+                &r2_spec,
+                "high",
+                None,
+                None,
+                &[],
+            ),
+            build_rework_prompt("W-1", 42, 99, "fix it", 0.0, None, &[]),
+            task_review_contract(42, "risk task", Some("body"), None, &[], &[]),
+        ];
+        assert!(no_risks.iter().all(|prompt| !prompt.contains("## Risks")));
+    }
+
+    #[test]
+    fn malformed_risk_refs_render_no_contract_section() {
+        let flags = risk::risk_flags("not JSON");
+        let contract = task_review_contract(42, "risk task", Some("body"), None, &[], &flags);
+        assert!(!contract.contains("## Risks"));
     }
 
     /// Task #231 / PR #778: a resumed reviewer that exits without re-signaling
@@ -1174,6 +1389,15 @@ mod tests {
                 "{name} must exclude follow-ups from lifecycle blocking"
             );
             assert!(
+                prompt.contains("Fixable secret bugs: `changes`")
+                    && prompt.contains(
+                        "`quorum post --agent YOUR_NAME --kind critical --to owner --body-stdin `"
+                    )
+                    && prompt.contains("omit secrets")
+                    && prompt.contains("not graph-blocker"),
+                "{name} must separate urgent secret notification from repairable review disposition"
+            );
+            assert!(
                 prompt.contains("zero BLOCKING findings and one or more FOLLOW-UP findings")
                     && prompt.contains("submit `approved --blocking 0`"),
                 "{name} must approve a follow-up-only review with zero blockers"
@@ -1298,7 +1522,7 @@ mod tests {
 
     #[test]
     fn rework_turn_requires_published_ancestry_preservation() {
-        let turn = build_rework_prompt("W-1", 42, 99, "resolve conflicts", 0.0, None);
+        let turn = build_rework_prompt("W-1", 42, 99, "resolve conflicts", 0.0, None, &[]);
         assert!(turn.contains("Preserve the existing published PR lineage"));
         assert!(turn.contains("Never rebase"));
         assert!(turn.contains("must remain an ancestor"));
@@ -1443,6 +1667,7 @@ mod tests {
                 "high",
                 None,
                 Some(context),
+                &[],
             );
             let r2 = build_r2_review_prompt_for_kind_with_context_and_cycle(
                 kind,
@@ -1450,6 +1675,7 @@ mod tests {
                 "high",
                 None,
                 Some(context),
+                &[],
             );
             assert!(r1.contains("final review opportunity"));
             assert!(r2.contains("final review opportunity"));
@@ -2272,6 +2498,10 @@ mod tests {
         assert!(graph_contract.contains(
             "grant authority, break restricted-role or phase isolation, escape the managed repository, or expose secrets"
         ));
+        assert!(graph_contract.contains(
+            "A fixable source defect, including potential secret exposure, uses BLOCKING `changes`"
+        ));
+        assert!(graph_contract.contains("with no safe repair on the current PR"));
         assert!(graph_contract.contains(
             "otherwise correct and safe but requires a bounded edit outside the child's `write` deliverables"
         ));

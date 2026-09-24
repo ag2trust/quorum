@@ -392,6 +392,7 @@ fn seed_review_only_task(home: &std::path::Path, pr: i64) -> i64 {
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
+            risk_flags: vec![],
         }],
         "test:v2",
         now,
@@ -432,6 +433,7 @@ fn seed_in_review_task(home: &std::path::Path, author: &str, pr: i64) -> i64 {
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
+            risk_flags: vec![],
         }],
         "test:v2",
         now,
@@ -531,7 +533,7 @@ fn orphan_reviewer_waits_for_complete_v3_classification() {
         .lines
         .iter()
         .position(|line| line.contains("classifier: stored 1 classification"))
-        .expect("v3 classification was not persisted");
+        .expect("v4 classification was not persisted");
     let spawned = handle
         .lines
         .iter()
@@ -539,14 +541,14 @@ fn orphan_reviewer_waits_for_complete_v3_classification() {
         .expect("reviewer spawn log missing");
     assert!(
         gated < classified && classified < spawned,
-        "reviewer must not spawn before v3 classification: {:?}",
+        "reviewer must not spawn before v4 classification: {:?}",
         handle.lines
     );
 
     let task = get_task(home.path(), task_id);
     let refs: serde_json::Value =
         serde_json::from_str(task.refs.as_deref().expect("classified refs")).unwrap();
-    assert_eq!(refs["cx_by"], "claude-opus-4-6:v3");
+    assert_eq!(refs["cx_by"], "claude-opus-4-6:v4");
     assert_eq!(refs["cx_size"], "S");
     assert_eq!(
         refs["cx_size_reason"],

@@ -242,7 +242,6 @@ fn delete_all_expired_token_usage(conn: &Connection, now: i64) -> Result<()> {
 fn delete_reclaimable_task_rows_bounded(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     let eligible = "SELECT id FROM tasks WHERE status='done' AND updated_at < ?1";
     for table in [
-        "agent_runs",
         "task_branches",
         "task_notes",
         "mailbox",
@@ -283,7 +282,6 @@ fn delete_reclaimable_task_rows_bounded(conn: &Connection, now: i64, limit: usiz
 /// reclamation.
 fn delete_orphaned_task_rows_bounded(conn: &Connection, limit: usize) -> Result<()> {
     for table in [
-        "agent_runs",
         "task_branches",
         "task_notes",
         "mailbox",
@@ -314,6 +312,126 @@ fn delete_orphaned_task_rows_bounded(conn: &Connection, limit: usize) -> Result<
           LIMIT ?1)",
         params![limit as i64],
     )?;
+    Ok(())
+}
+
+/// Durable schema columns whose foreign keys pin `agent_runs` evidence. The
+/// task row itself is not pinned: these evidence rows deliberately outlive
+/// ordinary completed-task reclamation.
+const DURABLE_AGENT_RUN_REF_TABLES: &[(&str, &str)] = &[
+    ("run_capabilities", "agent_run_id"),
+    ("fallback_launch_intents", "agent_run_id"),
+    ("fallback_launch_intents", "failed_agent_run_id"),
+    ("routing_attempts", "failed_agent_run_id"),
+    ("agent_runs", "failed_agent_run_id"),
+];
+
+fn agent_run_ref_guard_predicates() -> String {
+    let mut guards = String::new();
+    for (table, column) in DURABLE_AGENT_RUN_REF_TABLES {
+        guards.push_str(&format!(
+            " AND NOT EXISTS (SELECT 1 FROM {table} x WHERE x.{column}=agent_runs.id)"
+        ));
+    }
+    guards
+}
+
+/// Raw primary-key window for bounded agent-run collection. Age, task
+/// existence, and durable-reference predicates are deliberately applied
+/// only after this page is materialized, so a retained evidence wall cannot
+/// make one opportunistic write examine unbounded run history.
+const AGENT_RUN_WINDOW_SQL: &str =
+    "SELECT id FROM agent_runs WHERE id > ?1 ORDER BY id ASC LIMIT ?2";
+
+fn bounded_agent_run_candidates(conn: &Connection, limit: usize) -> Result<Vec<i64>> {
+    let cursor: i64 = conn
+        .query_row(
+            "SELECT value FROM sweep_cursors WHERE name='agent_runs'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let candidates: Vec<i64> = conn
+        .prepare(AGENT_RUN_WINDOW_SQL)?
+        .query_map(params![cursor, limit as i64], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let new_cursor: Option<i64> = if let Some(&max) = candidates.last() {
+        Some(if candidates.len() < limit { 0 } else { max })
+    } else if cursor > 0 {
+        Some(0)
+    } else {
+        None
+    };
+    if let Some(value) = new_cursor {
+        conn.execute(
+            "INSERT INTO sweep_cursors(name, value) VALUES ('agent_runs', ?1)
+             ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+            [value],
+        )?;
+    }
+    Ok(candidates)
+}
+
+fn bounded_agent_run_delete_sql(candidate_count: usize) -> String {
+    let placeholders = (0..candidate_count)
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let horizon_parameter = candidate_count + 1;
+    let guards = agent_run_ref_guard_predicates();
+    format!(
+        "DELETE FROM agent_runs
+         WHERE id IN ({placeholders})
+           AND (
+               EXISTS (
+                   SELECT 1 FROM tasks candidate_task
+                   WHERE candidate_task.id=agent_runs.task_id
+                     AND candidate_task.status='done'
+                     AND candidate_task.updated_at < ?{horizon_parameter}
+               )
+               OR NOT EXISTS (
+                   SELECT 1 FROM tasks parent_task
+                   WHERE parent_task.id=agent_runs.task_id
+               )
+           ){guards}"
+    )
+}
+
+fn delete_agent_runs_bounded(conn: &Connection, now: i64, limit: usize) -> Result<()> {
+    let candidates = bounded_agent_run_candidates(conn, limit)?;
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let horizon = now - DONE_TASK_TTL_SECS;
+    let sql = bounded_agent_run_delete_sql(candidates.len());
+    let mut bound: Vec<&dyn rusqlite::ToSql> = candidates
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+    bound.push(&horizon);
+    conn.execute(&sql, bound.as_slice())?;
+    Ok(())
+}
+
+fn delete_agent_runs_unbounded(conn: &Connection, now: i64) -> Result<()> {
+    let guards = agent_run_ref_guard_predicates();
+    conn.execute(
+        &format!(
+            "DELETE FROM agent_runs
+             WHERE (
+                 task_id IN (
+                     SELECT id FROM tasks WHERE status='done' AND updated_at < ?1
+                 )
+                 OR (task_id IS NOT NULL AND NOT EXISTS (
+                     SELECT 1 FROM tasks WHERE tasks.id=agent_runs.task_id
+                 ))
+             ){guards}"
+        ),
+        [now - DONE_TASK_TTL_SECS],
+    )?;
+    conn.execute("DELETE FROM sweep_cursors WHERE name='agent_runs'", [])?;
     Ok(())
 }
 
@@ -350,7 +468,6 @@ const DURABLE_TASK_REF_TABLES: &[(&str, &str)] = &[
 /// task. The parent delete waits until each of these is empty for the task, so
 /// bounded child sweeps drive the reclamation instead of one giant cascade.
 const OPERATIONAL_TASK_REF_TABLES: &[&str] = &[
-    "agent_runs",
     "task_branches",
     "task_notes",
     "task_messages",
@@ -503,12 +620,12 @@ pub fn cascade_dead_deps(conn: &Connection, now: i64, limit: usize) -> Result<us
 }
 
 fn cascade_dead_deps_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<usize> {
-    // Pick the failing dep to name in the park reason. A cancelled dep is
-    // terminal-terminal — the dependent can never dispatch without operator
-    // disposition — so it wins over a merely-failed dep, which may still be
-    // retried into `done`. Selecting a specific failed/cancelled dep also
-    // avoids the pre-existing hazard of naming a `done` sibling dep just
-    // because it happened to come first in the json_each iteration.
+    // Pick the failing dep to name in the park reason. A daemon-parked task is
+    // a first-class retryable hold even though its storage status is `failed`;
+    // it keeps dependents open and unready instead of cascading another park.
+    // A cancelled dep is terminal-terminal and wins over a genuinely failed
+    // sibling. Selecting a specific terminal dep also avoids naming a `done`
+    // sibling merely because it happened to come first in json_each order.
     let doomed: Vec<(i64, Option<i64>, Option<i64>, String)> = {
         let mut stmt = conn.prepare(
             "SELECT t.id,
@@ -518,7 +635,12 @@ fn cascade_dead_deps_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                      ORDER BY j.value LIMIT 1) AS cancelled_dep,
                     (SELECT j.value FROM json_each(t.depends_on) j
                      JOIN tasks d ON d.id = j.value
-                     WHERE d.status IN ('failed')
+                     WHERE d.status='failed'
+                       AND NOT (
+                           json_valid(COALESCE(d.refs, '{}'))
+                           AND json_extract(d.refs, '$.daemon_parked')=1
+                           AND json_extract(d.refs, '$.daemon_resume_status') IS NOT NULL
+                       )
                      ORDER BY j.value LIMIT 1) AS failed_dep,
                     t.status
              FROM tasks t
@@ -533,13 +655,27 @@ fn cascade_dead_deps_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                    SELECT 1 FROM json_each(t.depends_on) j2
                    LEFT JOIN tasks d ON d.id = j2.value
                    WHERE d.status NOT IN ('done','failed','cancelled')
+                      OR (
+                          d.status='failed'
+                          AND json_valid(COALESCE(d.refs, '{}'))
+                          AND json_extract(d.refs, '$.daemon_parked')=1
+                          AND json_extract(d.refs, '$.daemon_resume_status') IS NOT NULL
+                      )
                       OR d.id IS NULL
                )
                -- … and at least one dep is NOT done
                AND EXISTS (
                    SELECT 1 FROM json_each(t.depends_on) j3
                    JOIN tasks d ON d.id = j3.value
-                   WHERE d.status IN ('failed','cancelled')
+                   WHERE d.status IN ('cancelled')
+                      OR (
+                          d.status='failed'
+                          AND NOT (
+                              json_valid(COALESCE(d.refs, '{}'))
+                              AND json_extract(d.refs, '$.daemon_parked')=1
+                              AND json_extract(d.refs, '$.daemon_resume_status') IS NOT NULL
+                          )
+                      )
                )
              LIMIT ?2",
         )?;
@@ -626,6 +762,7 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     // to discard their recovery identities independently.
     crate::task_messages::expire_stale_deliveries(conn, now, limit)?;
     delete_bounded(conn, "task_messages", now, limit)?;
+    delete_agent_runs_bounded(conn, now, limit)?;
     delete_reclaimable_task_rows_bounded(conn, now, limit)?;
     delete_orphaned_task_rows_bounded(conn, limit)?;
     delete_reclaimable_tasks_bounded(conn, now, limit)?;
@@ -674,6 +811,7 @@ pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
         "DELETE FROM task_messages WHERE expires_at <= ?1",
         params![now],
     )?;
+    delete_agent_runs_unbounded(&tx, now)?;
     let unbounded = i64::MAX as usize;
     delete_reclaimable_task_rows_bounded(&tx, now, unbounded)?;
     delete_orphaned_task_rows_bounded(&tx, unbounded)?;
@@ -704,6 +842,7 @@ mod tests {
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
+                risk_flags: vec![],
             }],
             "unit-test:v2",
             now,
@@ -903,6 +1042,21 @@ mod tests {
         crate::agent_runs::insert(c, task_id, agent, "worker", "model", "high", "codex", 1).unwrap()
     }
 
+    fn insert_capability_protected_run(c: &Connection, task_id: i64, ordinal: usize) -> i64 {
+        let agent = format!("protected-{ordinal}");
+        let capability = format!("protected-capability-{task_id}-{ordinal}");
+        let agent_run_id = insert_run(c, task_id, &agent);
+        crate::agent_runs::close(c, agent_run_id, 2, "done").unwrap();
+        c.execute(
+            "INSERT INTO run_capabilities(
+                 run_id, task_id, agent, role, created_at, revoked_at, agent_run_id)
+             VALUES (?1, ?2, ?3, 'worker', 1, 2, ?4)",
+            params![capability, task_id, agent, agent_run_id],
+        )
+        .unwrap();
+        agent_run_id
+    }
+
     #[test]
     fn sweep_reclaims_task_agent_runs_without_touching_live_task_runs() {
         let (_d, mut c) = open_tmp();
@@ -1015,9 +1169,252 @@ mod tests {
             "agent-run cleanup must honor the per-sweep limit"
         );
         assert_eq!(
-            task_left, 1,
-            "parent waits until its bounded child cleanup finishes"
+            task_left, 0,
+            "agent-run history must not pin an otherwise reclaimable task"
         );
+
+        // The next raw-ID page drains the remaining run after its parent task
+        // has been reclaimed.
+        sweep_on_write(&c, DONE_TASK_TTL_SECS + 2, 1).unwrap();
+        let runs_left: i64 = c
+            .query_row(
+                "SELECT count(*) FROM agent_runs WHERE task_id=?1",
+                [task],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs_left, 0, "the orphan pass must reclaim the sibling run");
+    }
+
+    #[test]
+    fn sweep_retains_agent_run_referenced_by_durable_capability() {
+        let (_d, mut c) = open_tmp_fk();
+        let task = aged_done_task(&mut c, "completed fallback run");
+        let agent_run_id = insert_run(&c, task, "fallback-worker");
+        crate::agent_runs::close(&c, agent_run_id, 2, "done").unwrap();
+        c.execute(
+            "INSERT INTO run_capabilities(
+                 run_id, task_id, agent, role, created_at, revoked_at, agent_run_id)
+             VALUES ('durable-fallback-capability', ?1, 'fallback-worker',
+                     'worker', 1, 2, ?2)",
+            [task, agent_run_id],
+        )
+        .unwrap();
+
+        // Task creation runs the bounded sweep in its own write transaction.
+        // Historical capability evidence must not make an unrelated create fail.
+        let follow_up = crate::tasks::create(
+            &mut c,
+            "boss",
+            "follow up",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            DONE_TASK_TTL_SECS + 1,
+        )
+        .unwrap();
+        assert!(follow_up > task, "the unrelated task creation must commit");
+
+        // The explicit sweep follows the same evidence-retention rule.
+        sweep_all(&c, DONE_TASK_TTL_SECS + 1).unwrap();
+
+        let state: (Option<i64>, Option<i64>, i64) = c
+            .query_row(
+                "SELECT r.ended_at, capability.revoked_at, capability.agent_run_id
+                 FROM agent_runs r
+                 JOIN run_capabilities capability ON capability.agent_run_id=r.id
+                 WHERE r.task_id=?1 AND r.id=?2
+                   AND capability.run_id='durable-fallback-capability'",
+                [task, agent_run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (Some(2), Some(2), agent_run_id));
+        let reclaimed_task: i64 = c
+            .query_row("SELECT count(*) FROM tasks WHERE id=?1", [task], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            reclaimed_task, 0,
+            "durable run evidence must not pin an ordinary completed task"
+        );
+        let follow_up_status: String = c
+            .query_row("SELECT status FROM tasks WHERE id=?1", [follow_up], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            follow_up_status, "open",
+            "the newly created task must survive the explicit sweep"
+        );
+        let violations: i64 = c
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0, "sweep must leave the database FK-clean");
+    }
+
+    #[test]
+    fn sweep_protects_each_agent_run_fk_when_intent_and_capability_runs_differ() {
+        let (_d, mut c) = open_tmp_fk();
+        let task = aged_done_task(&mut c, "split fallback evidence");
+        let capability_run = insert_run(&c, task, "capability-run");
+        let intent_run = insert_run(&c, task, "intent-run");
+        crate::agent_runs::close(&c, capability_run, 2, "done").unwrap();
+        crate::agent_runs::close(&c, intent_run, 2, "done").unwrap();
+        c.execute(
+            "INSERT INTO run_capabilities(
+                 run_id, task_id, agent, role, created_at, revoked_at, agent_run_id)
+             VALUES ('split-capability', ?1, 'capability-run', 'worker', 1, 2, ?2)",
+            [task, capability_run],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO role_assignments(
+                 responsibility_key, task_id, role, profile_id, provider, runner,
+                 model, effort, pool_key, policy_generation, created_at)
+             VALUES ('split-responsibility', ?1, 'worker', 'primary', 'claude',
+                     'claude', 'model', 'high', 'worker', 'test-policy', 1)",
+            [task],
+        )
+        .unwrap();
+        let assignment_id = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO routing_attempts(
+                 role_assignment_id, responsibility_key, profile_id, provider,
+                 runner, model, effort, pool_key, policy_generation, recorded_at)
+             VALUES (?1, 'split-responsibility', 'primary', 'claude', 'claude',
+                     'model', 'high', 'worker', 'test-policy', 1)",
+            [assignment_id],
+        )
+        .unwrap();
+        let routing_attempt_id = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO fallback_launch_intents(
+                 responsibility_key, routing_attempt_id, task_id, role, worktree,
+                 pending_turn_json, agent_run_id, capability_run_id, created_at)
+             VALUES ('split-responsibility', ?1, ?2, 'worker', '/tmp/worktree',
+                     '{}', ?3, 'split-capability', 1)",
+            params![routing_attempt_id, task, intent_run],
+        )
+        .unwrap();
+
+        let follow_up = crate::tasks::create(
+            &mut c,
+            "boss",
+            "unrelated create",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            DONE_TASK_TTL_SECS + 1,
+        )
+        .unwrap();
+        sweep_all(&c, DONE_TASK_TTL_SECS + 1).unwrap();
+
+        let protected: i64 = c
+            .query_row(
+                "SELECT count(*) FROM agent_runs WHERE id IN (?1, ?2)",
+                [capability_run, intent_run],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(protected, 2, "each FK child must protect its own run");
+        assert!(crate::tasks::get(&c, follow_up).unwrap().is_some());
+        let violations: i64 = c
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+    }
+
+    #[test]
+    fn bounded_reclaimable_run_scan_advances_past_protected_wall() {
+        let (_d, mut c) = open_tmp_fk();
+        let task = aged_done_task(&mut c, "protected run wall");
+        insert_decomposition(&c, task);
+        for ordinal in 0..=SWEEP_LIMIT {
+            insert_capability_protected_run(&c, task, ordinal);
+        }
+        let tail = insert_run(&c, task, "deletable-tail");
+        crate::agent_runs::close(&c, tail, 2, "done").unwrap();
+
+        sweep_on_write(&c, DONE_TASK_TTL_SECS + 1, SWEEP_LIMIT).unwrap();
+        let tail_exists = |conn: &Connection| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE id=?1)",
+                [tail],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+        };
+        assert!(tail_exists(&c));
+        sweep_on_write(&c, DONE_TASK_TTL_SECS + 2, SWEEP_LIMIT).unwrap();
+        assert!(
+            !tail_exists(&c),
+            "the rotating raw-ID window must reach a deletable tail"
+        );
+        let protected: i64 = c
+            .query_row(
+                "SELECT count(*) FROM run_capabilities capability
+                 JOIN agent_runs runs ON runs.id=capability.agent_run_id
+                 WHERE runs.task_id=?1",
+                [task],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(protected, (SWEEP_LIMIT + 1) as i64);
+    }
+
+    #[test]
+    fn bounded_orphan_run_scan_preserves_protected_wall_and_reclaims_sibling() {
+        let (_d, c) = open_tmp_fk();
+        let missing_task = 99_999;
+        for ordinal in 0..=SWEEP_LIMIT {
+            insert_capability_protected_run(&c, missing_task, ordinal);
+        }
+        let sibling = insert_run(&c, missing_task, "orphan-sibling");
+        crate::agent_runs::close(&c, sibling, 2, "done").unwrap();
+
+        sweep_on_write(&c, 1, SWEEP_LIMIT).unwrap();
+        let sibling_exists = |conn: &Connection| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE id=?1)",
+                [sibling],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+        };
+        assert!(sibling_exists(&c));
+        sweep_on_write(&c, 2, SWEEP_LIMIT).unwrap();
+        assert!(
+            !sibling_exists(&c),
+            "the unprotected legacy orphan behind the wall must be reclaimed"
+        );
+        let protected: i64 = c
+            .query_row(
+                "SELECT count(*) FROM run_capabilities capability
+                 JOIN agent_runs runs ON runs.id=capability.agent_run_id
+                 WHERE runs.task_id=?1",
+                [missing_task],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(protected, (SWEEP_LIMIT + 1) as i64);
+        let violations: i64 = c
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
     }
 
     #[test]
@@ -1414,6 +1811,78 @@ mod tests {
                 "dependency #{cancelled_dep} is cancelled — unsatisfiable"
             )),
             "cancelled dep must be preferred over failed sibling in the reason"
+        );
+    }
+
+    #[test]
+    fn retryable_parked_dependency_keeps_dependent_open_until_resume() {
+        let (_d, mut c) = open_tmp();
+        let dependency = crate::tasks::create(
+            &mut c,
+            "owner",
+            "review awaiting retry",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        let dependent = crate::tasks::create(
+            &mut c,
+            "owner",
+            "later work",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dependency}]")),
+            None,
+            101,
+        )
+        .unwrap();
+
+        crate::tasks::park(
+            &mut c,
+            dependency,
+            "reviewer provision exhausted",
+            "in-review",
+            102,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(cascade_dead_deps(&c, 103, SWEEP_LIMIT).unwrap(), 0);
+        let waiting = crate::tasks::get(&c, dependent).unwrap().unwrap();
+        assert_eq!(waiting.status, "open");
+        assert!(
+            !waiting.ready,
+            "the parked prerequisite still gates dispatch"
+        );
+        let child_parks: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events
+                 WHERE kind='task_parked' AND subject=?1",
+                [format!("task#{dependent}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_parks, 0, "a retryable hold must not cascade failure");
+
+        let resumed = crate::tasks::retry_parked(&mut c, dependency, "owner", true, 104)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.status, "in-review");
+        c.execute(
+            "UPDATE tasks SET status='done',updated_at=105 WHERE id=?1",
+            [dependency],
+        )
+        .unwrap();
+        assert!(
+            crate::tasks::get(&c, dependent).unwrap().unwrap().ready,
+            "the same dependent becomes ready when the parked prerequisite completes"
         );
     }
 
@@ -1819,7 +2288,7 @@ mod tests {
     }
 
     #[test]
-    fn cascade_is_transitive() {
+    fn cascade_stops_at_first_retryable_park() {
         let (_d, mut c) = open_tmp();
         let a = crate::tasks::create(&mut c, "boss", "a", None, 0, None, None, None, None, 100)
             .unwrap();
@@ -1858,10 +2327,12 @@ mod tests {
         // First cascade: b parked.
         cascade_dead_deps(&c, 300, 100).unwrap();
         assert_eq!(crate::tasks::get(&c, b).unwrap().unwrap().status, "failed");
-        // c still open (b just became failed, need another sweep).
-        // Second cascade: c parked.
-        cascade_dead_deps(&c, 400, 100).unwrap();
-        assert_eq!(crate::tasks::get(&c, ch).unwrap().unwrap().status, "failed");
+        // b's daemon park is a retryable hold, so it remains a normal unmet
+        // prerequisite instead of propagating failure through the chain.
+        assert_eq!(cascade_dead_deps(&c, 400, 100).unwrap(), 0);
+        let c_task = crate::tasks::get(&c, ch).unwrap().unwrap();
+        assert_eq!(c_task.status, "open");
+        assert!(!c_task.ready);
     }
 
     // ── Review-only reaper recovery (table-driven) ─────────────────
@@ -2382,6 +2853,7 @@ mod tests {
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
+                risk_flags: vec![],
             }],
             "unit-test:v2",
             1000,
@@ -3123,6 +3595,140 @@ mod tests {
                  Existing indexes on {table}: {indexes:?}"
             );
         }
+    }
+
+    #[test]
+    fn agent_run_candidate_discovery_uses_a_bounded_primary_key_page() {
+        let (_d, c) = open_tmp_fk();
+        let plan: Vec<String> = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {AGENT_RUN_WINDOW_SQL}"))
+            .unwrap()
+            .query_map(params![0, SWEEP_LIMIT as i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains("INTEGER PRIMARY KEY") && detail.contains("rowid>?")
+            }),
+            "agent-run candidate discovery must seek the primary key: {plan:?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.contains("TEMP B-TREE")),
+            "agent-run candidate discovery must not sort retained history: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_agent_run_delete_probes_task_eligibility_by_primary_key() {
+        let (_d, c) = open_tmp_fk();
+        let sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            bounded_agent_run_delete_sql(SWEEP_LIMIT)
+        );
+        let bound = vec![0_i64; SWEEP_LIMIT + 1];
+        let plan: Vec<String> = c
+            .prepare(&sql)
+            .unwrap()
+            .query_map(rusqlite::params_from_iter(bound), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert!(
+            plan.iter().all(|detail| !detail.contains("LIST SUBQUERY")),
+            "bounded delete must not materialize an unbounded task population: {plan:?}"
+        );
+        for task_alias in ["candidate_task", "parent_task"] {
+            assert!(
+                plan.iter().any(|detail| {
+                    detail.contains(&format!("SEARCH {task_alias}"))
+                        && detail.contains("INTEGER PRIMARY KEY")
+                }),
+                "{task_alias} eligibility must be a correlated task-PK probe: {plan:?}"
+            );
+            assert!(
+                plan.iter().all(|detail| {
+                    !detail.contains(&format!("SCAN {task_alias}"))
+                        && !detail.contains(&format!("SEARCH {task_alias} USING INDEX tasks_"))
+                }),
+                "{task_alias} must not enumerate a task status index: {plan:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_durable_agent_run_ref_column_has_a_lookup_index() {
+        let (_d, c) = open_tmp_fk();
+        for (table, column) in DURABLE_AGENT_RUN_REF_TABLES {
+            let indexes: Vec<String> = c
+                .prepare(&format!("PRAGMA index_list({table})"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let served = indexes.iter().any(|index_name| {
+                c.prepare(&format!("PRAGMA index_info({index_name})"))
+                    .unwrap()
+                    .query_map([], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(2)?))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                    .into_iter()
+                    .any(|(sequence, name)| sequence == 0 && name == *column)
+            });
+            assert!(
+                served,
+                "{table}.{column} needs a leading lookup index for bounded sweep guards"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_agent_run_ref_inventory_covers_every_fk_on_agent_runs() {
+        let (_d, c) = open_tmp_fk();
+        let tables: Vec<String> = c
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let mut discovered: Vec<(String, String)> = Vec::new();
+        for table in &tables {
+            let references: Vec<(String, String)> = c
+                .prepare(&format!("PRAGMA foreign_key_list({table})"))
+                .unwrap()
+                .query_map([], |row| Ok((row.get(2)?, row.get(3)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            for (referenced_table, from_column) in references {
+                if referenced_table == "agent_runs" {
+                    discovered.push((table.clone(), from_column));
+                }
+            }
+        }
+        discovered.sort();
+        let mut expected: Vec<(String, String)> = DURABLE_AGENT_RUN_REF_TABLES
+            .iter()
+            .map(|(table, column)| ((*table).into(), (*column).into()))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            discovered, expected,
+            "every FK child of agent_runs must participate in the sweep guard"
+        );
     }
 
     #[test]

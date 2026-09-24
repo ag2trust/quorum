@@ -115,7 +115,7 @@ primary = 100
 # sha_poll_interval_secs = 600 # minimum: 30 seconds
 
 ## Diagnostics
-# log_dir = \"/path/to/logs\"
+# log_dir = \"/path/to/logs\" # daemon serve.log rotates at 1 MiB; keeps 3 files
 # doctor_enabled = false
 # resource_poll_secs = 30                  # range: 5..=3600
 # disk_warn_free_gib = 80
@@ -1946,9 +1946,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 None => quorum_core::perf::PerfCut::Default,
                 Some("complexity") => quorum_core::perf::PerfCut::Complexity,
                 Some("reviewer") => quorum_core::perf::PerfCut::Reviewer,
+                Some("risk-flag" | "risk_flag") => quorum_core::perf::PerfCut::RiskFlag,
                 Some(other) => {
                     return Err(QuorumError::Usage(format!(
-                        "unknown --by value '{other}'; valid: complexity, reviewer"
+                        "unknown --by value '{other}'; valid: complexity, reviewer, risk-flag"
                     )));
                 }
             };

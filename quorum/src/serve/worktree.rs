@@ -22,6 +22,28 @@ pub struct WorktreeManager {
     local_timeout: Duration,
 }
 
+#[derive(Debug)]
+struct WorktreeRegistration {
+    path: PathBuf,
+    locked_reason: Option<String>,
+}
+
+/// A GC candidate must be a direct child of the configured base. Resolve the
+/// parent rather than the candidate so a missing stale registration can still
+/// be checked without following a path outside that base.
+fn is_direct_child_of(worktree_base: &Path, path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    match (
+        std::fs::canonicalize(worktree_base),
+        std::fs::canonicalize(parent),
+    ) {
+        (Ok(base), Ok(parent)) => base == parent && path.file_name().is_some(),
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContinuationBaseMerge {
     Clean,
@@ -180,7 +202,9 @@ async fn run_git_with_limit(
     pipe_limit: usize,
     label: &str,
 ) -> Result<std::process::Output, String> {
-    cmd.kill_on_drop(true)
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|error| format!("{label}: {error}"))?;
@@ -282,7 +306,12 @@ async fn run_git_with_input(
 ) -> Result<std::process::Output, String> {
     tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
-        cmd.kill_on_drop(true).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = cmd.spawn().map_err(|e| format!("{label}: {e}"))?;
         let stdout = child.stdout.take().ok_or_else(|| format!("{label}: stdout unavailable"))?;
         let stderr = child.stderr.take().ok_or_else(|| format!("{label}: stderr unavailable"))?;
@@ -1662,11 +1691,16 @@ impl WorktreeManager {
     ) -> Vec<String> {
         let _guard = self.lock.lock().await;
 
-        let mut prune_cmd = self.git_cmd(repo_dir);
-        prune_cmd.args(["worktree", "prune"]);
-        if let Err(e) = run_git(prune_cmd, self.local_timeout, "git worktree prune").await {
-            eprintln!("warn: {e}");
-        }
+        self.prune_stale_initializing_unlocked(repo_dir, worktree_base)
+            .await;
+
+        let registrations = match self.list_worktrees_unlocked(repo_dir).await {
+            Ok(registrations) => registrations,
+            Err(error) => {
+                eprintln!("warn: {error}");
+                return Vec::new();
+            }
+        };
 
         let entries = match std::fs::read_dir(worktree_base) {
             Ok(e) => e,
@@ -1676,30 +1710,163 @@ impl WorktreeManager {
         let mut removed = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    eprintln!(
+                        "warn: worktree GC cannot inspect {}: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            if !metadata.file_type().is_dir() {
                 continue;
             }
             let path_str = path.to_string_lossy().to_string();
-            if active_worktrees.iter().any(|a| *a == path_str) {
+            let canonical_path = match std::fs::canonicalize(&path) {
+                Ok(path) => path,
+                Err(error) => {
+                    eprintln!(
+                        "warn: worktree GC cannot canonicalize {}: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            if !registrations.iter().any(|registration| {
+                std::fs::canonicalize(&registration.path).ok().as_ref() == Some(&canonical_path)
+            }) {
+                eprintln!(
+                    "warn: worktree GC leaving unregistered directory {}",
+                    path.display()
+                );
+                continue;
+            }
+            if active_worktrees.iter().any(|active| {
+                *active == path_str
+                    || std::fs::canonicalize(active).ok().as_ref() == Some(&canonical_path)
+            }) {
                 continue;
             }
 
             let mut rm_cmd = self.git_cmd(repo_dir);
             rm_cmd.args(["worktree", "remove", &path_str, "--force"]);
-            let git_ok = match run_git(rm_cmd, self.local_timeout, "git worktree remove").await {
-                Ok(out) if out.status.success() => true,
-                Ok(_) => false,
+            match run_git(rm_cmd, self.local_timeout, "git worktree remove").await {
+                Ok(out) if out.status.success() => removed.push(path_str),
+                Ok(out) => eprintln!(
+                    "warn: git worktree remove {} failed: {}",
+                    path.display(),
+                    git_diagnostic(&out.stderr)
+                ),
                 Err(e) => {
                     eprintln!("warn: {e}");
-                    false
                 }
-            };
-
-            if git_ok || std::fs::remove_dir_all(&path).is_ok() {
-                removed.push(path_str);
             }
         }
         removed
+    }
+
+    /// Unlock stale daemon registrations left by an interrupted worktree add,
+    /// then prune their Git metadata. Caller must arrange any cadence.
+    pub async fn prune_stale_initializing(&self, repo_dir: &Path, worktree_base: &Path) {
+        let _guard = self.lock.lock().await;
+        self.prune_stale_initializing_unlocked(repo_dir, worktree_base)
+            .await;
+    }
+
+    /// Caller MUST hold `self.lock`.
+    async fn list_worktrees_unlocked(
+        &self,
+        repo_dir: &Path,
+    ) -> Result<Vec<WorktreeRegistration>, String> {
+        let mut list = self.git_cmd(repo_dir);
+        list.args(["worktree", "list", "--porcelain"]);
+        let out = run_git(list, self.local_timeout, "git worktree list").await?;
+        if !out.status.success() {
+            return Err(format!(
+                "git worktree list failed: {}",
+                git_diagnostic(&out.stderr)
+            ));
+        }
+
+        let stdout = std::str::from_utf8(&out.stdout)
+            .map_err(|error| format!("git worktree list returned invalid UTF-8: {error}"))?;
+        let mut registrations = Vec::new();
+        let mut path = None;
+        let mut locked_reason = None;
+        for line in stdout.lines().chain(std::iter::once("")) {
+            if let Some(value) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(value));
+                locked_reason = None;
+            } else if let Some(reason) = line.strip_prefix("locked ") {
+                locked_reason = Some(reason.to_string());
+            } else if line == "locked" {
+                locked_reason = Some(String::new());
+            } else if line.is_empty() {
+                if let Some(path) = path.take() {
+                    registrations.push(WorktreeRegistration {
+                        path,
+                        locked_reason: locked_reason.take(),
+                    });
+                }
+            }
+        }
+        Ok(registrations)
+    }
+
+    /// Caller MUST hold `self.lock`.
+    async fn prune_stale_initializing_unlocked(&self, repo_dir: &Path, worktree_base: &Path) {
+        match self.list_worktrees_unlocked(repo_dir).await {
+            Ok(registrations) => {
+                for registration in registrations {
+                    if registration.locked_reason.as_deref() != Some("initializing")
+                        || !is_direct_child_of(worktree_base, &registration.path)
+                    {
+                        continue;
+                    }
+                    match std::fs::symlink_metadata(&registration.path) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            let mut unlock = self.git_cmd(repo_dir);
+                            unlock.args(["worktree", "unlock"]);
+                            unlock.arg(&registration.path);
+                            match run_git(
+                                unlock,
+                                self.local_timeout,
+                                "git worktree unlock stale initialization",
+                            )
+                            .await
+                            {
+                                Ok(out) if out.status.success() => {}
+                                Ok(out) => eprintln!(
+                                    "warn: git worktree unlock {} failed: {}",
+                                    registration.path.display(),
+                                    git_diagnostic(&out.stderr)
+                                ),
+                                Err(error) => eprintln!("warn: {error}"),
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => eprintln!(
+                            "warn: cannot inspect locked worktree {}: {error}",
+                            registration.path.display()
+                        ),
+                    }
+                }
+            }
+            Err(error) => eprintln!("warn: {error}"),
+        }
+
+        let mut prune = self.git_cmd(repo_dir);
+        prune.args(["worktree", "prune"]);
+        match run_git(prune, self.local_timeout, "git worktree prune").await {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => eprintln!(
+                "warn: git worktree prune failed: {}",
+                git_diagnostic(&out.stderr)
+            ),
+            Err(error) => eprintln!("warn: {error}"),
+        }
     }
 
     pub async fn remove(&self, repo_dir: &Path, worktree_dir: &Path) -> Result<(), String> {
@@ -2298,6 +2465,16 @@ mod tests {
             .unwrap();
         assert!(out.status.success(), "rev-parse {rev} failed");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn git_worktree_list(dir: &Path) -> String {
+        let output = git_output(dir, &["worktree", "list", "--porcelain"]);
+        assert!(
+            output.status.success(),
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
     }
 
     #[tokio::test]
@@ -3127,9 +3304,81 @@ mod tests {
         assert_eq!(removed.len(), 1);
         assert!(wt1.exists(), "active worktree should NOT be removed");
         assert!(!wt2.exists(), "orphaned worktree should be removed");
+        let listed = git_worktree_list(repo_dir.path());
+        assert!(listed.contains(wt1.to_string_lossy().as_ref()));
+        assert!(!listed.contains(wt2.to_string_lossy().as_ref()));
 
         // Clean up
         mgr.remove(repo_dir.path(), &wt1).await.ok();
+    }
+
+    #[tokio::test]
+    async fn gc_leaves_unregistered_directory_under_worktree_base() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let wt_base = tempfile::tempdir().unwrap();
+        let foreign = wt_base.path().join("foreign-worktree");
+        std::fs::create_dir(&foreign).unwrap();
+        init_git_repo(&foreign);
+
+        assert!(
+            !git_worktree_list(repo_dir.path()).contains(foreign.to_string_lossy().as_ref()),
+            "fixture directory must not be registered to this repository"
+        );
+
+        let removed = WorktreeManager::new()
+            .gc_orphaned(repo_dir.path(), wt_base.path(), &[])
+            .await;
+
+        assert!(removed.is_empty());
+        assert!(foreign.exists(), "GC must leave unregistered paths alone");
+        assert!(
+            git_output(&foreign, &["rev-parse", "--is-inside-work-tree"])
+                .status
+                .success(),
+            "the foreign checkout must remain usable"
+        );
+        assert!(
+            !git_worktree_list(repo_dir.path()).contains(foreign.to_string_lossy().as_ref()),
+            "foreign path must remain absent from this repository's registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_unlocks_and_prunes_missing_initializing_registration() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let wt_base = tempfile::tempdir().unwrap();
+        let stale = wt_base.path().join("initializing-worktree");
+        let mgr = WorktreeManager::new();
+        mgr.provision(repo_dir.path(), "branch-initializing", &stale, "main")
+            .await
+            .unwrap();
+        assert!(git_output(
+            repo_dir.path(),
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "initializing",
+                stale.to_string_lossy().as_ref(),
+            ],
+        )
+        .status
+        .success());
+        std::fs::remove_dir_all(&stale).unwrap();
+
+        let before = git_worktree_list(repo_dir.path());
+        assert!(before.contains(stale.to_string_lossy().as_ref()));
+        assert!(before.contains("locked initializing"));
+
+        mgr.gc_orphaned(repo_dir.path(), wt_base.path(), &[]).await;
+
+        assert!(!stale.exists());
+        assert!(
+            !git_worktree_list(repo_dir.path()).contains(stale.to_string_lossy().as_ref()),
+            "unlocked stale registration must be pruned"
+        );
     }
 
     // --- Timeout / reap tests (require Unix shims) ---
@@ -3185,6 +3434,52 @@ mod tests {
             .unwrap()
             .success();
         assert!(!alive, "timed-out git subprocess {pid:?} was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_git_sets_noninteractive_git_environment() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "printf '%s,%s' \"$GIT_TERMINAL_PROMPT\" \"$GIT_OPTIONAL_LOCKS\"",
+        ]);
+
+        let output = run_git(cmd, Duration::from_secs(1), "git environment")
+            .await
+            .expect("command should run");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"0,0");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_without_credentials_fails_fast_with_noninteractive_git() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let shim_dir = tempfile::tempdir().unwrap();
+        let shim = shim_dir.path().join("git-credential-prompt");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nif [ \"$GIT_TERMINAL_PROMPT\" != 0 ] || [ \"$GIT_OPTIONAL_LOCKS\" != 0 ]; then exec sleep 3600; fi\nprintf 'authentication required\\n' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (fetch_timeout, local_timeout) = short_timeouts();
+        let mgr = WorktreeManager::with_config(shim, fetch_timeout, local_timeout);
+        let repo = tempfile::tempdir().unwrap();
+        let worktree = repo.path().join("worktree");
+
+        let started = std::time::Instant::now();
+        let error = mgr
+            .fetch_and_provision(repo.path(), "daemon/test", &worktree, "private")
+            .await
+            .expect_err("credential-less fetch must fail");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.contains("authentication required"), "{error}");
     }
 
     #[cfg(unix)]
@@ -3399,7 +3694,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn gc_orphaned_timeout_falls_through_to_fs_cleanup() {
+    async fn gc_orphaned_timeout_leaves_unregistered_directory() {
         let repo_dir = tempfile::tempdir().unwrap();
         init_git_repo(repo_dir.path());
 
@@ -3407,18 +3702,16 @@ mod tests {
         let orphan = wt_base.path().join("orphan-wt");
         std::fs::create_dir(&orphan).unwrap();
 
-        // Hanging shim — git commands timeout, but fs fallback still works
+        // Hanging shim — GC cannot prove registration, so it must leave the
+        // directory alone rather than falling back to filesystem deletion.
         let shim_dir = tempfile::tempdir().unwrap();
         let shim = create_hanging_shim(shim_dir.path());
         let (ft, lt) = short_timeouts();
         let mgr = WorktreeManager::with_config(shim, ft, lt);
 
         let removed = mgr.gc_orphaned(repo_dir.path(), wt_base.path(), &[]).await;
-        assert!(
-            removed.contains(&orphan.to_string_lossy().to_string()),
-            "orphan should be cleaned up via fs fallback"
-        );
-        assert!(!orphan.exists());
+        assert!(removed.is_empty());
+        assert!(orphan.exists());
     }
 
     #[tokio::test]

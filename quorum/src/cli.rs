@@ -524,7 +524,8 @@ pub enum Command {
         /// Comma-separated tool allowlist for spawned agents (overrides built-in default).
         #[arg(long)]
         allowed_tools: Option<String>,
-        /// Directory for per-agent session logs (stream.jsonl, transcript.md, meta.json).
+        /// Directory for daemon and per-agent logs. Daemon messages append to serve.log,
+        /// rotating at 1 MiB and retaining the active file plus two prior files.
         /// Defaults to {quorum_home}/logs when omitted.
         #[arg(long)]
         log_dir: Option<String>,
@@ -585,7 +586,7 @@ pub enum Command {
     /// Performance report: model × effort aggregates over terminal tasks.
     /// Read-only, no mutations.
     Perf {
-        /// Cut dimension: `complexity` or `reviewer`.
+        /// Cut dimension: `complexity`, `reviewer`, or `risk-flag`.
         #[arg(long)]
         by: Option<String>,
         /// Include historical tasks from before the analytics rollout boundary.

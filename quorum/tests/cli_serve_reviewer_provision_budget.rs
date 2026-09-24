@@ -1,9 +1,10 @@
 //! Reviewer provisioning budget regressions.
 //!
-//! Every failure that happens after a reviewer identity and worktree exist must
-//! burn the durable `reviewer_provision_attempts` budget and park at the cap;
-//! a generated child whose graph plan is stale must be held instead, without
-//! ever allocating one. Split from `cli_serve_review_only_orphan.rs` only to
+//! Every real failure that happens after a reviewer identity and worktree exist
+//! must burn the durable `reviewer_provision_attempts` budget and park at the
+//! cap. A fetched branch advancing past stale PR metadata is synchronization,
+//! not failure, and a generated child whose graph plan is stale is held without
+//! allocating a reviewer. Split from `cli_serve_review_only_orphan.rs` only to
 //! keep each test binary inside the preflight per-binary time budget.
 //!
 //! Asserts DB state (attempts rows, task status/refs), not just console lines.
@@ -146,8 +147,11 @@ if [ "$cmd" = "pr list" ]; then
 elif [ "$cmd" = "pr view" ]; then
   pr="$3"
   branch="daemon/origworker-t1"
-  sha="$(git -C "$QUORUM_TEST_REPO" ls-remote origin "refs/heads/$branch" | awk '{print $1}')"
-  if [ -z "$sha" ]; then sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"; fi
+  sha="${QUORUM_TEST_GH_SHA:-}"
+  if [ -z "$sha" ]; then
+    sha="$(git -C "$QUORUM_TEST_REPO" ls-remote origin "refs/heads/$branch" | awk '{print $1}')"
+    if [ -z "$sha" ]; then sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"; fi
+  fi
   printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
@@ -284,6 +288,7 @@ fn seed_in_review_task(home: &std::path::Path, author: &str, pr: i64) -> i64 {
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
+            risk_flags: vec![],
         }],
         "test:v2",
         now,
@@ -680,6 +685,99 @@ fn persistent_reviewer_spawn_failure_stops_after_provision_budget() {
     let parked = get_task(home.path(), task_id);
     assert_eq!(parked.status, "failed", "task was not parked");
     assert_eq!(parked.reviewer, None);
+    drop(handle);
+}
+
+/// PR #135 incident: GitHub's PR metadata briefly repeated the previous head
+/// while a fresh fetch already observed the new branch tip. That disagreement
+/// invalidates the gate; it is not three independent reviewer provision
+/// failures and must never consume the per-head strike budget.
+#[test]
+fn fetched_newer_head_invalidates_stale_gate_without_provision_strike() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "OrigWorker";
+    let task_id = seed_in_review_task(home.path(), author, 42);
+    create_author_branch(repo_dir.path(), author, task_id);
+    record_closed_run(home.path(), task_id, author, "worker");
+    let names = write_named_pool(home.path(), &["Reviewer".into()]);
+    let repo = repo_dir.path().to_string_lossy();
+    let stale_head = String::from_utf8(
+        Command::new("git")
+            .args(["-C", &repo, "rev-parse", "daemon/origworker-t1"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    Command::new("git")
+        .args(["-C", &repo, "checkout", "daemon/origworker-t1"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &repo, "commit", "--allow-empty", "-m", "new head"])
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["-C", &repo, "checkout", "main"])
+        .status()
+        .unwrap();
+
+    let mut handle = ServeHandle::start_with_agent_bin_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+        &cargo_bin("fake-agent"),
+        &[("QUORUM_TEST_GH_SHA", stale_head.as_str())],
+    );
+    assert!(
+        handle.wait_for("without charging a reviewer provision strike", 30),
+        "stale API/fetched-head disagreement was not classified as synchronization: {:?}",
+        handle.lines
+    );
+
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    let attempts: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM reviewer_provision_attempts WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempts, 0, "head movement must not consume a strike");
+    let reviewer_runs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE task_id=?1 AND role='reviewer'",
+            [task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        reviewer_runs, 0,
+        "no reviewer process may start on a stale gate"
+    );
+    assert!(
+        quorum_core::pr_targets::get(&conn, task_id, 42)
+            .unwrap()
+            .is_none(),
+        "the disproven durable PR target must be invalidated"
+    );
+    assert_eq!(get_task(home.path(), task_id).status, "in-review");
     drop(handle);
 }
 

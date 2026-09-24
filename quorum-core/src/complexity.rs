@@ -186,6 +186,29 @@ mod tests {
                 "complexity rubric must not use size proxy {proxy}: {text}"
             );
         }
+        for (_, surface_phrase) in crate::risk::RUBRIC {
+            assert!(
+                !text.contains(surface_phrase),
+                "complexity rubric must not use risk surface phrase {surface_phrase}: {text}"
+            );
+        }
+
+        let risk_text = crate::risk::rubric_lines();
+        for reasoning_language in [
+            "meaningful reasoning choice",
+            "established pattern",
+            "implementation path",
+            "design choices",
+            "multiple invariants",
+            "failure modes",
+            "architectural boundary",
+            "novel interface tradeoffs",
+        ] {
+            assert!(
+                !risk_text.contains(reasoning_language),
+                "risk rubric must not use reasoning-difficulty language {reasoning_language}: {risk_text}"
+            );
+        }
     }
 
     #[test]
