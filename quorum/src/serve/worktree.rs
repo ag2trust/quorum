@@ -180,7 +180,9 @@ async fn run_git_with_limit(
     pipe_limit: usize,
     label: &str,
 ) -> Result<std::process::Output, String> {
-    cmd.kill_on_drop(true)
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|error| format!("{label}: {error}"))?;
@@ -282,7 +284,12 @@ async fn run_git_with_input(
 ) -> Result<std::process::Output, String> {
     tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
-        cmd.kill_on_drop(true).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = cmd.spawn().map_err(|e| format!("{label}: {e}"))?;
         let stdout = child.stdout.take().ok_or_else(|| format!("{label}: stdout unavailable"))?;
         let stderr = child.stderr.take().ok_or_else(|| format!("{label}: stderr unavailable"))?;
@@ -3185,6 +3192,52 @@ mod tests {
             .unwrap()
             .success();
         assert!(!alive, "timed-out git subprocess {pid:?} was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_git_sets_noninteractive_git_environment() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "printf '%s,%s' \"$GIT_TERMINAL_PROMPT\" \"$GIT_OPTIONAL_LOCKS\"",
+        ]);
+
+        let output = run_git(cmd, Duration::from_secs(1), "git environment")
+            .await
+            .expect("command should run");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"0,0");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_without_credentials_fails_fast_with_noninteractive_git() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let shim_dir = tempfile::tempdir().unwrap();
+        let shim = shim_dir.path().join("git-credential-prompt");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nif [ \"$GIT_TERMINAL_PROMPT\" != 0 ] || [ \"$GIT_OPTIONAL_LOCKS\" != 0 ]; then exec sleep 3600; fi\nprintf 'authentication required\\n' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (fetch_timeout, local_timeout) = short_timeouts();
+        let mgr = WorktreeManager::with_config(shim, fetch_timeout, local_timeout);
+        let repo = tempfile::tempdir().unwrap();
+        let worktree = repo.path().join("worktree");
+
+        let started = std::time::Instant::now();
+        let error = mgr
+            .fetch_and_provision(repo.path(), "daemon/test", &worktree, "private")
+            .await
+            .expect_err("credential-less fetch must fail");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.contains("authentication required"), "{error}");
     }
 
     #[cfg(unix)]
