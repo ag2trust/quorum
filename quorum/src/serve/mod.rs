@@ -381,7 +381,13 @@ fn classifier_assignment_request(
 }
 
 struct PoisonTracker {
-    strikes: HashMap<i64, u32>,
+    strikes: HashMap<i64, PoisonState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PoisonState {
+    strikes: u32,
+    retry_generation: i64,
 }
 
 struct ClaimSkipLogLimiter {
@@ -424,23 +430,53 @@ impl PoisonTracker {
     }
 
     fn record_strike(&mut self, task_id: i64) -> u32 {
-        let count = self.strikes.entry(task_id).or_insert(0);
-        *count += 1;
-        *count
+        let state = self.strikes.entry(task_id).or_insert(PoisonState {
+            strikes: 0,
+            retry_generation: 0,
+        });
+        state.strikes += 1;
+        state.strikes
     }
 
     fn clear(&mut self, task_id: i64) {
         self.strikes.remove(&task_id);
     }
 
-    #[cfg(test)]
+    /// Consume a newer durable owner retry exactly once. The state remains at
+    /// zero with its new generation so a subsequent post-spawn zero-output
+    /// failure belongs to this fresh retry budget rather than an old one.
+    fn consume_retry_generation(&mut self, task_id: i64, retry_generation: i64) -> bool {
+        let Some(state) = self.strikes.get_mut(&task_id) else {
+            return false;
+        };
+        if retry_generation <= state.retry_generation {
+            return false;
+        }
+        state.strikes = 0;
+        state.retry_generation = retry_generation;
+        true
+    }
+
     fn is_poisoned(&self, task_id: i64) -> bool {
-        self.strikes.get(&task_id).copied().unwrap_or(0) >= MAX_POISON_STRIKES
+        self.strikes
+            .get(&task_id)
+            .is_some_and(|state| state.strikes >= MAX_POISON_STRIKES)
     }
 
     #[cfg(test)]
     fn strikes(&self, task_id: i64) -> u32 {
-        self.strikes.get(&task_id).copied().unwrap_or(0)
+        self.strikes
+            .get(&task_id)
+            .map(|state| state.strikes)
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn retry_generation(&self, task_id: i64) -> i64 {
+        self.strikes
+            .get(&task_id)
+            .map(|state| state.retry_generation)
+            .unwrap_or(0)
     }
 }
 
@@ -20815,14 +20851,7 @@ async fn spawn_worker(
     let p = db_path.clone();
 
     let in_flight: Vec<i64> = workers.iter().map(|w| w.task_id).collect();
-    let poisoned: Vec<i64> = poison_tracker
-        .strikes
-        .iter()
-        .filter(|(_, &s)| s >= MAX_POISON_STRIKES)
-        .map(|(&id, _)| id)
-        .collect();
-
-    let ready_task = tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
+    let available = tokio::task::spawn_blocking(move || -> Result<Vec<tasks::Task>> {
         let conn = quorum_core::db::open(&p)?;
         let mut available = tasks::list_implementation_ready_open(&conn)?;
         available.extend(
@@ -20837,27 +20866,36 @@ async fn spawn_worker(
                             && remediation_retry_feedback(task.refs.as_deref()).is_none())
                 }),
         );
-        let found = available.into_iter().find(|t| {
-            if !t.ready || in_flight.contains(&t.id) || poisoned.contains(&t.id) {
-                return false;
-            }
-            if !tasks::classification_is_dispatchable(
-                &t.refs,
-                t.review_only,
-                t.continue_pr,
-                t.terminal_leaf,
-            ) {
-                return false;
-            }
-            if t.review_only {
-                return false;
-            }
-            true
-        });
-        Ok(found)
+        Ok(available)
     })
     .await
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??;
+
+    // The CLI owns retry generation in the same transaction as the restored
+    // task. Reconcile it at every admission attempt, rather than relying on
+    // a transient event, so a daemon that misses the CLI write still observes
+    // the next retry. A stale generation cannot clear a newer strike budget.
+    for candidate in &available {
+        poison_tracker.consume_retry_generation(
+            candidate.id,
+            tasks::poison_retry_generation(candidate.refs.as_deref()),
+        );
+    }
+
+    let ready_task = available.into_iter().find(|t| {
+        if !t.ready || in_flight.contains(&t.id) || poison_tracker.is_poisoned(t.id) {
+            return false;
+        }
+        if !tasks::classification_is_dispatchable(
+            &t.refs,
+            t.review_only,
+            t.continue_pr,
+            t.terminal_leaf,
+        ) {
+            return false;
+        }
+        !t.review_only
+    });
 
     let mut task = match ready_task {
         Some(t) => t,
@@ -35733,6 +35771,37 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         tracker.clear(1);
         assert_eq!(tracker.strikes(1), 0);
         assert_eq!(tracker.strikes(2), 1);
+    }
+
+    #[test]
+    fn poison_tracker_consumes_each_task_retry_generation_once() {
+        let mut tracker = PoisonTracker::new();
+        for _ in 0..MAX_POISON_STRIKES {
+            tracker.record_strike(1);
+            tracker.record_strike(2);
+        }
+        assert!(tracker.is_poisoned(1));
+        assert!(tracker.is_poisoned(2));
+
+        // This is the same admission-time observation a live daemon makes
+        // after the CLI committed task-retry. Only the named task resumes.
+        assert!(tracker.consume_retry_generation(1, 1));
+        assert!(!tracker.is_poisoned(1));
+        assert!(tracker.is_poisoned(2));
+        assert_eq!(tracker.retry_generation(1), 1);
+
+        // A replay of the durable generation cannot erase a fresh poison
+        // budget accrued by the retried task (including post-spawn deaths).
+        for _ in 0..MAX_POISON_STRIKES {
+            tracker.record_strike(1);
+        }
+        assert!(tracker.is_poisoned(1));
+        assert!(!tracker.consume_retry_generation(1, 1));
+        assert!(tracker.is_poisoned(1));
+
+        assert!(tracker.consume_retry_generation(1, 2));
+        assert!(!tracker.is_poisoned(1));
+        assert!(tracker.is_poisoned(2));
     }
 
     #[test]

@@ -101,6 +101,17 @@ impl ServeHandle {
         names: &std::path::Path,
         agent_bin: &str,
     ) -> Self {
+        Self::start_with_agent_bin_and_git_shim(home, repo, wt_base, names, agent_bin, None)
+    }
+
+    fn start_with_agent_bin_and_git_shim(
+        home: &std::path::Path,
+        repo: &std::path::Path,
+        wt_base: &std::path::Path,
+        names: &std::path::Path,
+        agent_bin: &str,
+        git_shim: Option<&std::path::Path>,
+    ) -> Self {
         let sentinel = tempfile::tempdir().unwrap();
         let sentinel_path = sentinel.path().to_string_lossy().to_string();
         let gh_shim = tempfile::tempdir().unwrap();
@@ -146,11 +157,13 @@ fi
         )
         .unwrap();
         std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let path = format!(
-            "{}:{}",
-            gh_shim.path().display(),
-            env::var("PATH").unwrap_or_default()
-        );
+        let mut path_parts = Vec::new();
+        if let Some(git_shim) = git_shim {
+            path_parts.push(git_shim.display().to_string());
+        }
+        path_parts.push(gh_shim.path().display().to_string());
+        path_parts.push(env::var("PATH").unwrap_or_default());
+        let path = path_parts.join(":");
         let mut child = common::test_daemon_command(cargo_bin("quorum"))
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
@@ -317,6 +330,21 @@ impl TestEnv {
             self.wt_base.path(),
             &self.names_file,
             bin,
+        )
+    }
+
+    fn start_serve_with_bin_and_git_shim(
+        &self,
+        bin: &str,
+        git_shim: &std::path::Path,
+    ) -> ServeHandle {
+        ServeHandle::start_with_agent_bin_and_git_shim(
+            self.home.path(),
+            self.repo_dir.path(),
+            self.wt_base.path(),
+            &self.names_file,
+            bin,
+            Some(git_shim),
         )
     }
 
@@ -682,6 +710,209 @@ fn explicit_retry_of_parked_rework_spawns_replacement_worker() {
         events.iter().any(|event| event.kind == "task_claimed"),
         "replacement claim must be durable: {events:?}"
     );
+    handle.sigkill();
+}
+
+/// Task #811: a daemon-local zero-output poison budget must consume the
+/// durable task-retry generation without a restart. The switchable agent
+/// first dies after accepting each prompt, then delegates to fake-agent after
+/// the public retry so the same daemon proves a fresh provisioning attempt.
+#[cfg(unix)]
+#[test]
+fn task_retry_reopens_live_zero_output_poison_budget_once() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = TestEnv::new();
+    seed_task(env.home.path(), "Live poison retry");
+    let task_id = 1;
+    let retry_ready = env.home.path().join("retry-ready");
+    let agent = env.home.path().join("switchable-zero-output-agent.sh");
+    let fake_agent = cargo_bin("fake-agent");
+    std::fs::write(
+        &agent,
+        format!(
+            "#!/bin/sh\n\
+             if [ -f '{}' ]; then\n\
+               exec '{}' \"$@\"\n\
+             fi\n\
+             IFS= read -r _turn\n\
+             exit 0\n",
+            retry_ready.display(),
+            fake_agent.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut handle = env.start_serve_with_bin(&agent.to_string_lossy());
+    assert!(
+        handle.wait_for(&format!("PARKED: task #{task_id}"), 30),
+        "three zero-output worker exits did not park the task: {:?}",
+        handle.lines
+    );
+    let parked = env.task(task_id);
+    assert_eq!(parked.status, "failed");
+    let claims_before_retry = env
+        .events_for_task(task_id)
+        .into_iter()
+        .filter(|event| event.kind == "task_claimed")
+        .count();
+    assert_eq!(
+        claims_before_retry, 3,
+        "the three-strike task must stop receiving automatic attempts"
+    );
+
+    // Let several live ticks pass: absent explicit retry, the poisoned id is
+    // still filtered before claim and cannot loop.
+    std::thread::sleep(Duration::from_millis(750));
+    assert_eq!(
+        env.events_for_task(task_id)
+            .into_iter()
+            .filter(|event| event.kind == "task_claimed")
+            .count(),
+        claims_before_retry,
+        "a parked poison budget must remain suppressed without owner retry"
+    );
+
+    let retry = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", env.home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "task-retry",
+            "--task-id",
+            &task_id.to_string(),
+            "--by",
+            "operator",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        retry.status.success(),
+        "task-retry failed: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert_eq!(
+        quorum_core::tasks::poison_retry_generation(env.task(task_id).refs.as_deref()),
+        1,
+        "the successful public retry must durably mint one generation"
+    );
+
+    std::fs::write(&retry_ready, b"ready\n").unwrap();
+    assert!(
+        handle.wait_for(&format!("for task #{task_id}"), 20),
+        "the same daemon did not consume retry generation and re-provision: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("worktree provisioned", 20),
+        "retried task did not receive a fresh provisioning attempt: {:?}",
+        handle.lines
+    );
+    assert_eq!(
+        env.events_for_task(task_id)
+            .into_iter()
+            .filter(|event| event.kind == "task_claimed")
+            .count(),
+        claims_before_retry + 1,
+        "one retry generation admits one fresh claim; stale evidence cannot loop"
+    );
+
+    handle.sigkill();
+}
+
+/// The same retry-generation admission applies when all three zero-output
+/// strikes occur before a worker process exists: a provisioning failure must
+/// park, stay suppressed, and resume only after the public owner retry.
+#[cfg(unix)]
+#[test]
+fn task_retry_reopens_live_provisioning_poison_budget_once() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = TestEnv::new();
+    seed_task(env.home.path(), "Live provisioning poison retry");
+    let task_id = 1;
+    let retry_ready = env.home.path().join("provision-retry-ready");
+    let git_shim_dir = tempfile::tempdir().unwrap();
+    let git_shim = git_shim_dir.path().join("git");
+    let real_git = String::from_utf8(Command::new("which").arg("git").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    std::fs::write(
+        &git_shim,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = -C ] && [ \"$3\" = worktree ] && [ \"$4\" = add ] && [ ! -f '{}' ]; then\n\
+               echo 'intentional worktree provisioning failure' >&2\n\
+               exit 1\n\
+             fi\n\
+             exec '{}' \"$@\"\n",
+            retry_ready.display(),
+            real_git,
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&git_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let fake_agent = cargo_bin("fake-agent");
+    let mut handle =
+        env.start_serve_with_bin_and_git_shim(&fake_agent.to_string_lossy(), git_shim_dir.path());
+    assert!(
+        handle.wait_for(&format!("PARKED: task #{task_id}"), 30),
+        "three provisioning failures did not park the task: {:?}",
+        handle.lines
+    );
+    assert_eq!(env.task(task_id).status, "failed");
+    let claims_before_retry = env
+        .events_for_task(task_id)
+        .into_iter()
+        .filter(|event| event.kind == "task_claimed")
+        .count();
+    assert_eq!(claims_before_retry, 3);
+
+    std::thread::sleep(Duration::from_millis(750));
+    assert_eq!(
+        env.events_for_task(task_id)
+            .into_iter()
+            .filter(|event| event.kind == "task_claimed")
+            .count(),
+        claims_before_retry,
+        "a three-strike provisioning failure must stay suppressed without retry"
+    );
+
+    let retry = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", env.home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "task-retry",
+            "--task-id",
+            &task_id.to_string(),
+            "--by",
+            "operator",
+        ])
+        .output()
+        .unwrap();
+    assert!(retry.status.success());
+    std::fs::write(&retry_ready, b"ready\n").unwrap();
+
+    assert!(
+        handle.wait_for(&format!("for task #{task_id}"), 20),
+        "the live daemon did not reattempt provisioning after task-retry: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("worktree provisioned", 20),
+        "retried provisioning attempt did not succeed: {:?}",
+        handle.lines
+    );
+    assert_eq!(
+        env.events_for_task(task_id)
+            .into_iter()
+            .filter(|event| event.kind == "task_claimed")
+            .count(),
+        claims_before_retry + 1
+    );
+
     handle.sigkill();
 }
 

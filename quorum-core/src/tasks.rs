@@ -37,6 +37,10 @@ pub const MAX_RECOVERY_ATTEMPTS: i64 = 3;
 pub const PARKED_REF: &str = "daemon_parked";
 pub const PARKED_REASON_REF: &str = "daemon_parked_reason";
 pub const PARKED_RESUME_STATUS_REF: &str = "daemon_resume_status";
+/// Monotonic, daemon-owned generation incremented by each successful explicit
+/// `task-retry`. A live daemon consumes a newer generation to discard only
+/// the matching task's in-memory zero-output poison budget.
+pub const POISON_RETRY_GENERATION_REF: &str = "poison_retry_generation";
 /// Durable "the dependency this park names cannot ever satisfy" bit (#473).
 /// Only the dependency-sweep path sets it; every other park path clears it so
 /// status's BLOCKED section renders no false unsatisfiable rows.
@@ -93,6 +97,44 @@ pub const MERGE_COMMIT_SHA_REF: &str = "merge_commit_sha";
 pub const DEPENDENCY_BASE_WAIT_ATTEMPTS_REF: &str = "dependency_base_wait_attempts";
 pub const DEPENDENCY_BASE_WAIT_REASON_REF: &str = "dependency_base_wait_reason";
 pub const MAX_DEPENDENCY_BASE_WAIT_ATTEMPTS: i64 = 3;
+
+/// Return the durable poison-retry generation encoded in task refs. Missing
+/// and malformed values deliberately read as the legacy generation zero: a
+/// malformed external edit can never advance a live daemon's poison budget.
+pub fn poison_retry_generation(refs: Option<&str>) -> i64 {
+    refs.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|refs| refs.get(POISON_RETRY_GENERATION_REF).cloned())
+        .and_then(|value| value.as_i64())
+        .filter(|generation| *generation >= 0)
+        .unwrap_or(0)
+}
+
+fn next_poison_retry_generation(refs: &str) -> Result<i64> {
+    let value: serde_json::Value = serde_json::from_str(refs).map_err(|error| {
+        QuorumError::Io(format!(
+            "invalid task refs while advancing {POISON_RETRY_GENERATION_REF}: {error}"
+        ))
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        QuorumError::Io(format!(
+            "invalid task refs while advancing {POISON_RETRY_GENERATION_REF}: expected object"
+        ))
+    })?;
+    let current = match object.get(POISON_RETRY_GENERATION_REF) {
+        None => 0,
+        Some(value) => value
+            .as_i64()
+            .filter(|generation| *generation >= 0)
+            .ok_or_else(|| {
+                QuorumError::Io(format!(
+                    "invalid daemon-owned {POISON_RETRY_GENERATION_REF}"
+                ))
+            })?,
+    };
+    current
+        .checked_add(1)
+        .ok_or_else(|| QuorumError::Io(format!("{POISON_RETRY_GENERATION_REF} overflow")))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyMergeCommit {
@@ -588,6 +630,11 @@ pub fn validate_creator_refs(refs_json: Option<&str>) -> Result<()> {
             "refs key '{MERGE_RETRY_REF}' is daemon-owned; use task-retry"
         )));
     }
+    if object.contains_key(POISON_RETRY_GENERATION_REF) {
+        return Err(QuorumError::Usage(format!(
+            "refs key '{POISON_RETRY_GENERATION_REF}' is daemon-owned; use task-retry"
+        )));
+    }
     Ok(())
 }
 
@@ -644,7 +691,10 @@ fn preserve_protected_refs(
             let runner_state =
                 preserve_runner_state && (key.starts_with("runner_") || key.starts_with("codex_"));
             let recovery_provenance = preserve_recovery_provenance
-                && matches!(key.as_str(), "source_task" | MERGE_COMMIT_SHA_REF);
+                && matches!(
+                    key.as_str(),
+                    "source_task" | MERGE_COMMIT_SHA_REF | POISON_RETRY_GENERATION_REF
+                );
             if classifier_or_pr || runner_state || recovery_provenance {
                 next_map.insert(key, value);
             }
@@ -5031,6 +5081,21 @@ pub fn retry_parked(
             )));
         }
     }
+    // A successful owner retry advances a durable generation in the exact
+    // transaction that restores the task. The daemon uses this value only to
+    // consume its own poison budget; stale retry events, timestamps, and task
+    // edits cannot manufacture a newer generation.
+    let poison_retry_generation = {
+        let refs: String =
+            tx.query_row("SELECT refs FROM tasks WHERE id=?1", params![id], |row| {
+                row.get(0)
+            })?;
+        if reset_recovery_budget {
+            next_poison_retry_generation(&refs)?
+        } else {
+            poison_retry_generation(Some(&refs))
+        }
+    };
     if policy_parked {
         // Retry of a policy park is a request to estimate remaining work.  Keep
         // the durable park/resume context but make it a classifier candidate.
@@ -5040,21 +5105,24 @@ pub fn retry_parked(
         // leave a stale `true` here (policy retry keeps status='failed').
         tx.execute(
             "UPDATE tasks
-             SET refs=json_remove(
-                     refs,
-                     '$.cx_est',
-                     '$.cx_size',
-                     '$.cx_size_reason',
-                     '$.cx_ready',
-                     '$.cx_not_ready_reason',
-                     '$.cx_by',
-                     '$.cx_dup_of',
-                     '$.daemon_parked_unsatisfiable'
+             SET refs=json_set(
+                     json_remove(
+                         refs,
+                         '$.cx_est',
+                         '$.cx_size',
+                         '$.cx_size_reason',
+                         '$.cx_ready',
+                         '$.cx_not_ready_reason',
+                         '$.cx_by',
+                         '$.cx_dup_of',
+                         '$.daemon_parked_unsatisfiable'
+                     ),
+                     '$.poison_retry_generation', ?4
                  ),
                  recovery_attempts=CASE WHEN ?3 THEN 0 ELSE recovery_attempts END,
                  updated_at=?2
              WHERE id=?1",
-            params![id, now, reset_recovery_budget],
+            params![id, now, reset_recovery_budget, poison_retry_generation],
         )?;
         crate::events::emit(
             &tx,
@@ -5172,62 +5240,65 @@ pub fn retry_parked(
              author=CASE WHEN ?6 THEN NULL ELSE author END,
              continue_pr=CASE WHEN ?7 THEN NULL ELSE continue_pr END,
              recovery_attempts=CASE WHEN ?5 THEN 0 ELSE recovery_attempts END,
-             refs=CASE
-                  WHEN ?6
-                  THEN json_remove(
-                      refs,
-                      '$.daemon_parked',
-                      '$.daemon_parked_reason',
-                      '$.daemon_parked_unsatisfiable',
-                      '$.daemon_resume_status',
-                      '$.daemon_rework_retry_requested',
-                      '$.daemon_parked_head_check',
-                      '$.daemon_merge_retry',
-                      '$.daemon_publication',
-                      '$.daemon_publication_failure_kind',
-                      '$.runner_continuation'
-                  )
-                  WHEN ?4='rework'
-                  THEN json_set(
-                      json_remove(
-                          refs,
-                          '$.daemon_parked',
-                          '$.daemon_parked_reason',
-                          '$.daemon_parked_unsatisfiable',
-                          '$.daemon_resume_status',
-                          '$.daemon_parked_head_check',
-                          '$.daemon_publication_failure_kind'
-                      ),
-                      '$.daemon_rework_retry_requested',
-                      json('true')
-                  )
-                  WHEN ?4='merging'
-                  THEN json_set(
-                      json_remove(
-                          refs,
-                          '$.daemon_parked',
-                          '$.daemon_parked_reason',
-                          '$.daemon_parked_unsatisfiable',
-                          '$.daemon_resume_status',
-                          '$.daemon_rework_retry_requested',
-                          '$.daemon_parked_head_check',
-                          '$.daemon_publication_failure_kind'
-                      ),
-                      '$.daemon_merge_retry',
-                      'requested'
-                  )
-                  ELSE json_remove(
-                      refs,
-                      '$.daemon_parked',
-                      '$.daemon_parked_reason',
-                      '$.daemon_parked_unsatisfiable',
-                      '$.daemon_resume_status',
-                      '$.daemon_rework_retry_requested',
-                      '$.daemon_parked_head_check',
-                      '$.daemon_merge_retry',
-                      '$.daemon_publication_failure_kind'
-                  )
-             END,
+             refs=json_set(
+                 CASE
+                     WHEN ?6
+                     THEN json_remove(
+                         refs,
+                         '$.daemon_parked',
+                         '$.daemon_parked_reason',
+                         '$.daemon_parked_unsatisfiable',
+                         '$.daemon_resume_status',
+                         '$.daemon_rework_retry_requested',
+                         '$.daemon_parked_head_check',
+                         '$.daemon_merge_retry',
+                         '$.daemon_publication',
+                         '$.daemon_publication_failure_kind',
+                         '$.runner_continuation'
+                     )
+                     WHEN ?4='rework'
+                     THEN json_set(
+                         json_remove(
+                             refs,
+                             '$.daemon_parked',
+                             '$.daemon_parked_reason',
+                             '$.daemon_parked_unsatisfiable',
+                             '$.daemon_resume_status',
+                             '$.daemon_parked_head_check',
+                             '$.daemon_publication_failure_kind'
+                         ),
+                         '$.daemon_rework_retry_requested',
+                         json('true')
+                     )
+                     WHEN ?4='merging'
+                     THEN json_set(
+                         json_remove(
+                             refs,
+                             '$.daemon_parked',
+                             '$.daemon_parked_reason',
+                             '$.daemon_parked_unsatisfiable',
+                             '$.daemon_resume_status',
+                             '$.daemon_rework_retry_requested',
+                             '$.daemon_parked_head_check',
+                             '$.daemon_publication_failure_kind'
+                         ),
+                         '$.daemon_merge_retry',
+                         'requested'
+                     )
+                     ELSE json_remove(
+                         refs,
+                         '$.daemon_parked',
+                         '$.daemon_parked_reason',
+                         '$.daemon_parked_unsatisfiable',
+                         '$.daemon_resume_status',
+                         '$.daemon_rework_retry_requested',
+                         '$.daemon_parked_head_check',
+                         '$.daemon_merge_retry',
+                         '$.daemon_publication_failure_kind'
+                     )
+                 END,
+                 '$.poison_retry_generation', ?8
+             ),
              updated_at=?3
          WHERE id=?1 AND status='failed'
            AND json_valid(refs)
@@ -5241,6 +5312,7 @@ pub fn retry_parked(
             reset_recovery_budget,
             reset_publication,
             retire_closed_continuation,
+            poison_retry_generation,
         ],
     )?;
     if updated == 0 {
@@ -5525,6 +5597,8 @@ pub fn retry_provider_blocked(
         tx.commit()?;
         return Ok(None);
     }
+    let poison_retry_generation = next_poison_retry_generation(&refs_raw)?;
+    refs[POISON_RETRY_GENERATION_REF] = serde_json::json!(poison_retry_generation);
     let next_status = if status == "working" {
         "open"
     } else {
@@ -10351,6 +10425,9 @@ mod tests {
         let retry_err =
             validate_creator_refs(Some(r#"{"daemon_merge_retry":"requested"}"#)).unwrap_err();
         assert!(format!("{retry_err}").contains("task-retry"));
+        let poison_retry_err =
+            validate_creator_refs(Some(r#"{"poison_retry_generation":1}"#)).unwrap_err();
+        assert!(format!("{poison_retry_err}").contains("task-retry"));
         assert!(validate_creator_refs(Some(r#"{"ticket":"ABC","repo":"o/r"}"#)).is_ok());
     }
 
@@ -10377,7 +10454,7 @@ mod tests {
             None,
             0,
             None,
-            Some(r#"{"cx_est":5,"cx_by":"classifier:v1","pr":41,"merge_commit_sha":"trusted"}"#),
+            Some(r#"{"cx_est":5,"cx_by":"classifier:v1","pr":41,"merge_commit_sha":"trusted","poison_retry_generation":1}"#),
             None,
             None,
             1000,
@@ -10396,6 +10473,7 @@ mod tests {
         assert_eq!(refs["cx_est"], 5);
         assert_eq!(refs["cx_by"], "classifier:v1");
         assert_eq!(refs[MERGE_COMMIT_SHA_REF], "trusted");
+        assert_eq!(refs[POISON_RETRY_GENERATION_REF], 1);
     }
 
     #[test]
@@ -11429,6 +11507,7 @@ mod tests {
             serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs["pr"], 419);
         assert!(refs.get("daemon_parked").is_none());
+        assert_eq!(refs[POISON_RETRY_GENERATION_REF], 1);
     }
 
     #[test]
@@ -12690,6 +12769,7 @@ mod tests {
         assert_eq!(refs["keep"], "yes");
         assert_eq!(refs["pr"], 419);
         assert_eq!(refs["codex_thread_id"], "thread-old");
+        assert_eq!(refs[POISON_RETRY_GENERATION_REF], 1);
         assert!(crate::runner_state::requested_retry(&refs, "codex").is_some());
         assert!(refs.get("codex_retry_requested").is_none());
         assert_eq!(retried.rework_round, 2);
