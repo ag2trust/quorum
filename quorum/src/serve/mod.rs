@@ -4457,6 +4457,65 @@ fn runner_retry_turn(refs: Option<&str>) -> Option<PendingTurn> {
     (turn.provider == resolved.to_string()).then_some(turn)
 }
 
+/// A Grok provider block is durable authority that its exact pending turn
+/// must be retried. A Done row written before its worker was reaped cannot
+/// override that authority during late-completion recovery: doing so would
+/// publish a stale delivery and enter review instead of resuming the exact
+/// provider session. Re-read and consume that row under one write lock so an
+/// explicit `task-retry` cannot race this disposition.
+async fn consume_late_grok_provider_blocked_done(
+    db_path: &Path,
+    mailbox_id: i64,
+    row: &mailbox::MailboxRow,
+) -> Result<bool> {
+    let Some(task_id) = row.task_id else {
+        return Ok(false);
+    };
+    if row.kind != mailbox::MailboxKind::Done || row.verdict.is_some() {
+        return Ok(false);
+    }
+    let path = db_path.to_path_buf();
+    let agent = row.agent.clone();
+    let now = now_unix();
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        let refs: Option<Option<String>> = tx
+            .query_row(
+                "SELECT t.refs
+                 FROM mailbox m
+                 JOIN tasks t ON t.id=m.task_id
+                 WHERE m.id=?1 AND m.consumed_at IS NULL AND m.kind='done'
+                   AND m.verdict IS NULL AND m.agent=?2 AND m.task_id=?3
+                   AND t.status IN ('working','rework') AND t.assignee=m.agent",
+                rusqlite::params![mailbox_id, agent, task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let provider_blocked = refs
+            .flatten()
+            .as_deref()
+            .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+            .and_then(|refs| runner_state::provider_block(&refs))
+            .is_some_and(|block| block.provider == "grok");
+        if provider_blocked {
+            let consumed = tx.execute(
+                "UPDATE mailbox SET consumed_at=?2 WHERE id=?1 AND consumed_at IS NULL",
+                rusqlite::params![mailbox_id, now],
+            )?;
+            if consumed != 1 {
+                return Err(QuorumError::Io(
+                    "late Grok provider-blocked Done row disappeared before consumption".into(),
+                ));
+            }
+        }
+        tx.commit()?;
+        Ok(provider_blocked)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("late Grok provider-block join: {error}")))?
+}
+
 /// Fold a worker completion that arrived after its slot disappeared. The core
 /// transaction re-reads the exact mailbox row, validates its durable identity,
 /// applies the lifecycle event, and consumes it together.
@@ -4467,6 +4526,9 @@ async fn recover_late_worker_done_atomic(
     published_pr: Option<i64>,
     publication: Option<PublishedCompletion>,
 ) -> Result<bool> {
+    if consume_late_grok_provider_blocked_done(db_path, mailbox_id, row).await? {
+        return Ok(false);
+    }
     let publication_pr = publication.as_ref().map(|publication| publication.pr);
     let (Some(task_id), Some(pr)) = (row.task_id, publication_pr.or(published_pr).or(row.pr))
     else {
@@ -4535,6 +4597,16 @@ async fn recover_late_worker_done_with_publication(
         return Ok(false);
     };
     if row.kind != mailbox::MailboxKind::Done || row.verdict.is_some() {
+        return Ok(false);
+    }
+    // This must run before journal lookup or publication. A checkpoint can
+    // commit after Phase 2 snapshots mailbox rows but before the worker is
+    // cleaned up; after a crash the late row is therefore real but stale.
+    if consume_late_grok_provider_blocked_done(&config.db_path, mailbox_id, row).await? {
+        log(&format!(
+            "late Grok Done from {} for task #{task_id} consumed under its durable provider block",
+            row.agent
+        ));
         return Ok(false);
     }
     let p = config.db_path.clone();
@@ -32493,6 +32565,122 @@ mod tests {
         drop(conn);
         initial.kill_and_reap().await;
         resumed.kill_and_reap().await;
+    }
+
+    /// A Done signal can land after Phase 2 snapshots the mailbox but before
+    /// Phase 4 cleans up a max-turn worker. If the daemon then crashes, startup
+    /// recovery must honor the already-committed checkpoint rather than publish
+    /// that stale signal into review.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_late_done_after_grok_max_turn_checkpoint_stays_provider_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"max_turns_reached\",\"sessionId\":\"grok-late-done-max\"}'",
+        )
+        .await;
+        let branch = format!("daemon/grok-late-done-t{task_id}");
+        slot.branch = branch.clone();
+        slot.remote_branch = branch.clone();
+
+        drain_events(&mut slot, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            wait_for_worker_exit_observation(&mut slot).await,
+            WorkerExitObservation::Exited(_)
+        ));
+        slot.finalize_pre_authoritative_exit_evidence("worker", &CostLimits::default())
+            .await;
+
+        // Phase 2 has already taken its mailbox snapshot. The provider
+        // terminal is checkpointed, then the worker writes Done before Phase
+        // 4 gets its normal cleanup turn and the daemon crashes.
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            assert!(mailbox::poll_unconsumed(&conn).unwrap().is_empty());
+        }
+        let session_id = slot.grok_max_turn_exhaustion().unwrap();
+        checkpoint_grok_max_turn_exhaustion(&db_path, &mut slot, &session_id)
+            .await
+            .unwrap();
+        let late_done = done_row("Internal-grok", Some(task_id), Some(731));
+        let mailbox_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            // Keep the pre-cleanup journal identity that startup recovery
+            // would otherwise use to publish the Done row. Its worktree is
+            // intentionally absent: reaching publication would be a test
+            // failure rather than an accidental network/model call.
+            journal::upsert(
+                &mut conn,
+                &JournalEntry {
+                    agent: "Internal-grok".into(),
+                    role: "worker".into(),
+                    task_id: Some(task_id),
+                    session_id: "grok-late-done-worker".into(),
+                    worktree: Some(
+                        dir.path()
+                            .join("must-not-publish-late-grok-done")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    branch: Some(branch.clone()),
+                    phase: "working".into(),
+                    cost_tokens: 0,
+                    agent_state: None,
+                    cost_usd: 0.0,
+                    log_dir: None,
+                    pid: None,
+                    pr: Some(731),
+                    rework_count: 0,
+                    provider: Some("grok".into()),
+                    continuation_id: Some(session_id.clone()),
+                    local_branch: Some(branch),
+                },
+            )
+            .unwrap();
+            mailbox::append(&mut conn, &late_done).unwrap()
+        };
+
+        // Reopening the database through the startup recovery path models a
+        // daemon restart before the max-turn slot cleanup. The checkpoint
+        // consumes the stale row before journal lookup/publication.
+        let config = pre_review_ci_test_config(
+            db_path.clone(),
+            dir.path().join("no-publication-repository"),
+        );
+        recover_late_worker_completions(&config).await.unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "working");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")
+                .unwrap()
+                .id,
+            "grok-late-done-max"
+        );
+        assert!(runner_state::provider_block(&refs).is_some());
+        assert!(!runner_state::retry_requested(&refs));
+        assert!(
+            !task_event_kinds(&db_path, task_id).contains(&"task_in_review".to_string()),
+            "the stale Done row must never apply SignaledDone"
+        );
+        let consumed: bool = conn
+            .query_row(
+                "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+                [mailbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            consumed,
+            "the checkpoint must durably dispose of stale Done"
+        );
+        drop(conn);
+        slot.kill_and_reap().await;
     }
 
     /// Exercise the live Phase 4 order, not just the checkpoint helper. A
