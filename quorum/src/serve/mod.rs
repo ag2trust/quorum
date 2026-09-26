@@ -4298,6 +4298,13 @@ impl SlotState {
         self.proc.worker_request()
     }
 
+    fn grok_max_turn_exhaustion(&self) -> Option<String> {
+        match &self.proc {
+            SlotProcess::Running(proc) => proc.grok_max_turn_exhaustion(),
+            SlotProcess::Failed { .. } | SlotProcess::Dormant { .. } => None,
+        }
+    }
+
     fn continuation_id_for_launch(&self) -> Option<&str> {
         self.proc
             .continuation_id()
@@ -15286,12 +15293,38 @@ async fn tick(
                 continue;
             }
         };
-        let runner_failure = if expected_fallback_currency.is_some() {
+        let max_turn_exhaustion = if expected_fallback_currency.is_some() {
             dead.finalize_pre_authoritative_exit_evidence("worker", &config.limits)
                 .await;
-            dead.classify_pre_authoritative_exit(status)
+            dead.grok_max_turn_exhaustion()
         } else {
             None
+        };
+        let runner_failure = expected_fallback_currency
+            .is_some()
+            .then(|| dead.classify_pre_authoritative_exit(status))
+            .flatten();
+        let max_turn_retry = match max_turn_exhaustion {
+            Some(session_id) => {
+                match checkpoint_grok_max_turn_exhaustion(&db_path, &mut dead, &session_id).await {
+                    Ok(retry) => {
+                        log(&format!(
+                        "Grok worker {} exhausted max turns on task #{} — checkpointed exact session for task-retry",
+                        dead.agent_name, dead.task_id,
+                    ));
+                        Some((session_id, retry))
+                    }
+                    Err(error) => {
+                        log(&format!(
+                        "FATAL: Grok worker {} max-turn checkpoint for task #{} failed; retaining slot: {error}",
+                        dead.agent_name, dead.task_id,
+                    ));
+                        workers.insert(i, dead);
+                        continue;
+                    }
+                }
+            }
+            None => None,
         };
         if let (Some(currency), Some(failure)) =
             (expected_fallback_currency.as_ref(), runner_failure.as_ref())
@@ -15323,19 +15356,28 @@ async fn tick(
             }
         }
         if dead.process_kind().turn_mode() == runner::TurnMode::RespawnPerTurn {
-            let reason = dead
-                .last_error_text
-                .as_deref()
-                .unwrap_or("turn-oriented runner exited before task submission")
-                .to_string();
-            let retry = PendingTurn {
-                provider: dead.process_kind().to_string(),
-                model: dead.model.clone(),
-                effort: dead.effort.clone(),
-                prompt: dead.pending_prompt.clone(),
-                turn_kind: dead.pending_turn_kind.clone(),
-                continuation_id: dead.continuation_id.clone(),
-                requested: false,
+            let (reason, retry) = match max_turn_retry {
+                Some((session_id, retry)) => (
+                    format!(
+                        "Grok max-turn exhaustion checkpointed exact session {session_id}; task-retry must resume it"
+                    ),
+                    retry,
+                ),
+                None => (
+                    dead.last_error_text
+                        .as_deref()
+                        .unwrap_or("turn-oriented runner exited before task submission")
+                        .to_string(),
+                    PendingTurn {
+                        provider: dead.process_kind().to_string(),
+                        model: dead.model.clone(),
+                        effort: dead.effort.clone(),
+                        prompt: dead.pending_prompt.clone(),
+                        turn_kind: dead.pending_turn_kind.clone(),
+                        continuation_id: dead.continuation_id.clone(),
+                        requested: false,
+                    },
+                ),
             };
             match dispose_dead_turn_runner_worker(
                 &db_path,
@@ -18109,6 +18151,26 @@ struct DurableGrokWorkerIdentity {
     assignment_effort: String,
 }
 
+/// Branch identity is already a daemon-owned task-ref field. Bind it to the
+/// terminal handoff rather than letting a later retry select a different
+/// branch for the otherwise exact provider session.
+fn bind_grok_worker_branch(refs: &mut serde_json::Value, branch: &str) -> Result<()> {
+    if branch.is_empty() {
+        return Err(QuorumError::Io(
+            "Grok worker terminal identity is missing its branch".into(),
+        ));
+    }
+    if let Some(recorded) = refs.get("branch").and_then(serde_json::Value::as_str) {
+        if recorded != branch {
+            return Err(QuorumError::Io(
+                "Grok worker terminal branch does not match the durable task branch".into(),
+            ));
+        }
+    }
+    refs["branch"] = serde_json::Value::String(branch.to_string());
+    Ok(())
+}
+
 /// Atomically hand off a fresh Grok worker's terminal session identity.
 ///
 /// Grok issues its identity only at terminal end, so accepting completion first
@@ -18161,6 +18223,7 @@ async fn persist_initial_grok_worker_session(
     let agent = request.agent.clone();
     let model = request.model.clone();
     let effort = request.effort.clone();
+    let branch = slot.remote_branch.clone();
     let pending_turn = request.pending_turn.clone();
     let requested_assignment_id = request.role_assignment_id;
     let requested_responsibility = request.responsibility_key.clone();
@@ -18253,6 +18316,7 @@ async fn persist_initial_grok_worker_session(
             .transpose()
             .map_err(|error| QuorumError::Io(format!("invalid task refs JSON: {error}")))?
             .unwrap_or_else(|| serde_json::json!({}));
+        bind_grok_worker_branch(&mut refs, &branch)?;
         let handoff = InitialWorkerSession {
             task_id,
             role_assignment_id: durable.assignment_id,
@@ -18343,10 +18407,7 @@ async fn persist_grok_worker_continuation(
     let previous_session = slot.continuation_id.clone().ok_or_else(|| {
         QuorumError::Io("Grok resumed worker terminal identity is missing its continuation".into())
     })?;
-    if slot.process_kind() != runner::AgentKind::Grok
-        || slot.pending_turn_kind == "initial"
-        || slot.worker_request().is_some()
-    {
+    if slot.process_kind() != runner::AgentKind::Grok || slot.worker_request().is_some() {
         return Err(QuorumError::Io(
             "Grok terminal identity does not belong to a resumed worker turn".into(),
         ));
@@ -18363,6 +18424,7 @@ async fn persist_grok_worker_continuation(
     let agent = slot.agent_name.clone();
     let model = slot.model.clone();
     let effort = slot.effort.clone();
+    let branch = slot.remote_branch.clone();
     let session_id = session_id.to_string();
 
     tokio::task::spawn_blocking(move || -> Result<()> {
@@ -18450,6 +18512,7 @@ async fn persist_grok_worker_continuation(
             .transpose()
             .map_err(|error| QuorumError::Io(format!("invalid task refs JSON: {error}")))?
             .unwrap_or_else(|| serde_json::json!({}));
+        bind_grok_worker_branch(&mut refs, &branch)?;
         if runner_state::initial_worker_session(&refs).is_none() {
             return Err(QuorumError::Io(
                 "Grok resumed worker is missing its initial durable session handoff".into(),
@@ -18501,6 +18564,35 @@ async fn persist_grok_worker_session(
     } else {
         persist_grok_worker_continuation(db_path, slot, session_id).await
     }
+}
+
+/// Turn Grok's terminal max-turn evidence into a durable, exact retry before
+/// the dead-turn lifecycle classifier can park the worker. A provider-issued
+/// session is the only authority that may make an initial turn resumable, so
+/// persist it first and derive the retry solely from that now-durable slot.
+async fn checkpoint_grok_max_turn_exhaustion(
+    db_path: &Path,
+    slot: &mut SlotState,
+    session_id: &str,
+) -> Result<PendingTurn> {
+    if slot.process_kind() != runner::AgentKind::Grok
+        || slot.worker_request().is_none() && slot.continuation_id.is_none()
+    {
+        return Err(QuorumError::Io(
+            "Grok max-turn exhaustion is missing its exact worker continuation identity".into(),
+        ));
+    }
+    persist_grok_worker_session(db_path, slot, session_id).await?;
+    slot.continuation_id = Some(session_id.to_string());
+    let retry = worker_fallback_pending_turn(slot);
+    if retry.continuation_id.as_deref() != Some(session_id)
+        || !runner_state::pending_turn_is_complete(&retry)
+    {
+        return Err(QuorumError::Io(
+            "Grok max-turn exhaustion did not produce a complete exact retry turn".into(),
+        ));
+    }
+    Ok(retry)
 }
 
 /// Phase 4b disposition for a dead turn-oriented worker.
@@ -31965,6 +32057,248 @@ mod tests {
         assert!(handoff.pending_turn.continuation_id.is_none());
         assert_eq!(handoff.session_id, "grok-session-exact");
         slot.kill_and_reap().await;
+    }
+
+    /// Max-turn exhaustion is a recoverable provider boundary, not a worker
+    /// delivery. The exact terminal session must be durable before the normal
+    /// dead-turn classifier parks it, and each owner-requested retry must use
+    /// that session rather than starting another Grok conversation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_max_turn_exhaustion_checkpoints_exact_session_for_bounded_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, mut initial, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"max_turns_reached\",\"sessionId\":\"grok-max-initial\"}'",
+        )
+        .await;
+        let branch = format!("daemon/internal-grok-t{task_id}");
+        initial.branch = branch.clone();
+        initial.remote_branch = branch.clone();
+
+        drain_events(&mut initial, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            wait_for_worker_exit_observation(&mut initial).await,
+            WorkerExitObservation::Exited(_)
+        ));
+        initial
+            .finalize_pre_authoritative_exit_evidence("worker", &CostLimits::default())
+            .await;
+        let session_id = initial
+            .grok_max_turn_exhaustion()
+            .expect("valid max-turn terminal must retain its Grok session");
+        assert_eq!(session_id, "grok-max-initial");
+        let retry = checkpoint_grok_max_turn_exhaustion(&db_path, &mut initial, &session_id)
+            .await
+            .unwrap();
+        assert_eq!(retry.continuation_id.as_deref(), Some("grok-max-initial"));
+        assert_eq!(retry.turn_kind, "initial");
+        assert_eq!(
+            dispose_dead_turn_runner_worker(
+                &db_path,
+                task_id,
+                &initial.agent_name,
+                "Grok max-turn exhaustion checkpointed exact session",
+                &retry,
+            )
+            .await
+            .unwrap(),
+            tasks::DeadTurnRunnerDisposition::ProviderBlocked
+        );
+
+        // Reopen after the first process is gone: this is the daemon-restart
+        // boundary. The checkpoint still contains the complete initial run,
+        // branch, continuation, and retry identity, and has not entered review.
+        let (assignment_id, responsibility_key) = {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let task = tasks::get(&conn, task_id).unwrap().unwrap();
+            assert_eq!(task.status, "working");
+            let refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            assert_eq!(refs["branch"], branch);
+            let initial_handoff = runner_state::initial_worker_session(&refs).unwrap();
+            assert_eq!(initial_handoff.task_id, task_id);
+            assert_eq!(initial_handoff.agent, "Internal-grok");
+            assert_eq!(initial_handoff.role, "worker");
+            assert_eq!(initial_handoff.provider, "grok");
+            assert_eq!(initial_handoff.runner, "grok");
+            assert_eq!(initial_handoff.model, "grok-4.5");
+            assert_eq!(initial_handoff.effort, "high");
+            assert_eq!(
+                initial_handoff.pending_turn.prompt,
+                "preserve the exact internal initial prompt"
+            );
+            assert_eq!(initial_handoff.session_id, "grok-max-initial");
+            assert_eq!(
+                runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")
+                    .unwrap()
+                    .id,
+                "grok-max-initial"
+            );
+            let staged: PendingTurn =
+                serde_json::from_value(refs[runner_state::RETRY_REF].clone()).unwrap();
+            assert_eq!(staged, retry);
+            assert!(!runner_state::retry_requested(&refs));
+            (
+                initial_handoff.role_assignment_id,
+                initial_handoff.responsibility_key,
+            )
+        };
+
+        let retried = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::retry_provider_blocked(&mut conn, task_id, "owner", now_unix())
+                .unwrap()
+                .expect("task-retry must resume the max-turn checkpoint")
+        };
+        assert_eq!(retried.status, "open");
+        let retry_after_restart = runner_retry_turn(retried.refs.as_deref()).unwrap();
+        assert_eq!(
+            retry_after_restart.continuation_id.as_deref(),
+            Some("grok-max-initial")
+        );
+        assert_eq!(retry_after_restart.prompt, retry.prompt);
+
+        let resumed_args = dir.path().join("resumed-grok-args");
+        let resumed_program = grok_worker_fixture_program(
+            dir.path(),
+            &format!(
+                "printf '%s\\n' \"$@\" > '{}'; printf '%s\\n' '{{\"type\":\"end\",\"stopReason\":\"max_turns_reached\",\"sessionId\":\"grok-max-resumed\"}}'",
+                resumed_args.display(),
+            ),
+        );
+        let retry_agent = "Internal-grok-retry";
+        let (retry_run_id, retry_capability) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::claim(
+                &mut conn,
+                retry_agent,
+                Some(task_id),
+                &[],
+                tasks::DEFAULT_LEASE_TTL_SECS,
+                now_unix(),
+            )
+            .unwrap()
+            .expect("retried task must be claimable exactly once");
+            let run_id = quorum_core::agent_runs::insert_worker_with_assignment(
+                &conn,
+                task_id,
+                retry_agent,
+                &responsibility_key,
+                "grok-4.5",
+                "high",
+                "grok",
+                "grok",
+                Some(assignment_id),
+                now_unix(),
+            )
+            .unwrap();
+            let capability = "internal-grok-retry-capability".to_string();
+            quorum_core::capabilities::issue(
+                &mut conn,
+                &capability,
+                task_id,
+                retry_agent,
+                "worker",
+                now_unix(),
+            )
+            .unwrap();
+            (run_id, capability)
+        };
+        let resumed_proc = runner::RunnerProc::launch(
+            &runner::LaunchRequest {
+                model: "grok-4.5",
+                effort: "high",
+                worktree: &initial.worktree_path,
+                prompt: &retry_after_restart.prompt,
+                environment: &[],
+                mode: runner::LaunchMode::Normal,
+                continuation_id: retry_after_restart.continuation_id.as_deref(),
+            },
+            &runner::AdapterConfig {
+                executable: resumed_program.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut resumed = slot_with_process(resumed_proc);
+        resumed.agent_name = retry_agent.into();
+        resumed.task_id = task_id;
+        resumed.model = "grok-4.5".into();
+        resumed.effort = "high".into();
+        resumed.worktree_path = initial.worktree_path.clone();
+        resumed.branch = branch;
+        resumed.remote_branch = resumed.branch.clone();
+        resumed.draining = true;
+        resumed.agent_run_id = Some(retry_run_id);
+        resumed.cap_run_id = Some(retry_capability);
+        resumed.continuation_id = retry_after_restart.continuation_id.clone();
+        resumed.pending_prompt = retry_after_restart.prompt.clone();
+        resumed.pending_turn_kind = retry_after_restart.turn_kind.clone();
+
+        drain_events(&mut resumed, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            wait_for_worker_exit_observation(&mut resumed).await,
+            WorkerExitObservation::Exited(_)
+        ));
+        resumed
+            .finalize_pre_authoritative_exit_evidence("worker", &CostLimits::default())
+            .await;
+        let resumed_session = resumed.grok_max_turn_exhaustion().unwrap();
+        let second_retry =
+            checkpoint_grok_max_turn_exhaustion(&db_path, &mut resumed, &resumed_session)
+                .await
+                .unwrap();
+        assert_eq!(
+            second_retry.continuation_id.as_deref(),
+            Some("grok-max-resumed")
+        );
+        assert_eq!(
+            dispose_dead_turn_runner_worker(
+                &db_path,
+                task_id,
+                &resumed.agent_name,
+                "Grok max-turn exhaustion checkpointed exact resumed session",
+                &second_retry,
+            )
+            .await
+            .unwrap(),
+            tasks::DeadTurnRunnerDisposition::ProviderBlocked
+        );
+        let resumed_args = std::fs::read_to_string(resumed_args).unwrap();
+        assert!(resumed_args
+            .lines()
+            .collect::<Vec<_>>()
+            .starts_with(&["--resume", "grok-max-initial"]));
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "working");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(runner_state::provider_block(&refs).is_some());
+        assert!(!runner_state::retry_requested(&refs));
+        assert_eq!(
+            runner_state::requested_retry(&refs, "grok"),
+            None,
+            "a second exhaustion must remain parked until another explicit task-retry"
+        );
+        assert_eq!(
+            runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")
+                .unwrap()
+                .id,
+            "grok-max-resumed"
+        );
+        drop(conn);
+        initial.kill_and_reap().await;
+        resumed.kill_and_reap().await;
     }
 
     #[cfg(unix)]
