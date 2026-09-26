@@ -1830,6 +1830,15 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
 
     #[test]
     fn grok_transport_configuration_is_closed_and_validated() {
+        assert_eq!(
+            resolve_grok_adapter(None).unwrap(),
+            GrokResolvedConfig {
+                sandbox: crate::serve::grok_agent::DEFAULT_SANDBOX.into(),
+                permission_mode: crate::serve::grok_agent::DEFAULT_PERMISSION_MODE.into(),
+                max_turns: crate::serve::grok_agent::DEFAULT_MAX_TURNS,
+            }
+        );
+
         let cfg: ServeFileConfig = toml::from_str(
             "[grok]\nsandbox = \"off\"\npermission_mode = \"bypassPermissions\"\nmax_turns = 12\n",
         )
