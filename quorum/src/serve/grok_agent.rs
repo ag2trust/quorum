@@ -34,12 +34,14 @@ pub const SUPPORTED_EFFORTS: &[&str] = &["low", "medium", "high"];
 pub const DEFAULT_SANDBOX: &str = "off";
 pub const EXPLICIT_WORKSPACE_SANDBOX: &str = "workspace";
 pub const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
-pub const DEFAULT_MAX_TURNS: u32 = 64;
+pub const DEFAULT_MAX_TURNS: u32 = 256;
 pub const MAX_CONFIGURED_TURNS: u32 = 256;
 
 const RESTRICTED_SANDBOX: &str = "read-only";
 const RESTRICTED_PERMISSION_MODE: &str = "dontAsk";
 const RESTRICTED_MAX_TURNS: u32 = 8;
+const SUCCESSFUL_STOP_REASON: &str = "EndTurn";
+const MAX_TURNS_REACHED_STOP_REASON: &str = "max_turns_reached";
 const MANAGED_WORKSPACE_SANDBOX: &str = "quorum_managed_workspace";
 const STDOUT_LINE_BYTES: usize = 1024 * 1024;
 const TERMINAL_STDOUT_LINES: usize = 256;
@@ -1126,6 +1128,14 @@ pub struct GrokProc {
     _mcp_config_home: Option<GrokMcpConfigHome>,
 }
 
+/// Provider evidence that a valid Grok session exhausted its configured turn
+/// limit. This is deliberately not a lifecycle decision; its future consumer
+/// must still establish any process-evidence requirements it needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MaxTurnsExhaustion {
+    pub(super) session_id: String,
+}
+
 impl GrokProc {
     pub fn launch(
         request: &LaunchRequest<'_>,
@@ -1361,15 +1371,14 @@ impl GrokProc {
             );
         };
         match value.get("type").and_then(serde_json::Value::as_str) {
-            Some("end")
-                if value
-                    .get("sessionId")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(valid_session_id) =>
-            {
+            Some("end") if successful_end_session_id(&value).is_some() => {
                 FailureObservation::success()
             }
-            Some("end" | "provider.stdout_invalid_utf8" | "provider.stdout_bytes_truncated") => {
+            Some("end") => FailureObservation::classified(
+                FailureDisposition::NonFailover,
+                "Grok terminal did not report the successful stopReason",
+            ),
+            Some("provider.stdout_invalid_utf8" | "provider.stdout_bytes_truncated") => {
                 FailureObservation::classified(
                     FailureDisposition::NonFailover,
                     "Grok terminal protocol was invalid",
@@ -1533,6 +1542,13 @@ impl GrokProc {
         self.pending_terminal.is_some()
             && !self.terminal_rejected
             && self.failures.observed_strict_failure().is_none()
+    }
+
+    #[allow(dead_code)] // consumed by the later checkpoint/resume lifecycle work
+    pub(super) fn max_turn_exhaustion(&self) -> Option<MaxTurnsExhaustion> {
+        self.pending_terminal
+            .as_deref()
+            .and_then(max_turns_exhaustion)
     }
 
     pub(super) fn set_raw_drain_budget_exhausted(&mut self, exhausted: bool) {
@@ -1712,6 +1728,27 @@ fn normalize_end(value: &serde_json::Value) -> Vec<AgentEvent> {
 
 fn terminal_session_id(raw: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    valid_end_session_id(&value).map(str::to_string)
+}
+
+fn successful_end_session_id(value: &serde_json::Value) -> Option<&str> {
+    (value.get("stopReason").and_then(serde_json::Value::as_str) == Some(SUCCESSFUL_STOP_REASON))
+        .then(|| valid_end_session_id(value))?
+}
+
+fn max_turns_exhaustion(raw: &str) -> Option<MaxTurnsExhaustion> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    if value.get("stopReason").and_then(serde_json::Value::as_str)
+        != Some(MAX_TURNS_REACHED_STOP_REASON)
+    {
+        return None;
+    }
+    Some(MaxTurnsExhaustion {
+        session_id: valid_end_session_id(&value)?.to_string(),
+    })
+}
+
+fn valid_end_session_id(value: &serde_json::Value) -> Option<&str> {
     if value.get("type").and_then(serde_json::Value::as_str) != Some("end") {
         return None;
     }
@@ -1719,7 +1756,6 @@ fn terminal_session_id(raw: &str) -> Option<String> {
         .get("sessionId")
         .and_then(serde_json::Value::as_str)
         .filter(|session_id| valid_session_id(session_id))
-        .map(str::to_string)
 }
 
 fn valid_session_id(session_id: &str) -> bool {
@@ -2235,10 +2271,18 @@ mod tests {
                 "--sandbox",
                 "off",
                 "--max-turns",
-                "64",
+                "256",
                 "--verbatim",
             ]
         );
+    }
+
+    #[test]
+    fn normal_shape_preserves_explicit_turn_cap() {
+        let mut spec = test_spec(std::path::Path::new("/tmp/repo"));
+        spec.max_turns = 12;
+        let args = headless_args(&spec, LaunchMode::Normal).unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["--max-turns", "12"]));
     }
 
     #[test]
@@ -2361,8 +2405,10 @@ mod tests {
         spec.permission_mode = "auto".into();
         assert!(headless_args(&spec, LaunchMode::Normal).is_err());
         spec.permission_mode = DEFAULT_PERMISSION_MODE.into();
-        spec.max_turns = 0;
-        assert!(headless_args(&spec, LaunchMode::Normal).is_err());
+        for max_turns in [0, MAX_CONFIGURED_TURNS + 1] {
+            spec.max_turns = max_turns;
+            assert!(headless_args(&spec, LaunchMode::Normal).is_err());
+        }
     }
 
     #[test]
@@ -2389,6 +2435,32 @@ mod tests {
                 cost_usd: None,
             }
         );
+    }
+
+    #[test]
+    fn terminal_success_requires_the_documented_stop_reason() {
+        let success = r#"{"type":"end","stopReason":"EndTurn","sessionId":"sess-1"}"#;
+        assert_eq!(
+            GrokProc::failure_observation(success),
+            FailureObservation::success()
+        );
+
+        for stop_reason in ["max_turns_reached", "cancelled"] {
+            let raw = serde_json::json!({
+                "type": "end",
+                "stopReason": stop_reason,
+                "sessionId": "sess-1",
+            })
+            .to_string();
+            assert_eq!(
+                GrokProc::failure_observation(&raw),
+                FailureObservation::classified(
+                    FailureDisposition::NonFailover,
+                    "Grok terminal did not report the successful stopReason",
+                ),
+                "stopReason={stop_reason}",
+            );
+        }
     }
 
     #[test]
@@ -2541,6 +2613,69 @@ mod tests {
         })
         .await
         .expect("process did not exit")
+    }
+
+    #[tokio::test]
+    async fn non_success_end_reasons_never_authorize_terminal_success() {
+        for (stop_reason, stderr, exit_code) in [
+            ("max_turns_reached", false, 0),
+            ("max_turns_reached", false, 7),
+            ("max_turns_reached", true, 0),
+            ("max_turns_reached", true, 7),
+            ("cancelled", false, 0),
+            ("cancelled", false, 7),
+            ("cancelled", true, 0),
+            ("cancelled", true, 7),
+        ] {
+            let raw = serde_json::json!({
+                "type": "end",
+                "stopReason": stop_reason,
+                "sessionId": "exhausted-session",
+            })
+            .to_string();
+            let stderr = if stderr {
+                "printf 'Grok diagnostic\\n' >&2;"
+            } else {
+                ""
+            };
+            let mut proc = shell_proc(&format!(
+                "printf '%s\\n' '{raw}'; {stderr} exit {exit_code}"
+            ))
+            .await;
+
+            assert_eq!(proc.next_raw_line().await.as_deref(), Some(raw.as_str()));
+            if stop_reason == "max_turns_reached" {
+                assert_eq!(
+                    proc.max_turn_exhaustion(),
+                    Some(MaxTurnsExhaustion {
+                        session_id: "exhausted-session".into(),
+                    })
+                );
+            } else {
+                assert_eq!(proc.max_turn_exhaustion(), None);
+            }
+            assert!(proc.next_raw_line().await.is_none());
+            assert_eq!(wait_status(&mut proc).await.code(), Some(exit_code));
+            assert_eq!(
+                proc.observed_pre_authoritative_failure()
+                    .unwrap()
+                    .disposition(),
+                FailureDisposition::NonFailover,
+            );
+            assert!(proc.authorized_terminal().await.is_none());
+            proc.kill_and_reap().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn max_turn_exhaustion_requires_a_valid_session_id() {
+        let mut proc = shell_proc(
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"max_turns_reached\",\"sessionId\":\" bad \"}'",
+        )
+        .await;
+        assert!(proc.next_raw_line().await.is_some());
+        assert_eq!(proc.max_turn_exhaustion(), None);
+        proc.kill_and_reap().await;
     }
 
     #[tokio::test]

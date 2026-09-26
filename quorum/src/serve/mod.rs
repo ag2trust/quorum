@@ -30423,7 +30423,7 @@ mod tests {
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
             dir.path(),
             "printf '%s\\n' '{\"type\":\"text\",\"data\":\"working\"}' \
-             '{\"type\":\"end\",\"sessionId\":\"grok-session-exact\"}'",
+             '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"grok-session-exact\"}'",
         )
         .await;
         let original_tokens = slot.cost_tokens;
@@ -30483,7 +30483,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
             dir.path(),
-            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"terminal-first-session\"}'",
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"terminal-first-session\"}'",
         )
         .await;
 
@@ -30579,7 +30579,7 @@ mod tests {
     async fn grok_submit_retains_terminal_beyond_raw_drain_budget() {
         let dir = tempfile::tempdir().unwrap();
         let body = format!(
-            "i=0; while [ \"$i\" -lt {MAX_STREAM_LINES_PER_TICK} ]; do printf '%s\\n' '{{\"type\":\"text\",\"data\":\"ordinary\"}}'; i=$((i+1)); done; printf '%s\\n' '{{\"type\":\"end\",\"sessionId\":\"budget-submit-session\"}}'"
+            "i=0; while [ \"$i\" -lt {MAX_STREAM_LINES_PER_TICK} ]; do printf '%s\\n' '{{\"type\":\"text\",\"data\":\"ordinary\"}}'; i=$((i+1)); done; printf '%s\\n' '{{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"budget-submit-session\"}}'"
         );
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(dir.path(), &body).await;
         {
@@ -30774,7 +30774,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
             dir.path(),
-            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"held-pipe-session\"}'; sleep 30 & exit 0",
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"held-pipe-session\"}'; sleep 30 & exit 0",
         )
         .await;
         let mailbox_id = {
@@ -30858,7 +30858,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
             dir.path(),
-            "sleep 1; printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"submit-race-session\"}'",
+            "sleep 1; printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"submit-race-session\"}'",
         )
         .await;
         {
@@ -30966,7 +30966,7 @@ mod tests {
             ("malformed", "printf '%s\\n' '{\"type\":\"end\"}'"),
             (
                 "duplicate",
-                "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"end\",\"sessionId\":\"session-b\"}'",
+                "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"session-a\"}' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"session-b\"}'",
             ),
         ];
         for (name, body) in fixtures {
@@ -31019,7 +31019,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
             dir.path(),
-            "sleep 6; printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"shutdown-session\"}'",
+            "sleep 6; printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"shutdown-session\"}'",
         )
         .await;
         let done = mailbox::MailboxRow {
@@ -31099,7 +31099,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
             dir.path(),
-            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"restart-session\"}'",
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"restart-session\"}'",
         )
         .await;
         assert!(
@@ -31173,7 +31173,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
             dir.path(),
-            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"grok-retry-session\"}'",
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"grok-retry-session\"}'",
         )
         .await;
 
@@ -31246,7 +31246,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
             dir.path(),
-            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"grok-remediation-session\"}'",
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"grok-remediation-session\"}'",
         )
         .await;
         {
@@ -31329,7 +31329,7 @@ mod tests {
         let program = grok_worker_fixture_program(
             dir.path(),
             r#"printf '%s\n' "$@" > "$GROK_ARGS_FILE"
-printf '%s\n' '{"type":"end","sessionId":"grok-session-terminal"}'"#,
+printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-session-terminal"}'"#,
         );
         let mut config = pre_review_ci_test_config(dir.path().join("quorum.db"), worktree.clone());
         config.grok = crate::serve_config::GrokResolvedConfig {
@@ -31408,7 +31408,7 @@ printf '%s\n' '{"type":"end","sessionId":"grok-session-terminal"}'"#,
         let dir = tempfile::tempdir().unwrap();
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
             dir.path(),
-            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"grok-session-initial\"}'",
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"grok-session-initial\"}'",
         )
         .await;
 
@@ -31423,7 +31423,7 @@ printf '%s\n' '{"type":"end","sessionId":"grok-session-terminal"}'"#,
 
         let program = grok_worker_fixture_program(
             dir.path(),
-            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"grok-session-rework\"}'",
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"grok-session-rework\"}'",
         );
         let resumed = runner::RunnerProc::launch(
             &runner::LaunchRequest {
@@ -31492,8 +31492,8 @@ printf '%s\n' '{"type":"end","sessionId":"grok-session-terminal"}'"#,
             ),
             (
                 "nonzero-exit",
-                "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}'; exit 7",
-                vec![r#"{"type":"end","sessionId":"session-a"}"#],
+                "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"session-a\"}'; exit 7",
+                vec![r#"{"type":"end","stopReason":"EndTurn","sessionId":"session-a"}"#],
             ),
             (
                 "malformed-terminal",
@@ -31507,25 +31507,25 @@ printf '%s\n' '{"type":"end","sessionId":"grok-session-terminal"}'"#,
             ),
             (
                 "duplicate-session",
-                "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"end\",\"sessionId\":\"session-a\"}'",
+                "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"session-a\"}' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"session-a\"}'",
                 vec![
-                    r#"{"type":"end","sessionId":"session-a"}"#,
-                    r#"{"type":"end","sessionId":"session-a"}"#,
+                    r#"{"type":"end","stopReason":"EndTurn","sessionId":"session-a"}"#,
+                    r#"{"type":"end","stopReason":"EndTurn","sessionId":"session-a"}"#,
                 ],
             ),
             (
                 "conflicting-session",
-                "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"end\",\"sessionId\":\"session-b\"}'",
+                "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"session-a\"}' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"session-b\"}'",
                 vec![
-                    r#"{"type":"end","sessionId":"session-a"}"#,
-                    r#"{"type":"end","sessionId":"session-b"}"#,
+                    r#"{"type":"end","stopReason":"EndTurn","sessionId":"session-a"}"#,
+                    r#"{"type":"end","stopReason":"EndTurn","sessionId":"session-b"}"#,
                 ],
             ),
             (
                 "trailing-outcome",
-                "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"session-a\"}' '{\"type\":\"text\",\"data\":\"late\"}'",
+                "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"session-a\"}' '{\"type\":\"text\",\"data\":\"late\"}'",
                 vec![
-                    r#"{"type":"end","sessionId":"session-a"}"#,
+                    r#"{"type":"end","stopReason":"EndTurn","sessionId":"session-a"}"#,
                     r#"{"type":"text","data":"late"}"#,
                 ],
             ),
@@ -31580,10 +31580,10 @@ printf '%s\n' '{"type":"end","sessionId":"grok-session-terminal"}'"#,
     #[tokio::test]
     async fn internal_grok_worker_keeps_terminal_identity_across_drain_timeout() {
         let dir = tempfile::tempdir().unwrap();
-        let terminal = r#"{"type":"end","sessionId":"delayed-zero-exit"}"#;
+        let terminal = r#"{"type":"end","stopReason":"EndTurn","sessionId":"delayed-zero-exit"}"#;
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
             dir.path(),
-            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"delayed-zero-exit\"}'; sleep 6",
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"delayed-zero-exit\"}'; sleep 6",
         )
         .await;
 
@@ -31632,10 +31632,10 @@ printf '%s\n' '{"type":"end","sessionId":"grok-session-terminal"}'"#,
     #[tokio::test]
     async fn phase4b_defers_grok_terminal_at_raw_drain_budget() {
         let dir = tempfile::tempdir().unwrap();
-        let terminal = r#"{"type":"end","sessionId":"budget-edge-session"}"#;
+        let terminal = r#"{"type":"end","stopReason":"EndTurn","sessionId":"budget-edge-session"}"#;
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
             dir.path(),
-            "i=0; while [ \"$i\" -lt 63 ]; do printf '{\"type\":\"text\",\"data\":\"line-%s\"}\\n' \"$i\"; i=$((i+1)); done; printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"budget-edge-session\"}'",
+            "i=0; while [ \"$i\" -lt 63 ]; do printf '{\"type\":\"text\",\"data\":\"line-%s\"}\\n' \"$i\"; i=$((i+1)); done; printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"budget-edge-session\"}'",
         )
         .await;
 
@@ -31703,7 +31703,7 @@ printf '%s\n' '{"type":"end","sessionId":"grok-session-terminal"}'"#,
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
             dir.path(),
             &format!(
-                "(read release < '{}') >&2 & printf '%s\\n' '{{\"type\":\"end\",\"sessionId\":\"pending-stderr-session\"}}'; exit 0",
+                "(read release < '{}') >&2 & printf '%s\\n' '{{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"pending-stderr-session\"}}'; exit 0",
                 stderr_gate.display()
             ),
         )
@@ -31773,10 +31773,10 @@ printf '%s\n' '{"type":"end","sessionId":"grok-session-terminal"}'"#,
     #[tokio::test]
     async fn internal_grok_worker_read_error_after_terminal_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let terminal = r#"{"type":"end","sessionId":"read-error-session"}"#;
+        let terminal = r#"{"type":"end","stopReason":"EndTurn","sessionId":"read-error-session"}"#;
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
             dir.path(),
-            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"read-error-session\"}'",
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"read-error-session\"}'",
         )
         .await;
         slot.live_process_mut()
@@ -31822,10 +31822,11 @@ printf '%s\n' '{"type":"end","sessionId":"grok-session-terminal"}'"#,
     #[tokio::test]
     async fn internal_grok_worker_stderr_read_error_after_terminal_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let terminal = r#"{"type":"end","sessionId":"stderr-read-error-session"}"#;
+        let terminal =
+            r#"{"type":"end","stopReason":"EndTurn","sessionId":"stderr-read-error-session"}"#;
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
             dir.path(),
-            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"stderr-read-error-session\"}'",
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"stderr-read-error-session\"}'",
         )
         .await;
         slot.live_process_mut()
@@ -31877,10 +31878,10 @@ printf '%s\n' '{"type":"end","sessionId":"grok-session-terminal"}'"#,
     #[tokio::test]
     async fn internal_grok_worker_finalizes_stderr_before_terminal_decision() {
         let dir = tempfile::tempdir().unwrap();
-        let terminal = r#"{"type":"end","sessionId":"stderr-session"}"#;
+        let terminal = r#"{"type":"end","stopReason":"EndTurn","sessionId":"stderr-session"}"#;
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
             dir.path(),
-            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"stderr-session\"}'; exec 1>&-; sleep 1; printf '%s\\n' 'late stderr failure' >&2",
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"stderr-session\"}'; exec 1>&-; sleep 1; printf '%s\\n' 'late stderr failure' >&2",
         )
         .await;
 
@@ -31934,7 +31935,7 @@ printf '%s\n' '{"type":"end","sessionId":"grok-session-terminal"}'"#,
         let dir = tempfile::tempdir().unwrap();
         let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
             dir.path(),
-            "printf '%s\\n' '{\"type\":\"end\",\"sessionId\":\"too-late\"}'",
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"too-late\"}'",
         )
         .await;
         {
