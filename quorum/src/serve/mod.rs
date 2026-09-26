@@ -30960,13 +30960,21 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn grok_delivery_gate_rejects_missing_malformed_and_duplicate_terminal_identity() {
+    async fn grok_delivery_gate_rejects_invalid_or_non_success_terminal_identity() {
         let fixtures = [
             ("missing", "printf '%s\\n' '{\"type\":\"text\",\"data\":\"done\"}'"),
             ("malformed", "printf '%s\\n' '{\"type\":\"end\"}'"),
             (
                 "duplicate",
                 "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"session-a\"}' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"session-b\"}'",
+            ),
+            (
+                "max-turns",
+                "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"max_turns_reached\",\"sessionId\":\"exhausted-session\"}'",
+            ),
+            (
+                "cancelled",
+                "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"cancelled\",\"sessionId\":\"cancelled-session\"}'",
             ),
         ];
         for (name, body) in fixtures {

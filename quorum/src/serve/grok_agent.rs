@@ -1715,6 +1715,13 @@ fn normalize_end(value: &serde_json::Value) -> Vec<AgentEvent> {
             cost_usd: None,
         }];
     }
+    if value.get("stopReason").and_then(serde_json::Value::as_str) != Some(SUCCESSFUL_STOP_REASON) {
+        return vec![AgentEvent::TurnFailed {
+            message: "Grok end event did not report the successful stopReason".into(),
+            usage: terminal_usage(value),
+            cost_usd: None,
+        }];
+    }
     vec![
         AgentEvent::ThreadStarted {
             thread_id: session_id.to_string(),
@@ -2460,6 +2467,14 @@ mod tests {
                 ),
                 "stopReason={stop_reason}",
             );
+            assert!(
+                matches!(
+                    normalize_grok_line(&raw).as_slice(),
+                    [AgentEvent::TurnFailed { message, .. }]
+                        if message.contains("successful stopReason")
+                ),
+                "stopReason={stop_reason}"
+            );
         }
     }
 
@@ -2495,7 +2510,7 @@ mod tests {
 
     #[test]
     fn fixture_partial_cost_does_not_hide_complete_tokens_or_invent_usd() {
-        let raw = r#"{"type":"end","sessionId":"sess-2","usage":{"input_tokens":8,"cache_read_input_tokens":4,"output_tokens":2},"total_cost_usd":0.1,"cost_is_partial":true}"#;
+        let raw = r#"{"type":"end","stopReason":"EndTurn","sessionId":"sess-2","usage":{"input_tokens":8,"cache_read_input_tokens":4,"output_tokens":2},"total_cost_usd":0.1,"cost_is_partial":true}"#;
         assert_eq!(
             normalize_grok_line(raw)[1],
             AgentEvent::TurnCompleted {
