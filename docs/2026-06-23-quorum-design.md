@@ -2116,8 +2116,9 @@ Consumed events:
 |---|---|
 | non-empty `text.data` | `AssistantText` |
 | `tool_call` | compact `Activity` using `toolName`/`rawInput` |
-| `end` with non-empty `sessionId` | continuation identity, then terminal success with complete usage/cost when available |
-| `end` without a session ID | terminal failure |
+| `end` with `stopReason` `EndTurn` and non-empty `sessionId` | continuation identity, then terminal success with complete usage/cost when available |
+| `end` with `stopReason` `max_turns_reached` or `cancelled` | continuation identity preserved; terminal non-success (see max-turn survival below) |
+| `end` without a valid session ID or stop reason | terminal failure |
 | `error` | terminal failure with complete usage/cost when available |
 | all other, unknown, or malformed lines | preserved raw and lifecycle-inert |
 
@@ -2131,11 +2132,52 @@ The process runs in its own process group. The adapter retains that group ID ind
 of the leader's reap state, so teardown kills descendants holding inherited pipes before it
 drains bounded output and reaps the child.
 
-An `end` event is the protocol's success marker, but managed worker success additionally
-requires exit status zero. `error`, non-zero exit,
-EOF without `end`, missing session identity, timeout, and forced termination are failure
-paths; the adapter never fabricates a terminal event from EOF or exit alone. Grok emits
-the session identity late, so no continuation may be relied on before `end`.
+An `end` event is the protocol's success marker only when its `stopReason` is the
+documented successful value `EndTurn`. The `max_turns_reached` and `cancelled` stop
+reasons are explicitly non-success even when the `end` event carries a valid session ID
+and exit status zero; neither authorizes managed terminal success or enters review.
+Managed worker success requires both `EndTurn` and exit status zero. `error`, non-zero
+exit, EOF without `end`, missing session identity, timeout, and forced termination are
+failure paths; the adapter never fabricates a terminal event from EOF or exit alone. Grok
+emits the session identity late, so no continuation may be relied on before `end`.
+
+#### Grok turn budget and max-turn survival
+
+Normal launches use the configured `max_turns` default of 256 (range 1..=256). Explicit
+values within 1..=256 are preserved. Restricted launches cap `max_turns` at 8 regardless
+of the configured value.
+
+When a Grok worker exhausts its turn budget, the CLI terminates with `stopReason`
+`max_turns_reached` and the provider-issued `sessionId`. This is not a success: the
+daemon does not authorize terminal completion, enter review, or treat it as a generic
+turn failure. Instead, the daemon atomically checkpoints a durable exhaustion record:
+
+- **Identity fields:** the valid session ID from the terminal `end` event, plus the
+  exact task ID, role assignment, agent name, worker role, provider (`grok`), model,
+  effort, pending prompt, turn kind, and branch. Every field is revalidated against
+  durable task and assignment state before the checkpoint transaction commits.
+- **Atomic persistence:** the checkpoint writes a `runner_provider_block` (reason:
+  exhaustion with the exact session) and a `runner_retry` (pending turn with the
+  provider-issued session as its continuation ID) in one `BEGIN IMMEDIATE` transaction.
+  A partial checkpoint that stores only one half is rejected; crash recovery cannot
+  observe a provider block without its matching retry identity or vice versa.
+- **Exact-session retry:** `task-retry` resumes using `--resume <session-id>` with the
+  checkpointed prompt, model, and effort. It never starts a fresh session and never
+  enters review for the exhausted turn. The retry `requested` flag is false (daemon-
+  originated), and a provider/model/continuation mismatch fails closed.
+- **Repeated exhaustion:** a second `max_turns_reached` on a retried turn supersedes
+  the active retry with its new provider session. The old continuation is not retained;
+  retaining it would fork the conversation. Repeated exhaustion is bounded by the
+  existing task recovery and retry budgets — no special exhaustion counter is needed.
+
+The slot is cleaned up as `provider_blocked` after a successful checkpoint. A checkpoint
+failure retains the slot for the ordinary dead-worker classifier to handle.
+
+Grok is enabled for managed workers only. It is never selected for planner, arbiter,
+reviewer, classifier, or collector roles. The Grok CLI is not used for daemon self-update,
+does not participate in the `EXIT_SELF_UPDATE` (exit 75) supervisor contract, and is never
+logged into or configured by the operator CLI session. Authentication is inherited from
+the operator environment or the CLI's own credential state.
 
 #### Grok discovery record
 
