@@ -3467,7 +3467,11 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let (fetch_timeout, local_timeout) = short_timeouts();
+        // This fixture still requires a prompt failure in under two seconds,
+        // but the parallel timing suite can take longer than 300ms to start
+        // the shell shim on a loaded CI runner.
+        let (_, local_timeout) = short_timeouts();
+        let fetch_timeout = Duration::from_secs(1);
         let mgr = WorktreeManager::with_config(shim, fetch_timeout, local_timeout);
         let repo = tempfile::tempdir().unwrap();
         let worktree = repo.path().join("worktree");
