@@ -2747,7 +2747,16 @@ async fn resolve_and_persist_continue_pr_target(
 ) -> std::result::Result<PrTarget, String> {
     // GitHub resolution is deliberately complete before opening the SQLite
     // write transaction below.
-    let target = resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await?;
+    let target = resolve_publication_pr_target_with_program(
+        pr,
+        &config.repo_dir,
+        Some(&config.repo),
+        config
+            .pr_target_program
+            .as_deref()
+            .unwrap_or(Path::new("gh")),
+    )
+    .await?;
     validate_continue_pr_target(&target, pr, base_branch)?;
     let db_path = config.db_path.clone();
     let persisted = target.clone();
@@ -22675,7 +22684,11 @@ async fn spawn_worker(
         },
         |retry| retry.prompt.clone(),
     );
-    if let Some(context) = &continuation_context {
+    // A provider retry already stores the exact launched turn, including the
+    // continuation provenance attached to its first launch. Re-appending that
+    // context forks the durable prompt from the one bound to the provider
+    // session, so only a fresh continue-pr worker receives it here.
+    if let (true, Some(context)) = (retry_turn.is_none(), continuation_context.as_deref()) {
         prompt_text.push_str(context);
     }
 
@@ -32564,6 +32577,222 @@ mod tests {
         );
         drop(conn);
         initial.kill_and_reap().await;
+        resumed.kill_and_reap().await;
+    }
+
+    /// A continue-pr worker's first launch binds provenance context into the
+    /// exact prompt. After max-turn exhaustion, task-retry must launch Grok
+    /// with that stored prompt verbatim: adding the context a second time
+    /// changes the resumed provider turn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn continue_pr_grok_max_turn_retry_preserves_exact_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        let args_file = dir.path().join("resumed-grok-args");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("state.txt"), "base\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["branch", "-M", "main"]);
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "main"]);
+        let continue_branch = "daemon/continue-grok-prompt";
+        git(&["checkout", "-q", "-b", continue_branch]);
+        std::fs::write(repo.join("state.txt"), "continue\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "continue"]);
+        git(&["push", "-q", "-u", "origin", continue_branch]);
+        let continue_head = git(&["rev-parse", "HEAD"]);
+
+        let db_path = dir.path().join("continue-grok-max.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::create_with_continue_pr_and_target_branch(
+                &mut conn,
+                "owner",
+                "continue Grok max-turn prompt",
+                Some("Preserve this exact continuation prompt."),
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                Some(731),
+                Some("main"),
+                now_unix(),
+            )
+            .unwrap()
+        };
+
+        let program = grok_worker_fixture_program(
+            dir.path(),
+            &format!(
+                "printf '%s\\n' \"$@\" > '{}'; printf '%s\\n' '{{\"type\":\"end\",\"stopReason\":\"max_turns_reached\",\"sessionId\":\"grok-continue-max\"}}'",
+                args_file.display()
+            ),
+        );
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo.clone());
+        let grok_profile = crate::serve_config::ModelProfile {
+            runner: "grok".into(),
+            model: "grok-4.5".into(),
+            effort: "high".into(),
+        };
+        let grok_pool = std::collections::BTreeMap::from([("grok".to_string(), 100)]);
+        config.model_profiles = std::collections::BTreeMap::from([("grok".into(), grok_profile)]);
+        config.routing = crate::serve_config::RoutingPolicy {
+            classifier: grok_pool.clone(),
+            planner: grok_pool.clone(),
+            arbiter: grok_pool.clone(),
+            collector: grok_pool.clone(),
+            worker: (1..=5)
+                .map(|level| (level.to_string(), grok_pool.clone()))
+                .collect(),
+            reviewer: (1..=5)
+                .map(|level| (level.to_string(), grok_pool.clone()))
+                .collect(),
+        };
+        config.worktree_base = dir.path().join("worktrees");
+        config.agent_bin = Some(program.to_string_lossy().into_owned());
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-continue-grok",
+            &open_pr_target_json(continue_branch, &continue_head, "main"),
+        ));
+
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+        assert!(
+            spawn_worker(
+                &config,
+                &wt_mgr,
+                &mut names,
+                &mut workers,
+                &mut poison,
+                &mut skips,
+                &mut roster,
+            )
+            .await
+            .unwrap(),
+            "the continue-pr worker must launch before its max-turn checkpoint"
+        );
+        let mut exhausted = workers.remove(0);
+        drain_events(&mut exhausted, &db_path, "worker", &CostLimits::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            wait_for_worker_exit_observation(&mut exhausted).await,
+            WorkerExitObservation::Exited(_)
+        ));
+        exhausted
+            .finalize_pre_authoritative_exit_evidence("worker", &CostLimits::default())
+            .await;
+        let exact_prompt = exhausted.pending_prompt.clone();
+        assert_eq!(
+            exact_prompt
+                .matches("CONTINUATION SOURCE — ANCESTRY MUST BE PRESERVED")
+                .count(),
+            1,
+            "the initial continue-pr launch must bind one provenance context"
+        );
+        let session_id = exhausted.grok_max_turn_exhaustion().unwrap();
+        checkpoint_grok_max_turn_exhaustion(&db_path, &mut exhausted, &session_id)
+            .await
+            .unwrap();
+        cleanup_slot(
+            &config,
+            &wt_mgr,
+            &mut names,
+            exhausted,
+            None,
+            "provider_blocked",
+        )
+        .await;
+
+        let retry = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let retried = tasks::retry_provider_blocked(&mut conn, task_id, "owner", now_unix())
+                .unwrap()
+                .expect("task-retry must activate the exact max-turn checkpoint");
+            runner_retry_turn(retried.refs.as_deref()).unwrap()
+        };
+        assert_eq!(retry.prompt, exact_prompt);
+        assert_eq!(retry.continuation_id.as_deref(), Some("grok-continue-max"));
+
+        assert!(
+            spawn_worker(
+                &config,
+                &wt_mgr,
+                &mut names,
+                &mut workers,
+                &mut poison,
+                &mut skips,
+                &mut roster,
+            )
+            .await
+            .unwrap(),
+            "task-retry must provision the exact Grok session"
+        );
+        assert_eq!(workers.len(), 1);
+        assert_eq!(
+            workers[0].continuation_id.as_deref(),
+            Some("grok-continue-max")
+        );
+        assert_eq!(workers[0].pending_prompt, exact_prompt);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while workers[0].try_wait().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("resumed Grok fixture must record its launch arguments");
+        let resumed_args = std::fs::read_to_string(&args_file).unwrap();
+        assert!(
+            resumed_args.lines().collect::<Vec<_>>().starts_with(&[
+                "--resume",
+                "grok-continue-max",
+                "-p"
+            ]),
+            "task-retry must use the provider-issued session rather than start fresh: {resumed_args:?}"
+        );
+        assert_eq!(
+            resumed_args
+                .matches("CONTINUATION SOURCE — ANCESTRY MUST BE PRESERVED")
+                .count(),
+            1,
+            "the resumed Grok CLI prompt must not duplicate continuation context"
+        );
+        let resumed = workers.remove(0);
         resumed.kill_and_reap().await;
     }
 
