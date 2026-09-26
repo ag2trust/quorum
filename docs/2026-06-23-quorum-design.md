@@ -2322,7 +2322,7 @@ Grok worker adapter configuration:
 [grok]
 sandbox = "off"                    # off | workspace (default: off)
 permission_mode = "bypassPermissions"
-max_turns = 64                      # 1..=256
+max_turns = 256                     # 1..=256
 ```
 
 `sandbox = "off"` is the production-capable default. Quorum provisions every managed

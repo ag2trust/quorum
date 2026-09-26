@@ -88,7 +88,7 @@ primary = 100
 # [grok]
 # sandbox = \"off\"                        # off|workspace (default: off)
 # permission_mode = \"bypassPermissions\"
-# max_turns = 64                         # 1..=256
+# max_turns = 256                        # 1..=256
 
 ## Token / cost / wall-clock limits (unlimited when absent)
 # max_turn_tokens = 200000
