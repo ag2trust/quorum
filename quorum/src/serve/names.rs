@@ -86,6 +86,7 @@ impl Pool {
         })
     }
 
+    #[cfg(test)]
     pub fn acquire(&mut self) -> AcquireResult {
         self.acquire_excluding(&HashSet::new())
     }
