@@ -362,7 +362,7 @@ fn errors_count(home: &std::path::Path) -> i64 {
         .unwrap()
 }
 
-/// Seed a review-only task directly in the DB with a known author and PR.
+/// Seed an externally-authored review-only task directly in the DB.
 fn seed_review_only_task(home: &std::path::Path, pr: i64) -> i64 {
     let mut conn = quorum_core::db::open(&db_path(home)).unwrap();
     let now = std::time::SystemTime::now()
@@ -994,6 +994,233 @@ fn orphan_r2_does_not_reuse_torn_down_worker_or_r1_name() {
     assert_ne!(reviewer, author);
     assert_ne!(reviewer, r1);
     drop(handle);
+}
+
+/// An external review-only PR has no implementation author. Its approval
+/// authority must therefore use the review counterpart sentinel without
+/// mutating `tasks.author`, across both R1 and final R2 approval persistence.
+#[test]
+fn review_only_null_author_records_external_approvals_and_merges() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let pr = 42;
+    let task_id = seed_review_only_task(home.path(), pr);
+    assert!(get_task(home.path(), task_id).review_only);
+    assert_eq!(get_task(home.path(), task_id).author, None);
+    // The test GH shim resolves this as the external PR head. It is not a
+    // task author and must remain absent from the task row.
+    create_author_branch(repo_dir.path(), "OrigWorker", task_id);
+    let names = write_named_pool(home.path(), &["R1".into(), "R2".into()]);
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+    );
+    assert!(
+        handle.wait_for("spawning reviewer", 30),
+        "R1 reviewer was not provisioned: {:?}",
+        handle.lines
+    );
+    let r1 = handle.extract_agent_name("spawning reviewer ").unwrap();
+    assert!(
+        handle.wait_for("result", 15),
+        "R1 reviewer did not produce a result: {:?}",
+        handle.lines
+    );
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r1,
+            "--pr",
+            &pr.to_string(),
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("R2: pre-merge reviewer", 30),
+        "R2 reviewer was not provisioned after R1 approval: {:?}",
+        handle.lines
+    );
+    {
+        let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+        let approval = quorum_core::approvals::get(&conn, pr, "r1")
+            .unwrap()
+            .expect("R1 approval must be durable before R2 is provisioned");
+        assert_eq!(approval.task_id, task_id);
+        assert_eq!(approval.author, "external");
+        assert_eq!(approval.reviewer, r1);
+        assert_ne!(approval.reviewer, approval.author);
+        assert_eq!(get_task(home.path(), task_id).author, None);
+    }
+
+    let r2 = handle
+        .extract_agent_name("R2: pre-merge reviewer ")
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(
+        handle.wait_for("result", 15),
+        "R2 reviewer did not produce a result: {:?}",
+        handle.lines
+    );
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r2,
+            "--pr",
+            &pr.to_string(),
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    assert!(
+        handle.wait_for("PR #42 merged — firing MergeSucceeded", 30),
+        "review-only external approvals did not merge: {:?}",
+        handle.lines
+    );
+    handle.drain_pending_lines();
+
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    for role in ["r1", "r2"] {
+        let approval = quorum_core::approvals::get(&conn, pr, role)
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing durable {role} approval"));
+        assert_eq!(approval.task_id, task_id);
+        assert_eq!(approval.author, "external");
+        assert_ne!(approval.reviewer, approval.author);
+    }
+    let discarded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE task_id=?1 AND end_reason='approval-no-author'",
+            rusqlite::params![task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(discarded, 0, "external approval must not be discarded");
+    assert_eq!(get_task(home.path(), task_id).author, None);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while get_task(home.path(), task_id).status != "done" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "merge success did not complete the review-only task: {:?}",
+            handle.lines
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !handle
+            .lines
+            .iter()
+            .any(|line| line.contains("approval-no-author") || line.contains("tick error")),
+        "approval must not be discarded or abort the tick: {:?}",
+        handle.lines
+    );
+}
+
+/// Non-review-only rows retain fail-closed behavior when no live or durable
+/// implementation author exists.
+#[test]
+fn non_review_only_null_author_discards_approval() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let pr = 42;
+    let task_id = seed_in_review_task(home.path(), "Worker", pr);
+    create_author_branch(repo_dir.path(), "OrigWorker", task_id);
+    {
+        let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+        conn.execute("UPDATE tasks SET author=NULL WHERE id=?1", [task_id])
+            .unwrap();
+    }
+    let names = write_named_pool(home.path(), &["Reviewer".into()]);
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+    );
+    assert!(
+        handle.wait_for("spawning reviewer", 30),
+        "reviewer was not provisioned: {:?}",
+        handle.lines
+    );
+    let reviewer = handle.extract_agent_name("spawning reviewer ").unwrap();
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer did not produce a result: {:?}",
+        handle.lines
+    );
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer,
+            "--pr",
+            &pr.to_string(),
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    assert!(
+        handle.wait_for("has no durable author — discarding verdict", 30),
+        "authorless implementation approval was not rejected: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("reviewer Reviewer torn down", 15),
+        "discarded reviewer was not torn down: {:?}",
+        handle.lines
+    );
+
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    assert!(quorum_core::approvals::get(&conn, pr, "r1")
+        .unwrap()
+        .is_none());
+    let discarded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE task_id=?1 AND end_reason='approval-no-author'",
+            rusqlite::params![task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(discarded, 1);
 }
 
 /// PR #3806 regression: in-review task through R1 changes → remediation →

@@ -1574,24 +1574,27 @@ async fn task_target_branch(db_path: &Path, task_id: i64) -> Result<Option<Strin
     }
 }
 
-/// Load the immutable implementation author when no live worker remains. A
-/// policy park intentionally tears down runtime state, so reviewer verdicts
-/// repairing one missing role must bind to the task row rather than inventing
-/// an empty or synthetic author.
-async fn durable_task_author(db_path: &Path, task_id: i64) -> Result<Option<String>> {
-    let path = db_path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<Option<String>> {
-        let conn = quorum_core::db::open(&path)?;
-        Ok(tasks::get(&conn, task_id)?
-            .and_then(|task| task.author)
-            .filter(|author| !author.is_empty()))
-    })
-    .await
-    .map_err(|error| {
-        QuorumError::Io(format!(
-            "task author read join failure for task #{task_id}: {error}"
-        ))
-    })?
+/// Resolve the author identity to bind approval authority to. Live workers
+/// take precedence, followed by the durable implementation author. A
+/// review-only task has no implementation worker or durable author by design,
+/// so its externally-authored PR is represented by the existing counterpart
+/// sentinel. Do not persist that sentinel to `tasks.author`: it deliberately
+/// continues to distinguish review-only branch handling from agent branches.
+fn approval_author(
+    conn: &quorum_core::Connection,
+    task_id: i64,
+    live_worker: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(author) = live_worker.filter(|author| !author.is_empty()) {
+        return Ok(Some(author.to_string()));
+    }
+    let Some(task) = tasks::get(conn, task_id)? else {
+        return Ok(None);
+    };
+    if let Some(author) = task.author.filter(|author| !author.is_empty()) {
+        return Ok(Some(author));
+    }
+    Ok(task.review_only.then(|| "external".to_string()))
 }
 
 /// Resolve the branch every task-scoped lifecycle boundary must use. New
@@ -9791,7 +9794,7 @@ fn validate_merge_retry_authority(
     if tasks::extract_pr_number(&task.refs) != Some(pr) || live.target.pr != pr {
         return invalid_all(format!("task #{task_id} is no longer bound to PR #{pr}"));
     }
-    let Some(author) = task.author.as_deref().filter(|author| !author.is_empty()) else {
+    let Some(author) = approval_author(conn, task_id, None)? else {
         return invalid_all(format!("task #{task_id} has no durable author"));
     };
     let Some(persisted) = pr_targets::get(conn, task_id, pr)? else {
@@ -11769,15 +11772,22 @@ async fn tick(
                     if !reviewers[ri].r2_origin && !drain_state.draining {
                         let r1_reviewer = reviewers[ri].agent_name.clone();
                         let r1_run_id = reviewers[ri].agent_run_id;
-                        let author = if let Some(author) = workers
+                        let live_worker = workers
                             .iter()
                             .find(|w| w.task_id == reviewer_task_id)
-                            .map(|w| w.agent_name.clone())
-                        {
-                            Some(author)
-                        } else {
-                            durable_task_author(&db_path, reviewer_task_id).await?
-                        };
+                            .map(|w| w.agent_name.clone());
+                        let p = db_path.clone();
+                        let tid = reviewer_task_id;
+                        let author = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+                            let conn = quorum_core::db::open(&p)?;
+                            approval_author(&conn, tid, live_worker.as_deref())
+                        })
+                        .await
+                        .map_err(|error| {
+                            QuorumError::Io(format!(
+                                "R1 approval author resolution join for task #{reviewer_task_id}: {error}"
+                            ))
+                        })??;
                         let Some(author) = author else {
                             log(&format!(
                                 "R1 approval for task #{reviewer_task_id} has no durable author — discarding verdict"
@@ -12174,14 +12184,24 @@ async fn tick(
                         // already_merging branch above and skip this.
                         {
                             let reviewer_name = reviewers[ri].agent_name.clone();
-                            let author = workers
+                            let live_worker = workers
                                 .iter()
                                 .find(|w| w.task_id == reviewer_task_id)
                                 .map(|w| w.agent_name.clone());
-                            let author = match author {
-                                Some(author) => Some(author),
-                                None => durable_task_author(&db_path, reviewer_task_id).await?,
-                            };
+                            let p = db_path.clone();
+                            let tid = reviewer_task_id;
+                            let author = tokio::task::spawn_blocking(
+                                move || -> Result<Option<String>> {
+                                    let conn = quorum_core::db::open(&p)?;
+                                    approval_author(&conn, tid, live_worker.as_deref())
+                                },
+                            )
+                            .await
+                            .map_err(|error| {
+                                QuorumError::Io(format!(
+                                    "final approval author resolution join for task #{reviewer_task_id}: {error}"
+                                ))
+                            })??;
                             if let Some(author) = author {
                                 let p = db_path.clone();
                                 let role = if reviewers[ri].r2_origin { "r2" } else { "r1" };
@@ -38750,6 +38770,113 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             source: ReviewerPrTargetSource::Live,
         };
         (dir, conn, task_id, live)
+    }
+
+    #[test]
+    fn approval_author_resolves_external_only_for_authorless_review_only_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+        let review_only = tasks::create(
+            &mut conn,
+            "creator",
+            "review-only approval authority",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(42),
+            100,
+        )
+        .unwrap();
+        let ordinary = tasks::create(
+            &mut conn,
+            "creator",
+            "ordinary approval authority",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(
+            approval_author(&conn, review_only, None)
+                .unwrap()
+                .as_deref(),
+            Some("external")
+        );
+        assert_eq!(approval_author(&conn, ordinary, None).unwrap(), None);
+        conn.execute(
+            "UPDATE tasks SET author='durable-author' WHERE id=?1",
+            [review_only],
+        )
+        .unwrap();
+        assert_eq!(
+            approval_author(&conn, review_only, None)
+                .unwrap()
+                .as_deref(),
+            Some("durable-author")
+        );
+        assert_eq!(
+            approval_author(&conn, review_only, Some("live-worker"))
+                .unwrap()
+                .as_deref(),
+            Some("live-worker")
+        );
+    }
+
+    #[test]
+    fn merge_retry_authority_accepts_review_only_external_approvals() {
+        let (_dir, conn, task_id, live) = seeded_merge_retry_authority();
+        conn.execute(
+            "UPDATE tasks SET author=NULL, review_only=1 WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE approvals SET author='external' WHERE task_id=?1",
+            [task_id],
+        )
+        .unwrap();
+
+        let authority = validate_merge_retry_authority(&conn, task_id, 42, &live)
+            .unwrap()
+            .unwrap();
+        assert_eq!(authority.reviewer, "rev-r2");
+    }
+
+    #[test]
+    fn merge_retry_authority_rejects_invalid_external_approvals() {
+        for (column, value, stale_role) in [
+            ("reviewer", "external", "r1"),
+            ("author", "mismatched-author", "r1"),
+        ] {
+            let (_dir, conn, task_id, live) = seeded_merge_retry_authority();
+            conn.execute(
+                "UPDATE tasks SET author=NULL, review_only=1 WHERE id=?1",
+                [task_id],
+            )
+            .unwrap();
+            conn.execute(
+                &format!("UPDATE approvals SET author='external', {column}=?1 WHERE task_id=?2 AND review_role='r1'"),
+                rusqlite::params![value, task_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE approvals SET author='external' WHERE task_id=?1 AND review_role='r2'",
+                [task_id],
+            )
+            .unwrap();
+
+            let invalid = validate_merge_retry_authority(&conn, task_id, 42, &live)
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(invalid.stale_roles, vec![stale_role]);
+        }
     }
 
     struct PolicyBlockedMergeCounter {
