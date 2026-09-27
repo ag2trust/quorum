@@ -97,6 +97,10 @@ pub const MERGE_COMMIT_SHA_REF: &str = "merge_commit_sha";
 pub const DEPENDENCY_BASE_WAIT_ATTEMPTS_REF: &str = "dependency_base_wait_attempts";
 pub const DEPENDENCY_BASE_WAIT_REASON_REF: &str = "dependency_base_wait_reason";
 pub const MAX_DEPENDENCY_BASE_WAIT_ATTEMPTS: i64 = 3;
+/// A completed decomposition can itself contain completed decomposition
+/// sources. Bound recursive dependency provenance expansion so corrupt graph
+/// data cannot turn one admission read into unbounded work.
+pub const MAX_DEPENDENCY_DECOMPOSITION_DEPTH: usize = 8;
 
 /// Return the durable poison-retry generation encoded in task refs. Missing
 /// and malformed values deliberately read as the legacy generation zero: a
@@ -139,11 +143,24 @@ fn next_poison_retry_generation(refs: &str) -> Result<i64> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyMergeCommit {
     pub task_id: i64,
+    /// The dependency named directly by the dependent task. This differs from
+    /// `task_id` when a completed decomposition source contributes the merge
+    /// commits of its completed graph children.
+    pub root_dependency_id: i64,
     /// The completed dependency's PR, when durable task metadata associates
     /// one. A missing merge SHA can be recovered from this authoritative PR
     /// before a dependent branch is allocated.
     pub pr_number: Option<i64>,
     pub merge_commit_sha: Option<String>,
+}
+
+/// Result of resolving merge provenance for a dependent task's completed
+/// prerequisites. A graph inconsistency is an expected fail-closed admission
+/// result, not a database failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependencyMergeCommitResolution {
+    Resolved(Vec<DependencyMergeCommit>),
+    Unresolved { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2048,21 +2065,57 @@ pub fn complete_detected_merge(
     })
 }
 
-/// Load durable merge and PR metadata for each dependency. A `done` task
+/// Load durable merge and PR metadata for each dependency. A completed
+/// decomposition source contributes every active-plan graph child's merge
+/// provenance, recursively for nested completed sources. A `done` leaf
 /// without a recorded commit remains `None` until the serving layer resolves
 /// its retained PR; callers must never silently allocate from that state.
 pub fn dependency_merge_commits(
     conn: &Connection,
     depends_on: Option<&str>,
-) -> Result<Vec<DependencyMergeCommit>> {
+) -> Result<DependencyMergeCommitResolution> {
     let Some(depends_on) = depends_on else {
-        return Ok(Vec::new());
+        return Ok(DependencyMergeCommitResolution::Resolved(Vec::new()));
     };
     let dependency_ids = serde_json::from_str::<Vec<i64>>(depends_on).map_err(|error| {
         QuorumError::Io(format!("invalid persisted task dependencies: {error}"))
     })?;
     let mut result = Vec::with_capacity(dependency_ids.len());
     for task_id in dependency_ids {
+        let mut visiting = std::collections::HashSet::new();
+        if let Err(reason) =
+            resolve_dependency_merge_commits(conn, task_id, task_id, 0, &mut visiting, &mut result)?
+        {
+            return Ok(DependencyMergeCommitResolution::Unresolved { reason });
+        }
+    }
+    Ok(DependencyMergeCommitResolution::Resolved(result))
+}
+
+/// Resolve one direct dependency to its durable merge-provenance leaves. The
+/// return value deliberately models graph state as an expected unresolved
+/// outcome: callers must defer admission rather than mistake inconsistent
+/// graph membership for a database outage.
+fn resolve_dependency_merge_commits(
+    conn: &Connection,
+    root_dependency_id: i64,
+    task_id: i64,
+    depth: usize,
+    visiting: &mut std::collections::HashSet<i64>,
+    result: &mut Vec<DependencyMergeCommit>,
+) -> Result<std::result::Result<(), String>> {
+    if depth >= MAX_DEPENDENCY_DECOMPOSITION_DEPTH {
+        return Ok(Err(format!(
+            "dependency #{root_dependency_id} nested decomposition exceeds the depth limit"
+        )));
+    }
+    if !visiting.insert(task_id) {
+        return Ok(Err(format!(
+            "dependency #{root_dependency_id} has a cyclic completed decomposition membership at task #{task_id}"
+        )));
+    }
+
+    let outcome = (|| -> Result<std::result::Result<(), String>> {
         let row: Option<(String, Option<String>)> = conn
             .query_row(
                 "SELECT status,refs FROM tasks WHERE id=?1",
@@ -2070,30 +2123,109 @@ pub fn dependency_merge_commits(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let (pr_number, merge_commit_sha) = row
-            .filter(|(status, _)| status == "done")
-            .and_then(|(_, refs)| refs)
-            .and_then(|refs| serde_json::from_str::<serde_json::Value>(&refs).ok())
-            .map(|refs| {
-                let pr_number = refs
-                    .get("pr")
-                    .and_then(pr_number_from_json)
-                    .filter(|pr| *pr > 0);
-                let merge_commit_sha = refs
-                    .get(MERGE_COMMIT_SHA_REF)
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|sha| !sha.is_empty() && !sha.contains('\0'))
-                    .map(str::to_owned);
-                (pr_number, merge_commit_sha)
-            })
-            .unwrap_or((None, None));
-        result.push(DependencyMergeCommit {
-            task_id,
-            pr_number,
-            merge_commit_sha,
-        });
-    }
-    Ok(result)
+        let Some((status, refs)) = row else {
+            return Ok(Err(format!(
+                "dependency #{root_dependency_id} completed decomposition membership references missing task #{task_id}"
+            )));
+        };
+        if status != "done" {
+            let description = if task_id == root_dependency_id {
+                format!("dependency #{task_id} is not done")
+            } else {
+                format!(
+                    "dependency #{root_dependency_id} completed decomposition graph child #{task_id} is not done"
+                )
+            };
+            return Ok(Err(description));
+        }
+
+        let graph: Option<(String, i64, i64, Option<i64>)> = conn
+            .query_row(
+                "SELECT state,active,freeze_active,accepted_plan_revision
+                 FROM task_decompositions WHERE source_task_id=?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((state, active, freeze_active, accepted_plan_revision)) = graph else {
+            let (pr_number, merge_commit_sha) = refs
+                .and_then(|refs| serde_json::from_str::<serde_json::Value>(&refs).ok())
+                .map(|refs| {
+                    let pr_number = refs
+                        .get("pr")
+                        .and_then(pr_number_from_json)
+                        .filter(|pr| *pr > 0);
+                    let merge_commit_sha = refs
+                        .get(MERGE_COMMIT_SHA_REF)
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|sha| !sha.is_empty() && !sha.contains('\0'))
+                        .map(str::to_owned);
+                    (pr_number, merge_commit_sha)
+                })
+                .unwrap_or((None, None));
+            result.push(DependencyMergeCommit {
+                task_id,
+                root_dependency_id,
+                pr_number,
+                merge_commit_sha,
+            });
+            return Ok(Ok(()));
+        };
+
+        let Some(accepted_plan_revision) = accepted_plan_revision else {
+            return Ok(Err(format!(
+                "dependency #{root_dependency_id} decomposition graph is not completed"
+            )));
+        };
+        if state != "completed" || active != 0 || freeze_active != 0 {
+            return Ok(Err(format!(
+                "dependency #{root_dependency_id} decomposition graph is not completed"
+            )));
+        }
+        let mismatched_active_members: i64 = conn.query_row(
+            "SELECT count(*) FROM task_graph_members
+             WHERE graph_id=(SELECT id FROM task_decompositions WHERE source_task_id=?1)
+               AND active=1 AND plan_revision!=?2",
+            rusqlite::params![task_id, accepted_plan_revision],
+            |row| row.get(0),
+        )?;
+        if mismatched_active_members != 0 {
+            return Ok(Err(format!(
+                "dependency #{root_dependency_id} completed decomposition graph membership is ambiguous"
+            )));
+        }
+        let mut statement = conn.prepare(
+            "SELECT member.task_id
+             FROM task_graph_members member
+             JOIN task_decompositions graph ON graph.id=member.graph_id
+             WHERE graph.source_task_id=?1 AND member.active=1
+               AND member.plan_revision=graph.accepted_plan_revision
+             ORDER BY member.task_id",
+        )?;
+        let child_ids = statement
+            .query_map([task_id], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if child_ids.is_empty() {
+            return Ok(Err(format!(
+                "dependency #{root_dependency_id} completed decomposition graph membership is ambiguous"
+            )));
+        }
+        for child_id in child_ids {
+            if let Err(reason) = resolve_dependency_merge_commits(
+                conn,
+                root_dependency_id,
+                child_id,
+                depth + 1,
+                visiting,
+                result,
+            )? {
+                return Ok(Err(reason));
+            }
+        }
+        Ok(Ok(()))
+    })();
+    visiting.remove(&task_id);
+    outcome
 }
 
 /// Persist a merge commit recovered for a completed dependency. The PR lookup
@@ -12469,11 +12601,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             commits,
-            vec![DependencyMergeCommit {
+            DependencyMergeCommitResolution::Resolved(vec![DependencyMergeCommit {
                 task_id: dependency,
+                root_dependency_id: dependency,
                 pr_number: None,
                 merge_commit_sha: Some("deadbeef".into()),
-            }]
+            }])
         );
 
         let reason = "fetched origin/develop does not yet contain dependency merge commit deadbeef";
@@ -12504,6 +12637,262 @@ mod tests {
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs[DEPENDENCY_BASE_WAIT_ATTEMPTS_REF], 3);
         assert_eq!(refs[PARKED_REASON_REF], reason);
+    }
+
+    fn mark_done_for_dependency_provenance(conn: &Connection, task_id: i64) {
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [task_id])
+            .unwrap();
+    }
+
+    fn insert_completed_dependency_graph(
+        conn: &Connection,
+        source_task_id: i64,
+        child_ids: &[i64],
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 plan_revision,accepted_plan_revision,created_at,updated_at
+             ) VALUES (?1,'completed',0,0,1,1,1,1,1)",
+            [source_task_id],
+        )
+        .unwrap();
+        let graph_id = conn.last_insert_rowid();
+        for (index, child_id) in child_ids.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+                 VALUES (?1,?2,?3,1,1)",
+                rusqlite::params![graph_id, child_id, format!("child-{index}")],
+            )
+            .unwrap();
+        }
+        graph_id
+    }
+
+    #[test]
+    fn dependency_merge_commits_expands_every_completed_graph_child() {
+        let (_dir, mut conn) = open_tmp();
+        let source = create(
+            &mut conn, "owner", "source", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let first = create(
+            &mut conn,
+            "owner",
+            "first child",
+            None,
+            0,
+            None,
+            Some(r#"{"merge_commit_sha":"1111111111111111111111111111111111111111"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let second = create(
+            &mut conn,
+            "owner",
+            "second child",
+            None,
+            0,
+            None,
+            Some(r#"{"merge_commit_sha":"2222222222222222222222222222222222222222"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        for task_id in [source, first, second] {
+            mark_done_for_dependency_provenance(&conn, task_id);
+        }
+        insert_completed_dependency_graph(&conn, source, &[first, second]);
+
+        assert_eq!(
+            dependency_merge_commits(&conn, Some(&format!("[{source}]"))).unwrap(),
+            DependencyMergeCommitResolution::Resolved(vec![
+                DependencyMergeCommit {
+                    task_id: first,
+                    root_dependency_id: source,
+                    pr_number: None,
+                    merge_commit_sha: Some("1111111111111111111111111111111111111111".into()),
+                },
+                DependencyMergeCommit {
+                    task_id: second,
+                    root_dependency_id: source,
+                    pr_number: None,
+                    merge_commit_sha: Some("2222222222222222222222222222222222222222".into()),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn dependency_merge_commits_expands_nested_completed_graphs() {
+        let (_dir, mut conn) = open_tmp();
+        let source = create(
+            &mut conn, "owner", "source", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let nested_source = create(
+            &mut conn,
+            "owner",
+            "nested source",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let outer_leaf = create(
+            &mut conn,
+            "owner",
+            "outer leaf",
+            None,
+            0,
+            None,
+            Some(r#"{"merge_commit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let nested_leaf = create(
+            &mut conn,
+            "owner",
+            "nested leaf",
+            None,
+            0,
+            None,
+            Some(r#"{"merge_commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        for task_id in [source, nested_source, outer_leaf, nested_leaf] {
+            mark_done_for_dependency_provenance(&conn, task_id);
+        }
+        insert_completed_dependency_graph(&conn, nested_source, &[nested_leaf]);
+        insert_completed_dependency_graph(&conn, source, &[nested_source, outer_leaf]);
+
+        assert_eq!(
+            dependency_merge_commits(&conn, Some(&format!("[{source}]"))).unwrap(),
+            DependencyMergeCommitResolution::Resolved(vec![
+                DependencyMergeCommit {
+                    task_id: nested_leaf,
+                    root_dependency_id: source,
+                    pr_number: None,
+                    merge_commit_sha: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+                },
+                DependencyMergeCommit {
+                    task_id: outer_leaf,
+                    root_dependency_id: source,
+                    pr_number: None,
+                    merge_commit_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn dependency_merge_commits_fails_closed_for_incomplete_graph_or_child() {
+        let (_dir, mut conn) = open_tmp();
+        let source = create(
+            &mut conn, "owner", "source", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let child = create(
+            &mut conn, "owner", "child", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        mark_done_for_dependency_provenance(&conn, source);
+        insert_completed_dependency_graph(&conn, source, &[child]);
+        assert_eq!(
+            dependency_merge_commits(&conn, Some(&format!("[{source}]"))).unwrap(),
+            DependencyMergeCommitResolution::Unresolved {
+                reason: format!(
+                    "dependency #{source} completed decomposition graph child #{child} is not done"
+                ),
+            }
+        );
+
+        conn.execute(
+            "UPDATE task_decompositions SET state='active',active=1 WHERE source_task_id=?1",
+            [source],
+        )
+        .unwrap();
+        mark_done_for_dependency_provenance(&conn, child);
+        assert_eq!(
+            dependency_merge_commits(&conn, Some(&format!("[{source}]"))).unwrap(),
+            DependencyMergeCommitResolution::Unresolved {
+                reason: format!("dependency #{source} decomposition graph is not completed"),
+            }
+        );
+
+        conn.execute("UPDATE tasks SET status='decomposed' WHERE id=?1", [source])
+            .unwrap();
+        let dependent = create(
+            &mut conn,
+            "owner",
+            "dependent of active graph",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{source}]")),
+            None,
+            2,
+        )
+        .unwrap();
+        assert!(
+            !get(&conn, dependent).unwrap().unwrap().ready,
+            "the established dependency-ready gate keeps active decomposition sources out of admission"
+        );
+        assert!(
+            claim(&mut conn, "worker", Some(dependent), &[], TTL, 2)
+                .unwrap()
+                .is_none(),
+            "the established dependency claim gate must remain authoritative"
+        );
+
+        let stale_member = create(
+            &mut conn,
+            "owner",
+            "stale active member",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            3,
+        )
+        .unwrap();
+        mark_done_for_dependency_provenance(&conn, stale_member);
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [source])
+            .unwrap();
+        conn.execute(
+            "UPDATE task_decompositions SET state='completed',active=0 WHERE source_task_id=?1",
+            [source],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             SELECT id,?2,'stale',2,1 FROM task_decompositions WHERE source_task_id=?1",
+            rusqlite::params![source, stale_member],
+        )
+        .unwrap();
+        assert_eq!(
+            dependency_merge_commits(&conn, Some(&format!("[{source}]"))).unwrap(),
+            DependencyMergeCommitResolution::Unresolved {
+                reason: format!(
+                    "dependency #{source} completed decomposition graph membership is ambiguous"
+                ),
+            }
+        );
     }
 
     #[test]
