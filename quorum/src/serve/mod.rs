@@ -21825,125 +21825,152 @@ async fn verify_dependency_base_before_allocation(
     let load_dependencies = || {
         let db_path = db_path.to_path_buf();
         let depends_on = task.depends_on.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<tasks::DependencyMergeCommit>> {
+        tokio::task::spawn_blocking(move || -> Result<tasks::DependencyMergeCommitResolution> {
             let conn = quorum_core::db::open(&db_path)?;
             tasks::dependency_merge_commits(&conn, depends_on.as_deref())
         })
     };
-    let mut dependencies = load_dependencies()
+    let mut resolution = load_dependencies()
         .await
         .map_err(|error| QuorumError::Io(format!("dependency merge lookup join: {error}")))??;
-    if dependencies.is_empty() {
+    let mut unresolved_reason = match &resolution {
+        tasks::DependencyMergeCommitResolution::Resolved(_) => None,
+        tasks::DependencyMergeCommitResolution::Unresolved { reason } => Some(reason.clone()),
+    };
+    let mut dependencies = match resolution {
+        tasks::DependencyMergeCommitResolution::Resolved(dependencies) => dependencies,
+        tasks::DependencyMergeCommitResolution::Unresolved { .. } => Vec::new(),
+    };
+    if dependencies.is_empty() && unresolved_reason.is_none() {
         return Ok(DependencyBaseAdmission::NotRequired);
     }
 
     // A manual close can legitimately make a dependency done after the PR
     // already merged. Recover that immutable witness before allocation. All
     // GitHub/Git work completes before the tiny guarded SQLite write below.
-    for dependency in dependencies
-        .iter()
-        .filter(|dependency| dependency.merge_commit_sha.is_none())
-    {
-        let Some(pr_number) = dependency.pr_number else {
-            continue;
-        };
-        let repo = repo_dir.to_path_buf();
-        let executor = Arc::clone(&config.merge_executor);
-        let status =
-            tokio::task::spawn_blocking(move || executor.merge_commit_status(pr_number, &repo))
-                .await
-                .map_err(|error| QuorumError::Io(format!("dependency PR lookup join: {error}")))?;
-        let merge_commit_sha = match status {
-            merge::MergeCommitStatus::Merged {
-                merge_commit_sha: Some(sha),
-            } => Some(sha),
-            merge::MergeCommitStatus::Merged {
-                merge_commit_sha: None,
-            }
-            | merge::MergeCommitStatus::Unknown => wt_mgr
-                .find_merged_pr_commit(repo_dir, base_branch, pr_number)
-                .await
-                .map_err(|error| {
-                    QuorumError::Io(format!(
-                        "dependency #{}, PR #{pr_number} merge lookup failed: {error}",
+    if unresolved_reason.is_none() {
+        for dependency in dependencies
+            .iter()
+            .filter(|dependency| dependency.merge_commit_sha.is_none())
+        {
+            let Some(pr_number) = dependency.pr_number else {
+                continue;
+            };
+            let repo = repo_dir.to_path_buf();
+            let executor = Arc::clone(&config.merge_executor);
+            let status =
+                tokio::task::spawn_blocking(move || executor.merge_commit_status(pr_number, &repo))
+                    .await
+                    .map_err(|error| {
+                        QuorumError::Io(format!("dependency PR lookup join: {error}"))
+                    })?;
+            let merge_commit_sha = match status {
+                merge::MergeCommitStatus::Merged {
+                    merge_commit_sha: Some(sha),
+                } => Some(sha),
+                merge::MergeCommitStatus::Merged {
+                    merge_commit_sha: None,
+                }
+                | merge::MergeCommitStatus::Unknown => wt_mgr
+                    .find_merged_pr_commit(repo_dir, base_branch, pr_number)
+                    .await
+                    .map_err(|error| {
+                        QuorumError::Io(format!(
+                            "dependency #{}, PR #{pr_number} merge lookup failed: {error}",
+                            dependency.task_id
+                        ))
+                    })?,
+                merge::MergeCommitStatus::Open => {
+                    let reason = format!(
+                        "dependency #{} is done but PR #{pr_number} is still open",
                         dependency.task_id
-                    ))
-                })?,
-            merge::MergeCommitStatus::Open => {
-                let reason = format!(
-                    "dependency #{} is done but PR #{pr_number} is still open",
-                    dependency.task_id
-                );
-                require_park_task(
-                    db_path,
-                    task.id,
-                    &reason,
-                    if task.status == "rework" {
-                        "rework"
-                    } else {
-                        "open"
-                    },
-                )
-                .await?;
-                log(&format!("PARKED: task #{}: {reason}", task.id));
-                return Ok(DependencyBaseAdmission::Deferred);
+                    );
+                    require_park_task(
+                        db_path,
+                        task.id,
+                        &reason,
+                        if task.status == "rework" {
+                            "rework"
+                        } else {
+                            "open"
+                        },
+                    )
+                    .await?;
+                    log(&format!("PARKED: task #{}: {reason}", task.id));
+                    return Ok(DependencyBaseAdmission::Deferred);
+                }
+                merge::MergeCommitStatus::Closed => {
+                    let reason = format!(
+                        "dependency #{} is done but PR #{pr_number} closed without merging",
+                        dependency.task_id
+                    );
+                    require_park_task(
+                        db_path,
+                        task.id,
+                        &reason,
+                        if task.status == "rework" {
+                            "rework"
+                        } else {
+                            "open"
+                        },
+                    )
+                    .await?;
+                    log(&format!("PARKED: task #{}: {reason}", task.id));
+                    return Ok(DependencyBaseAdmission::Deferred);
+                }
+            };
+            let Some(merge_commit_sha) = merge_commit_sha else {
+                continue;
+            };
+            let db_path = db_path.to_path_buf();
+            let task_id = dependency.task_id;
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = quorum_core::db::open(&db_path)?;
+                tasks::record_dependency_merge_commit(
+                    &mut conn,
+                    task_id,
+                    pr_number,
+                    &merge_commit_sha,
+                    now_unix(),
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| QuorumError::Io(format!("dependency merge stamp join: {error}")))??;
+        }
+        resolution = load_dependencies()
+            .await
+            .map_err(|error| QuorumError::Io(format!("dependency merge reload join: {error}")))??;
+        match resolution {
+            tasks::DependencyMergeCommitResolution::Resolved(reloaded) => dependencies = reloaded,
+            tasks::DependencyMergeCommitResolution::Unresolved { reason } => {
+                unresolved_reason = Some(reason);
+                dependencies.clear();
             }
-            merge::MergeCommitStatus::Closed => {
-                let reason = format!(
-                    "dependency #{} is done but PR #{pr_number} closed without merging",
-                    dependency.task_id
-                );
-                require_park_task(
-                    db_path,
-                    task.id,
-                    &reason,
-                    if task.status == "rework" {
-                        "rework"
-                    } else {
-                        "open"
-                    },
-                )
-                .await?;
-                log(&format!("PARKED: task #{}: {reason}", task.id));
-                return Ok(DependencyBaseAdmission::Deferred);
-            }
-        };
-        let Some(merge_commit_sha) = merge_commit_sha else {
-            continue;
-        };
-        let db_path = db_path.to_path_buf();
-        let task_id = dependency.task_id;
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = quorum_core::db::open(&db_path)?;
-            tasks::record_dependency_merge_commit(
-                &mut conn,
-                task_id,
-                pr_number,
-                &merge_commit_sha,
-                now_unix(),
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|error| QuorumError::Io(format!("dependency merge stamp join: {error}")))??;
+        }
     }
-    dependencies = load_dependencies()
-        .await
-        .map_err(|error| QuorumError::Io(format!("dependency merge reload join: {error}")))??;
 
     let missing_record = dependencies
         .iter()
         .find(|dependency| dependency.merge_commit_sha.is_none());
-    let reason = if let Some(dependency) = missing_record {
+    let reason = if let Some(reason) = unresolved_reason {
+        reason
+    } else if let Some(dependency) = missing_record {
+        let dependency_description = if dependency.root_dependency_id == dependency.task_id {
+            format!("dependency #{}", dependency.task_id)
+        } else {
+            format!(
+                "dependency #{} completed decomposition graph child #{}",
+                dependency.root_dependency_id, dependency.task_id
+            )
+        };
         match dependency.pr_number {
             Some(pr) => format!(
-                "dependency #{} is done but PR #{pr} has no recoverable merge commit SHA",
-                dependency.task_id
+                "{dependency_description} is done but PR #{pr} has no recoverable merge commit SHA"
             ),
-            None => format!(
-                "dependency #{} is done but has no recorded merge commit SHA",
-                dependency.task_id
-            ),
+            None => {
+                format!("{dependency_description} is done but has no recorded merge commit SHA")
+            }
         }
     } else {
         let merge_commits = dependencies
@@ -41482,6 +41509,578 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(
             refs[quorum_core::tasks::PARKED_REASON_REF],
             format!("dependency #{dependency_id} is done but PR #702 is still open")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_decomposition_dependency_verifies_every_child_merge_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let remote = dir.path().join("remote.git");
+        let worker = dir.path().join("worker");
+        let git = |repo: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-q"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "test"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "base"]);
+        git(&source, &["branch", "-M", "main"]);
+        git(
+            &source,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&source, &["push", "-q", "origin", "main"]);
+
+        let mut child_merges = Vec::new();
+        for branch in ["first-child", "second-child", "third-child"] {
+            git(&source, &["checkout", "-q", "-b", branch, "main"]);
+            git(&source, &["commit", "--allow-empty", "-qm", branch]);
+            git(&source, &["checkout", "-q", "main"]);
+            let merge_message = if branch == "first-child" {
+                "Merge pull request #701 from first-child"
+            } else {
+                branch
+            };
+            git(&source, &["merge", "--no-ff", branch, "-m", merge_message]);
+            child_merges.push(git(&source, &["rev-parse", "HEAD"]));
+        }
+        git(&source, &["push", "-q", "origin", "main"]);
+        assert!(std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                worker.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success());
+
+        let db_path = dir.path().join("completed-decomposition.db");
+        let (dependent, recovered_child) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let decomposition_source = tasks::create(
+                &mut conn,
+                "owner",
+                "provatar source #8",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            let children = child_merges
+                .iter()
+                .enumerate()
+                .map(|(index, merge_commit_sha)| {
+                    let refs = if index == 0 {
+                        serde_json::json!({ "pr": 701 })
+                    } else {
+                        serde_json::json!({ "merge_commit_sha": merge_commit_sha })
+                    };
+                    tasks::create(
+                        &mut conn,
+                        "owner",
+                        &format!("generated child {index}"),
+                        None,
+                        0,
+                        None,
+                        Some(&refs.to_string()),
+                        None,
+                        None,
+                        now_unix(),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            for task_id in std::iter::once(decomposition_source).chain(children.iter().copied()) {
+                conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [task_id])
+                    .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO task_decompositions(
+                     source_task_id,state,active,freeze_active,planned_source_revision,
+                     plan_revision,accepted_plan_revision,created_at,updated_at
+                 ) VALUES (?1,'completed',0,0,1,1,1,1,1)",
+                [decomposition_source],
+            )
+            .unwrap();
+            let graph_id = conn.last_insert_rowid();
+            for (index, child_id) in children.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+                     VALUES (?1,?2,?3,1,1)",
+                    rusqlite::params![graph_id, child_id, format!("child-{index}")],
+                )
+                .unwrap();
+            }
+            let dependent = tasks::create(
+                &mut conn,
+                "owner",
+                "provatar dependent #9",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                Some(&format!("[{decomposition_source}]")),
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            let dependent = tasks::claim(
+                &mut conn,
+                "worker",
+                Some(dependent),
+                &[],
+                tasks::DEFAULT_LEASE_TTL_SECS,
+                now_unix(),
+            )
+            .unwrap()
+            .unwrap();
+            let source_refs: Option<String> = conn
+                .query_row(
+                    "SELECT refs FROM tasks WHERE id=?1",
+                    [decomposition_source],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                source_refs.is_none(),
+                "the source never receives child PR evidence"
+            );
+            (dependent, children[0])
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), worker.clone());
+        config.merge_executor = Arc::new(UnknownDependencyMergeStatusExecutor);
+        let admission = verify_dependency_base_before_allocation(
+            &config,
+            &db_path,
+            &WorktreeManager::new(),
+            &worker,
+            &dependent,
+            "worker",
+            "main",
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            admission,
+            DependencyBaseAdmission::Verified { merge_commits, .. }
+                if merge_commits == child_merges
+        ));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let recovered_refs: String = conn
+            .query_row(
+                "SELECT refs FROM tasks WHERE id=?1",
+                [recovered_child],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let recovered_refs: serde_json::Value = serde_json::from_str(&recovered_refs).unwrap();
+        assert_eq!(recovered_refs["merge_commit_sha"], child_merges[0]);
+
+        let single_child_dependent = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let source = tasks::create(
+                &mut conn,
+                "owner",
+                "single-child source",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            let child = tasks::create(
+                &mut conn,
+                "owner",
+                "single sink child",
+                None,
+                0,
+                None,
+                Some(&serde_json::json!({ "merge_commit_sha": child_merges[1] }).to_string()),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            for task_id in [source, child] {
+                conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [task_id])
+                    .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO task_decompositions(
+                     source_task_id,state,active,freeze_active,planned_source_revision,
+                     plan_revision,accepted_plan_revision,created_at,updated_at
+                 ) VALUES (?1,'completed',0,0,1,1,1,1,1)",
+                [source],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+                 VALUES (?1,?2,'only',1,1)",
+                [conn.last_insert_rowid(), child],
+            )
+            .unwrap();
+            let dependent = tasks::create(
+                &mut conn,
+                "owner",
+                "single-child dependent",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                Some(&format!("[{source}]")),
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            tasks::claim(
+                &mut conn,
+                "worker",
+                Some(dependent),
+                &[],
+                tasks::DEFAULT_LEASE_TTL_SECS,
+                now_unix(),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert!(matches!(
+            verify_dependency_base_before_allocation(
+                &config,
+                &db_path,
+                &WorktreeManager::new(),
+                &worker,
+                &single_child_dependent,
+                "worker",
+                "main",
+            )
+            .await
+            .unwrap(),
+            DependencyBaseAdmission::Verified { merge_commits, .. }
+                if merge_commits == vec![child_merges[1].clone()]
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_decomposition_child_without_sha_defers_then_parks_naming_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing-child-sha.db");
+        let (source, missing_child, dependent_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let source = tasks::create(
+                &mut conn,
+                "owner",
+                "source",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            let missing_child = tasks::create(
+                &mut conn,
+                "owner",
+                "missing merge child",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            for task_id in [source, missing_child] {
+                conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [task_id])
+                    .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO task_decompositions(
+                     source_task_id,state,active,freeze_active,planned_source_revision,
+                     plan_revision,accepted_plan_revision,created_at,updated_at
+                 ) VALUES (?1,'completed',0,0,1,1,1,1,1)",
+                [source],
+            )
+            .unwrap();
+            let graph_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+                 VALUES (?1,?2,'missing',1,1)",
+                [graph_id, missing_child],
+            )
+            .unwrap();
+            let dependent_id = tasks::create(
+                &mut conn,
+                "owner",
+                "dependent",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                Some(&format!("[{source}]")),
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            (source, missing_child, dependent_id)
+        };
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        for attempt in 1..=3 {
+            let dependent = {
+                let mut conn = quorum_core::db::open(&db_path).unwrap();
+                tasks::claim(
+                    &mut conn,
+                    "worker",
+                    Some(dependent_id),
+                    &[],
+                    tasks::DEFAULT_LEASE_TTL_SECS,
+                    now_unix(),
+                )
+                .unwrap()
+                .unwrap()
+            };
+            assert!(matches!(
+                verify_dependency_base_before_allocation(
+                    &config,
+                    &db_path,
+                    &WorktreeManager::new(),
+                    dir.path(),
+                    &dependent,
+                    "worker",
+                    "main",
+                )
+                .await
+                .unwrap(),
+                DependencyBaseAdmission::Deferred
+            ));
+            if attempt < 3 {
+                let conn = quorum_core::db::open(&db_path).unwrap();
+                assert_eq!(
+                    tasks::get(&conn, dependent_id).unwrap().unwrap().status,
+                    "open"
+                );
+            }
+        }
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let dependent = tasks::get(&conn, dependent_id).unwrap().unwrap();
+        assert_eq!(dependent.status, "failed");
+        let refs: serde_json::Value =
+            serde_json::from_str(dependent.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            refs[quorum_core::tasks::PARKED_REASON_REF],
+            format!(
+                "dependency #{source} completed decomposition graph child #{missing_child} is done but has no recorded merge commit SHA"
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completed_decomposition_dependency_defers_when_one_child_merge_is_missing_from_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let remote = dir.path().join("remote.git");
+        let worker = dir.path().join("worker");
+        let git = |repo: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-q"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "test"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "base"]);
+        git(&source, &["branch", "-M", "main"]);
+        git(
+            &source,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&source, &["push", "-q", "origin", "main"]);
+
+        git(&source, &["checkout", "-q", "-b", "first", "main"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "first"]);
+        git(&source, &["checkout", "-q", "main"]);
+        git(&source, &["merge", "--no-ff", "first", "-m", "first"]);
+        let merged_child = git(&source, &["rev-parse", "HEAD"]);
+        git(&source, &["push", "-q", "origin", "main"]);
+        assert!(std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                worker.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success());
+
+        git(&source, &["checkout", "-q", "-b", "second", "main"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "second"]);
+        git(&source, &["checkout", "-q", "main"]);
+        git(&source, &["merge", "--no-ff", "second", "-m", "second"]);
+        let unpropagated_child = git(&source, &["rev-parse", "HEAD"]);
+
+        let db_path = dir.path().join("stale-decomposition-base.db");
+        let dependent = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let decomposition_source = tasks::create(
+                &mut conn,
+                "owner",
+                "source",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            let children = [merged_child.as_str(), unpropagated_child.as_str()]
+                .into_iter()
+                .map(|merge_commit_sha| {
+                    tasks::create(
+                        &mut conn,
+                        "owner",
+                        "child",
+                        None,
+                        0,
+                        None,
+                        Some(
+                            &serde_json::json!({ "merge_commit_sha": merge_commit_sha })
+                                .to_string(),
+                        ),
+                        None,
+                        None,
+                        now_unix(),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            for task_id in std::iter::once(decomposition_source).chain(children.iter().copied()) {
+                conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [task_id])
+                    .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO task_decompositions(
+                     source_task_id,state,active,freeze_active,planned_source_revision,
+                     plan_revision,accepted_plan_revision,created_at,updated_at
+                 ) VALUES (?1,'completed',0,0,1,1,1,1,1)",
+                [decomposition_source],
+            )
+            .unwrap();
+            let graph_id = conn.last_insert_rowid();
+            for (index, child_id) in children.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+                     VALUES (?1,?2,?3,1,1)",
+                    rusqlite::params![graph_id, child_id, format!("child-{index}")],
+                )
+                .unwrap();
+            }
+            let dependent_id = tasks::create(
+                &mut conn,
+                "owner",
+                "dependent",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                Some(&format!("[{decomposition_source}]")),
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            tasks::claim(
+                &mut conn,
+                "worker",
+                Some(dependent_id),
+                &[],
+                tasks::DEFAULT_LEASE_TTL_SECS,
+                now_unix(),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let config = pre_review_ci_test_config(db_path.clone(), worker.clone());
+        assert!(matches!(
+            verify_dependency_base_before_allocation(
+                &config,
+                &db_path,
+                &WorktreeManager::new(),
+                &worker,
+                &dependent,
+                "worker",
+                "main",
+            )
+            .await
+            .unwrap(),
+            DependencyBaseAdmission::Deferred
+        ));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let dependent = tasks::get(&conn, dependent.id).unwrap().unwrap();
+        assert_eq!(dependent.status, "open");
+        let refs: serde_json::Value =
+            serde_json::from_str(dependent.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            refs[quorum_core::tasks::DEPENDENCY_BASE_WAIT_REASON_REF],
+            format!(
+                "fetched origin/main does not yet contain dependency merge commit {unpropagated_child}"
+            )
         );
     }
 

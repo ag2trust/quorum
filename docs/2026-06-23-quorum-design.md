@@ -875,7 +875,11 @@ only through an explicit outside request)
   A daemon-observed merge also records GitHub's immutable merge commit in
   `refs.merge_commit_sha`. Before **first** allocation of a dependent's branch, the daemon
   fetches its authoritative target branch and requires every dependency's recorded merge
-  commit to be an ancestor of that fetched base SHA; that exact verified SHA is the
+  commit to be an ancestor of that fetched base SHA; a completed decomposition source instead
+  contributes every active member of its accepted completed graph (recursively for a completed
+  nested source). The source itself never receives fabricated PR or merge-SHA evidence. Any
+  incomplete graph, non-done child, missing leaf provenance, or ambiguous membership fails
+  closed through the same bounded dependency-base wait. That exact verified SHA is the
   allocation provenance. On **resume** (an existing `task_branches` row), the daemon
   instead verifies each dependency merge commit is an ancestor of the branch itself
   (local `refs/heads/<branch>`, falling back to `refs/remotes/origin/<branch>`); the

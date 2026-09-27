@@ -8446,11 +8446,14 @@ mod tests {
                     .as_deref(),
             )
             .unwrap(),
-            vec![crate::tasks::DependencyMergeCommit {
-                task_id: fixture.original,
-                pr_number: Some(RECOVERY_PR),
-                merge_commit_sha: Some(RECOVERY_MERGE.into()),
-            }]
+            crate::tasks::DependencyMergeCommitResolution::Resolved(vec![
+                crate::tasks::DependencyMergeCommit {
+                    task_id: fixture.original,
+                    root_dependency_id: fixture.original,
+                    pr_number: Some(RECOVERY_PR),
+                    merge_commit_sha: Some(RECOVERY_MERGE.into()),
+                },
+            ])
         );
         let events: (i64, i64) = fixture
             .conn
@@ -9372,8 +9375,14 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let commits =
-            crate::tasks::dependency_merge_commits(&fixture.conn, Some(&depends_on)).unwrap();
+        let commits = match crate::tasks::dependency_merge_commits(&fixture.conn, Some(&depends_on))
+            .unwrap()
+        {
+            crate::tasks::DependencyMergeCommitResolution::Resolved(commits) => commits,
+            crate::tasks::DependencyMergeCommitResolution::Unresolved { reason } => {
+                panic!("expected resolved recovery dependency: {reason}")
+            }
+        };
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].task_id, fixture.original);
         assert_eq!(commits[0].merge_commit_sha.as_deref(), Some(RECOVERY_MERGE));
