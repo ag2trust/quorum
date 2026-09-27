@@ -20463,6 +20463,16 @@ fn reviewer_name_exclusions(
     excluded
 }
 
+fn worker_name_exclusions(
+    prior_runs: &[quorum_core::agent_runs::AgentRun],
+) -> std::collections::HashSet<String> {
+    prior_runs
+        .iter()
+        .filter(|run| run.role == "worker" || run.role == "reviewer")
+        .map(|run| run.agent.clone())
+        .collect()
+}
+
 /// Record one durable provision strike for a (task, PR, role) and report the
 /// new count. Every failure inside `provision_reviewer_reserved` that happens
 /// after the reviewer identity and worktree exist must go through this: the
@@ -22128,10 +22138,21 @@ async fn spawn_worker(
         return Ok(false);
     }
 
-    let acquire_result = name_pool.acquire();
+    let prior_runs = {
+        let p = db_path.clone();
+        let task_id = task.id;
+        tokio::task::spawn_blocking(move || -> Result<Vec<quorum_core::agent_runs::AgentRun>> {
+            let conn = quorum_core::db::open(&p)?;
+            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??
+    };
+    let excluded = worker_name_exclusions(&prior_runs);
+    let acquire_result = name_pool.acquire_excluding(&excluded);
     if acquire_result.is_generated() && name_pool.has_file() {
         log(&format!(
-            "names pool exhausted, generated fallback name: {}",
+            "names pool exhausted, generated fallback worker name: {}",
             acquire_result.name()
         ));
     }
@@ -26496,7 +26517,28 @@ async fn spawn_remediation_worker(
         .unwrap_or((String::new(), String::new(), false))
     };
 
-    let agent_name = name_pool.acquire().into_name();
+    let prior_runs = {
+        let p = db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<quorum_core::agent_runs::AgentRun>> {
+            let conn = quorum_core::db::open(&p)?;
+            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+        })
+        .await
+        .map_err(|error| {
+            QuorumError::Io(format!(
+                "remediation worker history lookup join for task #{task_id}: {error}"
+            ))
+        })??
+    };
+    let excluded = worker_name_exclusions(&prior_runs);
+    let acquire_result = name_pool.acquire_excluding(&excluded);
+    if acquire_result.is_generated() && name_pool.has_file() {
+        log(&format!(
+            "names pool exhausted, generated fallback remediation worker name: {}",
+            acquire_result.name()
+        ));
+    }
+    let agent_name = acquire_result.into_name();
     lifetime_roster.register(&agent_name);
 
     // Acquire the remediation lease BEFORE any other write that could invoke
@@ -36059,6 +36101,164 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             grok: Default::default(),
             pr_target_program: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_worker_excludes_prior_reviewers_after_release_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("state.txt"), "base\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["branch", "-M", "main"]);
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "main"]);
+
+        let db_path = dir.path().join("quorum.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "reclaim must exclude reviewers",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            let r1 = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "PriorR1",
+                "reviewer",
+                "claude-sonnet-5",
+                "high",
+                "claude",
+                now_unix(),
+            )
+            .unwrap();
+            quorum_core::agent_runs::close(&conn, r1, now_unix(), "completed").unwrap();
+            let r2 = quorum_core::agent_runs::insert_r2(
+                &conn,
+                task_id,
+                "PriorR2",
+                "claude-sonnet-5",
+                "high",
+                "claude",
+                now_unix(),
+            )
+            .unwrap();
+            quorum_core::agent_runs::close(&conn, r2, now_unix(), "completed").unwrap();
+
+            tasks::claim(
+                &mut conn,
+                "ReleasedWorker",
+                Some(task_id),
+                &[],
+                tasks::DEFAULT_LEASE_TTL_SECS,
+                now_unix(),
+            )
+            .unwrap()
+            .expect("test worker must claim before release");
+            tasks::update(
+                &mut conn,
+                "ReleasedWorker",
+                task_id,
+                &tasks::TaskUpdate {
+                    status: Some("open"),
+                    ..Default::default()
+                },
+                now_unix(),
+            )
+            .unwrap();
+            assert_eq!(
+                tasks::get(&conn, task_id).unwrap().unwrap().status,
+                "open",
+                "the task must be claimable again after its worker releases it"
+            );
+            task_id
+        };
+
+        let names_path = dir.path().join("names.txt");
+        std::fs::write(&names_path, "PriorR1\nPriorR2\n").unwrap();
+        let mut names = Pool::load(&names_path, 1).unwrap();
+        let r1 = names.acquire().into_name();
+        let r2 = names.acquire().into_name();
+        assert_eq!((r1.as_str(), r2.as_str()), ("PriorR1", "PriorR2"));
+        names.release(&r1);
+        names.release(&r2);
+
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo.clone());
+        config.worktree_base = dir.path().join("worktrees");
+        config.agent_bin = Some("true".into());
+        let wt_mgr = WorktreeManager::new();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+
+        assert!(
+            spawn_worker(
+                &config,
+                &wt_mgr,
+                &mut names,
+                &mut workers,
+                &mut poison,
+                &mut skips,
+                &mut roster,
+            )
+            .await
+            .unwrap(),
+            "the released task must be re-claimed"
+        );
+        let worker_name = workers[0].agent_name.clone();
+        assert_ne!(worker_name, "PriorR1");
+        assert_ne!(worker_name, "PriorR2");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "working");
+        assert_eq!(task.assignee.as_deref(), Some(worker_name.as_str()));
+        assert!(
+            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+                .unwrap()
+                .iter()
+                .any(|run| run.role == "worker" && run.agent == worker_name),
+            "the new worker run must use the fresh, non-reviewer identity"
+        );
+
+        workers.pop().unwrap().kill_and_reap().await;
     }
 
     async fn make_live_pre_review_ci_slot(task_id: i64, worktree_path: PathBuf) -> SlotState {
