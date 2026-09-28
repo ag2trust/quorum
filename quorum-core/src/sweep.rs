@@ -77,8 +77,8 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
              )
              AND NOT (
                  t.status = 'rework'
-                 AND t.assignee IS NULL
                  AND json_valid(t.refs)
+                 AND json_type(t.refs, '$.pr') IS NOT NULL
                  AND (
                      COALESCE(json_type(t.refs, '$.daemon_rework_retry_requested')='true', 0)
                      OR COALESCE(json_type(t.refs, '$.daemon_recovered_remediation_retry')='true', 0)
@@ -2431,6 +2431,46 @@ mod tests {
                     && message.body.contains("resuming rework")
             }));
         }
+    }
+
+    #[test]
+    fn reaper_leaves_pr_bound_pending_remediation_retry_for_its_reconciler() {
+        let (_d, mut c) = open_tmp();
+        let id = crate::tasks::create(
+            &mut c,
+            "boss",
+            "pending exact remediation",
+            None,
+            0,
+            None,
+            Some(r#"{"pr":42,"daemon_rework_retry_requested":true}"#),
+            None,
+            Some(42),
+            1000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks
+             SET status='rework', assignee='W1', author='W1', rework_round=1,
+                 updated_at=1000
+             WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+
+        // The normal rework transition preserves its author as assignee until
+        // the exact retry claim is installed. That stale assignment must not
+        // make the reaper steal an owner-requested PR-bound retry.
+        reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
+        let task = crate::tasks::get(&c, id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.assignee.as_deref(), Some("W1"));
+        assert_eq!(task.recovery_attempts, 0);
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_rework_retry_requested"], true);
+        assert!(!crate::tasks::recovered_remediation_retry_requested(
+            task.refs.as_deref()
+        ));
     }
 
     #[test]
