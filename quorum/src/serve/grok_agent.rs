@@ -40,7 +40,7 @@ pub const MAX_CONFIGURED_TURNS: u32 = 256;
 const RESTRICTED_SANDBOX: &str = "read-only";
 const RESTRICTED_PERMISSION_MODE: &str = "dontAsk";
 const RESTRICTED_MAX_TURNS: u32 = 8;
-const SUCCESSFUL_STOP_REASON: &str = "EndTurn";
+const SUCCESSFUL_STOP_REASONS: &[&str] = &["EndTurn", "end_turn"];
 const MAX_TURNS_REACHED_STOP_REASON: &str = "max_turns_reached";
 const MANAGED_WORKSPACE_SANDBOX: &str = "quorum_managed_workspace";
 const STDOUT_LINE_BYTES: usize = 1024 * 1024;
@@ -1751,7 +1751,7 @@ fn normalize_end(value: &serde_json::Value) -> Vec<AgentEvent> {
             cost_usd: None,
         }];
     }
-    if value.get("stopReason").and_then(serde_json::Value::as_str) != Some(SUCCESSFUL_STOP_REASON) {
+    if !successful_stop_reason(value.get("stopReason").and_then(serde_json::Value::as_str)) {
         return vec![AgentEvent::TurnFailed {
             message: "Grok end event did not report the successful stopReason".into(),
             usage: terminal_usage(value),
@@ -1775,8 +1775,12 @@ fn terminal_session_id(raw: &str) -> Option<String> {
 }
 
 fn successful_end_session_id(value: &serde_json::Value) -> Option<&str> {
-    (value.get("stopReason").and_then(serde_json::Value::as_str) == Some(SUCCESSFUL_STOP_REASON))
+    successful_stop_reason(value.get("stopReason").and_then(serde_json::Value::as_str))
         .then(|| valid_end_session_id(value))?
+}
+
+fn successful_stop_reason(stop_reason: Option<&str>) -> bool {
+    stop_reason.is_some_and(|stop_reason| SUCCESSFUL_STOP_REASONS.contains(&stop_reason))
 }
 
 fn max_turns_exhaustion(raw: &str) -> Option<MaxTurnsExhaustion> {
@@ -2456,23 +2460,24 @@ mod tests {
 
     #[test]
     fn fixture_session_identity_and_terminal_success() {
-        let raw = r#"{"type":"end","stopReason":"EndTurn","sessionId":"sess-1","requestId":"req-1","usage":{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":3,"output_tokens":4},"total_cost_usd":0.0125}"#;
+        // Grok CLI 1.0.40's observed normal-mode terminal event (signature omitted).
+        let raw = r#"{"type":"end","stopReason":"end_turn","sessionId":"01a0e69a-9c9e-7ea3-aa94-9b160eab32f4","requestId":"d6702362-ca29-4526-9f39-8c20dfe3eae0","usage":{"input_tokens":13041,"cache_read_input_tokens":6656,"cache_creation_input_tokens":0,"output_tokens":38,"reasoning_tokens":30,"total_tokens":19735},"num_turns":1,"total_cost_usd":0.01007692}"#;
         let events = normalize_grok_line(raw);
         assert_eq!(
             events[0],
             AgentEvent::ThreadStarted {
-                thread_id: "sess-1".into()
+                thread_id: "01a0e69a-9c9e-7ea3-aa94-9b160eab32f4".into()
             }
         );
         assert_eq!(
             events[1],
             AgentEvent::TurnCompleted {
                 usage: Some(TokenUsage {
-                    input_tokens: 33,
-                    uncached_input_tokens: 10,
-                    cached_input_tokens: 20,
-                    cache_write_input_tokens: 3,
-                    output_tokens: 4,
+                    input_tokens: 19_697,
+                    uncached_input_tokens: 13_041,
+                    cached_input_tokens: 6_656,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 38,
                     ..Default::default()
                 }),
                 cost_usd: None,
@@ -2482,13 +2487,28 @@ mod tests {
 
     #[test]
     fn terminal_success_requires_the_documented_stop_reason() {
-        let success = r#"{"type":"end","stopReason":"EndTurn","sessionId":"sess-1"}"#;
-        assert_eq!(
-            GrokProc::failure_observation(success),
-            FailureObservation::success()
-        );
+        for stop_reason in ["EndTurn", "end_turn"] {
+            let raw = serde_json::json!({
+                "type": "end",
+                "stopReason": stop_reason,
+                "sessionId": "sess-1",
+            })
+            .to_string();
+            assert_eq!(
+                GrokProc::failure_observation(&raw),
+                FailureObservation::success(),
+                "stopReason={stop_reason}",
+            );
+            assert!(matches!(
+                normalize_grok_line(&raw).as_slice(),
+                [
+                    AgentEvent::ThreadStarted { .. },
+                    AgentEvent::TurnCompleted { .. }
+                ]
+            ));
+        }
 
-        for stop_reason in ["max_turns_reached", "cancelled"] {
+        for stop_reason in ["max_turns_reached", "cancelled", "error", "end_turn "] {
             let raw = serde_json::json!({
                 "type": "end",
                 "stopReason": stop_reason,
@@ -2512,6 +2532,19 @@ mod tests {
                 "stopReason={stop_reason}"
             );
         }
+
+        let missing_stop_reason = r#"{"type":"end","sessionId":"sess-1"}"#;
+        assert_eq!(
+            GrokProc::failure_observation(missing_stop_reason),
+            FailureObservation::classified(
+                FailureDisposition::NonFailover,
+                "Grok terminal did not report the successful stopReason",
+            ),
+        );
+        assert!(matches!(
+            normalize_grok_line(missing_stop_reason).as_slice(),
+            [AgentEvent::TurnFailed { message, .. }] if message.contains("successful stopReason")
+        ));
     }
 
     #[test]

@@ -2029,9 +2029,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 }
                 let pending_task_ids: Vec<i64> = tasks.iter().map(|task| task.id).collect();
                 let pending_inputs = quorum_core::classify::classification_inputs(&tasks);
-                let recommendations = quorum_core::complexity::recommendation_lines(
-                    quorum_core::complexity::RecommendationProvider::Claude,
-                );
 
                 let results = rt.block_on(async {
                     let mut slot = serve::classifier::spawn_classifier_configured(
@@ -2042,7 +2039,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                         serve::classifier::CLASSIFIER_MODEL,
                         serve::classifier::CLASSIFIER_EFFORT,
                         "workspace-write",
-                        &recommendations,
+                        "",
                     )
                     .await
                     .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
