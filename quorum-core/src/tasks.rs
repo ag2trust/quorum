@@ -516,15 +516,31 @@ macro_rules! size_dispatch_policy_sql {
 }
 pub(crate) const SIZE_DISPATCH_POLICY_SQL: &str = size_dispatch_policy_sql!();
 
+/// SQL fragment that is true when `tasks.refs` carries a non-null
+/// `branch_sync` reference — the daemon-created conflict judgment task
+/// bound to a `branch_syncs` row. Kept alongside the direct-dispatch
+/// macros so the SQL and Rust skip predicates share a single source.
+macro_rules! branch_sync_ref_present_sql {
+    () => {
+        "(json_valid(COALESCE(refs, '{}')) \
+          AND json_type(COALESCE(refs, '{}'), '$.branch_sync') IS NOT NULL \
+          AND json_type(COALESCE(refs, '{}'), '$.branch_sync') != 'null')"
+    };
+}
+pub const BRANCH_SYNC_REF_PRESENT_SQL: &str = branch_sync_ref_present_sql!();
+
 // SQL counterpart of the implementation branch in
 // `classification_is_dispatchable`. Callers that need implementation work
-// additionally require `review_only=0`; continuation tasks and terminal leaves
-// remain eligible outside the ordinary size policy. Terminal leaves still reject
-// XL, which is disallowed when a decomposition plan is accepted.
+// additionally require `review_only=0`; continuation tasks, tasks bound to a
+// `branch_syncs` conflict row, and terminal leaves remain eligible outside the
+// ordinary size policy. Terminal leaves still reject XL, which is disallowed
+// when a decomposition plan is accepted.
 macro_rules! direct_dispatch_clause_sql {
     () => {
         concat!(
             "(review_only=1 OR continue_pr IS NOT NULL OR ",
+            branch_sync_ref_present_sql!(),
+            " OR ",
             "(terminal_leaf=1 AND json_extract(refs, '$.cx_size') != 'XL') OR ",
             size_dispatch_policy_sql!(),
             ")"
@@ -1136,6 +1152,44 @@ pub fn create_with_continue_pr_and_target_branch(
     target_branch: Option<&str>,
     now: i64,
 ) -> Result<i64> {
+    let tx = begin_immediate(conn)?;
+    let id = create_task_tx(
+        &tx,
+        created_by,
+        title,
+        body,
+        priority,
+        labels,
+        refs,
+        depends_on,
+        review_pr,
+        continue_pr,
+        target_branch,
+        now,
+    )?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Insert one task row inside an existing write transaction and emit
+/// `task_created`. Callers own commit and any additional writes that must
+/// land atomically with the task creation (e.g. binding a `branch_syncs`
+/// judgment task to its sync row).
+#[allow(clippy::too_many_arguments)]
+pub fn create_task_tx(
+    tx: &rusqlite::Transaction<'_>,
+    created_by: &str,
+    title: &str,
+    body: Option<&str>,
+    priority: i64,
+    labels: Option<&str>,
+    refs: Option<&str>,
+    depends_on: Option<&str>,
+    review_pr: Option<i64>,
+    continue_pr: Option<i64>,
+    target_branch: Option<&str>,
+    now: i64,
+) -> Result<i64> {
     if review_pr.is_some() && continue_pr.is_some() {
         return Err(QuorumError::Usage(
             "--review-pr and --continue-pr are mutually exclusive".into(),
@@ -1172,16 +1226,15 @@ pub fn create_with_continue_pr_and_target_branch(
     } else {
         ("open", 0_i64, refs.map(|s| s.to_string()))
     };
-    let tx = begin_immediate(conn)?;
     if let Some(pr) = review_pr.or(continue_pr) {
-        if let Some(owner) = active_pr_owner_in(&tx, pr, None)? {
+        if let Some(owner) = active_pr_owner_in(tx, pr, None)? {
             return Err(QuorumError::Usage(format!(
                 "PR #{pr} is already associated with active task #{owner}"
             )));
         }
     }
-    crate::agents::touch(&tx, created_by, now)?;
-    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    crate::agents::touch(tx, created_by, now)?;
+    crate::sweep::sweep_on_write(tx, now, SWEEP_LIMIT)?;
     // A continuation of a failed generated child is a recovery candidate for
     // that exact child, not merely another task that happens to use the same
     // PR. Stamp the durable provenance while creating the continuation so the
@@ -1238,8 +1291,7 @@ pub fn create_with_continue_pr_and_target_branch(
         Some(l) => format!("created (prio {priority}, labels {l})"),
         None => format!("created (prio {priority})"),
     };
-    crate::events::emit(&tx, "task_created", &lease_target(id), &body_str, now)?;
-    tx.commit()?;
+    crate::events::emit(tx, "task_created", &lease_target(id), &body_str, now)?;
     Ok(id)
 }
 
@@ -4558,6 +4610,19 @@ pub fn classification_is_complete(refs: &Option<String>) -> bool {
     (1..=5).contains(&cx) && matches!(size, "S" | "M" | "L" | "XL") && reason_is_valid
 }
 
+/// Whether `refs` carries a non-null `branch_sync` reference — the durable
+/// binding written by the daemon when it creates the judgment task for a
+/// `conflict` branch-sync row. Match with [`BRANCH_SYNC_REF_PRESENT_SQL`].
+pub fn refs_have_branch_sync_ref(refs: Option<&str>) -> bool {
+    let Some(refs) = refs else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(refs) else {
+        return false;
+    };
+    value.get("branch_sync").is_some_and(|v| !v.is_null())
+}
+
 /// Classification policy is intentionally separate from model routing: difficult
 /// focused work may run, while unready or compound work is parked.
 pub fn classification_is_dispatchable(
@@ -4582,10 +4647,10 @@ pub fn classification_is_dispatchable_for_status(
     if !classification_is_complete(refs) {
         return false;
     }
-    let Some(refs) = refs else {
+    let Some(refs_str) = refs else {
         return false;
     };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(refs) else {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(refs_str) else {
         return false;
     };
     let Some(cx) = v.get("cx_est").and_then(|v| v.as_i64()) else {
@@ -4599,10 +4664,12 @@ pub fn classification_is_dispatchable_for_status(
         .and_then(serde_json::Value::as_array)
         .is_some_and(|flags| !flags.is_empty());
     let ready = v.get("cx_ready").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_branch_sync = refs_have_branch_sync_ref(Some(refs_str));
     ready
         && (1..=5).contains(&cx)
         && (review_only
             || continue_pr.is_some()
+            || is_branch_sync
             || (terminal_leaf && size != "XL")
             || (status != "open" && is_flagged_large_cx_four(size, cx, has_risk_flags))
             || size_is_dispatchable(size, cx, has_risk_flags))
@@ -4787,17 +4854,18 @@ pub(crate) fn park_complexity_five_tx(
 pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Result<usize> {
     let tx = begin_immediate(conn)?;
     let ids: Vec<i64> = {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare(&format!(
             "SELECT id FROM tasks
              WHERE status NOT IN ('done','failed','cancelled')
                AND json_valid(refs)
+               AND NOT {BRANCH_SYNC_REF_PRESENT_SQL}
                AND (json_extract(refs, '$.cx_ready')!=1
                     OR (review_only=0 AND continue_pr IS NULL
                         AND json_extract(refs, '$.cx_size')='XL'
                         AND json_extract(refs, '$.cx_est') <= 3))
              ORDER BY id
-             LIMIT ?1",
-        )?;
+             LIMIT ?1"
+        ))?;
         let rows = stmt
             .query_map(params![SWEEP_LIMIT as i64], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -16324,6 +16392,54 @@ mod tests {
                 .get::<_, bool>(0))
             .unwrap());
         assert!(DIRECT_DISPATCH_CLAUSE.contains(SIZE_DISPATCH_POLICY_SQL));
+    }
+
+    #[test]
+    fn branch_sync_ref_task_is_dispatchable_like_review_only_and_continue_pr() {
+        // A conflict judgment task carries `refs.branch_sync=<id>` and, once
+        // classified, must dispatch directly at every size — exactly matching
+        // the existing review-only and continue-pr skip semantics.
+        let (_dir, conn) = open_tmp();
+        let direct_sql = format!(
+            "SELECT {DIRECT_DISPATCH_CLAUSE} FROM (
+                SELECT ?1 AS refs, 0 AS review_only, NULL AS continue_pr, 0 AS terminal_leaf
+             )"
+        );
+        for size in ["S", "M", "L", "XL"] {
+            for cx_est in 1..=5 {
+                let refs = format!(
+                    r#"{{"branch_sync":42,"cx_est":{cx_est},"cx_size":"{size}","cx_ready":true,"cx_not_ready_reason":null,"cx_risk_flags":[]}}"#
+                );
+                assert!(
+                    classification_is_dispatchable(&Some(refs.clone()), false, None, false),
+                    "branch_sync ref must dispatch at {size}/{cx_est}"
+                );
+                let direct_sql_verdict: bool = conn
+                    .query_row(&direct_sql, params![refs.clone()], |row| row.get(0))
+                    .unwrap();
+                assert!(
+                    direct_sql_verdict,
+                    "SQL dispatch clause must accept branch_sync ref at {size}/{cx_est}"
+                );
+
+                let without_ref = format!(
+                    r#"{{"cx_est":{cx_est},"cx_size":"{size}","cx_ready":true,"cx_not_ready_reason":null,"cx_risk_flags":[]}}"#
+                );
+                let sql_without: bool = conn
+                    .query_row(&direct_sql, params![without_ref.clone()], |row| row.get(0))
+                    .unwrap();
+                let rust_without =
+                    classification_is_dispatchable(&Some(without_ref), false, None, false);
+                assert_eq!(
+                    sql_without, rust_without,
+                    "reference behavior for {size}/{cx_est} without branch_sync ref must match"
+                );
+            }
+        }
+        assert!(refs_have_branch_sync_ref(Some(r#"{"branch_sync":1}"#)));
+        assert!(!refs_have_branch_sync_ref(Some(r#"{"other":1}"#)));
+        assert!(!refs_have_branch_sync_ref(Some(r#"{"branch_sync":null}"#)));
+        assert!(!refs_have_branch_sync_ref(None));
     }
 
     #[test]

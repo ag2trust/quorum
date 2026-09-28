@@ -504,6 +504,28 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   `daemon/<author>-t<id>` grammar, so task branch cleanup and orphan discovery do not reap them.
   Their preserved conflict worktrees also live beside, rather than under, the task worktree base
   that recovery garbage-collects; `cleanup.rs` only accepts a matching `task_branches` allocation.
+- **Conflict judgment task.** A `conflict` row's judgment work is the sole task the branch-sync
+  path ever creates; every clean-path phase remains daemon-internal. The daemon's intake pass
+  scans active `conflict` rows whose `task_id IS NULL`, gathers the still-unmerged files from
+  the preserved sync worktree via `git diff --name-only --diff-filter=U`, and calls
+  `branch_sync::create_conflict_judgment_task` — one `BEGIN IMMEDIATE` transaction that inserts
+  a task with `created_by='daemon'`, `target_branch` equal to the sync `to`,
+  title `Resolve branch-sync conflict: <from> → <to> (#<id>)`, and `refs={"branch_sync":<id>}`,
+  then binds `branch_syncs.task_id` to the new id inside the same statement. The body lists the
+  pinned `source_sha`, pinned `target_sha`, the conflicted file list, and the instruction to
+  resolve and commit the merge in place without rebasing or dropping either side. Because task
+  provisioning and the row binding are one transaction, a restart or a concurrent tick can
+  never produce a second task for the same conflict; a row that already carries a `task_id` is
+  a clean negative with no side effects. A missing worktree or a git failure fails the
+  `conflict` row loudly on its current phase rather than looping. Tasks carrying a
+  `branch_sync` ref skip classifier parking, planner selection, and decomposition dispatch
+  exactly as `review-only` and `continue-pr` tasks do: `parking_reason` returns `None` for
+  them, planner/decomposition eligibility SQL excludes `refs.branch_sync IS NOT NULL`, and the
+  direct-dispatch clause (`classification_is_dispatchable` and `direct_dispatch_clause_sql!`)
+  admits them at any size. The remainder of the lifecycle — worker provisioning against the
+  preserved conflict worktree, publication of the resolved merge, R1-only review, merge, task
+  completion, and the paired cancellation path that releases the `conflict` row — is owned by
+  the follow-on tasks and is deliberately out of scope for this intake step.
 
 ### Ops
 - `quorum status [--watch]` → read-only health snapshot. Alerts and critical messages are

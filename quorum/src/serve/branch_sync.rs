@@ -9,7 +9,7 @@ use super::{
     log, parse_created_pr_number, parse_initial_pr_list, resolve_pr_target_with_program,
     run_publication_gh_command, validate_initial_pr_target, PrTarget, ServeConfig,
 };
-use quorum_core::branch_sync::{self, BranchSync};
+use quorum_core::branch_sync::{self, BranchSync, ConflictJudgmentOutcome};
 use quorum_core::error::{QuorumError, Result};
 use std::collections::HashMap;
 use std::path::Path;
@@ -116,6 +116,60 @@ pub async fn reconcile_one(
             sync.id, sync.phase
         ));
     }
+    Ok(())
+}
+
+/// Daemon intake pass: pick the oldest active `conflict` branch-sync row that
+/// lacks a bound judgment task, gather the still-unmerged files from the
+/// preserved sync worktree using the timeout-governed `WorktreeManager`
+/// helper, and provision the judgment task inside the core's one immediate
+/// transaction. One row per tick keeps the pass bounded regardless of how
+/// many sync pairs an operator has configured; a missing worktree or a git
+/// failure yields a loud `fail` on that row's `conflict` phase rather than
+/// an infinite retry loop. The row's `task_id` binding is created inside the
+/// same transaction as the task INSERT.
+pub async fn intake_conflict_judgment_task(
+    config: &ServeConfig,
+    worktrees: &WorktreeManager,
+) -> Result<()> {
+    let db_path = config.db_path.clone();
+    let sync = tokio::task::spawn_blocking(move || -> Result<Option<BranchSync>> {
+        let conn = quorum_core::db::open(&db_path)?;
+        branch_sync::next_conflict_awaiting_task(&conn)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("branch sync conflict intake join: {error}")))??;
+    let Some(sync) = sync else {
+        return Ok(());
+    };
+
+    let worktree = sync_worktree(config, &sync);
+    if let Err(error) = provision_conflict_task(config, worktrees, &sync, &worktree).await {
+        fail(config, &sync, &error).await?;
+        log(&format!(
+            "branch sync #{} conflict task intake failed: {error}",
+            sync.id
+        ));
+    }
+    Ok(())
+}
+
+async fn provision_conflict_task(
+    config: &ServeConfig,
+    worktrees: &WorktreeManager,
+    sync: &BranchSync,
+    worktree: &Path,
+) -> std::result::Result<(), String> {
+    let files = worktrees.sync_conflicted_files(worktree).await?;
+    let db_path = config.db_path.clone();
+    let id = sync.id;
+    tokio::task::spawn_blocking(move || -> Result<ConflictJudgmentOutcome> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        branch_sync::create_conflict_judgment_task(&mut conn, id, &files, quorum_core::clock::now())
+    })
+    .await
+    .map_err(|error| format!("branch sync conflict task provisioning join: {error}"))?
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -1644,6 +1698,177 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn init_conflict_worktree(worktree_dir: &Path) -> Vec<String> {
+        std::fs::create_dir_all(worktree_dir).unwrap();
+        git(worktree_dir, &["init", "-b", "main"]);
+        git(worktree_dir, &["config", "user.email", "test@example.com"]);
+        git(worktree_dir, &["config", "user.name", "Test"]);
+        std::fs::write(worktree_dir.join("shared.txt"), "base\n").unwrap();
+        git(worktree_dir, &["add", "shared.txt"]);
+        git(worktree_dir, &["commit", "-m", "base"]);
+        git(worktree_dir, &["checkout", "-b", "feature"]);
+        std::fs::write(worktree_dir.join("shared.txt"), "feature side\n").unwrap();
+        git(worktree_dir, &["commit", "-am", "feature edit"]);
+        git(worktree_dir, &["checkout", "main"]);
+        std::fs::write(worktree_dir.join("shared.txt"), "main side\n").unwrap();
+        git(worktree_dir, &["commit", "-am", "main edit"]);
+        let merge = Command::new("git")
+            .arg("-C")
+            .arg(worktree_dir)
+            .args(["merge", "--no-ff", "feature"])
+            .output()
+            .unwrap();
+        assert!(
+            !merge.status.success(),
+            "the divergent branches must produce a merge conflict"
+        );
+        vec!["shared.txt".to_string()]
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn intake_creates_judgment_task_only_for_unbound_conflict_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("quorum.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let sync = match branch_sync::request(&mut conn, "develop", "main", "owner", 1).unwrap() {
+            branch_sync::RequestOutcome::Requested(row) => row,
+            branch_sync::RequestOutcome::AlreadyActive(_) => unreachable!(),
+        };
+        let branch = format!("sync/{}", sync.id);
+        branch_sync::pin(
+            &mut conn,
+            sync.id,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &branch,
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        branch_sync::conflict(&mut conn, sync.id, 3)
+            .unwrap()
+            .unwrap();
+        drop(conn);
+
+        let config = sync_test_config(
+            db_path.clone(),
+            root.path().join("repo"),
+            root.path().join("worktrees"),
+            root.path().join("fake-gh"),
+        );
+        let worktree = sync_worktree(&config, &sync);
+        let expected_files = init_conflict_worktree(&worktree);
+
+        let worktrees = WorktreeManager::new();
+        intake_conflict_judgment_task(&config, &worktrees)
+            .await
+            .unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let bound = branch_sync::get(&conn, sync.id).unwrap().unwrap();
+        let task_id = bound.task_id.expect("intake must bind a judgment task");
+        assert_eq!(bound.phase, "conflict");
+        assert!(
+            bound.active,
+            "conflict row stays active for the judgment task"
+        );
+
+        let (created_by, target_branch, refs, body): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT created_by, target_branch, refs, body FROM tasks WHERE id=?1",
+                [task_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(created_by, "daemon");
+        assert_eq!(target_branch.as_deref(), Some("main"));
+        let refs_value: serde_json::Value = serde_json::from_str(refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs_value["branch_sync"], serde_json::json!(sync.id));
+        let body = body.expect("body is required for the judgment task");
+        for file in &expected_files {
+            assert!(body.contains(file), "body lists conflicted file {file}");
+        }
+        assert!(body.contains(&"a".repeat(40)), "body lists source_sha");
+        assert!(body.contains(&"b".repeat(40)), "body lists target_sha");
+        assert!(
+            body.contains("Do not rebase"),
+            "body carries the resolve-without-rebasing instruction"
+        );
+
+        // A second intake pass over the same bound row must be a clean no-op.
+        drop(conn);
+        intake_conflict_judgment_task(&config, &worktrees)
+            .await
+            .unwrap();
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let after = branch_sync::get(&conn, sync.id).unwrap().unwrap();
+        assert_eq!(after.task_id, Some(task_id));
+        let created_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM tasks WHERE json_valid(refs)
+                 AND json_extract(refs, '$.branch_sync')=?1",
+                [sync.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(created_count, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn intake_fails_the_conflict_row_when_the_worktree_is_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("quorum.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let sync = match branch_sync::request(&mut conn, "develop", "main", "owner", 1).unwrap() {
+            branch_sync::RequestOutcome::Requested(row) => row,
+            branch_sync::RequestOutcome::AlreadyActive(_) => unreachable!(),
+        };
+        branch_sync::pin(
+            &mut conn,
+            sync.id,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &format!("sync/{}", sync.id),
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        branch_sync::conflict(&mut conn, sync.id, 3)
+            .unwrap()
+            .unwrap();
+        drop(conn);
+
+        let config = sync_test_config(
+            db_path.clone(),
+            root.path().join("repo"),
+            root.path().join("worktrees"),
+            root.path().join("fake-gh"),
+        );
+        let worktrees = WorktreeManager::new();
+        intake_conflict_judgment_task(&config, &worktrees)
+            .await
+            .unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let row = branch_sync::get(&conn, sync.id).unwrap().unwrap();
+        assert_eq!(row.phase, "failed");
+        assert!(!row.active);
+        assert!(row.task_id.is_none(), "no task was ever bound");
+        assert!(row
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing"));
     }
 
     #[cfg(unix)]

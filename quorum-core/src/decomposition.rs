@@ -652,13 +652,17 @@ pub fn retry_exhausted_planning(
 /// to `planning`. `Ok(None)` is the expected result of a stale/racing request.
 pub fn begin_planning(conn: &mut Connection, input: &BeginPlanning<'_>) -> Result<Option<i64>> {
     let tx = begin_immediate(conn)?;
+    let branch_sync_ref = crate::tasks::BRANCH_SYNC_REF_PRESENT_SQL;
     let eligible: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM tasks
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM tasks
          WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
            AND review_only=0 AND continue_pr IS NULL AND terminal_leaf=0
+           AND NOT {branch_sync_ref}
            AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations)
            AND NOT EXISTS (SELECT 1 FROM task_decompositions
-                           WHERE state IN ('active','blocked') OR active=1))",
+                           WHERE state IN ('active','blocked') OR active=1))"
+        ),
         params![input.source_task_id, input.expected_revision],
         |row| row.get(0),
     )?;
@@ -684,9 +688,12 @@ pub fn begin_planning(conn: &mut Connection, input: &BeginPlanning<'_>) -> Resul
     inserted.map_err(map_sql_err)?;
     let graph_id = tx.last_insert_rowid();
     let changed = tx.execute(
-        "UPDATE tasks SET status='planning', updated_at=?3
+        &format!(
+            "UPDATE tasks SET status='planning', updated_at=?3
          WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
-           AND review_only=0 AND continue_pr IS NULL AND terminal_leaf=0",
+           AND review_only=0 AND continue_pr IS NULL AND terminal_leaf=0
+           AND NOT {branch_sync_ref}"
+        ),
         params![input.source_task_id, input.expected_revision, input.now],
     )?;
     if changed != 1 {
@@ -718,13 +725,17 @@ pub fn begin_routed_planning(
         ));
     }
     let tx = begin_immediate(conn)?;
+    let branch_sync_ref = crate::tasks::BRANCH_SYNC_REF_PRESENT_SQL;
     let eligible: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM tasks
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM tasks
          WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
            AND review_only=0 AND continue_pr IS NULL AND terminal_leaf=0
+           AND NOT {branch_sync_ref}
            AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations)
            AND NOT EXISTS (SELECT 1 FROM task_decompositions
-                           WHERE state IN ('active','blocked') OR active=1))",
+                           WHERE state IN ('active','blocked') OR active=1))"
+        ),
         params![input.source_task_id, input.expected_revision],
         |row| row.get(0),
     )?;
@@ -745,9 +756,12 @@ pub fn begin_routed_planning(
     inserted?;
     let graph_id = tx.last_insert_rowid();
     let changed = tx.execute(
-        "UPDATE tasks SET status='planning',updated_at=?3
+        &format!(
+            "UPDATE tasks SET status='planning',updated_at=?3
          WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
-           AND review_only=0 AND continue_pr IS NULL AND terminal_leaf=0",
+           AND review_only=0 AND continue_pr IS NULL AND terminal_leaf=0
+           AND NOT {branch_sync_ref}"
+        ),
         params![input.source_task_id, input.expected_revision, input.now],
     )?;
     if changed != 1 {

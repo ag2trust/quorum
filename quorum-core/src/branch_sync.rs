@@ -805,6 +805,179 @@ pub fn cancel_request(conn: &mut Connection, id: i64, by: &str, now: i64) -> Res
     Ok(CancelOutcome::Cancelled(row))
 }
 
+/// Select the oldest active `conflict` row that still lacks a bound judgment
+/// task. The daemon's intake pass calls this once per tick and hands the id
+/// to [`create_conflict_judgment_task`] for atomic provisioning, keeping the
+/// pass fair (oldest first) and bounded (one row per tick) regardless of
+/// how many sync pairs an operator has configured.
+pub fn next_conflict_awaiting_task(conn: &Connection) -> Result<Option<BranchSync>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {COLS} FROM branch_syncs
+                 WHERE active=1 AND phase='conflict' AND task_id IS NULL
+                 ORDER BY updated_at ASC, id ASC
+                 LIMIT 1"
+            ),
+            [],
+            row_to_branch_sync,
+        )
+        .optional()?)
+}
+
+/// Outcome of [`create_conflict_judgment_task`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictJudgmentOutcome {
+    /// A fresh judgment task was created and its id bound to the sync row in
+    /// one write transaction.
+    Created(ConflictJudgmentTask),
+    /// The row is missing, no longer active, no longer `conflict`, or already
+    /// carries a `task_id`. A concurrent daemon or coordinator won the race.
+    NotEligible,
+}
+
+/// The judgment task the daemon created for one conflicted branch sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictJudgmentTask {
+    pub sync_id: i64,
+    pub task_id: i64,
+    pub target_branch: String,
+    pub title: String,
+    pub body: String,
+    pub refs_json: String,
+}
+
+fn conflict_task_title(sync_id: i64, from: &str, to: &str) -> String {
+    format!("Resolve branch-sync conflict: {from} → {to} (#{sync_id})")
+}
+
+fn conflict_task_body(
+    source_sha: &str,
+    target_sha: &str,
+    sync_branch: &str,
+    conflicted_files: &[String],
+) -> String {
+    let mut body = String::new();
+    body.push_str(&format!("source_sha: {source_sha}\n"));
+    body.push_str(&format!("target_sha: {target_sha}\n"));
+    body.push_str(&format!("sync_branch: {sync_branch}\n"));
+    body.push_str("\nConflicted files:\n");
+    if conflicted_files.is_empty() {
+        body.push_str("(none reported by git diff --diff-filter=U)\n");
+    } else {
+        for file in conflicted_files {
+            body.push_str(&format!("- {file}\n"));
+        }
+    }
+    body.push_str(
+        "\nResolve the merge conflicts and commit the merge in place. \
+         Do not rebase, squash, or drop either side of the merge; both \
+         parents must remain reachable from the resolved commit.\n",
+    );
+    body
+}
+
+/// Atomically create the judgment task for one conflicted branch-sync row and
+/// bind its id back onto that row. A row that no longer needs a task (missing,
+/// inactive, non-`conflict`, or already bound) returns [`NotEligible`]
+/// without side effects. This is the sole daemon-owned path that provisions
+/// the conflict judgment task, so a restart or concurrent tick cannot double
+/// up on task creation.
+///
+/// [`NotEligible`]: ConflictJudgmentOutcome::NotEligible
+pub fn create_conflict_judgment_task(
+    conn: &mut Connection,
+    sync_id: i64,
+    conflicted_files: &[String],
+    now: i64,
+) -> Result<ConflictJudgmentOutcome> {
+    for file in conflicted_files {
+        if file.contains('\0') {
+            return Err(QuorumError::Usage(
+                "conflicted file paths must not contain NUL".into(),
+            ));
+        }
+    }
+    let tx = begin_immediate(conn)?;
+    let Some(row) = tx
+        .query_row(
+            &format!(
+                "SELECT {COLS} FROM branch_syncs
+                 WHERE id=?1 AND active=1 AND phase='conflict' AND task_id IS NULL"
+            ),
+            [sync_id],
+            row_to_branch_sync,
+        )
+        .optional()?
+    else {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(ConflictJudgmentOutcome::NotEligible);
+    };
+    let source_sha = row
+        .source_sha
+        .as_deref()
+        .ok_or_else(|| QuorumError::Usage("conflict row missing source_sha".into()))?;
+    let target_sha = row
+        .target_sha
+        .as_deref()
+        .ok_or_else(|| QuorumError::Usage("conflict row missing target_sha".into()))?;
+    let sync_branch = row
+        .sync_branch
+        .as_deref()
+        .ok_or_else(|| QuorumError::Usage("conflict row missing sync_branch".into()))?;
+    let title = conflict_task_title(row.id, &row.source_branch, &row.target_branch);
+    let body = conflict_task_body(source_sha, target_sha, sync_branch, conflicted_files);
+    let refs_json = serde_json::json!({ "branch_sync": row.id }).to_string();
+
+    let task_id = crate::tasks::create_task_tx(
+        &tx,
+        "daemon",
+        &title,
+        Some(&body),
+        0,
+        None,
+        Some(&refs_json),
+        None,
+        None,
+        None,
+        Some(&row.target_branch),
+        now,
+    )?;
+
+    let bound = tx.execute(
+        "UPDATE branch_syncs
+             SET task_id=?1, updated_at=?2
+             WHERE id=?3 AND active=1 AND phase='conflict' AND task_id IS NULL",
+        params![task_id, now, row.id],
+    )?;
+    if bound != 1 {
+        // A concurrent writer took the slot; roll back everything we staged.
+        return Err(QuorumError::Db(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_CHECK),
+            Some("branch sync row lost task binding race".into()),
+        )));
+    }
+    crate::events::emit(
+        &tx,
+        "branch_sync_judgment_task_created",
+        &format!("branch_sync#{}", row.id),
+        &format!(
+            "conflict judgment task#{task_id} created for {} -> {}",
+            row.source_branch, row.target_branch
+        ),
+        now,
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(ConflictJudgmentOutcome::Created(ConflictJudgmentTask {
+        sync_id: row.id,
+        task_id,
+        target_branch: row.target_branch,
+        title,
+        body,
+        refs_json,
+    }))
+}
+
 /// Return the most recent terminal rows, newest first. Bounded by `limit` so
 /// a long history stays cheap for a short read.
 pub fn list_recent_terminal(conn: &Connection, limit: i64) -> Result<Vec<BranchSync>> {
@@ -1227,6 +1400,114 @@ mod tests {
             cancel_request(&mut conn, sync.id, "coordinator", 102).unwrap(),
             CancelOutcome::NotCancellable(row) if row.phase == "failed"
         ));
+    }
+
+    fn pin_and_conflict(conn: &mut Connection, id: i64) {
+        let source = "a".repeat(40);
+        let target = "b".repeat(40);
+        pin(conn, id, &source, &target, "sync/1", 101)
+            .unwrap()
+            .unwrap();
+        conflict(conn, id, 102).unwrap().unwrap();
+    }
+
+    #[test]
+    fn create_conflict_judgment_task_links_row_atomically() {
+        let (_dir, mut conn) = open_tmp();
+        let sync = requested(request(&mut conn, "main", "develop", "A", 100).unwrap());
+        pin_and_conflict(&mut conn, sync.id);
+        let files = vec!["src/lib.rs".to_string(), "Cargo.toml".to_string()];
+        let outcome = create_conflict_judgment_task(&mut conn, sync.id, &files, 200).unwrap();
+        let task = match outcome {
+            ConflictJudgmentOutcome::Created(task) => task,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        assert_eq!(task.sync_id, sync.id);
+        assert_eq!(task.target_branch, "develop");
+        assert_eq!(
+            task.title,
+            format!(
+                "Resolve branch-sync conflict: main → develop (#{})",
+                sync.id
+            )
+        );
+        assert!(task.body.contains(&"a".repeat(40)), "body lists source_sha");
+        assert!(task.body.contains(&"b".repeat(40)), "body lists target_sha");
+        assert!(task.body.contains("src/lib.rs"), "body lists conflict file");
+        assert!(task.body.contains("Cargo.toml"), "body lists conflict file");
+        assert!(
+            task.body.contains("without rebasing") || task.body.contains("Do not rebase"),
+            "body carries the resolve-without-rebasing instruction"
+        );
+
+        let row = get(&conn, sync.id).unwrap().unwrap();
+        assert_eq!(row.task_id, Some(task.task_id));
+        assert!(
+            row.active,
+            "conflict row remains active for the judgment task"
+        );
+        assert_eq!(row.phase, "conflict");
+
+        let (created_by, target_branch, refs, body): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT created_by, target_branch, refs, body FROM tasks WHERE id=?1",
+                [task.task_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(created_by, "daemon");
+        assert_eq!(target_branch.as_deref(), Some("develop"));
+        assert!(body.is_some());
+        let refs_value: serde_json::Value = serde_json::from_str(refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs_value["branch_sync"], serde_json::json!(sync.id));
+
+        let event: String = conn
+            .query_row(
+                "SELECT kind FROM events WHERE subject=?1 ORDER BY seq DESC LIMIT 1",
+                [format!("branch_sync#{}", sync.id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event, "branch_sync_judgment_task_created");
+    }
+
+    #[test]
+    fn create_conflict_judgment_task_is_a_clean_negative_when_already_bound() {
+        let (_dir, mut conn) = open_tmp();
+        let sync = requested(request(&mut conn, "main", "develop", "A", 100).unwrap());
+        pin_and_conflict(&mut conn, sync.id);
+        let first = create_conflict_judgment_task(&mut conn, sync.id, &[], 200).unwrap();
+        let task_id = match first {
+            ConflictJudgmentOutcome::Created(task) => task.task_id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        let second = create_conflict_judgment_task(&mut conn, sync.id, &[], 201).unwrap();
+        assert_eq!(second, ConflictJudgmentOutcome::NotEligible);
+        let row = get(&conn, sync.id).unwrap().unwrap();
+        assert_eq!(row.task_id, Some(task_id), "task binding must not change");
+    }
+
+    #[test]
+    fn next_conflict_awaiting_task_returns_oldest_unbound_row() {
+        let (_dir, mut conn) = open_tmp();
+        let a = requested(request(&mut conn, "main", "develop", "A", 100).unwrap());
+        pin_and_conflict(&mut conn, a.id);
+        let b = requested(request(&mut conn, "release", "develop", "A", 100).unwrap());
+        pin_and_conflict(&mut conn, b.id);
+        // Nothing bound yet — oldest row wins.
+        let first = next_conflict_awaiting_task(&conn).unwrap().unwrap();
+        assert_eq!(first.id, a.id);
+        create_conflict_judgment_task(&mut conn, a.id, &[], 200).unwrap();
+        // Once bound, the next tick moves to the next oldest unbound row.
+        let second = next_conflict_awaiting_task(&conn).unwrap().unwrap();
+        assert_eq!(second.id, b.id);
+        create_conflict_judgment_task(&mut conn, b.id, &[], 201).unwrap();
+        assert!(next_conflict_awaiting_task(&conn).unwrap().is_none());
     }
 
     #[test]
