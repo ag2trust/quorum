@@ -22206,7 +22206,6 @@ async fn verify_dependency_base_before_allocation(
     Ok(DependencyBaseAdmission::Deferred)
 }
 
-#[allow(clippy::too_many_arguments)]
 /// The kept branch-sync merge a conflict judgment worker adopts.
 #[derive(Debug)]
 struct BranchSyncAdoption {
@@ -22219,11 +22218,39 @@ struct BranchSyncAdoption {
 /// `branch_sync::sync_worktree`: task GC sweeps only direct children of
 /// `worktree_base`, so this sibling keeps MERGE_HEAD alive until adoption.
 fn branch_sync_worktree_path(config: &ServeConfig, sync_id: i64) -> PathBuf {
-    let root = config
+    branch_sync_worktree_root(config).join(sync_id.to_string())
+}
+
+fn branch_sync_worktree_root(config: &ServeConfig) -> PathBuf {
+    config
         .worktree_base
         .parent()
-        .unwrap_or(config.worktree_base.as_path());
-    root.join("branch-sync-worktrees").join(sync_id.to_string())
+        .unwrap_or(config.worktree_base.as_path())
+        .join("branch-sync-worktrees")
+}
+
+/// Release a worker slot's worktree and local branch. An adopted kept sync
+/// merge is owned by the branch-sync reconciler, not the slot: removing it
+/// would erase MERGE_HEAD and delete `sync/<id>`, so every retry of the
+/// judgment task would fail adoption.
+async fn release_worker_worktree(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    worktree: &Path,
+    branch: &str,
+    delete_branch: bool,
+) {
+    if worktree.starts_with(branch_sync_worktree_root(config)) {
+        log(&format!(
+            "preserving adopted branch-sync worktree {} (branch {branch})",
+            worktree.display()
+        ));
+        return;
+    }
+    wt_mgr.remove(&config.repo_dir, worktree).await.ok();
+    if delete_branch {
+        wt_mgr.delete_branch(&config.repo_dir, branch).await;
+    }
 }
 
 /// Resolve a task's `branch_sync` ref to the kept sync merge it must adopt.
@@ -22274,6 +22301,7 @@ async fn resolve_branch_sync_adoption(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_worker(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -25920,11 +25948,14 @@ async fn cleanup_slot_inner(
     .await
     .ok();
 
-    let repo_dir = &config.repo_dir;
-    wt_mgr.remove(repo_dir, &state.worktree_path).await.ok();
-    if delete_branch {
-        wt_mgr.delete_branch(repo_dir, &state.branch).await;
-    }
+    release_worker_worktree(
+        config,
+        wt_mgr,
+        &state.worktree_path,
+        &state.branch,
+        delete_branch,
+    )
+    .await;
 
     guarded_worker_name_release_with_expectation(
         &config.db_path,
@@ -26035,9 +26066,7 @@ async fn teardown_worker_with_body(
         .ok();
     }
 
-    let repo_dir = &config.repo_dir;
-    wt_mgr.remove(repo_dir, &state.worktree_path).await.ok();
-    wt_mgr.delete_branch(repo_dir, &state.branch).await;
+    release_worker_worktree(config, wt_mgr, &state.worktree_path, &state.branch, true).await;
 
     guarded_worker_name_release(&config.db_path, name_pool, &state.agent_name, state.task_id).await;
     log(&format!("worker {} torn down", state.agent_name));
@@ -28156,6 +28185,55 @@ mod tests {
             .unwrap();
         assert_eq!(path, adoption.worktree);
         assert_eq!(sync_fixture_git(&path, &["rev-parse", "HEAD"]), target_tip);
+        assert_eq!(
+            sync_fixture_git(&path, &["rev-parse", "--verify", "MERGE_HEAD"]),
+            source_tip
+        );
+        assert_eq!(
+            sync_fixture_git(&path, &["diff", "--name-only", "--diff-filter=U"]),
+            "shared.txt"
+        );
+
+        // Post-spawn teardown (crash/idle/failure cleanup, and shutdown reset
+        // to open) must leave the kept merge adoptable for the retry.
+        let adopted_slot = || {
+            let mut child = tokio::process::Command::new("true")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let mut slot = slot_with_process(runner::RunnerProc::Claude(
+                agent::AgentProc::from_parts(child, stdin, tokio::io::BufReader::new(stdout)),
+            ));
+            slot.task_id = task_id;
+            slot.worktree_path = adoption.worktree.clone();
+            slot.branch = adoption.branch.clone();
+            slot
+        };
+        let mut name_pool = Pool::new_generated();
+        cleanup_slot_inner(
+            &config,
+            &mgr,
+            &mut name_pool,
+            adopted_slot(),
+            None,
+            true,
+            "crashed",
+            None,
+        )
+        .await;
+        teardown_worker(&config, &mgr, &mut name_pool, adopted_slot(), "open").await;
+        assert!(sync_fixture_git(
+            &repo,
+            &["branch", "--list", &adoption.branch]
+        )
+        .contains(&adoption.branch));
+        let path = mgr
+            .adopt_sync_worktree(&repo, &adoption.worktree, &adoption.branch)
+            .await
+            .unwrap();
         assert_eq!(
             sync_fixture_git(&path, &["rev-parse", "--verify", "MERGE_HEAD"]),
             source_tip
