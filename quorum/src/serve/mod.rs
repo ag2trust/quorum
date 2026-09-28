@@ -36445,7 +36445,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
         let mut config = pre_review_ci_test_config(db_path.clone(), repo.clone());
         config.worktree_base = dir.path().join("worktrees");
-        config.agent_bin = Some("true".into());
+        config.agent_bin = Some(
+            fake_stdin_holding_agent(dir.path(), "hold-worker")
+                .to_string_lossy()
+                .into_owned(),
+        );
         let wt_mgr = WorktreeManager::new();
         let mut workers = Vec::new();
         let mut poison = PoisonTracker::new();
@@ -43369,7 +43373,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         };
         let mut config = pre_review_ci_test_config(db_path.clone(), repo.clone());
         config.worktree_base = dir.path().join("worktrees");
-        config.agent_bin = Some("true".into());
+        config.agent_bin = Some(
+            fake_stdin_holding_agent(dir.path(), "hold-worker")
+                .to_string_lossy()
+                .into_owned(),
+        );
         config.pr_target_program = Some(fake_gh_returning(
             dir.path(),
             "gh-reclaimed-spawn",
@@ -43795,6 +43803,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         // gh pr view PR --json ... --repo NWO → emit fixed JSON on stdout.
         let script = format!("#!/bin/sh\ncat <<'JSON'\n{json}\nJSON\n");
         write_fake_gh_script(dir, name, &script)
+    }
+
+    #[cfg(unix)]
+    fn fake_stdin_holding_agent(dir: &Path, name: &str) -> PathBuf {
+        write_fake_gh_script(dir, name, "#!/bin/sh\nwhile IFS= read -r _; do :; done\n")
     }
 
     #[cfg(unix)]
