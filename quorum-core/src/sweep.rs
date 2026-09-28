@@ -125,10 +125,15 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
         let effective_rework_cap = rework_cap.unwrap_or(i64::from(crate::lifecycle::REWORK_CAP));
         let recovery_exhausted = *rework_round >= effective_rework_cap
             || *recovery_attempts >= crate::tasks::MAX_RECOVERY_ATTEMPTS;
-        if has_rework_context && recovery_exhausted {
+        // A branch-sync judgment worker gets no reclaim: its lapsed lease
+        // fails the task and the bound sync row in this transaction.
+        let branch_sync_bound = crate::branch_sync::active_for_task(conn, *id)?.is_some();
+        if branch_sync_bound || (has_rework_context && recovery_exhausted) {
             // Reaps do not spend a rework round, but a round already at its
             // immutable cap (or an exhausted recovery budget) is terminal.
-            let park_reason = if *rework_round >= effective_rework_cap {
+            let park_reason = if branch_sync_bound {
+                format!("branch sync judgment worker {reason}; no retry")
+            } else if *rework_round >= effective_rework_cap {
                 format!("remediation {reason}; rework cap exhausted")
             } else {
                 format!(
@@ -141,9 +146,17 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
             let parked_refs = crate::tasks::set_parked_refs(
                 unmarked_refs.as_deref(),
                 &park_reason,
-                "rework",
+                if has_rework_context { "rework" } else { "open" },
                 None,
             )?;
+            if branch_sync_bound {
+                crate::branch_sync::fail_for_task_tx(
+                    conn,
+                    *id,
+                    &format!("task #{id}: {park_reason}"),
+                    now,
+                )?;
+            }
             conn.execute(
                 "UPDATE tasks SET status='failed', assignee=NULL, refs=?2, updated_at=?3 WHERE id=?1",
                 params![id, parked_refs, now],

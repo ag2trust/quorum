@@ -44,14 +44,15 @@ pub fn is_valid_phase(phase: &str) -> bool {
 ///
 /// The clean path advances one step at a time. Outcome terminals are admitted
 /// only where their underlying operation occurs; `failed` and `cancelled` may
-/// end any active phase. This prevents a restarted executor from replaying or
-/// skipping durable work after it has observed a current row.
+/// end any active phase. A judgment task's delivered merge publishes a
+/// `conflict` row directly. This prevents a restarted executor from replaying
+/// or skipping durable work after it has observed a current row.
 pub fn is_valid_transition(phase: &str, next_phase: &str) -> bool {
     matches!(
         (phase, next_phase),
         ("requested", "pinned")
             | ("pinned", "prepared" | "noop" | "conflict")
-            | ("prepared", "published")
+            | ("prepared" | "conflict", "published")
             | ("published", "checks")
             | ("checks", "merging" | "ci_failed")
             | ("merging", "done" | "conflict")
@@ -283,6 +284,8 @@ pub fn next_clean_path_excluding(
 /// to the rows whose in-memory waits have already been admitted. The latter is
 /// the global waiter-cap gate: it leaves excess durable rows untouched until a
 /// retained waiter settles, rather than queueing an unbounded blocking task.
+/// A row bound to a judgment task is owned by that task's lifecycle, so its
+/// published PR never receives the clean path's approval-free merge authority.
 pub fn next_clean_path_excluding_at(
     conn: &Connection,
     excluded_ids: &[i64],
@@ -291,7 +294,7 @@ pub fn next_clean_path_excluding_at(
 ) -> Result<Option<BranchSync>> {
     let mut sql = format!(
         "SELECT {COLS} FROM branch_syncs
-         WHERE active=1
+         WHERE active=1 AND task_id IS NULL
            AND phase IN ('requested','pinned','prepared','published','checks','merging')
            AND (phase <> 'checks' OR ci_next_attempt_at IS NULL OR ci_next_attempt_at <= ?)"
     );
@@ -671,6 +674,99 @@ pub fn published(conn: &mut Connection, id: i64, pr: i64, now: i64) -> Result<Op
         )?;
     }
     tx.commit().map_err(map_sql_err)?;
+    Ok(sync)
+}
+
+/// Bind a conflict judgment task's delivered merge to its sync row: the
+/// worker's own merge commit becomes `merge_sha`, the daemon-created PR becomes
+/// `pr`, and the row advances `conflict` → `published` in one compare-and-set.
+/// A stale, terminal, or differently bound row returns `None` unchanged.
+pub fn publish_from_conflict(
+    conn: &mut Connection,
+    id: i64,
+    task_id: i64,
+    merge_sha: &str,
+    pr: i64,
+    now: i64,
+) -> Result<Option<BranchSync>> {
+    if merge_sha.is_empty() || merge_sha.contains('\0') || pr <= 0 {
+        return Err(QuorumError::Usage(
+            "branch sync publication requires a merge SHA and positive PR".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let sync = tx
+        .query_row(
+            &format!(
+                "UPDATE branch_syncs
+                 SET merge_sha=?1,pr=?2,phase='published',updated_at=?3
+                 WHERE id=?4 AND task_id=?5 AND phase='conflict' AND active=1
+                 RETURNING {COLS}"
+            ),
+            params![merge_sha, pr, now, id, task_id],
+            row_to_branch_sync,
+        )
+        .optional()?;
+    if let Some(row) = &sync {
+        crate::events::emit(
+            &tx,
+            "branch_sync_published",
+            &format!("branch_sync#{}", row.id),
+            &format!(
+                "{} -> {} judgment task#{task_id} published as PR #{pr}",
+                row.source_branch, row.target_branch
+            ),
+            now,
+        )?;
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(sync)
+}
+
+/// The active sync row bound to a judgment task, if any.
+pub fn active_for_task(conn: &Connection, task_id: i64) -> Result<Option<BranchSync>> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {COLS} FROM branch_syncs WHERE task_id=?1 AND active=1"),
+            [task_id],
+            row_to_branch_sync,
+        )
+        .optional()?)
+}
+
+/// Fail the active sync row bound to a judgment task inside the caller's
+/// write transaction, so the task's terminal failure and the row's `failed`
+/// phase commit together. A task with no bound active row is a no-op.
+pub fn fail_for_task_tx(
+    conn: &Connection,
+    task_id: i64,
+    error: &str,
+    now: i64,
+) -> Result<Option<BranchSync>> {
+    let detail = bounded_error(error);
+    let sync = conn
+        .query_row(
+            &format!(
+                "UPDATE branch_syncs
+                 SET phase='failed',active=0,last_error=?1,ci_next_attempt_at=NULL,
+                     ci_wait_inflight=0,updated_at=?2
+                 WHERE task_id=?3 AND active=1
+                 RETURNING {COLS}"
+            ),
+            params![detail, now, task_id],
+            row_to_branch_sync,
+        )
+        .optional()?;
+    if let Some(row) = &sync {
+        crate::errlog::log_error(conn, now, "branch_sync", &detail);
+        crate::events::emit(
+            conn,
+            "branch_sync_failed",
+            &format!("branch_sync#{}", row.id),
+            &detail,
+            now,
+        )?;
+    }
     Ok(sync)
 }
 
@@ -1508,6 +1604,187 @@ mod tests {
         assert_eq!(second.id, b.id);
         create_conflict_judgment_task(&mut conn, b.id, &[], 201).unwrap();
         assert!(next_conflict_awaiting_task(&conn).unwrap().is_none());
+    }
+
+    fn bound_judgment_task(conn: &mut Connection) -> (BranchSync, i64) {
+        let sync = requested(request(conn, "main", "develop", "A", 100).unwrap());
+        pin_and_conflict(conn, sync.id);
+        let task_id = match create_conflict_judgment_task(conn, sync.id, &[], 200).unwrap() {
+            ConflictJudgmentOutcome::Created(task) => task.task_id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        (sync, task_id)
+    }
+
+    #[test]
+    fn publish_from_conflict_records_merge_and_pr_in_one_cas() {
+        let (_dir, mut conn) = open_tmp();
+        let (sync, task_id) = bound_judgment_task(&mut conn);
+        let merge_sha = "c".repeat(40);
+
+        // Only the bound task may publish the row.
+        assert!(
+            publish_from_conflict(&mut conn, sync.id, task_id + 1, &merge_sha, 7, 300)
+                .unwrap()
+                .is_none()
+        );
+        assert!(publish_from_conflict(&mut conn, sync.id, task_id, "", 7, 300).is_err());
+        assert!(publish_from_conflict(&mut conn, sync.id, task_id, &merge_sha, 0, 300).is_err());
+        assert_eq!(get(&conn, sync.id).unwrap().unwrap().phase, "conflict");
+
+        let published = publish_from_conflict(&mut conn, sync.id, task_id, &merge_sha, 7, 301)
+            .unwrap()
+            .expect("conflict row publishes");
+        assert_eq!(published.phase, "published");
+        assert_eq!(published.merge_sha.as_deref(), Some(merge_sha.as_str()));
+        assert_eq!(published.pr, Some(7));
+        assert_eq!(published.task_id, Some(task_id));
+        assert!(published.active);
+        assert_eq!(published.sync_branch.as_deref(), Some("sync/1"));
+        let event: String = conn
+            .query_row(
+                "SELECT kind FROM events WHERE subject=?1 ORDER BY seq DESC LIMIT 1",
+                [format!("branch_sync#{}", sync.id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event, "branch_sync_published");
+
+        // A stale replay cannot rewrite the recorded merge or PR.
+        assert!(
+            publish_from_conflict(&mut conn, sync.id, task_id, &"d".repeat(40), 8, 302)
+                .unwrap()
+                .is_none()
+        );
+        let row = get(&conn, sync.id).unwrap().unwrap();
+        assert_eq!(row.merge_sha.as_deref(), Some(merge_sha.as_str()));
+        assert_eq!(row.pr, Some(7));
+
+        // The task lifecycle, not the approval-free clean path, owns the PR.
+        assert!(next_clean_path(&conn).unwrap().is_none());
+        assert!(is_valid_transition("conflict", "published"));
+    }
+
+    #[test]
+    fn publish_from_conflict_rejects_terminal_rows() {
+        let (_dir, mut conn) = open_tmp();
+        let (sync, task_id) = bound_judgment_task(&mut conn);
+        fail(&mut conn, sync.id, "conflict", "boom", 300)
+            .unwrap()
+            .unwrap();
+        assert!(
+            publish_from_conflict(&mut conn, sync.id, task_id, &"c".repeat(40), 7, 301)
+                .unwrap()
+                .is_none()
+        );
+        let row = get(&conn, sync.id).unwrap().unwrap();
+        assert_eq!(row.phase, "failed");
+        assert_eq!(row.pr, None);
+    }
+
+    fn classify(conn: &Connection, task_id: i64) {
+        conn.execute(
+            "UPDATE tasks SET refs=json_set(COALESCE(refs,'{}'),
+                 '$.cx_est',2,'$.cx_size','S','$.cx_ready',json('true'),
+                 '$.cx_not_ready_reason',json('null'))
+             WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+    }
+
+    fn claimed_judgment_task(conn: &mut Connection) -> (BranchSync, i64) {
+        let (sync, task_id) = bound_judgment_task(conn);
+        classify(conn, task_id);
+        crate::tasks::claim(conn, "Judge", Some(task_id), &[], 3600, 250)
+            .unwrap()
+            .expect("judgment worker claims");
+        (sync, task_id)
+    }
+
+    fn assert_failed_without_retry(conn: &Connection, sync_id: i64, task_id: i64, cause: &str) {
+        let row = get(conn, sync_id).unwrap().unwrap();
+        assert_eq!(row.phase, "failed");
+        assert!(!row.active, "failed row releases the pair");
+        let last_error = row.last_error.expect("failed row records last_error");
+        assert!(last_error.contains(cause), "{last_error}");
+        let task = crate::tasks::get(conn, task_id).unwrap().unwrap();
+        assert_eq!(
+            task.status, "failed",
+            "no reopen/retry for the judgment task"
+        );
+        assert_eq!(task.assignee, None);
+        assert!(crate::tasks::list_implementation_ready_open(conn)
+            .unwrap()
+            .iter()
+            .all(|open| open.id != task_id));
+        let errors: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM errors WHERE source='branch_sync'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(errors, 1);
+    }
+
+    #[test]
+    fn judgment_worker_failure_fails_task_and_sync_row_without_retry() {
+        let (_dir, mut conn) = open_tmp();
+        let (sync, task_id) = claimed_judgment_task(&mut conn);
+        let result = crate::tasks::apply_event(
+            &mut conn,
+            "daemon",
+            task_id,
+            &crate::lifecycle::Event::AgentFailed {
+                reason: "provider exited".into(),
+            },
+            300,
+        )
+        .unwrap();
+        assert_eq!(result.task.status, "failed");
+        assert!(!result
+            .effects
+            .contains(&crate::lifecycle::Effect::ResumeWorker));
+        assert_failed_without_retry(&conn, sync.id, task_id, "provider exited");
+    }
+
+    #[test]
+    fn judgment_worker_lease_expiry_fails_task_and_sync_row_without_retry() {
+        let (_dir, mut conn) = open_tmp();
+        let (sync, task_id) = claimed_judgment_task(&mut conn);
+        crate::sweep::reap_lapsed_tasks(&conn, 250 + 3600, SWEEP_LIMIT).unwrap();
+        assert_failed_without_retry(&conn, sync.id, task_id, "lease lapsed");
+        // A later sweep has nothing left to reclaim.
+        crate::sweep::reap_lapsed_tasks(&conn, 9000, SWEEP_LIMIT).unwrap();
+        assert_eq!(
+            crate::tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "failed"
+        );
+    }
+
+    #[test]
+    fn ordinary_worker_failure_keeps_its_recovery_retry() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = crate::tasks::create(
+            &mut conn, "A", "ordinary", None, 0, None, None, None, None, 100,
+        )
+        .unwrap();
+        classify(&conn, task_id);
+        crate::tasks::claim(&mut conn, "W", Some(task_id), &[], 3600, 101)
+            .unwrap()
+            .expect("ordinary claim");
+        let result = crate::tasks::apply_event(
+            &mut conn,
+            "daemon",
+            task_id,
+            &crate::lifecycle::Event::AgentFailed {
+                reason: "provider exited".into(),
+            },
+            102,
+        )
+        .unwrap();
+        assert_eq!(result.task.status, "open");
     }
 
     #[test]
