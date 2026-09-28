@@ -5080,6 +5080,30 @@ fn remediation_retry_feedback(refs: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A recovery reap is daemon authority, not an owner-requested parked retry.
+/// It still must use the exact remediation path, including any persisted
+/// reviewer feedback and the original worker's provider continuation.
+fn recovered_remediation_retry_feedback(refs: Option<&str>) -> Option<String> {
+    if !tasks::recovered_remediation_retry_requested(refs) {
+        return None;
+    }
+    let feedback = refs
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| {
+            value
+                .get("remediation_feedback")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|feedback| !feedback.is_empty())
+                .map(str::to_string)
+        });
+    Some(feedback.unwrap_or_else(|| {
+        "Resume the existing remediation after the prior worker ended unexpectedly. \
+         Preserve the existing PR and resolve its outstanding remediation context."
+            .into()
+    }))
+}
+
 /// The remediation reconcilers run before Phase 6's ordinary worker-cap loop,
 /// so they must apply the same slot accounting themselves.
 fn available_worker_slots(cap: usize, active_workers: usize) -> usize {
@@ -9801,7 +9825,8 @@ async fn reconcile_remediation_retries(
                         task.continue_pr,
                         task.terminal_leaf,
                         &task.status,
-                    ) && remediation_retry_feedback(task.refs.as_deref()).is_some()
+                    ) && (remediation_retry_feedback(task.refs.as_deref()).is_some()
+                        || recovered_remediation_retry_feedback(task.refs.as_deref()).is_some())
                 })
                 .collect())
         })
@@ -9829,13 +9854,21 @@ async fn reconcile_remediation_retries(
             .await;
             continue;
         };
-        let Some(feedback) = remediation_retry_feedback(task.refs.as_deref()) else {
+        let recovered = tasks::recovered_remediation_retry_requested(task.refs.as_deref());
+        let Some(feedback) = remediation_retry_feedback(task.refs.as_deref())
+            .or_else(|| recovered_remediation_retry_feedback(task.refs.as_deref()))
+        else {
             continue;
         };
 
         log(&format!(
-            "durable remediation retry: provisioning task #{} on PR #{pr}",
-            task.id
+            "{}: provisioning task #{} on PR #{pr}",
+            if recovered {
+                "durable remediation recovery"
+            } else {
+                "durable remediation retry"
+            },
+            task.id,
         ));
         let spawn_outcome = spawn_remediation_worker(
             config,

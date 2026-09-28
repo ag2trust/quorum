@@ -65,6 +65,11 @@ pub const PUBLICATION_FAILURE_KIND_PR_MERGED: &str = "pr-merged";
 pub const ABANDONED_PUBLICATION_REF: &str = "abandoned_publication";
 pub const CLASSIFIER_POLICY_PARKED_REF: &str = "classifier_policy_parked";
 pub const PARKED_REWORK_RETRY_REF: &str = "daemon_rework_retry_requested";
+/// One exact remediation replacement is due after a PR-bound remediation
+/// worker dies or its lease lapses.  The remediation claim consumes this bit
+/// atomically with installing the replacement lease; a later reap writes a
+/// fresh bit and spends the bounded recovery budget again.
+pub const RECOVERED_REMEDIATION_RETRY_REF: &str = "daemon_recovered_remediation_retry";
 /// Durable merge-call admission state. The CLI writes `requested` for an
 /// explicit replay; the single daemon atomically advances it to `attempting`
 /// before any GitHub/CI call. The live reviewed path also writes `attempting`
@@ -849,6 +854,54 @@ fn extract_pr_from_refs(refs: &Option<String>) -> Option<String> {
             p.as_str().map(|s| s.to_string())
         }
     })
+}
+
+/// Whether a PR-bound remediation recovery still needs its exact replacement
+/// worker.  This is deliberately separate from owner-requested parked retry:
+/// the latter has different admission and feedback authority.
+pub fn recovered_remediation_retry_requested(refs: Option<&str>) -> bool {
+    refs.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| {
+            value
+                .get(RECOVERED_REMEDIATION_RETRY_REF)
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+/// Persist a bounded exact-remediation replacement intent without disturbing
+/// the task's PR, feedback, or current rework round.
+pub fn set_recovered_remediation_retry(refs: Option<&str>) -> Result<String> {
+    let mut value: serde_json::Value = match refs {
+        Some(raw) => serde_json::from_str(raw)
+            .map_err(|error| QuorumError::Io(format!("invalid task refs JSON: {error}")))?,
+        None => serde_json::json!({}),
+    };
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| QuorumError::Io("task refs must be a JSON object".into()))?;
+    object.insert(
+        RECOVERED_REMEDIATION_RETRY_REF.into(),
+        serde_json::Value::Bool(true),
+    );
+    serde_json::to_string(&value)
+        .map_err(|error| QuorumError::Io(format!("serialize task refs: {error}")))
+}
+
+/// Drop an unconsumed recovery intent when the task moves beyond its current
+/// remediation turn or becomes terminal.
+pub fn clear_recovered_remediation_retry(refs: Option<&str>) -> Result<Option<String>> {
+    let Some(raw) = refs else {
+        return Ok(None);
+    };
+    let mut value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| QuorumError::Io(format!("invalid task refs JSON: {error}")))?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove(RECOVERED_REMEDIATION_RETRY_REF);
+    }
+    serde_json::to_string(&value)
+        .map(Some)
+        .map_err(|error| QuorumError::Io(format!("serialize task refs: {error}")))
 }
 
 pub fn extract_pr_number(refs: &Option<String>) -> Option<i64> {
@@ -1658,9 +1711,24 @@ pub fn claim_remediation_rework_with_feedback(
         Err(e) => return Err(e.into()),
     }
 
+    // A recovered-remediation intent represents exactly one replacement
+    // worker.  Consume it in this same transaction as the unique lease
+    // installation, so a restart or a second reconciler tick cannot launch a
+    // duplicate worker for the same reap.
     tx.execute(
-        "UPDATE tasks SET assignee=?1, updated_at=?2 WHERE id=?3",
-        params![agent, now, id],
+        "UPDATE tasks
+         SET assignee=?1,
+             refs=CASE WHEN json_valid(COALESCE(refs, '{}'))
+                       THEN json_remove(COALESCE(refs, '{}'), ?4)
+                       ELSE refs END,
+             updated_at=?2
+         WHERE id=?3",
+        params![
+            agent,
+            now,
+            id,
+            format!("$.{RECOVERED_REMEDIATION_RETRY_REF}")
+        ],
     )?;
     crate::events::emit(
         &tx,
@@ -3307,6 +3375,7 @@ where
     let mut assignee = task.assignee.clone();
     let mut refs = task.refs.clone();
     if is_crash_recovery && new_status == Status::Failed {
+        refs = clear_recovered_remediation_retry(refs.as_deref())?;
         refs = Some(set_parked_refs(
             refs.as_deref(),
             failure_cause,
@@ -3329,12 +3398,20 @@ where
         && new_status == Status::Failed
         && matches!(event, Event::AgentFailed { .. } | Event::LeaseExpired);
     if is_remediation_death_park {
+        refs = clear_recovered_remediation_retry(refs.as_deref())?;
         refs = Some(set_parked_refs(
             refs.as_deref(),
             failure_cause,
             "rework",
             None,
         )?);
+    }
+    if is_crash_recovery && new_status == Status::Rework {
+        refs = Some(set_recovered_remediation_retry(refs.as_deref())?);
+        // The prior worker is gone.  Keep the durable author identity, but
+        // leave the task unassigned so the exact-remediation reconciler is
+        // visibly responsible for installing its replacement lease.
+        assignee = None;
     }
 
     for eff in &effects {
@@ -3491,6 +3568,7 @@ fn clear_runner_retry_refs(refs: Option<&str>) -> Result<Option<String>> {
             "remediation_feedback",
             PARKED_HEAD_CHECK_REF,
             PARKED_REWORK_RETRY_REF,
+            RECOVERED_REMEDIATION_RETRY_REF,
             CI_REMEDIATION_REQUESTED_REF,
             CI_REMEDIATION_PR_REF,
             CI_REMEDIATION_HEAD_SHA_REF,
@@ -4387,6 +4465,8 @@ pub(crate) fn set_parked_refs(
     // sets this marker. Clear any stale bit left over from a prior park so
     // status's BLOCKED section never renders a false unsatisfiable row.
     object.remove(PARKED_UNSATISFIABLE_REF);
+    // A terminal task cannot retain an automatic replacement-worker intent.
+    object.remove(RECOVERED_REMEDIATION_RETRY_REF);
     // Reset the publication-failure classification on every park so a prior
     // pr-closed park cannot contaminate a subsequent generic park.
     match publication_failure_kind {
@@ -9818,6 +9898,7 @@ mod tests {
         let refs: serde_json::Value =
             serde_json::from_str(r.task.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs["pr"], 50);
+        assert_eq!(refs[RECOVERED_REMEDIATION_RETRY_REF], true);
         assert!(
             refs.get(PARKED_REF).is_none(),
             "a resumable remediation failure must not park the task"
@@ -9854,7 +9935,42 @@ mod tests {
         let refs: serde_json::Value =
             serde_json::from_str(r.task.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs["pr"], 50);
+        assert_eq!(refs[RECOVERED_REMEDIATION_RETRY_REF], true);
         assert!(refs.get(PARKED_REF).is_none());
+    }
+
+    #[test]
+    fn recovered_remediation_intent_is_consumed_by_one_exact_claim() {
+        let (_d, mut c) = open_tmp();
+        let id = review_only_task_in_rework(&mut c);
+        let recovered = apply_event(&mut c, "system", id, &Event::LeaseExpired, 1003).unwrap();
+        assert_eq!(recovered.task.status, "rework");
+        assert!(recovered_remediation_retry_requested(
+            recovered.task.refs.as_deref()
+        ));
+
+        let claimed = claim_remediation_rework_with_feedback(
+            &mut c,
+            "replacement",
+            id,
+            TTL,
+            1004,
+            Some("fix the persisted blocker"),
+        )
+        .unwrap()
+        .expect("the recovery intent must admit one exact remediation worker");
+        assert_eq!(claimed.status, "rework");
+        assert_eq!(claimed.rework_round, 1);
+        assert_eq!(extract_pr_number(&claimed.refs), Some(50));
+        assert!(!recovered_remediation_retry_requested(
+            claimed.refs.as_deref()
+        ));
+        assert!(
+            claim_remediation_rework(&mut c, "duplicate", id, TTL, 1005)
+                .unwrap()
+                .is_none(),
+            "the live replacement lease is the duplicate-spawn authority"
+        );
     }
 
     #[test]
@@ -9910,6 +10026,10 @@ mod tests {
         assert!(
             refs.get(PARKED_REWORK_RETRY_REF).is_none(),
             "terminal park must never carry an auto-retry flag"
+        );
+        assert!(
+            refs.get(RECOVERED_REMEDIATION_RETRY_REF).is_none(),
+            "terminal park must never retain a recovery intent"
         );
         assert_eq!(
             r.task.recovery_attempts, MAX_RECOVERY_ATTEMPTS,
@@ -14240,7 +14360,13 @@ mod tests {
         // grace=60, so 1400+60=1460 < 1500).
         crate::sweep::reap_lapsed_tasks(&c, 1500, 100).unwrap();
         let t = get(&c, id).unwrap().unwrap();
-        assert_eq!(t.status, "open", "expired remediation lease must be reaped");
+        assert_eq!(
+            t.status, "rework",
+            "expired remediation lease stays in rework"
+        );
+        assert_eq!(t.rework_round, 1, "a reap must not burn a rework round");
+        assert_eq!(extract_pr_number(&t.refs), Some(42));
+        assert!(recovered_remediation_retry_requested(t.refs.as_deref()));
     }
 
     #[test]

@@ -24,14 +24,15 @@ pub const SWEEP_LIMIT: usize = 100;
 /// lease — the daemon must install the remediation claim promptly.
 pub const REWORK_PROVISIONING_GRACE_SECS: i64 = 60;
 
-/// Reaper: return any `working` or `rework` task whose lease has lapsed (no active, unexpired
-/// lease on `task#<id>`) back to `open`, clearing the assignee, and emit a `task_reclaimed`
-/// event per task to the event log.
+/// Reap `working` or `rework` tasks with no active, unexpired lease on
+/// `task#<id>`. PR-bound remediation context stays in `rework` and writes one
+/// bounded exact-remediation recovery intent; ordinary first-round work still
+/// returns to `open`.
 pub fn reap_lapsed_tasks(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     // sweep_on_write and sweep_all already call us inside their write
     // transaction. Direct callers do not, so own an IMMEDIATE transaction in
-    // that case: parking a review-only remediation updates the task, note,
-    // lease, event, and owner alert as one indivisible state change.
+    // that case: a terminal recovery park updates the task, note, lease,
+    // event, and owner alert as one indivisible state change.
     if conn.is_autocommit() {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
         reap_lapsed_tasks_in_tx(&tx, now, limit)?;
@@ -42,13 +43,22 @@ pub fn reap_lapsed_tasks(conn: &Connection, now: i64, limit: usize) -> Result<()
 }
 
 fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<()> {
-    // (id, assignee, status, review_only, had_any_lease_ever, refs)
+    // (id, assignee, had_any_lease_ever, refs, rework_round,
+    //  stamped_rework_cap, recovery_attempts)
     #[allow(clippy::type_complexity)]
-    let lapsed: Vec<(i64, Option<String>, String, bool, bool, Option<String>)> = {
+    let lapsed: Vec<(
+        i64,
+        Option<String>,
+        bool,
+        Option<String>,
+        i64,
+        Option<i64>,
+        i64,
+    )> = {
         let mut stmt = conn.prepare(
-            "SELECT t.id, t.assignee, t.status, t.review_only,
+            "SELECT t.id, t.assignee,
                     EXISTS(SELECT 1 FROM claims c WHERE c.target = 'task#' || t.id) AS had_lease,
-                    t.refs
+                    t.refs, t.rework_round, t.rework_cap, t.recovery_attempts
              FROM tasks t
              WHERE t.status IN ('working', 'rework') AND NOT EXISTS (
                  SELECT 1 FROM claims c
@@ -71,6 +81,7 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                  AND json_valid(t.refs)
                  AND (
                      COALESCE(json_type(t.refs, '$.daemon_rework_retry_requested')='true', 0)
+                     OR COALESCE(json_type(t.refs, '$.daemon_recovered_remediation_retry')='true', 0)
                      OR CASE WHEN json_type(t.refs, '$.runner_retry') IS NOT NULL
                          THEN COALESCE(
                              json_type(t.refs, '$.runner_retry.requested')='true', 0
@@ -91,32 +102,48 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                     Ok((
                         r.get(0)?,
                         r.get(1)?,
-                        r.get(2)?,
-                        r.get::<_, i64>(3)? != 0,
-                        r.get::<_, i64>(4)? != 0,
+                        r.get::<_, i64>(2)? != 0,
+                        r.get(3)?,
+                        r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
                     ))
                 },
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
-    for (id, prev, status, review_only, had_lease, refs) in &lapsed {
+    for (id, prev, had_lease, refs, rework_round, rework_cap, recovery_attempts) in &lapsed {
         let target = format!("task#{id}");
         let reason = if *had_lease {
             "lease lapsed"
         } else {
             "no lease installed"
         };
-        if *review_only && status == "rework" {
-            // A lapsed remediation lease must not hand the task back to
-            // review: the replacement reviewer re-judges the unchanged PR
-            // head and its changes verdict burns a rework round with zero
-            // remediation applied. Park instead (same contract as the
-            // lifecycle layer); the resulting terminal park is owner-gated.
-            let park_reason = format!("remediation {reason}");
-            let parked_refs =
-                crate::tasks::set_parked_refs(refs.as_deref(), &park_reason, "rework", None)?;
+        let has_rework_context =
+            crate::tasks::extract_pr_number(refs).is_some() && *rework_round > 0;
+        let effective_rework_cap = rework_cap.unwrap_or(i64::from(crate::lifecycle::REWORK_CAP));
+        let recovery_exhausted = *rework_round >= effective_rework_cap
+            || *recovery_attempts >= crate::tasks::MAX_RECOVERY_ATTEMPTS;
+        if has_rework_context && recovery_exhausted {
+            // Reaps do not spend a rework round, but a round already at its
+            // immutable cap (or an exhausted recovery budget) is terminal.
+            let park_reason = if *rework_round >= effective_rework_cap {
+                format!("remediation {reason}; rework cap exhausted")
+            } else {
+                format!(
+                    "remediation {reason}; recovery budget exhausted ({}/{})",
+                    recovery_attempts,
+                    crate::tasks::MAX_RECOVERY_ATTEMPTS
+                )
+            };
+            let unmarked_refs = crate::tasks::clear_recovered_remediation_retry(refs.as_deref())?;
+            let parked_refs = crate::tasks::set_parked_refs(
+                unmarked_refs.as_deref(),
+                &park_reason,
+                "rework",
+                None,
+            )?;
             conn.execute(
                 "UPDATE tasks SET status='failed', assignee=NULL, refs=?2, updated_at=?3 WHERE id=?1",
                 params![id, parked_refs, now],
@@ -134,25 +161,26 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
             crate::decomposition::block_graph_if_child_failed(conn, *id, &park_reason, now)?;
             continue;
         }
-        // Only implementation tasks reach here: review_only tasks are never
-        // `working` (they enter the lifecycle at in-review), so the park
-        // branch above already consumed every review_only row this query can
-        // return.
-        let preserve_rework = status == "rework"
-            && refs
-                .as_deref()
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                .is_some_and(|value| {
-                    value
-                        .get(crate::tasks::PARKED_REWORK_RETRY_REF)
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                        || crate::runner_state::retry_requested(&value)
-                });
-        let recovered_status = if preserve_rework { "rework" } else { "open" };
+        let recovered_status = if has_rework_context { "rework" } else { "open" };
+        let recovered_refs = has_rework_context
+            .then(|| crate::tasks::set_recovered_remediation_retry(refs.as_deref()))
+            .transpose()?;
         conn.execute(
-            "UPDATE tasks SET status=?1, assignee=NULL, updated_at=?2 WHERE id=?3",
-            params![recovered_status, now, id],
+            "UPDATE tasks
+             SET status=?1, assignee=NULL,
+                 author=CASE WHEN ?2='open' AND ?3 THEN NULL ELSE author END,
+                 refs=COALESCE(?4, refs),
+                 recovery_attempts=recovery_attempts + 1,
+                 updated_at=?5
+             WHERE id=?6",
+            params![
+                recovered_status,
+                recovered_status,
+                crate::tasks::extract_pr_number(refs).is_none(),
+                recovered_refs,
+                now,
+                id
+            ],
         )?;
         // Clear any lingering (now-expired) lease row so the next claim starts clean.
         conn.execute(
@@ -164,6 +192,19 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
             None => format!("reclaimed ({reason}) → {recovered_status}"),
         };
         crate::events::emit(conn, "task_reclaimed", &target, &body, now)?;
+        if has_rework_context {
+            conn.execute(
+                "INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at, recipient)
+                 VALUES (?1, 'daemon', ?2, 'alert', ?3, ?4, ?5, 'owner')",
+                params![
+                    now,
+                    crate::feed::DEFAULT_TOPIC,
+                    format!("task #{id}: remediation lease expired; resuming rework"),
+                    format!("task:{id}"),
+                    now + crate::feed::DEFAULT_MESSAGE_TTL_SECS,
+                ],
+            )?;
+        }
     }
     Ok(())
 }
@@ -2335,149 +2376,95 @@ mod tests {
         assert!(!c_task.ready);
     }
 
-    // ── Review-only reaper recovery (table-driven) ─────────────────
+    // ── Rework reaper recovery (table-driven) ──────────────────────
 
     #[test]
-    fn reaper_review_only_and_impl_destinations() {
-        // Table-driven: implementation tasks recover to open; review_only
-        // rework parks (failed + daemon_parked) — bouncing to in-review would
-        // re-review the unchanged PR head and burn a rework round per bounce.
-        struct Case {
-            review_only: bool,
-            expected_status: &'static str,
-            label: &'static str,
-        }
-        let cases = [
-            Case {
-                review_only: false,
-                expected_status: "open",
-                label: "implementation→open",
-            },
-            Case {
-                review_only: true,
-                expected_status: "failed",
-                label: "review_only rework→parked",
-            },
-        ];
-        for case in &cases {
+    fn reaper_lease_expiry_retains_pr_bound_remediation_context() {
+        // Both a task still marked working and a review-only remediation
+        // already in rework use the lifecycle's PR-bound recovery path.
+        for (status, review_only) in [("working", false), ("rework", true)] {
             let (_d, mut c) = open_tmp();
-            let id = if case.review_only {
-                let id = crate::tasks::create(
-                    &mut c,
-                    "boss",
-                    "review task",
-                    None,
-                    0,
-                    None,
-                    None,
-                    None,
-                    Some(42),
-                    1000,
-                )
-                .unwrap();
-                // Move to rework to simulate VerdictChanges lifecycle path
-                c.execute(
-                    "UPDATE tasks SET status='rework', assignee='W1', reviewer='R1' WHERE id=?1",
-                    params![id],
-                )
-                .unwrap();
-                id
-            } else {
-                let id = crate::tasks::create(
-                    &mut c,
-                    "boss",
-                    "impl task",
-                    None,
-                    0,
-                    None,
-                    None,
-                    None,
-                    None,
-                    1000,
-                )
-                .unwrap();
-                ready_claim(&mut c, "W1", id, 100, 1000);
-                id
-            };
-            // Ensure a claim exists that will lapse
-            if case.review_only {
-                c.execute(
-                    "INSERT INTO claims(target, holder, ts, expires_at, active) \
-                     VALUES (?1, 'W1', 1000, 1100, 1)",
-                    params![format!("task#{id}")],
-                )
-                .unwrap();
-            }
+            let id = crate::tasks::create(
+                &mut c,
+                "boss",
+                "PR-bound remediation",
+                None,
+                0,
+                None,
+                None,
+                None,
+                Some(42),
+                1000,
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE tasks
+                 SET status=?1, assignee='W1', author='W1', review_only=?2,
+                     rework_round=1, rework_cap=3, refs='{\"pr\":42}'
+                 WHERE id=?3",
+                params![status, review_only, id],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO claims(target, holder, ts, expires_at, active)
+                 VALUES (?1, 'W1', 1000, 1050, 1)",
+                params![format!("task#{id}")],
+            )
+            .unwrap();
 
             reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
-            let t = crate::tasks::get(&c, id).unwrap().unwrap();
-            assert_eq!(t.status, case.expected_status, "{}", case.label);
-            assert!(
-                t.assignee.is_none(),
-                "{}: assignee must be cleared",
-                case.label
-            );
-
-            let target = format!("task#{id}");
-            let evs = crate::events::list(&c, 0, Some(&target), 10, 1100).unwrap();
-            if case.review_only {
-                // Parked, never reclaimed: durable owner-gated markers plus
-                // task_parked event and loud owner alert.
-                let refs: serde_json::Value =
-                    serde_json::from_str(t.refs.as_deref().unwrap()).unwrap();
-                assert_eq!(refs["daemon_parked"], true, "{}", case.label);
-                assert_eq!(refs["daemon_resume_status"], "rework", "{}", case.label);
-                assert!(
-                    refs.get("daemon_parked_head_check").is_none(),
-                    "{}",
-                    case.label
-                );
-                let parked = &evs
-                    .iter()
-                    .find(|e| e.kind == "task_parked")
-                    .expect("task_parked event missing")
-                    .body;
-                assert!(
-                    parked.contains("lease lapsed"),
-                    "{}: park event must say 'lease lapsed', got: {parked}",
-                    case.label
-                );
-                assert!(
-                    !evs.iter().any(|e| e.kind == "task_reclaimed"),
-                    "{}: parked task must not also emit task_reclaimed",
-                    case.label
-                );
-            } else {
-                let body = &evs
-                    .iter()
-                    .find(|e| e.kind == "task_reclaimed")
-                    .expect("task_reclaimed event missing")
-                    .body;
-                assert!(
-                    body.contains(case.expected_status),
-                    "{}: event body must report '{}'",
-                    case.label,
-                    case.expected_status
-                );
-                assert!(
-                    body.contains("lease lapsed"),
-                    "{}: event body must say 'lease lapsed'",
-                    case.label
-                );
-            }
+            let task = crate::tasks::get(&c, id).unwrap().unwrap();
+            assert_eq!(task.status, "rework", "{status}");
+            assert_eq!(task.rework_round, 1, "{status}: a reap burns no round");
+            assert_eq!(task.recovery_attempts, 1, "{status}: recovery is bounded");
+            assert_eq!(task.author.as_deref(), Some("W1"), "{status}");
+            assert!(task.assignee.is_none(), "{status}: old worker is gone");
+            assert_eq!(crate::tasks::extract_pr_number(&task.refs), Some(42));
+            assert!(crate::tasks::recovered_remediation_retry_requested(
+                task.refs.as_deref()
+            ));
+            let events = crate::events::list(&c, 0, Some(&format!("task#{id}")), 10, 1100).unwrap();
+            assert!(events.iter().any(|event| event.kind == "task_reclaimed"));
+            let alerts = crate::feed::peek(&c, None, None, 10, 1100).unwrap();
+            assert!(alerts.iter().any(|message| {
+                message.recipient.as_deref() == Some("owner")
+                    && message.body.contains("resuming rework")
+            }));
         }
     }
 
     #[test]
-    fn reaper_review_only_rework_park_preserves_round_and_alerts_owner() {
-        // A lapsed remediation lease parks (never bounces to review): the
-        // round budget is untouched, provenance survives for `task-retry`,
-        // and the failure is loud (owner alert).
+    fn reaper_prless_and_exhausted_remediation_keep_negative_destinations() {
         let (_d, mut c) = open_tmp();
-        let id = crate::tasks::create(
+        let prless = crate::tasks::create(
             &mut c,
             "boss",
-            "review task",
+            "first round",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='working', assignee='W1', author='W1' WHERE id=?1",
+            [prless],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO claims(target, holder, ts, expires_at, active)
+             VALUES (?1, 'W1', 1000, 1050, 1)",
+            [format!("task#{prless}")],
+        )
+        .unwrap();
+
+        let capped = crate::tasks::create(
+            &mut c,
+            "boss",
+            "capped remediation",
             None,
             0,
             None,
@@ -2488,95 +2475,106 @@ mod tests {
         )
         .unwrap();
         c.execute(
-            "UPDATE tasks SET status='rework', assignee='W1', reviewer='R1', rework_round=2 WHERE id=?1",
-            params![id],
+            "UPDATE tasks
+             SET status='rework', assignee='W2', author='W2', rework_round=2,
+                 rework_cap=2, refs='{\"pr\":42}'
+             WHERE id=?1",
+            [capped],
         )
         .unwrap();
         c.execute(
-            "INSERT INTO claims(target, holder, ts, expires_at, active) \
-             VALUES (?1, 'W1', 1000, 1050, 1)",
-            params![format!("task#{id}")],
+            "INSERT INTO claims(target, holder, ts, expires_at, active)
+             VALUES (?1, 'W2', 1000, 1050, 1)",
+            [format!("task#{capped}")],
+        )
+        .unwrap();
+
+        let budgeted = crate::tasks::create(
+            &mut c,
+            "boss",
+            "recovery budget exhausted",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(43),
+            1000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks
+             SET status='rework', assignee='W3', author='W3', rework_round=1,
+                 rework_cap=3, recovery_attempts=?2, refs='{\"pr\":43}'
+             WHERE id=?1",
+            params![budgeted, crate::tasks::MAX_RECOVERY_ATTEMPTS],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO claims(target, holder, ts, expires_at, active)
+             VALUES (?1, 'W3', 1000, 1050, 1)",
+            [format!("task#{budgeted}")],
         )
         .unwrap();
 
         reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
-        let t = crate::tasks::get(&c, id).unwrap().unwrap();
-        assert_eq!(t.status, "failed");
-        assert!(t.review_only, "review_only flag must be preserved");
-        assert_eq!(
-            t.rework_round, 2,
-            "infra failure must not consume a rework round"
-        );
-        assert!(t.assignee.is_none(), "assignee cleared by the park");
-        let active_claims: i64 = c
-            .query_row(
-                "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
-                params![format!("task#{id}")],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(active_claims, 0, "lapsed lease deactivated");
-        // Loud failure: owner alert with the retry hint.
-        let msgs = crate::feed::peek(&c, None, None, 10, 1100).unwrap();
+        let prless = crate::tasks::get(&c, prless).unwrap().unwrap();
+        assert_eq!(prless.status, "open");
         assert!(
-            msgs.iter().any(|m| m.kind == "alert"
-                && m.recipient.as_deref() == Some("owner")
-                && m.body.contains("task-retry")),
-            "owner alert with retry hint missing"
+            prless.author.is_none(),
+            "PR-less recovery clears the author"
         );
-        // Explicit retry resumes the remediation flow with the round intact.
-        let resumed = crate::tasks::retry_parked(&mut c, id, "boss", true, 1200)
-            .unwrap()
-            .unwrap();
-        assert_eq!(resumed.status, "rework");
-        assert_eq!(resumed.rework_round, 2);
+        let capped = crate::tasks::get(&c, capped).unwrap().unwrap();
+        assert_eq!(capped.status, "failed");
+        assert_eq!(capped.rework_round, 2, "a reap never changes the round");
+        assert!(capped.assignee.is_none());
+        let refs: serde_json::Value =
+            serde_json::from_str(capped.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["pr"], 42);
+        assert_eq!(refs["daemon_parked"], true);
+        assert!(refs
+            .get(crate::tasks::RECOVERED_REMEDIATION_RETRY_REF)
+            .is_none());
+        let budgeted = crate::tasks::get(&c, budgeted).unwrap().unwrap();
+        assert_eq!(budgeted.status, "failed");
+        assert_eq!(
+            budgeted.recovery_attempts,
+            crate::tasks::MAX_RECOVERY_ATTEMPTS
+        );
     }
 
     #[test]
-    fn reaper_park_blocks_active_graph_with_failed_child_and_alert() {
+    fn reaper_prless_child_returns_open_without_blocking_its_graph() {
         let (_d, mut c) = open_tmp();
         let (graph, child) = active_graph_rework_child(&mut c, None);
 
         reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
 
-        let graph_state: (String, i64, String, String) = c
+        assert_eq!(
+            crate::tasks::get(&c, child).unwrap().unwrap().status,
+            "open",
+            "a PR-less rework reap follows the ordinary Open recovery path"
+        );
+        let graph_state: (String, Option<String>, Option<String>) = c
             .query_row(
                 "SELECT state,active,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
                 [graph],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(graph_state.0, "blocked");
-        assert_eq!(graph_state.1, 1);
-        assert_eq!(graph_state.2, "generated-child-failed");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&graph_state.3).unwrap(),
-            serde_json::json!({
-                "affected_task": child,
-                "reason": "remediation lease lapsed",
-            })
-        );
-        let graph_event: (String, String) = c
+        assert_eq!(graph_state, ("active".into(), None, None));
+        let graph_events: i64 = c
             .query_row(
-                "SELECT subject,body FROM events WHERE kind='task_graph_blocked'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(graph_event.0, format!("task#{child}"));
-        assert!(graph_event.1.contains(&format!("task #{child}")));
-        let alerts: i64 = c
-            .query_row(
-                "SELECT count(*) FROM messages WHERE kind='alert' AND recipient='owner'",
+                "SELECT count(*) FROM events WHERE kind='task_graph_blocked'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(alerts >= 1, "blocked graph must leave an owner alert");
+        assert_eq!(graph_events, 0);
     }
 
     #[test]
-    fn reaper_park_does_not_block_graph_when_child_has_active_retry_marker() {
+    fn reaper_prless_retry_marker_does_not_override_open_recovery() {
         let (_d, mut c) = open_tmp();
         let (graph, child) =
             active_graph_rework_child(&mut c, Some(r#"{"runner_retry":{"requested":true}}"#));
@@ -2585,8 +2583,8 @@ mod tests {
 
         assert_eq!(
             crate::tasks::get(&c, child).unwrap().unwrap().status,
-            "failed",
-            "the child is parked before its retry marker suppresses graph blocking"
+            "open",
+            "a PR-less retry marker must not override the ordinary Open recovery path"
         );
 
         let graph_state: (String, Option<String>, Option<String>) = c
@@ -2813,32 +2811,19 @@ mod tests {
     }
 
     #[test]
-    fn reaper_preserves_dependency_blocked_runner_retry_until_rework_push() {
+    fn reaper_prless_runner_retry_returns_open() {
         let (_d, mut c) = open_tmp();
-        let dependency = crate::tasks::create(
-            &mut c,
-            "owner",
-            "pending dependency",
-            None,
-            0,
-            None,
-            None,
-            None,
-            None,
-            1000,
-        )
-        .unwrap();
         let task_id = crate::tasks::create(
             &mut c,
             "owner",
-            "runner retry",
+            "PR-less runner retry",
             None,
             0,
             None,
             Some(
                 r#"{"runner_retry":{"provider":"codex","model":"gpt-5","effort":"high","prompt":"finish","turn_kind":"rework","continuation_id":"thread-1","requested":true}}"#,
             ),
-            Some(&format!("[{dependency}]")),
+            None,
             None,
             1000,
         )
@@ -2860,70 +2845,25 @@ mod tests {
         )
         .unwrap();
         c.execute(
-            "UPDATE tasks SET status='rework', updated_at=1000 WHERE id=?1",
+            "UPDATE tasks SET status='rework', assignee='worker', author='worker', updated_at=1000 WHERE id=?1",
             params![task_id],
         )
         .unwrap();
-
-        // This is after the provisioning grace. The blocked provider retry
-        // must remain rework so its eventual ReworkPushed is legal.
-        reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
-        assert_eq!(
-            crate::tasks::get(&c, task_id).unwrap().unwrap().status,
-            "rework"
-        );
-
         c.execute(
-            "UPDATE tasks SET status='done' WHERE id=?1",
-            params![dependency],
+            "INSERT INTO claims(target, holder, ts, expires_at, active)
+             VALUES (?1, 'worker', 1000, 1050, 1)",
+            params![format!("task#{task_id}")],
         )
         .unwrap();
-        // A write can sweep after the dependency resolves but before the
-        // replacement worker claims. Durable provider retry identity must
-        // survive that ready-but-unclaimed interval.
-        reap_lapsed_tasks(&c, 1101, SWEEP_LIMIT).unwrap();
-        assert_eq!(
-            crate::tasks::get(&c, task_id).unwrap().unwrap().status,
-            "rework"
-        );
-        crate::tasks::claim_provider_retry_rework(&mut c, "codex", task_id, 10, 1101)
-            .unwrap()
-            .expect("resolved runner retry must claim in rework");
 
-        // If the replacement worker's lease lapses, the durable retry marker
-        // must not exempt the claimed row forever. Recovery clears the stale
-        // assignee while preserving rework semantics for another replacement.
-        reap_lapsed_tasks(&c, 1162, SWEEP_LIMIT).unwrap();
+        // No PR and no completed remediation round means this is still an
+        // ordinary task recovery, even if historical provider retry data is
+        // present in refs.
+        reap_lapsed_tasks(&c, 1100, SWEEP_LIMIT).unwrap();
         let recovered = crate::tasks::get(&c, task_id).unwrap().unwrap();
-        assert_eq!(recovered.status, "rework");
-        assert!(
-            recovered.assignee.is_none(),
-            "lapsed replacement assignee must be cleared"
-        );
-        let refs: serde_json::Value =
-            serde_json::from_str(recovered.refs.as_deref().unwrap()).unwrap();
-        assert!(crate::runner_state::retry_requested(&refs));
-        let active_claims: i64 = c
-            .query_row(
-                "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
-                params![format!("task#{task_id}")],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(active_claims, 0, "lapsed replacement lease is deactivated");
-
-        crate::tasks::claim_provider_retry_rework(&mut c, "replacement", task_id, 3600, 1163)
-            .unwrap()
-            .expect("recovered runner retry must be claimable again in rework");
-        let pushed = crate::tasks::apply_event(
-            &mut c,
-            "replacement",
-            task_id,
-            &crate::lifecycle::Event::ReworkPushed,
-            1164,
-        )
-        .unwrap();
-        assert_eq!(pushed.task.status, "in-review");
+        assert_eq!(recovered.status, "open");
+        assert!(recovered.author.is_none());
+        assert!(recovered.assignee.is_none());
     }
 
     #[test]
