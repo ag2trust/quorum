@@ -1265,6 +1265,39 @@ impl WorktreeManager {
             && !conflicts.stdout.is_empty())
     }
 
+    /// Enumerate the still-unmerged paths inside a preserved sync-conflict
+    /// worktree. Runs under the ordinary local git timeout so a hung or
+    /// oversize git call fails fast rather than stalling a daemon tick, and
+    /// treats a missing worktree as a caller-visible failure. Used by the
+    /// branch-sync conflict judgment-task intake to build the task body.
+    pub async fn sync_conflicted_files(&self, worktree_dir: &Path) -> Result<Vec<String>, String> {
+        let _guard = self.lock.lock().await;
+        if !worktree_dir.exists() {
+            return Err(format!(
+                "branch sync conflict worktree {} is missing",
+                worktree_dir.display()
+            ));
+        }
+        let mut cmd = self.git_cmd(worktree_dir);
+        cmd.args(["diff", "--name-only", "--diff-filter=U"]);
+        let output = run_git(cmd, self.local_timeout, "git list sync conflict files").await?;
+        if !output.status.success() {
+            return Err(format!(
+                "git diff --diff-filter=U failed: {}",
+                git_diagnostic(&output.stderr)
+            ));
+        }
+        let text = String::from_utf8(output.stdout).map_err(|error| {
+            format!("git diff --diff-filter=U produced non-UTF-8 output: {error}")
+        })?;
+        Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Fetch a PR head via `refs/pull/<pr>/head` and provision a worktree.
     /// Works for both same-repo and fork PRs (GitHub exposes this ref
     /// regardless of head repository).

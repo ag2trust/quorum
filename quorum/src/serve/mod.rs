@@ -5826,9 +5826,18 @@ async fn reconcile_decomposition_startup(
 
 fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>> {
     use rusqlite::OptionalExtension;
+    // The `refs.branch_sync` exclusion matches the core planner/decomposition
+    // guards in `begin_planning`/`begin_routed_planning` and the direct
+    // dispatch clause: a branch-sync judgment task bypasses planning exactly
+    // like continuation and review-only work. Selecting it here would let
+    // `begin_routed_planning` reject it every tick while ordinary
+    // decomposable candidates starve behind it.
+    let branch_sync_ref_present =
+        quorum_core::tasks::BRANCH_SYNC_REF_PRESENT_SQL.replace("refs", "t.refs");
     Ok(conn
         .query_row(
-            "SELECT t.id,t.revision FROM tasks t
+            &format!(
+                "SELECT t.id,t.revision FROM tasks t
          WHERE t.status='open' AND t.assignee IS NULL AND t.review_only=0
            AND t.terminal_leaf=0
            AND NOT EXISTS (SELECT 1 FROM task_decompositions repository_graph
@@ -5845,6 +5854,7 @@ fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>>
                  AND COALESCE(json_array_length(t.refs, '$.cx_risk_flags'), 0) >= 1)
            )
            AND t.continue_pr IS NULL
+           AND NOT {branch_sync_ref_present}
            AND NOT EXISTS (SELECT 1 FROM task_decompositions d WHERE d.source_task_id=t.id)
            AND NOT EXISTS (SELECT 1 FROM task_graph_members m WHERE m.task_id=t.id)
            AND (t.depends_on IS NULL OR NOT EXISTS (
@@ -5852,7 +5862,8 @@ fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>>
                WHERE NOT EXISTS (SELECT 1 FROM tasks prerequisite
                                  WHERE prerequisite.id=dep.value AND prerequisite.status='done')
            ))
-         ORDER BY t.priority DESC,t.id ASC LIMIT 1",
+         ORDER BY t.priority DESC,t.id ASC LIMIT 1"
+            ),
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -10824,6 +10835,10 @@ async fn tick_loop(
     // before lifecycle recovery so a crash can resume its pinned/prepared
     // evidence without waiting for the first normal daemon tick.
     branch_sync::reconcile_one(config, &wt_mgr, &mut branch_sync_checks).await?;
+    // Provision one pending conflict judgment task at startup so a restart
+    // that landed with unbound `conflict` rows observes them as tasks from
+    // the very first tick. The intake is bounded to one row per call.
+    branch_sync::intake_conflict_judgment_task(config, &wt_mgr).await?;
 
     // `attempting` means the prior daemon crossed the durable boundary before
     // a merge network call (ordinary reviewed merge or explicit replay), but
@@ -11517,6 +11532,11 @@ async fn tick(
     // tick. A pending sync CI wait is retained separately, so this pass only
     // starts or settles it and never holds lifecycle work for its timeout.
     branch_sync::reconcile_one(config, wt_mgr, branch_sync_checks).await?;
+    // Alongside clean-path reconciliation, provision one pending conflict
+    // judgment task per tick. The core selector caps this pass at one row
+    // regardless of how many sync pairs an operator has configured, and the
+    // git-diff runs under the shared local worktree timeout.
+    branch_sync::intake_conflict_judgment_task(config, wt_mgr).await?;
 
     let decomposition_freeze = tick_decomposition(
         config,
@@ -48281,6 +48301,41 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         conn.execute("UPDATE tasks SET status='done' WHERE id=3", [])
             .unwrap();
         assert_eq!(planning_candidate(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn planning_candidate_excludes_branch_sync_refs_ahead_of_decomposable_work() {
+        // A classified branch-sync judgment task ranked first must not win the
+        // planner selection: `begin_routed_planning` would cleanly reject it,
+        // starving the ordinary decomposable task ranked below. The selector
+        // must match the core planner/decomposition guards and skip the
+        // branch-sync ref outright, just as it already skips continuation
+        // and review-only work.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = quorum_core::db::open(&dir.path().join("branch-sync-planning.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('branch-sync judgment','open',100,'daemon',1,1,
+               '{\"branch_sync\":42,\"cx_est\":5,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null,\"cx_risk_flags\":[]}',0);
+             INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('ordinary decomposable','open',1,'owner',1,1,
+               '{\"cx_est\":5,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null,\"cx_risk_flags\":[]}',0);"
+        )
+        .unwrap();
+
+        // Without the branch-sync exclusion the higher-priority row would win
+        // — the assertion is the entire regression: the ordinary task plans
+        // while the branch-sync judgment task waits for the direct-dispatch
+        // path.
+        assert_eq!(planning_candidate(&conn).unwrap(), Some((2, 1)));
+
+        conn.execute("UPDATE tasks SET status='done' WHERE id=2", [])
+            .unwrap();
+        assert_eq!(
+            planning_candidate(&conn).unwrap(),
+            None,
+            "the branch-sync judgment task must never appear as a planner candidate"
+        );
     }
 
     #[test]

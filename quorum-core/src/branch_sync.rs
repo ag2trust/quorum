@@ -805,22 +805,24 @@ pub fn cancel_request(conn: &mut Connection, id: i64, by: &str, now: i64) -> Res
     Ok(CancelOutcome::Cancelled(row))
 }
 
-/// Read every active `conflict` row that still lacks a bound judgment task.
-/// The daemon's intake pass reads this, gathers the conflicted-file evidence
-/// from the preserved sync worktree, and then hands each id to
-/// [`create_conflict_judgment_task`] for atomic provisioning. Unlike the
-/// clean-path selector this returns every eligible row so no conflict is
-/// starved by a busy clean path.
-pub fn list_conflicts_awaiting_task(conn: &Connection) -> Result<Vec<BranchSync>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {COLS} FROM branch_syncs
-         WHERE active=1 AND phase='conflict' AND task_id IS NULL
-         ORDER BY updated_at ASC, id ASC"
-    ))?;
-    let syncs = stmt
-        .query_map([], row_to_branch_sync)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(syncs)
+/// Select the oldest active `conflict` row that still lacks a bound judgment
+/// task. The daemon's intake pass calls this once per tick and hands the id
+/// to [`create_conflict_judgment_task`] for atomic provisioning, keeping the
+/// pass fair (oldest first) and bounded (one row per tick) regardless of
+/// how many sync pairs an operator has configured.
+pub fn next_conflict_awaiting_task(conn: &Connection) -> Result<Option<BranchSync>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {COLS} FROM branch_syncs
+                 WHERE active=1 AND phase='conflict' AND task_id IS NULL
+                 ORDER BY updated_at ASC, id ASC
+                 LIMIT 1"
+            ),
+            [],
+            row_to_branch_sync,
+        )
+        .optional()?)
 }
 
 /// Outcome of [`create_conflict_judgment_task`].
@@ -1491,16 +1493,21 @@ mod tests {
     }
 
     #[test]
-    fn list_conflicts_awaiting_task_excludes_bound_rows() {
+    fn next_conflict_awaiting_task_returns_oldest_unbound_row() {
         let (_dir, mut conn) = open_tmp();
         let a = requested(request(&mut conn, "main", "develop", "A", 100).unwrap());
         pin_and_conflict(&mut conn, a.id);
         let b = requested(request(&mut conn, "release", "develop", "A", 100).unwrap());
         pin_and_conflict(&mut conn, b.id);
-        create_conflict_judgment_task(&mut conn, b.id, &[], 200).unwrap();
-        let awaiting = list_conflicts_awaiting_task(&conn).unwrap();
-        assert_eq!(awaiting.len(), 1);
-        assert_eq!(awaiting[0].id, a.id);
+        // Nothing bound yet — oldest row wins.
+        let first = next_conflict_awaiting_task(&conn).unwrap().unwrap();
+        assert_eq!(first.id, a.id);
+        create_conflict_judgment_task(&mut conn, a.id, &[], 200).unwrap();
+        // Once bound, the next tick moves to the next oldest unbound row.
+        let second = next_conflict_awaiting_task(&conn).unwrap().unwrap();
+        assert_eq!(second.id, b.id);
+        create_conflict_judgment_task(&mut conn, b.id, &[], 201).unwrap();
+        assert!(next_conflict_awaiting_task(&conn).unwrap().is_none());
     }
 
     #[test]

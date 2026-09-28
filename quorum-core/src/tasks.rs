@@ -527,7 +527,7 @@ macro_rules! branch_sync_ref_present_sql {
           AND json_type(COALESCE(refs, '{}'), '$.branch_sync') != 'null')"
     };
 }
-pub(crate) const BRANCH_SYNC_REF_PRESENT_SQL: &str = branch_sync_ref_present_sql!();
+pub const BRANCH_SYNC_REF_PRESENT_SQL: &str = branch_sync_ref_present_sql!();
 
 // SQL counterpart of the implementation branch in
 // `classification_is_dispatchable`. Callers that need implementation work

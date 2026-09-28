@@ -119,46 +119,48 @@ pub async fn reconcile_one(
     Ok(())
 }
 
-/// Daemon intake pass: for each active `conflict` branch-sync row that lacks a
-/// bound task, list the still-unmerged files in the preserved sync worktree
-/// and atomically provision the judgment task. A missing/collapsed worktree,
-/// git failure, or lost race yields a loud `fail` on that row's phase rather
-/// than an infinite retry loop; the row's `task_id` binding is created inside
-/// the same transaction as the task INSERT.
-///
-/// Wired into the daemon tick by the follow-on lifecycle task; kept unused
-/// here so this intake logic and its tests can land ahead of that wiring.
-#[allow(dead_code)]
-pub async fn intake_conflict_judgment_tasks(config: &ServeConfig) -> Result<()> {
+/// Daemon intake pass: pick the oldest active `conflict` branch-sync row that
+/// lacks a bound judgment task, gather the still-unmerged files from the
+/// preserved sync worktree using the timeout-governed `WorktreeManager`
+/// helper, and provision the judgment task inside the core's one immediate
+/// transaction. One row per tick keeps the pass bounded regardless of how
+/// many sync pairs an operator has configured; a missing worktree or a git
+/// failure yields a loud `fail` on that row's `conflict` phase rather than
+/// an infinite retry loop. The row's `task_id` binding is created inside the
+/// same transaction as the task INSERT.
+pub async fn intake_conflict_judgment_task(
+    config: &ServeConfig,
+    worktrees: &WorktreeManager,
+) -> Result<()> {
     let db_path = config.db_path.clone();
-    let pending = tokio::task::spawn_blocking(move || -> Result<Vec<BranchSync>> {
+    let sync = tokio::task::spawn_blocking(move || -> Result<Option<BranchSync>> {
         let conn = quorum_core::db::open(&db_path)?;
-        branch_sync::list_conflicts_awaiting_task(&conn)
+        branch_sync::next_conflict_awaiting_task(&conn)
     })
     .await
     .map_err(|error| QuorumError::Io(format!("branch sync conflict intake join: {error}")))??;
+    let Some(sync) = sync else {
+        return Ok(());
+    };
 
-    for sync in pending {
-        let worktree = sync_worktree(config, &sync);
-        let result = provision_conflict_task(config, &sync, &worktree).await;
-        if let Err(error) = result {
-            fail(config, &sync, &error).await?;
-            log(&format!(
-                "branch sync #{} conflict task intake failed: {error}",
-                sync.id
-            ));
-        }
+    let worktree = sync_worktree(config, &sync);
+    if let Err(error) = provision_conflict_task(config, worktrees, &sync, &worktree).await {
+        fail(config, &sync, &error).await?;
+        log(&format!(
+            "branch sync #{} conflict task intake failed: {error}",
+            sync.id
+        ));
     }
     Ok(())
 }
 
-#[allow(dead_code)]
 async fn provision_conflict_task(
     config: &ServeConfig,
+    worktrees: &WorktreeManager,
     sync: &BranchSync,
-    worktree: &std::path::Path,
+    worktree: &Path,
 ) -> std::result::Result<(), String> {
-    let files = list_conflicted_files(worktree).await?;
+    let files = worktrees.sync_conflicted_files(worktree).await?;
     let db_path = config.db_path.clone();
     let id = sync.id;
     tokio::task::spawn_blocking(move || -> Result<ConflictJudgmentOutcome> {
@@ -169,39 +171,6 @@ async fn provision_conflict_task(
     .map_err(|error| format!("branch sync conflict task provisioning join: {error}"))?
     .map_err(|error| error.to_string())?;
     Ok(())
-}
-
-#[allow(dead_code)]
-async fn list_conflicted_files(
-    worktree: &std::path::Path,
-) -> std::result::Result<Vec<String>, String> {
-    if !worktree.exists() {
-        return Err(format!(
-            "branch sync conflict worktree {} is missing",
-            worktree.display()
-        ));
-    }
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["diff", "--name-only", "--diff-filter=U"])
-        .output()
-        .await
-        .map_err(|error| format!("git diff --diff-filter=U: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git diff --diff-filter=U failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let text = String::from_utf8(output.stdout)
-        .map_err(|error| format!("git diff --diff-filter=U produced non-UTF-8 output: {error}"))?;
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
 }
 
 fn sync_branch(sync: &BranchSync) -> String {
@@ -1794,7 +1763,10 @@ mod tests {
         let worktree = sync_worktree(&config, &sync);
         let expected_files = init_conflict_worktree(&worktree);
 
-        intake_conflict_judgment_tasks(&config).await.unwrap();
+        let worktrees = WorktreeManager::new();
+        intake_conflict_judgment_task(&config, &worktrees)
+            .await
+            .unwrap();
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         let bound = branch_sync::get(&conn, sync.id).unwrap().unwrap();
@@ -1834,7 +1806,9 @@ mod tests {
 
         // A second intake pass over the same bound row must be a clean no-op.
         drop(conn);
-        intake_conflict_judgment_tasks(&config).await.unwrap();
+        intake_conflict_judgment_task(&config, &worktrees)
+            .await
+            .unwrap();
         let conn = quorum_core::db::open(&db_path).unwrap();
         let after = branch_sync::get(&conn, sync.id).unwrap().unwrap();
         assert_eq!(after.task_id, Some(task_id));
@@ -1880,7 +1854,10 @@ mod tests {
             root.path().join("worktrees"),
             root.path().join("fake-gh"),
         );
-        intake_conflict_judgment_tasks(&config).await.unwrap();
+        let worktrees = WorktreeManager::new();
+        intake_conflict_judgment_task(&config, &worktrees)
+            .await
+            .unwrap();
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         let row = branch_sync::get(&conn, sync.id).unwrap().unwrap();
