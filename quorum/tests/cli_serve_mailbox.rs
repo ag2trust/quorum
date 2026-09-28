@@ -1029,13 +1029,14 @@ fn rework_feed_failure_releases_task() {
     );
 
     // VerdictChanges moves the task to rework, then AgentFailed from the
-    // failed feed releases it to open. Journal absence proves cleanup finished.
-    wait_for_task_status(home.path(), 1, "open");
+    // failed feed retains that remediation context for a replacement worker.
+    // Journal absence proves cleanup finished.
+    wait_for_task_status(home.path(), 1, "rework");
     wait_for_journal_absent(home.path(), &worker_name);
 
     handle.stop();
 
-    // The failed rework delivery releases the task for a replacement worker.
+    // The failed rework delivery retains the task for a replacement worker.
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
@@ -1047,7 +1048,7 @@ fn rework_feed_failure_releases_task() {
     let task: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
         task["status"].as_str(),
-        Some("open"),
-        "task was not released after rework feed failure: {stdout}"
+        Some("rework"),
+        "task did not retain remediation context after rework feed failure: {stdout}"
     );
 }

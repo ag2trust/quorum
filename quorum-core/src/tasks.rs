@@ -3253,10 +3253,10 @@ where
     let (mut new_status, mut effects) = crate::lifecycle::transition(&view, event)
         .map_err(|e| QuorumError::Usage(e.to_string()))?;
 
-    // Recovery budget: crash-recovery transitions (Working/Rework → Open via
-    // AgentFailed/LeaseExpired) are bounded. Park loudly in Failed when exhausted;
-    // only an explicit caller may originate Cancelled.
-    let is_crash_recovery = new_status == Status::Open
+    // Recovery budget: crash-recovery transitions (Working/Rework → Open or
+    // Rework via AgentFailed/LeaseExpired) are bounded. Park loudly in Failed
+    // when exhausted; only an explicit caller may originate Cancelled.
+    let is_crash_recovery = matches!(new_status, Status::Open | Status::Rework)
         && matches!(status, Status::Working | Status::Rework)
         && matches!(event, Event::AgentFailed { .. } | Event::LeaseExpired);
 
@@ -3268,7 +3268,9 @@ where
 
     if is_crash_recovery && task.recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
         new_status = Status::Failed;
-        effects.retain(|e| !matches!(e, Effect::NotifyOwner { .. }));
+        // A terminal recovery exhaustion must not retain the rework respawn
+        // effect selected before this storage-level budget guard.
+        effects.retain(|e| !matches!(e, Effect::NotifyOwner { .. } | Effect::ResumeWorker));
         if !effects.contains(&Effect::ReleaseLease) {
             effects.push(Effect::ReleaseLease);
         }
@@ -3292,7 +3294,7 @@ where
     );
     let recovery_attempts = if reset_recovery {
         0
-    } else if is_crash_recovery && new_status == Status::Open {
+    } else if is_crash_recovery && matches!(new_status, Status::Open | Status::Rework) {
         task.recovery_attempts + 1
     } else {
         task.recovery_attempts
@@ -3316,10 +3318,9 @@ where
             None,
         )?);
     }
-    // Review-only remediation death: the lifecycle layer already chose Failed
-    // (park, never bounce to review — a replacement reviewer on the unchanged
-    // head burns a rework round with zero remediation applied). Write durable
-    // owner-gated park markers only.
+    // A terminal remediation recovery (the immutable rework cap or recovery
+    // budget is exhausted) remains owner-gated. Write durable park markers
+    // only after the lifecycle layer has selected Failed.
     // Every Failed park is owner-gated. In particular, daemon teardown must
     // not put a runnable retry marker on a terminal row: after restart the
     // pre-shutdown selection is no longer authoritative.
@@ -7914,7 +7915,7 @@ mod tests {
             disposition,
             ManagedExitDisposition::AgentFailed(_)
         ));
-        assert_eq!(get(&c, id).unwrap().unwrap().status, "open");
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "rework");
     }
 
     #[test]
@@ -8468,7 +8469,7 @@ mod tests {
         claim(&mut c, "R", Some(id), &[], TTL, 1002).unwrap();
         apply_event(&mut c, "R", id, &Event::VerdictChanges, 1003).unwrap();
 
-        // A fails during rework → open (author=A preserved because PR exists)
+        // A fails during rework → rework (author=A and the remediation context persist)
         apply_event(
             &mut c,
             "A",
@@ -8480,24 +8481,15 @@ mod tests {
         )
         .unwrap();
 
-        // B reclaims → assignee=B, author=A (preserved)
-        let t = claim(&mut c, "B", Some(id), &[], TTL, 1005)
+        // B receives the replacement remediation lease → assignee=B, author=A.
+        let t = claim_remediation_rework(&mut c, "B", id, TTL, 1005)
             .unwrap()
             .unwrap();
         assert_eq!(t.assignee.as_deref(), Some("B"));
         assert_eq!(t.author.as_deref(), Some("A"), "author must be preserved");
 
-        // B signals done — authorized by assignee, not author
-        let r = apply_event(
-            &mut c,
-            "B",
-            id,
-            &Event::SignaledDone {
-                pr: "51".to_string(),
-            },
-            1006,
-        )
-        .unwrap();
+        // B pushes the same remediation round — authorized by assignee, not author.
+        let r = apply_event(&mut c, "B", id, &Event::ReworkPushed, 1006).unwrap();
         assert_eq!(r.task.status, "in-review");
         assert_eq!(
             r.task.author.as_deref(),
@@ -9795,10 +9787,9 @@ mod tests {
     }
 
     #[test]
-    fn remediation_agent_failed_parks_review_only_rework() {
-        // D5b: a remediation worker lost at runtime must park the task, not
-        // hand the unchanged PR head back to a fresh reviewer (whose changes
-        // verdict would burn a rework round with zero remediation applied).
+    fn remediation_agent_failed_resumes_review_only_rework() {
+        // A remediation worker lost at runtime returns to the existing
+        // remediation context, never to a fresh reviewer on the unchanged PR.
         let (_d, mut c) = open_tmp();
         let id = review_only_task_in_rework(&mut c);
 
@@ -9813,23 +9804,23 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(r.task.status, "failed");
+        assert_eq!(r.task.status, "rework");
         assert_eq!(
             r.task.rework_round, 1,
             "infra failure must not consume a rework round"
         );
+        assert_eq!(r.task.recovery_attempts, 1);
+        assert!(r.effects.contains(&Effect::ResumeWorker));
         assert!(
             !r.effects.contains(&Effect::SpawnReviewer),
             "remediation death must not spawn a reviewer"
         );
         let refs: serde_json::Value =
             serde_json::from_str(r.task.refs.as_deref().unwrap()).unwrap();
-        assert_eq!(refs[PARKED_REF], true);
-        assert_eq!(refs[PARKED_RESUME_STATUS_REF], "rework");
-        assert!(refs.get(PARKED_HEAD_CHECK_REF).is_none());
+        assert_eq!(refs["pr"], 50);
         assert!(
-            refs.get(PARKED_REWORK_RETRY_REF).is_none(),
-            "a genuine crash park must stay owner-gated — no auto-retry flag"
+            refs.get(PARKED_REF).is_none(),
+            "a resumable remediation failure must not park the task"
         );
         let active_claims: i64 = c
             .query_row(
@@ -9838,35 +9829,36 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(active_claims, 0, "park releases the remediation lease");
+        assert_eq!(active_claims, 0, "recovery releases the remediation lease");
         // Failures are loud: owner alert delivered.
         let msgs = crate::feed::peek(&c, None, None, 10, 1003).unwrap();
         assert!(
             msgs.iter().any(|m| m.kind == "alert"
                 && m.recipient.as_deref() == Some("owner")
-                && m.body.contains("task-retry")),
-            "owner alert with retry hint missing"
+                && m.body.contains("worker killed by watchdog")),
+            "owner alert is missing"
         );
     }
 
     #[test]
-    fn remediation_lease_expired_parks_review_only_rework() {
+    fn remediation_lease_expired_resumes_review_only_rework() {
         let (_d, mut c) = open_tmp();
         let id = review_only_task_in_rework(&mut c);
 
         let r = apply_event(&mut c, "system", id, &Event::LeaseExpired, 1003).unwrap();
-        assert_eq!(r.task.status, "failed");
+        assert_eq!(r.task.status, "rework");
         assert_eq!(r.task.rework_round, 1);
+        assert_eq!(r.task.recovery_attempts, 1);
+        assert!(r.effects.contains(&Effect::ResumeWorker));
         assert!(!r.effects.contains(&Effect::SpawnReviewer));
         let refs: serde_json::Value =
             serde_json::from_str(r.task.refs.as_deref().unwrap()).unwrap();
-        assert_eq!(refs[PARKED_REF], true);
-        assert_eq!(refs[PARKED_RESUME_STATUS_REF], "rework");
-        assert!(refs.get(PARKED_HEAD_CHECK_REF).is_none());
+        assert_eq!(refs["pr"], 50);
+        assert!(refs.get(PARKED_REF).is_none());
     }
 
     #[test]
-    fn daemon_caused_park_is_owner_gated_even_with_budget() {
+    fn daemon_caused_rework_recovery_spends_budget() {
         let (_d, mut c) = open_tmp();
         let id = review_only_task_in_rework(&mut c);
 
@@ -9880,23 +9872,14 @@ mod tests {
             1003,
         )
         .unwrap();
-        assert_eq!(r.task.status, "failed");
+        assert_eq!(r.task.status, "rework");
         let refs: serde_json::Value =
             serde_json::from_str(r.task.refs.as_deref().unwrap()).unwrap();
-        assert_eq!(refs[PARKED_REF], true);
-        assert!(refs.get(PARKED_REWORK_RETRY_REF).is_none());
+        assert_eq!(refs["pr"], 50);
+        assert!(refs.get(PARKED_REF).is_none());
         assert_eq!(
-            r.task.recovery_attempts, 0,
-            "owner-gated park must not spend an automatic retry budget"
-        );
-
-        let resumed = retry_parked(&mut c, id, "boss", true, 1004)
-            .unwrap()
-            .unwrap();
-        assert_eq!(resumed.status, "rework");
-        assert_eq!(
-            resumed.recovery_attempts, 0,
-            "owner retry refills the budget"
+            r.task.recovery_attempts, 1,
+            "automatic remediation recovery must spend its bounded retry budget"
         );
     }
 
@@ -10985,7 +10968,7 @@ mod tests {
     /// and never overwrite it (#340). The branch (derived from author) stays
     /// stable across re-claims, preventing duplicate PRs.
     #[test]
-    fn rework_reclaim_preserves_original_author() {
+    fn rework_recovery_claim_preserves_original_author() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
 
@@ -11011,11 +10994,11 @@ mod tests {
         claim(&mut c, "Optic-c6at", Some(id), &[], TTL, 1002).unwrap();
         apply_event(&mut c, "Optic-c6at", id, &Event::VerdictChanges, 1003).unwrap();
 
-        // Author's lease lapsed — rework → open
+        // Author's lease lapsed — rework context remains resumable.
         apply_event(&mut c, "system", id, &Event::LeaseExpired, 1004).unwrap();
 
-        // Different agent claims the reopened task
-        let t = claim(&mut c, "Lever-lx89", Some(id), &[], TTL, 1005)
+        // Different agent claims the replacement remediation lease.
+        let t = claim_remediation_rework(&mut c, "Lever-lx89", id, TTL, 1005)
             .unwrap()
             .unwrap();
 
@@ -11031,9 +11014,9 @@ mod tests {
         );
     }
 
-    /// Auto-select claim (task_id=None) also preserves author on rework re-claim (#340).
+    /// Replacement remediation claims preserve the original author after a lease lapse (#340).
     #[test]
-    fn rework_reclaim_auto_select_preserves_author() {
+    fn rework_recovery_replacement_preserves_author() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
 
@@ -11056,11 +11039,11 @@ mod tests {
         claim(&mut c, "R", Some(id), &[], TTL, 1002).unwrap();
         apply_event(&mut c, "R", id, &Event::VerdictChanges, 1003).unwrap();
 
-        // Lease lapse → open
+        // Lease lapse → resumable rework.
         apply_event(&mut c, "system", id, &Event::LeaseExpired, 1004).unwrap();
 
-        // New agent auto-selects (no task_id)
-        let t = claim(&mut c, "Lever-lx89", None, &[], TTL, 1005)
+        // New remediation agent claims the retained rework task.
+        let t = claim_remediation_rework(&mut c, "Lever-lx89", id, TTL, 1005)
             .unwrap()
             .unwrap();
         assert_eq!(t.id, id);
@@ -11296,6 +11279,81 @@ mod tests {
     }
 
     #[test]
+    fn rework_recovery_budget_parks_without_respawning() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "rework recovery budget",
+            None,
+            5,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        claim(&mut c, "author", Some(id), &[], TTL, 200).unwrap();
+        apply_event(
+            &mut c,
+            "author",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            300,
+        )
+        .unwrap();
+        apply_event(
+            &mut c,
+            "reviewer",
+            id,
+            &Event::ReviewerAttached {
+                agent: "reviewer".into(),
+            },
+            400,
+        )
+        .unwrap();
+        apply_event(&mut c, "reviewer", id, &Event::VerdictChanges, 500).unwrap();
+
+        for attempt in 1..=MAX_RECOVERY_ATTEMPTS {
+            claim_remediation_rework(&mut c, "replacement", id, TTL, 600 + attempt)
+                .unwrap()
+                .expect("retained remediation context must be claimable");
+            let recovered = apply_event(
+                &mut c,
+                "daemon",
+                id,
+                &Event::AgentFailed {
+                    reason: "remediation crashed".into(),
+                },
+                650 + attempt,
+            )
+            .unwrap();
+            assert_eq!(recovered.task.status, "rework", "attempt {attempt}");
+            assert_eq!(
+                recovered.task.recovery_attempts, attempt,
+                "attempt {attempt}"
+            );
+            assert_eq!(recovered.task.rework_round, 1, "attempt {attempt}");
+            assert_eq!(extract_pr_number(&recovered.task.refs), Some(42));
+            assert!(recovered.effects.contains(&Effect::ResumeWorker));
+        }
+
+        claim_remediation_rework(&mut c, "replacement", id, TTL, 700)
+            .unwrap()
+            .expect("the final bounded attempt must claim");
+        let exhausted = apply_event(&mut c, "daemon", id, &Event::LeaseExpired, 750).unwrap();
+        assert_eq!(exhausted.task.status, "failed");
+        assert_eq!(exhausted.task.recovery_attempts, MAX_RECOVERY_ATTEMPTS);
+        assert_eq!(exhausted.task.rework_round, 1);
+        assert_eq!(extract_pr_number(&exhausted.task.refs), Some(42));
+        assert!(
+            !exhausted.effects.contains(&Effect::ResumeWorker),
+            "a terminal budget exhaustion must not request another worker"
+        );
+    }
+
+    #[test]
     fn recovery_budget_resets_on_signaled_done() {
         let (_d, mut c) = open_tmp();
         let tid = create(
@@ -11379,7 +11437,7 @@ mod tests {
         // Install remediation lease (as the daemon would).
         claim_remediation_rework(&mut c, "w1", tid, TTL, 510).unwrap();
 
-        // Rework crash → open, recovery_attempts = 1
+        // Rework crash → rework, recovery_attempts = 1
         apply_event(
             &mut c,
             "daemon",
@@ -11391,21 +11449,15 @@ mod tests {
         )
         .unwrap();
         let t = get(&c, tid).unwrap().unwrap();
+        assert_eq!(t.status, "rework");
         assert_eq!(t.recovery_attempts, 1);
 
-        // Re-claim (w1 is still author since PR exists) → working → submit → in-review
-        claim(&mut c, "w1", Some(tid), &[], TTL, 700).unwrap();
-        apply_event(
-            &mut c,
-            "w1",
-            tid,
-            &Event::SignaledDone { pr: "10".into() },
-            800,
-        )
-        .unwrap();
-        // SignaledDone resets recovery_attempts
+        // The replacement worker finishes the retained remediation round.
+        claim_remediation_rework(&mut c, "w1", tid, TTL, 700).unwrap();
+        apply_event(&mut c, "w1", tid, &Event::ReworkPushed, 800).unwrap();
+        // ReworkPushed resets recovery_attempts.
         let t = get(&c, tid).unwrap().unwrap();
-        assert_eq!(t.recovery_attempts, 0, "SignaledDone resets counter");
+        assert_eq!(t.recovery_attempts, 0, "ReworkPushed resets counter");
 
         // New rework cycle to test ReworkPushed specifically:
         // Bump recovery_attempts via raw SQL to simulate prior crashes
