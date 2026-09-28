@@ -2208,6 +2208,15 @@ the session identity late, so no continuation may be relied on before `end`.
   successful model call. Some authentication failures did not promptly terminate after
   emitting the error, so bounded group kill/reap is part of the transport contract.
 
+**Verified facts (2026-09-28):**
+
+- `~/.grok/bin/grok` reported `grok 1.0.40 (eb1a2256660d) [stable]`. A successful
+  normal-mode worker invocation using the adapter's argument shape ended with a
+  `streaming-json` `end` event whose `stopReason` was `end_turn` (with `sessionId`,
+  `requestId`, usage, `num_turns`, and `total_cost_usd`). The adapter accepts this exact
+  snake_case spelling alongside the older `EndTurn` spelling; other terminal reasons
+  remain failures.
+
 **Hypotheses and deliberately unverified behavior:**
 
 - Grok has not passed attended real-CLI worker, remediation, R1, R2, restart, shutdown,
