@@ -1060,8 +1060,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("q.db");
         let mut conn = db::open(&db_path).unwrap();
-        let tid = seed_task(&mut conn, "mismatched sampling", "Worker-T");
         let other = seed_task(&mut conn, "sampling owner", "Worker-X");
+        let tid = seed_task(&mut conn, "mismatched sampling", "Worker-T");
         conn.execute(
             "UPDATE tasks
              SET status='merging', refs=json_set(COALESCE(refs, '{}'), '$.pr', 208)
