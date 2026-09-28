@@ -191,16 +191,6 @@ fn bounded_classifier_prompt(
     Ok(prompt)
 }
 
-/// Build the user turn for the classifier prompt.
-#[allow(dead_code)] // default-provider convenience retained for compatibility
-pub fn classifier_turn(
-    tasks: &[TaskForClassification],
-    dup_context: &[TaskForClassification],
-) -> String {
-    let prompt = classify::build_prompt(tasks, dup_context);
-    super::agent::user_turn(&prompt)
-}
-
 /// Drain a bounded slice of classifier output. The wall-clock and byte budgets
 /// belong to the slot, so repeated daemon ticks cannot reset them. Violations
 /// are provider failures for both ordinary and decomposition classification.
