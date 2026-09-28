@@ -29,6 +29,10 @@ pub const MODEL_TIERS: &[ModelTier] = &[
         model_id: "claude-opus-4-8",
     },
     ModelTier {
+        tier: "opus-55",
+        model_id: "claude-opus-5-5",
+    },
+    ModelTier {
         tier: "luna",
         model_id: "gpt-5.6-luna",
     },
@@ -85,6 +89,7 @@ mod tests {
             ("opus-46", "claude-opus-4-6"),
             ("opus-47", "claude-opus-4-7"),
             ("opus-48", "claude-opus-4-8"),
+            ("opus-55", "claude-opus-5-5"),
             ("luna", "gpt-5.6-luna"),
             ("terra", "gpt-5.6-terra"),
             ("sol", "gpt-5.6-sol"),
@@ -105,9 +110,13 @@ mod tests {
     #[test]
     fn claude_floor_vocabulary_excludes_codex_tiers() {
         assert_eq!(claude_model_id_for_tier("opus-47"), Some("claude-opus-4-7"));
+        assert_eq!(claude_model_id_for_tier("opus-55"), Some("claude-opus-5-5"));
         for tier in ["luna", "terra", "sol", "unknown"] {
             assert_eq!(claude_model_id_for_tier(tier), None, "{tier}");
         }
-        assert_eq!(known_claude_tiers(), "sonnet-5|opus-46|opus-47|opus-48");
+        assert_eq!(
+            known_claude_tiers(),
+            "sonnet-5|opus-46|opus-47|opus-48|opus-55"
+        );
     }
 }
