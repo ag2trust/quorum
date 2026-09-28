@@ -546,12 +546,19 @@ fn store_classifications_tx(
                     params![result.task_id, now, note],
                 )?;
             }
-            let (review_only, continue_pr): (bool, Option<i64>) = tx.query_row(
-                "SELECT review_only, continue_pr FROM tasks WHERE id=?1",
-                params![result.task_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            if let Some(reason) = parking_reason(&sanitized, review_only, continue_pr.is_some()) {
+            let (review_only, continue_pr, task_refs): (bool, Option<i64>, Option<String>) = tx
+                .query_row(
+                    "SELECT review_only, continue_pr, refs FROM tasks WHERE id=?1",
+                    params![result.task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+            let is_branch_sync = crate::tasks::refs_have_branch_sync_ref(task_refs.as_deref());
+            if let Some(reason) = parking_reason(
+                &sanitized,
+                review_only,
+                continue_pr.is_some(),
+                is_branch_sync,
+            ) {
                 crate::tasks::park_classified_task_tx(tx, result.task_id, reason, now)?;
             } else {
                 crate::tasks::restore_classified_task_tx(tx, result.task_id, now)?;
@@ -673,11 +680,13 @@ fn parking_reason(
     result: &TaskClassification,
     review_only: bool,
     continue_pr: bool,
+    branch_sync_ref: bool,
 ) -> Option<&str> {
     if !result.ready {
         return result.not_ready_reason.as_deref();
     }
-    if !review_only && !continue_pr && result.size == "XL" && result.cx_est <= 3 {
+    if !review_only && !continue_pr && !branch_sync_ref && result.size == "XL" && result.cx_est <= 3
+    {
         return Some(crate::tasks::LOW_COMPLEXITY_XL_PARK_REASON);
     }
     None
@@ -2486,12 +2495,16 @@ mod redesigned_tests {
 
     #[test]
     fn policy_allows_focused_complexity_five() {
-        assert!(parking_reason(&result(5, "S", true, None), false, false).is_none());
-        assert!(parking_reason(&result(5, "M", true, None), false, false).is_none());
-        assert!(parking_reason(&result(5, "L", true, None), false, false).is_none());
-        assert!(parking_reason(&result(2, "XL", true, None), false, false).is_some());
-        assert!(parking_reason(&result(2, "XL", true, None), false, true).is_none());
-        assert!(parking_reason(&result(2, "XL", true, None), true, false).is_none());
+        assert!(parking_reason(&result(5, "S", true, None), false, false, false).is_none());
+        assert!(parking_reason(&result(5, "M", true, None), false, false, false).is_none());
+        assert!(parking_reason(&result(5, "L", true, None), false, false, false).is_none());
+        assert!(parking_reason(&result(2, "XL", true, None), false, false, false).is_some());
+        assert!(parking_reason(&result(2, "XL", true, None), false, true, false).is_none());
+        assert!(parking_reason(&result(2, "XL", true, None), true, false, false).is_none());
+        assert!(
+            parking_reason(&result(2, "XL", true, None), false, false, true).is_none(),
+            "a branch-sync judgment task skips parking like review-only/continue-pr"
+        );
     }
 
     #[test]
