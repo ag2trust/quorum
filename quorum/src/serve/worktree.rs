@@ -1191,6 +1191,41 @@ impl WorktreeManager {
             .await
     }
 
+    /// Provision a branch-sync conflict judgment worker onto the kept sync
+    /// worktree. Unlike [`Self::provision`], this never cuts the branch from
+    /// a base ref and never re-attaches a missing worktree: a fresh checkout
+    /// of the branch would silently drop `MERGE_HEAD` and the unmerged index
+    /// the worker must resolve, so anything but the exact kept registration
+    /// fails loud.
+    pub async fn adopt_sync_worktree(
+        &self,
+        repo_dir: &Path,
+        worktree_dir: &Path,
+        branch: &str,
+    ) -> Result<PathBuf, String> {
+        let _guard = self.lock.lock().await;
+        if !self.branch_exists_unlocked(repo_dir, branch).await {
+            return Err(format!("branch sync local branch {branch} is missing"));
+        }
+        let Some(existing) = self
+            .find_worktree_for_branch_unlocked(repo_dir, branch)
+            .await
+        else {
+            return Err(format!(
+                "branch sync worktree {} for {branch} is missing; refusing to recreate it without MERGE_HEAD",
+                worktree_dir.display()
+            ));
+        };
+        let expected = std::fs::canonicalize(worktree_dir).ok();
+        let actual = std::fs::canonicalize(&existing).ok();
+        if expected.is_none() || expected != actual {
+            return Err(format!(
+                "branch collision: '{branch}' already checked out in worktree '{existing}'"
+            ));
+        }
+        Ok(worktree_dir.to_path_buf())
+    }
+
     async fn ensure_sync_worktree_unlocked(
         &self,
         repo_dir: &Path,
