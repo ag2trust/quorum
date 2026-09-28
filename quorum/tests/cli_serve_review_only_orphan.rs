@@ -7,7 +7,7 @@
 //! 4. Remediation worker pushes → in-review + re-review fed to reviewer
 //!
 //! Unit-level tests cover:
-//! - Expired-lease review-only rework recovers to in-review (not open)
+//! - Expired-lease PR-bound review-only rework retains rework (not open)
 //! - Healthy remediation lease survives reaper
 //! - Claim race produces no errors rows
 //!
@@ -1466,11 +1466,11 @@ fn review_only_orphan_full_lifecycle() {
     );
 }
 
-/// Negative: an expired remediation lease parks the review-only task (never
-/// bounces to in-review) — a replacement reviewer on the unchanged PR head
-/// would burn a rework round with zero remediation applied (D5b).
+/// An expired PR-bound remediation lease retains the review-only task's rework
+/// context, so the daemon can provision one replacement worker without
+/// re-reviewing the unchanged PR head or burning a round.
 #[test]
-fn review_only_rework_expired_lease_parks_for_retry() {
+fn review_only_rework_expired_lease_retains_rework_for_recovery() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
 
@@ -1538,43 +1538,39 @@ fn review_only_rework_expired_lease_parks_for_retry() {
         quorum_core::sweep::reap_lapsed_tasks(&conn, now, 100).unwrap();
     }
 
-    // Verify: parked (failed + daemon_parked, resume rework), never in-review.
+    // Verify: retained rework with the same PR/round and one durable recovery
+    // intent, never in-review or open.
     let task = get_task(home.path(), task_id);
     assert_eq!(
-        task.status, "failed",
-        "expired-lease review-only rework must park, got: {}",
+        task.status, "rework",
+        "expired-lease review-only rework must retain rework, got: {}",
         task.status
     );
+    assert_eq!(quorum_core::tasks::extract_pr_number(&task.refs), Some(pr));
     assert_eq!(
         task.rework_round, 1,
         "infra failure must not consume a rework round"
     );
     let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-    assert_eq!(refs["daemon_parked"], true);
-    assert_eq!(refs["daemon_resume_status"], "rework");
     assert!(
-        refs.get("daemon_parked_head_check").is_none(),
-        "terminal park must not carry automatic head-check authority"
-    );
-    assert!(
-        refs.get("daemon_rework_retry_requested").is_none(),
-        "terminal park must stay owner-gated until explicit task-retry"
+        refs["daemon_recovered_remediation_retry"].as_bool() == Some(true),
+        "rework recovery must persist the exact replacement-worker intent"
     );
 
     let events = events_for_task(home.path(), task_id);
-    let parked = events
+    let reclaimed = events
         .iter()
-        .find(|(k, _)| k == "task_parked")
+        .find(|(k, _)| k == "task_reclaimed")
         .map(|(_, b)| b.clone());
-    assert!(parked.is_some(), "reaper must emit task_parked event");
+    assert!(reclaimed.is_some(), "reaper must emit task_reclaimed event");
     assert!(
-        parked.as_ref().unwrap().contains("lease lapsed"),
-        "park event must say 'lease lapsed' (not 'no lease installed'), got: {:?}",
-        parked
+        reclaimed.as_ref().unwrap().contains("lease lapsed"),
+        "reclaim event must say 'lease lapsed', got: {:?}",
+        reclaimed
     );
     assert!(
-        !events.iter().any(|(k, _)| k == "task_reclaimed"),
-        "parked task must not also emit task_reclaimed"
+        !events.iter().any(|(k, _)| k == "task_parked"),
+        "reclaimed task must not also emit task_parked"
     );
 }
 
