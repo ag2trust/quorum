@@ -51,7 +51,7 @@ pub struct RoutingPolicy {
 impl RoutingPolicy {
     /// Effective Arbiter routing pool. An unset `[routing.arbiter]` block
     /// (empty map) falls back to the planner pool, so the Arbiter resolves to
-    /// the same Claude Opus 4.8 model the planner uses unless an operator
+    /// the same model profile distribution as the planner unless an operator
     /// configures an explicit override. Dormant: no runtime path resolves an
     /// Arbiter assignment yet.
     pub fn arbiter_pool(&self) -> &PercentagePool {
@@ -2454,6 +2454,9 @@ worktree_base = "/tmp/wt"
 
     #[test]
     fn suggested_models_accepts_every_closed_tier_at_supported_efforts() {
+        assert!(quorum_core::model_tiers::MODEL_TIERS
+            .iter()
+            .any(|tier| tier.tier == "opus-55" && tier.model_id == "claude-opus-5-5"));
         let mut selections = std::collections::HashMap::new();
         for (index, tier) in quorum_core::model_tiers::MODEL_TIERS.iter().enumerate() {
             selections.insert(
@@ -2499,7 +2502,7 @@ worktree_base = "/tmp/wt"
             assert_eq!(err.exit_code(), 2, "{model}: {err}");
             assert!(
                 err.to_string()
-                    .contains("expected Claude tier: sonnet-5|opus-46|opus-47|opus-48"),
+                    .contains("expected Claude tier: sonnet-5|opus-46|opus-47|opus-48|opus-55"),
                 "{model}: {err}"
             );
         }

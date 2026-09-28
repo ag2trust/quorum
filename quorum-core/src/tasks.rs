@@ -10797,6 +10797,39 @@ mod tests {
     }
 
     #[test]
+    fn task_creation_accepts_opus_55_tier_label_and_rejects_unknown_tier() {
+        let (_d, mut c) = open_tmp();
+        assert!(super::create(
+            &mut c,
+            "daemon",
+            "opus 5.5 task",
+            None,
+            0,
+            Some(r#"["tier:opus-55"]"#),
+            None,
+            None,
+            None,
+            1000,
+        )
+        .is_ok());
+
+        let err = super::create(
+            &mut c,
+            "daemon",
+            "unknown tier task",
+            None,
+            0,
+            Some(r#"["tier:opus-99"]"#),
+            None,
+            None,
+            None,
+            1001,
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
     fn creator_refs_cannot_forge_classifier_authority() {
         for refs in [
             r#"{"cx_est":5}"#,
