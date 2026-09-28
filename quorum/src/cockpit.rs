@@ -502,8 +502,15 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        let has_missing_deps = !b.missing_deps.is_empty();
         let is_deadlocked = !b.deadlocked_on.is_empty();
-        let block_icon = if is_deadlocked {
+        let block_icon = if has_missing_deps {
+            if sty.color {
+                "⚠️"
+            } else {
+                "[MISSING]"
+            }
+        } else if is_deadlocked {
             if sty.color {
                 "💀"
             } else {
@@ -516,7 +523,16 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
                 "[blocked]"
             }
         };
-        let suffix = if is_deadlocked {
+        let missing_suffix = if has_missing_deps {
+            let missing_ids: Vec<String> = b.missing_deps.iter().map(|d| format!("#{d}")).collect();
+            format!(
+                " (MISSING — dependency row not found; will never unblock: {})",
+                missing_ids.join(", ")
+            )
+        } else {
+            String::new()
+        };
+        let deadlocked_suffix = if is_deadlocked {
             let dead_ids: Vec<String> = b.deadlocked_on.iter().map(|d| format!("#{d}")).collect();
             format!(" (CANCELLED — will never unblock: {})", dead_ids.join(", "))
         } else {
@@ -524,14 +540,15 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
         };
         let _ = writeln!(
             w,
-            "  #{:<5} {:<8} {:<18} {:<8} {} waits on {}{}",
+            "  #{:<5} {:<8} {:<18} {:<8} {} waits on {}{}{}",
             b.id,
             b.provider.as_deref().unwrap_or("pending"),
             b.model.as_deref().unwrap_or("pending"),
             b.effort.as_deref().unwrap_or("pending"),
             block_icon,
             dep,
-            suffix,
+            missing_suffix,
+            deadlocked_suffix,
         );
         let _ = writeln!(w, "      {}", truncate(&b.title, width.saturating_sub(6)));
     }
@@ -1089,6 +1106,7 @@ mod tests {
             tier_eff: "opus46·hi".into(),
             waiting_on: vec![1],
             deadlocked_on: vec![],
+            missing_deps: vec![],
         });
 
         let mut buf = Vec::new();
@@ -1560,6 +1578,7 @@ mod tests {
             effort: None,
             waiting_on: vec![4, 6, 9],
             deadlocked_on: vec![],
+            missing_deps: vec![],
         });
         let mut buf = Vec::new();
         render_with_style(&s, &Style::plain(), &mut buf);
@@ -1587,6 +1606,7 @@ mod tests {
             effort: None,
             waiting_on: vec![3, 5, 7],
             deadlocked_on: vec![5],
+            missing_deps: vec![],
         });
         let mut buf = Vec::new();
         render_with_style(&s, &Style::plain(), &mut buf);
@@ -1599,6 +1619,49 @@ mod tests {
         assert!(
             line.contains("CANCELLED") && line.contains("#5"),
             "cancelled dep detail must appear: {line}"
+        );
+    }
+
+    #[test]
+    fn blocked_missing_dependency_is_explicitly_never_resolvable() {
+        let mut s = default_stats();
+        s.blocked.push(BlockedTask {
+            id: 30,
+            title: "missing-dependency task".into(),
+            tier_eff: "opus46·md".into(),
+            provider: None,
+            model: None,
+            effort: None,
+            waiting_on: vec![404],
+            deadlocked_on: vec![],
+            missing_deps: vec![404],
+        });
+        s.blocked.push(BlockedTask {
+            id: 31,
+            title: "ordinary-pending task".into(),
+            tier_eff: "opus46·md".into(),
+            provider: None,
+            model: None,
+            effort: None,
+            waiting_on: vec![405],
+            deadlocked_on: vec![],
+            missing_deps: vec![],
+        });
+
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        let missing_line = output.lines().find(|l| l.contains("#30")).unwrap();
+        assert!(
+            missing_line.contains("[MISSING]")
+                && missing_line.contains("#404")
+                && missing_line.contains("will never unblock"),
+            "missing dependency must be explicit: {missing_line}"
+        );
+        let pending_line = output.lines().find(|l| l.contains("#31")).unwrap();
+        assert!(
+            pending_line.contains("waits on #405") && !pending_line.contains("MISSING"),
+            "ordinary pending dependency must remain ordinary: {pending_line}"
         );
     }
 

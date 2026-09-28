@@ -126,6 +126,8 @@ pub struct BlockedTask {
     pub waiting_on: Vec<i64>,
     /// Dep ids that are cancelled — will never unblock without intervention.
     pub deadlocked_on: Vec<i64>,
+    /// Dep ids with no surviving task row — will never unblock without intervention.
+    pub missing_deps: Vec<i64>,
 }
 
 /// A recent feed message — last N rows, oldest-first within the window.
@@ -2097,6 +2099,7 @@ fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
         }
         let waiting_on = unmet_deps(conn, &depends_on)?;
         let deadlocked_on = cancelled_deps(conn, &depends_on)?;
+        let missing_deps = missing_deps(conn, &depends_on)?;
         blocked.push(BlockedTask {
             id,
             title,
@@ -2106,6 +2109,7 @@ fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
             tier_eff: tier_eff_label(labels.as_deref()),
             waiting_on,
             deadlocked_on,
+            missing_deps,
         });
     }
     Ok(blocked)
@@ -2136,6 +2140,23 @@ fn cancelled_deps(conn: &Connection, depends_on: &Option<String>) -> Result<Vec<
         "SELECT je.value FROM json_each(?1) je
          WHERE EXISTS (
              SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'cancelled'
+         )",
+    )?;
+    let ids = stmt
+        .query_map(params![json], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
+/// Return the subset of dep ids from `depends_on` that have no task row.
+fn missing_deps(conn: &Connection, depends_on: &Option<String>) -> Result<Vec<i64>> {
+    let Some(json) = depends_on.as_deref() else {
+        return Ok(vec![]);
+    };
+    let mut stmt = conn.prepare(
+        "SELECT je.value FROM json_each(?1) je
+         WHERE NOT EXISTS (
+             SELECT 1 FROM tasks d WHERE d.id = je.value
          )",
     )?;
     let ids = stmt
@@ -4050,9 +4071,63 @@ mod tests {
         assert!(b_ids.contains(&t3));
         let b2 = s.blocked.iter().find(|b| b.id == t2).unwrap();
         assert_eq!(b2.waiting_on, vec![t1]);
+        assert!(b2.missing_deps.is_empty());
         assert_eq!(b2.tier_eff, "opus46");
         let b3 = s.blocked.iter().find(|b| b.id == t3).unwrap();
         assert_eq!(b3.waiting_on, vec![t2]);
+        assert!(b3.missing_deps.is_empty());
+    }
+
+    #[test]
+    fn blocked_section_identifies_deleted_dependency_rows() {
+        let (_d, mut c) = open_tmp();
+        let pending = crate::tasks::create(
+            &mut c, "boss", "pending", None, 0, None, None, None, None, 100,
+        )
+        .unwrap();
+        let normally_blocked = crate::tasks::create(
+            &mut c,
+            "boss",
+            "normally-blocked",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{pending}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        let deleted = crate::tasks::create(
+            &mut c, "boss", "deleted", None, 0, None, None, None, None, 100,
+        )
+        .unwrap();
+        let missing_blocked = crate::tasks::create(
+            &mut c,
+            "boss",
+            "missing-blocked",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{deleted}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute("DELETE FROM tasks WHERE id=?1", params![deleted])
+            .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let normal = s.blocked.iter().find(|b| b.id == normally_blocked).unwrap();
+        assert!(normal.missing_deps.is_empty());
+        let missing = s.blocked.iter().find(|b| b.id == missing_blocked).unwrap();
+        assert_eq!(missing.waiting_on, vec![deleted]);
+        assert_eq!(missing.missing_deps, vec![deleted]);
+        assert_eq!(
+            serde_json::to_value(missing).unwrap()["missing_deps"],
+            serde_json::json!([deleted])
+        );
     }
 
     #[test]
