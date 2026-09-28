@@ -1,11 +1,8 @@
 //! Performance report queries for `quorum perf`. Read-only — no writes, no mutations.
 //!
-//! Computes aggregate metrics from the `tasks` table (terminal tasks only: done, failed,
-//! cancelled). Model/effort resolved from `agent_runs` (earliest worker spawn per task),
-//! falling back to caller-supplied defaults for orphan tasks. Complexity derived from
-//! `complexity:*` labels and risk flags from classifier-owned task refs. The separate facts surface below deliberately has a
-//! stricter, delivery-evidence-based inclusion policy; it does not affect the
-//! legacy aggregate report.
+//! The human/aggregate report is derived from the same resolved intent evidence
+//! as the versioned facts surface below. This keeps cohort inclusion, lineage,
+//! complexity, and execution attribution consistent across both views.
 
 use crate::db::map_sql_err;
 use crate::error::Result;
@@ -39,19 +36,18 @@ pub struct PerfRow {
     pub risk_flag: Option<String>,
     pub n_tasks: i64,
     pub merged_count: i64,
-    pub failed_rework_cap_count: i64,
-    pub other_count: i64,
-    pub late_blocker_count: i64,
-    pub late_blocker_rate: f64,
-    pub first_pass_pct: f64,
-    pub avg_rework: f64,
+    pub failed_count: i64,
+    pub late_blocker_count: Option<i64>,
+    pub late_blocker_rate: Option<f64>,
+    pub first_pass_pct: Option<f64>,
+    pub avg_rework: Option<f64>,
     pub fail_pct: f64,
-    pub median_wall_mins: f64,
-    pub avg_reviewer_secs: f64,
-    pub rubber_stamp_count: i64,
-    pub approve_rate_pct: f64,
-    pub avg_blocking: f64,
-    pub total_cost_usd: f64,
+    pub median_wall_mins: Option<f64>,
+    pub avg_reviewer_secs: Option<f64>,
+    pub rubber_stamp_count: Option<i64>,
+    /// Sum of the facts report's provisional effective token totals. `None`
+    /// means at least one intent in the row lacks complete token evidence.
+    pub provisional_effective_tokens: Option<i64>,
 }
 
 /// Read the prospective-only boundary from the `perf_watermark` table.
@@ -67,141 +63,6 @@ pub fn read_watermark(conn: &Connection) -> Result<Option<i64>> {
     Ok(val)
 }
 
-fn extract_label_value(labels_json: Option<&str>, prefix: &str) -> Option<String> {
-    let s = labels_json?;
-    let v: serde_json::Value = serde_json::from_str(s).ok()?;
-    let arr = v.as_array()?;
-    for item in arr {
-        if let Some(t) = item.as_str() {
-            if let Some(rest) = t.strip_prefix(prefix) {
-                if !rest.is_empty() {
-                    return Some(rest.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-fn extract_complexity(labels_json: Option<&str>) -> String {
-    extract_label_value(labels_json, "complexity:").unwrap_or_else(|| "untagged".to_string())
-}
-
-struct TaskRow {
-    id: i64,
-    status: String,
-    labels: Option<String>,
-    refs: Option<String>,
-    model: String,
-    effort: String,
-    rework_round: i64,
-    rework_cap: Option<i64>,
-    created_at: i64,
-    updated_at: i64,
-    reviewer: Option<String>,
-}
-
-fn load_terminal_tasks(
-    conn: &Connection,
-    default_model: &str,
-    default_effort: &str,
-    since: Option<i64>,
-) -> Result<Vec<TaskRow>> {
-    let since_val = since.unwrap_or(0);
-    let mut stmt = conn.prepare(
-        "SELECT t.id, t.status, t.labels, t.refs, t.rework_round, t.rework_cap, t.created_at, t.updated_at, t.reviewer, \
-                COALESCE(ar.model, ?1), COALESCE(ar.effort, ?2) \
-         FROM tasks t \
-         LEFT JOIN ( \
-             SELECT task_id, model, effort, \
-                    ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY spawned_at ASC) AS rn \
-             FROM agent_runs WHERE role = 'worker' \
-         ) ar ON ar.task_id = t.id AND ar.rn = 1 \
-         WHERE t.status IN ('done', 'failed', 'cancelled') \
-           AND t.updated_at >= ?3",
-    )?;
-    let rows = stmt
-        .query_map(
-            rusqlite::params![default_model, default_effort, since_val],
-            |r| {
-                Ok(TaskRow {
-                    id: r.get(0)?,
-                    status: r.get(1)?,
-                    labels: r.get(2)?,
-                    refs: r.get(3)?,
-                    rework_round: r.get(4)?,
-                    rework_cap: r.get(5)?,
-                    created_at: r.get(6)?,
-                    updated_at: r.get(7)?,
-                    reviewer: r.get(8)?,
-                    model: r.get(9)?,
-                    effort: r.get(10)?,
-                })
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
-fn load_reviewer_durations(conn: &Connection) -> Result<HashMap<i64, Vec<i64>>> {
-    let mut stmt = conn.prepare(
-        "SELECT task_id, ended_at - spawned_at \
-         FROM agent_runs \
-         WHERE role = 'reviewer' AND ended_at IS NOT NULL AND sub_role IS NULL",
-    )?;
-    let mut map: HashMap<i64, Vec<i64>> = HashMap::new();
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
-    for row in rows {
-        let (task_id, duration) = row?;
-        map.entry(task_id).or_default().push(duration);
-    }
-    Ok(map)
-}
-
-fn load_approval_stats(conn: &Connection) -> Result<HashMap<i64, (String, i64)>> {
-    let mut stmt = conn.prepare("SELECT task_id, verdict, blocking_count FROM approvals")?;
-    let mut map = HashMap::new();
-    let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, i64>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (task_id, verdict, blocking) = row?;
-        map.insert(task_id, (verdict, blocking));
-    }
-    Ok(map)
-}
-
-fn load_cost_by_task(conn: &Connection) -> Result<HashMap<i64, f64>> {
-    let mut stmt = conn.prepare(
-        "SELECT task_id, SUM(cost_usd) FROM journal WHERE task_id IS NOT NULL GROUP BY task_id",
-    )?;
-    let mut map = HashMap::new();
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)))?;
-    for row in rows {
-        let (task_id, cost) = row?;
-        map.insert(task_id, cost);
-    }
-    Ok(map)
-}
-
-struct AuxData {
-    reviewer_durations: HashMap<i64, Vec<i64>>,
-    approvals: HashMap<i64, (String, i64)>,
-    costs: HashMap<i64, f64>,
-}
-
-fn load_aux_data(conn: &Connection) -> Result<AuxData> {
-    Ok(AuxData {
-        reviewer_durations: load_reviewer_durations(conn)?,
-        approvals: load_approval_stats(conn)?,
-        costs: load_cost_by_task(conn)?,
-    })
-}
-
 fn median(sorted: &[f64]) -> f64 {
     if sorted.is_empty() {
         return 0.0;
@@ -214,260 +75,23 @@ fn median(sorted: &[f64]) -> f64 {
     }
 }
 
-type GroupKey = (
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
-
-struct GroupAccum {
-    total: i64,
-    merged: i64,
-    failed_rework_cap: i64,
-    other: i64,
-    late_blockers: i64,
-    first_pass: i64,
-    rework_sum: i64,
-    failed: i64,
-    wall_mins: Vec<f64>,
-    reviewer_durations: Vec<i64>,
-    n_approved: i64,
-    n_with_approval: i64,
-    blocking_sum: i64,
-    cost_usd_sum: f64,
-}
-
-impl GroupAccum {
-    fn new() -> Self {
-        Self {
-            total: 0,
-            merged: 0,
-            failed_rework_cap: 0,
-            other: 0,
-            late_blockers: 0,
-            first_pass: 0,
-            rework_sum: 0,
-            failed: 0,
-            wall_mins: Vec::new(),
-            reviewer_durations: Vec::new(),
-            n_approved: 0,
-            n_with_approval: 0,
-            blocking_sum: 0,
-            cost_usd_sum: 0.0,
-        }
-    }
-
-    fn add(&mut self, task: &TaskRow, aux: &AuxData, late_blocker: bool) {
-        self.total += 1;
-        if task.status == "done" {
-            self.merged += 1;
-        } else if task.status == "failed"
-            && task.rework_round
-                >= task
-                    .rework_cap
-                    .unwrap_or(crate::lifecycle::REWORK_CAP as i64)
-        {
-            self.failed_rework_cap += 1;
-        } else {
-            self.other += 1;
-        }
-        if late_blocker {
-            self.late_blockers += 1;
-        }
-        if task.status == "done" && task.rework_round == 0 {
-            self.first_pass += 1;
-        }
-        self.rework_sum += task.rework_round;
-        if task.status == "failed" || task.status == "cancelled" {
-            self.failed += 1;
-        }
-        let wall_secs = (task.updated_at - task.created_at).max(0) as f64;
-        self.wall_mins.push(wall_secs / 60.0);
-
-        if let Some(durs) = aux.reviewer_durations.get(&task.id) {
-            self.reviewer_durations.extend(durs);
-        }
-        if let Some((verdict, blocking)) = aux.approvals.get(&task.id) {
-            self.n_with_approval += 1;
-            if verdict == "approved" {
-                self.n_approved += 1;
-            }
-            self.blocking_sum += blocking;
-        }
-        if let Some(&cost) = aux.costs.get(&task.id) {
-            self.cost_usd_sum += cost;
-        }
-    }
-
-    fn into_row(
-        mut self,
-        model: String,
-        effort: String,
-        complexity: Option<String>,
-        reviewer: Option<String>,
-        risk_flag: Option<String>,
-    ) -> PerfRow {
-        self.wall_mins
-            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let n = self.total as f64;
-        let n_reviews = self.reviewer_durations.len() as f64;
-        let n_appr = self.n_with_approval as f64;
-        PerfRow {
-            model,
-            effort,
-            complexity,
-            reviewer,
-            risk_flag,
-            n_tasks: self.total,
-            merged_count: self.merged,
-            failed_rework_cap_count: self.failed_rework_cap,
-            other_count: self.other,
-            late_blocker_count: self.late_blockers,
-            late_blocker_rate: if n > 0.0 {
-                self.late_blockers as f64 / n
-            } else {
-                0.0
-            },
-            first_pass_pct: if n > 0.0 {
-                (self.first_pass as f64 / n) * 100.0
-            } else {
-                0.0
-            },
-            avg_rework: if n > 0.0 {
-                self.rework_sum as f64 / n
-            } else {
-                0.0
-            },
-            fail_pct: if n > 0.0 {
-                (self.failed as f64 / n) * 100.0
-            } else {
-                0.0
-            },
-            median_wall_mins: median(&self.wall_mins),
-            avg_reviewer_secs: if n_reviews > 0.0 {
-                self.reviewer_durations.iter().sum::<i64>() as f64 / n_reviews
-            } else {
-                0.0
-            },
-            rubber_stamp_count: self.reviewer_durations.iter().filter(|&&d| d < 120).count() as i64,
-            approve_rate_pct: if n_appr > 0.0 {
-                (self.n_approved as f64 / n_appr) * 100.0
-            } else {
-                0.0
-            },
-            avg_blocking: if n_appr > 0.0 {
-                self.blocking_sum as f64 / n_appr
-            } else {
-                0.0
-            },
-            total_cost_usd: self.cost_usd_sum,
-        }
-    }
-}
-
 pub fn perf(
     conn: &Connection,
     cut: PerfCut,
-    default_model: &str,
-    default_effort: &str,
+    _default_model: &str,
+    _default_effort: &str,
 ) -> Result<PerfReport> {
-    perf_with(conn, cut, default_model, default_effort, false)
+    perf_with(conn, cut, "pending", "pending", false)
 }
 
 pub fn perf_with(
     conn: &Connection,
     cut: PerfCut,
-    default_model: &str,
-    default_effort: &str,
+    _default_model: &str,
+    _default_effort: &str,
     include_all: bool,
 ) -> Result<PerfReport> {
-    let since = if include_all {
-        None
-    } else {
-        read_watermark(conn)?
-    };
-    let tasks = load_terminal_tasks(conn, default_model, default_effort, since)?;
-    if tasks.is_empty() {
-        return Ok(PerfReport { rows: vec![] });
-    }
-
-    let aux = load_aux_data(conn)?;
-    let late_blocker_flags = crate::review_findings::late_blocker_task_flags(conn)?;
-    let mut groups: BTreeMap<GroupKey, GroupAccum> = BTreeMap::new();
-
-    for task in &tasks {
-        let (model, effort, complexity, reviewer_col, risk_flags) = match cut {
-            PerfCut::Default => (
-                task.model.clone(),
-                task.effort.clone(),
-                None,
-                None,
-                vec![None],
-            ),
-            PerfCut::Complexity => {
-                let cx = extract_complexity(task.labels.as_deref());
-                (
-                    task.model.clone(),
-                    task.effort.clone(),
-                    Some(cx),
-                    None,
-                    vec![None],
-                )
-            }
-            PerfCut::Reviewer => {
-                let rev = task.reviewer.clone().unwrap_or_else(|| "none".to_string());
-                (
-                    task.model.clone(),
-                    task.effort.clone(),
-                    None,
-                    Some(rev),
-                    vec![None],
-                )
-            }
-            // A risk flag is a task characteristic, not a model-routing
-            // dimension. Keep this cut at the closed flag set plus untagged.
-            PerfCut::RiskFlag => (
-                "all".to_string(),
-                "all".to_string(),
-                None,
-                None,
-                crate::risk::risk_flag_names(task.refs.as_deref().unwrap_or(""))
-                    .into_iter()
-                    .map(Some)
-                    .collect(),
-            ),
-        };
-
-        for risk_flag in risk_flags {
-            let late_blocker = risk_flag.as_ref().is_some_and(|flag| {
-                late_blocker_flags
-                    .get(&task.id)
-                    .is_some_and(|flags| flags.iter().any(|late_flag| late_flag == flag))
-            });
-            let key = (
-                model.clone(),
-                effort.clone(),
-                complexity.clone(),
-                reviewer_col.clone(),
-                risk_flag,
-            );
-            groups
-                .entry(key)
-                .or_insert_with(GroupAccum::new)
-                .add(task, &aux, late_blocker);
-        }
-    }
-
-    let rows = groups
-        .into_iter()
-        .map(|((model, effort, cx, rev, risk_flag), acc)| {
-            acc.into_row(model, effort, cx, rev, risk_flag)
-        })
-        .collect();
-
-    Ok(PerfReport { rows })
+    aggregate_facts(&perf_facts(conn, include_all)?, cut)
 }
 
 // ── facts report scaffold (perf-facts-v1) ──────────────────────────────────
@@ -3772,9 +3396,240 @@ pub fn perf_facts(conn: &Connection, include_all: bool) -> Result<FactsReport> {
     })
 }
 
+type GroupKey = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+struct GroupAccum {
+    total: i64,
+    merged: i64,
+    failed: i64,
+    late_blockers: i64,
+    late_blockers_complete: bool,
+    first_pass: i64,
+    rework_sum: i64,
+    rework_complete: bool,
+    wall_mins: Vec<f64>,
+    wall_complete: bool,
+    reviewer_durations: Vec<i64>,
+    reviewer_complete: bool,
+    token_total: Option<i64>,
+}
+
+impl Default for GroupAccum {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            merged: 0,
+            failed: 0,
+            late_blockers: 0,
+            late_blockers_complete: true,
+            first_pass: 0,
+            rework_sum: 0,
+            rework_complete: true,
+            wall_mins: Vec::new(),
+            wall_complete: true,
+            reviewer_durations: Vec::new(),
+            reviewer_complete: true,
+            token_total: Some(0),
+        }
+    }
+}
+
+fn first_attempt<'a>(intent: &'a IntentFacts, role: &str) -> Option<&'a serde_json::Value> {
+    intent
+        .contributing_attempts
+        .as_ref()?
+        .get(role)?
+        .as_array()?
+        .first()
+}
+
+fn attempt_dimension(intent: &IntentFacts, role: &str, field: &str, absent: &str) -> String {
+    let Some(attempt) = first_attempt(intent, role) else {
+        return absent.to_string();
+    };
+    attempt
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| present_text(value))
+        .unwrap_or("unreported")
+        .to_string()
+}
+
+fn reviewer_durations(intent: &IntentFacts) -> impl Iterator<Item = i64> + '_ {
+    intent
+        .contributing_attempts
+        .as_ref()
+        .and_then(|attempts| attempts.get("reviewer"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|attempt| {
+            let spawned = attempt.get("spawned_at")?.as_i64()?;
+            let ended = attempt.get("ended_at")?.as_i64()?;
+            Some((ended - spawned).max(0))
+        })
+}
+
+fn intent_token_total(intent: &IntentFacts) -> Option<i64> {
+    if !intent.coverage.role_tokens_usd {
+        return None;
+    }
+    intent
+        .role_tokens_usd
+        .as_ref()?
+        .get("provisional_effective_token_total")?
+        .as_i64()
+        .filter(|total| *total >= 0)
+}
+
+fn intent_has_blocker(intent: &IntentFacts) -> bool {
+    intent.coverage.review_quality
+        && intent
+            .review_quality
+            .as_ref()
+            .and_then(|quality| quality.pointer("/finding_kinds/blocking"))
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|count| count > 0)
+}
+
+impl GroupAccum {
+    fn add(&mut self, intent: &IntentFacts) {
+        self.total += 1;
+        match intent.terminal_outcome.as_deref() {
+            Some("done") => self.merged += 1,
+            Some("failed") => self.failed += 1,
+            _ => {}
+        }
+        match intent.rework_count {
+            Some(rework_count) => {
+                if intent.terminal_outcome.as_deref() == Some("done") && rework_count == 0 {
+                    self.first_pass += 1;
+                }
+                self.rework_sum += rework_count;
+            }
+            None => self.rework_complete = false,
+        }
+        if intent.rework_count.is_none() || !intent.coverage.review_quality {
+            self.late_blockers_complete = false;
+        } else if intent.rework_count.is_some_and(|count| count >= 2) && intent_has_blocker(intent)
+        {
+            self.late_blockers += 1;
+        }
+        if let Some(wall_secs) = intent.wall_secs {
+            self.wall_mins.push(wall_secs.max(0) as f64 / 60.0);
+        } else {
+            self.wall_complete = false;
+        }
+        if intent.coverage.contributing_attempts {
+            self.reviewer_durations.extend(reviewer_durations(intent));
+        } else {
+            self.reviewer_complete = false;
+        }
+        self.token_total = match (self.token_total, intent_token_total(intent)) {
+            (Some(total), Some(tokens)) => total.checked_add(tokens),
+            _ => None,
+        };
+    }
+
+    fn into_row(
+        mut self,
+        model: String,
+        effort: String,
+        complexity: Option<String>,
+        reviewer: Option<String>,
+        risk_flag: Option<String>,
+    ) -> PerfRow {
+        self.wall_mins
+            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = self.total as f64;
+        let n_reviews = self.reviewer_durations.len() as f64;
+        PerfRow {
+            model,
+            effort,
+            complexity,
+            reviewer,
+            risk_flag,
+            n_tasks: self.total,
+            merged_count: self.merged,
+            failed_count: self.failed,
+            late_blocker_count: self.late_blockers_complete.then_some(self.late_blockers),
+            late_blocker_rate: self
+                .late_blockers_complete
+                .then_some(self.late_blockers as f64 / n),
+            first_pass_pct: self
+                .rework_complete
+                .then_some((self.first_pass as f64 / n) * 100.0),
+            avg_rework: self.rework_complete.then_some(self.rework_sum as f64 / n),
+            fail_pct: if n > 0.0 {
+                (self.failed as f64 / n) * 100.0
+            } else {
+                0.0
+            },
+            median_wall_mins: self.wall_complete.then(|| median(&self.wall_mins)),
+            avg_reviewer_secs: (self.reviewer_complete && n_reviews > 0.0)
+                .then(|| self.reviewer_durations.iter().sum::<i64>() as f64 / n_reviews),
+            rubber_stamp_count: self.reviewer_complete.then(|| {
+                self.reviewer_durations
+                    .iter()
+                    .filter(|&&duration| duration < 120)
+                    .count() as i64
+            }),
+            provisional_effective_tokens: self.token_total,
+        }
+    }
+}
+
+fn aggregate_facts(report: &FactsReport, cut: PerfCut) -> Result<PerfReport> {
+    let mut groups: BTreeMap<GroupKey, GroupAccum> = BTreeMap::new();
+    for intent in report.intents.iter().filter(|intent| intent.included) {
+        let worker_model = attempt_dimension(intent, "worker", "model", "pending");
+        let worker_effort = attempt_dimension(intent, "worker", "effort", "pending");
+        let complexity = intent
+            .complexity
+            .as_ref()
+            .and_then(|value| value.get("cx_est"))
+            .and_then(serde_json::Value::as_i64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "untagged".to_string());
+        let reviewer = attempt_dimension(intent, "reviewer", "agent", "none");
+        let keys: Vec<GroupKey> = match cut {
+            PerfCut::Default => vec![(worker_model, worker_effort, None, None, None)],
+            PerfCut::Complexity => {
+                vec![(worker_model, worker_effort, Some(complexity), None, None)]
+            }
+            PerfCut::Reviewer => vec![(worker_model, worker_effort, None, Some(reviewer), None)],
+            PerfCut::RiskFlag => intent
+                .risk_flags
+                .iter()
+                .cloned()
+                .map(|flag| ("all".to_string(), "all".to_string(), None, None, Some(flag)))
+                .collect(),
+        };
+        for key in keys {
+            groups.entry(key).or_default().add(intent);
+        }
+    }
+    Ok(PerfReport {
+        rows: groups
+            .into_iter()
+            .map(
+                |((model, effort, complexity, reviewer, risk_flag), accum)| {
+                    accum.into_row(model, effort, complexity, reviewer, risk_flag)
+                },
+            )
+            .collect(),
+    })
+}
+
 pub fn render_table(report: &PerfReport) {
     if report.rows.is_empty() {
-        println!("No terminal tasks found.");
+        println!("No included intents found.");
         return;
     }
 
@@ -3784,21 +3639,28 @@ pub fn render_table(report: &PerfReport) {
 
     if has_risk_flag {
         let header = format!(
-            "{:<24} {:>7} {:>8} {:>9} {:>7} {:>9} {:>10}",
-            "RISK_FLAG", "N", "MERGED", "FAIL_CAP", "OTHER", "LATE_BLK", "LATE_RATE"
+            "{:<24} {:>7} {:>8} {:>8} {:>9} {:>10}",
+            "RISK_FLAG", "N", "MERGED", "FAILED", "LATE_BLK", "LATE_RATE"
         );
         println!("{header}");
         println!("{}", "-".repeat(header.len()));
         for row in &report.rows {
+            let late_blockers = row
+                .late_blocker_count
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let late_rate = row
+                .late_blocker_rate
+                .map(|value| format!("{:.1}%", value * 100.0))
+                .unwrap_or_else(|| "-".to_string());
             println!(
-                "{:<24} {:>7} {:>8} {:>9} {:>7} {:>9} {:>9.1}%",
+                "{:<24} {:>7} {:>8} {:>8} {:>9} {:>10}",
                 row.risk_flag.as_deref().unwrap_or(""),
                 row.n_tasks,
                 row.merged_count,
-                row.failed_rework_cap_count,
-                row.other_count,
-                row.late_blocker_count,
-                row.late_blocker_rate * 100.0,
+                row.failed_count,
+                late_blockers,
+                late_rate,
             );
         }
         return;
@@ -3812,17 +3674,8 @@ pub fn render_table(report: &PerfReport) {
         header.push_str(&format!(" {:<18}", "REVIEWER"));
     }
     header.push_str(&format!(
-        " {:>7} {:>10} {:>9} {:>7} {:>11} {:>10} {:>7} {:>8} {:>9} {:>10}",
-        "N",
-        "1st_PASS",
-        "AVG_RWK",
-        "FAIL",
-        "MED_MINS",
-        "AVG_REV_S",
-        "RUBBER",
-        "APR_RT",
-        "AVG_BLK",
-        "COST_USD"
+        " {:>7} {:>10} {:>9} {:>7} {:>11} {:>10} {:>7} {:>12}",
+        "N", "1st_PASS", "AVG_RWK", "FAIL", "MED_MINS", "AVG_REV_S", "RUBBER", "EFF_TOKENS"
     ));
     println!("{header}");
     println!("{}", "-".repeat(header.len()));
@@ -3835,18 +3688,40 @@ pub fn render_table(report: &PerfReport) {
         if has_reviewer {
             line.push_str(&format!(" {:<18}", r.reviewer.as_deref().unwrap_or("")));
         }
+        let tokens = r
+            .provisional_effective_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let first_pass = r
+            .first_pass_pct
+            .map(|value| format!("{value:.1}%"))
+            .unwrap_or_else(|| "-".to_string());
+        let avg_rework = r
+            .avg_rework
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "-".to_string());
+        let median_wall = r
+            .median_wall_mins
+            .map(|value| format!("{value:.1}"))
+            .unwrap_or_else(|| "-".to_string());
+        let avg_reviewer = r
+            .avg_reviewer_secs
+            .map(|value| format!("{value:.0}"))
+            .unwrap_or_else(|| "-".to_string());
+        let rubber_stamps = r
+            .rubber_stamp_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
         line.push_str(&format!(
-            " {:>7} {:>9.1}% {:>9.2} {:>6.1}% {:>11.1} {:>10.0} {:>7} {:>7.1}% {:>9.2} {:>10.2}",
+            " {:>7} {:>10} {:>9} {:>6.1}% {:>11} {:>10} {:>7} {:>12}",
             r.n_tasks,
-            r.first_pass_pct,
-            r.avg_rework,
+            first_pass,
+            avg_rework,
             r.fail_pct,
-            r.median_wall_mins,
-            r.avg_reviewer_secs,
-            r.rubber_stamp_count,
-            r.approve_rate_pct,
-            r.avg_blocking,
-            r.total_cost_usd
+            median_wall,
+            avg_reviewer,
+            rubber_stamps,
+            tokens,
         ));
         println!("{line}");
     }
@@ -4030,563 +3905,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_db_returns_empty_report() {
-        let (_d, c) = open_tmp();
-        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
-        assert!(r.rows.is_empty());
-    }
-
-    #[test]
-    fn model_effort_from_agent_runs() {
-        let (_d, mut c) = open_tmp();
-        let tid = seed_task(&mut c, "done", None, 0, Some("rev-1"), 1000, 1600);
-        seed_run(&c, tid, "claude-opus-4-6", "high", 1001);
-
-        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
-        assert_eq!(r.rows.len(), 1);
-        let row = &r.rows[0];
-        assert_eq!(row.model, "claude-opus-4-6");
-        assert_eq!(row.effort, "high");
-        assert_eq!(row.n_tasks, 1);
-        assert!((row.first_pass_pct - 100.0).abs() < 0.01);
-        assert!((row.median_wall_mins - 10.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn orphan_task_uses_defaults() {
-        let (_d, mut c) = open_tmp();
-        seed_task(&mut c, "done", None, 0, None, 1000, 1600);
-
-        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
-        assert_eq!(r.rows.len(), 1);
-        assert_eq!(r.rows[0].model, DM);
-        assert_eq!(r.rows[0].effort, DE);
-    }
-
-    #[test]
-    fn earliest_worker_run_wins() {
-        let (_d, mut c) = open_tmp();
-        let tid = seed_task(&mut c, "done", None, 1, None, 1000, 2000);
-        seed_run(&c, tid, "claude-opus-4-6", "medium", 1100);
-        seed_run(&c, tid, "claude-sonnet-5", "high", 1050);
-
-        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
-        assert_eq!(r.rows.len(), 1);
-        assert_eq!(
-            r.rows[0].model, "claude-sonnet-5",
-            "earlier spawn should win"
-        );
-        assert_eq!(r.rows[0].effort, "high");
-    }
-
-    #[test]
-    fn reviewer_run_ignored() {
-        let (_d, mut c) = open_tmp();
-        let tid = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
-        // Only a reviewer run — should fall back to defaults
-        crate::agent_runs::insert(
-            &c,
-            tid,
-            "rev",
-            "reviewer",
-            "claude-opus-4-8",
-            "max",
-            "claude",
-            1001,
-        )
-        .unwrap();
-
-        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
-        assert_eq!(r.rows[0].model, DM);
-        assert_eq!(r.rows[0].effort, DE);
-    }
-
-    #[test]
-    fn mixed_outcomes_correct_aggregates() {
-        let (_d, mut c) = open_tmp();
-
-        let t1 = seed_task(&mut c, "done", None, 0, Some("R"), 1000, 1600);
-        seed_run(&c, t1, "opus-47", "medium", 1001);
-        let t2 = seed_task(&mut c, "done", None, 2, Some("R"), 1000, 2200);
-        seed_run(&c, t2, "opus-47", "medium", 1001);
-        let t3 = seed_task(&mut c, "failed", None, 1, Some("R"), 1000, 1300);
-        seed_run(&c, t3, "opus-47", "medium", 1001);
-        let t4 = seed_task(&mut c, "cancelled", None, 0, None, 1000, 1060);
-        seed_run(&c, t4, "opus-47", "medium", 1001);
-
-        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
-        assert_eq!(r.rows.len(), 1);
-        let row = &r.rows[0];
-        assert_eq!(row.model, "opus-47");
-        assert_eq!(row.effort, "medium");
-        assert_eq!(row.n_tasks, 4);
-        assert!((row.first_pass_pct - 25.0).abs() < 0.01);
-        assert!((row.avg_rework - 0.75).abs() < 0.01);
-        assert!((row.fail_pct - 50.0).abs() < 0.01);
-        assert!((row.median_wall_mins - 7.5).abs() < 0.01);
-    }
-
-    #[test]
-    fn complexity_cut_splits_by_label() {
-        let (_d, mut c) = open_tmp();
-        let t1 = seed_task(
-            &mut c,
-            "done",
-            Some(r#"["complexity:simple"]"#),
-            0,
-            None,
-            1000,
-            1600,
-        );
-        seed_run(&c, t1, "opus-46", "high", 1001);
-        let t2 = seed_task(
-            &mut c,
-            "done",
-            Some(r#"["complexity:complex"]"#),
-            1,
-            None,
-            1000,
-            2200,
-        );
-        seed_run(&c, t2, "opus-46", "high", 1001);
-        let t3 = seed_task(&mut c, "done", None, 0, None, 1000, 1300);
-        seed_run(&c, t3, "opus-46", "high", 1001);
-
-        let r = perf(&c, PerfCut::Complexity, DM, DE).unwrap();
-        assert_eq!(r.rows.len(), 3);
-        let simple = r
-            .rows
-            .iter()
-            .find(|r| r.complexity.as_deref() == Some("simple"))
-            .unwrap();
-        assert_eq!(simple.n_tasks, 1);
-        assert!((simple.first_pass_pct - 100.0).abs() < 0.01);
-
-        let complex = r
-            .rows
-            .iter()
-            .find(|r| r.complexity.as_deref() == Some("complex"))
-            .unwrap();
-        assert_eq!(complex.n_tasks, 1);
-        assert!((complex.first_pass_pct - 0.0).abs() < 0.01);
-
-        let untagged = r
-            .rows
-            .iter()
-            .find(|r| r.complexity.as_deref() == Some("untagged"))
-            .unwrap();
-        assert_eq!(untagged.n_tasks, 1);
-    }
-
-    #[test]
-    fn risk_flag_cut_counts_outcomes_and_late_blockers() {
-        let (_d, mut c) = open_tmp();
-        let grammar_refs =
-            r#"{"cx_risk_flags":[{"flag":"grammar_or_parser","evidence":"Parses a delimiter."}]}"#;
-        let public_refs =
-            r#"{"cx_risk_flags":[{"flag":"public_contract","evidence":"Changes JSON output."}]}"#;
-
-        let merged = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
-        let capped = seed_task(&mut c, "failed", None, 7, None, 1000, 1600);
-        let other = seed_task(&mut c, "cancelled", None, 0, None, 1000, 1600);
-        let late = seed_task(&mut c, "done", None, 2, None, 1000, 1600);
-        let early = seed_task(&mut c, "done", None, 1, None, 1000, 1600);
-        let _untagged = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
-        for task_id in [merged, capped] {
-            c.execute(
-                "UPDATE tasks SET refs=?1 WHERE id=?2",
-                rusqlite::params![grammar_refs, task_id],
-            )
-            .unwrap();
-        }
-        for task_id in [other, late, early] {
-            c.execute(
-                "UPDATE tasks SET refs=?1 WHERE id=?2",
-                rusqlite::params![public_refs, task_id],
-            )
-            .unwrap();
-        }
-        crate::review_findings::replace_for_pr(
-            &mut c,
-            100,
-            &[crate::review_findings::ReviewFinding {
-                id: 0,
-                pr_number: 0,
-                task_id: Some(late),
-                reviewer: "r1".into(),
-                kind: "blocking".into(),
-                author_pushback: false,
-                pushback_accepted: None,
-                severity: None,
-                text: "must fix".into(),
-                source_endpoint: "pulls".into(),
-                addressed_status: None,
-                evidence: vec![],
-                collector_model: None,
-                collector_version: None,
-            }],
-        )
-        .unwrap();
-        crate::review_findings::replace_for_pr(
-            &mut c,
-            101,
-            &[crate::review_findings::ReviewFinding {
-                task_id: Some(early),
-                ..crate::review_findings::ReviewFinding {
-                    id: 0,
-                    pr_number: 0,
-                    task_id: None,
-                    reviewer: "r1".into(),
-                    kind: "blocking".into(),
-                    author_pushback: false,
-                    pushback_accepted: None,
-                    severity: None,
-                    text: "must fix".into(),
-                    source_endpoint: "pulls".into(),
-                    addressed_status: None,
-                    evidence: vec![],
-                    collector_model: None,
-                    collector_version: None,
-                }
-            }],
-        )
-        .unwrap();
-
-        let report = perf(&c, PerfCut::RiskFlag, DM, DE).unwrap();
-        assert_eq!(report.rows.len(), 3, "two known flags plus untagged");
-        let grammar = report
-            .rows
-            .iter()
-            .find(|row| row.risk_flag.as_deref() == Some("grammar_or_parser"))
-            .unwrap();
-        assert_eq!(grammar.merged_count, 1);
-        assert_eq!(grammar.failed_rework_cap_count, 1);
-        assert_eq!(grammar.other_count, 0);
-        assert_eq!(grammar.late_blocker_count, 0);
-
-        let public = report
-            .rows
-            .iter()
-            .find(|row| row.risk_flag.as_deref() == Some("public_contract"))
-            .unwrap();
-        assert_eq!(public.merged_count, 2);
-        assert_eq!(public.failed_rework_cap_count, 0);
-        assert_eq!(public.other_count, 1);
-        assert_eq!(public.late_blocker_count, 1);
-        assert!((public.late_blocker_rate - (1.0 / 3.0)).abs() < f64::EPSILON);
-
-        let no_flags = report
-            .rows
-            .iter()
-            .find(|row| row.risk_flag.as_deref() == Some("untagged"))
-            .unwrap();
-        assert_eq!(no_flags.n_tasks, 1);
-        assert_eq!(no_flags.merged_count, 1);
-    }
-
-    #[test]
-    fn reviewer_cut_splits_by_reviewer() {
-        let (_d, mut c) = open_tmp();
-        let t1 = seed_task(&mut c, "done", None, 0, Some("alice"), 1000, 1600);
-        seed_run(&c, t1, "opus-46", "high", 1001);
-        let t2 = seed_task(&mut c, "done", None, 1, Some("alice"), 1000, 2200);
-        seed_run(&c, t2, "opus-46", "high", 1001);
-        let t3 = seed_task(&mut c, "done", None, 0, Some("bob"), 1000, 1300);
-        seed_run(&c, t3, "opus-46", "high", 1001);
-        let t4 = seed_task(&mut c, "failed", None, 0, None, 1000, 1060);
-        seed_run(&c, t4, "opus-46", "high", 1001);
-
-        let r = perf(&c, PerfCut::Reviewer, DM, DE).unwrap();
-        assert_eq!(r.rows.len(), 3);
-
-        let alice = r
-            .rows
-            .iter()
-            .find(|r| r.reviewer.as_deref() == Some("alice"))
-            .unwrap();
-        assert_eq!(alice.n_tasks, 2);
-        assert!((alice.first_pass_pct - 50.0).abs() < 0.01);
-
-        let bob = r
-            .rows
-            .iter()
-            .find(|r| r.reviewer.as_deref() == Some("bob"))
-            .unwrap();
-        assert_eq!(bob.n_tasks, 1);
-
-        let none = r
-            .rows
-            .iter()
-            .find(|r| r.reviewer.as_deref() == Some("none"))
-            .unwrap();
-        assert_eq!(none.n_tasks, 1);
-    }
-
-    #[test]
-    fn multiple_model_effort_combos() {
-        let (_d, mut c) = open_tmp();
-        let t1 = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
-        seed_run(&c, t1, "opus-46", "high", 1001);
-        let t2 = seed_task(&mut c, "done", None, 0, None, 1000, 1300);
-        seed_run(&c, t2, "sonnet-5", "medium", 1001);
-        // Orphan — falls back to defaults
-        seed_task(&mut c, "done", None, 0, None, 1000, 1120);
-
-        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
-        assert_eq!(r.rows.len(), 3);
-
-        let opus = r.rows.iter().find(|r| r.model == "opus-46").unwrap();
-        assert_eq!(opus.effort, "high");
-
-        let sonnet = r.rows.iter().find(|r| r.model == "sonnet-5").unwrap();
-        assert_eq!(sonnet.effort, "medium");
-
-        let fallback = r.rows.iter().find(|r| r.model == DM).unwrap();
-        assert_eq!(fallback.effort, DE);
-    }
-
-    #[test]
-    fn no_unknown_in_output() {
-        let (_d, mut c) = open_tmp();
-        // Mix: one with agent_runs, one orphan
-        let t1 = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
-        seed_run(&c, t1, "claude-opus-4-6", "medium", 1001);
-        seed_task(&mut c, "done", None, 0, None, 1000, 1300);
-
-        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
-        for row in &r.rows {
-            assert_ne!(row.model, "unknown", "model must never be 'unknown'");
-            assert_ne!(row.effort, "unknown", "effort must never be 'unknown'");
-        }
-    }
-
-    #[test]
-    fn non_terminal_tasks_excluded() {
-        let (_d, mut c) = open_tmp();
-        // Terminal
-        let tid = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
-        seed_run(&c, tid, "opus-46", "high", 1001);
-        // Non-terminal — must be excluded
-        let tx = crate::db::begin_immediate(&mut c).unwrap();
-        tx.execute(
-            "INSERT INTO tasks(title, body, status, priority, labels, assignee, created_by, \
-             created_at, updated_at, refs, depends_on, author, reviewer, rework_round, review_only) \
-             VALUES ('wip', NULL, 'working', 0, NULL, 'A', 'boss', 1000, 1600, NULL, NULL, 'A', NULL, 0, 0)",
-            [],
-        ).unwrap();
-        tx.execute(
-            "INSERT INTO tasks(title, body, status, priority, labels, assignee, created_by, \
-             created_at, updated_at, refs, depends_on, author, reviewer, rework_round, review_only) \
-             VALUES ('open', NULL, 'open', 0, NULL, NULL, 'boss', 1000, 1600, NULL, NULL, NULL, NULL, 0, 0)",
-            [],
-        ).unwrap();
-        tx.commit().unwrap();
-
-        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
-        assert_eq!(r.rows.len(), 1);
-        assert_eq!(r.rows[0].n_tasks, 1);
-    }
-
-    #[test]
-    fn median_odd_count() {
-        assert!((median(&[1.0, 3.0, 5.0]) - 3.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn median_even_count() {
-        assert!((median(&[1.0, 2.0, 3.0, 4.0]) - 2.5).abs() < 0.001);
-    }
-
-    #[test]
-    fn median_single() {
-        assert!((median(&[7.0]) - 7.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn median_empty() {
-        assert!((median(&[]) - 0.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn reviewer_duration_and_rubber_stamp() {
-        let (_d, mut c) = open_tmp();
-        let t1 = seed_task(&mut c, "done", None, 0, Some("rev-a"), 1000, 1600);
-        seed_run(&c, t1, "opus-46", "high", 1001);
-        seed_reviewer_run(&c, t1, "rev-a", 1500, 1500 + 300); // 300s
-
-        let t2 = seed_task(&mut c, "done", None, 0, Some("rev-a"), 2000, 2600);
-        seed_run(&c, t2, "opus-46", "high", 2001);
-        seed_reviewer_run(&c, t2, "rev-a", 2500, 2500 + 60); // 60s — rubber stamp
-
-        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
-        assert_eq!(r.rows.len(), 1);
-        let row = &r.rows[0];
-        assert!(
-            (row.avg_reviewer_secs - 180.0).abs() < 0.01,
-            "avg of 300+60 = 180"
-        );
-        assert_eq!(row.rubber_stamp_count, 1, "one review under 120s");
-    }
-
-    #[test]
-    fn no_reviewer_runs_zero_defaults() {
-        let (_d, mut c) = open_tmp();
-        seed_task(&mut c, "done", None, 0, None, 1000, 1600);
-
-        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
-        assert!((r.rows[0].avg_reviewer_secs - 0.0).abs() < 0.01);
-        assert_eq!(r.rows[0].rubber_stamp_count, 0);
-    }
-
-    #[test]
-    fn approval_stats_approve_rate_and_blocking() {
-        let (_d, mut c) = open_tmp();
-        let t1 = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
-        seed_run(&c, t1, "opus-46", "high", 1001);
-        seed_approval(&c, t1, "approved", 0);
-
-        let t2 = seed_task(&mut c, "done", None, 1, None, 2000, 2600);
-        seed_run(&c, t2, "opus-46", "high", 2001);
-        seed_approval(&c, t2, "changes", 3);
-
-        let t3 = seed_task(&mut c, "done", None, 0, None, 3000, 3600);
-        seed_run(&c, t3, "opus-46", "high", 3001);
-        seed_approval(&c, t3, "approved", 0);
-
-        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
-        let row = &r.rows[0];
-        // 2 approved out of 3 with approvals
-        assert!((row.approve_rate_pct - 66.666).abs() < 0.01);
-        // avg blocking: (0+3+0)/3 = 1.0
-        assert!((row.avg_blocking - 1.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn no_approvals_zero_defaults() {
-        let (_d, mut c) = open_tmp();
-        let t1 = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
-        seed_run(&c, t1, "opus-46", "high", 1001);
-
-        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
-        assert!((r.rows[0].approve_rate_pct - 0.0).abs() < 0.01);
-        assert!((r.rows[0].avg_blocking - 0.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn cost_aggregates_from_journal() {
-        let (_d, mut c) = open_tmp();
-        let t1 = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
-        seed_run(&c, t1, "opus-46", "high", 1001);
-        seed_journal_cost(&mut c, t1, "w1", 1.50);
-
-        let t2 = seed_task(&mut c, "done", None, 0, None, 2000, 2600);
-        seed_run(&c, t2, "opus-46", "high", 2001);
-        seed_journal_cost(&mut c, t2, "w2", 0.75);
-
-        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
-        assert!((r.rows[0].total_cost_usd - 2.25).abs() < 0.01);
-    }
-
-    #[test]
-    fn reviewer_cut_with_review_metrics() {
-        let (_d, mut c) = open_tmp();
-        let t1 = seed_task(&mut c, "done", None, 0, Some("alice"), 1000, 1600);
-        seed_run(&c, t1, "opus-46", "high", 1001);
-        seed_reviewer_run(&c, t1, "alice", 1500, 1500 + 400); // 400s
-        seed_approval(&c, t1, "approved", 0);
-
-        let t2 = seed_task(&mut c, "done", None, 0, Some("bob"), 2000, 2600);
-        seed_run(&c, t2, "opus-46", "high", 2001);
-        seed_reviewer_run(&c, t2, "bob", 2500, 2500 + 31); // 31s rubber stamp
-        seed_approval(&c, t2, "approved", 0);
-
-        let r = perf(&c, PerfCut::Reviewer, DM, DE).unwrap();
-
-        let alice = r
-            .rows
-            .iter()
-            .find(|r| r.reviewer.as_deref() == Some("alice"))
-            .unwrap();
-        assert!((alice.avg_reviewer_secs - 400.0).abs() < 0.01);
-        assert_eq!(alice.rubber_stamp_count, 0);
-        assert!((alice.approve_rate_pct - 100.0).abs() < 0.01);
-
-        let bob = r
-            .rows
-            .iter()
-            .find(|r| r.reviewer.as_deref() == Some("bob"))
-            .unwrap();
-        assert!((bob.avg_reviewer_secs - 31.0).abs() < 0.01);
-        assert_eq!(bob.rubber_stamp_count, 1);
-    }
-
-    // ── watermark boundary tests (#158) ─────────────────────────────────
-
-    #[test]
-    fn watermark_excludes_historical_tasks() {
-        let (_d, mut c) = open_tmp();
-        // Set watermark to 5000: only tasks with updated_at >= 5000 are eligible.
-        c.execute(
-            "UPDATE perf_watermark SET watermark = 5000 WHERE id = 1",
-            [],
-        )
-        .unwrap();
-
-        // Historical task (updated_at=1600 < 5000) — must be excluded.
-        let t1 = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
-        seed_run(&c, t1, "opus-46", "high", 1001);
-        // Post-rollout task (updated_at=6000 >= 5000) — must be included.
-        let t2 = seed_task(&mut c, "done", None, 0, None, 5000, 6000);
-        seed_run(&c, t2, "opus-46", "high", 5001);
-
-        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
-        assert_eq!(r.rows.len(), 1);
-        assert_eq!(r.rows[0].n_tasks, 1, "only post-watermark task counted");
-    }
-
-    #[test]
-    fn watermark_all_flag_includes_historical() {
-        let (_d, mut c) = open_tmp();
-        c.execute(
-            "UPDATE perf_watermark SET watermark = 5000 WHERE id = 1",
-            [],
-        )
-        .unwrap();
-
-        let t1 = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
-        seed_run(&c, t1, "opus-46", "high", 1001);
-        let t2 = seed_task(&mut c, "done", None, 0, None, 5000, 6000);
-        seed_run(&c, t2, "opus-46", "high", 5001);
-
-        let r = perf_with(&c, PerfCut::Default, DM, DE, true).unwrap();
-        assert_eq!(r.rows.len(), 1);
-        assert_eq!(r.rows[0].n_tasks, 2, "--all must include both tasks");
-    }
-
-    /// Negative-path: if the watermark boundary filter were removed, this
-    /// test would fail — historical tasks would reappear in the default report.
-    #[test]
-    fn watermark_negative_path_regression_guard() {
-        let (_d, mut c) = open_tmp();
-        c.execute(
-            "UPDATE perf_watermark SET watermark = 9000 WHERE id = 1",
-            [],
-        )
-        .unwrap();
-
-        // All tasks are historical (updated_at < 9000).
-        seed_task(&mut c, "done", None, 0, None, 1000, 1600);
-        seed_task(&mut c, "failed", None, 0, None, 2000, 3000);
-        seed_task(&mut c, "cancelled", None, 0, None, 4000, 5000);
-
-        let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
-        assert!(
-            r.rows.is_empty(),
-            "default perf must return no rows when all tasks predate the watermark"
-        );
-    }
-
-    #[test]
     fn watermark_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("q.db");
@@ -4659,6 +3977,120 @@ mod tests {
         let id = tx.last_insert_rowid();
         tx.commit().unwrap();
         id
+    }
+
+    fn seed_facts_worker(
+        conn: &Connection,
+        task_id: i64,
+        model: &str,
+        effort: &str,
+        spawned_at: i64,
+    ) -> i64 {
+        let assignment = seed_assignment(conn, task_id, "worker", None, None, "worker");
+        seed_attributed_run(
+            conn,
+            task_id,
+            "worker-1",
+            "worker",
+            model,
+            "codex",
+            effort,
+            assignment,
+            None,
+            spawned_at,
+            spawned_at + 10,
+            "merged",
+        )
+    }
+
+    #[test]
+    fn aggregate_uses_facts_complexity_and_first_worker_attempt() {
+        let (_d, mut c) = open_tmp();
+        let task_id = seed_ordinary(&mut c, 1_600);
+        set_refs(
+            &c,
+            task_id,
+            &serde_json::json!({
+                "merge_commit_sha": format!("{task_id:040x}"),
+                "cx_est": 3,
+                "cx_size": "M",
+                "cx_ready": true,
+                "cx_not_ready_reason": null,
+                "cx_by": "test:v2",
+            })
+            .to_string(),
+        );
+        seed_facts_worker(&c, task_id, "gpt-5.6-terra", "high", 1_100);
+
+        let facts = perf_facts(&c, false).unwrap();
+        let aggregate = perf(&c, PerfCut::Complexity, DM, DE).unwrap();
+        assert_eq!(facts.counts.included, 1);
+        for cut in [
+            PerfCut::Default,
+            PerfCut::Complexity,
+            PerfCut::Reviewer,
+            PerfCut::RiskFlag,
+        ] {
+            assert_eq!(
+                perf(&c, cut, DM, DE)
+                    .unwrap()
+                    .rows
+                    .iter()
+                    .map(|row| row.n_tasks)
+                    .sum::<i64>(),
+                facts.counts.included,
+            );
+        }
+        assert_eq!(aggregate.rows.len(), 1);
+        let row = &aggregate.rows[0];
+        assert_eq!(row.complexity.as_deref(), Some("3"));
+        assert_eq!(row.model, "gpt-5.6-terra");
+        assert_eq!(row.effort, "high");
+    }
+
+    #[test]
+    fn aggregate_uses_pending_only_without_a_worker_attempt() {
+        let (_d, mut c) = open_tmp();
+        seed_ordinary(&mut c, 1_600);
+
+        let facts = perf_facts(&c, false).unwrap();
+        let aggregate = perf(&c, PerfCut::Default, DM, DE).unwrap();
+        assert_eq!(
+            aggregate.rows.iter().map(|row| row.n_tasks).sum::<i64>(),
+            facts.counts.included
+        );
+        assert_eq!(aggregate.rows[0].model, "pending");
+        assert_eq!(aggregate.rows[0].effort, "pending");
+        assert_eq!(aggregate.rows[0].provisional_effective_tokens, None);
+    }
+
+    #[test]
+    fn aggregate_sums_provisional_effective_tokens_from_facts() {
+        let (_d, mut c) = open_tmp();
+        let task_id = seed_ordinary(&mut c, 1_600);
+        let run_id = seed_facts_worker(&c, task_id, "gpt-5.6-terra", "high", 1_100);
+        crate::token_usage::record(
+            &mut c,
+            Some(run_id),
+            "worker",
+            &[task_id],
+            None,
+            "codex",
+            "gpt-5.6-terra",
+            "high",
+            crate::token_usage::TokenUsage {
+                uncached_input_tokens: 7,
+                cached_input_tokens: 2,
+                output_tokens: 4,
+                reasoning_tokens: 2,
+                ..Default::default()
+            },
+            1_200,
+        )
+        .unwrap();
+
+        let aggregate = perf(&c, PerfCut::Default, DM, DE).unwrap();
+        assert_eq!(aggregate.rows[0].provisional_effective_tokens, Some(15));
     }
 
     #[test]
@@ -8443,9 +7875,9 @@ mod tests {
         )
         .unwrap();
 
-        // Task exactly at the boundary (updated_at == watermark).
-        let t1 = seed_task(&mut c, "done", None, 0, None, 1000, 1600);
-        seed_run(&c, t1, "opus-46", "high", 1001);
+        // Verified merged intent exactly at the boundary
+        // (updated_at == watermark).
+        seed_ordinary(&mut c, 1600);
 
         let r = perf(&c, PerfCut::Default, DM, DE).unwrap();
         assert_eq!(r.rows.len(), 1);

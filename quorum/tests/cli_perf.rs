@@ -127,7 +127,68 @@ fn perf_facts_rejects_incompatible_flags_as_usage_errors() {
 }
 
 #[test]
-fn legacy_perf_empty_output_remains_byte_for_byte_compatible() {
+fn aggregate_table_uses_facts_complexity_and_explicit_missing_tokens() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path()).arg("init").assert().success();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "owner",
+            "--title",
+            "measured",
+        ])
+        .assert()
+        .success();
+
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    conn.execute(
+        "UPDATE tasks
+         SET status='done', completion_provenance='merged',
+             refs=json_object(
+                 'merge_commit_sha','0123456789abcdef0123456789abcdef01234567',
+                 'cx_est',3,'cx_size','M','cx_ready',json('true'),
+                 'cx_not_ready_reason',NULL,'cx_by','test:v2')
+         WHERE id=1",
+        [],
+    )
+    .unwrap();
+
+    quorum(home.path())
+        .args(["perf", "--all", "--by", "complexity"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("COMPLEXITY"))
+        .stdout(predicate::str::contains("EFF_TOKENS"))
+        .stdout(predicate::str::contains("pending"))
+        .stdout(predicate::str::contains(" 3 "))
+        .stdout(predicate::str::contains("COST_USD").not())
+        .stdout(predicate::str::contains("APR_RT").not())
+        .stdout(predicate::str::contains("AVG_BLK").not());
+
+    let aggregate = quorum(home.path())
+        .args(["perf", "--all", "--by", "complexity", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let aggregate: serde_json::Value = serde_json::from_slice(&aggregate).unwrap();
+    let facts = quorum(home.path())
+        .args(["perf", "--all", "--facts", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let facts: serde_json::Value = serde_json::from_slice(&facts).unwrap();
+    assert_eq!(aggregate["rows"][0]["complexity"], 3.to_string());
+    assert_eq!(aggregate["rows"][0]["n_tasks"], facts["counts"]["included"]);
+    assert!(aggregate["rows"][0]["provisional_effective_tokens"].is_null());
+}
+
+#[test]
+fn aggregate_perf_empty_output_matches_included_intent_semantics() {
     let home = tempfile::tempdir().unwrap();
     quorum(home.path()).arg("init").assert().success();
 
@@ -145,7 +206,7 @@ fn legacy_perf_empty_output_remains_byte_for_byte_compatible() {
             .get_output()
             .stdout
             .clone();
-        assert_eq!(output, b"No terminal tasks found.\n", "args: {args:?}");
+        assert_eq!(output, b"No included intents found.\n", "args: {args:?}");
     }
     for args in [
         ["perf", "--json"].as_slice(),

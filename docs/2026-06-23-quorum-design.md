@@ -1814,20 +1814,19 @@ Historical collector artifacts (collection runs, findings, errors) created by a
 prior backfill are retained as audit data but do not affect the default report.
 
 **Risk-flag performance cut (#277):** `quorum perf --by risk-flag` is a
-read-only cut over the classifier-owned `refs.cx_risk_flags` accessor. A task
-contributes once to every known flag it carries; a task without a valid flag set
-contributes once to `untagged`. The report has at most eight rows (the seven
-closed classifier flags plus `untagged`) and does not further split these rows
-by model or effort. Each row reports `merged_count` (`status=done`),
-`failed_rework_cap_count` (`status=failed` at its effective rework cap), and
-`other_count` for all remaining terminal outcomes.
+read-only cut over the classifier-owned risk flags exposed by the facts report.
+An included intent contributes once to every known flag it carries; an intent
+without a valid flag set contributes once to `untagged`. The report has at most
+eight rows (the seven closed classifier flags plus `untagged`) and does not
+further split these rows by model or effort. Each row reports verified merged
+and irrecoverable failed intent counts from the facts cohort.
 
-`late_blocker_count` and `late_blocker_rate` are observational joins of those
-task flags with durable collector findings. A task counts once per flag when a
-`review_findings.kind='blocking'` row exists and its persisted `rework_round`
-is at least 2; the rate denominator is the row's task count. This consumes the
-current classifier-owned refs through the shared accessor rather than taking an
-analytics snapshot, and never changes lifecycle or routing state.
+`late_blocker_count` and `late_blocker_rate` use the facts report's covered
+review-quality evidence. An intent counts once per flag when its durable,
+complete collector evidence contains a blocking finding and its facts rework
+count is at least 2; the rate denominator is the row's intent count. The report
+renders both late-blocker fields as a dash if any intent in the row lacks that
+evidence. It never changes lifecycle or routing state.
 
 **Performance facts report (#249):** `quorum perf --facts --json [--all]` is a
 versioned, read-only evidence surface. `--facts` requires `--json` and conflicts
@@ -1852,6 +1851,26 @@ aggregate risk-flag cut.
 This report only reads durable task evidence. It is not a QPS calculation,
 score or leaderboard, budget/weight definition, or durable analytics snapshot;
 it performs no writes and does not establish any of those future contracts.
+
+**Aggregate performance projection (#303):** the non-`--facts` human table and
+aggregate JSON are projections of the included intents in `perf-facts-v1`, not
+an independent task query. Complexity uses the root classifier's covered
+`cx_est` value (1–5), with `untagged` reserved for absent evidence. Model and
+effort use the first durably attributed worker attempt; `pending/pending` means
+there is no worker attempt, while an attempt with a missing execution value is
+shown as `unreported`. Reviewer cuts likewise use the first attributed reviewer
+attempt. Consequently, each single-valued cut totals to the facts report's
+included intent count; the multi-valued risk cut may count an intent once per
+flag by design.
+
+The table labels its token column `EFF_TOKENS` and sums the facts report's
+`provisional_effective_token_total`. A dash means at least one intent in the row
+lacks complete token coverage. The rework, wall-time, and reviewer metrics also
+render a dash rather than a numeric zero when their facts evidence is
+incomplete. Effective tokens are not a provider bill or USD estimate. The legacy
+approval-rate, average-blocker, and journal-cost columns are omitted: the first
+two were not backed by complete facts evidence and the journal cost was not
+durable provider-reported cost. `perf-facts-v1` itself is unchanged.
 
 ## Built-in coding runners: Claude, Codex, and Grok Build
 
