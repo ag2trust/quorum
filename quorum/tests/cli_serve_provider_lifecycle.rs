@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn cargo_bin(name: &str) -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin(name)
@@ -2472,28 +2472,30 @@ fn remediation_provision_failure_parks_review_only_rework_without_reviewer_loop(
     case.handle.stop();
 }
 
-/// D5b: a remediation worker that spawns fine but dies at runtime WITHOUT
-/// pushing must park the task — never hand the unchanged PR head back to a
-/// fresh reviewer (whose changes verdict would burn a rework round with zero
-/// remediation applied). The terminal park is immediately owner-gated; an
-/// explicit `task-retry` resumes the remediation flow with persisted feedback.
+/// A remediation worker that spawns fine but dies at runtime without pushing
+/// returns to the existing remediation context, never to a fresh reviewer on
+/// the unchanged PR head.
 #[test]
-fn remediation_runtime_death_parks_review_only_rework_without_reviewer_loop() {
+fn remediation_runtime_death_resumes_review_only_rework_without_reviewer_loop() {
     let mut case = Case::start_review_only("claude", "claude-opus-4-6");
     case.handle.wait_for("spawning reviewer ");
     let reviewer = case.handle.agent_after("spawning reviewer ");
     case.handle.wait_for("result");
 
-    // Swap in a runner that accepts the initial turn, then dies without any
-    // protocol output. The next spawn is the remediation worker, so this
-    // forces a deterministic RUNTIME death (post-spawn), not a provisioning
-    // failure — the case the provision-failure park cannot cover.
+    // Fail one remediation worker after accepting its turn, then keep the
+    // exact replacement alive. This proves the recovery intent provisions
+    // exactly one replacement instead of merely leaving the task in rework.
     std::fs::write(
         case.home.path().join("dual-runner.sh"),
         r#"#!/bin/sh
 printf '%s|%s\n' "${QUORUM_AGENT:-none}" "$*" >> "$RUNNER_LOG"
+if [ ! -f "${RUNNER_LOG}.remediation-failed-once" ]; then
+  : > "${RUNNER_LOG}.remediation-failed-once"
+  IFS= read -r line
+  exit 1
+fi
 IFS= read -r line
-exit 1
+while IFS= read -r line; do :; done
 "#,
     )
     .unwrap();
@@ -2521,30 +2523,36 @@ exit 1
         ],
     );
     case.handle.wait_for("spawning remediation worker ");
-    let remediation = case.handle.agent_after("spawning remediation worker ");
-    case.handle.wait_for("lifecycle: task #1 -> failed");
+    let failed_remediation = case.handle.agent_after("spawning remediation worker ");
+    case.handle.wait_for("lifecycle: task #1 -> rework");
+    case.handle
+        .wait_for("durable remediation recovery: provisioning task #1");
+    case.handle.wait_for("spawning remediation worker ");
+    case.handle.wait_for("remediation worker ");
+    let replacement = case.handle.agent_after("spawning remediation worker ");
+    assert_ne!(
+        replacement, failed_remediation,
+        "recovery needs a fresh worker"
+    );
 
     let conn = case.db();
     let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
-    assert_eq!(task.status, "failed");
+    assert_eq!(task.status, "rework");
     assert_eq!(
         task.rework_round, 1,
         "runtime death must not consume a rework round"
     );
+    assert_eq!(task.recovery_attempts, 1, "runtime death spends one retry");
     let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-    assert_eq!(refs["daemon_parked"], true);
-    assert_eq!(refs["daemon_resume_status"], "rework");
+    assert_eq!(refs["pr"], 1);
+    assert!(refs.get("daemon_parked").is_none());
     assert!(
-        refs.get("daemon_parked_head_check").is_none(),
-        "new terminal parks must not create automatic head-check authority"
-    );
-    assert!(
-        refs.get("daemon_rework_retry_requested").is_none(),
-        "a genuine crash park must stay owner-gated — no auto-retry flag"
+        refs.get("daemon_recovered_remediation_retry").is_none(),
+        "the spawned replacement must consume the one recovery intent"
     );
     assert_eq!(
         refs["remediation_feedback"], "fix the blocker",
-        "feedback must be durable at spawn so retry can rebuild the turn"
+        "feedback must remain durable while the worker is replaced"
     );
     let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
     assert_eq!(
@@ -2554,69 +2562,54 @@ exit 1
     );
     let active_claims: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM claims WHERE target='task:1' AND active=1",
+            "SELECT COUNT(*) FROM claims WHERE target='task#1' AND active=1",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(active_claims, 0, "parking releases the remediation claim");
+    assert_eq!(active_claims, 1, "replacement owns the remediation claim");
+    assert!(
+        (1..=2).contains(&runs.iter().filter(|run| run.role == "worker").count()),
+        "only the failed worker and its replacement may have durable worker runs"
+    );
+    assert_eq!(
+        case.handle
+            .lines
+            .iter()
+            .filter(|line| line.contains("spawning remediation worker "))
+            .count(),
+        2,
+        "one failure must provision exactly one replacement worker"
+    );
     drop(conn);
 
-    // Explicit retry resumes the remediation flow (not generic provisioning).
-    write_dual_protocol_runner(case.home.path());
-    assert!(Command::new("git")
-        .args([
-            "-C",
-            &case._repo.path().to_string_lossy(),
-            "branch",
-            "-f",
-            "review-pr-1",
-        ])
-        .status()
-        .unwrap()
-        .success());
-    case.retry_parked();
-    case.handle
-        .wait_for("durable remediation retry: provisioning task #1");
-    case.handle.wait_for("spawning remediation worker ");
-    let retry_worker = case.handle.agent_after("spawning remediation worker ");
-    assert_ne!(
-        retry_worker, remediation,
-        "retry must provision a fresh remediation worker"
-    );
-    case.handle
-        .wait_for(&format!("worker {retry_worker} result"));
-    let conn = case.db();
-    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
-    assert_eq!(task.status, "rework");
-    assert_eq!(
-        task.rework_round, 1,
-        "retry must not consume a rework round"
-    );
-    drop(conn);
-    case.done(&retry_worker, &["--pr", "1"]);
-    case.handle.wait_for("lifecycle: task #1 -> in-review");
-    case.handle.stop();
+    // The replacement deliberately remains idle, so end this fixture with a
+    // hard daemon crash rather than exercising graceful-drain behavior here.
+    case.handle.crash_mut();
 }
 
-/// #270: even if the PR head moves after a remediation worker dies, the
-/// terminal task remains owner-gated. A stale pre-terminal head-check marker
-/// must never revive it; explicit retry returns to remediation exactly once.
+/// Even if the PR head moves after a remediation worker dies, the retained
+/// rework task stays in remediation rather than becoming owner-gated.
 #[test]
-fn remediation_death_after_push_remains_owner_gated() {
+fn remediation_death_after_push_retains_rework_context() {
     let mut case = Case::start_review_only("claude", "claude-opus-4-6");
     case.handle.wait_for("spawning reviewer ");
     let reviewer = case.handle.agent_after("spawning reviewer ");
     case.handle.wait_for("result");
 
-    // Dying runner: accepts the initial turn, then exits without protocol
-    // output — a runtime death after spawn.
+    // The first remediation worker exits without output; its exact replacement
+    // remains alive while the PR head moves.
     std::fs::write(
         case.home.path().join("dual-runner.sh"),
         r#"#!/bin/sh
 printf '%s|%s\n' "${QUORUM_AGENT:-none}" "$*" >> "$RUNNER_LOG"
+if [ ! -f "${RUNNER_LOG}.remediation-failed-once" ]; then
+  : > "${RUNNER_LOG}.remediation-failed-once"
+  IFS= read -r line
+  exit 1
+fi
 IFS= read -r line
-exit 1
+while IFS= read -r line; do :; done
 "#,
     )
     .unwrap();
@@ -2644,10 +2637,12 @@ exit 1
         ],
     );
     case.handle.wait_for("spawning remediation worker ");
-    case.handle.wait_for("lifecycle: task #1 -> failed");
+    case.handle.wait_for("lifecycle: task #1 -> rework");
+    case.handle
+        .wait_for("durable remediation recovery: provisioning task #1");
+    case.handle.wait_for("spawning remediation worker ");
 
-    // Simulate the dead worker's push landing after the terminal transition.
-    write_dual_protocol_runner(case.home.path());
+    // Simulate the dead worker's push landing after the recovery transition.
     assert!(Command::new("git")
         .args([
             "-C",
@@ -2674,27 +2669,43 @@ exit 1
     let conn = case.db();
     let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
     assert_eq!(
-        task.status, "failed",
-        "terminal task must not revive merely because its PR head moved"
+        task.status, "rework",
+        "a PR head move must not discard the retained remediation context"
     );
     assert_eq!(
         task.rework_round, 1,
-        "the terminal park must not consume a rework round"
+        "recovery must not consume a rework round"
+    );
+    assert_eq!(
+        task.recovery_attempts, 1,
+        "the failed remediation worker consumes one bounded recovery"
     );
     let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-    assert_eq!(refs["daemon_parked"], true);
-    assert_eq!(refs["daemon_resume_status"], "rework");
-    assert!(refs.get("daemon_parked_head_check").is_none());
-    assert!(refs.get("daemon_rework_retry_requested").is_none());
+    assert_eq!(refs["pr"], 1);
+    assert!(refs.get("daemon_parked").is_none());
+    assert!(refs.get("daemon_recovered_remediation_retry").is_none());
     let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
     assert_eq!(
         runs.iter().filter(|run| run.role == "reviewer").count(),
         1,
         "head movement must not provision a replacement reviewer"
     );
+    assert!(
+        (1..=2).contains(&runs.iter().filter(|run| run.role == "worker").count()),
+        "only the failed worker and its replacement may have durable worker runs"
+    );
+    assert_eq!(
+        case.handle
+            .lines
+            .iter()
+            .filter(|line| line.contains("spawning remediation worker "))
+            .count(),
+        2,
+        "the recovery intent must create one replacement worker"
+    );
     drop(conn);
 
-    // Explicit owner retry returns to the remediation path on the moved head.
+    // The retained rework context remains valid for a later remediation turn.
     let new_head = String::from_utf8(
         Command::new("git")
             .args([
@@ -2725,24 +2736,96 @@ exit 1
     )
     .unwrap();
     drop(conn);
-    case.retry_parked();
-    case.handle
-        .wait_for("durable remediation retry: provisioning task #1");
-    case.handle.wait_for("spawning remediation worker ");
-    let retry_worker = case.handle.agent_after("spawning remediation worker ");
-    case.handle
-        .wait_for(&format!("worker {retry_worker} result"));
     let task = quorum_core::tasks::get(&case.db(), 1).unwrap().unwrap();
     assert_eq!(task.status, "rework");
     assert_eq!(task.rework_round, 1);
+    case.handle.crash_mut();
+}
+
+/// A direct lapsed-lease sweep records the same exact-remediation recovery
+/// intent as an agent failure, and a restarted daemon consumes it once.
+#[test]
+fn remediation_lease_expiry_restarts_exact_worker_once() {
+    let mut case = Case::start_review_only("claude", "claude-opus-4-6");
+    case.handle.wait_for("spawning reviewer ");
+    let reviewer = case.handle.agent_after("spawning reviewer ");
+    case.handle.wait_for("result");
+    case.done(
+        &reviewer,
+        &[
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--blocking",
+            "1",
+            "--feedback",
+            "fix the blocker",
+        ],
+    );
+    case.handle.wait_for("spawning remediation worker ");
+    let remediation = case.handle.agent_after("spawning remediation worker ");
+    case.handle
+        .wait_for(&format!("worker {remediation} result"));
+
+    let reaped_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + quorum_core::tasks::DEFAULT_LEASE_TTL_SECS;
+    {
+        let conn = case.db();
+        quorum_core::sweep::reap_lapsed_tasks(&conn, reaped_at, quorum_core::sweep::SWEEP_LIMIT)
+            .unwrap();
+        let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.rework_round, 1, "lease expiry must not burn a round");
+        assert_eq!(task.recovery_attempts, 1);
+        assert!(quorum_core::tasks::recovered_remediation_retry_requested(
+            task.refs.as_deref()
+        ));
+    }
+
+    // The old process is deliberately not allowed to consume the intent: a
+    // fresh daemon must reconcile the durable row after restart.
+    case.handle.crash_mut();
+    case.restart_after_stop("claude", "claude-opus-4-6", None);
+    case.handle.wait_for("recovery: complete");
+    case.handle
+        .wait_for("durable remediation recovery: provisioning task #1");
+    case.handle.wait_for("spawning remediation worker ");
+    case.handle.wait_for("remediation worker ");
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "rework");
+    assert_eq!(task.rework_round, 1);
+    assert_eq!(
+        task.recovery_attempts, 2,
+        "restart recovery records its bounded second lost-worker observation"
+    );
+    assert_eq!(
+        quorum_core::tasks::extract_pr_number(&task.refs),
+        Some(1),
+        "restart must retain the original PR"
+    );
+    assert!(!quorum_core::tasks::recovered_remediation_retry_requested(
+        task.refs.as_deref()
+    ));
+    let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
+    assert_eq!(
+        runs.iter().filter(|run| run.role == "worker").count(),
+        2,
+        "the lapsed worker and its exact replacement are the only worker runs"
+    );
+    drop(conn);
     case.handle.stop();
 }
 
-/// #270: drain teardown parks remediation work without leaving durable
-/// automatic-retry authority. Restart keeps the terminal row owner-gated;
-/// explicit `task-retry` resumes it without spending recovery budget.
+/// Drain teardown preserves remediation work and its bounded recovery count
+/// across a restart, without turning it into an owner-gated terminal park.
 #[test]
-fn drain_park_of_remediation_stays_owner_gated_on_restart() {
+fn drain_recovery_of_remediation_retains_rework_on_restart() {
     let mut case = Case::start_review_only("claude", "claude-opus-4-6");
     case.handle.wait_for("spawning reviewer ");
     let reviewer = case.handle.agent_after("spawning reviewer ");
@@ -2766,87 +2849,55 @@ fn drain_park_of_remediation_stays_owner_gated_on_restart() {
         .wait_for(&format!("worker {remediation} result"));
 
     // Drain: the idle remediation worker is torn down with AgentFailed
-    // ("daemon draining") and parked for an explicit owner retry.
+    // ("daemon draining") and returns to rework.
     case.handle.stop_mut();
     {
         let conn = case.db();
         let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
-        assert_eq!(task.status, "failed", "drain must park, not bounce");
+        assert_eq!(task.status, "rework", "drain must retain rework");
         assert_eq!(task.rework_round, 1, "drain must not consume a round");
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-        assert_eq!(refs["daemon_parked"], true);
-        assert!(
-            refs.get("daemon_rework_retry_requested").is_none(),
-            "terminal park must not carry automatic-retry authority"
-        );
+        assert_eq!(refs["pr"], 1);
+        assert!(refs.get("daemon_parked").is_none());
         assert_eq!(
-            task.recovery_attempts, 0,
-            "owner-gated park must not spend recovery budget"
+            task.recovery_attempts, 1,
+            "automatic recovery must spend one bounded retry"
         );
     }
 
-    // The PR branch was torn down with the dead slot; recreate it so the
-    // respawned remediation worker can provision (same as the manual-retry
-    // tests).
-    assert!(Command::new("git")
-        .args([
-            "-C",
-            &case._repo.path().to_string_lossy(),
-            "branch",
-            "-f",
-            "review-pr-1",
-        ])
-        .status()
-        .unwrap()
-        .success());
-
-    // Restart must leave the terminal task inert and provision nothing.
-    let runner_log_before_restart = std::fs::read_to_string(&case.runner_log).unwrap();
+    // Restart consumes the durable exact-remediation recovery intent and
+    // provisions one replacement worker for the same PR.
     case.restart_after_stop("claude", "claude-opus-4-6", None);
     case.handle.wait_for("recovery: complete");
-    case.wait_for_completed_tick();
-    let runner_log_after_restart = std::fs::read_to_string(&case.runner_log).unwrap();
-    assert_eq!(
-        runner_log_after_restart, runner_log_before_restart,
-        "restart must not provision a worker for a terminal park"
-    );
-
-    let conn = case.db();
-    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
-    assert_eq!(task.status, "failed");
-    assert_eq!(task.rework_round, 1);
-    assert_eq!(task.recovery_attempts, 0);
-    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-    assert_eq!(refs["daemon_parked"], true);
-    assert!(refs.get("daemon_rework_retry_requested").is_none());
-    drop(conn);
-
-    // Explicit owner action resumes the preserved remediation request once.
-    case.retry_parked();
     case.handle
-        .wait_for("durable remediation retry: provisioning task #1");
+        .wait_for("durable remediation recovery: provisioning task #1");
     case.handle.wait_for("spawning remediation worker ");
-    let retry_worker = case.handle.agent_after("spawning remediation worker ");
-    case.handle
-        .wait_for(&format!("worker {retry_worker} result"));
-
+    case.handle.wait_for("remediation worker ");
     let conn = case.db();
     let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
     assert_eq!(task.status, "rework");
-    assert_eq!(task.rework_round, 1, "respawn must not consume a round");
+    assert_eq!(task.rework_round, 1);
     assert_eq!(
-        task.recovery_attempts, 0,
-        "explicit retry must not alter the recovery budget"
+        task.recovery_attempts, 2,
+        "restart recovery records its second bounded reap"
     );
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["pr"], 1);
+    assert!(refs.get("daemon_parked").is_none());
+    assert!(refs.get("daemon_recovered_remediation_retry").is_none());
+
     let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
     assert_eq!(
         runs.iter().filter(|run| run.role == "reviewer").count(),
         1,
         "no replacement reviewer across drain + restart"
     );
+    assert_eq!(
+        runs.iter().filter(|run| run.role == "worker").count(),
+        2,
+        "restart must consume one recovery intent without duplicate workers"
+    );
     drop(conn);
-    case.done(&retry_worker, &["--pr", "1"]);
-    case.handle.wait_for("lifecycle: task #1 -> in-review");
     case.handle.stop();
 }
 

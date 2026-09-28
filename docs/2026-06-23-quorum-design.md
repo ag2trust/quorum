@@ -737,7 +737,14 @@ only through an explicit outside request)
 
 **From Working:**
 - `SignaledDone { pr }` → InReview · effects: SpawnReviewer
-- `AgentFailed` / `LeaseExpired` → Open · effects: ReleaseLease (+NotifyOwner on failure)
+- `AgentFailed` / `LeaseExpired` with an existing PR and `rework_round > 0` → Rework ·
+  effects: ReleaseLease, ResumeWorker, NotifyOwner. The daemon persists one exact-remediation
+  recovery intent and provisions the replacement through the existing PR-bound remediation path.
+  The PR, author, and round are retained; the reap does not increment `rework_round`.
+  Recovery is bounded by the task's rework cap and recovery budget; cap- or budget-exhausted
+  rows become Failed.
+- Other `AgentFailed` / `LeaseExpired` → Open · effects: ReleaseLease (+NotifyOwner on failure).
+  A PR-less first-round recovery also clears the author.
 - `Cancelled { by }` → Cancelled · effects: ReleaseLease
 
 **From InReview:**
@@ -754,14 +761,15 @@ only through an explicit outside request)
 
 **From Rework:**
 - `ReworkPushed` → InReview · effects: ResumeReviewer
-- `AgentFailed` / `LeaseExpired` → Open · effects: ReleaseLease (+NotifyOwner on failure)
-- `AgentFailed` / `LeaseExpired` (review_only=true) → Failed (parked, resume `rework`) ·
-  effects: ReleaseLease, NotifyOwner. A lost remediation worker must not hand the
-  unchanged PR head back to a fresh reviewer — that changes verdict would burn a rework
-  round with zero remediation applied. The terminal park is never selected for
-  automatic retry, including after daemon restart; only an explicit `task-retry`
-  restores it to `rework`. The lapsed-lease sweep applies the same owner-gated park
-  instead of reclaiming to `in-review`.
+- `AgentFailed` / `LeaseExpired` with an existing PR and `rework_round > 0` → Rework ·
+  effects: ReleaseLease, ResumeWorker, NotifyOwner. The exact-remediation recovery intent
+  survives daemon restart and is consumed atomically with the replacement lease, so a
+  recovered remediation never falls through to a fresh initial worker or reviewer. The PR,
+  author, and round remain intact and no reap burns a rework round. Repeated reaps are bounded
+  by the existing recovery budget; a round already at its rework cap (or an exhausted recovery
+  budget) becomes Failed.
+- Other `AgentFailed` / `LeaseExpired` → Open · effects: ReleaseLease (+NotifyOwner on failure).
+  PR-less first-round recovery clears the author.
 - `Cancelled { by }` → Cancelled · effects: ReleaseLease
 
 **From Merging:**

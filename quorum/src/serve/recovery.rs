@@ -3153,7 +3153,7 @@ exec sleep 30
     }
 
     #[tokio::test]
-    async fn pidless_remediation_provision_follows_generic_cleanup() {
+    async fn pidless_remediation_provision_retains_rework_context() {
         let fixture = dormant_fixture();
         let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
         tasks::apply_event(
@@ -3238,7 +3238,14 @@ exec sleep 30
         assert!(!roster.owns("Remediation"));
         let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
         let task = tasks::get(&conn, fixture.task_id).unwrap().unwrap();
-        assert_eq!(task.status, "open");
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.rework_round, 1, "reaping must not consume a round");
+        assert_eq!(
+            task.recovery_attempts, 1,
+            "reaping consumes one bounded retry"
+        );
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["pr"], 901, "recovery must retain the remediation PR");
         assert!(journal::list_in_flight(&conn)
             .unwrap()
             .iter()

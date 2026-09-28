@@ -180,6 +180,37 @@ impl std::error::Error for InvalidTransition {}
 /// stamped (historic rows, or the daemon's `max_rework` config left unset).
 pub const REWORK_CAP: u32 = 7;
 
+/// Recover a lost remediation worker without discarding its durable PR context.
+///
+/// Reaps do not consume a rework round, but a task already at its immutable cap
+/// must still remain terminal rather than receive another remediation worker.
+fn recover_rework_worker(t: &TaskView, reason: String) -> Option<(Status, Vec<Effect>)> {
+    if t.pr.is_none() || t.rework_round == 0 {
+        return None;
+    }
+
+    if t.rework_round >= t.rework_cap {
+        return Some((
+            Status::Failed,
+            vec![
+                Effect::NotifyOwner {
+                    reason: format!("rework cap ({}) exceeded", t.rework_cap),
+                },
+                Effect::ReleaseLease,
+            ],
+        ));
+    }
+
+    Some((
+        Status::Rework,
+        vec![
+            Effect::ReleaseLease,
+            Effect::ResumeWorker,
+            Effect::NotifyOwner { reason },
+        ],
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // transition — the exhaustive match
 // ---------------------------------------------------------------------------
@@ -270,6 +301,9 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
             Ok((Status::InReview, vec![Effect::SpawnReviewer]))
         }
         (Status::Working, Event::AgentFailed { reason }) => {
+            if let Some(recovery) = recover_rework_worker(t, reason.clone()) {
+                return Ok(recovery);
+            }
             let mut effects = vec![Effect::ReleaseLease];
             // Preserve author when task has an open PR — the work survives the worker
             if t.pr.is_none() {
@@ -281,6 +315,11 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
             Ok((Status::Open, effects))
         }
         (Status::Working, Event::LeaseExpired) => {
+            if let Some(recovery) =
+                recover_rework_worker(t, "remediation lease expired; resuming rework".into())
+            {
+                return Ok(recovery);
+            }
             let mut effects = vec![Effect::ReleaseLease];
             if t.pr.is_none() {
                 effects.push(Effect::ClearAuthor);
@@ -394,54 +433,29 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
             Ok((Status::InReview, vec![Effect::ResumeReviewer]))
         }
         (Status::Rework, Event::AgentFailed { reason }) => {
-            if t.review_only {
-                // A lost remediation worker must not hand the task back to
-                // review: the replacement reviewer re-judges the unchanged PR
-                // head and its changes verdict burns a rework round with zero
-                // remediation applied. Park instead (Failed + daemon_parked
-                // refs, written by the storage layer); only an explicit
-                // `task-retry` can restore it to rework.
-                Ok((
-                    Status::Failed,
-                    vec![
-                        Effect::ReleaseLease,
-                        Effect::NotifyOwner {
-                            reason: format!(
-                                "remediation worker lost ({reason}); parked — \
-                                 resume with `quorum task-retry`"
-                            ),
-                        },
-                    ],
-                ))
-            } else {
-                Ok((
-                    Status::Open,
-                    vec![
-                        Effect::ReleaseLease,
-                        Effect::NotifyOwner {
-                            reason: reason.clone(),
-                        },
-                    ],
-                ))
+            if let Some(recovery) = recover_rework_worker(t, reason.clone()) {
+                return Ok(recovery);
             }
+            let mut effects = vec![Effect::ReleaseLease];
+            if t.pr.is_none() {
+                effects.push(Effect::ClearAuthor);
+            }
+            effects.push(Effect::NotifyOwner {
+                reason: reason.clone(),
+            });
+            Ok((Status::Open, effects))
         }
         (Status::Rework, Event::LeaseExpired) => {
-            if t.review_only {
-                // Same park-not-bounce contract as AgentFailed above.
-                Ok((
-                    Status::Failed,
-                    vec![
-                        Effect::ReleaseLease,
-                        Effect::NotifyOwner {
-                            reason: "remediation lease expired; parked — \
-                                     resume with `quorum task-retry`"
-                                .into(),
-                        },
-                    ],
-                ))
-            } else {
-                Ok((Status::Open, vec![Effect::ReleaseLease]))
+            if let Some(recovery) =
+                recover_rework_worker(t, "remediation lease expired; resuming rework".into())
+            {
+                return Ok(recovery);
             }
+            let mut effects = vec![Effect::ReleaseLease];
+            if t.pr.is_none() {
+                effects.push(Effect::ClearAuthor);
+            }
+            Ok((Status::Open, effects))
         }
         (Status::Rework, Event::Cancelled { by }) => Ok((
             Status::Cancelled,
@@ -851,36 +865,49 @@ mod tests {
     }
 
     #[test]
-    fn working_agent_failed_with_pr_preserves_author() {
+    fn working_rework_context_agent_failed_returns_to_rework() {
         let mut t = view(Status::Working);
         t.pr = Some("42".into());
         t.author = Some("W1".into());
+        t.rework_round = 1;
         assert_ok(
             &t,
             &Event::AgentFailed {
                 reason: "idle".into(),
             },
-            Status::Open,
+            Status::Rework,
             &[
                 Effect::ReleaseLease,
+                Effect::ResumeWorker,
                 Effect::NotifyOwner {
                     reason: "idle".into(),
                 },
             ],
         );
+        assert_eq!(t.pr.as_deref(), Some("42"));
+        assert_eq!(t.rework_round, 1);
     }
 
     #[test]
-    fn working_lease_expired_with_pr_preserves_author() {
+    fn working_rework_context_lease_expired_returns_to_rework() {
         let mut t = view(Status::Working);
         t.pr = Some("42".into());
         t.author = Some("W1".into());
+        t.rework_round = 1;
         assert_ok(
             &t,
             &Event::LeaseExpired,
-            Status::Open,
-            &[Effect::ReleaseLease],
+            Status::Rework,
+            &[
+                Effect::ReleaseLease,
+                Effect::ResumeWorker,
+                Effect::NotifyOwner {
+                    reason: "remediation lease expired; resuming rework".into(),
+                },
+            ],
         );
+        assert_eq!(t.pr.as_deref(), Some("42"));
+        assert_eq!(t.rework_round, 1);
     }
 
     #[test]
@@ -1133,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn rework_agent_failed() {
+    fn rework_agent_failed_without_pr_reopens_and_clears_author() {
         let t = view(Status::Rework);
         assert_ok(
             &t,
@@ -1143,6 +1170,7 @@ mod tests {
             Status::Open,
             &[
                 Effect::ReleaseLease,
+                Effect::ClearAuthor,
                 Effect::NotifyOwner {
                     reason: "crash".into(),
                 },
@@ -1151,71 +1179,85 @@ mod tests {
     }
 
     #[test]
-    fn rework_lease_expired() {
+    fn rework_lease_expired_without_pr_reopens_and_clears_author() {
         let t = view(Status::Rework);
         assert_ok(
             &t,
             &Event::LeaseExpired,
             Status::Open,
-            &[Effect::ReleaseLease],
+            &[Effect::ReleaseLease, Effect::ClearAuthor],
         );
     }
 
-    // ── Review-only rework recovery (table-driven) ─────────────────
-    // Implementation tasks recover to Open (worker requeue). review_only
-    // tasks park (Failed + daemon_parked refs): bouncing to InReview would
-    // re-review the unchanged PR head and burn a rework round per bounce.
+    // ── Rework recovery (table-driven) ──────────────────────────────
+    // A durable PR and nonzero rework round identify remediation context.
+    // Worker failures resume that context identically for implementation and
+    // review-only tasks, without spending another round.
 
     #[test]
     fn rework_recovery_destinations_by_review_only() {
         struct Case {
             review_only: bool,
             event: Event,
-            expected_status: Status,
             label: &'static str,
         }
         let cases = [
             Case {
                 review_only: false,
                 event: Event::AgentFailed { reason: "x".into() },
-                expected_status: Status::Open,
-                label: "impl+AgentFailed→Open",
+                label: "impl+AgentFailed→Rework",
             },
             Case {
                 review_only: true,
                 event: Event::AgentFailed { reason: "x".into() },
-                expected_status: Status::Failed,
-                label: "review_only+AgentFailed→Failed(park)",
+                label: "review_only+AgentFailed→Rework",
             },
             Case {
                 review_only: false,
                 event: Event::LeaseExpired,
-                expected_status: Status::Open,
-                label: "impl+LeaseExpired→Open",
+                label: "impl+LeaseExpired→Rework",
             },
             Case {
                 review_only: true,
                 event: Event::LeaseExpired,
-                expected_status: Status::Failed,
-                label: "review_only+LeaseExpired→Failed(park)",
+                label: "review_only+LeaseExpired→Rework",
             },
         ];
         for case in &cases {
             let mut t = view(Status::Rework);
             t.review_only = case.review_only;
             t.pr = Some("42".into());
-            let (next, _) =
+            t.rework_round = 1;
+            let (next, effects) =
                 transition(&t, &case.event).unwrap_or_else(|e| panic!("{}: {e}", case.label));
-            assert_eq!(next, case.expected_status, "{}", case.label);
+            assert_eq!(next, Status::Rework, "{}", case.label);
+            assert!(effects.contains(&Effect::ReleaseLease), "{}", case.label);
+            assert!(effects.contains(&Effect::ResumeWorker), "{}", case.label);
+            assert!(
+                effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::NotifyOwner { .. })),
+                "{}",
+                case.label
+            );
+            assert!(
+                !effects.contains(&Effect::ClearAuthor)
+                    && !effects.contains(&Effect::IncrementReworkRound),
+                "{}",
+                case.label
+            );
+            assert_eq!(t.pr.as_deref(), Some("42"), "{}", case.label);
+            assert_eq!(t.rework_round, 1, "{}", case.label);
         }
     }
 
     #[test]
-    fn rework_agent_failed_review_only_parks_without_reviewer() {
+    fn rework_agent_failed_review_only_resumes_without_reviewer() {
         let mut t = view(Status::Rework);
         t.review_only = true;
         t.pr = Some("42".into());
         t.author = Some("W1".into());
+        t.rework_round = 1;
         let (status, effects) = transition(
             &t,
             &Event::AgentFailed {
@@ -1223,10 +1265,9 @@ mod tests {
             },
         )
         .unwrap();
-        // Park, never bounce: a replacement reviewer on the unchanged head
-        // would burn a rework round with zero remediation applied.
-        assert_eq!(status, Status::Failed);
+        assert_eq!(status, Status::Rework);
         assert!(effects.contains(&Effect::ReleaseLease));
+        assert!(effects.contains(&Effect::ResumeWorker));
         assert!(
             !effects.contains(&Effect::SpawnReviewer),
             "remediation death must not spawn a reviewer"
@@ -1238,18 +1279,63 @@ mod tests {
         assert!(effects
             .iter()
             .any(|e| matches!(e, Effect::NotifyOwner { reason } if reason.contains("crash"))));
+        assert!(!effects.contains(&Effect::ClearAuthor));
+        assert_eq!(t.pr.as_deref(), Some("42"));
+        assert_eq!(t.rework_round, 1);
     }
 
     #[test]
-    fn rework_lease_expired_review_only_parks_without_reviewer() {
+    fn rework_lease_expired_review_only_resumes_without_reviewer() {
         let mut t = view(Status::Rework);
         t.review_only = true;
         t.pr = Some("42".into());
+        t.rework_round = 1;
         let (status, effects) = transition(&t, &Event::LeaseExpired).unwrap();
-        assert_eq!(status, Status::Failed);
+        assert_eq!(status, Status::Rework);
         assert!(effects.contains(&Effect::ReleaseLease));
+        assert!(effects.contains(&Effect::ResumeWorker));
         assert!(!effects.contains(&Effect::SpawnReviewer));
         assert!(!effects.contains(&Effect::IncrementReworkRound));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::NotifyOwner { .. })),
+            "resumed remediation must notify the owner"
+        );
+        assert!(!effects.contains(&Effect::ClearAuthor));
+        assert_eq!(t.pr.as_deref(), Some("42"));
+        assert_eq!(t.rework_round, 1);
+    }
+
+    #[test]
+    fn exhausted_rework_context_recovery_fails_without_respawning() {
+        for status in [Status::Working, Status::Rework] {
+            for event in [
+                Event::AgentFailed {
+                    reason: "crash".into(),
+                },
+                Event::LeaseExpired,
+            ] {
+                let mut t = view(status);
+                t.pr = Some("42".into());
+                t.author = Some("W1".into());
+                t.rework_round = t.rework_cap;
+                let (next, effects) = transition(&t, &event).unwrap();
+                assert_eq!(next, Status::Failed, "{status:?} + {event:?}");
+                assert_eq!(
+                    effects,
+                    vec![
+                        Effect::NotifyOwner {
+                            reason: format!("rework cap ({}) exceeded", t.rework_cap),
+                        },
+                        Effect::ReleaseLease,
+                    ],
+                    "{status:?} + {event:?}"
+                );
+                assert_eq!(t.pr.as_deref(), Some("42"));
+                assert_eq!(t.rework_round, t.rework_cap);
+            }
+        }
     }
 
     #[test]
@@ -1690,9 +1776,9 @@ mod tests {
         assert!(next.is_terminal());
     }
 
-    // Rework → Open (lease expired) → re-claim preserves PR/branch
+    // Rework → Rework (lease expired) preserves PR/branch and resumes a worker
     #[test]
-    fn walk_rework_open_reclaim_preserves_pr() {
+    fn walk_rework_reap_resumes_with_pr() {
         let mut t = view(Status::Open);
 
         // open → working → in-review
@@ -1715,24 +1801,25 @@ mod tests {
         t.status = next;
         t.rework_round += 1;
 
-        // rework agent's lease expires → back to Open
+        // rework agent's lease expires → rework, retaining its PR context
         let (next, effects) = transition(&t, &Event::LeaseExpired).unwrap();
-        assert_eq!(next, Status::Open);
+        assert_eq!(next, Status::Rework);
         assert!(effects.contains(&Effect::ReleaseLease));
+        assert!(effects.contains(&Effect::ResumeWorker));
+        assert!(!effects.contains(&Effect::IncrementReworkRound));
         t.status = next;
 
-        // PR and rework_round survive the Open transition (TaskView state persists)
+        // PR and rework_round survive the reap (TaskView state persists).
         assert_eq!(t.pr.as_deref(), Some("55"));
         assert_eq!(t.rework_round, 1);
 
-        // re-claim from Open
-        let (next, effects) = transition(&t, &Event::Claimed { agent: "W2".into() }).unwrap();
-        assert_eq!(next, Status::Working);
-        assert_eq!(effects, vec![Effect::SetAuthor { agent: "W2".into() }]);
+        // The respawned worker completes the same remediation round.
+        let (next, effects) = transition(&t, &Event::ReworkPushed).unwrap();
+        assert_eq!(next, Status::InReview);
+        assert_eq!(effects, vec![Effect::ResumeReviewer]);
         t.status = next;
-        t.author = Some("W2".into());
 
-        // the PR is still there
+        // The original PR and rework round remain bound through re-review.
         assert_eq!(t.pr.as_deref(), Some("55"));
         assert_eq!(t.rework_round, 1);
     }
