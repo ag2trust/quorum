@@ -3010,6 +3010,34 @@ mod tests {
         id
     }
 
+    fn aged_dependency_with_open_dependent(c: &mut Connection, title: &str) -> (i64, i64) {
+        // Link the open dependent before aging the dependency. Task creation
+        // runs an opportunistic sweep before its INSERT, so aging first would
+        // let that sweep reclaim an otherwise unreferenced dependency.
+        let dependency =
+            crate::tasks::create(c, "boss", title, None, 0, None, None, None, None, 1).unwrap();
+        let depends_on = format!("[{dependency}]");
+        let dependent = crate::tasks::create(
+            c,
+            "boss",
+            "dependent",
+            None,
+            0,
+            None,
+            None,
+            Some(&depends_on),
+            None,
+            1,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=0 WHERE id=?1",
+            [dependency],
+        )
+        .unwrap();
+        (dependency, dependent)
+    }
+
     type ReclaimableTaskSweeper = fn(&Connection) -> Result<()>;
 
     fn reclaimable_task_sweepers() -> [(&'static str, ReclaimableTaskSweeper); 2] {
@@ -3338,21 +3366,7 @@ mod tests {
     fn sweep_retains_aged_done_task_referenced_by_live_dependent() {
         for (path, sweep) in reclaimable_task_sweepers() {
             let (_d, mut c) = open_tmp_fk();
-            let dependency = aged_done_task(&mut c, "aged dependency");
-            let depends_on = format!("[{dependency}]");
-            crate::tasks::create(
-                &mut c,
-                "boss",
-                "live dependent",
-                None,
-                0,
-                None,
-                None,
-                Some(&depends_on),
-                None,
-                1,
-            )
-            .unwrap();
+            let (dependency, _) = aged_dependency_with_open_dependent(&mut c, "aged dependency");
 
             sweep(&c).unwrap();
             assert_task_survives(
@@ -3368,21 +3382,15 @@ mod tests {
         for terminal_status in ["done", "failed", "cancelled"] {
             for (path, sweep) in reclaimable_task_sweepers() {
                 let (_d, mut c) = open_tmp_fk();
-                let dependency = aged_done_task(&mut c, "aged dependency");
-                let depends_on = format!("[{dependency}]");
-                let dependent = crate::tasks::create(
-                    &mut c,
-                    "boss",
-                    "terminal dependent",
-                    None,
-                    0,
-                    None,
-                    None,
-                    Some(&depends_on),
-                    None,
-                    1,
-                )
-                .unwrap();
+                let (dependency, dependent) =
+                    aged_dependency_with_open_dependent(&mut c, "aged dependency");
+
+                sweep(&c).unwrap();
+                assert_task_survives(
+                    &c,
+                    dependency,
+                    &format!("a live dependent's depends_on before {terminal_status} transition"),
+                );
                 c.execute(
                     "UPDATE tasks SET status=?1 WHERE id=?2",
                     params![terminal_status, dependent],
