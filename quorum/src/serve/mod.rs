@@ -28225,11 +28225,10 @@ mod tests {
         )
         .await;
         teardown_worker(&config, &mgr, &mut name_pool, adopted_slot(), "open").await;
-        assert!(sync_fixture_git(
-            &repo,
-            &["branch", "--list", &adoption.branch]
-        )
-        .contains(&adoption.branch));
+        assert!(
+            sync_fixture_git(&repo, &["branch", "--list", &adoption.branch])
+                .contains(&adoption.branch)
+        );
         let path = mgr
             .adopt_sync_worktree(&repo, &adoption.worktree, &adoption.branch)
             .await
