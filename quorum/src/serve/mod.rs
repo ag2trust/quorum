@@ -28062,6 +28062,10 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         sync_fixture_git(tmp.path(), &["init", "--bare", &bare.to_string_lossy()]);
         sync_fixture_git(&repo, &["init", "-b", "main"]);
+        // The daemon's sync merge runs without `-c` overrides; CI runners have
+        // no global identity, so the repo (and its worktrees) must carry one.
+        sync_fixture_git(&repo, &["config", "user.email", "test@test.com"]);
+        sync_fixture_git(&repo, &["config", "user.name", "Test"]);
         sync_fixture_git(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
         std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
         sync_fixture_git(&repo, &["add", "shared.txt"]);
