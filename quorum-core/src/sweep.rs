@@ -545,6 +545,20 @@ fn task_ref_guard_predicates() -> String {
     guards
 }
 
+/// Keep a completed dependency while a non-terminal task still names it in
+/// `depends_on`. Unlike the child-table guards, dependencies are JSON rather
+/// than foreign keys, so this must be an explicit sweep guard.
+const LIVE_DEPENDENT_GUARD_PREDICATE: &str =
+    " AND NOT EXISTS (SELECT 1 FROM tasks dep, json_each(dep.depends_on) j \
+     WHERE j.value = tasks.id \
+       AND dep.status NOT IN ('done','failed','cancelled'))";
+
+fn reclaimable_task_guard_predicates() -> String {
+    let mut guards = task_ref_guard_predicates();
+    guards.push_str(LIVE_DEPENDENT_GUARD_PREDICATE);
+    guards
+}
+
 /// Primary-key page used to drive opportunistic task reclamation. Keep age,
 /// status, and reference predicates out of this query: adding them can make
 /// SQLite choose a secondary index and sort every qualifying historical row
@@ -608,9 +622,11 @@ fn delete_reclaimable_tasks_bounded(conn: &Connection, now: i64, limit: usize) -
     }
 
     // Apply eligibility and guards only to the bounded raw-ID window. Per-row
-    // durable NOT EXISTS probes are served by the indexes materialized in
-    // schema.sql; no age/status predicate participates in candidate discovery.
-    let guards = task_ref_guard_predicates();
+    // child-table NOT EXISTS probes are served by the indexes materialized in
+    // schema.sql; the JSON dependency guard is also evaluated only after this
+    // page has been fixed. No age/status predicate participates in candidate
+    // discovery.
+    let guards = reclaimable_task_guard_predicates();
     let placeholders = candidates.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
         "DELETE FROM tasks
@@ -629,12 +645,13 @@ fn delete_reclaimable_tasks_bounded(conn: &Connection, now: i64, limit: usize) -
 
 /// Explicit unbounded reclamation used by `quorum sweep`. No candidate cap,
 /// no cursor — every aged done task whose guards pass is deleted in one
-/// statement. Guard probes stay indexed; SQLite's LIMIT-free DELETE avoids
-/// the SQLITE_MAX_VARIABLE_NUMBER cap that a materialized `IN (...)` would
-/// hit at scale. Resets the opportunistic cursor so subsequent sweep-on-write
-/// mutations restart from the beginning after a full explicit sweep.
+/// statement. Child-table guard probes stay indexed; SQLite's LIMIT-free
+/// DELETE avoids the SQLITE_MAX_VARIABLE_NUMBER cap that a materialized
+/// `IN (...)` would hit at scale. Resets the opportunistic cursor so
+/// subsequent sweep-on-write mutations restart from the beginning after a
+/// full explicit sweep.
 fn delete_reclaimable_tasks_unbounded(conn: &Connection, now: i64) -> Result<()> {
-    let guards = task_ref_guard_predicates();
+    let guards = reclaimable_task_guard_predicates();
     let sql = format!("DELETE FROM tasks WHERE status='done' AND updated_at < ?1{guards}");
     conn.execute(&sql, params![now - DONE_TASK_TTL_SECS])?;
     conn.execute(
@@ -2993,6 +3010,17 @@ mod tests {
         id
     }
 
+    type ReclaimableTaskSweeper = fn(&Connection) -> Result<()>;
+
+    fn reclaimable_task_sweepers() -> [(&'static str, ReclaimableTaskSweeper); 2] {
+        [
+            ("bounded", |conn| {
+                sweep_on_write(conn, DONE_TASK_TTL_SECS + 1, SWEEP_LIMIT)
+            }),
+            ("unbounded", |conn| sweep_all(conn, DONE_TASK_TTL_SECS + 1)),
+        ]
+    }
+
     fn insert_decomposition(c: &Connection, source_task_id: i64) {
         c.execute(
             "INSERT INTO task_decompositions(
@@ -3287,19 +3315,94 @@ mod tests {
 
     #[test]
     fn unreferenced_aged_done_task_is_still_reclaimed() {
-        // The durable-ref guard must not turn every aged done task into a
-        // permanent row: an unreferenced one still reclaims under FK
-        // enforcement.
-        let (_d, mut c) = open_tmp_fk();
-        let orphan = aged_done_task(&mut c, "orphan");
+        // Neither the child-table guards nor the live-dependency guard may
+        // turn every aged done task into a permanent row.
+        for (path, sweep) in reclaimable_task_sweepers() {
+            let (_d, mut c) = open_tmp_fk();
+            let orphan = aged_done_task(&mut c, "orphan");
 
-        sweep_on_write(&c, DONE_TASK_TTL_SECS + 1, SWEEP_LIMIT).unwrap();
-        let count: i64 = c
-            .query_row("SELECT count(*) FROM tasks WHERE id=?1", [orphan], |r| {
-                r.get(0)
-            })
+            sweep(&c).unwrap();
+            let count: i64 = c
+                .query_row("SELECT count(*) FROM tasks WHERE id=?1", [orphan], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "{path} sweep must reclaim unreferenced aged done task"
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_retains_aged_done_task_referenced_by_live_dependent() {
+        for (path, sweep) in reclaimable_task_sweepers() {
+            let (_d, mut c) = open_tmp_fk();
+            let dependency = aged_done_task(&mut c, "aged dependency");
+            let depends_on = format!("[{dependency}]");
+            crate::tasks::create(
+                &mut c,
+                "boss",
+                "live dependent",
+                None,
+                0,
+                None,
+                None,
+                Some(&depends_on),
+                None,
+                1,
+            )
             .unwrap();
-        assert_eq!(count, 0, "unreferenced aged done task must reclaim");
+
+            sweep(&c).unwrap();
+            assert_task_survives(
+                &c,
+                dependency,
+                &format!("a live dependent's depends_on during {path} sweep"),
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_reclaims_aged_dependency_after_all_dependents_are_terminal() {
+        for terminal_status in ["done", "failed", "cancelled"] {
+            for (path, sweep) in reclaimable_task_sweepers() {
+                let (_d, mut c) = open_tmp_fk();
+                let dependency = aged_done_task(&mut c, "aged dependency");
+                let depends_on = format!("[{dependency}]");
+                let dependent = crate::tasks::create(
+                    &mut c,
+                    "boss",
+                    "terminal dependent",
+                    None,
+                    0,
+                    None,
+                    None,
+                    Some(&depends_on),
+                    None,
+                    1,
+                )
+                .unwrap();
+                c.execute(
+                    "UPDATE tasks SET status=?1 WHERE id=?2",
+                    params![terminal_status, dependent],
+                )
+                .unwrap();
+
+                sweep(&c).unwrap();
+                let count: i64 = c
+                    .query_row(
+                        "SELECT count(*) FROM tasks WHERE id=?1",
+                        [dependency],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    count, 0,
+                    "{path} sweep must reclaim dependency after {terminal_status} dependent"
+                );
+            }
+        }
     }
 
     #[test]
