@@ -2773,6 +2773,63 @@ async fn resolve_and_persist_continue_pr_target(
     Ok(target)
 }
 
+/// Validate the narrow recovery case where a re-claimed task still owns the
+/// branch that heads its daemon-created PR. `refs.pr` is not continuation
+/// authority by itself: the live target must also prove that it is the exact
+/// reserved branch before a worker slot may retain that PR identity.
+fn validate_reclaimed_reserved_pr_target(
+    target: &PrTarget,
+    expected_pr: i64,
+    base_branch: &str,
+    reserved_branch: &str,
+) -> std::result::Result<(), String> {
+    validate_continue_pr_target(target, expected_pr, base_branch)?;
+    if target.head_ref != reserved_branch {
+        return Err(format!(
+            "recorded PR #{expected_pr} heads {}, not reserved task branch {reserved_branch}",
+            target.head_ref
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve the live target before the short baseline write. A historical
+/// `refs.pr` can be adopted only while it still names this task's exact
+/// reserved branch; validation or persistence failure deliberately leaves the
+/// caller on ordinary base-derived provisioning.
+async fn resolve_and_persist_reclaimed_reserved_pr_target(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    base_branch: &str,
+    reserved_branch: &str,
+) -> std::result::Result<PrTarget, String> {
+    // GitHub resolution is complete before the SQLite write transaction.
+    let target = resolve_publication_pr_target_with_program(
+        pr,
+        &config.repo_dir,
+        Some(&config.repo),
+        config
+            .pr_target_program
+            .as_deref()
+            .unwrap_or(Path::new("gh")),
+    )
+    .await?;
+    validate_reclaimed_reserved_pr_target(&target, pr, base_branch, reserved_branch)?;
+
+    let db_path = config.db_path.clone();
+    let persisted = target.clone();
+    let reserved_branch = reserved_branch.to_string();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        persist_reclaimed_reserved_pr_baseline(&mut conn, task_id, &reserved_branch, &persisted)
+    })
+    .await
+    .map_err(|error| format!("reclaimed reserved PR target persistence join failure: {error}"))?
+    .map_err(|error| format!("reclaimed reserved PR target persistence failed: {error}"))?;
+    Ok(target)
+}
+
 async fn resolve_and_persist_parked_rework_target(
     config: &ServeConfig,
     task_id: i64,
@@ -2926,6 +2983,92 @@ fn persist_continue_pr_baseline(
     target: &PrTarget,
 ) -> Result<()> {
     let tx = quorum_core::db::begin_immediate(conn)?;
+    if let Some(owner) = tasks::active_pr_owner_in(&tx, target.pr, Some(task_id))? {
+        return Err(QuorumError::Usage(format!(
+            "continue PR #{} is already owned by active task #{owner}",
+            target.pr
+        )));
+    }
+    if let Some(existing) = pr_targets::get(&tx, task_id, target.pr)? {
+        if existing.is_fork != target.is_fork
+            || existing.head_ref != target.head_ref
+            || existing.head_sha != target.head_sha
+        {
+            return Err(QuorumError::Usage(format!(
+                "continue PR #{} moved after its durable baseline (expected {} at {}, got {} at {})",
+                target.pr,
+                existing.head_ref,
+                existing.head_sha,
+                target.head_ref,
+                target.head_sha
+            )));
+        }
+        tx.commit()?;
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO pr_targets
+           (task_id, pr_number, head_ref, head_sha, is_fork, resolved_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        (
+            task_id,
+            target.pr,
+            &target.head_ref,
+            &target.head_sha,
+            target.is_fork as i64,
+            now_unix(),
+        ),
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Atomically recheck the mutable recovery evidence captured before GitHub
+/// resolution, then record the immutable target a worker slot will use. This
+/// is intentionally separate from `persist_continue_pr_baseline`: explicit
+/// `continue_pr` remains its existing immutable task-creation path.
+fn persist_reclaimed_reserved_pr_baseline(
+    conn: &mut quorum_core::Connection,
+    task_id: i64,
+    reserved_branch: &str,
+    target: &PrTarget,
+) -> Result<()> {
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    let task = tasks::get(&tx, task_id)?
+        .ok_or_else(|| QuorumError::Usage(format!("task #{task_id} no longer exists")))?;
+    if task.continue_pr.is_some() {
+        return Err(QuorumError::Usage(format!(
+            "task #{task_id} gained an explicit continue PR before reserved-branch recovery"
+        )));
+    }
+    if tasks::extract_pr_number(&task.refs) != Some(target.pr) {
+        return Err(QuorumError::Usage(format!(
+            "task #{task_id} recorded PR changed before reserved-branch recovery"
+        )));
+    }
+    if parked_rework_publication_intent(task.refs.as_deref())
+        .map_err(QuorumError::Usage)?
+        .is_some()
+    {
+        return Err(QuorumError::Usage(format!(
+            "task #{task_id} gained a parked rework publication before reserved-branch recovery"
+        )));
+    }
+    let current_reserved_branch: Option<String> = tx
+        .query_row(
+            "SELECT branch FROM task_branches WHERE task_id=?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if current_reserved_branch.as_deref() != Some(reserved_branch)
+        || target.head_ref != reserved_branch
+    {
+        return Err(QuorumError::Usage(format!(
+            "task #{task_id} reserved branch changed before PR #{} baseline persistence",
+            target.pr
+        )));
+    }
     if let Some(owner) = tasks::active_pr_owner_in(&tx, target.pr, Some(task_id))? {
         return Err(QuorumError::Usage(format!(
             "continue PR #{} is already owned by active task #{owner}",
@@ -22322,11 +22465,33 @@ async fn spawn_worker(
         agent_name, task.id, task.title
     ));
 
+    // Read a prior branch reservation once. It is both the normal re-claim
+    // allocation and the only branch a historical refs.pr may prove it owns.
+    let reserved_allocation: Option<(String, String)> = {
+        let allocation_db = db_path.clone();
+        let allocation_task = task.id;
+        tokio::task::spawn_blocking(move || -> Result<Option<(String, String)>> {
+            let conn = quorum_core::db::open(&allocation_db)?;
+            Ok(conn
+                .query_row(
+                    "SELECT branch,worktree FROM task_branches WHERE task_id=?1",
+                    [allocation_task],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?)
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("reserved allocation join: {e}")))??
+    };
+
     // A continuation assignment is bound to the live PR target resolved after
     // the atomic claim. Explicit --continue-pr remains authoritative. A
     // parked-rework retry may recover the same authority only from a complete
     // daemon publication lease; it must never adopt a mutable refs.pr value or
-    // fall through to base-derived provisioning once that lease exists.
+    // fall through to base-derived provisioning once that lease exists. The
+    // remaining re-claim case adopts refs.pr only when its live head is this
+    // task's reserved branch; otherwise normal base-derived provisioning
+    // remains the safe path.
     let (continue_target, parked_rework_continuation) = if let Some(pr) = task.continue_pr {
         match resolve_and_persist_continue_pr_target(config, task.id, pr, effective_base_branch)
             .await
@@ -22384,7 +22549,32 @@ async fn spawn_worker(
                     }
                 }
             }
-            None => (None, false),
+            None => {
+                let recorded_pr = tasks::extract_pr_number(&task.refs);
+                match (recorded_pr, reserved_allocation.as_ref()) {
+                    (Some(pr), Some((reserved_branch, _))) => {
+                        match resolve_and_persist_reclaimed_reserved_pr_target(
+                            config,
+                            task.id,
+                            pr,
+                            effective_base_branch,
+                            reserved_branch,
+                        )
+                        .await
+                        {
+                            Ok(target) => (Some(target), false),
+                            Err(error) => {
+                                log(&format!(
+                                    "task #{} recorded PR #{pr} is not adopted for reserved branch {reserved_branch}: {error}",
+                                    task.id
+                                ));
+                                (None, false)
+                            }
+                        }
+                    }
+                    _ => (None, false),
+                }
+            }
         }
     };
     let continuation_pr = continue_target.as_ref().map(|target| target.pr);
@@ -22398,29 +22588,10 @@ async fn spawn_worker(
     // forking a duplicate PR (#340).
     let branch_agent = task.author.as_deref().unwrap_or(&agent_name);
     let session_id = agent::new_session_id();
-    let reserved_allocation = if continue_target.is_none() {
-        let allocation_db = db_path.clone();
-        let allocation_task = task.id;
-        tokio::task::spawn_blocking(move || {
-            let conn = quorum_core::db::open(&allocation_db)?;
-            let allocation = conn
-                .query_row(
-                    "SELECT branch,worktree FROM task_branches WHERE task_id=?1",
-                    [allocation_task],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()?;
-            Ok::<_, QuorumError>(allocation)
-        })
-        .await
-        .map_err(|e| QuorumError::Io(format!("reserved allocation join: {e}")))??
-    } else {
-        None
-    };
-    let branch = if let Some((branch, _)) = &reserved_allocation {
-        branch.clone()
-    } else if continue_target.is_some() {
+    let branch = if continue_target.is_some() {
         reviewer::remediation_branch(&agent_name, task.id)
+    } else if let Some((branch, _)) = &reserved_allocation {
+        branch.clone()
     } else {
         format!("daemon/{}-t{}", branch_agent.to_lowercase(), task.id)
     };
@@ -42906,6 +43077,311 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(validate_continue_pr_target(&target, 19, "main")
             .unwrap_err()
             .contains("identity changed"));
+    }
+
+    #[test]
+    fn reclaimed_reserved_pr_target_requires_the_exact_reserved_head_branch() {
+        let target = PrTarget {
+            pr: 20,
+            head_ref: "daemon/reclaimed-t20".into(),
+            head_sha: "abc123".into(),
+            is_fork: false,
+            base_ref: Some("main".into()),
+            state: Some("OPEN".into()),
+        };
+        validate_reclaimed_reserved_pr_target(&target, 20, "main", "daemon/reclaimed-t20")
+            .expect("an open same-repo PR on the reserved branch is adoptable");
+        let error = validate_reclaimed_reserved_pr_target(&target, 20, "main", "daemon/other-t20")
+            .expect_err("refs.pr cannot be adopted from a different head branch");
+        assert!(error.contains("not reserved task branch"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reclaimed_reserved_pr_resolver_binds_only_validated_slot_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reclaimed-reserved.db");
+        let pr = 820;
+        let branch = "daemon/reclaimed-t820";
+        let head_sha = "8208208208208208208208208208208208208208";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "reclaimed reserved delivery",
+                None,
+                0,
+                None,
+                Some(
+                    &serde_json::json!({
+                        "pr": pr,
+                        "cx_est": 3,
+                        "cx_size": "M",
+                        "cx_ready": true,
+                        "cx_not_ready_reason": null,
+                        "cx_by": "test:v2"
+                    })
+                    .to_string(),
+                ),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            assert!(quorum_core::branches::record_exact_allocation(
+                &mut conn,
+                task_id,
+                branch,
+                &dir.path().join("reserved-worktree").to_string_lossy(),
+                "former-worker",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                now_unix(),
+            )
+            .unwrap());
+            task_id
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-reclaimed-reserved",
+            &open_pr_target_json(branch, head_sha, "main"),
+        ));
+
+        let target =
+            resolve_and_persist_reclaimed_reserved_pr_target(&config, task_id, pr, "main", branch)
+                .await
+                .expect("matching live refs.pr target must bind the reclaimed worker");
+        assert_eq!(target.pr, pr);
+        assert_eq!(target.head_ref, branch);
+
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let stored = pr_targets::get(&conn, task_id, pr)
+            .unwrap()
+            .expect("validated target must be durable before worker launch");
+        assert_eq!(stored.head_ref, branch);
+        assert_eq!(stored.head_sha, head_sha);
+        assert_eq!(
+            worker_publication_pr(Some(pr), Some(target.pr)).unwrap(),
+            Some(pr),
+            "an explicit matching --pr confirms the spawn binding"
+        );
+        assert_eq!(
+            worker_publication_pr(None, Some(target.pr)).unwrap(),
+            Some(pr),
+            "an omitted --pr backfills from the spawn binding"
+        );
+        assert!(worker_publication_pr(Some(pr + 1), Some(target.pr)).is_err());
+
+        let worker = "reclaimed-worker";
+        tasks::claim(
+            &mut conn,
+            worker,
+            Some(task_id),
+            &[],
+            tasks::DEFAULT_LEASE_TTL_SECS,
+            now_unix(),
+        )
+        .unwrap()
+        .expect("the re-claimed task must enter working before its completion");
+        tasks::apply_event(
+            &mut conn,
+            worker,
+            task_id,
+            &worker_done_event(0, pr),
+            now_unix(),
+        )
+        .unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "in-review",
+            "a matching bound PR reaches review rather than the initial-PR path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reclaimed_reserved_pr_resolver_never_binds_a_mismatched_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reclaimed-mismatched-head.db");
+        let pr = 821;
+        let reserved_branch = "daemon/reclaimed-t821";
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "reclaimed mismatched head",
+                None,
+                0,
+                None,
+                Some(&format!(
+                    r#"{{"pr":{pr},"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}}"#
+                )),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            assert!(quorum_core::branches::record_exact_allocation(
+                &mut conn,
+                task_id,
+                reserved_branch,
+                &dir.path().join("reserved-worktree").to_string_lossy(),
+                "former-worker",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                now_unix(),
+            )
+            .unwrap());
+            task_id
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-reclaimed-mismatched-head",
+            &open_pr_target_json(
+                "daemon/some-other-task",
+                "8218218218218218218218218218218218218218",
+                "main",
+            ),
+        ));
+
+        let error = resolve_and_persist_reclaimed_reserved_pr_target(
+            &config,
+            task_id,
+            pr,
+            "main",
+            reserved_branch,
+        )
+        .await
+        .expect_err("a live PR on another branch must fall through without binding");
+        assert!(error.contains("not reserved task branch"));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert!(
+            pr_targets::get(&conn, task_id, pr).unwrap().is_none(),
+            "a rejected refs.pr must never create the durable worker PR binding"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_worker_records_reclaimed_reserved_pr_in_slot_and_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        let git = |args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        git(&["commit", "--allow-empty", "-qm", "base"]);
+        git(&["branch", "-M", "main"]);
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "main"]);
+        let branch = "daemon/reclaimed-t822";
+        git(&["checkout", "-q", "-b", branch]);
+        git(&["commit", "--allow-empty", "-qm", "reclaimed delivery"]);
+        git(&["push", "-q", "-u", "origin", branch]);
+        let head_sha = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "main"]);
+
+        let db_path = dir.path().join("reclaimed-spawn.db");
+        let pr = 822;
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "spawn reclaimed reserved delivery",
+                None,
+                0,
+                None,
+                Some(&format!(
+                    r#"{{"pr":{pr},"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}}"#
+                )),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            assert!(quorum_core::branches::record_exact_allocation(
+                &mut conn,
+                task_id,
+                branch,
+                &dir.path().join("prior-worktree").to_string_lossy(),
+                "former-worker",
+                &head_sha,
+                now_unix(),
+            )
+            .unwrap());
+            task_id
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo.clone());
+        config.worktree_base = dir.path().join("worktrees");
+        config.agent_bin = Some("true".into());
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-reclaimed-spawn",
+            &open_pr_target_json(branch, &head_sha, "main"),
+        ));
+        let mut names = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+        assert!(
+            spawn_worker(
+                &config,
+                &WorktreeManager::new(),
+                &mut names,
+                &mut workers,
+                &mut poison,
+                &mut skips,
+                &mut roster,
+            )
+            .await
+            .unwrap(),
+            "a matching reserved PR must be bound during the real spawn path"
+        );
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].task_id, task_id);
+        assert_eq!(workers[0].pr, Some(pr));
+        assert_eq!(workers[0].remote_branch, branch);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let journal_entry = journal::list_in_flight(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.task_id == Some(task_id))
+            .expect("spawned worker must have a durable journal entry");
+        assert_eq!(journal_entry.pr, Some(pr));
+        assert_eq!(journal_entry.branch.as_deref(), Some(branch));
+        assert_eq!(
+            pr_targets::get(&conn, task_id, pr)
+                .unwrap()
+                .unwrap()
+                .head_ref,
+            branch
+        );
+        drop(conn);
+        workers.pop().unwrap().kill_and_reap().await;
     }
 
     #[test]
