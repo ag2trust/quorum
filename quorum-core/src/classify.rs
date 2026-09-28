@@ -1,7 +1,6 @@
 //! Task classifier — authoritative complexity, execution size, readiness, and
 //! duplicate hints.  A complete classification gates worker dispatch.
 
-use crate::complexity;
 use crate::db::begin_immediate;
 use crate::error::Result;
 use crate::risk::{RiskFlag, MAX_RISK_EVIDENCE_BYTES, MAX_RISK_FLAGS};
@@ -759,16 +758,10 @@ pub fn build_prompt(
     tasks: &[TaskForClassification],
     dup_context: &[TaskForClassification],
 ) -> String {
-    build_prompt_with_recommendations(
-        tasks,
-        dup_context,
-        &complexity::recommendation_lines(complexity::RecommendationProvider::Claude),
-    )
+    build_prompt_with_recommendations(tasks, dup_context, "")
 }
 
-/// Build the classifier prompt with the active provider's routing guidance.
-/// Recommendations describe Quorum's operational policy only; they do not
-/// alter the classifier's required complexity-only response.
+/// Build the classifier prompt with optional routing guidance.
 pub fn build_prompt_with_recommendations(
     tasks: &[TaskForClassification],
     dup_context: &[TaskForClassification],
@@ -1149,16 +1142,13 @@ mod tests {
     }
 
     #[test]
-    fn provider_specific_prompt_contains_only_its_routing_ladder() {
-        let prompt = build_prompt_with_recommendations(
-            &[],
-            &[],
-            &crate::complexity::recommendation_lines(
-                crate::complexity::RecommendationProvider::Codex,
-            ),
-        );
-        assert!(prompt.contains("gpt-5.6-sol / high"));
-        assert!(!prompt.contains("claude-opus-4-8"));
+    fn backfill_prompt_matches_daemon_without_model_recommendations() {
+        let backfill_prompt = build_prompt(&[], &[]);
+        let daemon_prompt = build_prompt_with_recommendations(&[], &[], "");
+
+        assert_eq!(backfill_prompt, daemon_prompt);
+        assert!(!backfill_prompt.contains("claude-opus-"));
+        assert!(!backfill_prompt.contains("gpt-5.6-"));
     }
 
     #[test]
@@ -2377,9 +2367,7 @@ mod tests {
 
     #[test]
     fn classifier_prompt_contains_shared_rubric_descriptions() {
-        let rubric = classifier_rubric(&complexity::recommendation_lines(
-            complexity::RecommendationProvider::Claude,
-        ));
+        let rubric = classifier_rubric("");
         for (level, label, desc, _time) in &crate::complexity::RUBRIC {
             assert!(
                 rubric.contains(&format!("{level}: {label}")) && rubric.contains(*desc),
@@ -2390,9 +2378,7 @@ mod tests {
 
     #[test]
     fn classifier_prompt_calibrates_complexity_and_size_as_orthogonal_agent_dimensions() {
-        let rubric = classifier_rubric(&complexity::recommendation_lines(
-            complexity::RecommendationProvider::Claude,
-        ));
+        let rubric = classifier_rubric("");
         assert!(rubric.contains("execution surface for one managed AI coding agent"));
         assert!(rubric.contains("Do not estimate human time or translate from human project sizes"));
         assert!(rubric
