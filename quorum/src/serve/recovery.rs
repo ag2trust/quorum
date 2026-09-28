@@ -570,7 +570,13 @@ async fn verify_dormant_worktree(
         .map_err(|error| invalid(format!("worktree base is unavailable: {error}")))?;
     let canonical_worktree = std::fs::canonicalize(&worktree)
         .map_err(|error| invalid(format!("worktree is unavailable: {error}")))?;
-    if canonical_worktree.parent() != Some(canonical_base.as_path()) {
+    // A parked branch-sync judgment worker lives in the kept sync worktree,
+    // which sits in the daemon's sibling namespace rather than worktree_base.
+    let canonical_sync_root = std::fs::canonicalize(super::branch_sync_worktree_root(config)).ok();
+    let parent = canonical_worktree.parent();
+    if parent != Some(canonical_base.as_path())
+        && (canonical_sync_root.is_none() || parent != canonical_sync_root.as_deref())
+    {
         return Err(invalid(format!(
             "worktree {} is outside the managed worktree base",
             worktree.display()
@@ -1377,25 +1383,27 @@ mod tests {
     }
 
     fn dormant_fixture() -> DormantFixture {
+        dormant_fixture_at("worktrees/Dormant-t1", "daemon/dormant-t1")
+    }
+
+    /// Dormant worker fixture whose worktree is `worktree_rel` under the
+    /// fixture root (the managed base is always `<root>/worktrees`).
+    fn dormant_fixture_at(worktree_rel: &str, branch: &str) -> DormantFixture {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let worktree_base = dir.path().join("worktrees");
-        let worktree = worktree_base.join("Dormant-t1");
+        let worktree = dir.path().join(worktree_rel);
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&worktree_base).unwrap();
+        std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
         run_git(&repo, &["init", "-b", "main"]);
         run_git(&repo, &["config", "user.email", "test@example.com"]);
         run_git(&repo, &["config", "user.name", "Test"]);
         run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
-        run_git(&repo, &["branch", "daemon/dormant-t1"]);
+        run_git(&repo, &["branch", branch]);
         run_git(
             &repo,
-            &[
-                "worktree",
-                "add",
-                worktree.to_str().unwrap(),
-                "daemon/dormant-t1",
-            ],
+            &["worktree", "add", worktree.to_str().unwrap(), branch],
         );
 
         let db_path = dir.path().join("quorum.db");
@@ -1441,8 +1449,8 @@ mod tests {
         tasks::update_refs_daemon(&mut conn, task_id, &refs.to_string(), now + 2).unwrap();
         conn.execute(
             "INSERT INTO task_branches(task_id,branch,worktree,allocated_by,allocated_at)
-             VALUES (?1,'daemon/dormant-t1',?2,'Dormant',?3)",
-            rusqlite::params![task_id, worktree.to_string_lossy(), now],
+             VALUES (?1,?2,?3,'Dormant',?4)",
+            rusqlite::params![task_id, branch, worktree.to_string_lossy(), now],
         )
         .unwrap();
         let run_id = quorum_core::agent_runs::insert(
@@ -1493,7 +1501,7 @@ mod tests {
                 task_id: Some(task_id),
                 session_id: "session-dormant".into(),
                 worktree: Some(worktree.to_string_lossy().into_owned()),
-                branch: Some("daemon/dormant-t1".into()),
+                branch: Some(branch.into()),
                 phase: "awaiting-review".into(),
                 cost_tokens: 123,
                 agent_state: None,
@@ -1504,7 +1512,7 @@ mod tests {
                 rework_count: 0,
                 provider: Some("codex".into()),
                 continuation_id: Some("thread-dormant".into()),
-                local_branch: Some("daemon/dormant-t1".into()),
+                local_branch: Some(branch.into()),
             },
         )
         .unwrap();
@@ -1733,6 +1741,62 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "recovery duplicated {table}");
         }
+    }
+
+    #[tokio::test]
+    async fn restart_reconstructs_dormant_branch_sync_judgment_worker() {
+        let fixture = dormant_fixture_at("branch-sync-worktrees/7", "sync/7");
+        let repo = &fixture.config.repo_dir;
+        let git = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        // Kept sync merge: both sides edited f.txt, leaving MERGE_HEAD and an
+        // unmerged path in the adopted worktree.
+        std::fs::write(repo.join("f.txt"), "source\n").unwrap();
+        run_git(repo, &["add", "f.txt"]);
+        run_git(repo, &["commit", "-m", "source"]);
+        std::fs::write(fixture.worktree.join("f.txt"), "target\n").unwrap();
+        run_git(&fixture.worktree, &["add", "f.txt"]);
+        run_git(&fixture.worktree, &["commit", "-m", "target"]);
+        assert!(!git(&fixture.worktree, &["merge", "main"]).status.success());
+        let merge_head = || {
+            let output = git(&fixture.worktree, &["rev-parse", "--verify", "MERGE_HEAD"]);
+            assert!(output.status.success(), "MERGE_HEAD must survive recovery");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let before = merge_head();
+
+        let wt_mgr = WorktreeManager::new();
+        let mut names = super::super::names::Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        recover(
+            &fixture.config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut roster,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].task_id, fixture.task_id);
+        assert_eq!(workers[0].worktree_path, fixture.worktree);
+        assert!(matches!(workers[0].proc, SlotProcess::Dormant { .. }));
+        assert_eq!(merge_head(), before);
+        let unmerged = git(
+            &fixture.worktree,
+            &["diff", "--name-only", "--diff-filter=U"],
+        );
+        assert_eq!(String::from_utf8(unmerged.stdout).unwrap(), "f.txt\n");
+        let branch = git(repo, &["rev-parse", "--verify", "refs/heads/sync/7"]);
+        assert!(branch.status.success(), "sync/7 must survive recovery");
     }
 
     #[tokio::test]

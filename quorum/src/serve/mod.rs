@@ -22206,6 +22206,101 @@ async fn verify_dependency_base_before_allocation(
     Ok(DependencyBaseAdmission::Deferred)
 }
 
+/// The kept branch-sync merge a conflict judgment worker adopts.
+#[derive(Debug)]
+struct BranchSyncAdoption {
+    branch: String,
+    worktree: PathBuf,
+    target_sha: String,
+}
+
+/// Daemon namespace for kept sync merges. Must match
+/// `branch_sync::sync_worktree`: task GC sweeps only direct children of
+/// `worktree_base`, so this sibling keeps MERGE_HEAD alive until adoption.
+fn branch_sync_worktree_path(config: &ServeConfig, sync_id: i64) -> PathBuf {
+    branch_sync_worktree_root(config).join(sync_id.to_string())
+}
+
+fn branch_sync_worktree_root(config: &ServeConfig) -> PathBuf {
+    config
+        .worktree_base
+        .parent()
+        .unwrap_or(config.worktree_base.as_path())
+        .join("branch-sync-worktrees")
+}
+
+/// Release a worker slot's worktree and local branch. An adopted kept sync
+/// merge is owned by the branch-sync reconciler, not the slot: removing it
+/// would erase MERGE_HEAD and delete `sync/<id>`, so every retry of the
+/// judgment task would fail adoption.
+async fn release_worker_worktree(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    worktree: &Path,
+    branch: &str,
+    delete_branch: bool,
+) {
+    if worktree.starts_with(branch_sync_worktree_root(config)) {
+        log(&format!(
+            "preserving adopted branch-sync worktree {} (branch {branch})",
+            worktree.display()
+        ));
+        return;
+    }
+    wt_mgr.remove(&config.repo_dir, worktree).await.ok();
+    if delete_branch {
+        wt_mgr.delete_branch(&config.repo_dir, branch).await;
+    }
+}
+
+/// Resolve a task's `branch_sync` ref to the kept sync merge it must adopt.
+/// Absent ref → ordinary provisioning. A malformed ref, or a row that is
+/// missing, inactive, bound to another task, or lacks its pinned branch,
+/// is an error so the caller fails closed.
+async fn resolve_branch_sync_adoption(
+    config: &ServeConfig,
+    task_id: i64,
+    refs: Option<&str>,
+) -> std::result::Result<Option<BranchSyncAdoption>, String> {
+    let Some(value) = refs
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|refs| refs.get("branch_sync").cloned())
+    else {
+        return Ok(None);
+    };
+    let sync_id = value
+        .as_i64()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| format!("invalid branch_sync ref {value}"))?;
+    let db_path = config.db_path.clone();
+    let sync = tokio::task::spawn_blocking(move || {
+        let conn = quorum_core::db::open(&db_path)?;
+        quorum_core::branch_sync::get(&conn, sync_id)
+    })
+    .await
+    .map_err(|error| format!("branch sync adoption lookup join: {error}"))?
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| format!("branch sync #{sync_id} does not exist"))?;
+    if !sync.active || sync.task_id != Some(task_id) {
+        return Err(format!(
+            "branch sync #{sync_id} is not an active row bound to task #{task_id}"
+        ));
+    }
+    let branch = sync
+        .sync_branch
+        .filter(|branch| !branch.is_empty())
+        .ok_or_else(|| format!("branch sync #{sync_id} is missing sync_branch"))?;
+    let target_sha = sync
+        .target_sha
+        .filter(|sha| !sha.is_empty())
+        .ok_or_else(|| format!("branch sync #{sync_id} is missing target_sha"))?;
+    Ok(Some(BranchSyncAdoption {
+        branch,
+        worktree: branch_sync_worktree_path(config, sync_id),
+        target_sha,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_worker(
     config: &ServeConfig,
@@ -22404,6 +22499,28 @@ async fn spawn_worker(
     };
     let effective_base_branch = task_target.unwrap_or(&config.base_branch);
 
+    // A branch-sync conflict judgment task never gets a fresh branch: it
+    // adopts the kept `sync/<id>` worktree whose MERGE_HEAD it must resolve.
+    // A malformed or unbound `branch_sync` ref fails closed instead of
+    // falling through to base-derived provisioning.
+    let sync_adoption =
+        match resolve_branch_sync_adoption(config, task.id, task.refs.as_deref()).await {
+            Ok(adoption) => adoption,
+            Err(error) => {
+                let reason = format!("branch sync judgment provisioning rejected: {error}");
+                persist_provisioning_failure(&db_path, task.id, &reason).await;
+                park_task(
+                    &db_path,
+                    task.id,
+                    &reason,
+                    if retrying_rework { "rework" } else { "open" },
+                )
+                .await;
+                guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
+                return Ok(false);
+            }
+        };
+
     // Dependency completion alone is not enough to cut a child branch: GitHub
     // may report a merged PR before its base ref reaches this clone. Fetch and
     // prove each recorded merge commit before any branch/provenance/worktree
@@ -22484,7 +22601,9 @@ async fn spawn_worker(
     // remaining re-claim case adopts refs.pr only when its live head is this
     // task's reserved branch; otherwise normal base-derived provisioning
     // remains the safe path.
-    let (continue_target, parked_rework_continuation) = if let Some(pr) = task.continue_pr {
+    let (continue_target, parked_rework_continuation) = if sync_adoption.is_some() {
+        (None, false)
+    } else if let Some(pr) = task.continue_pr {
         match resolve_and_persist_continue_pr_target(config, task.id, pr, effective_base_branch)
             .await
         {
@@ -22582,6 +22701,8 @@ async fn spawn_worker(
     let session_id = agent::new_session_id();
     let branch = if continue_target.is_some() {
         reviewer::remediation_branch(&agent_name, task.id)
+    } else if let Some(adoption) = &sync_adoption {
+        adoption.branch.clone()
     } else if let Some((branch, _)) = &reserved_allocation {
         branch.clone()
     } else {
@@ -22591,9 +22712,14 @@ async fn spawn_worker(
         .as_ref()
         .map(|target| target.head_ref.clone())
         .unwrap_or_else(|| branch.clone());
-    let wt_path = reserved_allocation
+    let wt_path = sync_adoption
         .as_ref()
-        .map(|(_, path)| PathBuf::from(path))
+        .map(|adoption| adoption.worktree.clone())
+        .or_else(|| {
+            reserved_allocation
+                .as_ref()
+                .map(|(_, path)| PathBuf::from(path))
+        })
         .unwrap_or_else(|| {
             config
                 .worktree_base
@@ -22663,9 +22789,12 @@ async fn spawn_worker(
                 }
             }
         }
-        let resolved_provenance = match verified_dependency_base {
-            Some(base_sha) => base_sha,
-            None => {
+        let resolved_provenance = match (verified_dependency_base, &sync_adoption) {
+            (Some(base_sha), _) => base_sha,
+            // The kept sync branch was cut at the row's pinned target; the
+            // live target tip may already have advanced past it.
+            (None, Some(adoption)) => adoption.target_sha.clone(),
+            (None, None) => {
                 let base_ref = format!("origin/{effective_base_branch}");
                 match wt_mgr.resolve_ref_sha(worker_repo_dir, &base_ref).await {
                     Ok(sha) => sha,
@@ -22737,6 +22866,11 @@ async fn spawn_worker(
             let context = continuation_worker_context(target, effective_base_branch, base_merge);
             (path, Some(context))
         })
+    } else if sync_adoption.is_some() {
+        wt_mgr
+            .adopt_sync_worktree(worker_repo_dir, &wt_path, &branch)
+            .await
+            .map(|path| (path, None))
     } else {
         wt_mgr
             .provision(
@@ -22808,8 +22942,11 @@ async fn spawn_worker(
         } else {
             release_task(&db_path, &agent_name, task.id).await;
         }
-        wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
-        wt_mgr.delete_branch(worker_repo_dir, &branch).await;
+        // The kept sync merge is the judgment's only copy of MERGE_HEAD.
+        if sync_adoption.is_none() {
+            wt_mgr.remove(worker_repo_dir, &wt_path).await.ok();
+            wt_mgr.delete_branch(worker_repo_dir, &branch).await;
+        }
         guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
         return Ok(false);
     }
@@ -22951,8 +23088,10 @@ async fn spawn_worker(
             poison_task(&db_path, &agent_name, task.id, MAX_POISON_STRIKES, None).await;
             WorkerNameReleaseExpectation::Released
         };
-        wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
-        wt_mgr.delete_branch(&config.repo_dir, &branch).await;
+        if sync_adoption.is_none() {
+            wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
+            wt_mgr.delete_branch(&config.repo_dir, &branch).await;
+        }
         guarded_worker_name_release_with_expectation(
             &db_path,
             name_pool,
@@ -25809,11 +25948,14 @@ async fn cleanup_slot_inner(
     .await
     .ok();
 
-    let repo_dir = &config.repo_dir;
-    wt_mgr.remove(repo_dir, &state.worktree_path).await.ok();
-    if delete_branch {
-        wt_mgr.delete_branch(repo_dir, &state.branch).await;
-    }
+    release_worker_worktree(
+        config,
+        wt_mgr,
+        &state.worktree_path,
+        &state.branch,
+        delete_branch,
+    )
+    .await;
 
     guarded_worker_name_release_with_expectation(
         &config.db_path,
@@ -25924,9 +26066,7 @@ async fn teardown_worker_with_body(
         .ok();
     }
 
-    let repo_dir = &config.repo_dir;
-    wt_mgr.remove(repo_dir, &state.worktree_path).await.ok();
-    wt_mgr.delete_branch(repo_dir, &state.branch).await;
+    release_worker_worktree(config, wt_mgr, &state.worktree_path, &state.branch, true).await;
 
     guarded_worker_name_release(&config.db_path, name_pool, &state.agent_name, state.task_id).await;
     log(&format!("worker {} torn down", state.agent_name));
@@ -27925,6 +28065,215 @@ mod tests {
             grok: Default::default(),
             pr_target_program: None,
         }
+    }
+
+    fn sync_fixture_git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.email=test@test.com", "-c", "user.name=Test"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn branch_sync_judgment_worker_adopts_kept_conflicted_sync_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("remote.git");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        sync_fixture_git(tmp.path(), &["init", "--bare", &bare.to_string_lossy()]);
+        sync_fixture_git(&repo, &["init", "-b", "main"]);
+        // The daemon's sync merge runs without `-c` overrides; CI runners have
+        // no global identity, so the repo (and its worktrees) must carry one.
+        sync_fixture_git(&repo, &["config", "user.email", "test@test.com"]);
+        sync_fixture_git(&repo, &["config", "user.name", "Test"]);
+        sync_fixture_git(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        sync_fixture_git(&repo, &["add", "shared.txt"]);
+        sync_fixture_git(&repo, &["commit", "-m", "base"]);
+        sync_fixture_git(&repo, &["checkout", "-b", "develop"]);
+        std::fs::write(repo.join("shared.txt"), "source\n").unwrap();
+        sync_fixture_git(&repo, &["commit", "-am", "source change"]);
+        sync_fixture_git(&repo, &["checkout", "main"]);
+        std::fs::write(repo.join("shared.txt"), "target\n").unwrap();
+        sync_fixture_git(&repo, &["commit", "-am", "target change"]);
+        sync_fixture_git(&repo, &["push", "origin", "main", "develop"]);
+        let source_tip = sync_fixture_git(&repo, &["rev-parse", "develop"]);
+        let target_tip = sync_fixture_git(&repo, &["rev-parse", "main"]);
+
+        let db_path = tmp.path().join("quorum.db");
+        let mut config = pre_review_checks_config(db_path.clone(), repo.clone());
+        config.worktree_base = tmp.path().join("worktrees");
+        std::fs::create_dir_all(&config.worktree_base).unwrap();
+        let sync_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            match quorum_core::branch_sync::request(&mut conn, "develop", "main", "owner", 1)
+                .unwrap()
+            {
+                quorum_core::branch_sync::RequestOutcome::Requested(row) => row.id,
+                quorum_core::branch_sync::RequestOutcome::AlreadyActive(_) => unreachable!(),
+            }
+        };
+
+        // Drive the real daemon path (requested → pinned → conflict) so the
+        // kept worktree lands wherever branch_sync.rs actually places it.
+        let mgr = WorktreeManager::new();
+        let mut checks = branch_sync::BranchSyncChecks::default();
+        for _ in 0..2 {
+            branch_sync::reconcile_one(&config, &mgr, &mut checks)
+                .await
+                .unwrap();
+        }
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let row = quorum_core::branch_sync::get(&conn, sync_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.phase, "conflict", "{:?}", row.last_error);
+        drop(conn);
+
+        // Ordinary task GC between conflict and adoption must not reap it.
+        let removed = mgr.gc_orphaned(&repo, &config.worktree_base, &[]).await;
+        assert!(removed.is_empty(), "GC reaped {removed:?}");
+
+        branch_sync::intake_conflict_judgment_task(&config, &mgr)
+            .await
+            .unwrap();
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task_id = quorum_core::branch_sync::get(&conn, sync_id)
+            .unwrap()
+            .unwrap()
+            .task_id
+            .expect("judgment task bound");
+        let refs: Option<String> = conn
+            .query_row("SELECT refs FROM tasks WHERE id=?1", [task_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        drop(conn);
+
+        let adoption = resolve_branch_sync_adoption(&config, task_id, refs.as_deref())
+            .await
+            .unwrap()
+            .expect("branch_sync ref routes to adoption");
+        assert_eq!(adoption.branch, format!("sync/{sync_id}"));
+        assert_eq!(
+            adoption.worktree,
+            tmp.path()
+                .join("branch-sync-worktrees")
+                .join(sync_id.to_string())
+        );
+        assert_eq!(adoption.target_sha, target_tip);
+
+        // Advance the remote target: adoption must not re-cut from base.
+        std::fs::write(repo.join("later.txt"), "later\n").unwrap();
+        sync_fixture_git(&repo, &["add", "later.txt"]);
+        sync_fixture_git(&repo, &["commit", "-m", "later target"]);
+        sync_fixture_git(&repo, &["push", "origin", "main"]);
+        sync_fixture_git(&repo, &["fetch", "origin"]);
+
+        let path = mgr
+            .adopt_sync_worktree(&repo, &adoption.worktree, &adoption.branch)
+            .await
+            .unwrap();
+        assert_eq!(path, adoption.worktree);
+        assert_eq!(sync_fixture_git(&path, &["rev-parse", "HEAD"]), target_tip);
+        assert_eq!(
+            sync_fixture_git(&path, &["rev-parse", "--verify", "MERGE_HEAD"]),
+            source_tip
+        );
+        assert_eq!(
+            sync_fixture_git(&path, &["diff", "--name-only", "--diff-filter=U"]),
+            "shared.txt"
+        );
+
+        // Post-spawn teardown (crash/idle/failure cleanup, and shutdown reset
+        // to open) must leave the kept merge adoptable for the retry.
+        let adopted_slot = || {
+            let mut child = tokio::process::Command::new("true")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let mut slot = slot_with_process(runner::RunnerProc::Claude(
+                agent::AgentProc::from_parts(child, stdin, tokio::io::BufReader::new(stdout)),
+            ));
+            slot.task_id = task_id;
+            slot.worktree_path = adoption.worktree.clone();
+            slot.branch = adoption.branch.clone();
+            slot
+        };
+        let mut name_pool = Pool::new_generated();
+        cleanup_slot_inner(
+            &config,
+            &mgr,
+            &mut name_pool,
+            adopted_slot(),
+            None,
+            true,
+            "crashed",
+            None,
+        )
+        .await;
+        teardown_worker(&config, &mgr, &mut name_pool, adopted_slot(), "open").await;
+        assert!(
+            sync_fixture_git(&repo, &["branch", "--list", &adoption.branch])
+                .contains(&adoption.branch)
+        );
+        let path = mgr
+            .adopt_sync_worktree(&repo, &adoption.worktree, &adoption.branch)
+            .await
+            .unwrap();
+        assert_eq!(
+            sync_fixture_git(&path, &["rev-parse", "--verify", "MERGE_HEAD"]),
+            source_tip
+        );
+        assert_eq!(
+            sync_fixture_git(&path, &["diff", "--name-only", "--diff-filter=U"]),
+            "shared.txt"
+        );
+
+        // Authority: the row is bound to exactly this task; other refs fail closed.
+        assert!(
+            resolve_branch_sync_adoption(&config, task_id + 1, refs.as_deref())
+                .await
+                .is_err()
+        );
+        assert!(
+            resolve_branch_sync_adoption(&config, task_id, Some(r#"{"branch_sync":"x"}"#))
+                .await
+                .is_err()
+        );
+        assert!(resolve_branch_sync_adoption(&config, task_id, Some("{}"))
+            .await
+            .unwrap()
+            .is_none());
+
+        // A lost kept worktree is never silently recreated without MERGE_HEAD.
+        sync_fixture_git(
+            &repo,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &adoption.worktree.to_string_lossy(),
+            ],
+        );
+        let error = mgr
+            .adopt_sync_worktree(&repo, &adoption.worktree, &adoption.branch)
+            .await
+            .unwrap_err();
+        assert!(error.contains("refusing to recreate"), "{error}");
+        assert!(!adoption.worktree.exists());
     }
 
     #[test]
