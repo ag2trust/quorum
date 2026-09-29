@@ -19885,7 +19885,8 @@ enum GrokWorkerDeliveryGate {
 }
 
 /// Settle a Grok delivery the gate rejected: fail the worker's assignment
-/// back through `AgentFailed`, tear its slot down, and consume the Done row
+/// back through `AgentFailed` (or accept a same-transaction lapsed-lease
+/// reap), tear its slot down, and consume the Done row
 /// exactly once. If the lifecycle write fails, both the slot and the row are
 /// retained so the next tick retries the same settlement loudly.
 async fn settle_failed_grok_worker_delivery(
@@ -19903,16 +19904,17 @@ async fn settle_failed_grok_worker_delivery(
     log(&format!(
         "Grok worker {worker_name} delivery for task #{worker_task_id} failed before review: {reason}"
     ));
-    let failed = fire_event(
+    // Sweep-aware: a lapsed lease reaped in the same transaction settles the
+    // assignment; a plain `AgentFailed` would be rejected from `open`, roll
+    // the reap back, and replay this delivery every tick.
+    let settled = fail_worker_for_teardown(
         db_path,
         &worker_name,
         worker_task_id,
-        &Event::AgentFailed {
-            reason: format!("Grok submission rejected before review: {reason}"),
-        },
+        &format!("Grok submission rejected before review: {reason}"),
     )
     .await;
-    if failed.is_some() {
+    if settled {
         let worker = workers.remove(wi);
         cleanup_slot(
             config,
@@ -26174,10 +26176,11 @@ async fn cleanup_slot_inner(
     .await;
 }
 
-/// Fail a torn-down worker's task unless the write-path sweep in the same
-/// transaction already recovered it (lapsed lease). Genuine rejections keep
-/// the loud lifecycle diagnostic that `fire_event` records.
-async fn fail_worker_for_teardown(db_path: &Path, agent: &str, task_id: i64, reason: &str) {
+/// Fail a worker's task unless the write-path sweep in the same transaction
+/// already recovered it (lapsed lease). Returns true when the assignment is
+/// settled either way. Genuine rejections return false and keep the loud
+/// lifecycle diagnostic that `fire_event` records.
+async fn fail_worker_for_teardown(db_path: &Path, agent: &str, task_id: i64, reason: &str) -> bool {
     let p = db_path.to_path_buf();
     let actor = agent.to_string();
     let failure_reason = reason.to_string();
@@ -26200,11 +26203,13 @@ async fn fail_worker_for_teardown(db_path: &Path, agent: &str, task_id: i64, rea
                 transition.task.status,
                 names.join(", ")
             ));
+            true
         }
         Ok(Ok(tasks::WorkerTeardownFailure::AlreadyRecoveredBySweep)) => {
             log(&format!(
                 "lifecycle: task #{task_id} worker {agent} teardown — lapsed assignment already recovered by sweep; no second AgentFailed"
             ));
+            true
         }
         Ok(Err(error)) => {
             let message = error.to_string();
@@ -26212,6 +26217,7 @@ async fn fail_worker_for_teardown(db_path: &Path, agent: &str, task_id: i64, rea
                 "lifecycle: teardown AgentFailed failed for task #{task_id}: {message}"
             ));
             persist_lifecycle_diagnostic(db_path, agent, task_id, &event_debug, &message).await;
+            false
         }
         Err(error) => {
             let message = format!("join error: {error}");
@@ -26219,6 +26225,7 @@ async fn fail_worker_for_teardown(db_path: &Path, agent: &str, task_id: i64, rea
                 "lifecycle: teardown AgentFailed failed for task #{task_id}: {message}"
             ));
             persist_lifecycle_diagnostic(db_path, agent, task_id, &event_debug, &message).await;
+            false
         }
     }
 }
@@ -48022,6 +48029,66 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 .id,
             "pivot-session",
             "the retained durable continuation is never silently replaced"
+        );
+    }
+
+    /// A rejected delivery whose worker lease has lapsed must still settle:
+    /// the same-transaction sweep reap counts as the failure, the slot is torn
+    /// down, and the Done row is consumed once instead of replaying per tick.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_rejected_delivery_with_lapsed_lease_settles_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"cleat-session\"}'",
+        )
+        .await;
+        let mailbox_id = append_worker_done(&db_path, "Internal-grok", task_id, Some(189));
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let lapsed = conn
+                .execute(
+                    "UPDATE claims SET expires_at=?1 WHERE target=?2 AND active=1",
+                    rusqlite::params![now_unix() - 60, format!("task#{task_id}")],
+                )
+                .unwrap();
+            assert_eq!(lapsed, 1, "fixture must hold exactly one active task lease");
+        }
+        let mut workers = vec![slot];
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+
+        settle_failed_grok_worker_delivery(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            0,
+            mailbox_id,
+            "Grok emitted a duplicate or conflicting terminal session identity",
+        )
+        .await;
+
+        assert!(workers.is_empty(), "the rejected worker slot is torn down");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "open", "the lapsed-lease reap must commit");
+        assert_eq!(task.assignee, None);
+        assert_eq!(task.recovery_attempts, 1, "one recovery transition only");
+        assert_eq!(mailbox_consumption(&conn, mailbox_id), (1, 0));
+        assert!(
+            !mailbox::poll_unconsumed(&conn)
+                .unwrap()
+                .iter()
+                .any(|(id, _)| *id == mailbox_id),
+            "a consumed Done row cannot replay on a later tick"
+        );
+        assert_eq!(
+            errors_with_source(&conn, "lifecycle"),
+            0,
+            "no invalid-transition diagnostic"
         );
     }
 
