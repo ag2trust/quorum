@@ -4243,6 +4243,73 @@ pub fn dispose_managed_run_exit(
     dispose_managed_exit_inner(conn, role, agent, id, Some(run_id), reason, now)
 }
 
+/// Outcome of failing a torn-down worker's task.
+#[derive(Debug)]
+pub enum WorkerTeardownFailure {
+    /// `AgentFailed` was applied to the task's current status.
+    Failed(Box<TransitionResult>),
+    /// The write-path sweep in this same transaction already moved the task
+    /// out of the worker's `working`/`rework` assignment (normally a lapsed
+    /// lease reaped to `open`/`rework`, which also spends a recovery
+    /// attempt). A second `AgentFailed` would be an invalid double
+    /// transition, so the sweep's result is committed on its own.
+    AlreadyRecoveredBySweep,
+}
+
+/// Fail a worker's task during daemon teardown without double-transitioning
+/// a task the storage sweep already recovered.
+///
+/// `apply_event` sweeps inside its transaction *before* reading the task. For
+/// a worker whose lease lapsed (for example while the daemon was wedged and
+/// could not renew it), that sweep reaps `working` to `open`, the subsequent
+/// `AgentFailed` is rejected as a transition from `open`, and the rollback
+/// discards the reap as well. Here the pre-sweep assignment is read first in
+/// the same immediate transaction; if the sweep changed it, the sweep's
+/// recovery is committed and no event is applied. Every other status keeps
+/// the ordinary `AgentFailed` transition (and its loud rejection when
+/// genuinely invalid).
+pub fn fail_worker_for_teardown(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    reason: &str,
+    now: i64,
+) -> Result<WorkerTeardownFailure> {
+    let tx = begin_immediate(conn)?;
+    let read_assignment = |tx: &Transaction<'_>| -> Result<Option<(String, Option<String>)>> {
+        Ok(tx
+            .query_row(
+                "SELECT status, assignee FROM tasks WHERE id=?1",
+                params![id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?)
+    };
+    let before = read_assignment(&tx)?;
+    crate::sweep::sweep_on_write(&tx, now, crate::sweep::SWEEP_LIMIT)?;
+    let after = read_assignment(&tx)?;
+    let was_worker_assignment = before
+        .as_ref()
+        .is_some_and(|(status, _)| matches!(status.as_str(), "working" | "rework"));
+    if was_worker_assignment && before != after {
+        crate::agents::touch(&tx, agent, now)?;
+        tx.commit()?;
+        return Ok(WorkerTeardownFailure::AlreadyRecoveredBySweep);
+    }
+    apply_event_tx_with_deferred_sweep(
+        tx,
+        agent,
+        id,
+        &Event::AgentFailed {
+            reason: reason.to_string(),
+        },
+        now,
+        true,
+        |_| Ok(()),
+    )
+    .map(|transition| WorkerTeardownFailure::Failed(Box::new(transition)))
+}
+
 fn dispose_managed_exit_inner(
     conn: &mut Connection,
     role: ManagedRunRole,
@@ -4253,6 +4320,12 @@ fn dispose_managed_exit_inner(
     now: i64,
 ) -> Result<ManagedExitDisposition> {
     let tx = begin_immediate(conn)?;
+    // Sweep before classifying. `apply_event_tx` otherwise sweeps after the
+    // classification read, so a lapsed lease would be reaped to `open`
+    // inside this transaction and the `AgentFailed` below rejected as a
+    // transition from `open` (rolling the reap back with it). Classifying the
+    // post-sweep state treats a reaped run as no longer owning its phase.
+    crate::sweep::sweep_on_write(&tx, now, crate::sweep::SWEEP_LIMIT)?;
     let role_name = match role {
         ManagedRunRole::Worker => "worker",
         ManagedRunRole::Reviewer => "reviewer",
@@ -4285,7 +4358,7 @@ fn dispose_managed_exit_inner(
         ManagedExitClassification::ActiveWithoutOutcome => {}
     }
 
-    apply_event_tx(
+    apply_event_tx_with_deferred_sweep(
         tx,
         agent,
         id,
@@ -4293,6 +4366,7 @@ fn dispose_managed_exit_inner(
             reason: reason.to_string(),
         },
         now,
+        true,
         |tx| {
             if let Some(run_id) = run_id {
                 crate::capabilities::revoke_managed_run_tx(tx, run_id, agent, id, role_name, now)?;
