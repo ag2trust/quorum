@@ -10937,9 +10937,33 @@ async fn reconcile_merged_continuations(
 
 async fn tick_loop(
     config: &ServeConfig,
+    daemon_pid: i64,
+    daemon_instance: String,
+    writable_path_resolver: planner::WritablePathResolver,
+) -> Result<i32> {
+    // The daemon owns the doctor outside the loop body so no return — an
+    // explicit exit path or a propagated tick-loop error — can leave its
+    // process group running. The explicit exit paths reap it first; this is
+    // the reap-once backstop.
+    let mut doctor_slot: Option<doctor::DoctorSlot> = None;
+    let result = tick_loop_owning_doctor(
+        config,
+        daemon_pid,
+        daemon_instance,
+        writable_path_resolver,
+        &mut doctor_slot,
+    )
+    .await;
+    doctor::reap_doctor_slot(&config.db_path, &mut doctor_slot).await;
+    result
+}
+
+async fn tick_loop_owning_doctor(
+    config: &ServeConfig,
     _daemon_pid: i64,
     daemon_instance: String,
     writable_path_resolver: planner::WritablePathResolver,
+    doctor_slot: &mut Option<doctor::DoctorSlot>,
 ) -> Result<i32> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|e| QuorumError::Io(format!("failed to register SIGINT handler: {e}")))?;
@@ -11013,7 +11037,6 @@ async fn tick_loop(
     };
     let mut classifier_consec_errors: u32 = 0;
     let mut classifier_backoff_until: Option<std::time::Instant> = None;
-    let mut doctor_slot: Option<doctor::DoctorSlot> = None;
     let mut doctored_tasks: std::collections::HashSet<i64> = std::collections::HashSet::new();
     // Decomposition authority is always reconstructed before any recovery
     // pass that can complete, merge, reset, or provision task lifecycle.
@@ -11278,6 +11301,7 @@ async fn tick_loop(
         // Check if heartbeat task detected lock theft.
         if lock_stolen.load(std::sync::atomic::Ordering::SeqCst) {
             log("daemon lock stolen — tearing down and exiting");
+            doctor::reap_doctor_slot(&config.db_path, doctor_slot).await;
             if let Some(slot) = classifier_slot.take() {
                 reap_classifier_with_usage(&config.db_path, slot, None).await;
             }
@@ -11310,6 +11334,7 @@ async fn tick_loop(
             } else {
                 log("shutting down (signal, no in-flight agents)");
             }
+            doctor::reap_doctor_slot(&config.db_path, doctor_slot).await;
             if let Some(slot) = classifier_slot.take() {
                 reap_classifier_with_usage(&config.db_path, slot, None).await;
             }
@@ -11344,6 +11369,7 @@ async fn tick_loop(
         if let Some(ref sentinel) = config.exit_when_gone {
             if !sentinel.exists() {
                 log("exit-when-gone: sentinel disappeared — parent died, force shutdown");
+                doctor::reap_doctor_slot(&config.db_path, doctor_slot).await;
                 if let Some(slot) = classifier_slot.take() {
                     reap_classifier_with_usage(&config.db_path, slot, None).await;
                 }
@@ -11454,6 +11480,7 @@ async fn tick_loop(
                     "DRAIN: all agents finished source={source} sha={sha}; \
                      exit_code={exit} supervisor={supervisor_action}"
                 ));
+                doctor::reap_doctor_slot(&config.db_path, doctor_slot).await;
                 if let Some(slot) = classifier_slot.take() {
                     reap_classifier_with_usage(&config.db_path, slot, None).await;
                 }
@@ -11484,6 +11511,7 @@ async fn tick_loop(
                     workers.len(),
                     reviewers.len(),
                 ));
+                doctor::reap_doctor_slot(&config.db_path, doctor_slot).await;
                 if let Some(slot) = classifier_slot.take() {
                     reap_classifier_with_usage(&config.db_path, slot, None).await;
                 }
@@ -11600,7 +11628,7 @@ async fn tick_loop(
             &mut decomposition_coordinator,
             &mut classifier_consec_errors,
             &mut classifier_backoff_until,
-            &mut doctor_slot,
+            doctor_slot,
             &mut doctored_tasks,
             &signal_count,
         )
@@ -11618,6 +11646,7 @@ async fn tick_loop(
                     // each leader before relaunching work from journal recovery. We cannot
                     // gracefully teardown (that writes to the DB, which also fails against a
                     // too-new schema); just reap the processes and release their names.
+                    doctor::reap_doctor_slot(&config.db_path, doctor_slot).await;
                     if let Some(slot) = classifier_slot.take() {
                         reap_classifier_with_usage(&config.db_path, slot, None).await;
                     }
@@ -17467,9 +17496,9 @@ async fn tick(
     // 8a: Drain events from in-flight doctor.
     if let Some(slot) = doctor_slot.as_mut() {
         let exited = matches!(slot.proc.try_wait(), Ok(Some(_)));
+        let tid = slot.task_id;
 
-        if let Some(result) = doctor::drain_doctor_events(slot).await {
-            let tid = slot.task_id;
+        let finished = if let Some(result) = doctor::drain_doctor_events(slot).await {
             match result {
                 doctor::DoctorResult::Done(text) => {
                     log(&format!(
@@ -17481,13 +17510,16 @@ async fn tick(
                     log(&format!("doctor: error on task #{tid}: {e}"));
                 }
             }
-            doctored_tasks.insert(tid);
-            *doctor_slot = None;
+            true
         } else if exited {
-            let tid = slot.task_id;
             log(&format!("doctor: process exited for task #{tid}"));
+            true
+        } else {
+            false
+        };
+        if finished {
             doctored_tasks.insert(tid);
-            *doctor_slot = None;
+            doctor::reap_doctor_slot(&db_path, doctor_slot).await;
         }
     }
 
@@ -17555,11 +17587,28 @@ async fn tick(
                 &config.repo,
             ) {
                 Ok(mut slot) => {
-                    if let Err(e) = slot.proc.feed_turn(&turn).await {
-                        log(&format!("doctor: feed_turn failed: {e}"));
-                    } else {
-                        log(&format!("doctor: spawned for task #{}", evidence.task_id));
-                        *doctor_slot = Some(slot);
+                    // Journal before feeding so an unclean daemon death at any
+                    // later point leaves a row restart recovery can kill.
+                    let outcome = match persist_worker_journal(
+                        &db_path,
+                        doctor::journal_entry(&slot),
+                    )
+                    .await
+                    {
+                        Err(e) => Err(format!("journal handoff failed: {e}")),
+                        Ok(()) => slot
+                            .proc
+                            .feed_turn(&turn)
+                            .await
+                            .map_err(|e| format!("feed_turn failed: {e}")),
+                    };
+                    *doctor_slot = Some(slot);
+                    match outcome {
+                        Ok(()) => log(&format!("doctor: spawned for task #{}", evidence.task_id)),
+                        Err(e) => {
+                            log(&format!("doctor: {e}"));
+                            doctor::reap_doctor_slot(&db_path, doctor_slot).await;
+                        }
                     }
                 }
                 Err(e) => {
