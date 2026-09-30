@@ -359,8 +359,41 @@ pub fn build_branch_sync_review_prompt_for_kind_with_context_and_cycle(
     )
 }
 
+/// Build the R1 prompt for a CI-fix continuation on a branch-sync PR. Unlike
+/// conflict judgment, the original merge is already the accepted baseline;
+/// only the fix-forward commits through the exact gated head are in scope.
+#[allow(clippy::too_many_arguments)]
+pub fn build_branch_sync_ci_fix_review_prompt_for_kind_with_context_and_cycle(
+    kind: AgentKind,
+    spec: &ReviewerSpec,
+    effort: &str,
+    graph_context: Option<&str>,
+    review_cycle: Option<ReviewCycleContext>,
+    risk_flags: &[RiskFlag],
+    merge_sha: &str,
+    head_sha: &str,
+) -> String {
+    let prompt = build_review_prompt_for_kind_with_context_and_cycle(
+        kind,
+        spec,
+        effort,
+        graph_context,
+        review_cycle,
+        risk_flags,
+    )
+    .replace(
+        "full PR diff and surrounding code (never hunks alone)",
+        "branch-sync CI-fix range specified below and surrounding code (never hunks alone)",
+    );
+    format!(
+        "{prompt}\n\n{}",
+        branch_sync_ci_fix_review_artifact_contract(merge_sha, head_sha)
+    )
+}
+
 pub struct RereviewManagedContext<'a> {
     pub branch_sync_merge_sha: Option<&'a str>,
+    pub branch_sync_ci_fix_range: Option<(&'a str, &'a str)>,
     pub risk_instruction: &'a str,
     pub task_contract: &'a str,
 }
@@ -385,7 +418,16 @@ pub fn build_complete_rereview_turn_with_context(
         graph_context,
         review_cycle,
     );
-    let content = if let Some(merge_sha) = managed_context.branch_sync_merge_sha {
+    let content = if let Some((merge_sha, head_sha)) = managed_context.branch_sync_ci_fix_range {
+        let content = rereview_turn_content(&turn).replace(
+            "full current PR diff and surrounding code",
+            "branch-sync CI-fix range specified below and surrounding code",
+        );
+        format!(
+            "{content}\n\n{}",
+            branch_sync_ci_fix_review_artifact_contract(merge_sha, head_sha)
+        )
+    } else if let Some(merge_sha) = managed_context.branch_sync_merge_sha {
         let content = rereview_turn_content(&turn).replace(
             "full current PR diff and surrounding code",
             "branch-sync review artifact specified below and surrounding code",
@@ -437,6 +479,19 @@ fn branch_sync_review_artifact_contract(merge_sha: &str) -> String {
          generic PR diff: the remerge diff must expose how the merge resolved both parents, and \
          every later commit must also be covered. An R1 changes verdict follows the normal \
          bounded rework path on this sync branch.\n"
+    )
+}
+
+fn branch_sync_ci_fix_review_artifact_contract(merge_sha: &str, head_sha: &str) -> String {
+    format!(
+        "## Branch-sync CI-fix review artifact\n\n\
+         This is an R1-only branch-sync CI-fix review. Review only the fix-forward commits after \
+         the preserved merge through the exact gated PR head with:\n\n\
+         `git diff {merge_sha}..{head_sha}`\n\n\
+         That exact range is the authoritative review artifact. Do not substitute a generic \
+         PR-wide diff or review the already-recorded merge as newly authored work. Confirm the fix keeps \
+         the merge commit in history and addresses the failing checks without unrelated changes. \
+         An R1 changes verdict follows the normal bounded rework path on this sync branch.\n"
     )
 }
 
@@ -2089,6 +2144,7 @@ mod tests {
             ReviewCycleContext::from_persisted_rework_round(1, quorum_core::lifecycle::REWORK_CAP),
             RereviewManagedContext {
                 branch_sync_merge_sha: Some("merge123"),
+                branch_sync_ci_fix_range: None,
                 risk_instruction,
                 task_contract: &task_contract,
             },
@@ -2105,6 +2161,32 @@ mod tests {
             content.contains("- cross_layer: storage, review prompt, and merge gate must agree")
         );
         assert!(!content.contains("full current PR diff"));
+    }
+
+    #[test]
+    fn branch_sync_ci_fix_r1_prompt_is_scoped_to_merge_through_exact_head() {
+        let spec = ReviewerSpec {
+            pr: 42,
+            worker_agent: "Worker-1".into(),
+            reviewer_name: "Reviewer-1".into(),
+        };
+        for kind in [AgentKind::Claude, AgentKind::Codex] {
+            let prompt = build_branch_sync_ci_fix_review_prompt_for_kind_with_context_and_cycle(
+                kind,
+                &spec,
+                "high",
+                None,
+                None,
+                &[],
+                "merge123",
+                "head456",
+            );
+            assert!(prompt.contains("git diff merge123..head456"));
+            assert!(prompt.contains("authoritative review artifact"));
+            assert!(prompt.contains("Review only the fix-forward commits"));
+            assert!(!prompt.contains("git show --remerge-diff"));
+            assert!(!prompt.contains("full PR diff"));
+        }
     }
 
     /// Extracts every `quorum <subcommand> --<flag>` from all turn-template

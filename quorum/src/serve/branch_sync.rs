@@ -9,7 +9,7 @@ use super::{
     log, parse_created_pr_number, parse_initial_pr_list, resolve_pr_target_with_program,
     run_publication_gh_command, validate_initial_pr_target, PrTarget, ServeConfig,
 };
-use quorum_core::branch_sync::{self, BranchSync, ConflictJudgmentOutcome};
+use quorum_core::branch_sync::{self, BranchSync, CiFailureFixOutcome, ConflictJudgmentOutcome};
 use quorum_core::error::{QuorumError, Result};
 use std::collections::HashMap;
 use std::path::Path;
@@ -154,6 +154,147 @@ pub async fn intake_conflict_judgment_task(
     Ok(())
 }
 
+/// Provision one continuation task for the oldest CI-failed sync PR that is
+/// not yet bound to judgment work. Selection is only a bounded short read;
+/// the core helper rechecks eligibility and inserts/binds in one immediate
+/// transaction, so startup and normal ticks are safely replayable.
+pub async fn intake_ci_failure_fix_task(config: &ServeConfig) -> Result<()> {
+    let db_path = config.db_path.clone();
+    let sync = tokio::task::spawn_blocking(move || -> Result<Option<BranchSync>> {
+        let conn = quorum_core::db::open(&db_path)?;
+        branch_sync::next_ci_failed_awaiting_task(&conn)
+    })
+    .await
+    .map_err(|error| {
+        QuorumError::Io(format!("branch sync CI-fix intake lookup join: {error}"))
+    })??;
+    let Some(sync) = sync else {
+        return Ok(());
+    };
+    let db_path = config.db_path.clone();
+    let id = sync.id;
+    let created = tokio::task::spawn_blocking(move || -> Result<CiFailureFixOutcome> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        branch_sync::create_ci_failure_fix_task(&mut conn, id, quorum_core::clock::now())
+    })
+    .await
+    .map_err(|error| format!("branch sync CI-fix task provisioning join: {error}"))
+    .and_then(|result| result.map_err(|error| error.to_string()));
+    match created {
+        Ok(CiFailureFixOutcome::Created(task)) => log(&format!(
+            "branch sync #{}: CI-fix task #{} created for PR #{}",
+            task.sync_id, task.task_id, task.pr
+        )),
+        Ok(CiFailureFixOutcome::NotEligible) => {}
+        Err(error) => {
+            fail(config, &sync, &error).await?;
+            log(&format!(
+                "branch sync #{} CI-fix task intake failed: {error}",
+                sync.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Leave durable operator-visible evidence on the existing sync PR when its
+/// one CI-fix worker fails. The task and sync are already terminal, so a
+/// transient GitHub failure cannot reopen or retry implementation work; a
+/// later tick retries only this notification under a durable bounded backoff.
+pub async fn reconcile_failed_ci_fix_comment(config: &ServeConfig) -> Result<()> {
+    let db_path = config.db_path.clone();
+    let admitted = tokio::task::spawn_blocking(move || -> Result<_> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        branch_sync::begin_failed_ci_fix_comment_attempt(&mut conn, quorum_core::clock::now())
+    })
+    .await
+    .map_err(|error| {
+        QuorumError::Io(format!(
+            "branch sync failure-comment admission join: {error}"
+        ))
+    })??;
+    let Some(admitted) = admitted else {
+        return Ok(());
+    };
+    let sync = admitted.sync;
+    let attempt = admitted.attempt;
+    let Some(pr) = sync.pr else {
+        return Ok(());
+    };
+    let Some(task_id) = sync.task_id else {
+        return Ok(());
+    };
+    let mut args = vec![
+        "pr".to_string(),
+        "comment".to_string(),
+        pr.to_string(),
+        "--body".to_string(),
+        format!(
+            "Branch sync #{} CI-fix task #{} failed. The sync is marked failed and will not be retried automatically.",
+            sync.id, task_id
+        ),
+    ];
+    if !config.repo.is_empty() {
+        args.push("--repo".to_string());
+        args.push(config.repo.clone());
+    }
+    let failure = match run_branch_sync_gh(config, &args, "gh pr comment").await {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => Some(String::from_utf8_lossy(&output.stderr).into_owned()),
+        Err(error) => Some(error),
+    };
+    if let Some(error) = failure {
+        let db_path = config.db_path.clone();
+        let id = sync.id;
+        let persisted_error = error.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&db_path)?;
+            let _ = branch_sync::record_failure_comment_failed(
+                &mut conn,
+                id,
+                task_id,
+                attempt,
+                &persisted_error,
+                quorum_core::clock::now(),
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|join_error| {
+            QuorumError::Io(format!(
+                "branch sync failure-comment failure record join: {join_error}"
+            ))
+        })??;
+        let disposition = if attempt >= branch_sync::FAILURE_COMMENT_MAX_ATTEMPTS {
+            "abandoned after bounded retries"
+        } else {
+            "deferred under durable backoff"
+        };
+        log(&format!(
+            "branch sync #{} failure comment attempt {}/{} {disposition}: {error}",
+            sync.id,
+            attempt,
+            branch_sync::FAILURE_COMMENT_MAX_ATTEMPTS,
+        ));
+        return Ok(());
+    }
+    let db_path = config.db_path.clone();
+    let id = sync.id;
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        let _ = branch_sync::record_failure_comment_posted(
+            &mut conn,
+            id,
+            task_id,
+            attempt,
+            quorum_core::clock::now(),
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("branch sync failure-comment record join: {error}")))?
+}
+
 async fn provision_conflict_task(
     config: &ServeConfig,
     worktrees: &WorktreeManager,
@@ -173,19 +314,17 @@ async fn provision_conflict_task(
     Ok(())
 }
 
-/// Bind a conflict judgment task's normal delivery to its sync row. The daemon
-/// has already published `head_ref` at `merge_sha` as `pr` against the task's
-/// target (the sync `to`). This verifies that delivery is the row's `sync/<id>`
-/// branch and a true merge of both pinned tips, then records the worker's merge
-/// commit and PR and advances `conflict` → `published`. Tasks without a bound
-/// row, and an idempotent replay or later rework push for the same PR, are
-/// no-ops; any other mismatch is an error the caller must fail loudly.
+/// Validate and, when needed, bind a branch-sync judgment delivery. Conflict
+/// work records its newly resolved merge and advances to `published`. A CI-fix
+/// continuation keeps the original `merge_sha` and `ci_failed` phase while
+/// proving that commit remains in the new PR head; normal publication storage
+/// records that new head in `pr_targets`.
 pub async fn record_judgment_publication(
     config: &ServeConfig,
     worktrees: &WorktreeManager,
     task_id: i64,
     head_ref: &str,
-    merge_sha: &str,
+    published_head_sha: &str,
     pr: i64,
 ) -> std::result::Result<(), String> {
     let db_path = config.db_path.clone();
@@ -209,6 +348,25 @@ pub async fn record_judgment_publication(
     if sync.phase == "published" && sync.pr == Some(pr) {
         return Ok(());
     }
+    if sync.phase == "ci_failed" {
+        if sync.pr != Some(pr) {
+            return Err(format!(
+                "branch sync #{} CI-fix delivery targeted PR #{pr}, expected PR {:?}",
+                sync.id, sync.pr
+            ));
+        }
+        let original_merge_sha = required(sync.merge_sha.as_deref(), "merge_sha")?;
+        if !worktrees
+            .source_is_ancestor_of_target(&config.repo_dir, original_merge_sha, published_head_sha)
+            .await?
+        {
+            return Err(format!(
+                "branch sync #{} CI-fix head {published_head_sha} rewrites recorded merge {original_merge_sha}",
+                sync.id,
+            ));
+        }
+        return Ok(());
+    }
     if sync.phase != "conflict" {
         return Err(format!(
             "branch sync #{} is {} with PR {:?}; cannot bind judgment PR #{pr}",
@@ -218,12 +376,17 @@ pub async fn record_judgment_publication(
     let source_sha = required(sync.source_sha.as_deref(), "source_sha")?;
     let target_sha = required(sync.target_sha.as_deref(), "target_sha")?;
     worktrees
-        .verify_branch_sync_merge_ancestry(&config.repo_dir, merge_sha, source_sha, target_sha)
+        .verify_branch_sync_merge_ancestry(
+            &config.repo_dir,
+            published_head_sha,
+            source_sha,
+            target_sha,
+        )
         .await?;
 
     let db_path = config.db_path.clone();
     let id = sync.id;
-    let merge_sha = merge_sha.to_string();
+    let merge_sha = published_head_sha.to_string();
     let published = tokio::task::spawn_blocking(move || -> Result<Option<BranchSync>> {
         let mut conn = quorum_core::db::open(&db_path)?;
         branch_sync::publish_from_conflict(

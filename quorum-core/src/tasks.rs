@@ -2895,6 +2895,67 @@ pub fn fail_reviewer_if_owner(
     .map(Some)
 }
 
+/// Terminalize a CI-fix task and its bound branch-sync row when the PR target
+/// no longer matches the exact fix head published under the daemon's lease.
+/// The caller owns an immediate transaction and has already resolved the live
+/// target. This guarded write re-proves the active binding, review phase, and
+/// persisted publication head before revoking all task authority.
+pub fn fail_branch_sync_ci_fix_stale_authority_tx(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: i64,
+    pr: i64,
+    expected_head: &str,
+    observed_target: &str,
+    now: i64,
+) -> Result<bool> {
+    let reason = format!(
+        "branch sync CI-fix stale authority: expected PR #{pr} head {expected_head}, observed {observed_target}"
+    );
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET status='failed',assignee=NULL,reviewer=NULL,updated_at=?1
+         WHERE id=?2 AND status='in-review'
+           AND EXISTS (
+               SELECT 1 FROM branch_syncs b
+               WHERE b.task_id=tasks.id AND b.pr=?3 AND b.phase='ci_failed' AND b.active=1
+           )
+           AND EXISTS (
+               SELECT 1 FROM pr_targets p
+               WHERE p.task_id=tasks.id AND p.pr_number=?3 AND p.head_sha=?4
+           )",
+        params![now, task_id, pr, expected_head],
+    )?;
+    if changed != 1 {
+        return Ok(false);
+    }
+    deactivate_lease(tx, task_id, now)?;
+    let failed_sync = crate::branch_sync::fail_for_task_tx(tx, task_id, &reason, now)?;
+    if failed_sync.is_none() {
+        return Err(QuorumError::Io(format!(
+            "task #{task_id} lost its branch-sync binding during stale-authority failure"
+        )));
+    }
+    tx.execute(
+        "INSERT INTO task_notes(task_id,ts,agent,body)
+         VALUES (?1,?2,'daemon',?3)",
+        params![task_id, now, reason],
+    )?;
+    crate::events::emit(tx, "task_failed", &lease_target(task_id), &reason, now)?;
+    tx.execute(
+        "INSERT INTO messages(ts,author,topic,kind,body,refs,expires_at,recipient)
+         VALUES (?1,'daemon',?2,'alert',?3,?4,?5,'owner')",
+        params![
+            now,
+            crate::feed::DEFAULT_TOPIC,
+            format!("task #{task_id}: {reason}; no automatic retry"),
+            format!("task:{task_id}"),
+            now + crate::feed::DEFAULT_MESSAGE_TTL_SECS,
+        ],
+    )?;
+    crate::decomposition::block_graph_if_child_failed(tx, task_id, &reason, now)?;
+    Ok(true)
+}
+
 /// Verdict supplied to late-review recovery. R1/R2 is deliberately not an
 /// input: it is derived from the durable `agent_runs.sub_role` identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
