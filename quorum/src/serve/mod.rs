@@ -41002,6 +41002,15 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             tasks::apply_event(&mut conn, "r1", branch_task, &Event::VerdictChanges, 15).unwrap();
         assert_eq!(exhausted.task.status, "failed");
         assert_eq!(exhausted.task.rework_round, 1);
+        let failed_sync = quorum_core::branch_sync::get(&conn, sync.id)
+            .unwrap()
+            .expect("branch-sync row remains auditable after cap exhaustion");
+        assert_eq!(failed_sync.phase, "failed");
+        assert!(!failed_sync.active);
+        assert!(failed_sync
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("review rework cap (1) exceeded")));
     }
 
     #[test]
