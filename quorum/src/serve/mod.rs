@@ -4936,7 +4936,8 @@ async fn recover_late_worker_done_with_publication(
                 ));
                 let reason = format!("restart publication reconciliation failed: {error}");
                 if is_active_branch_sync_ci_fix(&config.db_path, task_id).await? {
-                    fail_worker_for_teardown(&config.db_path, &row.agent, task_id, &reason).await;
+                    fail_worker_assignment_settled(&config.db_path, &row.agent, task_id, &reason)
+                        .await;
                 } else {
                     let resume_status = if entry.rework_count > 0 {
                         "rework"
@@ -4969,7 +4970,7 @@ async fn recover_late_worker_done_with_publication(
         log(&format!(
             "late branch sync judgment publication rejected for task #{task_id}: {error}"
         ));
-        fail_worker_for_teardown(
+        fail_worker_assignment_settled(
             &config.db_path,
             &row.agent,
             task_id,
@@ -15113,7 +15114,8 @@ async fn tick(
                     let resume_status = if w.rework_count > 0 { "rework" } else { "open" };
                     let reason = format!("daemon-owned publication failed: {error}");
                     if is_active_branch_sync_ci_fix(&db_path, w.task_id).await? {
-                        fail_worker_for_teardown(&db_path, &w.agent_name, w.task_id, &reason).await;
+                        fail_worker_assignment_settled(&db_path, &w.agent_name, w.task_id, &reason)
+                            .await;
                     } else {
                         let kind = publication_failure_kind_from_error(error);
                         park_task_publication_failure(
@@ -15154,7 +15156,7 @@ async fn tick(
                     let w = workers.remove(wi);
                     // Sweep-aware: a lease lapsed meanwhile is failed by the
                     // same-transaction reap instead of rolling it back.
-                    fail_worker_for_teardown(
+                    fail_worker_assignment_settled(
                         &db_path,
                         &w.agent_name,
                         w.task_id,
@@ -20419,7 +20421,7 @@ async fn settle_failed_grok_worker_delivery(
     // Sweep-aware: a lapsed lease reaped in the same transaction settles the
     // assignment; a plain `AgentFailed` would be rejected from `open`, roll
     // the reap back, and replay this delivery every tick.
-    let settled = fail_worker_for_teardown(
+    let settled = fail_worker_assignment_settled(
         db_path,
         &worker_name,
         worker_task_id,
@@ -23569,7 +23571,7 @@ async fn spawn_worker(
                 let reason = format!("continue PR #{pr} provisioning rejected: {error}");
                 persist_provisioning_failure(&db_path, task.id, &reason).await;
                 if is_active_branch_sync_ci_fix(&db_path, task.id).await? {
-                    fail_worker_for_teardown(&db_path, &agent_name, task.id, &reason).await;
+                    fail_worker_assignment_settled(&db_path, &agent_name, task.id, &reason).await;
                 } else {
                     park_task(&db_path, task.id, &reason, "open").await;
                 }
@@ -26990,17 +26992,22 @@ async fn cleanup_slot_inner(
     .await;
 }
 
-/// Fail a worker's task unless the write-path sweep in the same transaction
-/// already recovered it (lapsed lease). Returns true when the assignment is
-/// settled either way. Genuine rejections return false and keep the loud
-/// lifecycle diagnostic that `fire_event` records.
-async fn fail_worker_for_teardown(db_path: &Path, agent: &str, task_id: i64, reason: &str) -> bool {
+/// Fail a worker's assignment unless the write-path sweep in the same
+/// transaction already recovered it (lapsed lease). Returns the applied
+/// transition or the sweep-recovery outcome. Genuine rejections return
+/// `None` and keep the loud lifecycle diagnostic that `fire_event` records.
+async fn fail_worker_assignment(
+    db_path: &Path,
+    agent: &str,
+    task_id: i64,
+    reason: &str,
+) -> Option<tasks::WorkerFailureOutcome> {
     let p = db_path.to_path_buf();
     let actor = agent.to_string();
     let failure_reason = reason.to_string();
     let result = tokio::task::spawn_blocking(move || {
         let mut conn = quorum_core::db::open(&p)?;
-        tasks::fail_worker_for_teardown(&mut conn, &actor, task_id, &failure_reason, now_unix())
+        tasks::fail_worker_assignment(&mut conn, &actor, task_id, &failure_reason, now_unix())
     })
     .await;
     let event_debug = format!(
@@ -27010,38 +27017,51 @@ async fn fail_worker_for_teardown(db_path: &Path, agent: &str, task_id: i64, rea
         }
     );
     match result {
-        Ok(Ok(tasks::WorkerTeardownFailure::Failed(transition))) => {
+        Ok(Ok(tasks::WorkerFailureOutcome::Applied(transition))) => {
             let names: Vec<String> = transition.effects.iter().map(tasks::effect_name).collect();
             log(&format!(
                 "lifecycle: task #{task_id} -> {} (effects: [{}])",
                 transition.task.status,
                 names.join(", ")
             ));
-            true
+            Some(tasks::WorkerFailureOutcome::Applied(transition))
         }
-        Ok(Ok(tasks::WorkerTeardownFailure::AlreadyRecoveredBySweep)) => {
+        Ok(Ok(tasks::WorkerFailureOutcome::AlreadyRecoveredBySweep)) => {
             log(&format!(
-                "lifecycle: task #{task_id} worker {agent} teardown — lapsed assignment already recovered by sweep; no second AgentFailed"
+                "lifecycle: task #{task_id} worker {agent} failure — lapsed assignment already recovered by sweep; no second AgentFailed"
             ));
-            true
+            Some(tasks::WorkerFailureOutcome::AlreadyRecoveredBySweep)
         }
         Ok(Err(error)) => {
             let message = error.to_string();
             log(&format!(
-                "lifecycle: teardown AgentFailed failed for task #{task_id}: {message}"
+                "lifecycle: AgentFailed failed for task #{task_id}: {message}"
             ));
             persist_lifecycle_diagnostic(db_path, agent, task_id, &event_debug, &message).await;
-            false
+            None
         }
         Err(error) => {
             let message = format!("join error: {error}");
             log(&format!(
-                "lifecycle: teardown AgentFailed failed for task #{task_id}: {message}"
+                "lifecycle: AgentFailed failed for task #{task_id}: {message}"
             ));
             persist_lifecycle_diagnostic(db_path, agent, task_id, &event_debug, &message).await;
-            false
+            None
         }
     }
+}
+
+/// Convenience for callers that only need to know whether worker-failure
+/// settlement completed, regardless of which transition path settled it.
+async fn fail_worker_assignment_settled(
+    db_path: &Path,
+    agent: &str,
+    task_id: i64,
+    reason: &str,
+) -> bool {
+    fail_worker_assignment(db_path, agent, task_id, reason)
+        .await
+        .is_some()
 }
 
 async fn is_active_branch_sync_ci_fix(db_path: &Path, task_id: i64) -> Result<bool> {
@@ -27114,7 +27134,7 @@ async fn teardown_worker_with_body(
     }
 
     if task_status == "open" {
-        fail_worker_for_teardown(
+        fail_worker_assignment_settled(
             &config.db_path,
             &state.agent_name,
             state.task_id,
@@ -49835,6 +49855,52 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(task.recovery_attempts, 0);
         assert_eq!(task_event_count(&conn, 1, "task_open"), 0);
         assert_eq!(mailbox_consumption(&conn, mailbox_id), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn worker_failure_wrapper_preserves_applied_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("worker-failure-applied.db");
+        create_active_task(&db_path, DRAIN_AUTHOR, "working");
+
+        let outcome = fail_worker_assignment(&db_path, DRAIN_AUTHOR, 1, "worker exited").await;
+
+        let Some(tasks::WorkerFailureOutcome::Applied(transition)) = outcome else {
+            panic!("live worker failure must return its applied transition");
+        };
+        assert_eq!(transition.task.status, "open");
+        assert_eq!(transition.task.recovery_attempts, 1);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(errors_with_source(&conn, "lifecycle"), 0);
+    }
+
+    #[tokio::test]
+    async fn worker_failure_wrapper_reports_rejection_and_persists_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("worker-failure-rejected.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::create(
+                &mut conn,
+                "owner",
+                "open task",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap()
+        };
+
+        let outcome = fail_worker_assignment(&db_path, "worker", task_id, "worker exited").await;
+
+        assert!(outcome.is_none(), "invalid transition must not be settled");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(tasks::get(&conn, task_id).unwrap().unwrap().status, "open");
+        assert_eq!(errors_with_source(&conn, "lifecycle"), 1);
     }
 
     /// Errors rows 99/100: the daemon wedged for hours, the worker leases
