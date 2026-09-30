@@ -64,6 +64,12 @@ opus = 100
 [routing.reviewer.5]
 opus = 100
 
+# Grok profiles may appear only in worker routing pools; other roles are rejected at startup.
+# [grok]
+# sandbox = "off"   # off|workspace
+# permission_mode = "bypassPermissions"
+# max_turns = 256   # 1..=256
+
 # ── cost ceilings ────────────────────────────────────────────────────
 max_idle_secs = 900              # 15 min without an event
 max_task_wall_secs = 14400      # 4h
