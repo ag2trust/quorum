@@ -12,6 +12,12 @@ const WORD_LIST: &[&str] = &[
     "Gauge", "Hasp",
 ];
 
+/// Names-file lines starting with this are comments, so no pooled identity —
+/// configured, generated, or restored from the journal — ever begins with
+/// it. Daemon-internal journal keys (the doctor's) use it to stay outside the
+/// agent-name space without restricting which names operators may configure.
+pub const COMMENT_PREFIX: char = '#';
+
 pub struct Pool {
     available: Vec<String>,
     in_use: HashSet<String>,
@@ -58,7 +64,7 @@ impl Pool {
         let names: Vec<String> = content
             .lines()
             .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter(|l| !l.is_empty() && !l.starts_with(COMMENT_PREFIX))
             .collect();
 
         if names.is_empty() {
@@ -246,6 +252,26 @@ mod tests {
         let pool = Pool::load(&path, 4).unwrap();
         assert!(pool.has_file());
         assert_eq!(pool.available.len(), 3);
+    }
+
+    /// `doctor-*` stays an ordinary configured/restored identity, and no
+    /// pooled name can start with the comment prefix the doctor key uses.
+    #[test]
+    fn no_pooled_name_enters_the_comment_prefixed_key_space() {
+        let (_f, path) = write_names_file(&["doctor-7", "#doctor-7", "  #Hidden", "Gamma"]);
+        let mut pool = Pool::load(&path, 1).unwrap();
+        assert_eq!(pool.available, vec!["doctor-7", "Gamma"]);
+        assert_eq!(pool.acquire().name(), "doctor-7");
+        assert_eq!(pool.acquire().name(), "Gamma");
+        for _ in 0..64 {
+            assert!(!pool.acquire().name().starts_with(COMMENT_PREFIX));
+        }
+
+        let mut restored = Pool::new_generated();
+        assert_eq!(
+            restored.acquire_named("doctor-7").as_deref(),
+            Some("doctor-7")
+        );
     }
 
     #[test]
