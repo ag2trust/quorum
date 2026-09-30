@@ -359,42 +359,15 @@ pub fn build_branch_sync_review_prompt_for_kind_with_context_and_cycle(
     )
 }
 
-/// Build a sticky R1 re-review turn without losing the branch-sync artifact
-/// boundary. The underlying turn is stream JSON, so update its content and
-/// reserialize rather than appending invalid bytes after the envelope.
-pub fn build_branch_sync_rereview_turn_with_context(
-    reviewer_name: &str,
-    pr: i64,
-    worker_agent: &str,
-    effort: &str,
-    graph_context: Option<&str>,
-    review_cycle: ReviewCycleContext,
-    merge_sha: &str,
-    risk_instruction: &str,
-    task_contract: &str,
-) -> String {
-    let turn = build_rereview_turn_with_context(
-        reviewer_name,
-        pr,
-        worker_agent,
-        effort,
-        graph_context,
-        review_cycle,
-    );
-    let content = rereview_turn_content(&turn).replace(
-        "full current PR diff and surrounding code",
-        "branch-sync review artifact specified below and surrounding code",
-    );
-    let content = format!(
-        "{content}\n\n{}",
-        branch_sync_review_artifact_contract(merge_sha)
-    );
-    serialize_complete_rereview_turn(content, risk_instruction, task_contract)
+pub struct RereviewManagedContext<'a> {
+    pub branch_sync_merge_sha: Option<&'a str>,
+    pub risk_instruction: &'a str,
+    pub task_contract: &'a str,
 }
 
-/// Build an ordinary sticky re-review turn with its task and risk context
-/// inside the stream-JSON envelope. Nothing may be concatenated after this
-/// final serialization because `AgentProc::feed_turn` writes it verbatim.
+/// Build a sticky re-review turn with all managed context inside the
+/// stream-JSON envelope. Nothing may be concatenated after this final
+/// serialization because `AgentProc::feed_turn` writes it verbatim.
 pub fn build_complete_rereview_turn_with_context(
     reviewer_name: &str,
     pr: i64,
@@ -402,8 +375,7 @@ pub fn build_complete_rereview_turn_with_context(
     effort: &str,
     graph_context: Option<&str>,
     review_cycle: ReviewCycleContext,
-    risk_instruction: &str,
-    task_contract: &str,
+    managed_context: RereviewManagedContext<'_>,
 ) -> String {
     let turn = build_rereview_turn_with_context(
         reviewer_name,
@@ -413,10 +385,22 @@ pub fn build_complete_rereview_turn_with_context(
         graph_context,
         review_cycle,
     );
+    let content = if let Some(merge_sha) = managed_context.branch_sync_merge_sha {
+        let content = rereview_turn_content(&turn).replace(
+            "full current PR diff and surrounding code",
+            "branch-sync review artifact specified below and surrounding code",
+        );
+        format!(
+            "{content}\n\n{}",
+            branch_sync_review_artifact_contract(merge_sha)
+        )
+    } else {
+        rereview_turn_content(&turn)
+    };
     serialize_complete_rereview_turn(
-        rereview_turn_content(&turn),
-        risk_instruction,
-        task_contract,
+        content,
+        managed_context.risk_instruction,
+        managed_context.task_contract,
     )
 }
 
@@ -2096,16 +2080,18 @@ mod tests {
             &[],
             &risks,
         );
-        let rereview = build_branch_sync_rereview_turn_with_context(
+        let rereview = build_complete_rereview_turn_with_context(
             "Reviewer-1",
             42,
             "Worker-1",
             "high",
             None,
             ReviewCycleContext::from_persisted_rework_round(1, quorum_core::lifecycle::REWORK_CAP),
-            "merge123",
-            risk_instruction,
-            &task_contract,
+            RereviewManagedContext {
+                branch_sync_merge_sha: Some("merge123"),
+                risk_instruction,
+                task_contract: &task_contract,
+            },
         );
         let envelope: serde_json::Value = serde_json::from_str(&rereview).unwrap();
         assert_eq!(envelope["type"], "user");

@@ -9598,29 +9598,19 @@ async fn resume_reviewer_after_ci(
         .map_err(|error| QuorumError::Io(format!("branch-sync review context join: {error}")))??
     };
     let risk_instruction = reviewer::r1_risk_instruction(&risk_flags);
-    let rereview_turn = match branch_sync_merge_sha.as_deref() {
-        Some(merge_sha) => reviewer::build_branch_sync_rereview_turn_with_context(
-            &reviewers[reviewer_index].agent_name,
-            pr,
-            &workers[worker_index].agent_name,
-            &reviewers[reviewer_index].effort,
-            graph_context.as_deref(),
-            review_cycle,
-            merge_sha,
+    let rereview_turn = reviewer::build_complete_rereview_turn_with_context(
+        &reviewers[reviewer_index].agent_name,
+        pr,
+        &workers[worker_index].agent_name,
+        &reviewers[reviewer_index].effort,
+        graph_context.as_deref(),
+        review_cycle,
+        reviewer::RereviewManagedContext {
+            branch_sync_merge_sha: branch_sync_merge_sha.as_deref(),
             risk_instruction,
-            &task_contract,
-        ),
-        None => reviewer::build_complete_rereview_turn_with_context(
-            &reviewers[reviewer_index].agent_name,
-            pr,
-            &workers[worker_index].agent_name,
-            &reviewers[reviewer_index].effort,
-            graph_context.as_deref(),
-            review_cycle,
-            risk_instruction,
-            &task_contract,
-        ),
-    };
+            task_contract: &task_contract,
+        },
+    );
     // Revalidate at the external feed boundary. This second guarded read makes
     // any cancellation/context change during CI/prompt preparation fail loud
     // before the sticky reviewer receives another turn.
