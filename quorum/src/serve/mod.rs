@@ -2605,6 +2605,50 @@ fn persist_reviewer_pr_target(
         )
         .optional()?;
 
+    // A branch-sync CI fix is a stricter continuation than an ordinary PR:
+    // the worker's lease-protected publication becomes immutable authority.
+    // Never let the general reviewer-target refresh rotate that head to a
+    // same-repository actor's later push. Terminalize the task and sync in
+    // this same write transaction so no reviewer or merge can be authorized.
+    if let Some(sync) = quorum_core::branch_sync::active_for_task(&tx, task_id)? {
+        if sync.phase == "ci_failed" && task.continue_pr == sync.pr {
+            let expected = existing.as_ref().ok_or_else(|| {
+                QuorumError::Io(format!(
+                    "branch sync #{} CI-fix task #{task_id} reached review without a published PR target",
+                    sync.id
+                ))
+            })?;
+            let target_matches = expected.pr_number == resolved.target.pr
+                && expected.head_ref == resolved.target.head_ref
+                && expected.head_sha == resolved.target.head_sha
+                && expected.is_fork == resolved.target.is_fork;
+            if !target_matches {
+                let observed = format!(
+                    "PR #{} {}@{} fork={}",
+                    resolved.target.pr,
+                    resolved.target.head_ref,
+                    resolved.target.head_sha,
+                    resolved.target.is_fork,
+                );
+                if !tasks::fail_branch_sync_ci_fix_stale_authority_tx(
+                    &tx,
+                    task_id,
+                    expected.pr_number,
+                    &expected.head_sha,
+                    &observed,
+                    now_unix(),
+                )? {
+                    return Err(QuorumError::Io(format!(
+                        "branch sync #{} CI-fix authority changed before stale head could be failed",
+                        sync.id
+                    )));
+                }
+                tx.commit()?;
+                return Ok(false);
+            }
+        }
+    }
+
     if let Some(existing) = &existing {
         if existing.pr_number != resolved.target.pr
             || existing.head_ref != resolved.target.head_ref
@@ -47089,6 +47133,97 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(stored.head_ref, "feature/review");
         assert_eq!(stored.head_sha, "gated-sha");
         assert!(!stored.is_fork);
+    }
+
+    #[test]
+    fn branch_sync_ci_fix_post_publication_head_drift_fails_before_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_test_db(dir.path());
+        let sync = match quorum_core::branch_sync::request(&mut conn, "develop", "main", "owner", 1)
+            .unwrap()
+        {
+            quorum_core::branch_sync::RequestOutcome::Requested(sync) => sync,
+            quorum_core::branch_sync::RequestOutcome::AlreadyActive(_) => unreachable!(),
+        };
+        let branch = format!("sync/{}", sync.id);
+        quorum_core::branch_sync::pin(
+            &mut conn,
+            sync.id,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &branch,
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        let merge_sha = "c".repeat(40);
+        quorum_core::branch_sync::prepared(&mut conn, sync.id, &branch, &merge_sha, 3)
+            .unwrap()
+            .unwrap();
+        quorum_core::branch_sync::published(&mut conn, sync.id, 42, 4)
+            .unwrap()
+            .unwrap();
+        quorum_core::branch_sync::begin_checks(&mut conn, sync.id, 5)
+            .unwrap()
+            .unwrap();
+        quorum_core::branch_sync::ci_failed(&mut conn, sync.id, "PR #42 CI failed: test", 6)
+            .unwrap()
+            .unwrap();
+        let task_id =
+            match quorum_core::branch_sync::create_ci_failure_fix_task(&mut conn, sync.id, 7)
+                .unwrap()
+            {
+                quorum_core::branch_sync::CiFailureFixOutcome::Created(task) => task.task_id,
+                quorum_core::branch_sync::CiFailureFixOutcome::NotEligible => unreachable!(),
+            };
+        let published_fix_head = "d".repeat(40);
+        pr_targets::upsert(&mut conn, task_id, 42, &branch, &published_fix_head, false).unwrap();
+        conn.execute(
+            "UPDATE tasks
+             SET status='in-review',refs=json_set(
+                 refs,'$.pr',42,'$.cx_est',3,'$.cx_size','M',
+                 '$.cx_ready',json('true'),'$.cx_not_ready_reason',json('null'),
+                 '$.cx_risk_flags',json('[]')
+             )
+             WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        assert!(tasks::reserve_reviewer_provision(&mut conn, task_id, "winner", "r1", 8).unwrap());
+
+        // A foreign push lands after the worker's lease-protected publication
+        // and becomes the live/gated GitHub target. It must never replace the
+        // persisted fix head or acquire reviewer/merge authority.
+        let foreign_head = "e".repeat(40);
+        let moved = live_reviewer_target(42, &branch, &foreign_head);
+        assert!(!persist_reviewer_pr_target(
+            &mut conn,
+            task_id,
+            "winner",
+            "r1",
+            &moved,
+            &foreign_head,
+        )
+        .unwrap());
+
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        assert!(task.reviewer.is_none());
+        assert_eq!(
+            pr_targets::get(&conn, task_id, 42)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            published_fix_head,
+        );
+        let failed_sync = quorum_core::branch_sync::get(&conn, sync.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed_sync.phase, "failed");
+        assert!(!failed_sync.active);
+        assert!(quorum_core::approvals::get_for_pr(&conn, 42)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

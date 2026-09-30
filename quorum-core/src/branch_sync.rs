@@ -15,6 +15,9 @@ const COLS: &str = "id, source_branch, target_branch, source_sha, target_sha, sy
                     merge_sha, pr, phase, ci_attempts, ci_next_attempt_at, ci_wait_inflight, \
                     task_id, active, requested_by, last_error, created_at, updated_at";
 
+pub const FAILURE_COMMENT_MAX_ATTEMPTS: i64 = 3;
+const FAILURE_COMMENT_RETRY_BASE_SECS: i64 = 30;
+
 /// Terminal branch-sync phases release the active-pair slot in the statement
 /// that records the phase, allowing a subsequent request for that pair.
 pub fn is_terminal_phase(phase: &str) -> bool {
@@ -843,35 +846,104 @@ pub fn active_for_task(conn: &Connection, task_id: i64) -> Result<Option<BranchS
         .optional()?)
 }
 
-/// Select one failed CI-fix sync whose PR still needs the terminal daemon
-/// comment. The task's authoritative `continue_pr` distinguishes this path
-/// from conflict judgment failures that may not have published a PR.
-pub fn next_failed_ci_fix_awaiting_comment(conn: &Connection) -> Result<Option<BranchSync>> {
-    Ok(conn
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureCommentAttempt {
+    pub sync: BranchSync,
+    pub attempt: i64,
+}
+
+/// Admit one due terminal-comment attempt and durably spend that attempt
+/// before the external GitHub call. Attempts live in the failed task's refs,
+/// rather than the TTL'd event stream, so restart and event sweeping cannot
+/// reset the bound. A failed oldest row is excluded until its backoff expires,
+/// allowing later rows to make progress.
+pub fn begin_failed_ci_fix_comment_attempt(
+    conn: &mut Connection,
+    now: i64,
+) -> Result<Option<FailureCommentAttempt>> {
+    let tx = begin_immediate(conn)?;
+    let sync = tx
         .query_row(
             &format!(
                 "SELECT {COLS} FROM branch_syncs
                  WHERE id=(
                      SELECT b.id FROM branch_syncs b
+                     JOIN tasks t ON t.id=b.task_id AND t.continue_pr=b.pr
                      WHERE b.active=0 AND b.phase='failed'
                        AND b.task_id IS NOT NULL AND b.pr IS NOT NULL
-                       AND EXISTS (
-                           SELECT 1 FROM tasks t
-                           WHERE t.id=b.task_id AND t.continue_pr=b.pr
-                       )
-                       AND NOT EXISTS (
-                           SELECT 1 FROM events e
-                           WHERE e.kind='branch_sync_failure_commented'
-                             AND e.subject='branch_sync#' || b.id
-                       )
-                     ORDER BY b.updated_at ASC,b.id ASC
+                       AND t.status='failed' AND json_valid(t.refs)
+                       AND COALESCE(json_extract(
+                               t.refs,'$.branch_sync_failure_comment_posted'),0)!=1
+                       AND COALESCE(json_extract(
+                               t.refs,'$.branch_sync_failure_comment_attempts'),0)
+                           BETWEEN 0 AND ?1 - 1
+                       AND COALESCE(json_extract(
+                               t.refs,'$.branch_sync_failure_comment_next_at'),0) <= ?2
+                     ORDER BY COALESCE(json_extract(
+                                  t.refs,'$.branch_sync_failure_comment_next_at'),b.updated_at),
+                              b.updated_at,b.id
                      LIMIT 1
                  )"
             ),
-            [],
+            params![FAILURE_COMMENT_MAX_ATTEMPTS, now],
             row_to_branch_sync,
         )
-        .optional()?)
+        .optional()?;
+    let Some(sync) = sync else {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(None);
+    };
+    let task_id = sync.task_id.ok_or_else(|| {
+        QuorumError::Io(format!(
+            "branch sync #{} lost its CI-fix task binding during comment admission",
+            sync.id
+        ))
+    })?;
+    let prior_attempts: i64 = tx.query_row(
+        "SELECT COALESCE(json_extract(
+             refs,'$.branch_sync_failure_comment_attempts'),0)
+         FROM tasks WHERE id=?1",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    let attempt = prior_attempts + 1;
+    let next_at = (attempt < FAILURE_COMMENT_MAX_ATTEMPTS)
+        .then(|| now + FAILURE_COMMENT_RETRY_BASE_SECS * 4_i64.pow((attempt - 1) as u32));
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET refs=json_remove(
+                 json_set(
+                     refs,
+                     '$.branch_sync_failure_comment_attempts',?1,
+                     '$.branch_sync_failure_comment_next_at',?2
+                 ),
+                 '$.branch_sync_failure_comment_last_error',
+                 '$.branch_sync_failure_comment_exhausted'
+             ),
+             updated_at=?3
+         WHERE id=?4 AND status='failed' AND continue_pr=?5
+           AND json_valid(refs)
+           AND COALESCE(json_extract(
+                   refs,'$.branch_sync_failure_comment_posted'),0)!=1
+           AND COALESCE(json_extract(
+                   refs,'$.branch_sync_failure_comment_attempts'),0)=?6",
+        params![attempt, next_at, now, task_id, sync.pr, prior_attempts],
+    )?;
+    if changed != 1 {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(None);
+    }
+    crate::events::emit(
+        &tx,
+        "branch_sync_failure_comment_attempted",
+        &format!("branch_sync#{}", sync.id),
+        &format!(
+            "terminal CI-fix failure comment attempt {attempt}/{FAILURE_COMMENT_MAX_ATTEMPTS} for task#{task_id}"
+        ),
+        now,
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(Some(FailureCommentAttempt { sync, attempt }))
 }
 
 /// Record successful publication of the terminal CI-fix failure comment.
@@ -881,23 +953,31 @@ pub fn record_failure_comment_posted(
     conn: &mut Connection,
     id: i64,
     task_id: i64,
+    attempt: i64,
     now: i64,
 ) -> Result<bool> {
     let tx = begin_immediate(conn)?;
-    let eligible: bool = tx.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM branch_syncs b
-             JOIN tasks t ON t.id=b.task_id AND t.continue_pr=b.pr
-             WHERE b.id=?1 AND b.task_id=?2 AND b.active=0 AND b.phase='failed'
-               AND NOT EXISTS (
-                   SELECT 1 FROM events e
-                   WHERE e.kind='branch_sync_failure_commented'
-                     AND e.subject='branch_sync#' || b.id
-               )
-         )",
-        params![id, task_id],
-        |row| row.get(0),
-    )?;
+    let eligible = tx.execute(
+        "UPDATE tasks
+         SET refs=json_remove(
+                 json_set(refs,'$.branch_sync_failure_comment_posted',json('true')),
+                 '$.branch_sync_failure_comment_next_at',
+                 '$.branch_sync_failure_comment_last_error',
+                 '$.branch_sync_failure_comment_exhausted'
+             ),
+             updated_at=?4
+         WHERE id=?2 AND status='failed' AND json_valid(refs)
+           AND COALESCE(json_extract(
+                   refs,'$.branch_sync_failure_comment_attempts'),0)=?3
+           AND COALESCE(json_extract(
+                   refs,'$.branch_sync_failure_comment_posted'),0)!=1
+           AND EXISTS (
+               SELECT 1 FROM branch_syncs b
+               WHERE b.id=?1 AND b.task_id=tasks.id AND b.pr=tasks.continue_pr
+                 AND b.active=0 AND b.phase='failed'
+           )",
+        params![id, task_id, attempt, now],
+    )? == 1;
     if eligible {
         crate::events::emit(
             &tx,
@@ -909,6 +989,59 @@ pub fn record_failure_comment_posted(
     }
     tx.commit().map_err(map_sql_err)?;
     Ok(eligible)
+}
+
+/// Record one failed external comment attempt. The next-at timestamp was
+/// installed before the call, so this write only preserves bounded diagnostics
+/// and marks the terminal attempt as exhausted.
+pub fn record_failure_comment_failed(
+    conn: &mut Connection,
+    id: i64,
+    task_id: i64,
+    attempt: i64,
+    error: &str,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let detail = bounded_error(error);
+    let exhausted = attempt >= FAILURE_COMMENT_MAX_ATTEMPTS;
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET refs=json_set(
+                 refs,
+                 '$.branch_sync_failure_comment_last_error',?1,
+                 '$.branch_sync_failure_comment_exhausted',?2
+             ),
+             updated_at=?3
+         WHERE id=?4 AND status='failed' AND json_valid(refs)
+           AND COALESCE(json_extract(
+                   refs,'$.branch_sync_failure_comment_attempts'),0)=?5
+           AND COALESCE(json_extract(
+                   refs,'$.branch_sync_failure_comment_posted'),0)!=1
+           AND EXISTS (
+               SELECT 1 FROM branch_syncs b
+               WHERE b.id=?6 AND b.task_id=tasks.id AND b.pr=tasks.continue_pr
+                 AND b.active=0 AND b.phase='failed'
+           )",
+        params![detail, exhausted, now, task_id, attempt, id],
+    )? == 1;
+    if changed {
+        crate::events::emit(
+            &tx,
+            if exhausted {
+                "branch_sync_failure_comment_exhausted"
+            } else {
+                "branch_sync_failure_comment_deferred"
+            },
+            &format!("branch_sync#{id}"),
+            &format!(
+                "terminal CI-fix failure comment attempt {attempt}/{FAILURE_COMMENT_MAX_ATTEMPTS} failed: {detail}"
+            ),
+            now,
+        )?;
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(changed)
 }
 
 /// Fail the active sync row bound to a judgment task inside the caller's
@@ -1993,35 +2126,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ci_failure_fix_worker_failure_fails_sync_without_retry_and_queues_pr_comment() {
-        let (_dir, mut conn) = open_tmp();
-        let sync = requested(request(&mut conn, "develop", "main", "A", 100).unwrap());
+    fn failed_ci_fix_task(
+        conn: &mut Connection,
+        source: &str,
+        target: &str,
+        pr: i64,
+        now: i64,
+    ) -> (BranchSync, i64) {
+        let sync = requested(request(conn, source, target, "A", now).unwrap());
         pin(
-            &mut conn,
+            conn,
             sync.id,
             &"a".repeat(40),
             &"b".repeat(40),
             &format!("sync/{}", sync.id),
-            101,
+            now + 1,
         )
         .unwrap()
         .unwrap();
         prepared(
-            &mut conn,
+            conn,
             sync.id,
             &format!("sync/{}", sync.id),
             &"c".repeat(40),
-            102,
+            now + 2,
         )
         .unwrap()
         .unwrap();
-        published(&mut conn, sync.id, 77, 103).unwrap().unwrap();
-        begin_checks(&mut conn, sync.id, 104).unwrap().unwrap();
-        ci_failed(&mut conn, sync.id, "PR #77 CI failed: test", 105)
+        published(conn, sync.id, pr, now + 3).unwrap().unwrap();
+        begin_checks(conn, sync.id, now + 4).unwrap().unwrap();
+        ci_failed(conn, sync.id, &format!("PR #{pr} CI failed: test"), now + 5)
             .unwrap()
             .unwrap();
-        let task_id = match create_ci_failure_fix_task(&mut conn, sync.id, 106).unwrap() {
+        let task_id = match create_ci_failure_fix_task(conn, sync.id, now + 6).unwrap() {
             CiFailureFixOutcome::Created(task) => task.task_id,
             CiFailureFixOutcome::NotEligible => unreachable!(),
         };
@@ -2034,23 +2171,23 @@ mod tests {
         )
         .unwrap();
         crate::tasks::claim(
-            &mut conn,
+            conn,
             "worker",
             Some(task_id),
             &[],
             crate::tasks::DEFAULT_LEASE_TTL_SECS,
-            107,
+            now + 7,
         )
         .unwrap()
         .unwrap();
         let transition = crate::tasks::apply_event(
-            &mut conn,
+            conn,
             "worker",
             task_id,
             &crate::lifecycle::Event::AgentFailed {
                 reason: "worker crashed".into(),
             },
-            108,
+            now + 8,
         )
         .unwrap();
         assert_eq!(transition.task.status, "failed");
@@ -2058,20 +2195,112 @@ mod tests {
             .effects
             .iter()
             .any(|effect| matches!(effect, crate::lifecycle::Effect::ResumeWorker)));
+        (sync, task_id)
+    }
+
+    #[test]
+    fn ci_failure_fix_worker_failure_fails_sync_without_retry_and_queues_pr_comment() {
+        let (_dir, mut conn) = open_tmp();
+        let (sync, task_id) = failed_ci_fix_task(&mut conn, "develop", "main", 77, 100);
         let failed = get(&conn, sync.id).unwrap().unwrap();
         assert_eq!(failed.phase, "failed");
         assert!(!failed.active);
-        assert_eq!(
-            next_failed_ci_fix_awaiting_comment(&conn)
-                .unwrap()
-                .map(|row| row.id),
-            Some(sync.id)
-        );
-        assert!(record_failure_comment_posted(&mut conn, sync.id, task_id, 109).unwrap());
-        assert!(next_failed_ci_fix_awaiting_comment(&conn)
+        let admitted = begin_failed_ci_fix_comment_attempt(&mut conn, 109)
+            .unwrap()
+            .expect("failed worker queues a comment attempt");
+        assert_eq!(admitted.sync.id, sync.id);
+        assert_eq!(admitted.attempt, 1);
+        assert!(record_failure_comment_posted(&mut conn, sync.id, task_id, 1, 110).unwrap());
+        assert!(begin_failed_ci_fix_comment_attempt(&mut conn, 200)
             .unwrap()
             .is_none());
-        assert!(!record_failure_comment_posted(&mut conn, sync.id, task_id, 110).unwrap());
+        assert!(!record_failure_comment_posted(&mut conn, sync.id, task_id, 1, 111).unwrap());
+    }
+
+    #[test]
+    fn failed_ci_fix_comment_retries_are_bounded_backed_off_and_fair() {
+        let (_dir, mut conn) = open_tmp();
+        let (oldest, oldest_task) = failed_ci_fix_task(&mut conn, "develop", "main", 77, 100);
+        let (later, later_task) = failed_ci_fix_task(&mut conn, "release", "main", 78, 200);
+
+        let first = begin_failed_ci_fix_comment_attempt(&mut conn, 300)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.sync.id, oldest.id);
+        assert!(record_failure_comment_failed(
+            &mut conn,
+            oldest.id,
+            oldest_task,
+            first.attempt,
+            "permission denied",
+            300,
+        )
+        .unwrap());
+
+        let second = begin_failed_ci_fix_comment_attempt(&mut conn, 300)
+            .unwrap()
+            .expect("the backed-off oldest row must not starve a later row");
+        assert_eq!(second.sync.id, later.id);
+        assert!(record_failure_comment_posted(
+            &mut conn,
+            later.id,
+            later_task,
+            second.attempt,
+            301,
+        )
+        .unwrap());
+
+        assert!(begin_failed_ci_fix_comment_attempt(&mut conn, 329)
+            .unwrap()
+            .is_none());
+        for (at, expected_attempt) in [(330, 2), (450, 3)] {
+            let retry = begin_failed_ci_fix_comment_attempt(&mut conn, at)
+                .unwrap()
+                .unwrap();
+            assert_eq!(retry.sync.id, oldest.id);
+            assert_eq!(retry.attempt, expected_attempt);
+            assert!(record_failure_comment_failed(
+                &mut conn,
+                oldest.id,
+                oldest_task,
+                retry.attempt,
+                "permission denied",
+                at,
+            )
+            .unwrap());
+        }
+        assert!(begin_failed_ci_fix_comment_attempt(&mut conn, 10_000)
+            .unwrap()
+            .is_none());
+        let (attempts, exhausted): (i64, bool) = conn
+            .query_row(
+                "SELECT json_extract(refs,'$.branch_sync_failure_comment_attempts'),
+                        json_extract(refs,'$.branch_sync_failure_comment_exhausted')
+                 FROM tasks WHERE id=?1",
+                [oldest_task],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempts, FAILURE_COMMENT_MAX_ATTEMPTS);
+        assert!(exhausted);
+    }
+
+    #[test]
+    fn failed_sync_does_not_mislabel_done_or_cancelled_ci_fix_tasks() {
+        let (_dir, mut conn) = open_tmp();
+        let (_, done_task) = failed_ci_fix_task(&mut conn, "develop", "main", 77, 100);
+        let (_, cancelled_task) = failed_ci_fix_task(&mut conn, "release", "main", 78, 200);
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [done_task])
+            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            [cancelled_task],
+        )
+        .unwrap();
+
+        assert!(begin_failed_ci_fix_comment_attempt(&mut conn, 300)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

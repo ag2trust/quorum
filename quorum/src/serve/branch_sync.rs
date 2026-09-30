@@ -200,20 +200,24 @@ pub async fn intake_ci_failure_fix_task(config: &ServeConfig) -> Result<()> {
 /// Leave durable operator-visible evidence on the existing sync PR when its
 /// one CI-fix worker fails. The task and sync are already terminal, so a
 /// transient GitHub failure cannot reopen or retry implementation work; a
-/// later tick retries only this idempotently-marked notification.
+/// later tick retries only this notification under a durable bounded backoff.
 pub async fn reconcile_failed_ci_fix_comment(config: &ServeConfig) -> Result<()> {
     let db_path = config.db_path.clone();
-    let sync = tokio::task::spawn_blocking(move || -> Result<Option<BranchSync>> {
-        let conn = quorum_core::db::open(&db_path)?;
-        branch_sync::next_failed_ci_fix_awaiting_comment(&conn)
+    let admitted = tokio::task::spawn_blocking(move || -> Result<_> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        branch_sync::begin_failed_ci_fix_comment_attempt(&mut conn, quorum_core::clock::now())
     })
     .await
     .map_err(|error| {
-        QuorumError::Io(format!("branch sync failure-comment lookup join: {error}"))
+        QuorumError::Io(format!(
+            "branch sync failure-comment admission join: {error}"
+        ))
     })??;
-    let Some(sync) = sync else {
+    let Some(admitted) = admitted else {
         return Ok(());
     };
+    let sync = admitted.sync;
+    let attempt = admitted.attempt;
     let Some(pr) = sync.pr else {
         return Ok(());
     };
@@ -234,21 +238,43 @@ pub async fn reconcile_failed_ci_fix_comment(config: &ServeConfig) -> Result<()>
         args.push("--repo".to_string());
         args.push(config.repo.clone());
     }
-    let output = match run_branch_sync_gh(config, &args, "gh pr comment").await {
-        Ok(output) => output,
-        Err(error) => {
-            log(&format!(
-                "branch sync #{} failure comment deferred: {error}",
-                sync.id
-            ));
-            return Ok(());
-        }
+    let failure = match run_branch_sync_gh(config, &args, "gh pr comment").await {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => Some(String::from_utf8_lossy(&output.stderr).into_owned()),
+        Err(error) => Some(error),
     };
-    if !output.status.success() {
+    if let Some(error) = failure {
+        let db_path = config.db_path.clone();
+        let id = sync.id;
+        let persisted_error = error.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&db_path)?;
+            let _ = branch_sync::record_failure_comment_failed(
+                &mut conn,
+                id,
+                task_id,
+                attempt,
+                &persisted_error,
+                quorum_core::clock::now(),
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|join_error| {
+            QuorumError::Io(format!(
+                "branch sync failure-comment failure record join: {join_error}"
+            ))
+        })??;
+        let disposition = if attempt >= branch_sync::FAILURE_COMMENT_MAX_ATTEMPTS {
+            "abandoned after bounded retries"
+        } else {
+            "deferred under durable backoff"
+        };
         log(&format!(
-            "branch sync #{} failure comment deferred: {}",
+            "branch sync #{} failure comment attempt {}/{} {disposition}: {error}",
             sync.id,
-            String::from_utf8_lossy(&output.stderr)
+            attempt,
+            branch_sync::FAILURE_COMMENT_MAX_ATTEMPTS,
         ));
         return Ok(());
     }
@@ -260,6 +286,7 @@ pub async fn reconcile_failed_ci_fix_comment(config: &ServeConfig) -> Result<()>
             &mut conn,
             id,
             task_id,
+            attempt,
             quorum_core::clock::now(),
         )?;
         Ok(())
