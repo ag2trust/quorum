@@ -723,6 +723,115 @@ pub fn publish_from_conflict(
     Ok(sync)
 }
 
+/// Settle a conflict judgment task's approved, daemon-merged delivery after
+/// the caller has proven both pinned tips are ancestors of GitHub's immutable
+/// merge commit. The compare-and-set requires the row still be the task's
+/// `published` binding; a stale, terminal, or differently bound row returns
+/// `None` unchanged. `merge_commit_sha` is the remote witness recorded in the
+/// `branch_sync_merged` event, matching the clean path's completion.
+pub fn resolve_conflict_done(
+    conn: &mut Connection,
+    id: i64,
+    task_id: i64,
+    merge_commit_sha: &str,
+    now: i64,
+) -> Result<Option<BranchSync>> {
+    if merge_commit_sha.is_empty() || merge_commit_sha.contains('\0') {
+        return Err(QuorumError::Usage(
+            "branch sync completion requires a merge commit SHA".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let sync = tx
+        .query_row(
+            &format!(
+                "UPDATE branch_syncs
+                 SET phase='done',active=0,updated_at=?1
+                 WHERE id=?2 AND task_id=?3 AND phase='published' AND active=1
+                 RETURNING {COLS}"
+            ),
+            params![now, id, task_id],
+            row_to_branch_sync,
+        )
+        .optional()?;
+    if let Some(row) = &sync {
+        crate::events::emit(
+            &tx,
+            "branch_sync_merged",
+            &format!("branch_sync#{}", row.id),
+            &format!(
+                "{} -> {} judgment task#{task_id} merged as {merge_commit_sha}",
+                row.source_branch, row.target_branch
+            ),
+            now,
+        )?;
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(sync)
+}
+
+/// Select the oldest active row whose bound judgment task has been cancelled.
+/// The daemon removes that row's `sync/<id>` branch before
+/// [`cancel_for_cancelled_task`] releases the pair, so a crash between the two
+/// steps replays the idempotent removal rather than leaking the branch.
+pub fn next_cancelled_judgment(conn: &Connection) -> Result<Option<BranchSync>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {COLS} FROM branch_syncs
+                 WHERE active=1 AND task_id IS NOT NULL
+                   AND EXISTS (SELECT 1 FROM tasks t
+                               WHERE t.id=branch_syncs.task_id AND t.status='cancelled')
+                 ORDER BY updated_at ASC, id ASC
+                 LIMIT 1"
+            ),
+            [],
+            row_to_branch_sync,
+        )
+        .optional()?)
+}
+
+/// Cancel the active row bound to a cancelled judgment task and release the
+/// pair. The compare-and-set re-proves the task binding and its `cancelled`
+/// status in the same statement; any other state returns `None` unchanged.
+/// Rows without a judgment task keep the coordinator [`cancel_request`] path.
+pub fn cancel_for_cancelled_task(
+    conn: &mut Connection,
+    id: i64,
+    task_id: i64,
+    now: i64,
+) -> Result<Option<BranchSync>> {
+    let tx = begin_immediate(conn)?;
+    let sync = tx
+        .query_row(
+            &format!(
+                "UPDATE branch_syncs
+                 SET phase='cancelled',active=0,ci_next_attempt_at=NULL,ci_wait_inflight=0,
+                     updated_at=?1
+                 WHERE id=?2 AND task_id=?3 AND active=1
+                   AND EXISTS (SELECT 1 FROM tasks t WHERE t.id=?3 AND t.status='cancelled')
+                 RETURNING {COLS}"
+            ),
+            params![now, id, task_id],
+            row_to_branch_sync,
+        )
+        .optional()?;
+    if let Some(row) = &sync {
+        crate::events::emit(
+            &tx,
+            "branch_sync_cancelled",
+            &format!("branch_sync#{}", row.id),
+            &format!(
+                "{} -> {} cancelled with judgment task#{task_id}",
+                row.source_branch, row.target_branch
+            ),
+            now,
+        )?;
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(sync)
+}
+
 /// The active sync row bound to a judgment task, if any.
 pub fn active_for_task(conn: &Connection, task_id: i64) -> Result<Option<BranchSync>> {
     Ok(conn
@@ -1663,6 +1772,94 @@ mod tests {
         // The task lifecycle, not the approval-free clean path, owns the PR.
         assert!(next_clean_path(&conn).unwrap().is_none());
         assert!(is_valid_transition("conflict", "published"));
+    }
+
+    #[test]
+    fn resolve_conflict_done_requires_bound_published_row() {
+        let (_dir, mut conn) = open_tmp();
+        let (sync, task_id) = bound_judgment_task(&mut conn);
+        let merged = "e".repeat(40);
+        // Still `conflict`: nothing has been published or merged yet.
+        assert!(
+            resolve_conflict_done(&mut conn, sync.id, task_id, &merged, 300)
+                .unwrap()
+                .is_none()
+        );
+        publish_from_conflict(&mut conn, sync.id, task_id, &"c".repeat(40), 7, 301)
+            .unwrap()
+            .unwrap();
+        assert!(resolve_conflict_done(&mut conn, sync.id, task_id, "", 302).is_err());
+        assert!(
+            resolve_conflict_done(&mut conn, sync.id, task_id + 1, &merged, 302)
+                .unwrap()
+                .is_none(),
+            "only the bound judgment task may complete the row"
+        );
+        assert!(get(&conn, sync.id).unwrap().unwrap().active);
+
+        let done = resolve_conflict_done(&mut conn, sync.id, task_id, &merged, 303)
+            .unwrap()
+            .expect("published judgment row completes");
+        assert_eq!(done.phase, "done");
+        assert!(!done.active, "completion must release the pair");
+        assert!(active_for_pair(&conn, "main", "develop").unwrap().is_none());
+        let event: String = conn
+            .query_row(
+                "SELECT kind FROM events WHERE subject=?1 ORDER BY seq DESC LIMIT 1",
+                [format!("branch_sync#{}", sync.id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event, "branch_sync_merged");
+        // A replay after completion is a clean negative.
+        assert!(
+            resolve_conflict_done(&mut conn, sync.id, task_id, &merged, 304)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cancel_for_cancelled_task_requires_cancelled_bound_task() {
+        let (_dir, mut conn) = open_tmp();
+        let (sync, task_id) = bound_judgment_task(&mut conn);
+        // An open judgment task does not authorize cancelling its row.
+        assert!(next_cancelled_judgment(&conn).unwrap().is_none());
+        assert!(cancel_for_cancelled_task(&mut conn, sync.id, task_id, 300)
+            .unwrap()
+            .is_none());
+        assert!(get(&conn, sync.id).unwrap().unwrap().active);
+
+        conn.execute("UPDATE tasks SET status='cancelled' WHERE id=?1", [task_id])
+            .unwrap();
+        let pending = next_cancelled_judgment(&conn).unwrap().unwrap();
+        assert_eq!(pending.id, sync.id);
+        assert!(
+            cancel_for_cancelled_task(&mut conn, sync.id, task_id + 1, 301)
+                .unwrap()
+                .is_none(),
+            "a different task binding cannot cancel the row"
+        );
+        let cancelled = cancel_for_cancelled_task(&mut conn, sync.id, task_id, 302)
+            .unwrap()
+            .expect("cancelled judgment task cancels its row");
+        assert_eq!(cancelled.phase, "cancelled");
+        assert!(!cancelled.active, "cancellation must release the pair");
+        assert!(next_cancelled_judgment(&conn).unwrap().is_none());
+        assert!(cancel_for_cancelled_task(&mut conn, sync.id, task_id, 303)
+            .unwrap()
+            .is_none());
+        // The coordinator path still refuses rows that carry a judgment task.
+        let unbound = requested(request(&mut conn, "main", "develop", "A", 304).unwrap());
+        assert!(matches!(
+            cancel_request(&mut conn, sync.id, "A", 305).unwrap(),
+            CancelOutcome::NotCancellable(_)
+        ));
+        assert!(
+            cancel_for_cancelled_task(&mut conn, unbound.id, task_id, 306)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

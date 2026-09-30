@@ -21,6 +21,7 @@
 
 use super::log;
 use super::merge::{self, MergeabilityState};
+use super::worktree::WorktreeManager;
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::{approvals, journal, mailbox, tasks};
 use std::path::Path;
@@ -40,6 +41,7 @@ pub struct RecoveryOutcome {
 pub(crate) async fn recover(
     db_path: &Path,
     repo_dir: &Path,
+    wt_mgr: &WorktreeManager,
     merge_executor: &Arc<dyn merge::MergeExecutor>,
     configured_base_branch: &str,
     checks_timeout_secs: u64,
@@ -235,6 +237,7 @@ pub(crate) async fn recover(
         if merge_approved(
             db_path,
             repo_dir,
+            wt_mgr,
             merge_executor,
             appr,
             configured_base_branch,
@@ -376,9 +379,11 @@ async fn adopt_stranded_verdicts(
 /// Merge a durably-approved PR and close its task. Returns `true` on a
 /// successful merge (approval + journal cleaned up), `false` if the merge did
 /// not happen (conflicting / merge failure) — the caller counts it as deferred.
+#[allow(clippy::too_many_arguments)]
 async fn merge_approved(
     db_path: &Path,
     repo_dir: &Path,
+    wt_mgr: &WorktreeManager,
     merge_executor: &Arc<dyn merge::MergeExecutor>,
     appr: &approvals::Approval,
     configured_base_branch: &str,
@@ -623,6 +628,17 @@ async fn merge_approved(
         log(&format!("PARKED: task #{}: {reason}", appr.task_id));
         return Ok(false);
     };
+
+    // A branch-sync judgment row is verified and settled before its task
+    // closes, exactly as on the live merge paths.
+    super::settle_branch_sync_judgment_merge(
+        db_path,
+        repo_dir,
+        wt_mgr,
+        appr.task_id,
+        &merge_commit_sha,
+    )
+    .await?;
 
     if attempt_admitted {
         let p = db_path.to_path_buf();
@@ -881,9 +897,17 @@ mod tests {
 
         let concrete = Arc::new(MockExec::new(HashMap::from([(208, "2c0c833".to_string())])));
         let exec: Arc<dyn merge::MergeExecutor> = concrete.clone();
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let outcome = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.merged, 1, "matching approval must merge");
         assert_eq!(
@@ -934,9 +958,17 @@ mod tests {
         drop(conn);
 
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "2c0c833".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let outcome = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.merged, 1);
         let conn = db::open(&db_path).unwrap();
@@ -984,9 +1016,17 @@ mod tests {
         let exec = exec_arc(
             MockExec::new(HashMap::from([(208, "2c0c833".to_string())])).without_merge_commit_sha(),
         );
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let outcome = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.merged, 0);
         assert_eq!(outcome.deferred, 1);
@@ -1043,9 +1083,17 @@ mod tests {
             "same-head".to_string(),
         )])));
         let exec: Arc<dyn merge::MergeExecutor> = concrete.clone();
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let outcome = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.deferred, 1);
         assert!(concrete.merged.lock().unwrap().is_empty());
@@ -1094,9 +1142,17 @@ mod tests {
             "same-head".to_string(),
         )])));
         let exec: Arc<dyn merge::MergeExecutor> = concrete.clone();
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let outcome = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.deferred, 1);
         assert!(concrete.merged.lock().unwrap().is_empty());
@@ -1165,9 +1221,17 @@ mod tests {
             "same-head".to_string(),
         )])));
         let exec: Arc<dyn merge::MergeExecutor> = concrete.clone();
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let outcome = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.deferred, 1);
         assert!(concrete.merged.lock().unwrap().is_empty());
@@ -1217,9 +1281,17 @@ mod tests {
             "same-head".to_string(),
         )])));
         let exec: Arc<dyn merge::MergeExecutor> = concrete.clone();
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let outcome = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.deferred, 1);
         assert!(concrete.merged.lock().unwrap().is_empty());
@@ -1267,9 +1339,17 @@ mod tests {
                 .failing(merge::MergeFailureKind::PolicyBlocked),
         );
         let exec: Arc<dyn merge::MergeExecutor> = concrete.clone();
-        let first = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let first = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
         assert_eq!(first.deferred, 1);
         assert_eq!(concrete.merged.lock().unwrap().len(), 1);
 
@@ -1283,9 +1363,17 @@ mod tests {
         assert_eq!(approvals::get_for_pr(&conn, 208).unwrap().len(), 2);
         drop(conn);
 
-        let second = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let second = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
         assert_eq!(second.deferred, 1);
         assert_eq!(
             concrete.merged.lock().unwrap().len(),
@@ -1343,9 +1431,17 @@ mod tests {
                 .failing(merge::MergeFailureKind::Retryable),
         );
         let exec: Arc<dyn merge::MergeExecutor> = concrete.clone();
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let outcome = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.deferred, 1);
         assert_eq!(concrete.merged.lock().unwrap().len(), 1);
 
@@ -1389,9 +1485,17 @@ mod tests {
 
         // Current head differs from approved head → stale.
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "NEW_sha".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let outcome = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.merged, 0, "stale approval must not merge");
         assert_eq!(outcome.demoted, 1);
@@ -1426,9 +1530,17 @@ mod tests {
         drop(conn);
 
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "abc".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let outcome = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.merged, 0);
         assert_eq!(outcome.rejected, 1, "self-review must be rejected");
@@ -1500,9 +1612,17 @@ mod tests {
         drop(conn);
 
         let exec = exec_arc(MockExec::new(HashMap::from([(208, HEAD.to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let outcome = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.adopted, 1, "stranded verdict must be adopted");
         assert_eq!(outcome.merged, 1, "adopted approval must merge");
@@ -1559,9 +1679,17 @@ mod tests {
 
         let concrete = Arc::new(MockExec::new(HashMap::from([(208, CURRENT.to_string())])));
         let exec: Arc<dyn merge::MergeExecutor> = concrete.clone();
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let outcome = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.adopted, 0);
         assert_eq!(outcome.merged, 0);
@@ -1601,9 +1729,17 @@ mod tests {
         drop(conn);
 
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "2c0c833".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let outcome = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.adopted, 0, "unattested verdict must not be adopted");
         assert_eq!(outcome.merged, 0);
@@ -1654,9 +1790,17 @@ mod tests {
         let mut m = MockExec::new(HashMap::from([(208, "abc".to_string())]));
         m.conflicting = true;
         let exec = exec_arc(m);
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let outcome = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.merged, 0);
         assert_eq!(outcome.deferred, 1);
@@ -1692,9 +1836,17 @@ mod tests {
         drop(conn);
 
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "2c0c833".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let outcome = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.merged, 0, "R1-only must not merge");
         assert_eq!(outcome.demoted, 0, "R1 matches SHA, not demoted");
@@ -1747,9 +1899,17 @@ mod tests {
 
         // Current head matches R2 but not R1 → R1 is stale → demoted.
         let exec = exec_arc(MockExec::new(HashMap::from([(208, "sha_new".to_string())])));
-        let outcome = recover(&db_path, Path::new("/tmp/repo"), &exec, "main", 10, 1)
-            .await
-            .unwrap();
+        let outcome = recover(
+            &db_path,
+            Path::new("/tmp/repo"),
+            &WorktreeManager::new(),
+            &exec,
+            "main",
+            10,
+            1,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome.merged, 0, "mixed-SHA must not merge");
         assert_eq!(outcome.demoted, 1, "stale R1 demoted");
