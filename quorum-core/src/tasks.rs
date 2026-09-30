@@ -4336,11 +4336,11 @@ pub fn dispose_managed_run_exit(
     dispose_managed_exit_inner(conn, role, agent, id, Some(run_id), reason, now)
 }
 
-/// Outcome of failing a torn-down worker's task.
-#[derive(Debug)]
-pub enum WorkerTeardownFailure {
+/// Outcome of applying a sweep-aware failure to a worker assignment.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkerFailureOutcome {
     /// `AgentFailed` was applied to the task's current status.
-    Failed(Box<TransitionResult>),
+    Applied(Box<TransitionResult>),
     /// The write-path sweep in this same transaction already moved the task
     /// out of the worker's `working`/`rework` assignment (normally a lapsed
     /// lease reaped to `open`/`rework`, which also spends a recovery
@@ -4349,8 +4349,8 @@ pub enum WorkerTeardownFailure {
     AlreadyRecoveredBySweep,
 }
 
-/// Fail a worker's task during daemon teardown without double-transitioning
-/// a task the storage sweep already recovered.
+/// Fail a worker assignment without double-transitioning a task the storage
+/// sweep already recovered.
 ///
 /// `apply_event` sweeps inside its transaction *before* reading the task. For
 /// a worker whose lease lapsed (for example while the daemon was wedged and
@@ -4361,13 +4361,13 @@ pub enum WorkerTeardownFailure {
 /// recovery is committed and no event is applied. Every other status keeps
 /// the ordinary `AgentFailed` transition (and its loud rejection when
 /// genuinely invalid).
-pub fn fail_worker_for_teardown(
+pub fn fail_worker_assignment(
     conn: &mut Connection,
     agent: &str,
     id: i64,
     reason: &str,
     now: i64,
-) -> Result<WorkerTeardownFailure> {
+) -> Result<WorkerFailureOutcome> {
     let tx = begin_immediate(conn)?;
     let read_assignment = |tx: &Transaction<'_>| -> Result<Option<(String, Option<String>)>> {
         Ok(tx
@@ -4387,7 +4387,7 @@ pub fn fail_worker_for_teardown(
     if was_worker_assignment && before != after {
         crate::agents::touch(&tx, agent, now)?;
         tx.commit()?;
-        return Ok(WorkerTeardownFailure::AlreadyRecoveredBySweep);
+        return Ok(WorkerFailureOutcome::AlreadyRecoveredBySweep);
     }
     apply_event_tx_with_deferred_sweep(
         tx,
@@ -4400,7 +4400,7 @@ pub fn fail_worker_for_teardown(
         true,
         |_| Ok(()),
     )
-    .map(|transition| WorkerTeardownFailure::Failed(Box::new(transition)))
+    .map(|transition| WorkerFailureOutcome::Applied(Box::new(transition)))
 }
 
 fn dispose_managed_exit_inner(
@@ -6678,6 +6678,76 @@ mod tests {
             review_pr,
             now,
         )
+    }
+
+    #[test]
+    fn fail_worker_assignment_returns_applied_transition() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 1_000,
+        )
+        .unwrap();
+        claim(&mut conn, "worker", Some(task_id), &[], TTL, 1_000).unwrap();
+
+        let outcome =
+            fail_worker_assignment(&mut conn, "worker", task_id, "worker process exited", 1_001)
+                .unwrap();
+
+        let WorkerFailureOutcome::Applied(transition) = outcome else {
+            panic!("live worker failure must apply AgentFailed");
+        };
+        assert_eq!(transition.task.status, "open");
+        assert_eq!(transition.task.recovery_attempts, 1);
+        assert_eq!(get(&conn, task_id).unwrap().unwrap(), transition.task);
+    }
+
+    #[test]
+    fn fail_worker_assignment_reports_recovery_by_same_transaction_sweep() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 1_000,
+        )
+        .unwrap();
+        claim(&mut conn, "worker", Some(task_id), &[], TTL, 1_000).unwrap();
+        conn.execute(
+            "UPDATE claims SET expires_at=1001 WHERE target=?1 AND active=1",
+            [lease_target(task_id)],
+        )
+        .unwrap();
+
+        let outcome =
+            fail_worker_assignment(&mut conn, "worker", task_id, "worker process exited", 1_001)
+                .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkerFailureOutcome::AlreadyRecoveredBySweep
+        ));
+        let task = get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert_eq!(task.assignee, None);
+        assert_eq!(task.recovery_attempts, 1);
+    }
+
+    #[test]
+    fn fail_worker_assignment_rejects_task_without_worker_state() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 1_000,
+        )
+        .unwrap();
+
+        let error =
+            fail_worker_assignment(&mut conn, "worker", task_id, "worker process exited", 1_001)
+                .unwrap_err();
+
+        let QuorumError::Usage(message) = error else {
+            panic!("open-task AgentFailed must be an invalid transition");
+        };
+        assert!(message.contains("invalid transition"), "{message}");
+        let task = get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert_eq!(task.recovery_attempts, 0);
     }
 
     #[test]
