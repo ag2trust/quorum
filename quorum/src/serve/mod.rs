@@ -2599,6 +2599,47 @@ fn enforce_sticky_branch_sync_ci_fix_reviewer_target(
     Ok(accepted)
 }
 
+/// Apply the sticky CI-fix authority check when a head-only GitHub probe
+/// observes the PR. The persisted tuple supplies the immutable PR/ref/fork
+/// identity; only the newly observed head is substituted. This lets CI-gate
+/// and final-feed probes stale-fail a foreign push without another target
+/// lookup or any network work inside the transaction.
+fn enforce_sticky_branch_sync_ci_fix_observed_head(
+    conn: &mut quorum_core::Connection,
+    task_id: i64,
+    pr: i64,
+    observed_head: &str,
+) -> Result<bool> {
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    let Some(task) = tasks::get(&tx, task_id)? else {
+        tx.commit()?;
+        return Ok(false);
+    };
+    if task.status != "in-review" {
+        tx.commit()?;
+        return Ok(false);
+    }
+    let existing = pr_targets::get(&tx, task_id, pr)?;
+    let observed = ResolvedReviewerPrTarget {
+        target: PrTarget {
+            pr,
+            head_ref: existing
+                .as_ref()
+                .map(|target| target.head_ref.clone())
+                .unwrap_or_default(),
+            head_sha: observed_head.to_string(),
+            is_fork: existing.as_ref().is_some_and(|target| target.is_fork),
+            base_ref: None,
+            state: None,
+        },
+        source: ReviewerPrTargetSource::Live,
+    };
+    let accepted =
+        enforce_branch_sync_ci_fix_reviewer_target_tx(&tx, &task, existing.as_ref(), &observed)?;
+    tx.commit()?;
+    Ok(accepted)
+}
+
 async fn validate_reviewer_pr_target_for_task(
     resolved: &ResolvedReviewerPrTarget,
     expected_pr: i64,
@@ -9575,6 +9616,57 @@ async fn handle_pre_review_checks_failure(
     Ok(())
 }
 
+async fn sticky_branch_sync_ci_fix_observed_head_matches(
+    db_path: &Path,
+    task_id: i64,
+    pr: i64,
+    observed_head: &str,
+) -> Result<bool> {
+    let db_path = db_path.to_path_buf();
+    let observed_head = observed_head.to_string();
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        enforce_sticky_branch_sync_ci_fix_observed_head(&mut conn, task_id, pr, &observed_head)
+    })
+    .await
+    .map_err(|error| {
+        QuorumError::Io(format!(
+            "branch-sync sticky re-review observed-head guard join for task #{task_id}: {error}"
+        ))
+    })?
+}
+
+async fn cleanup_stale_branch_sync_ci_fix_slots(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    reviewers: &mut Vec<SlotState>,
+    task_id: i64,
+) {
+    if let Some(index) = reviewers
+        .iter()
+        .position(|reviewer| reviewer.task_id == task_id)
+    {
+        let reviewer = reviewers.remove(index);
+        teardown_reviewer(config, wt_mgr, name_pool, reviewer, "stale_authority").await;
+    }
+    if let Some(index) = workers.iter().position(|worker| worker.task_id == task_id) {
+        let worker = workers.remove(index);
+        cleanup_slot_inner(
+            config,
+            wt_mgr,
+            name_pool,
+            worker,
+            None,
+            false,
+            "stale_authority",
+            None,
+        )
+        .await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn resume_reviewer_after_ci(
     config: &ServeConfig,
@@ -9599,6 +9691,29 @@ async fn resume_reviewer_after_ci(
 
     let (ci_gate, gated_head_sha, head_polled) =
         poll_resume_reviewer_pre_review_checks(config, pre_review_checks, task_id, pr).await?;
+    // A newly polled head is checked before pending/failed handling. Cached
+    // heads were checked on the tick that observed them, so they need no
+    // repeated write transaction while their check wait is in flight.
+    if head_polled
+        && !gated_head_sha.is_empty()
+        && !sticky_branch_sync_ci_fix_observed_head_matches(
+            &config.db_path,
+            task_id,
+            pr,
+            &gated_head_sha,
+        )
+        .await?
+    {
+        log(&format!(
+            "ResumeReviewer: task #{task_id} lost immutable branch-sync CI-fix target authority at CI gate; reviewer not fed"
+        ));
+        pre_review_checks.remove(&task_id);
+        cleanup_stale_branch_sync_ci_fix_slots(
+            config, wt_mgr, name_pool, workers, reviewers, task_id,
+        )
+        .await;
+        return Ok(true);
+    }
     match ci_gate {
         PreReviewChecksGate::Waiting => {
             if head_polled {
@@ -9790,9 +9905,8 @@ async fn resume_reviewer_after_ci(
 
     if matches!(branch_sync_scope, Some(BranchSyncReviewScope::CiFix { .. })) {
         // A foreign push after the earlier live-target lookup must not race
-        // the final authority transaction and reviewer feed. Defer it now;
-        // the next tick gates that head and then stale-fails it against the
-        // immutable worker-published target.
+        // the final authority transaction and reviewer feed. A known changed
+        // head is stale-failed now; only an unavailable probe is deferred.
         let feed_head_sha = {
             let repo = config.repo_dir.clone();
             let executor = Arc::clone(&config.merge_executor);
@@ -9801,11 +9915,34 @@ async fn resume_reviewer_after_ci(
                 .ok()
                 .flatten()
         };
-        if feed_head_sha.as_deref() != Some(gated_head_sha.as_str()) {
+        let Some(feed_head_sha) = feed_head_sha else {
             log(&format!(
-                "ResumeReviewer: branch-sync CI-fix PR #{pr} head moved at re-review feed boundary; reviewer not fed"
+                "ResumeReviewer: branch-sync CI-fix PR #{pr} head unavailable at re-review feed boundary; reviewer not fed"
             ));
             return Ok(false);
+        };
+        if !sticky_branch_sync_ci_fix_observed_head_matches(
+            &config.db_path,
+            task_id,
+            pr,
+            &feed_head_sha,
+        )
+        .await?
+        {
+            log(&format!(
+                "ResumeReviewer: task #{task_id} lost immutable branch-sync CI-fix target authority at re-review feed boundary; reviewer not fed"
+            ));
+            pre_review_checks.remove(&task_id);
+            cleanup_stale_branch_sync_ci_fix_slots(
+                config, wt_mgr, name_pool, workers, reviewers, task_id,
+            )
+            .await;
+            return Ok(true);
+        }
+        if feed_head_sha != gated_head_sha {
+            return Err(QuorumError::Io(format!(
+                "branch-sync CI-fix task #{task_id} accepted inconsistent gated and feed heads"
+            )));
         }
 
         let db_path = config.db_path.clone();
@@ -9825,22 +9962,10 @@ async fn resume_reviewer_after_ci(
                 "ResumeReviewer: task #{task_id} lost immutable branch-sync CI-fix target authority; reviewer not fed"
             ));
             pre_review_checks.remove(&task_id);
-            let reviewer = reviewers.remove(reviewer_index);
-            teardown_reviewer(config, wt_mgr, name_pool, reviewer, "stale_authority").await;
-            if let Some(index) = workers.iter().position(|worker| worker.task_id == task_id) {
-                let worker = workers.remove(index);
-                cleanup_slot_inner(
-                    config,
-                    wt_mgr,
-                    name_pool,
-                    worker,
-                    None,
-                    false,
-                    "stale_authority",
-                    None,
-                )
-                .await;
-            }
+            cleanup_stale_branch_sync_ci_fix_slots(
+                config, wt_mgr, name_pool, workers, reviewers, task_id,
+            )
+            .await;
             return Ok(true);
         }
     }
@@ -47464,6 +47589,126 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(quorum_core::approvals::get_for_pr(&conn, 42)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn branch_sync_ci_fix_observed_head_drift_preempts_pending_and_failed_ci_gates() {
+        for gate in [
+            PreReviewChecksGate::Waiting,
+            PreReviewChecksGate::Failed {
+                failing_checks: vec!["tests".into()],
+            },
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut conn = open_test_db(dir.path());
+            let sync =
+                match quorum_core::branch_sync::request(&mut conn, "develop", "main", "owner", 1)
+                    .unwrap()
+                {
+                    quorum_core::branch_sync::RequestOutcome::Requested(sync) => sync,
+                    quorum_core::branch_sync::RequestOutcome::AlreadyActive(_) => unreachable!(),
+                };
+            let branch = format!("sync/{}", sync.id);
+            quorum_core::branch_sync::pin(
+                &mut conn,
+                sync.id,
+                &"a".repeat(40),
+                &"b".repeat(40),
+                &branch,
+                2,
+            )
+            .unwrap()
+            .unwrap();
+            let merge_sha = "c".repeat(40);
+            quorum_core::branch_sync::prepared(&mut conn, sync.id, &branch, &merge_sha, 3)
+                .unwrap()
+                .unwrap();
+            quorum_core::branch_sync::published(&mut conn, sync.id, 42, 4)
+                .unwrap()
+                .unwrap();
+            quorum_core::branch_sync::begin_checks(&mut conn, sync.id, 5)
+                .unwrap()
+                .unwrap();
+            quorum_core::branch_sync::ci_failed(&mut conn, sync.id, "PR #42 CI failed: test", 6)
+                .unwrap()
+                .unwrap();
+            let task_id =
+                match quorum_core::branch_sync::create_ci_failure_fix_task(&mut conn, sync.id, 7)
+                    .unwrap()
+                {
+                    quorum_core::branch_sync::CiFailureFixOutcome::Created(task) => task.task_id,
+                    quorum_core::branch_sync::CiFailureFixOutcome::NotEligible => unreachable!(),
+                };
+            let published_rework_head = "d".repeat(40);
+            pr_targets::upsert(
+                &mut conn,
+                task_id,
+                42,
+                &branch,
+                &published_rework_head,
+                false,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks
+                 SET status='in-review',assignee='Worker',reviewer='Sticky-R1',
+                     refs=json_set(
+                         refs,'$.pr',42,'$.cx_est',3,'$.cx_size','M',
+                         '$.cx_ready',json('true'),'$.cx_not_ready_reason',json('null'),
+                         '$.cx_risk_flags',json('[]')
+                     )
+                 WHERE id=?1",
+                [task_id],
+            )
+            .unwrap();
+
+            // The full live-target lookup saw the authorized worker head H2.
+            assert!(enforce_sticky_branch_sync_ci_fix_reviewer_target(
+                &mut conn,
+                task_id,
+                &live_reviewer_target(42, &branch, &published_rework_head),
+            )
+            .unwrap());
+
+            // A later head-only probe sees foreign H3. This guard runs before
+            // `resume_reviewer_after_ci` handles either gate result, so H3 can
+            // neither wait indefinitely nor launch remediation for failed CI.
+            let foreign_head = "e".repeat(40);
+            assert!(
+                !enforce_sticky_branch_sync_ci_fix_observed_head(
+                    &mut conn,
+                    task_id,
+                    42,
+                    &foreign_head,
+                )
+                .unwrap(),
+                "foreign head must preempt {gate:?} handling",
+            );
+
+            let task = tasks::get(&conn, task_id).unwrap().unwrap();
+            assert_eq!(task.status, "failed", "gate {gate:?}");
+            assert!(task.assignee.is_none(), "gate {gate:?}");
+            assert!(task.reviewer.is_none(), "gate {gate:?}");
+            assert_eq!(
+                pr_targets::get(&conn, task_id, 42)
+                    .unwrap()
+                    .unwrap()
+                    .head_sha,
+                published_rework_head,
+                "gate {gate:?}",
+            );
+            let failed_sync = quorum_core::branch_sync::get(&conn, sync.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(failed_sync.phase, "failed", "gate {gate:?}");
+            assert!(!failed_sync.active, "gate {gate:?}");
+            assert!(
+                tasks::ci_remediation_intent(task.refs.as_deref())
+                    .unwrap()
+                    .is_none(),
+                "foreign failed-check head must not launch remediation",
+            );
+        }
     }
 
     #[tokio::test]
