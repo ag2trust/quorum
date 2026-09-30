@@ -8765,6 +8765,7 @@ fn classify_tick_error(e: &QuorumError) -> TickErrorAction {
         | QuorumError::BadInput(_)
         | QuorumError::Busy
         | QuorumError::FallbackInstallConflict
+        | QuorumError::TerminalIdentityRejected(_)
         | QuorumError::Db(_)
         | QuorumError::Io(_) => TickErrorAction::Continue,
     }
@@ -14583,39 +14584,10 @@ async fn tick(
                     break;
                 }
                 GrokWorkerDeliveryGate::Failed(reason) => {
-                    let worker_name = workers[wi].agent_name.clone();
-                    let worker_task_id = workers[wi].task_id;
-                    log(&format!(
-                        "Grok worker {worker_name} delivery for task #{worker_task_id} failed before review: {reason}"
-                    ));
-                    let failed = fire_event(
-                        &db_path,
-                        &worker_name,
-                        worker_task_id,
-                        &Event::AgentFailed {
-                            reason: format!("Grok submission rejected before review: {reason}"),
-                        },
+                    settle_failed_grok_worker_delivery(
+                        config, wt_mgr, name_pool, workers, wi, *id, &reason,
                     )
                     .await;
-                    if failed.is_some() {
-                        let worker = workers.remove(wi);
-                        cleanup_slot(
-                            config,
-                            wt_mgr,
-                            name_pool,
-                            worker,
-                            None,
-                            "terminal_handoff_failed",
-                        )
-                        .await;
-                        if !consume_mailbox_row(&db_path, *id).await {
-                            break;
-                        }
-                    } else {
-                        log(&format!(
-                            "FATAL: Grok delivery failure for task #{worker_task_id} could not be persisted; retaining worker and mailbox authority"
-                        ));
-                    }
                     break;
                 }
             }
@@ -18461,13 +18433,13 @@ struct DurableGrokWorkerIdentity {
 /// branch for the otherwise exact provider session.
 fn bind_grok_worker_branch(refs: &mut serde_json::Value, branch: &str) -> Result<()> {
     if branch.is_empty() {
-        return Err(QuorumError::Io(
+        return Err(QuorumError::TerminalIdentityRejected(
             "Grok worker terminal identity is missing its branch".into(),
         ));
     }
     if let Some(recorded) = refs.get("branch").and_then(serde_json::Value::as_str) {
         if recorded != branch {
-            return Err(QuorumError::Io(
+            return Err(QuorumError::TerminalIdentityRejected(
                 "Grok worker terminal branch does not match the durable task branch".into(),
             ));
         }
@@ -18519,7 +18491,7 @@ fn bind_grok_max_turn_checkpoint(
         || retry.requested
         || !runner_state::pending_turn_is_complete(retry)
     {
-        return Err(QuorumError::Io(
+        return Err(QuorumError::TerminalIdentityRejected(
             "Grok max-turn checkpoint retry does not match its terminal session".into(),
         ));
     }
@@ -18557,12 +18529,53 @@ fn bind_grok_max_turn_checkpoint(
             runner_state::set_provider_block(refs, &block, retry);
             return Ok(());
         }
-        return Err(QuorumError::Io(
+        return Err(QuorumError::TerminalIdentityRejected(
             "Grok max-turn checkpoint conflicts with an existing provider retry".into(),
         ));
     }
     runner_state::set_provider_block(refs, &block, retry);
     Ok(())
+}
+
+/// A fresh initial Grok worker can only complete its terminal handoff when
+/// the task carries no prior worker handoff: `persist_initial_grok_worker_session`
+/// rejects any existing `runner_initial_worker_session` or worker
+/// `runner_continuation` that is not byte-identical to its own handoff, which
+/// a new provider session can never be. Launching anyway spends a full turn
+/// whose delivery is then rejected. Mirror that rejection before launch so
+/// the retained durable session is surfaced instead of silently forked or
+/// cleared. Returns the durable reason when the launch must be refused.
+fn grok_fresh_initial_launch_conflict(task_id: i64, refs: Option<&str>) -> Option<String> {
+    let refs: serde_json::Value = match refs.map(serde_json::from_str).transpose() {
+        Ok(refs) => refs.unwrap_or_else(|| serde_json::json!({})),
+        Err(error) => {
+            return Some(format!(
+                "fresh Grok initial worker refused for task #{task_id}: task refs are not valid JSON ({error})"
+            ));
+        }
+    };
+    if let Some(raw) = refs.get(runner_state::INITIAL_WORKER_SESSION_REF) {
+        let detail = runner_state::initial_worker_session(&refs)
+            .map(|session| {
+                format!(
+                    "session {} by {} ({})",
+                    session.session_id, session.agent, session.responsibility_key
+                )
+            })
+            .unwrap_or_else(|| format!("unparseable record {raw}"));
+        return Some(format!(
+            "fresh Grok initial worker refused for task #{task_id}: task refs retain a durable Grok initial worker session handoff ({detail}); a new initial turn cannot hand off over it"
+        ));
+    }
+    if let Some(raw) = refs.get(runner_state::CONTINUATION_REF) {
+        let detail = serde_json::from_value::<ContinuationIdentity>(raw.clone())
+            .map(|identity| format!("{} {}", identity.provider, identity.id))
+            .unwrap_or_else(|_| format!("unparseable record {raw}"));
+        return Some(format!(
+            "fresh Grok initial worker refused for task #{task_id}: task refs retain a worker runner continuation ({detail}) that no new initial Grok session can match"
+        ));
+    }
+    None
 }
 
 /// Atomically hand off a fresh Grok worker's terminal session identity.
@@ -18582,12 +18595,14 @@ async fn persist_initial_grok_worker_session(
         || session_id.trim() != session_id
         || session_id.chars().any(char::is_control)
     {
-        return Err(QuorumError::Io(
+        return Err(QuorumError::TerminalIdentityRejected(
             "Grok terminal session identity is malformed".into(),
         ));
     }
     let request = slot.worker_request().cloned().ok_or_else(|| {
-        QuorumError::Io("Grok terminal session is missing its exact RunnerRequest".into())
+        QuorumError::TerminalIdentityRejected(
+            "Grok terminal session is missing its exact RunnerRequest".into(),
+        )
     })?;
     if slot.process_kind() != runner::AgentKind::Grok
         || request.task_id != slot.task_id
@@ -18602,16 +18617,20 @@ async fn persist_initial_grok_worker_session(
         || request.pending_turn.turn_kind != "initial"
         || slot.continuation_id.is_some()
     {
-        return Err(QuorumError::Io(
+        return Err(QuorumError::TerminalIdentityRejected(
             "Grok terminal identity does not belong to a fresh initial worker turn".into(),
         ));
     }
 
     let run_id = slot.agent_run_id.ok_or_else(|| {
-        QuorumError::Io("Grok worker terminal identity is missing its agent run".into())
+        QuorumError::TerminalIdentityRejected(
+            "Grok worker terminal identity is missing its agent run".into(),
+        )
     })?;
     let cap_run_id = slot.cap_run_id.clone().ok_or_else(|| {
-        QuorumError::Io("Grok worker terminal identity is missing its run capability".into())
+        QuorumError::TerminalIdentityRejected(
+            "Grok worker terminal identity is missing its run capability".into(),
+        )
     })?;
     let path = db_path.to_path_buf();
     let task_id = request.task_id;
@@ -18637,7 +18656,7 @@ async fn persist_initial_grok_worker_session(
         if !matches!(status.as_str(), "working" | "rework")
             || assignee.as_deref() != Some(agent.as_str())
         {
-            return Err(QuorumError::Io(format!(
+            return Err(QuorumError::TerminalIdentityRejected(format!(
                 "Grok worker terminal identity arrived after task #{task_id} left its exact working assignment"
             )));
         }
@@ -18686,7 +18705,7 @@ async fn persist_initial_grok_worker_session(
             || durable.assignment_model != model
             || durable.assignment_effort != effort
         {
-            return Err(QuorumError::Io(
+            return Err(QuorumError::TerminalIdentityRejected(
                 "Grok terminal session does not match its durable task, assignment, role, model, effort, and runner identity".into(),
             ));
         }
@@ -18701,7 +18720,7 @@ async fn persist_initial_grok_worker_session(
             |row| row.get(0),
         )?;
         if !owns_capability {
-            return Err(QuorumError::Io(
+            return Err(QuorumError::TerminalIdentityRejected(
                 "Grok terminal session lost its exact worker capability".into(),
             ));
         }
@@ -18749,7 +18768,7 @@ async fn persist_initial_grok_worker_session(
                 // Keep going so a pre-fix partial handoff can be atomically
                 // completed with its matching max-turn provider block.
             } else {
-                return Err(QuorumError::Io(
+                return Err(QuorumError::TerminalIdentityRejected(
                     "Grok emitted a duplicate or conflicting terminal session identity".into(),
                 ));
             }
@@ -18773,7 +18792,7 @@ async fn persist_initial_grok_worker_session(
             rusqlite::params![task_id, refs.to_string(), now_unix(), agent, revision],
         )?;
         if updated != 1 {
-            return Err(QuorumError::Io(
+            return Err(QuorumError::TerminalIdentityRejected(
                 "Grok worker terminal identity lost task authority before persistence".into(),
             ));
         }
@@ -18802,24 +18821,30 @@ async fn persist_grok_worker_continuation(
         || session_id.trim() != session_id
         || session_id.chars().any(char::is_control)
     {
-        return Err(QuorumError::Io(
+        return Err(QuorumError::TerminalIdentityRejected(
             "Grok terminal session identity is malformed".into(),
         ));
     }
     let previous_session = slot.continuation_id.clone().ok_or_else(|| {
-        QuorumError::Io("Grok resumed worker terminal identity is missing its continuation".into())
+        QuorumError::TerminalIdentityRejected(
+            "Grok resumed worker terminal identity is missing its continuation".into(),
+        )
     })?;
     if slot.process_kind() != runner::AgentKind::Grok || slot.worker_request().is_some() {
-        return Err(QuorumError::Io(
+        return Err(QuorumError::TerminalIdentityRejected(
             "Grok terminal identity does not belong to a resumed worker turn".into(),
         ));
     }
 
     let run_id = slot.agent_run_id.ok_or_else(|| {
-        QuorumError::Io("Grok worker terminal identity is missing its agent run".into())
+        QuorumError::TerminalIdentityRejected(
+            "Grok worker terminal identity is missing its agent run".into(),
+        )
     })?;
     let cap_run_id = slot.cap_run_id.clone().ok_or_else(|| {
-        QuorumError::Io("Grok worker terminal identity is missing its run capability".into())
+        QuorumError::TerminalIdentityRejected(
+            "Grok worker terminal identity is missing its run capability".into(),
+        )
     })?;
     let path = db_path.to_path_buf();
     let task_id = slot.task_id;
@@ -18842,7 +18867,7 @@ async fn persist_grok_worker_continuation(
         if !matches!(status.as_str(), "working" | "rework")
             || assignee.as_deref() != Some(agent.as_str())
         {
-            return Err(QuorumError::Io(format!(
+            return Err(QuorumError::TerminalIdentityRejected(format!(
                 "Grok worker terminal identity arrived after task #{task_id} left its exact worker assignment"
             )));
         }
@@ -18889,7 +18914,7 @@ async fn persist_grok_worker_continuation(
             || durable.assignment_model != model
             || durable.assignment_effort != effort
         {
-            return Err(QuorumError::Io(
+            return Err(QuorumError::TerminalIdentityRejected(
                 "Grok resumed terminal session does not match its durable task, assignment, role, model, effort, and runner identity".into(),
             ));
         }
@@ -18904,7 +18929,7 @@ async fn persist_grok_worker_continuation(
             |row| row.get(0),
         )?;
         if !owns_capability {
-            return Err(QuorumError::Io(
+            return Err(QuorumError::TerminalIdentityRejected(
                 "Grok terminal session lost its exact worker capability".into(),
             ));
         }
@@ -18917,18 +18942,18 @@ async fn persist_grok_worker_continuation(
             .unwrap_or_else(|| serde_json::json!({}));
         bind_grok_worker_branch(&mut refs, &branch)?;
         if runner_state::initial_worker_session(&refs).is_none() {
-            return Err(QuorumError::Io(
+            return Err(QuorumError::TerminalIdentityRejected(
                 "Grok resumed worker is missing its initial durable session handoff".into(),
             ));
         }
         let persisted = runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")
             .ok_or_else(|| {
-                QuorumError::Io(
+                QuorumError::TerminalIdentityRejected(
                     "Grok resumed worker is missing its persisted continuation".into(),
                 )
             })?;
         if persisted.id != previous_session && persisted.id != session_id {
-            return Err(QuorumError::Io(
+            return Err(QuorumError::TerminalIdentityRejected(
                 "Grok resumed worker continuation does not match its launch identity".into(),
             ));
         }
@@ -18951,7 +18976,7 @@ async fn persist_grok_worker_continuation(
             rusqlite::params![task_id, refs.to_string(), now_unix(), agent, revision],
         )?;
         if updated != 1 {
-            return Err(QuorumError::Io(
+            return Err(QuorumError::TerminalIdentityRejected(
                 "Grok worker terminal identity lost task authority before persistence".into(),
             ));
         }
@@ -19427,7 +19452,11 @@ fn slot_is_graceful_drain_candidate(slot: &SlotState) -> bool {
 /// - A worker whose task is already in review is cleaned up without a
 ///   lifecycle mutation. An unconditional `AgentFailed` there releases the
 ///   review lease and clears `tasks.reviewer`, which orphans the reviewer's
-///   verdict. Every other worker keeps the previous `AgentFailed` teardown.
+///   verdict. A worker whose task is mid-merge keeps the explicit
+///   `AgentFailed` reset to in-review. Every other worker classifies its exit
+///   through the exact-run disposition: an unconsumed matching Done row
+///   retains the slot so Phase 2 delivers it on a later tick; only a run that
+///   still owns its phase without an outcome is failed back.
 /// - A reviewer classifies its exit through the same exact-run disposition
 ///   the dead-process path (Phase 4b) uses. A verdict row that landed after
 ///   this tick's mailbox poll is folded atomically (the startup late-verdict
@@ -19448,34 +19477,99 @@ async fn drain_idle_agents(
         .map(|(i, _)| i)
         .collect();
     for &i in drain_workers.iter().rev() {
-        let w = workers.remove(i);
+        let agent_name = workers[i].agent_name.clone();
+        let task_id = workers[i].task_id;
         log(&format!(
-            "DRAIN: tearing down idle worker {} (task #{})",
-            w.agent_name, w.task_id
+            "DRAIN: tearing down idle worker {agent_name} (task #{task_id})"
         ));
-        if task_is_in_review(db_path, w.task_id).await {
-            // The worker no longer owns this phase. `InReview + AgentFailed`
-            // releases the task lease and clears `tasks.reviewer`, which
-            // orphans a verdict the reviewer has already made durable.
-            log(&format!(
-                "DRAIN: worker {} task #{} is in review — cleaning up without failing the review phase",
-                w.agent_name, w.task_id
-            ));
-        } else {
-            // Owned phases fail back to open as before; a task mid-merge is
-            // reset to in-review so approval recovery merges it from durable
-            // state after restart.
-            fire_event(
-                db_path,
-                &w.agent_name,
-                w.task_id,
-                &Event::AgentFailed {
-                    reason: "daemon draining".into(),
-                },
-            )
-            .await;
+        match task_status_for_drain(db_path, task_id).await.as_deref() {
+            Some("in-review") => {
+                // The worker no longer owns this phase. `InReview + AgentFailed`
+                // releases the task lease and clears `tasks.reviewer`, which
+                // orphans a verdict the reviewer has already made durable.
+                log(&format!(
+                    "DRAIN: worker {agent_name} task #{task_id} is in review — cleaning up without failing the review phase"
+                ));
+                let w = workers.remove(i);
+                cleanup_slot(config, wt_mgr, name_pool, w, None, "drain").await;
+                continue;
+            }
+            Some("merging") => {
+                // A task mid-merge is reset to in-review so approval recovery
+                // merges it from durable state after restart. The exact-run
+                // worker disposition below deliberately never transitions a
+                // phase the worker no longer owns, so keep this explicit.
+                fire_event(
+                    db_path,
+                    &agent_name,
+                    task_id,
+                    &Event::AgentFailed {
+                        reason: "daemon draining".into(),
+                    },
+                )
+                .await;
+                let w = workers.remove(i);
+                cleanup_slot(config, wt_mgr, name_pool, w, None, "drain").await;
+                continue;
+            }
+            _ => {}
         }
-        cleanup_slot(config, wt_mgr, name_pool, w, None, "drain").await;
+        // Owned phases classify through the same exact-run disposition as a
+        // dead worker (Phase 4a/4b). An unconsumed matching Done row is a
+        // durable delivery: failing the task here would reopen it and let
+        // Phase 2 consume that valid submission against an open task.
+        let Some(disposition) = dispose_managed_process_exit(
+            db_path,
+            tasks::ManagedRunRole::Worker,
+            &agent_name,
+            task_id,
+            workers[i].cap_run_id.as_deref(),
+            "daemon draining",
+        )
+        .await
+        else {
+            log(&format!(
+                "worker {agent_name} drain classification failed — retaining slot for retry"
+            ));
+            continue;
+        };
+        match disposition {
+            tasks::ManagedExitDisposition::OutcomePending => {
+                log(&format!(
+                    "DRAIN: worker {agent_name} task #{task_id} has a pending delivery — retaining slot for mailbox delivery"
+                ));
+            }
+            tasks::ManagedExitDisposition::OutcomeRecorded => {
+                let w = workers.remove(i);
+                cleanup_slot_with_terminal_action(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    w,
+                    None,
+                    "completed",
+                    TerminalUsageAction::RecordedOutcomeCleanup,
+                )
+                .await;
+            }
+            tasks::ManagedExitDisposition::OwnershipTransferred => {
+                let w = workers.remove(i);
+                cleanup_slot_with_terminal_action(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    w,
+                    None,
+                    "ownership_transferred",
+                    TerminalUsageAction::TransferredOwnershipCleanup,
+                )
+                .await;
+            }
+            tasks::ManagedExitDisposition::AgentFailed(_) => {
+                let w = workers.remove(i);
+                cleanup_slot(config, wt_mgr, name_pool, w, None, "drain").await;
+            }
+        }
     }
 
     let drain_reviewers: Vec<usize> = reviewers
@@ -19581,17 +19675,19 @@ async fn drain_idle_agents(
     }
 }
 
-async fn task_is_in_review(db_path: &Path, task_id: i64) -> bool {
+/// Best-effort status read that routes drain teardown. `None` (read failure
+/// or missing task) falls through to the atomic exact-run disposition, which
+/// performs its own authoritative classification.
+async fn task_status_for_drain(db_path: &Path, task_id: i64) -> Option<String> {
     let p = db_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let conn = quorum_core::db::open(&p).ok()?;
         let task = tasks::get(&conn, task_id).ok()??;
-        Some(task.status == "in-review")
+        Some(task.status)
     })
     .await
     .ok()
     .flatten()
-    .unwrap_or(false)
 }
 
 async fn reviewer_approval_already_recorded(db_path: &Path, agent: &str, task_id: i64) -> bool {
@@ -19788,6 +19884,55 @@ enum GrokWorkerDeliveryGate {
     Failed(String),
 }
 
+/// Settle a Grok delivery the gate rejected: fail the worker's assignment
+/// back through `AgentFailed` (or accept a same-transaction lapsed-lease
+/// reap), tear its slot down, and consume the Done row
+/// exactly once. If the lifecycle write fails, both the slot and the row are
+/// retained so the next tick retries the same settlement loudly.
+async fn settle_failed_grok_worker_delivery(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    wi: usize,
+    mailbox_id: i64,
+    reason: &str,
+) {
+    let db_path = &config.db_path;
+    let worker_name = workers[wi].agent_name.clone();
+    let worker_task_id = workers[wi].task_id;
+    log(&format!(
+        "Grok worker {worker_name} delivery for task #{worker_task_id} failed before review: {reason}"
+    ));
+    // Sweep-aware: a lapsed lease reaped in the same transaction settles the
+    // assignment; a plain `AgentFailed` would be rejected from `open`, roll
+    // the reap back, and replay this delivery every tick.
+    let settled = fail_worker_for_teardown(
+        db_path,
+        &worker_name,
+        worker_task_id,
+        &format!("Grok submission rejected before review: {reason}"),
+    )
+    .await;
+    if settled {
+        let worker = workers.remove(wi);
+        cleanup_slot(
+            config,
+            wt_mgr,
+            name_pool,
+            worker,
+            None,
+            "terminal_handoff_failed",
+        )
+        .await;
+        consume_mailbox_row(db_path, mailbox_id).await;
+    } else {
+        log(&format!(
+            "FATAL: Grok delivery failure for task #{worker_task_id} could not be persisted; retaining worker and mailbox authority"
+        ));
+    }
+}
+
 /// Checkpoint a valid exhausted Grok session only after its leader exits and
 /// terminal evidence has been finalized. The checkpoint transaction includes
 /// its provider block, so callers can safely remove the live slot immediately
@@ -19856,9 +20001,11 @@ async fn gate_grok_worker_delivery(
     match drain_events(slot, db_path, "worker", limits).await {
         Ok(_) => {}
         // Terminal identity validation failures are delivery failures, not
-        // daemon failures. Keep SQLite/join/IO failures loud and retryable.
-        Err(error) if error.to_string().starts_with("Grok ") => {
-            return Ok(GrokWorkerDeliveryGate::Failed(error.to_string()));
+        // daemon failures. The handoff path returns them as a dedicated error
+        // variant; SQLite/join/IO failures keep their own variants and stay
+        // loud and retryable.
+        Err(QuorumError::TerminalIdentityRejected(reason)) => {
+            return Ok(GrokWorkerDeliveryGate::Failed(reason));
         }
         Err(error) => return Err(error),
     }
@@ -19905,8 +20052,8 @@ async fn gate_grok_worker_delivery(
 
     match drain_events(slot, db_path, "worker", limits).await {
         Ok(_) => {}
-        Err(error) if error.to_string().starts_with("Grok ") => {
-            return Ok(GrokWorkerDeliveryGate::Failed(error.to_string()));
+        Err(QuorumError::TerminalIdentityRejected(reason)) => {
+            return Ok(GrokWorkerDeliveryGate::Failed(reason));
         }
         Err(error) => return Err(error),
     }
@@ -20103,7 +20250,7 @@ async fn drain_events(
                 runner::AgentEvent::ThreadStarted { thread_id } => {
                     if slot.process_kind() == runner::AgentKind::Grok {
                         if role != "worker" {
-                            return Err(QuorumError::Io(
+                            return Err(QuorumError::TerminalIdentityRejected(
                                 "managed Grok terminal identity is valid only at the worker boundary"
                                     .into(),
                             ));
@@ -22954,7 +23101,7 @@ async fn spawn_worker(
     // Keep the durable agent-run timestamp and session-log directory keyed by
     // the same captured value. The detail API verifies that identity directly.
     let session_started_at = now_unix();
-    let worker_session_log = config.log_dir.as_ref().and_then(|ld| {
+    let mut worker_session_log = config.log_dir.as_ref().and_then(|ld| {
         session_log::SessionLog::create(
             ld,
             &agent_name,
@@ -23110,6 +23257,44 @@ async fn spawn_worker(
             .as_ref()
             .and_then(|retry| retry.continuation_id.as_deref()),
     );
+    // A fresh initial Grok turn over a retained durable worker handoff can
+    // never persist its terminal identity. Fail closed before any run,
+    // capability, or process exists: park with the specific durable reason
+    // (operator `task-retry`/cancel), keep the refs and the task branch.
+    if resolved_kind == runner::AgentKind::Grok && continuation_id.is_none() {
+        if let Some(reason) = grok_fresh_initial_launch_conflict(task.id, task.refs.as_deref()) {
+            log(&format!("task #{}: {reason}", task.id));
+            persist_provisioning_failure(&db_path, task.id, &reason).await;
+            park_task(
+                &db_path,
+                task.id,
+                &reason,
+                if retrying_rework { "rework" } else { "open" },
+            )
+            .await;
+            // Remove only the checkout provisioned for this refused launch so
+            // a later retry does not collide with it. The branch (which may
+            // hold the prior worker's commits) is deliberately retained; the
+            // kept sync merge is the judgment's only copy of MERGE_HEAD.
+            if sync_adoption.is_none() {
+                wt_mgr.remove(&config.repo_dir, &wt_path).await.ok();
+            }
+            if let Some(log) = worker_session_log.as_mut() {
+                log.finalize(None);
+            }
+            let journal_db = db_path.clone();
+            let journal_agent = agent_name.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let mut conn = quorum_core::db::open(&journal_db)?;
+                journal::delete(&mut conn, &journal_agent).map(|_| ())
+            })
+            .await
+            .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+            .ok();
+            guarded_worker_name_release(&db_path, name_pool, &agent_name, task.id).await;
+            return Ok(false);
+        }
+    }
     let launch = runner::LaunchRequest {
         model: &resolved_model,
         effort: &resolved_effort,
@@ -24112,6 +24297,30 @@ async fn launch_and_commit_fallback(
     grok_worker_request: Option<runner::WorkerTurnRequest>,
     journal: FallbackJournalPromotion<'_>,
 ) -> std::result::Result<runner::RunnerProc, runner::RunnerFailure> {
+    if grok_worker_request.is_some() {
+        // Same fail-closed rule as the primary spawn path: a fresh Grok
+        // worker turn over a retained durable handoff can never persist its
+        // terminal identity. A NonFailover failure settles the fallback
+        // through its existing bounded path before any process exists.
+        let refs = quorum_core::db::open(journal.db_path)
+            .and_then(|conn| tasks::get(&conn, journal.task_id))
+            .map_err(|error| {
+                fallback_launch_failure(format!(
+                    "fallback Grok worker could not read task #{} refs: {error}",
+                    journal.task_id
+                ))
+            })?
+            .ok_or_else(|| {
+                fallback_launch_failure(format!(
+                    "fallback Grok worker task #{} disappeared before launch",
+                    journal.task_id
+                ))
+            })?
+            .refs;
+        if let Some(reason) = grok_fresh_initial_launch_conflict(journal.task_id, refs.as_deref()) {
+            return Err(fallback_launch_failure(reason));
+        }
+    }
     let executable = routed_provider_executable(config, kind, launch.worktree)?;
     let adapter = runner_adapter_config(config, Some(&executable));
     let (mut proc, gate) = runner::RunnerProc::launch_gated(launch, &adapter).await?;
@@ -25967,6 +26176,60 @@ async fn cleanup_slot_inner(
     .await;
 }
 
+/// Fail a worker's task unless the write-path sweep in the same transaction
+/// already recovered it (lapsed lease). Returns true when the assignment is
+/// settled either way. Genuine rejections return false and keep the loud
+/// lifecycle diagnostic that `fire_event` records.
+async fn fail_worker_for_teardown(db_path: &Path, agent: &str, task_id: i64, reason: &str) -> bool {
+    let p = db_path.to_path_buf();
+    let actor = agent.to_string();
+    let failure_reason = reason.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut conn = quorum_core::db::open(&p)?;
+        tasks::fail_worker_for_teardown(&mut conn, &actor, task_id, &failure_reason, now_unix())
+    })
+    .await;
+    let event_debug = format!(
+        "{:?}",
+        Event::AgentFailed {
+            reason: reason.to_string()
+        }
+    );
+    match result {
+        Ok(Ok(tasks::WorkerTeardownFailure::Failed(transition))) => {
+            let names: Vec<String> = transition.effects.iter().map(tasks::effect_name).collect();
+            log(&format!(
+                "lifecycle: task #{task_id} -> {} (effects: [{}])",
+                transition.task.status,
+                names.join(", ")
+            ));
+            true
+        }
+        Ok(Ok(tasks::WorkerTeardownFailure::AlreadyRecoveredBySweep)) => {
+            log(&format!(
+                "lifecycle: task #{task_id} worker {agent} teardown — lapsed assignment already recovered by sweep; no second AgentFailed"
+            ));
+            true
+        }
+        Ok(Err(error)) => {
+            let message = error.to_string();
+            log(&format!(
+                "lifecycle: teardown AgentFailed failed for task #{task_id}: {message}"
+            ));
+            persist_lifecycle_diagnostic(db_path, agent, task_id, &event_debug, &message).await;
+            false
+        }
+        Err(error) => {
+            let message = format!("join error: {error}");
+            log(&format!(
+                "lifecycle: teardown AgentFailed failed for task #{task_id}: {message}"
+            ));
+            persist_lifecycle_diagnostic(db_path, agent, task_id, &event_debug, &message).await;
+            false
+        }
+    }
+}
+
 /// Tear down a worker agent: kill process, update task, clean up journal/worktree/name.
 async fn teardown_worker(
     config: &ServeConfig,
@@ -26026,13 +26289,11 @@ async fn teardown_worker_with_body(
     }
 
     if task_status == "open" {
-        fire_event(
+        fail_worker_for_teardown(
             &config.db_path,
             &state.agent_name,
             state.task_id,
-            &Event::AgentFailed {
-                reason: "worker teardown (shutdown/cleanup)".into(),
-            },
+            "worker teardown (shutdown/cleanup)",
         )
         .await;
         let p = config.db_path.clone();
@@ -47462,6 +47723,703 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let task = tasks::get(&conn, 1).unwrap().unwrap();
         assert_eq!(task.status, "open");
         assert_eq!(task.recovery_attempts, 1);
+    }
+
+    // ── Incident 2026-09-28 (task #306): drain / Grok handoff wedge ─────
+
+    fn append_worker_done(db_path: &Path, agent: &str, task_id: i64, pr: Option<i64>) -> i64 {
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        mailbox::append(
+            &mut conn,
+            &mailbox::MailboxRow {
+                agent: agent.into(),
+                kind: mailbox::MailboxKind::Done,
+                task_id: Some(task_id),
+                pr,
+                verdict: None,
+                feedback: None,
+                note: None,
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn errors_with_source(conn: &quorum_core::Connection, source: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM errors WHERE source=?1",
+            [source],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Task #306: Pivot submitted (Done row 850) and graceful drain then
+    /// fired `AgentFailed`, reopening the task and discarding the valid
+    /// delivery. A pending matching Done row must retain the slot so Phase 2
+    /// delivers it; only afterwards does drain release the in-review worker.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_retains_worker_with_pending_delivery_instead_of_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drain-pending-worker.db");
+        let worktree = dir.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        create_active_task(&db_path, DRAIN_AUTHOR, "working");
+        issue_test_run(&db_path, DRAIN_AUTHOR, DRAIN_AUTHOR_CAP);
+        let mailbox_id = append_worker_done(&db_path, DRAIN_AUTHOR, 1, None);
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut workers =
+            vec![drain_test_slot(DRAIN_AUTHOR, 1, worktree, DRAIN_AUTHOR_CAP, None).await];
+        let mut reviewers: Vec<SlotState> = Vec::new();
+
+        drain_idle_agents(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+        )
+        .await;
+        assert_eq!(
+            workers.len(),
+            1,
+            "a pending delivery must retain its worker slot for Phase 2"
+        );
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let task = tasks::get(&conn, 1).unwrap().unwrap();
+            assert_eq!(task.status, "working", "drain must not reopen the task");
+            assert_eq!(task.assignee.as_deref(), Some(DRAIN_AUTHOR));
+            assert_eq!(task.recovery_attempts, 0);
+            assert_eq!(task_event_count(&conn, 1, "task_open"), 0);
+            assert_eq!(mailbox_consumption(&conn, mailbox_id), (0, 1));
+        }
+
+        // Next tick: Phase 2 delivers the retained row through the ordinary
+        // worker path (the lifecycle transition + consumption it performs).
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::apply_event(
+                &mut conn,
+                DRAIN_AUTHOR,
+                1,
+                &Event::SignaledDone { pr: "189".into() },
+                now_unix(),
+            )
+            .unwrap();
+        }
+        assert!(consume_mailbox_row(&db_path, mailbox_id).await);
+
+        drain_idle_agents(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+        )
+        .await;
+        assert!(workers.is_empty(), "the delivered worker is then released");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(task.recovery_attempts, 0);
+        assert_eq!(task_event_count(&conn, 1, "task_open"), 0);
+        assert_eq!(mailbox_consumption(&conn, mailbox_id), (1, 0));
+    }
+
+    /// Errors rows 99/100: the daemon wedged for hours, the worker leases
+    /// lapsed, and shutdown teardown fired `AgentFailed`. `apply_event`'s own
+    /// write sweep reaped the task to `open` first, so the event was rejected
+    /// ("no agent in open") and the rollback discarded the reap as well.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn teardown_of_lapsed_lease_worker_commits_reap_without_second_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("teardown-lapsed.db");
+        let worktree = dir.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        create_active_task(&db_path, DRAIN_AUTHOR, "working");
+        issue_test_run(&db_path, DRAIN_AUTHOR, DRAIN_AUTHOR_CAP);
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE claims SET expires_at=?1 WHERE target='task#1' AND active=1",
+                [now_unix() - 60],
+            )
+            .unwrap();
+        }
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let slot = drain_test_slot(DRAIN_AUTHOR, 1, worktree, DRAIN_AUTHOR_CAP, None).await;
+
+        teardown_worker(&config, &wt_mgr, &mut name_pool, slot, "open").await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "open", "the lapsed-lease reap must commit");
+        assert_eq!(task.assignee, None);
+        assert_eq!(
+            task.recovery_attempts, 1,
+            "exactly one recovery transition (the reap), not a second AgentFailed"
+        );
+        assert_eq!(task_event_count(&conn, 1, "task_reclaimed"), 1);
+        assert_eq!(task_event_count(&conn, 1, "task_open"), 0);
+        assert_eq!(
+            errors_with_source(&conn, "lifecycle"),
+            0,
+            "teardown must not record an invalid-transition diagnostic"
+        );
+    }
+
+    /// Negative path: a live-lease worker torn down at shutdown is still
+    /// failed back to open through `AgentFailed`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn teardown_of_live_lease_worker_still_fails_task_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("teardown-live.db");
+        let worktree = dir.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        create_active_task(&db_path, DRAIN_AUTHOR, "working");
+        issue_test_run(&db_path, DRAIN_AUTHOR, DRAIN_AUTHOR_CAP);
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let slot = drain_test_slot(DRAIN_AUTHOR, 1, worktree, DRAIN_AUTHOR_CAP, None).await;
+
+        teardown_worker(&config, &wt_mgr, &mut name_pool, slot, "open").await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert_eq!(task.recovery_attempts, 1);
+        assert_eq!(task_event_count(&conn, 1, "task_open"), 1);
+        assert_eq!(task_event_count(&conn, 1, "task_reclaimed"), 0);
+        assert_eq!(errors_with_source(&conn, "lifecycle"), 0);
+    }
+
+    /// The exact-run disposition classifies after the write sweep, so a
+    /// lapsed lease is ownership already recovered, not a rejected
+    /// `AgentFailed` from `open`.
+    #[tokio::test]
+    async fn managed_exit_of_lapsed_lease_worker_is_ownership_transferred() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dispose-lapsed.db");
+        create_active_task(&db_path, "Spool", "working");
+        issue_test_run(&db_path, "Spool", "run-lapsed");
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE claims SET expires_at=?1 WHERE target='task#1' AND active=1",
+                [now_unix() - 60],
+            )
+            .unwrap();
+        }
+        let disposition = dispose_managed_process_exit(
+            &db_path,
+            tasks::ManagedRunRole::Worker,
+            "Spool",
+            1,
+            Some("run-lapsed"),
+            "daemon draining",
+        )
+        .await
+        .expect("lapsed-lease classification must not fail");
+        assert!(matches!(
+            disposition,
+            tasks::ManagedExitDisposition::OwnershipTransferred
+        ));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert_eq!(task.recovery_attempts, 1);
+        assert_eq!(errors_with_source(&conn, "lifecycle"), 0);
+    }
+
+    #[cfg(unix)]
+    async fn gate_until_settled(
+        slot: &mut SlotState,
+        db_path: &Path,
+    ) -> Result<GrokWorkerDeliveryGate> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match gate_grok_worker_delivery(slot, db_path, &CostLimits::default()).await {
+                    Ok(GrokWorkerDeliveryGate::Pending) => tokio::task::yield_now().await,
+                    settled => return settled,
+                }
+            }
+        })
+        .await
+        .expect("Grok fixture must settle the delivery gate")
+    }
+
+    /// Task #306 (Cleat, Done row 852): a fresh initial Grok turn over a
+    /// retained durable worker continuation is rejected by the handoff
+    /// persistence. That rejection is Io-shaped storage-wise but a delivery
+    /// failure semantically; it must become `Failed`, and the row must be
+    /// consumed exactly once instead of replaying as a tick error forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_conflicting_terminal_identity_fails_delivery_and_consumes_row_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"cleat-session\"}'",
+        )
+        .await;
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET refs=json_set(refs,'$.runner_continuation',
+                     json('{\"provider\":\"grok\",\"id\":\"pivot-session\"}'))
+                 WHERE id=?1",
+                [task_id],
+            )
+            .unwrap();
+        }
+        let mailbox_id = append_worker_done(&db_path, "Internal-grok", task_id, Some(189));
+        let mut workers = vec![slot];
+
+        let gate = gate_until_settled(&mut workers[0], &db_path).await;
+        let reason = match gate {
+            Ok(GrokWorkerDeliveryGate::Failed(reason)) => reason,
+            other => panic!("conflicting terminal identity must fail the delivery: {other:?}"),
+        };
+        assert!(
+            reason.contains("duplicate or conflicting terminal session identity"),
+            "{reason}"
+        );
+
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        settle_failed_grok_worker_delivery(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            0,
+            mailbox_id,
+            &reason,
+        )
+        .await;
+        assert!(workers.is_empty(), "the rejected worker slot is torn down");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert_eq!(task.recovery_attempts, 1);
+        assert_eq!(mailbox_consumption(&conn, mailbox_id), (1, 0));
+        assert!(
+            !mailbox::poll_unconsumed(&conn)
+                .unwrap()
+                .iter()
+                .any(|(id, _)| *id == mailbox_id),
+            "a consumed Done row cannot replay on a later tick"
+        );
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::continuation(&refs, ContinuationSlot::Worker, "grok")
+                .unwrap()
+                .id,
+            "pivot-session",
+            "the retained durable continuation is never silently replaced"
+        );
+    }
+
+    /// A rejected delivery whose worker lease has lapsed must still settle:
+    /// the same-transaction sweep reap counts as the failure, the slot is torn
+    /// down, and the Done row is consumed once instead of replaying per tick.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_rejected_delivery_with_lapsed_lease_settles_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"cleat-session\"}'",
+        )
+        .await;
+        let mailbox_id = append_worker_done(&db_path, "Internal-grok", task_id, Some(189));
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let lapsed = conn
+                .execute(
+                    "UPDATE claims SET expires_at=?1 WHERE target=?2 AND active=1",
+                    rusqlite::params![now_unix() - 60, format!("task#{task_id}")],
+                )
+                .unwrap();
+            assert_eq!(lapsed, 1, "fixture must hold exactly one active task lease");
+        }
+        let mut workers = vec![slot];
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+
+        settle_failed_grok_worker_delivery(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            0,
+            mailbox_id,
+            "Grok emitted a duplicate or conflicting terminal session identity",
+        )
+        .await;
+
+        assert!(workers.is_empty(), "the rejected worker slot is torn down");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "open", "the lapsed-lease reap must commit");
+        assert_eq!(task.assignee, None);
+        assert_eq!(task.recovery_attempts, 1, "one recovery transition only");
+        assert_eq!(mailbox_consumption(&conn, mailbox_id), (1, 0));
+        assert!(
+            !mailbox::poll_unconsumed(&conn)
+                .unwrap()
+                .iter()
+                .any(|(id, _)| *id == mailbox_id),
+            "a consumed Done row cannot replay on a later tick"
+        );
+        assert_eq!(
+            errors_with_source(&conn, "lifecycle"),
+            0,
+            "no invalid-transition diagnostic"
+        );
+    }
+
+    /// Negative path: a genuine storage failure in the handoff stays a loud
+    /// `Err` (a retryable tick error), not a delivery failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_handoff_storage_failure_stays_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db_path, mut slot, task_id) = initial_grok_worker_fixture(
+            dir.path(),
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"db-error-session\"}'",
+        )
+        .await;
+        let mailbox_id = append_worker_done(&db_path, "Internal-grok", task_id, Some(189));
+        {
+            // The durable run lookup then finds no live row: a rusqlite
+            // error, not an identity-validation outcome.
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE agent_runs SET ended_at=?1 WHERE id=?2",
+                rusqlite::params![now_unix(), slot.agent_run_id.unwrap()],
+            )
+            .unwrap();
+        }
+
+        let gate = gate_until_settled(&mut slot, &db_path).await;
+        assert!(
+            matches!(
+                gate,
+                Err(QuorumError::Db(rusqlite::Error::QueryReturnedNoRows))
+            ),
+            "storage failure must stay Err: {gate:?}"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "working"
+        );
+        assert_eq!(mailbox_consumption(&conn, mailbox_id), (0, 1));
+        drop(conn);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    fn seed_prior_grok_initial_session(db_path: &Path, task_id: i64) {
+        let conn = quorum_core::db::open(db_path).unwrap();
+        let refs: Option<String> = conn
+            .query_row("SELECT refs FROM tasks WHERE id=?1", [task_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let mut refs: serde_json::Value = refs
+            .as_deref()
+            .map(|raw| serde_json::from_str(raw).unwrap())
+            .unwrap_or_else(|| serde_json::json!({}));
+        runner_state::set_initial_worker_session(
+            &mut refs,
+            &runner_state::InitialWorkerSession {
+                task_id,
+                role_assignment_id: 1,
+                responsibility_key: worker_responsibility_key(task_id, 1),
+                agent: "Pivot-nz35".into(),
+                role: "worker".into(),
+                provider: "grok".into(),
+                runner: "grok".into(),
+                model: "grok-4.5".into(),
+                effort: "high".into(),
+                pending_turn: PendingTurn {
+                    provider: "grok".into(),
+                    model: "grok-4.5".into(),
+                    effort: "high".into(),
+                    prompt: "prior exact prompt".into(),
+                    turn_kind: "initial".into(),
+                    continuation_id: None,
+                    requested: false,
+                },
+                session_id: "pivot-session".into(),
+            },
+        );
+        runner_state::set_continuation(
+            &mut refs,
+            ContinuationSlot::Worker,
+            &ContinuationIdentity {
+                provider: "grok".into(),
+                id: "pivot-session".into(),
+            },
+        );
+        conn.execute(
+            "UPDATE tasks SET refs=?2 WHERE id=?1",
+            rusqlite::params![task_id, refs.to_string()],
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn grok_routed_config(db_path: PathBuf, repo: PathBuf, program: &Path) -> ServeConfig {
+        let mut config = pre_review_ci_test_config(db_path, repo);
+        let grok_profile = crate::serve_config::ModelProfile {
+            runner: "grok".into(),
+            model: "grok-4.5".into(),
+            effort: "high".into(),
+        };
+        let grok_pool = std::collections::BTreeMap::from([("grok".to_string(), 100)]);
+        config.model_profiles = std::collections::BTreeMap::from([("grok".into(), grok_profile)]);
+        config.routing = crate::serve_config::RoutingPolicy {
+            classifier: grok_pool.clone(),
+            planner: grok_pool.clone(),
+            arbiter: grok_pool.clone(),
+            collector: grok_pool.clone(),
+            worker: (1..=5)
+                .map(|level| (level.to_string(), grok_pool.clone()))
+                .collect(),
+            reviewer: (1..=5)
+                .map(|level| (level.to_string(), grok_pool.clone()))
+                .collect(),
+        };
+        config.agent_bin = Some(program.to_string_lossy().into_owned());
+        config
+    }
+
+    /// Task #306 (Cleat, run 907): the reopened task still carried Pivot's
+    /// durable initial handoff, yet a fresh initial Grok worker was launched
+    /// whose terminal identity could never persist. Refuse before any run or
+    /// process exists and park with the specific durable reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_initial_grok_launch_refused_over_retained_durable_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        let launched_marker = dir.path().join("grok-launched");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("state.txt"), "base\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["branch", "-M", "main"]);
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "main"]);
+        git(&["fetch", "-q", "origin"]);
+
+        let db_path = dir.path().join("grok-fresh-refused.db");
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::create(
+                &mut conn,
+                "owner",
+                "reopened Grok task",
+                Some("retains a prior durable Grok session"),
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap()
+        };
+        seed_prior_grok_initial_session(&db_path, task_id);
+
+        let program = grok_worker_fixture_program(
+            dir.path(),
+            &format!(
+                "touch '{}'; printf '%s\\n' '{{\"type\":\"end\",\"stopReason\":\"EndTurn\",\"sessionId\":\"fresh\"}}'",
+                launched_marker.display()
+            ),
+        );
+        let mut config = grok_routed_config(db_path.clone(), repo.clone(), &program);
+        config.worktree_base = dir.path().join("worktrees");
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+
+        let spawned = spawn_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut poison,
+            &mut skips,
+            &mut roster,
+        )
+        .await
+        .unwrap();
+        assert!(!spawned, "the fresh Grok launch must be refused");
+        assert!(workers.is_empty());
+        assert!(
+            !launched_marker.exists(),
+            "no Grok process may run over a retained durable session"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "failed", "refusal parks the task");
+        assert_eq!(task.assignee, None);
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        let reason = refs[tasks::PARKED_REASON_REF].as_str().unwrap();
+        assert!(
+            reason.contains("fresh Grok initial worker refused")
+                && reason.contains("pivot-session"),
+            "{reason}"
+        );
+        assert_eq!(refs[tasks::PARKED_RESUME_STATUS_REF], "open");
+        assert_eq!(
+            runner_state::initial_worker_session(&refs)
+                .unwrap()
+                .session_id,
+            "pivot-session",
+            "the durable handoff is retained, never silently cleared"
+        );
+        let runs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE task_id=?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 0, "no agent run is recorded for a refused launch");
+        let live_caps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_capabilities WHERE task_id=?1 AND revoked_at IS NULL",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_caps, 0);
+    }
+
+    /// The gated fallback launch applies the same refusal as a NonFailover
+    /// failure before any provider process exists.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grok_fallback_launch_refused_over_retained_durable_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let launched_marker = dir.path().join("grok-fallback-launched");
+        let db_path = dir.path().join("grok-fallback-refused.db");
+        create_active_task(&db_path, "Spool", "working");
+        seed_prior_grok_initial_session(&db_path, 1);
+        let program = grok_worker_fixture_program(
+            dir.path(),
+            &format!("touch '{}'", launched_marker.display()),
+        );
+        let config = grok_routed_config(db_path.clone(), dir.path().to_path_buf(), &program);
+        let pending_turn = PendingTurn {
+            provider: "grok".into(),
+            model: "grok-4.5".into(),
+            effort: "high".into(),
+            prompt: "fallback prompt".into(),
+            turn_kind: "initial".into(),
+            continuation_id: None,
+            requested: false,
+        };
+        let session_id = agent::new_session_id();
+        let worktree_text = worktree.to_string_lossy().into_owned();
+        let result = launch_and_commit_fallback(
+            &config,
+            runner::AgentKind::Grok,
+            &runner::LaunchRequest {
+                model: "grok-4.5",
+                effort: "high",
+                worktree: &worktree,
+                prompt: "fallback prompt",
+                environment: &[],
+                mode: runner::LaunchMode::Normal,
+                continuation_id: None,
+            },
+            Some(runner::WorkerTurnRequest {
+                task_id: 1,
+                role_assignment_id: 1,
+                responsibility_key: worker_responsibility_key(1, 1),
+                agent: "Spool".into(),
+                role: "worker".into(),
+                provider: "grok".into(),
+                runner: "grok".into(),
+                model: "grok-4.5".into(),
+                effort: "high".into(),
+                pending_turn,
+            }),
+            FallbackJournalPromotion {
+                db_path: &db_path,
+                agent: "Spool",
+                role: "worker",
+                task_id: 1,
+                session_id: &session_id,
+                worktree: &worktree_text,
+                provider: "grok",
+                working_phase: "working",
+                log_dir: None,
+            },
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("fallback Grok launch must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.disposition(), runner::FailureDisposition::NonFailover);
+        assert!(
+            error
+                .to_string()
+                .contains("fresh Grok initial worker refused"),
+            "{error}"
+        );
+        assert!(!launched_marker.exists(), "no fallback process may run");
     }
 
     fn issue_test_run(db_path: &Path, agent: &str, run_id: &str) {
