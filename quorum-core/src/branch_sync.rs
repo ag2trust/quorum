@@ -1764,6 +1764,75 @@ mod tests {
     }
 
     #[test]
+    fn judgment_rework_awaiting_lease_keeps_its_recovered_retry() {
+        // After VerdictChanges the lease is released and the task waits in
+        // `rework` for the remediation worker. That healthy wait is not a
+        // worker lapse: past the provisioning grace it must recover as rework
+        // and leave the published sync row alone.
+        let (_dir, mut conn) = open_tmp();
+        let (sync, task_id) = claimed_judgment_task(&mut conn);
+        publish_from_conflict(&mut conn, sync.id, task_id, &"c".repeat(40), 7, 300)
+            .unwrap()
+            .expect("conflict row publishes");
+        conn.execute(
+            "UPDATE tasks SET status='rework', assignee=NULL, rework_round=1,
+                 refs=json_set(COALESCE(refs,'{}'),'$.pr',7), updated_at=301
+             WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE claims SET active=0 WHERE target=?1",
+            [format!("task#{task_id}")],
+        )
+        .unwrap();
+
+        let now = 301 + crate::sweep::REWORK_PROVISIONING_GRACE_SECS + 1;
+        crate::sweep::reap_lapsed_tasks(&conn, now, SWEEP_LIMIT).unwrap();
+
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework", "no terminal failure for the wait");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            refs[crate::tasks::RECOVERED_REMEDIATION_RETRY_REF],
+            serde_json::json!(true),
+            "ordinary recovered-retry marker is written"
+        );
+        let row = get(&conn, sync.id).unwrap().unwrap();
+        assert_eq!(row.phase, "published");
+        assert!(row.active);
+        assert_eq!(row.last_error, None);
+        let errors: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM errors WHERE source='branch_sync'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(errors, 0);
+
+        // A remediation lease that is installed (consuming the retry marker)
+        // and then lapses is a real worker lapse: it fails the task and the
+        // sync row without retry.
+        let unmarked = crate::tasks::clear_recovered_remediation_retry(task.refs.as_deref())
+            .unwrap()
+            .unwrap();
+        conn.execute(
+            "INSERT INTO claims(target, holder, ts, expires_at, active)
+             VALUES (?1, 'Judge2', ?2, ?3, 1)",
+            params![format!("task#{task_id}"), now + 1, now + 61],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET assignee='Judge2', refs=?2, updated_at=?3 WHERE id=?1",
+            params![task_id, unmarked, now + 1],
+        )
+        .unwrap();
+        crate::sweep::reap_lapsed_tasks(&conn, now + 61, SWEEP_LIMIT).unwrap();
+        assert_failed_without_retry(&conn, sync.id, task_id, "lease lapsed");
+    }
+
+    #[test]
     fn ordinary_worker_failure_keeps_its_recovery_retry() {
         let (_dir, mut conn) = open_tmp();
         let task_id = crate::tasks::create(

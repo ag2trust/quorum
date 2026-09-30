@@ -44,7 +44,7 @@ pub fn reap_lapsed_tasks(conn: &Connection, now: i64, limit: usize) -> Result<()
 
 fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     // (id, assignee, had_any_lease_ever, refs, rework_round,
-    //  stamped_rework_cap, recovery_attempts)
+    //  stamped_rework_cap, recovery_attempts, installed_lease_lapsed)
     #[allow(clippy::type_complexity)]
     let lapsed: Vec<(
         i64,
@@ -54,11 +54,16 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
         i64,
         Option<i64>,
         i64,
+        bool,
     )> = {
         let mut stmt = conn.prepare(
             "SELECT t.id, t.assignee,
                     EXISTS(SELECT 1 FROM claims c WHERE c.target = 'task#' || t.id) AS had_lease,
-                    t.refs, t.rework_round, t.rework_cap, t.recovery_attempts
+                    t.refs, t.rework_round, t.rework_cap, t.recovery_attempts,
+                    t.status = 'working' OR EXISTS(
+                        SELECT 1 FROM claims c
+                        WHERE c.target = 'task#' || t.id AND c.active=1 AND c.expires_at <= ?1
+                    ) AS installed_lease_lapsed
              FROM tasks t
              WHERE t.status IN ('working', 'rework') AND NOT EXISTS (
                  SELECT 1 FROM claims c
@@ -107,13 +112,24 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                         r.get(4)?,
                         r.get(5)?,
                         r.get(6)?,
+                        r.get::<_, i64>(7)? != 0,
                     ))
                 },
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
-    for (id, prev, had_lease, refs, rework_round, rework_cap, recovery_attempts) in &lapsed {
+    for (
+        id,
+        prev,
+        had_lease,
+        refs,
+        rework_round,
+        rework_cap,
+        recovery_attempts,
+        installed_lease_lapsed,
+    ) in &lapsed
+    {
         let target = format!("task#{id}");
         let reason = if *had_lease {
             "lease lapsed"
@@ -125,9 +141,13 @@ fn reap_lapsed_tasks_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
         let effective_rework_cap = rework_cap.unwrap_or(i64::from(crate::lifecycle::REWORK_CAP));
         let recovery_exhausted = *rework_round >= effective_rework_cap
             || *recovery_attempts >= crate::tasks::MAX_RECOVERY_ATTEMPTS;
-        // A branch-sync judgment worker gets no reclaim: its lapsed lease
-        // fails the task and the bound sync row in this transaction.
-        let branch_sync_bound = crate::branch_sync::active_for_task(conn, *id)?.is_some();
+        // A branch-sync judgment worker gets no reclaim: a real lapse of its
+        // installed lease (working, or an active claim now expired) fails the
+        // task and the bound sync row in this transaction. A rework task
+        // still waiting for its remediation lease is not a worker lapse and
+        // keeps the ordinary recovered-retry path below.
+        let branch_sync_bound =
+            *installed_lease_lapsed && crate::branch_sync::active_for_task(conn, *id)?.is_some();
         if branch_sync_bound || (has_rework_context && recovery_exhausted) {
             // Reaps do not spend a rework round, but a round already at its
             // immutable cap (or an exhausted recovery budget) is terminal.
