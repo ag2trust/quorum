@@ -173,6 +173,79 @@ async fn provision_conflict_task(
     Ok(())
 }
 
+/// Bind a conflict judgment task's normal delivery to its sync row. The daemon
+/// has already published `head_ref` at `merge_sha` as `pr` against the task's
+/// target (the sync `to`). This verifies that delivery is the row's `sync/<id>`
+/// branch and a true merge of both pinned tips, then records the worker's merge
+/// commit and PR and advances `conflict` → `published`. Tasks without a bound
+/// row, and an idempotent replay or later rework push for the same PR, are
+/// no-ops; any other mismatch is an error the caller must fail loudly.
+pub async fn record_judgment_publication(
+    config: &ServeConfig,
+    worktrees: &WorktreeManager,
+    task_id: i64,
+    head_ref: &str,
+    merge_sha: &str,
+    pr: i64,
+) -> std::result::Result<(), String> {
+    let db_path = config.db_path.clone();
+    let sync = tokio::task::spawn_blocking(move || -> Result<Option<BranchSync>> {
+        let conn = quorum_core::db::open(&db_path)?;
+        branch_sync::active_for_task(&conn, task_id)
+    })
+    .await
+    .map_err(|error| format!("branch sync judgment lookup join: {error}"))?
+    .map_err(|error| error.to_string())?;
+    let Some(sync) = sync else {
+        return Ok(());
+    };
+    let branch = required(sync.sync_branch.as_deref(), "sync_branch")?;
+    if head_ref != branch {
+        return Err(format!(
+            "branch sync #{} judgment delivery published {head_ref}, expected {branch}",
+            sync.id
+        ));
+    }
+    if sync.phase == "published" && sync.pr == Some(pr) {
+        return Ok(());
+    }
+    if sync.phase != "conflict" {
+        return Err(format!(
+            "branch sync #{} is {} with PR {:?}; cannot bind judgment PR #{pr}",
+            sync.id, sync.phase, sync.pr
+        ));
+    }
+    let source_sha = required(sync.source_sha.as_deref(), "source_sha")?;
+    let target_sha = required(sync.target_sha.as_deref(), "target_sha")?;
+    worktrees
+        .verify_branch_sync_merge_ancestry(&config.repo_dir, merge_sha, source_sha, target_sha)
+        .await?;
+
+    let db_path = config.db_path.clone();
+    let id = sync.id;
+    let merge_sha = merge_sha.to_string();
+    let published = tokio::task::spawn_blocking(move || -> Result<Option<BranchSync>> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        branch_sync::publish_from_conflict(
+            &mut conn,
+            id,
+            task_id,
+            &merge_sha,
+            pr,
+            quorum_core::clock::now(),
+        )
+    })
+    .await
+    .map_err(|error| format!("branch sync judgment publication join: {error}"))?
+    .map_err(|error| error.to_string())?;
+    if published.is_none() {
+        return Err(format!(
+            "branch sync #{id} left conflict before judgment PR #{pr} could be recorded"
+        ));
+    }
+    Ok(())
+}
+
 fn sync_branch(sync: &BranchSync) -> String {
     // The row ID is globally unique and durable, which makes it sufficient for
     // restart reconciliation without concatenating owner-controlled branch

@@ -3386,7 +3386,20 @@ where
         _ => "unknown",
     };
 
-    if is_crash_recovery && task.recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
+    // A branch-sync judgment worker gets no crash-recovery retry: a failed or
+    // lease-expired worker fails the task and its bound sync row together.
+    let branch_sync_failure =
+        is_crash_recovery && crate::branch_sync::active_for_task(&tx, id)?.is_some();
+    if branch_sync_failure {
+        new_status = Status::Failed;
+        effects.retain(|e| !matches!(e, Effect::NotifyOwner { .. } | Effect::ResumeWorker));
+        if !effects.contains(&Effect::ReleaseLease) {
+            effects.push(Effect::ReleaseLease);
+        }
+        let reason = format!("branch sync judgment worker failed without retry: {failure_cause}");
+        crate::branch_sync::fail_for_task_tx(&tx, id, &format!("task #{id}: {reason}"), now)?;
+        effects.push(Effect::NotifyOwner { reason });
+    } else if is_crash_recovery && task.recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
         new_status = Status::Failed;
         // A terminal recovery exhaustion must not retain the rework respawn
         // effect selected before this storage-level budget guard.

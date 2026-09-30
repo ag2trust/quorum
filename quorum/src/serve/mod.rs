@@ -4751,6 +4751,28 @@ async fn recover_late_worker_done_with_publication(
                 return Ok(false);
             }
         };
+    if let Err(error) = branch_sync::record_judgment_publication(
+        config,
+        wt_mgr,
+        task_id,
+        &published.head_ref,
+        &published.source_sha,
+        published.pr,
+    )
+    .await
+    {
+        log(&format!(
+            "late branch sync judgment publication rejected for task #{task_id}: {error}"
+        ));
+        fail_worker_for_teardown(
+            &config.db_path,
+            &row.agent,
+            task_id,
+            &format!("branch sync judgment publication rejected: {error}"),
+        )
+        .await;
+        return Ok(false);
+    }
     let folded = recover_late_worker_done_atomic(
         &config.db_path,
         mailbox_id,
@@ -14687,6 +14709,52 @@ async fn tick(
                     )
                     .await;
                     cleanup_slot(config, wt_mgr, name_pool, w, None, "daemon_push_failed").await;
+                    if !consume_mailbox_row(&db_path, *id).await {
+                        break;
+                    }
+                    break;
+                }
+            }
+
+            // A branch-sync judgment delivery binds its merge commit and PR to
+            // the sync row before review. A rejected binding fails the worker,
+            // which fails the task and sync row without retry.
+            if let Ok(ref published) = published {
+                if let Err(error) = branch_sync::record_judgment_publication(
+                    config,
+                    wt_mgr,
+                    workers[wi].task_id,
+                    &published.head_ref,
+                    &published.source_sha,
+                    published.pr,
+                )
+                .await
+                {
+                    log(&format!(
+                        "branch sync judgment publication rejected for worker {} task #{}: {error}",
+                        workers[wi].agent_name, workers[wi].task_id
+                    ));
+                    let w = workers.remove(wi);
+                    // Sweep-aware: a lease lapsed meanwhile is failed by the
+                    // same-transaction reap instead of rolling it back.
+                    fail_worker_for_teardown(
+                        &db_path,
+                        &w.agent_name,
+                        w.task_id,
+                        &format!("branch sync judgment publication rejected: {error}"),
+                    )
+                    .await;
+                    cleanup_slot_inner(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        w,
+                        None,
+                        false,
+                        "agent_failed",
+                        None,
+                    )
+                    .await;
                     if !consume_mailbox_row(&db_path, *id).await {
                         break;
                     }
@@ -28535,6 +28603,199 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("refusing to recreate"), "{error}");
         assert!(!adoption.worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn branch_sync_judgment_delivery_publishes_sync_branch_against_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("remote.git");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        sync_fixture_git(tmp.path(), &["init", "--bare", &bare.to_string_lossy()]);
+        sync_fixture_git(&repo, &["init", "-b", "main"]);
+        sync_fixture_git(&repo, &["config", "user.email", "test@test.com"]);
+        sync_fixture_git(&repo, &["config", "user.name", "Test"]);
+        sync_fixture_git(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        sync_fixture_git(&repo, &["add", "shared.txt"]);
+        sync_fixture_git(&repo, &["commit", "-m", "base"]);
+        sync_fixture_git(&repo, &["checkout", "-b", "develop"]);
+        std::fs::write(repo.join("shared.txt"), "source\n").unwrap();
+        sync_fixture_git(&repo, &["commit", "-am", "source change"]);
+        sync_fixture_git(&repo, &["checkout", "main"]);
+        std::fs::write(repo.join("shared.txt"), "target\n").unwrap();
+        sync_fixture_git(&repo, &["commit", "-am", "target change"]);
+        sync_fixture_git(&repo, &["push", "origin", "main", "develop"]);
+        let source_tip = sync_fixture_git(&repo, &["rev-parse", "develop"]);
+        let target_tip = sync_fixture_git(&repo, &["rev-parse", "main"]);
+
+        let db_path = tmp.path().join("quorum.db");
+        let mut config = pre_review_checks_config(db_path.clone(), repo.clone());
+        config.worktree_base = tmp.path().join("worktrees");
+        // The configured base differs from the sync `to`: publication must
+        // target the task's authoritative branch, never the daemon default.
+        config.base_branch = "develop".into();
+        // Any clean-path GitHub call on the task-owned row would fail it.
+        config.pr_target_program = Some(tmp.path().join("missing-gh"));
+        std::fs::create_dir_all(&config.worktree_base).unwrap();
+        let sync_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            match quorum_core::branch_sync::request(&mut conn, "develop", "main", "owner", 1)
+                .unwrap()
+            {
+                quorum_core::branch_sync::RequestOutcome::Requested(row) => row.id,
+                quorum_core::branch_sync::RequestOutcome::AlreadyActive(_) => unreachable!(),
+            }
+        };
+        let mgr = WorktreeManager::new();
+        let mut checks = branch_sync::BranchSyncChecks::default();
+        for _ in 0..2 {
+            branch_sync::reconcile_one(&config, &mgr, &mut checks)
+                .await
+                .unwrap();
+        }
+        branch_sync::intake_conflict_judgment_task(&config, &mgr)
+            .await
+            .unwrap();
+        let (task_id, refs) = {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = quorum_core::branch_sync::get(&conn, sync_id)
+                .unwrap()
+                .unwrap()
+                .task_id
+                .expect("judgment task bound");
+            let refs: Option<String> = conn
+                .query_row("SELECT refs FROM tasks WHERE id=?1", [task_id], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            (task_id, refs)
+        };
+        let adoption = resolve_branch_sync_adoption(&config, task_id, refs.as_deref())
+            .await
+            .unwrap()
+            .expect("branch_sync ref routes to adoption");
+        let sync_branch = format!("sync/{sync_id}");
+        assert_eq!(adoption.branch, sync_branch);
+        let path = mgr
+            .adopt_sync_worktree(&repo, &adoption.worktree, &adoption.branch)
+            .await
+            .unwrap();
+
+        // The normal delivery path publishes the adopted branch against the
+        // task's authoritative target, which is the sync `to`.
+        let mut intent = PublicationIntent {
+            branch: adoption.branch.clone(),
+            local_sha: target_tip.clone(),
+            pr: None,
+            stage: "intent".into(),
+            target_branch: None,
+            expected_remote_sha: None,
+        };
+        reconcile_publication_intent_with_task_target(&db_path, task_id, None, &mut intent)
+            .await
+            .unwrap();
+        assert_eq!(
+            publication_base_branch(&intent, &config.base_branch).unwrap(),
+            "main"
+        );
+
+        // A delivery that did not resolve the merge is rejected, as is any
+        // branch other than the row's `sync/<id>`.
+        let unresolved = branch_sync::record_judgment_publication(
+            &config,
+            &mgr,
+            task_id,
+            &sync_branch,
+            &target_tip,
+            91,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            unresolved.contains("does not contain pinned source"),
+            "{unresolved}"
+        );
+
+        // The worker resolves and commits the merge in place.
+        std::fs::write(path.join("shared.txt"), "source\ntarget\n").unwrap();
+        sync_fixture_git(&path, &["add", "shared.txt"]);
+        sync_fixture_git(&path, &["commit", "--no-edit"]);
+        let worker_merge = sync_fixture_git(&path, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            sync_fixture_git(&path, &["rev-parse", "HEAD^1", "HEAD^2"]),
+            format!("{target_tip}\n{source_tip}")
+        );
+
+        let wrong_branch = branch_sync::record_judgment_publication(
+            &config,
+            &mgr,
+            task_id,
+            "daemon/other-t1",
+            &worker_merge,
+            91,
+        )
+        .await
+        .unwrap_err();
+        assert!(wrong_branch.contains(&sync_branch), "{wrong_branch}");
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let row = quorum_core::branch_sync::get(&conn, sync_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.phase, "conflict");
+            assert_eq!(row.pr, None);
+        }
+
+        branch_sync::record_judgment_publication(
+            &config,
+            &mgr,
+            task_id,
+            &sync_branch,
+            &worker_merge,
+            91,
+        )
+        .await
+        .unwrap();
+        // Restart replay of the same delivery is idempotent.
+        branch_sync::record_judgment_publication(
+            &config,
+            &mgr,
+            task_id,
+            &sync_branch,
+            &worker_merge,
+            91,
+        )
+        .await
+        .unwrap();
+        // The approval-free clean path never takes over the task-owned PR.
+        branch_sync::reconcile_one(&config, &mgr, &mut checks)
+            .await
+            .unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let row = quorum_core::branch_sync::get(&conn, sync_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.phase, "published", "{:?}", row.last_error);
+        assert!(row.active);
+        assert_eq!(row.merge_sha.as_deref(), Some(worker_merge.as_str()));
+        assert_eq!(row.pr, Some(91));
+        assert_eq!(row.task_id, Some(task_id));
+        assert_eq!(row.sync_branch.as_deref(), Some(sync_branch.as_str()));
+        assert_eq!(row.target_branch, "main");
+
+        // An unrelated task has no bound row and is a no-op.
+        branch_sync::record_judgment_publication(
+            &config,
+            &mgr,
+            task_id + 1,
+            "daemon/x-t9",
+            "deadbeef",
+            5,
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
