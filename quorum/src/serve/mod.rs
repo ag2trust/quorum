@@ -4764,13 +4764,11 @@ async fn recover_late_worker_done_with_publication(
         log(&format!(
             "late branch sync judgment publication rejected for task #{task_id}: {error}"
         ));
-        fire_event(
+        fail_worker_for_teardown(
             &config.db_path,
             &row.agent,
             task_id,
-            &Event::AgentFailed {
-                reason: format!("branch sync judgment publication rejected: {error}"),
-            },
+            &format!("branch sync judgment publication rejected: {error}"),
         )
         .await;
         return Ok(false);
@@ -14737,13 +14735,13 @@ async fn tick(
                         workers[wi].agent_name, workers[wi].task_id
                     ));
                     let w = workers.remove(wi);
-                    fire_event(
+                    // Sweep-aware: a lease lapsed meanwhile is failed by the
+                    // same-transaction reap instead of rolling it back.
+                    fail_worker_for_teardown(
                         &db_path,
                         &w.agent_name,
                         w.task_id,
-                        &Event::AgentFailed {
-                            reason: format!("branch sync judgment publication rejected: {error}"),
-                        },
+                        &format!("branch sync judgment publication rejected: {error}"),
                     )
                     .await;
                     cleanup_slot_inner(
