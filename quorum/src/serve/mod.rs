@@ -12022,54 +12022,18 @@ async fn tick(
 
         // Kill rows — hard-terminate the targeted agent immediately.
         if row.kind == mailbox::MailboxKind::Kill {
-            let mut consume_kill = true;
-            if let Some(target) = &row.to_agent {
-                let reason = row.note.as_deref().unwrap_or("no reason given");
-                let by = &row.agent;
-
-                // Check workers first, then reviewers.
-                if let Some(wi) = workers.iter().position(|w| w.agent_name == *target) {
-                    log(&format!(
-                        "kill: terminating worker {} (task #{}) by {by}: {reason}",
-                        workers[wi].agent_name, workers[wi].task_id,
-                    ));
-                    kill_worker_by_request(config, wt_mgr, name_pool, workers, wi, by, reason)
-                        .await;
-                } else if let Some(ri) = reviewers.iter().position(|r| r.agent_name == *target) {
-                    log(&format!(
-                        "kill: terminating reviewer {} (task #{}) by {by}: {reason}",
-                        reviewers[ri].agent_name, reviewers[ri].task_id,
-                    ));
-                    let mutation = fail_reviewer_if_owner(
-                        &db_path,
-                        &reviewers[ri].agent_name,
-                        reviewers[ri].task_id,
-                        &format!("killed by {by}: {reason}"),
-                    )
-                    .await;
-                    if mutation.is_some() {
-                        let r = reviewers.remove(ri);
-                        emit_kill_event(&db_path, target, by, reason).await;
-                        teardown_reviewer(config, wt_mgr, name_pool, r, "killed").await;
-                    } else {
-                        log(&format!(
-                            "kill: reviewer {target} lifecycle mutation failed — retaining slot and kill request for retry"
-                        ));
-                        consume_kill = false;
-                    }
-                } else if lifetime_roster.owns(target) {
-                    log(&format!(
-                        "kill: agent {target} not active (already dead/finished)"
-                    ));
-                } else {
-                    // Passive agent — daemon can't terminate it, but
-                    // consume the row (single daemon per DB, invariant 11).
-                    log(&format!(
-                        "kill: agent {target} not managed by daemon — consuming row"
-                    ));
-                }
-            }
-            if consume_kill && !consume_mailbox_row(&db_path, *id).await {
+            if !process_kill_row(
+                config,
+                wt_mgr,
+                name_pool,
+                workers,
+                reviewers,
+                lifetime_roster,
+                *id,
+                row,
+            )
+            .await
+            {
                 break;
             }
             continue;
@@ -26967,10 +26931,47 @@ async fn fail_worker_assignment_settled(
         .is_some()
 }
 
+/// Whether `agent` still holds a worker-phase (`working`/`rework`) assignment
+/// of `task_id`. An unreadable task counts as held: the caller must not
+/// discard retry authority on evidence it could not obtain.
+async fn worker_assignment_still_held(db_path: &Path, agent: &str, task_id: i64) -> bool {
+    let p = db_path.to_path_buf();
+    let actor = agent.to_string();
+    let result = tokio::task::spawn_blocking(move || -> Result<bool> {
+        let conn = quorum_core::db::open(&p)?;
+        Ok(tasks::get(&conn, task_id)?.is_some_and(|task| {
+            matches!(task.status.as_str(), "working" | "rework")
+                && task.assignee.as_deref() == Some(actor.as_str())
+        }))
+    })
+    .await;
+    match result {
+        Ok(Ok(held)) => held,
+        Ok(Err(error)) => {
+            log(&format!(
+                "kill: task #{task_id} assignment re-read failed for {agent}: {error}"
+            ));
+            true
+        }
+        Err(error) => {
+            log(&format!(
+                "kill: task #{task_id} assignment re-read join error for {agent}: {error}"
+            ));
+            true
+        }
+    }
+}
+
 /// Hard-terminate a worker on a kill request. The failure is sweep-aware: a
 /// lease that lapsed before the kill is settled by the same-transaction reap.
 /// Teardown then releases the slot without a second `AgentFailed`, which
 /// would be rejected from `open` (or double-spend the recovery budget).
+///
+/// Returns whether the kill settled. The slot is released only when the
+/// failure was applied, the sweep already recovered the assignment, or the
+/// worker provably no longer holds a `working`/`rework` assignment (the
+/// rejection was already recorded loudly). Otherwise the slot stays in
+/// `workers` so the caller can retain the kill row and retry.
 async fn kill_worker_by_request(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -26979,18 +26980,96 @@ async fn kill_worker_by_request(
     worker_index: usize,
     by: &str,
     reason: &str,
-) {
-    let worker = workers.remove(worker_index);
-    fail_worker_assignment_settled(
+) -> bool {
+    let agent_name = workers[worker_index].agent_name.clone();
+    let task_id = workers[worker_index].task_id;
+    let outcome = fail_worker_assignment(
         &config.db_path,
-        &worker.agent_name,
-        worker.task_id,
+        &agent_name,
+        task_id,
         &format!("killed by {by}: {reason}"),
     )
     .await;
+    if outcome.is_none()
+        && worker_assignment_still_held(&config.db_path, &agent_name, task_id).await
+    {
+        return false;
+    }
+    let worker = workers.remove(worker_index);
     // Emit agent_killed event for the log.
     emit_kill_event(&config.db_path, &worker.agent_name, by, reason).await;
     teardown_worker_inner(config, wt_mgr, name_pool, worker, "open", None, false).await;
+    true
+}
+
+/// Phase 2 handling of one kill mailbox row: terminate the targeted managed
+/// agent and consume the row. The row is left pending when the target's
+/// lifecycle mutation did not settle, so the next tick retries it. Returns
+/// `false` when mailbox processing must stop for this tick.
+#[allow(clippy::too_many_arguments)]
+async fn process_kill_row(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    reviewers: &mut Vec<SlotState>,
+    lifetime_roster: &LifetimeRoster,
+    id: i64,
+    row: &mailbox::MailboxRow,
+) -> bool {
+    let db_path = config.db_path.clone();
+    let mut consume_kill = true;
+    if let Some(target) = &row.to_agent {
+        let reason = row.note.as_deref().unwrap_or("no reason given");
+        let by = &row.agent;
+
+        // Check workers first, then reviewers.
+        if let Some(wi) = workers.iter().position(|w| w.agent_name == *target) {
+            log(&format!(
+                "kill: terminating worker {} (task #{}) by {by}: {reason}",
+                workers[wi].agent_name, workers[wi].task_id,
+            ));
+            if !kill_worker_by_request(config, wt_mgr, name_pool, workers, wi, by, reason).await {
+                log(&format!(
+                    "kill: worker {target} failure did not settle — retaining slot and kill request for retry"
+                ));
+                consume_kill = false;
+            }
+        } else if let Some(ri) = reviewers.iter().position(|r| r.agent_name == *target) {
+            log(&format!(
+                "kill: terminating reviewer {} (task #{}) by {by}: {reason}",
+                reviewers[ri].agent_name, reviewers[ri].task_id,
+            ));
+            let mutation = fail_reviewer_if_owner(
+                &db_path,
+                &reviewers[ri].agent_name,
+                reviewers[ri].task_id,
+                &format!("killed by {by}: {reason}"),
+            )
+            .await;
+            if mutation.is_some() {
+                let r = reviewers.remove(ri);
+                emit_kill_event(&db_path, target, by, reason).await;
+                teardown_reviewer(config, wt_mgr, name_pool, r, "killed").await;
+            } else {
+                log(&format!(
+                    "kill: reviewer {target} lifecycle mutation failed — retaining slot and kill request for retry"
+                ));
+                consume_kill = false;
+            }
+        } else if lifetime_roster.owns(target) {
+            log(&format!(
+                "kill: agent {target} not active (already dead/finished)"
+            ));
+        } else {
+            // Passive agent — daemon can't terminate it, but
+            // consume the row (single daemon per DB, invariant 11).
+            log(&format!(
+                "kill: agent {target} not managed by daemon — consuming row"
+            ));
+        }
+    }
+    !consume_kill || consume_mailbox_row(&db_path, id).await
 }
 
 /// Fail a live-process worker whose rework turn could not be fed and release
@@ -50050,7 +50129,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let wt_mgr = WorktreeManager::new();
         let mut name_pool = Pool::new_generated();
 
-        kill_worker_by_request(
+        let settled = kill_worker_by_request(
             &config,
             &wt_mgr,
             &mut name_pool,
@@ -50060,6 +50139,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "stuck",
         )
         .await;
+
+        assert!(settled);
 
         assert!(workers.is_empty(), "the killed worker slot is released");
         let conn = quorum_core::db::open(&config.db_path).unwrap();
@@ -50086,7 +50167,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let wt_mgr = WorktreeManager::new();
         let mut name_pool = Pool::new_generated();
 
-        kill_worker_by_request(
+        let settled = kill_worker_by_request(
             &config,
             &wt_mgr,
             &mut name_pool,
@@ -50097,6 +50178,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         )
         .await;
 
+        assert!(settled);
+
         assert!(workers.is_empty());
         let conn = quorum_core::db::open(&config.db_path).unwrap();
         let task = tasks::get(&conn, 1).unwrap().unwrap();
@@ -50105,6 +50188,178 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(task_event_count(&conn, 1, "task_open"), 1);
         assert_eq!(task_event_count(&conn, 1, "task_reclaimed"), 0);
         assert_eq!(errors_with_source(&conn, "lifecycle"), 0);
+    }
+
+    #[cfg(unix)]
+    fn append_kill_row(db_path: &Path, target: &str) -> mailbox::MailboxRow {
+        let row = mailbox::MailboxRow {
+            agent: "owner".into(),
+            kind: mailbox::MailboxKind::Kill,
+            task_id: None,
+            pr: None,
+            verdict: None,
+            feedback: None,
+            note: Some("stuck".into()),
+            to_agent: Some(target.into()),
+            payload: None,
+        };
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        mailbox::append(&mut conn, &row).unwrap();
+        row
+    }
+
+    /// Drive the Phase 2 kill handler over the real pending kill row, the
+    /// way `tick` does after its mailbox snapshot.
+    #[cfg(unix)]
+    async fn process_pending_kill_row(
+        config: &ServeConfig,
+        workers: &mut Vec<SlotState>,
+    ) -> (i64, bool) {
+        let (id, row) = {
+            let conn = quorum_core::db::open(&config.db_path).unwrap();
+            let mut rows = mailbox::poll_unconsumed(&conn).unwrap();
+            assert_eq!(rows.len(), 1, "exactly one pending kill row");
+            rows.remove(0)
+        };
+        assert_eq!(row.kind, mailbox::MailboxKind::Kill);
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut reviewers = Vec::new();
+        let mut lifetime_roster = LifetimeRoster::new();
+        for worker in workers.iter() {
+            lifetime_roster.register(&worker.agent_name);
+        }
+        let keep_processing = process_kill_row(
+            config,
+            &wt_mgr,
+            &mut name_pool,
+            workers,
+            &mut reviewers,
+            &lifetime_roster,
+            id,
+            &row,
+        )
+        .await;
+        (id, keep_processing)
+    }
+
+    #[cfg(unix)]
+    fn mailbox_row_consumed(conn: &rusqlite::Connection, id: i64) -> bool {
+        conn.query_row(
+            "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Phase 2 kill row for a worker whose lease already lapsed: the sweep
+    /// reap counts as settled, so the slot is released and the row consumed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_row_for_lapsed_lease_worker_is_consumed_after_sweep_reap() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, mut workers) = mailbox_failure_fixture(dir.path(), "working", true).await;
+        append_kill_row(&config.db_path, DRAIN_AUTHOR);
+
+        let (id, keep_processing) = process_pending_kill_row(&config, &mut workers).await;
+
+        assert!(keep_processing);
+        assert!(workers.is_empty(), "the killed worker slot is released");
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        assert!(mailbox_row_consumed(&conn, id), "settled kill is consumed");
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "open", "the lapsed-lease reap must commit");
+        assert_eq!(task.assignee, None);
+        assert_eq!(task.recovery_attempts, 1, "one recovery transition only");
+        assert_eq!(task_event_count(&conn, 1, "task_reclaimed"), 1);
+        assert_eq!(task_event_count(&conn, 1, "task_open"), 0);
+        assert_eq!(
+            errors_with_source(&conn, "lifecycle"),
+            0,
+            "no invalid-transition diagnostic"
+        );
+    }
+
+    /// Negative path: when the worker failure cannot be written, the task
+    /// still holds its live assignment, so the slot and the kill row are both
+    /// retained. The retry settles once the write succeeds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_row_is_retained_with_slot_until_worker_failure_settles() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, mut workers) = mailbox_failure_fixture(dir.path(), "working", false).await;
+        append_kill_row(&config.db_path, DRAIN_AUTHOR);
+        {
+            let conn = quorum_core::db::open(&config.db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER block_task_writes BEFORE UPDATE ON tasks
+                 BEGIN SELECT RAISE(ABORT, 'injected task write failure'); END;",
+            )
+            .unwrap();
+        }
+
+        let (id, keep_processing) = process_pending_kill_row(&config, &mut workers).await;
+
+        assert!(keep_processing, "an unsettled kill does not stop the tick");
+        assert_eq!(workers.len(), 1, "unsettled kill retains the worker slot");
+        {
+            let conn = quorum_core::db::open(&config.db_path).unwrap();
+            assert!(
+                !mailbox_row_consumed(&conn, id),
+                "unsettled kill retains the kill row for retry"
+            );
+            let task = tasks::get(&conn, 1).unwrap().unwrap();
+            assert_eq!(task.status, "working");
+            assert_eq!(task.assignee.as_deref(), Some(DRAIN_AUTHOR));
+            assert_eq!(task.recovery_attempts, 0);
+            assert_eq!(
+                errors_with_source(&conn, "lifecycle"),
+                1,
+                "the failed write is recorded loudly"
+            );
+            conn.execute_batch("DROP TRIGGER block_task_writes;")
+                .unwrap();
+        }
+
+        let (retry_id, keep_processing) = process_pending_kill_row(&config, &mut workers).await;
+
+        assert!(keep_processing);
+        assert_eq!(retry_id, id, "the same kill row is retried");
+        assert!(workers.is_empty());
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        assert!(mailbox_row_consumed(&conn, id));
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert_eq!(task.recovery_attempts, 1);
+        assert_eq!(task_event_count(&conn, 1, "task_open"), 1);
+        assert_eq!(errors_with_source(&conn, "lifecycle"), 1);
+    }
+
+    /// A rejected failure for a worker that no longer holds a worker-phase
+    /// assignment is a proved terminal disposition: loud, but the slot is
+    /// released and the kill row consumed instead of replaying every tick.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_row_for_worker_without_assignment_is_loud_and_consumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, mut workers) = mailbox_failure_fixture(dir.path(), "cancelled", false).await;
+        append_kill_row(&config.db_path, DRAIN_AUTHOR);
+
+        let (id, keep_processing) = process_pending_kill_row(&config, &mut workers).await;
+
+        assert!(keep_processing);
+        assert!(workers.is_empty());
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        assert!(mailbox_row_consumed(&conn, id));
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "cancelled");
+        assert_eq!(task.recovery_attempts, 0);
+        assert_eq!(
+            errors_with_source(&conn, "lifecycle"),
+            1,
+            "the invalid transition stays loud"
+        );
     }
 
     /// A rework feed failure for a worker whose lease lapsed is settled by
