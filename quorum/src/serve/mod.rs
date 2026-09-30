@@ -10321,6 +10321,7 @@ async fn required_merged_commit_sha(
 /// the immutable SHA dependency consumers require for base verification.
 async fn complete_detected_merge_with_metadata(
     config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
     task_id: i64,
     pr: i64,
 ) -> Result<bool> {
@@ -10329,6 +10330,7 @@ async fn complete_detected_merge_with_metadata(
     else {
         return Ok(false);
     };
+    settle_branch_sync_judgment_merge(config, wt_mgr, task_id, &merge_commit_sha).await?;
     let db_path = config.db_path.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&db_path)?;
@@ -10343,7 +10345,11 @@ async fn complete_detected_merge_with_metadata(
 /// Consume one owner retry and perform at most one formal approval/merge call.
 /// All network checks precede a final durable-authority reread; failures either
 /// invalidate only stale evidence or park the unchanged exact-SHA authority.
-async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result<()> {
+async fn reconcile_merge_retries(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    draining: bool,
+) -> Result<()> {
     if draining {
         return Ok(());
     }
@@ -10449,20 +10455,7 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
             else {
                 return Ok(());
             };
-            let p = config.db_path.clone();
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                let mut conn = quorum_core::db::open(&p)?;
-                tasks::complete_approved_merge(
-                    &mut conn,
-                    task_id,
-                    pr,
-                    &merge_commit_sha,
-                    now_unix(),
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| QuorumError::Io(format!("merge retry completion join: {error}")))??;
+            complete_approved_task_merge(config, wt_mgr, task_id, pr, merge_commit_sha).await?;
             return Ok(());
         }
         merge::MergeabilityState::Conflicting => {
@@ -10610,20 +10603,7 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
             else {
                 return Ok(());
             };
-            let p = config.db_path.clone();
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                let mut conn = quorum_core::db::open(&p)?;
-                tasks::complete_approved_merge(
-                    &mut conn,
-                    task_id,
-                    pr,
-                    &merge_commit_sha,
-                    now_unix(),
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| QuorumError::Io(format!("merge retry completion join: {error}")))??;
+            complete_approved_task_merge(config, wt_mgr, task_id, pr, merge_commit_sha).await?;
             return Ok(());
         }
         merge::MergeabilityState::Conflicting => {
@@ -10671,14 +10651,7 @@ async fn reconcile_merge_retries(config: &ServeConfig, draining: bool) -> Result
         else {
             return Ok(());
         };
-        let p = config.db_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut conn = quorum_core::db::open(&p)?;
-            tasks::complete_approved_merge(&mut conn, task_id, pr, &merge_commit_sha, now_unix())?;
-            Ok(())
-        })
-        .await
-        .map_err(|error| QuorumError::Io(format!("merge retry completion join: {error}")))??;
+        complete_approved_task_merge(config, wt_mgr, task_id, pr, merge_commit_sha).await?;
         log(&format!(
             "PR #{pr} merged from explicit durable-approval retry"
         ));
@@ -10866,6 +10839,8 @@ async fn tick_loop(
     // that landed with unbound `conflict` rows observes them as tasks from
     // the very first tick. The intake is bounded to one row per call.
     branch_sync::intake_conflict_judgment_task(config, &wt_mgr).await?;
+    // Release one sync row whose judgment task was cancelled while no daemon ran.
+    reconcile_cancelled_branch_sync_judgment(config, &wt_mgr).await?;
 
     // `attempting` means the prior daemon crossed the durable boundary before
     // a merge network call (ordinary reviewed merge or explicit replay), but
@@ -12586,22 +12561,14 @@ async fn tick(
                             }
                             break;
                         };
-                        let p = db_path.clone();
-                        tokio::task::spawn_blocking(move || -> Result<()> {
-                            let mut conn = quorum_core::db::open(&p)?;
-                            tasks::complete_approved_merge(
-                                &mut conn,
-                                reviewer_task_id,
-                                pr_num,
-                                &merge_commit_sha,
-                                now_unix(),
-                            )?;
-                            Ok(())
-                        })
-                        .await
-                        .map_err(|error| {
-                            QuorumError::Io(format!("already-merged completion join: {error}"))
-                        })??;
+                        complete_approved_task_merge(
+                            config,
+                            wt_mgr,
+                            reviewer_task_id,
+                            pr_num,
+                            merge_commit_sha,
+                        )
+                        .await?;
                         // #125 fires the collector immediately (best-effort).
                         // #127 also durably enqueues so the tick loop retries
                         // with backoff and cap; a successful run deletes the
@@ -13908,20 +13875,14 @@ async fn tick(
                             }
                             break;
                         };
-                        let p = db_path.clone();
-                        tokio::task::spawn_blocking(move || -> Result<()> {
-                            let mut conn = quorum_core::db::open(&p)?;
-                            tasks::complete_approved_merge(
-                                &mut conn,
-                                reviewer_task_id,
-                                pr_num,
-                                &merge_commit_sha,
-                                now_unix(),
-                            )?;
-                            Ok(())
-                        })
-                        .await
-                        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))??;
+                        complete_approved_task_merge(
+                            config,
+                            wt_mgr,
+                            reviewer_task_id,
+                            pr_num,
+                            merge_commit_sha,
+                        )
+                        .await?;
                         log(&format!(
                             "lifecycle: task #{reviewer_task_id} -> done (effects: [release_lease])"
                         ));
@@ -16210,6 +16171,11 @@ async fn tick(
         }
     }
 
+    // ── Phase 4b3: Branch-sync judgment cancellation ────────────────────
+    // After any held slot on a cancelled task is torn down above, remove one
+    // cancelled judgment task's `sync/<id>` branch and release its sync row.
+    reconcile_cancelled_branch_sync_judgment(config, wt_mgr).await?;
+
     // ── Phase 4c: Deliver queued messages to idle workers (M5) ──────────
     // Messages are delivered "at idle" — only when the worker is between turns
     // (draining=false). If the target is still draining, the message stays
@@ -16287,7 +16253,7 @@ async fn tick(
     // This runs before reviewer provisioning so invalid/missing authority can
     // return to in-review and request only its first missing role in the same
     // tick. A valid replay never allocates a reviewer or worker.
-    reconcile_merge_retries(config, drain_state.draining).await?;
+    reconcile_merge_retries(config, wt_mgr, drain_state.draining).await?;
 
     // ── Phase 5: Spawn reviewers for workers with PRs ──────────────────
     // Each worker that has a PR and no paired reviewer (and is not draining)
@@ -16373,7 +16339,8 @@ async fn tick(
                             "PR #{pr} already merged — firing PrFoundMerged for task #{task_id}"
                         ));
                         let _ =
-                            complete_detected_merge_with_metadata(config, *task_id, *pr).await?;
+                            complete_detected_merge_with_metadata(config, wt_mgr, *task_id, *pr)
+                                .await?;
                         pr_closed_workers.push(*wi);
                         continue;
                     }
@@ -16678,7 +16645,8 @@ async fn tick(
                              firing PrFoundMerged for task #{task_id}"
                         ));
                         let _ =
-                            complete_detected_merge_with_metadata(config, *task_id, *pr).await?;
+                            complete_detected_merge_with_metadata(config, wt_mgr, *task_id, *pr)
+                                .await?;
                         continue;
                     }
                     merge::MergeabilityState::Closed => {
@@ -22562,6 +22530,261 @@ async fn release_worker_worktree(
     if delete_branch {
         wt_mgr.delete_branch(&config.repo_dir, branch).await;
     }
+}
+
+/// Run the clean branch-sync path's post-merge verification for a judgment
+/// task's merged delivery: fetch the sync target, then prove both pinned tips
+/// are ancestors of GitHub's immutable merge commit.
+async fn verify_branch_sync_judgment_merge(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    sync: &quorum_core::branch_sync::BranchSync,
+    merge_commit_sha: &str,
+) -> std::result::Result<(), String> {
+    let pinned = |value: Option<&str>, field: &str| {
+        value
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("branch sync durable row is missing {field}"))
+    };
+    let source_sha = pinned(sync.source_sha.as_deref(), "source_sha")?;
+    let target_sha = pinned(sync.target_sha.as_deref(), "target_sha")?;
+    wt_mgr
+        .fetch_branch_sync_target(&config.repo_dir, &sync.target_branch)
+        .await?;
+    wt_mgr
+        .verify_branch_sync_merge_ancestry(
+            &config.repo_dir,
+            merge_commit_sha,
+            &source_sha,
+            &target_sha,
+        )
+        .await
+}
+
+/// Settle the sync row bound to a judgment task whose PR the daemon has
+/// merged, before the task itself becomes `done`. A verified merge marks the
+/// row `done`; a verification failure (or a row that is no longer the task's
+/// `published` binding) fails it loudly on its current phase, never silently
+/// done. Either way the row releases the pair, and the task — whose PR GitHub
+/// already merged — still completes. Tasks without a bound row are no-ops.
+async fn settle_branch_sync_judgment_merge(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    task_id: i64,
+    merge_commit_sha: &str,
+) -> Result<()> {
+    let p = config.db_path.clone();
+    let sync = tokio::task::spawn_blocking(move || {
+        let conn = quorum_core::db::open(&p)?;
+        quorum_core::branch_sync::active_for_task(&conn, task_id)
+    })
+    .await
+    .map_err(|error| {
+        QuorumError::Io(format!("branch sync judgment merge lookup join: {error}"))
+    })??;
+    let Some(sync) = sync else {
+        return Ok(());
+    };
+    let verified = verify_branch_sync_judgment_merge(config, wt_mgr, &sync, merge_commit_sha).await;
+    let p = config.db_path.clone();
+    let id = sync.id;
+    let phase = sync.phase.clone();
+    let merge_commit_sha = merge_commit_sha.to_string();
+    let outcome = tokio::task::spawn_blocking(move || -> Result<std::result::Result<(), String>> {
+        let mut conn = quorum_core::db::open(&p)?;
+        let error = match verified {
+            Ok(()) => {
+                if quorum_core::branch_sync::resolve_conflict_done(
+                    &mut conn,
+                    id,
+                    task_id,
+                    &merge_commit_sha,
+                    now_unix(),
+                )?
+                .is_some()
+                {
+                    return Ok(Ok(()));
+                }
+                format!(
+                    "branch sync #{id} was not task #{task_id}'s published binding when its PR merged as {merge_commit_sha}"
+                )
+            }
+            Err(error) => error,
+        };
+        quorum_core::branch_sync::fail(&mut conn, id, &phase, &error, now_unix())?;
+        Ok(Err(error))
+    })
+    .await
+    .map_err(|error| {
+        QuorumError::Io(format!("branch sync judgment merge settlement join: {error}"))
+    })??;
+    match outcome {
+        Ok(()) => log(&format!(
+            "branch sync #{id}: judgment task #{task_id} merge verified — done"
+        )),
+        Err(error) => log(&format!(
+            "branch sync #{id}: judgment task #{task_id} merge verification failed: {error}"
+        )),
+    }
+    Ok(())
+}
+
+/// Complete a daemon-approved merge. A bound branch-sync row is verified and
+/// settled first, so the task reaches `done` only after that verification.
+async fn complete_approved_task_merge(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    task_id: i64,
+    pr: i64,
+    merge_commit_sha: String,
+) -> Result<()> {
+    settle_branch_sync_judgment_merge(config, wt_mgr, task_id, &merge_commit_sha).await?;
+    let p = config.db_path.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        tasks::complete_approved_merge(&mut conn, task_id, pr, &merge_commit_sha, now_unix())?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("approved merge completion join: {error}")))??;
+    Ok(())
+}
+
+/// Daemon cancel path for branch-sync judgment tasks: once a bound task is
+/// `cancelled`, remove only its `sync/<id>` branch (kept worktree, local ref,
+/// remote ref), then cancel the row and release the pair. Removal precedes the
+/// row transition so a crash replays the idempotent removal instead of leaking
+/// the branch; a removal failure fails the row loudly rather than looping.
+/// One row per call keeps the pass bounded.
+async fn reconcile_cancelled_branch_sync_judgment(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+) -> Result<()> {
+    let p = config.db_path.clone();
+    let sync = tokio::task::spawn_blocking(move || {
+        let conn = quorum_core::db::open(&p)?;
+        quorum_core::branch_sync::next_cancelled_judgment(&conn)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("branch sync cancellation lookup join: {error}")))??;
+    let Some(sync) = sync else {
+        return Ok(());
+    };
+    let Some(task_id) = sync.task_id else {
+        return Ok(());
+    };
+    let removed = remove_branch_sync_branch(config, wt_mgr, &sync).await;
+    let p = config.db_path.clone();
+    let id = sync.id;
+    let phase = sync.phase.clone();
+    let failure = removed.as_ref().err().cloned();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&p)?;
+        let now = now_unix();
+        match failure {
+            None => {
+                quorum_core::branch_sync::cancel_for_cancelled_task(&mut conn, id, task_id, now)?;
+            }
+            Some(error) => {
+                let error = format!(
+                    "judgment task #{task_id} cancelled but sync branch removal failed: {error}"
+                );
+                quorum_core::branch_sync::fail(&mut conn, id, &phase, &error, now)?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("branch sync cancellation join: {error}")))??;
+    match removed {
+        Ok(()) => log(&format!(
+            "branch sync #{id}: judgment task #{task_id} cancelled — sync branch removed"
+        )),
+        Err(error) => log(&format!(
+            "branch sync #{id}: judgment task #{task_id} cancelled but sync branch removal failed: {error}"
+        )),
+    }
+    Ok(())
+}
+
+/// Remove a cancelled judgment's kept worktree and its `sync/<id>` branch,
+/// locally and on `origin`. The branch name is re-derived from the row id and
+/// must match the durable binding; the sync `from` and `to` are never touched.
+/// Every step is idempotent so a replay after a crash converges.
+async fn remove_branch_sync_branch(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    sync: &quorum_core::branch_sync::BranchSync,
+) -> std::result::Result<(), String> {
+    let branch = format!("sync/{}", sync.id);
+    if sync.sync_branch.as_deref() != Some(branch.as_str())
+        || branch == sync.source_branch
+        || branch == sync.target_branch
+    {
+        return Err(format!(
+            "refusing to remove unexpected sync branch {:?} for {} -> {}",
+            sync.sync_branch, sync.source_branch, sync.target_branch
+        ));
+    }
+    let worktree = branch_sync_worktree_path(config, sync.id);
+    if worktree.exists() {
+        wt_mgr.remove(&config.repo_dir, &worktree).await?;
+    }
+    let local_ref = format!("refs/heads/{branch}");
+    wt_mgr.delete_branch(&config.repo_dir, &branch).await;
+    if wt_mgr
+        .resolve_ref_sha(&config.repo_dir, &local_ref)
+        .await
+        .is_ok()
+    {
+        return Err(format!("local branch {branch} still exists after removal"));
+    }
+
+    let git = |args: &[&str]| {
+        let mut command = tokio::process::Command::new("git");
+        command
+            .arg("-C")
+            .arg(&config.repo_dir)
+            .args(args)
+            .stdin(Stdio::null());
+        command
+    };
+    let listed = run_publication_gh_command(
+        git(&["ls-remote", "origin", &local_ref]),
+        PUBLICATION_GH_TIMEOUT,
+        "git ls-remote sync branch",
+    )
+    .await?;
+    if !listed.status.success() {
+        return Err(format!(
+            "git ls-remote origin {local_ref} failed: {}",
+            String::from_utf8_lossy(&listed.stderr)
+        ));
+    }
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    let Some(remote_sha) = listed.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let sha = fields.next()?;
+        (fields.next() == Some(local_ref.as_str())).then(|| sha.to_string())
+    }) else {
+        return Ok(());
+    };
+    let lease = format!("--force-with-lease={local_ref}:{remote_sha}");
+    let refspec = format!(":{local_ref}");
+    let deleted = run_publication_gh_command(
+        git(&["push", "origin", &lease, &refspec]),
+        PUBLICATION_GH_TIMEOUT,
+        "git push delete sync branch",
+    )
+    .await?;
+    if !deleted.status.success() {
+        return Err(format!(
+            "git push origin --delete {branch} failed: {}",
+            String::from_utf8_lossy(&deleted.stderr)
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve a task's `branch_sync` ref to the kept sync merge it must adopt.
@@ -28892,6 +29115,298 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    struct PublishedJudgmentFixture {
+        tmp: tempfile::TempDir,
+        bare: PathBuf,
+        repo: PathBuf,
+        config: ServeConfig,
+        mgr: WorktreeManager,
+        sync_id: i64,
+        task_id: i64,
+        worker_path: PathBuf,
+        worker_merge: String,
+        target_tip: String,
+    }
+
+    /// A conflicted `develop -> main` sync whose judgment task resolved the
+    /// merge in place, pushed `sync/<id>`, and was bound as PR #91.
+    async fn published_judgment_fixture() -> PublishedJudgmentFixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("remote.git");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        sync_fixture_git(tmp.path(), &["init", "--bare", &bare.to_string_lossy()]);
+        sync_fixture_git(&repo, &["init", "-b", "main"]);
+        sync_fixture_git(&repo, &["config", "user.email", "test@test.com"]);
+        sync_fixture_git(&repo, &["config", "user.name", "Test"]);
+        sync_fixture_git(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        sync_fixture_git(&repo, &["add", "shared.txt"]);
+        sync_fixture_git(&repo, &["commit", "-m", "base"]);
+        sync_fixture_git(&repo, &["checkout", "-b", "develop"]);
+        std::fs::write(repo.join("shared.txt"), "source\n").unwrap();
+        sync_fixture_git(&repo, &["commit", "-am", "source change"]);
+        sync_fixture_git(&repo, &["checkout", "main"]);
+        std::fs::write(repo.join("shared.txt"), "target\n").unwrap();
+        sync_fixture_git(&repo, &["commit", "-am", "target change"]);
+        sync_fixture_git(&repo, &["push", "origin", "main", "develop"]);
+        let target_tip = sync_fixture_git(&repo, &["rev-parse", "main"]);
+
+        let db_path = tmp.path().join("quorum.db");
+        let mut config = pre_review_checks_config(db_path.clone(), repo.clone());
+        config.worktree_base = tmp.path().join("worktrees");
+        config.pr_target_program = Some(tmp.path().join("missing-gh"));
+        std::fs::create_dir_all(&config.worktree_base).unwrap();
+        let sync_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            match quorum_core::branch_sync::request(&mut conn, "develop", "main", "owner", 1)
+                .unwrap()
+            {
+                quorum_core::branch_sync::RequestOutcome::Requested(row) => row.id,
+                quorum_core::branch_sync::RequestOutcome::AlreadyActive(_) => unreachable!(),
+            }
+        };
+        let mgr = WorktreeManager::new();
+        let mut checks = branch_sync::BranchSyncChecks::default();
+        for _ in 0..2 {
+            branch_sync::reconcile_one(&config, &mgr, &mut checks)
+                .await
+                .unwrap();
+        }
+        branch_sync::intake_conflict_judgment_task(&config, &mgr)
+            .await
+            .unwrap();
+        let (task_id, refs) = {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = quorum_core::branch_sync::get(&conn, sync_id)
+                .unwrap()
+                .unwrap()
+                .task_id
+                .expect("judgment task bound");
+            let refs: Option<String> = conn
+                .query_row("SELECT refs FROM tasks WHERE id=?1", [task_id], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            (task_id, refs)
+        };
+        let adoption = resolve_branch_sync_adoption(&config, task_id, refs.as_deref())
+            .await
+            .unwrap()
+            .expect("branch_sync ref routes to adoption");
+        let worker_path = mgr
+            .adopt_sync_worktree(&repo, &adoption.worktree, &adoption.branch)
+            .await
+            .unwrap();
+        std::fs::write(worker_path.join("shared.txt"), "source\ntarget\n").unwrap();
+        sync_fixture_git(&worker_path, &["add", "shared.txt"]);
+        sync_fixture_git(&worker_path, &["commit", "--no-edit"]);
+        let worker_merge = sync_fixture_git(&worker_path, &["rev-parse", "HEAD"]);
+        let sync_branch = format!("sync/{sync_id}");
+        sync_fixture_git(&worker_path, &["push", "origin", &sync_branch]);
+        branch_sync::record_judgment_publication(
+            &config,
+            &mgr,
+            task_id,
+            &sync_branch,
+            &worker_merge,
+            91,
+        )
+        .await
+        .unwrap();
+        PublishedJudgmentFixture {
+            tmp,
+            bare,
+            repo,
+            config,
+            mgr,
+            sync_id,
+            task_id,
+            worker_path,
+            worker_merge,
+            target_tip,
+        }
+    }
+
+    fn judgment_row_and_task_status(
+        fx: &PublishedJudgmentFixture,
+    ) -> (quorum_core::branch_sync::BranchSync, String) {
+        let conn = quorum_core::db::open(&fx.config.db_path).unwrap();
+        let row = quorum_core::branch_sync::get(&conn, fx.sync_id)
+            .unwrap()
+            .unwrap();
+        let status = tasks::get(&conn, fx.task_id).unwrap().unwrap().status;
+        (row, status)
+    }
+
+    fn set_judgment_task_merging(fx: &PublishedJudgmentFixture) {
+        let conn = quorum_core::db::open(&fx.config.db_path).unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='merging' WHERE id=?1",
+            [fx.task_id],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn branch_sync_judgment_approved_merge_verifies_ancestry_then_completes_sync_and_task() {
+        let fx = published_judgment_fixture().await;
+        // GitHub's merge of PR #91 lands the worker's resolved merge on `to`.
+        sync_fixture_git(&fx.worker_path, &["push", "origin", "HEAD:main"]);
+        set_judgment_task_merging(&fx);
+
+        complete_approved_task_merge(&fx.config, &fx.mgr, fx.task_id, 91, fx.worker_merge.clone())
+            .await
+            .unwrap();
+
+        let (row, status) = judgment_row_and_task_status(&fx);
+        assert_eq!(row.phase, "done", "{:?}", row.last_error);
+        assert!(!row.active, "a completed judgment sync releases the pair");
+        assert_eq!(status, "done");
+        let conn = quorum_core::db::open(&fx.config.db_path).unwrap();
+        let merged: String = conn
+            .query_row(
+                "SELECT body FROM events WHERE kind='branch_sync_merged' AND subject=?1",
+                [format!("branch_sync#{}", fx.sync_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(merged.contains(&fx.worker_merge), "{merged}");
+        assert!(
+            quorum_core::branch_sync::active_for_pair(&conn, "develop", "main")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_sync_judgment_merge_failing_ancestry_fails_sync_row_loudly() {
+        let fx = published_judgment_fixture().await;
+        set_judgment_task_merging(&fx);
+
+        // A "merge commit" lacking the pinned source tip must never be `done`.
+        complete_approved_task_merge(&fx.config, &fx.mgr, fx.task_id, 91, fx.target_tip.clone())
+            .await
+            .unwrap();
+
+        let (row, status) = judgment_row_and_task_status(&fx);
+        assert_eq!(row.phase, "failed");
+        assert!(!row.active);
+        let error = row.last_error.unwrap_or_default();
+        assert!(error.contains("does not contain pinned source"), "{error}");
+        assert_eq!(status, "done", "the merged PR still completes its task");
+        let conn = quorum_core::db::open(&fx.config.db_path).unwrap();
+        let errors: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM errors WHERE source='branch_sync'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(errors, 1);
+    }
+
+    #[tokio::test]
+    async fn branch_sync_judgment_cancellation_removes_only_sync_branch_and_cancels_row() {
+        let fx = published_judgment_fixture().await;
+        let sync_branch = format!("sync/{}", fx.sync_id);
+        let remote_heads = |fx: &PublishedJudgmentFixture| {
+            sync_fixture_git(
+                &fx.bare,
+                &["for-each-ref", "--format=%(refname) %(objectname)"],
+            )
+        };
+        let local_head = |branch: &str| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&fx.repo)
+                .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+                .output()
+                .unwrap()
+        };
+        let before = remote_heads(&fx);
+        assert!(
+            before.contains(&format!("refs/heads/{sync_branch}")),
+            "{before}"
+        );
+        let main_before = sync_fixture_git(&fx.repo, &["rev-parse", "main"]);
+        let develop_before = sync_fixture_git(&fx.repo, &["rev-parse", "develop"]);
+
+        // A live judgment task keeps its sync row and branch.
+        reconcile_cancelled_branch_sync_judgment(&fx.config, &fx.mgr)
+            .await
+            .unwrap();
+        let (row, _) = judgment_row_and_task_status(&fx);
+        assert!(row.active);
+        assert_eq!(remote_heads(&fx), before);
+
+        {
+            let mut conn = quorum_core::db::open(&fx.config.db_path).unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "owner",
+                fx.task_id,
+                &Event::Cancelled { by: "owner".into() },
+                now_unix(),
+            )
+            .unwrap();
+        }
+        reconcile_cancelled_branch_sync_judgment(&fx.config, &fx.mgr)
+            .await
+            .unwrap();
+
+        let (row, status) = judgment_row_and_task_status(&fx);
+        assert_eq!(status, "cancelled");
+        assert_eq!(row.phase, "cancelled", "{:?}", row.last_error);
+        assert!(!row.active, "cancellation releases the pair");
+        assert!(!local_head(&sync_branch).status.success());
+        assert!(!fx.worker_path.exists(), "kept sync worktree is removed");
+        let after = remote_heads(&fx);
+        assert!(
+            !after.contains(&format!("refs/heads/{sync_branch}")),
+            "{after}"
+        );
+        // `from` and `to` are untouched locally and on the remote.
+        assert_eq!(
+            sync_fixture_git(&fx.repo, &["rev-parse", "main"]),
+            main_before
+        );
+        assert_eq!(
+            sync_fixture_git(&fx.repo, &["rev-parse", "develop"]),
+            develop_before
+        );
+        for line in before
+            .lines()
+            .filter(|line| !line.contains(&format!("refs/heads/{sync_branch}")))
+        {
+            assert!(
+                after.lines().any(|kept| kept == line),
+                "{line} changed: {after}"
+            );
+        }
+        let conn = quorum_core::db::open(&fx.config.db_path).unwrap();
+        let cancelled: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='branch_sync_cancelled' AND subject=?1",
+                [format!("branch_sync#{}", fx.sync_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cancelled, 1);
+        drop(conn);
+
+        // Replay is a clean no-op, and the released pair accepts a new request.
+        reconcile_cancelled_branch_sync_judgment(&fx.config, &fx.mgr)
+            .await
+            .unwrap();
+        let mut conn = quorum_core::db::open(&fx.config.db_path).unwrap();
+        assert!(matches!(
+            quorum_core::branch_sync::request(&mut conn, "develop", "main", "owner", 2).unwrap(),
+            quorum_core::branch_sync::RequestOutcome::Requested(_)
+        ));
+        drop(fx.tmp);
     }
 
     #[test]
@@ -40213,7 +40728,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         });
         config.merge_executor = executor.clone();
 
-        reconcile_merge_retries(&config, false).await.unwrap();
+        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+            .await
+            .unwrap();
 
         assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         let conn = quorum_core::db::open(&config.db_path).unwrap();
@@ -40278,7 +40795,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         });
         config.merge_executor = executor.clone();
 
-        reconcile_merge_retries(&config, false).await.unwrap();
+        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+            .await
+            .unwrap();
 
         assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let conn = quorum_core::db::open(&config.db_path).unwrap();
@@ -40334,7 +40853,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         });
         config.merge_executor = executor.clone();
 
-        reconcile_merge_retries(&config, false).await.unwrap();
+        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+            .await
+            .unwrap();
 
         assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let conn = quorum_core::db::open(&config.db_path).unwrap();
@@ -40393,7 +40914,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         });
         config.merge_executor = executor.clone();
 
-        reconcile_merge_retries(&config, false).await.unwrap();
+        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+            .await
+            .unwrap();
 
         assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(
@@ -40439,7 +40962,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         });
         config.merge_executor = executor.clone();
 
-        reconcile_merge_retries(&config, false).await.unwrap();
+        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+            .await
+            .unwrap();
         assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         {
             let conn = quorum_core::db::open(&config.db_path).unwrap();
@@ -40454,7 +40979,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         }
 
         // Ordinary ticks cannot turn the retained evidence into a network loop.
-        reconcile_merge_retries(&config, false).await.unwrap();
+        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+            .await
+            .unwrap();
         assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         {
@@ -40464,7 +40991,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 .unwrap();
             assert_eq!(retried.status, "merging");
         }
-        reconcile_merge_retries(&config, false).await.unwrap();
+        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+            .await
+            .unwrap();
         assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
         let conn = quorum_core::db::open(&config.db_path).unwrap();
         assert_eq!(
@@ -40507,7 +41036,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         });
         config.merge_executor = executor.clone();
 
-        reconcile_merge_retries(&config, false).await.unwrap();
+        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+            .await
+            .unwrap();
 
         assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         let conn = quorum_core::db::open(&config.db_path).unwrap();
