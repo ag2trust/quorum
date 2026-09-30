@@ -1033,6 +1033,11 @@ fn decide_r2_requirement(
     {
         return Ok(required);
     }
+    if let Some(required) = quorum_core::review_audits::record_branch_sync_r2_requirement(
+        conn, task_id, pr_number, head_sha,
+    )? {
+        return Ok(required);
+    }
     if task.rework_round >= i64::from(task.effective_rework_cap()) {
         return quorum_core::review_audits::record_r2_requirement(
             conn, task_id, pr_number, head_sha, false,
@@ -1060,6 +1065,39 @@ fn decide_r2_requirement(
     };
 
     quorum_core::review_audits::record_r2_requirement(conn, task_id, pr_number, head_sha, required)
+}
+
+/// Resolve the recorded merge that defines a branch-sync judgment review.
+/// Ordinary tasks return `None`; a task carrying the reserved ref fails closed
+/// unless the active sync row is bound back to it and carries a merge SHA.
+fn branch_sync_review_merge_sha(
+    conn: &quorum_core::Connection,
+    task_id: i64,
+) -> Result<Option<String>> {
+    let task = tasks::get(conn, task_id)?
+        .ok_or_else(|| QuorumError::Io(format!("review task #{task_id} disappeared")))?;
+    if !tasks::refs_have_branch_sync_ref(task.refs.as_deref()) {
+        return Ok(None);
+    }
+    if quorum_core::review_audits::branch_sync_r2_skip_reason(conn, task_id)?.is_none() {
+        return Err(QuorumError::Io(format!(
+            "task #{task_id} has a branch_sync ref without a matching active daemon binding"
+        )));
+    }
+    let sync = quorum_core::branch_sync::active_for_task(conn, task_id)?.ok_or_else(|| {
+        QuorumError::Io(format!(
+            "task #{task_id} lost its active branch-sync row before R1 review"
+        ))
+    })?;
+    let sync_id = sync.id;
+    sync.merge_sha
+        .filter(|sha| !sha.is_empty())
+        .map(Some)
+        .ok_or_else(|| {
+            QuorumError::Io(format!(
+                "branch sync #{sync_id} has no recorded merge SHA for R1 review"
+            ))
+        })
 }
 
 /// Whether reviewer authority can still be issued for `task_id` right now.
@@ -9548,14 +9586,36 @@ async fn resume_reviewer_after_ci(
             .await
             .map_err(|error| QuorumError::Io(format!("review-cycle context join: {error}")))??
     };
-    let rereview_prompt = reviewer::build_rereview_turn_with_context(
-        &reviewers[reviewer_index].agent_name,
-        pr,
-        &workers[worker_index].agent_name,
-        &reviewers[reviewer_index].effort,
-        graph_context.as_deref(),
-        review_cycle,
-    );
+    let branch_sync_merge_sha = if reviewers[reviewer_index].r2_origin {
+        None
+    } else {
+        let db_path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let conn = quorum_core::db::open(&db_path)?;
+            branch_sync_review_merge_sha(&conn, task_id)
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("branch-sync review context join: {error}")))??
+    };
+    let rereview_prompt = match branch_sync_merge_sha.as_deref() {
+        Some(merge_sha) => reviewer::build_branch_sync_rereview_turn_with_context(
+            &reviewers[reviewer_index].agent_name,
+            pr,
+            &workers[worker_index].agent_name,
+            &reviewers[reviewer_index].effort,
+            graph_context.as_deref(),
+            review_cycle,
+            merge_sha,
+        ),
+        None => reviewer::build_rereview_turn_with_context(
+            &reviewers[reviewer_index].agent_name,
+            pr,
+            &workers[worker_index].agent_name,
+            &reviewers[reviewer_index].effort,
+            graph_context.as_deref(),
+            review_cycle,
+        ),
+    };
     let risk_instruction = reviewer::r1_risk_instruction(&risk_flags);
     let rereview_turn = if risk_instruction.is_empty() {
         format!("{rereview_prompt}\n\n{task_contract}")
@@ -9590,6 +9650,22 @@ async fn resume_reviewer_after_ci(
         return Err(QuorumError::Io(format!(
             "review-cycle context changed before re-review feed for task #{task_id}"
         )));
+    }
+    if branch_sync_merge_sha.is_some() {
+        let db_path = config.db_path.clone();
+        let current_merge_sha = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+            let conn = quorum_core::db::open(&db_path)?;
+            branch_sync_review_merge_sha(&conn, task_id)
+        })
+        .await
+        .map_err(|error| {
+            QuorumError::Io(format!("branch-sync re-review revalidation join: {error}"))
+        })??;
+        if current_merge_sha != branch_sync_merge_sha {
+            return Err(QuorumError::Io(format!(
+                "branch-sync review context changed before re-review feed for task #{task_id}"
+            )));
+        }
     }
     install_reviewer_rereview_pending_turn(&mut reviewers[reviewer_index], &rereview_turn);
     if let Err(error) = reviewers[reviewer_index]
@@ -11999,7 +12075,7 @@ async fn tick(
                         )
                         .await;
 
-                        let r2_required = {
+                        let (r2_required, r2_skip_reason) = {
                             let p = db_path.clone();
                             let sha = head_sha.clone();
                             let policy = R2SamplingPolicy {
@@ -12009,20 +12085,31 @@ async fn tick(
                                 default_model: reviewers[ri].model.clone(),
                                 default_effort: reviewers[ri].effort.clone(),
                             };
-                            tokio::task::spawn_blocking(move || -> Result<bool> {
-                                let mut conn = quorum_core::db::open(&p)?;
-                                decide_r2_requirement(
-                                    &mut conn,
-                                    reviewer_task_id,
-                                    pr_num,
-                                    &sha,
-                                    &policy,
-                                )
-                            })
+                            tokio::task::spawn_blocking(
+                                move || -> Result<(bool, Option<&'static str>)> {
+                                    let mut conn = quorum_core::db::open(&p)?;
+                                    let required = decide_r2_requirement(
+                                        &mut conn,
+                                        reviewer_task_id,
+                                        pr_num,
+                                        &sha,
+                                        &policy,
+                                    )?;
+                                    let reason = if required {
+                                        None
+                                    } else {
+                                        quorum_core::review_audits::branch_sync_r2_skip_reason(
+                                            &conn,
+                                            reviewer_task_id,
+                                        )?
+                                    };
+                                    Ok((required, reason))
+                                },
+                            )
                             .await
                             .ok()
                             .and_then(Result::ok)
-                            .unwrap_or(true)
+                            .unwrap_or((true, None))
                         };
 
                         let r2_already_approved = if r2_required {
@@ -12055,7 +12142,8 @@ async fn tick(
                                 if r2_already_approved {
                                     "retained exact-task R2 approval remains valid"
                                 } else {
-                                    "sampling or exhausted rework budget skipped R2"
+                                    r2_skip_reason
+                                        .unwrap_or("sampling or exhausted rework budget skipped R2")
                                 }
                             ));
                         } else {
@@ -21225,17 +21313,23 @@ async fn provision_reviewer_reserved(
     } else {
         None
     };
-    let complexity = {
+    let (complexity, branch_sync_merge_sha) = {
         let conn = quorum_core::db::open(&config.db_path)?;
         let task = tasks::get(&conn, worker.task_id)?.ok_or_else(|| {
             QuorumError::Io(format!("review task #{} disappeared", worker.task_id))
         })?;
-        classifier_complexity(&task.refs).ok_or_else(|| {
+        let complexity = classifier_complexity(&task.refs).ok_or_else(|| {
             QuorumError::Usage(format!(
                 "task #{} cannot dispatch reviewer without classifier-owned complexity",
                 worker.task_id
             ))
-        })?
+        })?;
+        let branch_sync_merge_sha = if matches!(role, ReviewRole::R1) {
+            branch_sync_review_merge_sha(&conn, worker.task_id)?
+        } else {
+            None
+        };
+        (complexity, branch_sync_merge_sha)
     };
     let assignment = assign_role(
         config,
@@ -21671,14 +21765,27 @@ async fn provision_reviewer_reserved(
                 worker_agent: worker.agent_name.to_string(),
                 reviewer_name: reviewer_name.clone(),
             };
-            reviewer::build_review_prompt_for_kind_with_context_and_cycle(
-                reviewer_kind,
-                &spec,
-                &reviewer_effort,
-                graph_context.as_deref(),
-                review_cycle,
-                &risk_flags,
-            )
+            match branch_sync_merge_sha.as_deref() {
+                Some(merge_sha) => {
+                    reviewer::build_branch_sync_review_prompt_for_kind_with_context_and_cycle(
+                        reviewer_kind,
+                        &spec,
+                        &reviewer_effort,
+                        graph_context.as_deref(),
+                        review_cycle,
+                        &risk_flags,
+                        merge_sha,
+                    )
+                }
+                None => reviewer::build_review_prompt_for_kind_with_context_and_cycle(
+                    reviewer_kind,
+                    &spec,
+                    &reviewer_effort,
+                    graph_context.as_deref(),
+                    review_cycle,
+                    &risk_flags,
+                ),
+            }
         }
         ReviewRole::R2 { r1_reviewer, .. } => {
             let spec = reviewer::R2ReviewSpec {
@@ -40740,6 +40847,161 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
         let role = next_needed_role(&conn, 42, "abc123").unwrap();
         assert_eq!(role, Some("r1"));
+    }
+
+    #[test]
+    fn branch_sync_r1_only_gate_is_scoped_to_daemon_bound_judgment_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+        let sync = match quorum_core::branch_sync::request(&mut conn, "develop", "main", "owner", 1)
+            .unwrap()
+        {
+            quorum_core::branch_sync::RequestOutcome::Requested(sync) => sync,
+            quorum_core::branch_sync::RequestOutcome::AlreadyActive(_) => unreachable!(),
+        };
+        quorum_core::branch_sync::pin(
+            &mut conn,
+            sync.id,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &format!("sync/{}", sync.id),
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        quorum_core::branch_sync::conflict(&mut conn, sync.id, 3)
+            .unwrap()
+            .unwrap();
+        let branch_task = match quorum_core::branch_sync::create_conflict_judgment_task(
+            &mut conn,
+            sync.id,
+            &["shared.txt".into()],
+            4,
+        )
+        .unwrap()
+        {
+            quorum_core::branch_sync::ConflictJudgmentOutcome::Created(task) => task.task_id,
+            quorum_core::branch_sync::ConflictJudgmentOutcome::NotEligible => unreachable!(),
+        };
+        let ordinary_task = tasks::create(
+            &mut conn,
+            "creator",
+            "ordinary mandatory-R2 task",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            5,
+        )
+        .unwrap();
+        let mandatory = R2SamplingPolicy {
+            enabled: true,
+            target_per_stratum: 0,
+            steady_state_p: 1.0,
+            default_model: "model".into(),
+            default_effort: "high".into(),
+        };
+
+        assert!(
+            !decide_r2_requirement(&mut conn, branch_task, 80, "branch-head", &mandatory,).unwrap()
+        );
+        assert!(
+            decide_r2_requirement(&mut conn, ordinary_task, 81, "ordinary-head", &mandatory,)
+                .unwrap()
+        );
+        for (task_id, pr, head) in [
+            (branch_task, 80, "branch-head"),
+            (ordinary_task, 81, "ordinary-head"),
+        ] {
+            quorum_core::approvals::record(
+                &mut conn,
+                &quorum_core::approvals::Approval {
+                    pr_number: pr,
+                    review_role: "r1".into(),
+                    task_id,
+                    author: "worker".into(),
+                    reviewer: "r1".into(),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: head.into(),
+                },
+            )
+            .unwrap();
+        }
+
+        assert!(all_required_roles_approved(&conn, 80, "branch-head").unwrap());
+        assert_eq!(
+            decide_provision(&conn, branch_task, 80, "branch-head").unwrap(),
+            ProvisionDecision::AllApproved,
+            "the branch-sync R1 approval must not provision R2"
+        );
+        assert_eq!(
+            next_needed_role(&conn, 81, "ordinary-head").unwrap(),
+            Some("r2"),
+            "an ordinary task still requires R2 under the mandatory policy"
+        );
+        assert_eq!(
+            decide_provision(&conn, ordinary_task, 81, "ordinary-head").unwrap(),
+            ProvisionDecision::Needed("r2")
+        );
+
+        let classified_branch_refs = serde_json::json!({
+            "branch_sync": sync.id,
+            "cx_est": 1,
+            "cx_size": "S",
+            "cx_ready": true,
+            "cx_not_ready_reason": null,
+            "cx_risk_flags": []
+        })
+        .to_string();
+        conn.execute(
+            "UPDATE tasks SET rework_cap=1, refs=?1 WHERE id=?2",
+            rusqlite::params![classified_branch_refs, branch_task],
+        )
+        .unwrap();
+        tasks::claim(
+            &mut conn,
+            "worker",
+            Some(branch_task),
+            &[],
+            tasks::DEFAULT_LEASE_TTL_SECS,
+            10,
+        )
+        .unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "worker",
+            branch_task,
+            &Event::SignaledDone { pr: "80".into() },
+            11,
+        )
+        .unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "daemon",
+            branch_task,
+            &Event::ReviewerAttached { agent: "r1".into() },
+            12,
+        )
+        .unwrap();
+        let rework = tasks::apply_actionable_rework_event(
+            &mut conn,
+            "r1",
+            branch_task,
+            &Event::VerdictChanges,
+            "fix the merge resolution",
+            13,
+        )
+        .unwrap();
+        assert_eq!(rework.task.status, "rework");
+        assert_eq!(rework.task.rework_round, 1);
+        tasks::apply_event(&mut conn, "worker", branch_task, &Event::ReworkPushed, 14).unwrap();
+        let exhausted =
+            tasks::apply_event(&mut conn, "r1", branch_task, &Event::VerdictChanges, 15).unwrap();
+        assert_eq!(exhausted.task.status, "failed");
+        assert_eq!(exhausted.task.rework_round, 1);
     }
 
     #[test]

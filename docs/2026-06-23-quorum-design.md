@@ -1182,7 +1182,21 @@ before merge. R2 sampling is opt-in: absent config resolves to
 lower `r2_steady_state_p` (for example, to 0.30) and optionally set a per-stratum
 coverage floor. A negative floor or probability outside `0.0..=1.0` is a usage
 error; values are never clamped. `r2_enabled = false` disables sampling, not the
-R2 safety gate, and therefore also leaves R2 mandatory.
+R2 safety gate, and therefore also leaves R2 mandatory. The one workflow-specific
+exception is a daemon-created branch-sync judgment task: when its `branch_sync`
+ref names the active `branch_syncs` row bound back to that task, R1 is the final
+review gate and the decision is recorded as
+`skipped: branch-sync judgment-only review`. A ref without that matching daemon
+binding grants no authority, and every other task continues through the ordinary
+R2 decision and gate.
+
+For branch-sync judgment R1, the review artifact is
+`git show --remerge-diff <merge_sha>` for the merge commit recorded on the sync
+row, plus every commit after that merge on the current sync-branch head. This
+preserves visibility into the merge resolution instead of replacing it with a
+generic PR diff. An R1 changes verdict uses the normal rework transition on the
+same sync branch, including the stamped rework cap; each replacement R1 reviews
+the recorded merge and all later rework commits.
 
 R2 is skipped when R1 approves after `rework_round` has reached that task's
 stamped rework cap (see the Rework cap bullet earlier in this document —
@@ -1195,10 +1209,13 @@ prior decision requiring R2 remains authoritative if the branch later returns
 to that head.
 
 When R1 approves, Quorum records a sampling decision in a daemon-owned table,
-keyed by both PR number and head SHA; it is not task refs because task refs are
-agent-writable metadata and cannot authorize a merge-gate bypass. Later rework
-heads append rather than overwrite earlier decisions. The seed is derived only
-from those stable values; the persisted decision prevents a restart, advancing
+keyed by both PR number and head SHA. Task refs are not otherwise consulted for
+this gate because they are agent-writable metadata and cannot authorize a
+merge-gate bypass. The narrow exception is the daemon-set `branch_sync` ref
+described above, which is authoritative only when the referenced active sync row
+is bound back to the same task; the ref alone is insufficient. Later rework heads
+append rather than overwrite earlier decisions. The seed is derived only from
+those stable values; the persisted decision prevents a restart, advancing
 coverage count, or force-push back to a prior head from changing that head's
 review requirement. Missing, unreadable, or task-mismatched persisted state
 fails closed to mandatory R2. R1 and R2 both bind their approval to the head
