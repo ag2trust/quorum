@@ -949,6 +949,10 @@ pub struct CollectionRequest {
     /// concurrent tests do not race on a process-global env var.
     #[allow(dead_code)]
     pub env_vars: Vec<(String, String)>,
+    /// Daemon-owned process tracker. Set only by
+    /// [`CollectorTracker::spawn_detached`]; the one-shot CLI path runs the
+    /// classifier inline and owns its process directly.
+    pub tracker: Option<CollectorTracker>,
 }
 
 impl CollectionRequest {
@@ -980,6 +984,7 @@ impl CollectionRequest {
             role_assignment_id: None,
             codex_sandbox: "danger-full-access".to_string(),
             env_vars: vec![],
+            tracker: None,
         }
     }
 
@@ -1632,6 +1637,21 @@ async fn spawn_and_run_classifier(
     .await
     .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
 
+    // Daemon-owned runs register the process group and journal it before the
+    // turn starts, so every daemon exit path and restart recovery can kill it.
+    let owned = match &request.tracker {
+        Some(tracker) => {
+            let agent = journal_agent(request.pr_number);
+            if let Err(error) = tracker.adopt(request, &agent, &proc).await {
+                let _ = proc.kill_and_reap().await;
+                tracker.release(&request.db_path, &agent).await;
+                return Err(error);
+            }
+            Some((tracker, agent))
+        }
+        None => None,
+    };
+
     let deadline = tokio::time::Instant::now() + CLASSIFIER_TIMEOUT;
     let mut response_text = String::new();
     let mut stdout_bytes = 0usize;
@@ -1742,6 +1762,9 @@ async fn spawn_and_run_classifier(
     // lifecycle-inert, but its usage is still durable telemetry.
     let kind = proc.kind();
     let terminal = proc.kill_and_reap().await;
+    if let Some((tracker, agent)) = owned {
+        tracker.release(&request.db_path, &agent).await;
+    }
     Ok(finalize_classifier_turn(
         kind,
         terminal,
@@ -1775,30 +1798,349 @@ fn finalize_classifier_turn(
     ClassifierTurnOutcome { response, usage }
 }
 
-/// Spawn a detached collection task from the daemon merge branch. Never awaits.
-/// The daemon tick returns immediately; the collection runs in the background
-/// and records its own success/failure to `review_collection_runs`. This is the
-/// architectural boundary — the merged task's lifecycle is already complete
-/// before we get here, and nothing this function does can undo that.
-pub fn spawn_detached(request: CollectionRequest) {
-    tokio::spawn(async move {
-        match run_collection(&request).await {
-            Ok(outcome) => {
-                eprintln!(
-                    "quorum serve: post-merge collector for PR #{} completed \
-                     ({} findings)",
-                    outcome.pr_number, outcome.findings_count
-                );
+/// Journal role for a daemon-owned collector classifier process. Restart
+/// recovery kills and deletes these rows; they never enter task recovery.
+pub const JOURNAL_ROLE: &str = "collector";
+
+/// Upper bound on the whole collector drain — kill, join, confirmation, and
+/// journal delete — matching the restart-recovery reap timeout, so no exit
+/// path (including the exit-75 self-update) waits longer on collectors.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Unique journal key for one collector classifier process. It starts with
+/// the names-file comment prefix, which no pooled agent identity can carry,
+/// so it never shares the `journal.agent` primary key with a worker/reviewer
+/// row, and carries a fresh id so concurrent or repair turns never collide.
+fn journal_agent(pr_number: i64) -> String {
+    format!(
+        "{}collector-{pr_number}-{}",
+        super::names::COMMENT_PREFIX,
+        super::agent::new_session_id()
+    )
+}
+
+/// One journaled classifier process group owned by a tracked collection task.
+struct OwnedCollector {
+    pgid: i32,
+    /// Set once the owning task reaped the group; drain must not signal a
+    /// pgid the kernel may already have reused.
+    reaped: bool,
+}
+
+#[derive(Default)]
+struct TrackerState {
+    /// Set by drain. No collection task is spawned and no classifier process
+    /// is adopted afterwards.
+    closed: bool,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    owned: std::collections::HashMap<String, OwnedCollector>,
+}
+
+#[derive(Default)]
+struct TrackerInner {
+    state: std::sync::Mutex<TrackerState>,
+    /// Journal keys whose rows drain already removed. Held across each
+    /// collector journal write so an upsert orphaned by an aborted task can
+    /// never land after drain deleted its row.
+    swept: std::sync::Mutex<HashSet<String>>,
+}
+
+/// Daemon-owned set of detached collection tasks and their live classifier
+/// process groups. The tick loop owns one tracker and drains it on every exit
+/// path, so neither a daemon exit nor runtime shutdown drops a live collector.
+#[derive(Clone, Default)]
+pub struct CollectorTracker {
+    inner: std::sync::Arc<TrackerInner>,
+}
+
+impl fmt::Debug for CollectorTracker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CollectorTracker")
+    }
+}
+
+impl CollectorTracker {
+    fn state(&self) -> std::sync::MutexGuard<'_, TrackerState> {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Spawn a tracked collection task from the daemon merge branch. Never
+    /// awaits. The daemon tick returns immediately; the collection runs in the
+    /// background and records its own success/failure to
+    /// `review_collection_runs`. This is the architectural boundary — the
+    /// merged task's lifecycle is already complete before we get here, and
+    /// nothing this function does can undo that.
+    pub fn spawn_detached(&self, request: CollectionRequest) {
+        self.spawn_with(request, None);
+    }
+
+    /// `inputs` lets tests bypass the `gh` fetch, as
+    /// [`run_collection_with_inputs`] does.
+    fn spawn_with(&self, mut request: CollectionRequest, inputs: Option<CollectorInputs>) {
+        request.tracker = Some(self.clone());
+        let mut state = self.state();
+        if state.closed {
+            eprintln!(
+                "quorum serve: post-merge collector for PR #{} not started: daemon is exiting \
+                 (retry via `quorum review-interpret`)",
+                request.pr_number
+            );
+            return;
+        }
+        // Finished handles hold nothing; keep the set bounded by live tasks.
+        state.tasks.retain(|task| !task.is_finished());
+        state.tasks.push(tokio::spawn(async move {
+            let result = match inputs {
+                Some(inputs) => run_collection_with_inputs(&request, inputs, clock::now()).await,
+                None => run_collection(&request).await,
+            };
+            match result {
+                Ok(outcome) => {
+                    eprintln!(
+                        "quorum serve: post-merge collector for PR #{} completed \
+                         ({} findings)",
+                        outcome.pr_number, outcome.findings_count
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "quorum serve: post-merge collector for PR #{} FAILED: {} \
+                         (recorded in review_collection_runs; retry via `quorum review-interpret`)",
+                        request.pr_number, e
+                    );
+                }
             }
-            Err(e) => {
-                eprintln!(
-                    "quorum serve: post-merge collector for PR #{} FAILED: {} \
-                     (recorded in review_collection_runs; retry via `quorum review-interpret`)",
-                    request.pr_number, e
-                );
+        }));
+    }
+
+    /// Register a just-launched classifier process group and journal it. On
+    /// any error the caller must kill the process and [`Self::release`] it.
+    async fn adopt(
+        &self,
+        request: &CollectionRequest,
+        agent: &str,
+        proc: &RunnerProc,
+    ) -> Result<()> {
+        let pgid = proc.process_group_id();
+        {
+            // No await separates launch from this registration, so an abort
+            // can never strand an unregistered process.
+            let mut state = self.state();
+            if state.closed {
+                // Drain already ran its kill pass; kill synchronously rather
+                // than rely on the dropped process handle.
+                kill_group(pgid);
+                return Err(QuorumError::Io(
+                    "collector classifier refused: daemon is exiting".into(),
+                ));
+            }
+            state.owned.insert(
+                agent.to_string(),
+                OwnedCollector {
+                    pgid,
+                    reaped: false,
+                },
+            );
+        }
+        let entry = quorum_core::journal::JournalEntry {
+            agent: agent.to_string(),
+            role: JOURNAL_ROLE.into(),
+            // The PR is carried only in the agent key: task-keyed journal
+            // readers must never mistake the collector for a worker/reviewer.
+            task_id: None,
+            session_id: agent.to_string(),
+            worktree: None,
+            branch: None,
+            phase: JOURNAL_ROLE.into(),
+            cost_tokens: 0,
+            agent_state: None,
+            cost_usd: 0.0,
+            log_dir: None,
+            pid: Some(pgid),
+            pr: None,
+            rework_count: 0,
+            provider: Some(proc.kind().to_string()),
+            continuation_id: None,
+            local_branch: None,
+        };
+        let inner = self.inner.clone();
+        let path = request.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let swept = inner
+                .swept
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if swept.contains(&entry.agent) {
+                return Ok(());
+            }
+            let mut conn = quorum_core::db::open(&path)?;
+            quorum_core::journal::upsert(&mut conn, &entry)
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("collector journal join failed: {error}")))?
+        .map_err(|error| QuorumError::Io(format!("collector journal write failed: {error}")))
+    }
+
+    /// Called by the owning task after `kill_and_reap`: stop drain from
+    /// signalling the reaped group, then delete its journal row.
+    async fn release(&self, db_path: &Path, agent: &str) {
+        match self.state().owned.get_mut(agent) {
+            Some(owned) => owned.reaped = true,
+            None => return,
+        }
+        let path = db_path.to_path_buf();
+        let key = agent.to_string();
+        let deleted = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let mut conn = quorum_core::db::open(&path)?;
+            quorum_core::journal::delete(&mut conn, &key)
+        })
+        .await;
+        match deleted {
+            Ok(Ok(_)) => {
+                self.state().owned.remove(agent);
+            }
+            // The entry stays registered as reaped so drain retries the delete.
+            Ok(Err(error)) => super::log(&format!(
+                "collector: journal delete for {agent} failed: {error}"
+            )),
+            Err(error) => super::log(&format!(
+                "collector: journal delete for {agent} join failed: {error}"
+            )),
+        }
+    }
+
+    /// Kill and reap every live collector classifier process group, stop the
+    /// tracked collection tasks, and delete their journal rows. Idempotent:
+    /// later calls find nothing to do.
+    ///
+    /// Fail-safe and bounded by [`DRAIN_TIMEOUT`] end to end. The process
+    /// groups are SIGKILLed directly from the registry — never by relying on
+    /// a dropped future — before any task is aborted. A row — restart
+    /// recovery's only evidence of the process group — is deleted only after
+    /// its group is confirmed dead, and a delete still pending at the
+    /// deadline is abandoned rather than awaited. An interrupted collection
+    /// leaves no success row, so the interpret retry queue re-runs it.
+    pub async fn drain(&self, db_path: &Path) {
+        self.drain_within(db_path, DRAIN_TIMEOUT).await;
+    }
+
+    async fn drain_within(&self, db_path: &Path, bound: Duration) {
+        let deadline = tokio::time::Instant::now() + bound;
+        let (tasks, owned) = {
+            let mut state = self.state();
+            state.closed = true;
+            let owned = state
+                .owned
+                .drain()
+                .map(|(agent, owned)| {
+                    if !owned.reaped {
+                        kill_group(owned.pgid);
+                    }
+                    (agent, owned)
+                })
+                .collect::<Vec<_>>();
+            (std::mem::take(&mut state.tasks), owned)
+        };
+        for task in &tasks {
+            task.abort();
+        }
+        let mut unjoined = 0usize;
+        for task in tasks {
+            // Finished, aborted, and panicked tasks all resolve here; the
+            // aborted ones were killed above, so their outcome is not needed.
+            if tokio::time::timeout_at(deadline, task).await.is_err() {
+                unjoined += 1;
             }
         }
-    });
+        if unjoined > 0 {
+            super::log(&format!(
+                "collector: {unjoined} collection task(s) not joined within {}s",
+                bound.as_secs()
+            ));
+        }
+        if owned.is_empty() {
+            return;
+        }
+        let mut dead = Vec::with_capacity(owned.len());
+        for (agent, owned) in owned {
+            if owned.reaped || process_group_gone_by(owned.pgid, deadline).await {
+                dead.push(agent);
+            } else {
+                super::log(&format!(
+                    "collector: process group {} of {agent} not confirmed dead within {}s — \
+                     keeping its journal row for restart recovery",
+                    owned.pgid,
+                    bound.as_secs()
+                ));
+            }
+        }
+        if dead.is_empty() {
+            return;
+        }
+        let inner = self.inner.clone();
+        let path = db_path.to_path_buf();
+        let delete = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut swept = inner
+                .swept
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            swept.extend(dead.iter().cloned());
+            let mut conn = quorum_core::db::open(&path)?;
+            let tx = quorum_core::db::begin_immediate(&mut conn)?;
+            for agent in &dead {
+                tx.execute(
+                    "DELETE FROM journal WHERE agent=?1 AND role=?2",
+                    rusqlite::params![agent, JOURNAL_ROLE],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        });
+        match tokio::time::timeout_at(deadline, delete).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => super::log(&format!("collector: journal delete failed: {error}")),
+            Ok(Err(error)) => {
+                super::log(&format!("collector: journal delete join failed: {error}"))
+            }
+            Err(_) => super::log(&format!(
+                "collector: journal delete still pending at the {}s bound — not waiting; \
+                 restart recovery removes the rows if it never lands",
+                bound.as_secs()
+            )),
+        }
+    }
+}
+
+fn kill_group(pgid: i32) {
+    // Zero and negative ids would signal the daemon's own group or everything.
+    if pgid > 0 {
+        unsafe {
+            libc::killpg(pgid, libc::SIGKILL);
+        }
+    }
+}
+
+/// Poll until no process remains in `pgid` or `deadline` passes. SIGKILLed
+/// descendants are reparented and reaped asynchronously, so absence is only
+/// confirmed by `ESRCH`.
+async fn process_group_gone_by(pgid: i32, deadline: tokio::time::Instant) -> bool {
+    if pgid <= 0 {
+        return false;
+    }
+    loop {
+        let gone = unsafe { libc::killpg(pgid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[cfg(test)]
@@ -3041,6 +3383,7 @@ mod tests {
             role_assignment_id: None,
             codex_sandbox: "danger-full-access".to_string(),
             env_vars,
+            tracker: None,
         }
     }
 
@@ -3486,6 +3829,7 @@ mod tests {
             role_assignment_id: None,
             codex_sandbox: "danger-full-access".to_string(),
             env_vars: vec![],
+            tracker: None,
         };
         let result = run_collection(&retry).await;
 
@@ -3775,5 +4119,602 @@ esac
             "genuine gh failure must propagate as error; exit={} stdout={stdout} stderr={stderr}",
             outcome.status,
         );
+    }
+
+    // ── Collector process ownership: track, journal, drain ──────────────
+
+    use quorum_core::journal;
+
+    fn write_executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Fake Claude binary that never answers: it leaves a descendant in its
+    /// process group and stays alive until killed.
+    fn hanging_agent(dir: &Path) -> PathBuf {
+        let bin = dir.join("agent-hang");
+        write_executable(&bin, "#!/bin/sh\nsleep 300 &\nexec sleep 300\n");
+        bin
+    }
+
+    fn group_alive(pgid: i32) -> bool {
+        unsafe { libc::killpg(pgid, 0) == 0 }
+    }
+
+    /// SIGKILLed descendants are reparented and reaped asynchronously; allow
+    /// a bounded window for the group to disappear.
+    async fn group_gone(pgid: i32) -> bool {
+        process_group_gone_by(pgid, tokio::time::Instant::now() + Duration::from_secs(5)).await
+    }
+
+    fn rows_with_role(db: &Path, role: &str) -> Vec<journal::JournalEntry> {
+        let conn = db::open(db).unwrap();
+        journal::list_in_flight(&conn)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.role == role)
+            .collect()
+    }
+
+    async fn wait_for_row(db: &Path, role: &str) -> journal::JournalEntry {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(row) = rows_with_role(db, role).pop() {
+                return row;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no {role} journal row appeared"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn hanging_request(dir: &Path, db: &Path, pr: i64) -> CollectionRequest {
+        let mut request = live_request(dir, db, pr, None, false);
+        request.agent_bin = Some(hanging_agent(dir).to_string_lossy().into_owned());
+        request
+    }
+
+    /// Spawn a tracked collection whose classifier hangs; return its pgid.
+    async fn live_tracked_collector(
+        tracker: &CollectorTracker,
+        dir: &Path,
+        db: &Path,
+        pr: i64,
+    ) -> i32 {
+        tracker.spawn_with(hanging_request(dir, db, pr), Some(synthetic_inputs(pr)));
+        let pgid = wait_for_row(db, JOURNAL_ROLE).await.pid.unwrap();
+        assert!(group_alive(pgid), "journaled collector is live");
+        pgid
+    }
+
+    fn bump_schema(db: &Path) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.pragma_update(None, "user_version", db::SCHEMA_VERSION + 1)
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tracked_classifier_is_journaled_as_task_neutral_collector_row() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let tracker = CollectorTracker::default();
+        let pgid = live_tracked_collector(&tracker, dir.path(), &db, 501).await;
+
+        let rows = rows_with_role(&db, JOURNAL_ROLE);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].agent.starts_with("#collector-501-"), "{rows:?}");
+        assert_eq!(rows[0].pid, Some(pgid));
+        assert_eq!(rows[0].task_id, None, "task-keyed readers must ignore it");
+        assert_eq!(rows[0].worktree, None);
+
+        tracker.drain(&db).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tracked_success_deletes_row_and_records_run() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let tracker = CollectorTracker::default();
+        let mut request = live_request(dir.path(), &db, 502, None, false);
+        request.tracker = Some(tracker.clone());
+
+        let outcome = run_live(&request).await.unwrap();
+        assert_eq!(outcome.status, RunStatus::Success);
+        assert!(rows_with_role(&db, JOURNAL_ROLE).is_empty());
+        assert!(tracker.state().owned.is_empty());
+        let conn = db::open(&db).unwrap();
+        let run = review_findings::get_run(&conn, 502).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Success);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tracked_failure_deletes_row_and_records_failed_run() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let tracker = CollectorTracker::default();
+        let mut request = live_request(dir.path(), &db, 503, None, true);
+        request.tracker = Some(tracker.clone());
+
+        run_live(&request).await.unwrap_err();
+        assert!(rows_with_role(&db, JOURNAL_ROLE).is_empty());
+        assert!(tracker.state().owned.is_empty());
+        let conn = db::open(&db).unwrap();
+        let run = review_findings::get_run(&conn, 503).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn drain_without_collectors_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("never-opened.db");
+        CollectorTracker::default().drain(&db).await;
+        assert!(!db.exists(), "an empty tracker must not touch the database");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_kills_live_collector_group_and_deletes_row_once() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let tracker = CollectorTracker::default();
+        let pgid = live_tracked_collector(&tracker, dir.path(), &db, 504).await;
+
+        tracker.drain(&db).await;
+        assert!(
+            group_gone(pgid).await,
+            "collector process group must be dead"
+        );
+        assert!(rows_with_role(&db, JOURNAL_ROLE).is_empty());
+        let state = tracker.state();
+        assert!(state.tasks.is_empty() && state.owned.is_empty());
+        drop(state);
+
+        // Reap-once: a second exit path finds nothing to do.
+        tracker.drain(&db).await;
+    }
+
+    /// Finished-but-unjoined: the task completed on its own before any exit
+    /// path ran; drain only joins the handle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_joins_finished_collector_and_keeps_its_run() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let tracker = CollectorTracker::default();
+        tracker.spawn_with(
+            live_request(dir.path(), &db, 505, None, false),
+            Some(synthetic_inputs(505)),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !tracker.state().tasks.iter().all(|task| task.is_finished()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "collector never finished"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        tracker.drain(&db).await;
+        assert!(tracker.state().tasks.is_empty());
+        assert!(rows_with_role(&db, JOURNAL_ROLE).is_empty());
+        let conn = db::open(&db).unwrap();
+        let run = review_findings::get_run(&conn, 505).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Success);
+    }
+
+    /// After drain the tracker is closed: nothing is spawned, and a classifier
+    /// launched by a straggler is killed at adoption instead of journaled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_tracker_spawns_nothing_and_kills_late_classifier() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let tracker = CollectorTracker::default();
+        tracker.drain(&db).await;
+
+        tracker.spawn_with(
+            hanging_request(dir.path(), &db, 506),
+            Some(synthetic_inputs(506)),
+        );
+        assert!(
+            tracker.state().tasks.is_empty(),
+            "closed tracker spawns nothing"
+        );
+
+        let pid_file = dir.path().join("late.pid");
+        let bin = dir.path().join("agent-late");
+        write_executable(
+            &bin,
+            &format!(
+                "#!/bin/sh\necho $$ > '{}'\nsleep 300 &\nexec sleep 300\n",
+                pid_file.display()
+            ),
+        );
+        let mut request = live_request(dir.path(), &db, 506, None, false);
+        request.agent_bin = Some(bin.to_string_lossy().into_owned());
+        request.tracker = Some(tracker.clone());
+        let started = std::time::Instant::now();
+        run_live(&request).await.unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "a refused classifier must not run its turn"
+        );
+        if let Some(pgid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        {
+            assert!(group_gone(pgid).await, "late classifier group must be dead");
+        }
+        assert!(rows_with_role(&db, JOURNAL_ROLE).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_against_too_new_schema_still_kills_within_bound() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let tracker = CollectorTracker::default();
+        let pgid = live_tracked_collector(&tracker, dir.path(), &db, 507).await;
+        bump_schema(&db);
+
+        let started = std::time::Instant::now();
+        tracker.drain(&db).await;
+        assert!(
+            started.elapsed() < DRAIN_TIMEOUT,
+            "exit-75 drain must stay bounded"
+        );
+        assert!(
+            group_gone(pgid).await,
+            "collector process group must be dead"
+        );
+    }
+
+    /// Slow delete path: a writer holding the DB lock must not hold the exit
+    /// past the bound once the group is confirmed dead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_journal_delete_is_abandoned_at_bound() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let tracker = CollectorTracker::default();
+        let pgid = live_tracked_collector(&tracker, dir.path(), &db, 508).await;
+        let blocker = db::open(&db).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = std::time::Instant::now();
+        tracker.drain_within(&db, Duration::from_secs(1)).await;
+        let elapsed = started.elapsed();
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "blocked delete held the exit for {elapsed:?}"
+        );
+        assert!(
+            group_gone(pgid).await,
+            "collector process group must be dead"
+        );
+    }
+
+    /// Runtime shutdown after the drain drops nothing live: the group is
+    /// already dead and the row already gone when the runtime goes away.
+    #[test]
+    fn runtime_shutdown_after_drain_leaves_no_live_collector() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let pgid = rt.block_on(async {
+            let tracker = CollectorTracker::default();
+            let pgid = live_tracked_collector(&tracker, dir.path(), &db, 509).await;
+            tracker.drain(&db).await;
+            pgid
+        });
+        rt.shutdown_timeout(Duration::from_secs(1));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while group_alive(pgid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "collector process group survived runtime shutdown"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(rows_with_role(&db, JOURNAL_ROLE).is_empty());
+    }
+
+    // ── Shutdown-path matrix: real tick loop, live doctor + live collector ─
+    //
+    // The daemon's signal handlers and the `gh` lookup on PATH are
+    // process-wide, so the loop runs in its own test process and the parent
+    // drives each exit path from outside.
+
+    const MATRIX_CHILD_ROOT: &str = "QUORUM_COLLECTOR_MATRIX_CHILD_ROOT";
+    const MATRIX_CHILD_MODE: &str = "QUORUM_COLLECTOR_MATRIX_CHILD_MODE";
+    const DOCTOR_ROLE: &str = super::super::doctor::JOURNAL_ROLE;
+
+    fn matrix_config(root: &Path) -> (super::super::ServeConfig, String) {
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            &["init", "-b", "main"][..],
+            &["config", "user.email", "test@example.com"],
+            &["config", "user.name", "Test"],
+            &["commit", "--allow-empty", "-m", "init"],
+        ] {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        }
+        let worktree_base = root.join("worktrees");
+        std::fs::create_dir_all(&worktree_base).unwrap();
+
+        // A stalled in-review task with no PR: Phase 8b selects it for the
+        // doctor. A ready interpret job: Phase 7.5 spawns a detached collector.
+        let db_path = root.join("quorum.db");
+        let mut conn = db::open(&db_path).unwrap();
+        let now = super::super::now_unix();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "stalled",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET status='in-review' WHERE id=?1", [task_id])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO review_interpret_jobs(
+                 pr_number,task_id,repo,interpreter_version,attempts,created_at)
+             VALUES (4242,?1,NULL,?2,0,?3)",
+            rusqlite::params![task_id, COLLECTOR_VERSION, now - 100_000],
+        )
+        .unwrap();
+        let instance = quorum_core::daemon_lock::new_instance_id();
+        assert_eq!(
+            quorum_core::daemon_lock::try_acquire(
+                &mut conn,
+                std::process::id() as i64,
+                &instance,
+                now,
+                30,
+            )
+            .unwrap(),
+            quorum_core::daemon_lock::AcquireResult::Acquired,
+        );
+        drop(conn);
+
+        let sentinel = root.join("sentinel");
+        std::fs::write(&sentinel, "").unwrap();
+        let bin = hanging_agent(root);
+        let profile = crate::serve_config::ModelProfile {
+            runner: "claude".into(),
+            model: "claude-sonnet-5".into(),
+            effort: "high".into(),
+        };
+        let pool = std::collections::BTreeMap::from([("test".to_string(), 100)]);
+        let config = super::super::ServeConfig {
+            db_path,
+            cap: 1,
+            model_profiles: std::collections::BTreeMap::from([("test".to_string(), profile)]),
+            routing: crate::serve_config::RoutingPolicy {
+                classifier: pool.clone(),
+                planner: pool.clone(),
+                arbiter: pool.clone(),
+                collector: pool.clone(),
+                worker: (1..=5)
+                    .map(|level| (level.to_string(), pool.clone()))
+                    .collect(),
+                reviewer: (1..=5)
+                    .map(|level| (level.to_string(), pool.clone()))
+                    .collect(),
+            },
+            repo_dir: repo,
+            worktree_base,
+            names_file: None,
+            agent_bin: Some(bin.to_string_lossy().into_owned()),
+            merge_executor: std::sync::Arc::new(super::super::merge::CommandMergeExecutor {
+                command: "true".into(),
+                checks_cmd: None,
+                mergeability_cmd: None,
+            }),
+            bare_agent: true,
+            limits: super::super::CostLimits::default(),
+            log_dir: None,
+            self_update_drain: false,
+            drain_timeout_secs: 1,
+            self_repo: None,
+            sha_poll_interval_secs: 60,
+            merge_checks_timeout_secs: 1,
+            merge_checks_poll_secs: 1,
+            repo: "owner/repo".into(),
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
+            exit_when_gone: Some(sentinel),
+            required_jobs: Vec::new(),
+            master_ci_gate: false,
+            master_ci_timeout_secs: 1,
+            allowed_tools: None,
+            doctor_enabled: true,
+            resource_monitor: crate::resource_health::ResourceMonitorConfig::default(),
+            r2_enabled: false,
+            r2_target_per_stratum: 0,
+            r2_steady_state_p: 0.0,
+            max_rework: quorum_core::lifecycle::REWORK_CAP,
+            codex_sandbox: "danger-full-access".into(),
+            grok: Default::default(),
+            pr_target_program: None,
+        };
+        (config, instance)
+    }
+
+    /// Child half of the matrix: run the real tick loop until the parent's
+    /// trigger ends it, and check the exit value that path must produce.
+    #[test]
+    #[ignore = "spawned by the shutdown-path matrix tests"]
+    fn shutdown_matrix_child() {
+        let Some(root) = std::env::var_os(MATRIX_CHILD_ROOT).map(PathBuf::from) else {
+            return;
+        };
+        let mode = std::env::var(MATRIX_CHILD_MODE).unwrap();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                // The production shape: block_on the loop, then shut the
+                // runtime down with the same grace `serve` uses.
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let result = rt.block_on(async {
+                    let (config, instance) = matrix_config(&root);
+                    std::fs::write(root.join("ready"), "").unwrap();
+                    super::super::tick_loop(
+                        &config,
+                        std::process::id() as i64,
+                        instance,
+                        super::super::planner::WritablePathResolver::default(),
+                    )
+                    .await
+                });
+                rt.shutdown_timeout(Duration::from_secs(1));
+                match (mode.as_str(), result) {
+                    ("signal", Ok(0)) | ("exit-when-gone" | "lock-stolen", Ok(1)) => {}
+                    ("schema-too-new", Ok(super::super::EXIT_SELF_UPDATE)) => {}
+                    ("schema-too-new", Err(QuorumError::SchemaTooNew { .. })) => {}
+                    (mode, result) => panic!("{mode}: unexpected tick loop result {result:?}"),
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// Start the child daemon, wait for a live journaled doctor and a live
+    /// journaled collector, fire `trigger`, and assert that after the child
+    /// exits neither process group is alive and (when the schema still lets
+    /// the rows be read) neither journal row remains.
+    async fn assert_exit_path_reaps_doctor_and_collector(
+        mode: &str,
+        trigger: impl FnOnce(&Path, u32),
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let shim_dir = tempfile::tempdir().unwrap();
+        write_gh_shim(shim_dir.path(), "echo ok");
+        let path = format!(
+            "{}:{}",
+            shim_dir.path().display(),
+            std::env::var_os("PATH")
+                .unwrap_or_default()
+                .to_string_lossy()
+        );
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "serve::collector::tests::shutdown_matrix_child",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(MATRIX_CHILD_ROOT, root.path())
+            .env(MATRIX_CHILD_MODE, mode)
+            .env("PATH", path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        struct KillOnDrop(u32);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                unsafe { libc::kill(self.0 as i32, libc::SIGKILL) };
+            }
+        }
+        let _guard = KillOnDrop(child.id());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !root.path().join("ready").exists() {
+            assert!(std::time::Instant::now() < deadline, "child never started");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let db = root.path().join("quorum.db");
+        let doctor = wait_for_row(&db, DOCTOR_ROLE).await.pid.unwrap();
+        let collector = wait_for_row(&db, JOURNAL_ROLE).await.pid.unwrap();
+        assert!(group_alive(doctor), "journaled doctor is live");
+        assert!(group_alive(collector), "journaled collector is live");
+
+        trigger(root.path(), child.id());
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemon did not exit after the {mode} trigger"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(status.success(), "child daemon test failed: {status:?}");
+        assert!(
+            group_gone(doctor).await,
+            "doctor process group must be dead"
+        );
+        assert!(
+            group_gone(collector).await,
+            "collector process group must be dead"
+        );
+        // A too-new schema cannot be written or read; restart recovery
+        // removes those rows.
+        if mode != "schema-too-new" {
+            assert!(rows_with_role(&db, DOCTOR_ROLE).is_empty());
+            assert!(rows_with_role(&db, JOURNAL_ROLE).is_empty());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exit_when_gone_reaps_doctor_and_collector() {
+        assert_exit_path_reaps_doctor_and_collector("exit-when-gone", |root, _| {
+            std::fs::remove_file(root.join("sentinel")).unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lock_stolen_reaps_doctor_and_collector() {
+        assert_exit_path_reaps_doctor_and_collector("lock-stolen", |root, _| {
+            let conn = db::open(&root.join("quorum.db")).unwrap();
+            conn.execute("UPDATE daemon_lock SET instance_id='thief' WHERE id=1", [])
+                .unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signal_shutdown_reaps_doctor_and_collector() {
+        assert_exit_path_reaps_doctor_and_collector("signal", |_, pid| {
+            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn schema_too_new_exit_reaps_doctor_and_collector() {
+        assert_exit_path_reaps_doctor_and_collector("schema-too-new", |root, _| {
+            bump_schema(&root.join("quorum.db"));
+        })
+        .await;
     }
 }
