@@ -3116,6 +3116,7 @@ exec sleep 30
         let outcome = super::super::approvals::recover(
             &fixture.config.db_path,
             &fixture.config.repo_dir,
+            &super::super::worktree::WorktreeManager::new(),
             &executor,
             &fixture.config.base_branch,
             1,

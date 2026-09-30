@@ -10330,7 +10330,14 @@ async fn complete_detected_merge_with_metadata(
     else {
         return Ok(false);
     };
-    settle_branch_sync_judgment_merge(config, wt_mgr, task_id, &merge_commit_sha).await?;
+    settle_branch_sync_judgment_merge(
+        &config.db_path,
+        &config.repo_dir,
+        wt_mgr,
+        task_id,
+        &merge_commit_sha,
+    )
+    .await?;
     let db_path = config.db_path.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&db_path)?;
@@ -10917,6 +10924,7 @@ async fn tick_loop(
         if let Err(e) = approvals::recover(
             &config.db_path,
             &config.repo_dir,
+            &wt_mgr,
             &config.merge_executor,
             &config.base_branch,
             config.merge_checks_timeout_secs,
@@ -22536,7 +22544,7 @@ async fn release_worker_worktree(
 /// task's merged delivery: fetch the sync target, then prove both pinned tips
 /// are ancestors of GitHub's immutable merge commit.
 async fn verify_branch_sync_judgment_merge(
-    config: &ServeConfig,
+    repo_dir: &Path,
     wt_mgr: &WorktreeManager,
     sync: &quorum_core::branch_sync::BranchSync,
     merge_commit_sha: &str,
@@ -22550,15 +22558,10 @@ async fn verify_branch_sync_judgment_merge(
     let source_sha = pinned(sync.source_sha.as_deref(), "source_sha")?;
     let target_sha = pinned(sync.target_sha.as_deref(), "target_sha")?;
     wt_mgr
-        .fetch_branch_sync_target(&config.repo_dir, &sync.target_branch)
+        .fetch_branch_sync_target(repo_dir, &sync.target_branch)
         .await?;
     wt_mgr
-        .verify_branch_sync_merge_ancestry(
-            &config.repo_dir,
-            merge_commit_sha,
-            &source_sha,
-            &target_sha,
-        )
+        .verify_branch_sync_merge_ancestry(repo_dir, merge_commit_sha, &source_sha, &target_sha)
         .await
 }
 
@@ -22568,13 +22571,16 @@ async fn verify_branch_sync_judgment_merge(
 /// `published` binding) fails it loudly on its current phase, never silently
 /// done. Either way the row releases the pair, and the task — whose PR GitHub
 /// already merged — still completes. Tasks without a bound row are no-ops.
+/// Every daemon path that completes a merged task, including startup approval
+/// recovery, must call this first.
 async fn settle_branch_sync_judgment_merge(
-    config: &ServeConfig,
+    db_path: &Path,
+    repo_dir: &Path,
     wt_mgr: &WorktreeManager,
     task_id: i64,
     merge_commit_sha: &str,
 ) -> Result<()> {
-    let p = config.db_path.clone();
+    let p = db_path.to_path_buf();
     let sync = tokio::task::spawn_blocking(move || {
         let conn = quorum_core::db::open(&p)?;
         quorum_core::branch_sync::active_for_task(&conn, task_id)
@@ -22586,8 +22592,9 @@ async fn settle_branch_sync_judgment_merge(
     let Some(sync) = sync else {
         return Ok(());
     };
-    let verified = verify_branch_sync_judgment_merge(config, wt_mgr, &sync, merge_commit_sha).await;
-    let p = config.db_path.clone();
+    let verified =
+        verify_branch_sync_judgment_merge(repo_dir, wt_mgr, &sync, merge_commit_sha).await;
+    let p = db_path.to_path_buf();
     let id = sync.id;
     let phase = sync.phase.clone();
     let merge_commit_sha = merge_commit_sha.to_string();
@@ -22639,7 +22646,14 @@ async fn complete_approved_task_merge(
     pr: i64,
     merge_commit_sha: String,
 ) -> Result<()> {
-    settle_branch_sync_judgment_merge(config, wt_mgr, task_id, &merge_commit_sha).await?;
+    settle_branch_sync_judgment_merge(
+        &config.db_path,
+        &config.repo_dir,
+        wt_mgr,
+        task_id,
+        &merge_commit_sha,
+    )
+    .await?;
     let p = config.db_path.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&p)?;
@@ -29279,6 +29293,100 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    struct RecoveredJudgmentMerge {
+        merge_sha: String,
+    }
+
+    impl merge::MergeExecutor for RecoveredJudgmentMerge {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: true,
+                message: "merged".into(),
+                failure_kind: None,
+            }
+        }
+
+        fn check_mergeability(&self, _pr: i64, _repo_dir: &Path) -> merge::MergeabilityState {
+            merge::MergeabilityState::Mergeable
+        }
+
+        fn head_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+            Some(self.merge_sha.clone())
+        }
+
+        fn merge_commit_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+            Some(self.merge_sha.clone())
+        }
+    }
+
+    /// B1 (#852): startup approval recovery merges an R1-approved judgment
+    /// task after a restart; its sync row must settle `done` with the task
+    /// rather than stay `published` and strand the pair.
+    #[tokio::test]
+    async fn branch_sync_judgment_startup_approval_recovery_completes_sync_row() {
+        let fx = published_judgment_fixture().await;
+        sync_fixture_git(&fx.worker_path, &["push", "origin", "HEAD:main"]);
+        {
+            let mut conn = quorum_core::db::open(&fx.config.db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks
+                 SET status='merging', author='judge',
+                     refs=json_set(COALESCE(refs, '{}'), '$.pr', 91)
+                 WHERE id=?1",
+                [fx.task_id],
+            )
+            .unwrap();
+            quorum_core::approvals::record(
+                &mut conn,
+                &quorum_core::approvals::Approval {
+                    pr_number: 91,
+                    review_role: "r1".into(),
+                    task_id: fx.task_id,
+                    author: "judge".into(),
+                    reviewer: "rev-r1".into(),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: fx.worker_merge.clone(),
+                },
+            )
+            .unwrap();
+            quorum_core::review_audits::record_r2_requirement(
+                &mut conn,
+                fx.task_id,
+                91,
+                &fx.worker_merge,
+                false,
+            )
+            .unwrap();
+        }
+        let executor: Arc<dyn merge::MergeExecutor> = Arc::new(RecoveredJudgmentMerge {
+            merge_sha: fx.worker_merge.clone(),
+        });
+
+        let outcome = approvals::recover(
+            &fx.config.db_path,
+            &fx.config.repo_dir,
+            &fx.mgr,
+            &executor,
+            &fx.config.base_branch,
+            1,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.merged, 1, "{outcome:?}");
+        let (row, status) = judgment_row_and_task_status(&fx);
+        assert_eq!(status, "done");
+        assert_eq!(row.phase, "done", "{:?}", row.last_error);
+        assert!(!row.active, "recovered merge must release the pair");
     }
 
     #[tokio::test]
