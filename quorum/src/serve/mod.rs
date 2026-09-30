@@ -2366,7 +2366,12 @@ fn log(msg: &str) {
 /// it never mutates lifecycle, verdicts, or GitHub. Failures land in the
 /// `review_collection_runs` table (loud, observable, retryable) and MUST NOT
 /// touch the completed task. See serve/collector.rs.
-fn spawn_post_merge_collector(config: &ServeConfig, pr_num: i64, task_id: i64) {
+fn spawn_post_merge_collector(
+    config: &ServeConfig,
+    collectors: &collector::CollectorTracker,
+    pr_num: i64,
+    task_id: i64,
+) {
     let assignment = match assign_role(
         config,
         quorum_core::role_assignments::AssignmentRequest {
@@ -2415,7 +2420,7 @@ fn spawn_post_merge_collector(config: &ServeConfig, pr_num: i64, task_id: i64) {
         config.codex_sandbox.clone(),
     );
     request.role_assignment_id = Some(assignment.id);
-    collector::spawn_detached(request);
+    collectors.spawn_detached(request);
 }
 
 /// Build the daemon-authored branch name for an orphan in-review task.
@@ -11066,20 +11071,24 @@ async fn tick_loop(
     daemon_instance: String,
     writable_path_resolver: planner::WritablePathResolver,
 ) -> Result<i32> {
-    // The daemon owns the doctor outside the loop body so no return — an
-    // explicit exit path or a propagated tick-loop error — can leave its
-    // process group running. The explicit exit paths reap it first; this is
-    // the reap-once backstop.
+    // The daemon owns the doctor and the detached collectors outside the loop
+    // body so no return — an explicit exit path or a propagated tick-loop
+    // error — can leave their process groups running. The explicit exit paths
+    // reap them first; this is the reap-once backstop, and it runs before
+    // `serve` shuts the runtime down.
     let mut doctor_slot: Option<doctor::DoctorSlot> = None;
+    let collectors = collector::CollectorTracker::default();
     let result = tick_loop_owning_doctor(
         config,
         daemon_pid,
         daemon_instance,
         writable_path_resolver,
         &mut doctor_slot,
+        &collectors,
     )
     .await;
     doctor::reap_doctor_slot(&config.db_path, &mut doctor_slot).await;
+    collectors.drain(&config.db_path).await;
     result
 }
 
@@ -11089,6 +11098,7 @@ async fn tick_loop_owning_doctor(
     daemon_instance: String,
     writable_path_resolver: planner::WritablePathResolver,
     doctor_slot: &mut Option<doctor::DoctorSlot>,
+    collectors: &collector::CollectorTracker,
 ) -> Result<i32> {
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .map_err(|e| QuorumError::Io(format!("failed to register SIGINT handler: {e}")))?;
@@ -11427,6 +11437,7 @@ async fn tick_loop_owning_doctor(
         if lock_stolen.load(std::sync::atomic::Ordering::SeqCst) {
             log("daemon lock stolen — tearing down and exiting");
             doctor::reap_doctor_slot(&config.db_path, doctor_slot).await;
+            collectors.drain(&config.db_path).await;
             if let Some(slot) = classifier_slot.take() {
                 reap_classifier_with_usage(&config.db_path, slot, None).await;
             }
@@ -11460,6 +11471,7 @@ async fn tick_loop_owning_doctor(
                 log("shutting down (signal, no in-flight agents)");
             }
             doctor::reap_doctor_slot(&config.db_path, doctor_slot).await;
+            collectors.drain(&config.db_path).await;
             if let Some(slot) = classifier_slot.take() {
                 reap_classifier_with_usage(&config.db_path, slot, None).await;
             }
@@ -11495,6 +11507,7 @@ async fn tick_loop_owning_doctor(
             if !sentinel.exists() {
                 log("exit-when-gone: sentinel disappeared — parent died, force shutdown");
                 doctor::reap_doctor_slot(&config.db_path, doctor_slot).await;
+                collectors.drain(&config.db_path).await;
                 if let Some(slot) = classifier_slot.take() {
                     reap_classifier_with_usage(&config.db_path, slot, None).await;
                 }
@@ -11606,6 +11619,7 @@ async fn tick_loop_owning_doctor(
                      exit_code={exit} supervisor={supervisor_action}"
                 ));
                 doctor::reap_doctor_slot(&config.db_path, doctor_slot).await;
+                collectors.drain(&config.db_path).await;
                 if let Some(slot) = classifier_slot.take() {
                     reap_classifier_with_usage(&config.db_path, slot, None).await;
                 }
@@ -11637,6 +11651,7 @@ async fn tick_loop_owning_doctor(
                     reviewers.len(),
                 ));
                 doctor::reap_doctor_slot(&config.db_path, doctor_slot).await;
+                collectors.drain(&config.db_path).await;
                 if let Some(slot) = classifier_slot.take() {
                     reap_classifier_with_usage(&config.db_path, slot, None).await;
                 }
@@ -11755,6 +11770,7 @@ async fn tick_loop_owning_doctor(
             &mut classifier_backoff_until,
             doctor_slot,
             &mut doctored_tasks,
+            collectors,
             &signal_count,
         )
         .await
@@ -11772,6 +11788,7 @@ async fn tick_loop_owning_doctor(
                     // gracefully teardown (that writes to the DB, which also fails against a
                     // too-new schema); just reap the processes and release their names.
                     doctor::reap_doctor_slot(&config.db_path, doctor_slot).await;
+                    collectors.drain(&config.db_path).await;
                     if let Some(slot) = classifier_slot.take() {
                         reap_classifier_with_usage(&config.db_path, slot, None).await;
                     }
@@ -11880,6 +11897,7 @@ async fn tick(
     classifier_backoff_until: &mut Option<std::time::Instant>,
     doctor_slot: &mut Option<doctor::DoctorSlot>,
     doctored_tasks: &mut std::collections::HashSet<i64>,
+    collectors: &collector::CollectorTracker,
     signal_count: &std::sync::Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<()> {
     let db_path = config.db_path.clone();
@@ -12929,7 +12947,7 @@ async fn tick(
                         // #127 also durably enqueues so the tick loop retries
                         // with backoff and cap; a successful run deletes the
                         // job.
-                        spawn_post_merge_collector(config, pr_num, reviewer_task_id);
+                        spawn_post_merge_collector(config, collectors, pr_num, reviewer_task_id);
                         enqueue_interpret_job(&db_path, pr_num, reviewer_task_id, &config.repo)
                             .await;
                         if let Some(wi) = workers.iter().position(|w| w.task_id == reviewer_task_id)
@@ -14246,7 +14264,7 @@ async fn tick(
                         // #127 also durably enqueues so the tick loop retries
                         // with backoff and cap; a successful run deletes the
                         // job.
-                        spawn_post_merge_collector(config, pr_num, reviewer_task_id);
+                        spawn_post_merge_collector(config, collectors, pr_num, reviewer_task_id);
                         enqueue_interpret_job(&db_path, pr_num, reviewer_task_id, &config.repo)
                             .await;
                         if config.self_update_drain
@@ -17613,7 +17631,7 @@ async fn tick(
                 config.codex_sandbox.clone(),
             );
             request.role_assignment_id = Some(assignment.id);
-            collector::spawn_detached(request);
+            collectors.spawn_detached(request);
         }
     }
 
@@ -35132,6 +35150,7 @@ mod tests {
                         &mut classifier_backoff_until,
                         &mut doctor_slot,
                         &mut doctored_tasks,
+                        &collector::CollectorTracker::default(),
                         &signal_count,
                     )
                     .await
@@ -39314,6 +39333,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         &mut classifier_backoff_until,
                         &mut doctor_slot,
                         &mut doctored_tasks,
+                        &collector::CollectorTracker::default(),
                         &signal_count,
                     )
                     .await
@@ -39402,6 +39422,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         &mut classifier_backoff_until,
                         &mut doctor_slot,
                         &mut doctored_tasks,
+                        &collector::CollectorTracker::default(),
                         &signal_count,
                     )
                     .await
