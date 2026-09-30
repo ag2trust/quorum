@@ -12033,20 +12033,8 @@ async fn tick(
                         "kill: terminating worker {} (task #{}) by {by}: {reason}",
                         workers[wi].agent_name, workers[wi].task_id,
                     ));
-                    let w = workers.remove(wi);
-                    let task_id = w.task_id;
-                    fire_event(
-                        &db_path,
-                        &w.agent_name,
-                        task_id,
-                        &Event::AgentFailed {
-                            reason: format!("killed by {by}: {reason}"),
-                        },
-                    )
-                    .await;
-                    // Emit agent_killed event for the log.
-                    emit_kill_event(&db_path, target, by, reason).await;
-                    teardown_worker(config, wt_mgr, name_pool, w, "open").await;
+                    kill_worker_by_request(config, wt_mgr, name_pool, workers, wi, by, reason)
+                        .await;
                 } else if let Some(ri) = reviewers.iter().position(|r| r.agent_name == *target) {
                     log(&format!(
                         "kill: terminating reviewer {} (task #{}) by {by}: {reason}",
@@ -13105,25 +13093,8 @@ async fn tick(
                                                 )
                                                 .await
                                                 {
-                                                    let w = workers.remove(wi);
-                                                    fire_event(
-                                                        &db_path,
-                                                        &w.agent_name,
-                                                        w.task_id,
-                                                        &Event::AgentFailed {
-                                                            reason: format!(
-                                                                "rework feed failed: {e}"
-                                                            ),
-                                                        },
-                                                    )
-                                                    .await;
-                                                    cleanup_slot(
-                                                        config,
-                                                        wt_mgr,
-                                                        name_pool,
-                                                        w,
-                                                        None,
-                                                        "agent_failed",
+                                                    fail_worker_after_rework_feed_failure(
+                                                        config, wt_mgr, name_pool, workers, wi, &e,
                                                     )
                                                     .await;
                                                 }
@@ -13170,13 +13141,14 @@ async fn tick(
                                                 "no PR or draining — cannot spawn remediation \
                                                  for task #{reviewer_task_id}"
                                             ));
-                                            fire_event(
+                                            // Sweep-aware: this fails the `rework` worker-phase
+                                            // assignment, so a same-transaction lapsed-lease reap
+                                            // settles it instead of being rolled back.
+                                            fail_worker_assignment_settled(
                                                 &db_path,
                                                 "daemon",
                                                 reviewer_task_id,
-                                                &Event::AgentFailed {
-                                                    reason: "no worker and no PR for rework".into(),
-                                                },
+                                                "no worker and no PR for rework",
                                             )
                                             .await;
                                         }
@@ -13401,25 +13373,8 @@ async fn tick(
                                                 )
                                                 .await
                                                 {
-                                                    let w = workers.remove(wi);
-                                                    fire_event(
-                                                        &db_path,
-                                                        &w.agent_name,
-                                                        w.task_id,
-                                                        &Event::AgentFailed {
-                                                            reason: format!(
-                                                                "rework feed failed: {e}"
-                                                            ),
-                                                        },
-                                                    )
-                                                    .await;
-                                                    cleanup_slot(
-                                                        config,
-                                                        wt_mgr,
-                                                        name_pool,
-                                                        w,
-                                                        None,
-                                                        "agent_failed",
+                                                    fail_worker_after_rework_feed_failure(
+                                                        config, wt_mgr, name_pool, workers, wi, &e,
                                                     )
                                                     .await;
                                                 }
@@ -13466,13 +13421,14 @@ async fn tick(
                                                 "no PR or draining — cannot spawn remediation \
                                                  for task #{reviewer_task_id}"
                                             ));
-                                            fire_event(
+                                            // Sweep-aware: this fails the `rework` worker-phase
+                                            // assignment, so a same-transaction lapsed-lease reap
+                                            // settles it instead of being rolled back.
+                                            fail_worker_assignment_settled(
                                                 &db_path,
                                                 "daemon",
                                                 reviewer_task_id,
-                                                &Event::AgentFailed {
-                                                    reason: "no worker and no PR for rework".into(),
-                                                },
+                                                "no worker and no PR for rework",
                                             )
                                             .await;
                                         }
@@ -13628,25 +13584,9 @@ async fn tick(
                                                     )
                                                     .await
                                                     {
-                                                        let w = workers.remove(wi);
-                                                        fire_event(
-                                                            &db_path,
-                                                            &w.agent_name,
-                                                            w.task_id,
-                                                            &Event::AgentFailed {
-                                                                reason: format!(
-                                                                    "rework feed failed: {e}"
-                                                                ),
-                                                            },
-                                                        )
-                                                        .await;
-                                                        cleanup_slot(
-                                                            config,
-                                                            wt_mgr,
-                                                            name_pool,
-                                                            w,
-                                                            None,
-                                                            "agent_failed",
+                                                        fail_worker_after_rework_feed_failure(
+                                                            config, wt_mgr, name_pool, workers, wi,
+                                                            &e,
                                                         )
                                                         .await;
                                                     }
@@ -13695,14 +13635,14 @@ async fn tick(
                                                     "no PR or draining — cannot spawn remediation \
                                                      for task #{reviewer_task_id}"
                                                 ));
-                                                fire_event(
+                                                // Sweep-aware: this fails the `rework` worker-phase
+                                                // assignment, so a same-transaction lapsed-lease reap
+                                                // settles it instead of being rolled back.
+                                                fail_worker_assignment_settled(
                                                     &db_path,
                                                     "daemon",
                                                     reviewer_task_id,
-                                                    &Event::AgentFailed {
-                                                        reason: "no worker and no PR for rework"
-                                                            .into(),
-                                                    },
+                                                    "no worker and no PR for rework",
                                                 )
                                                 .await;
                                             }
@@ -13984,25 +13924,8 @@ async fn tick(
                                                 )
                                                 .await
                                                 {
-                                                    let w = workers.remove(wi);
-                                                    fire_event(
-                                                        &db_path,
-                                                        &w.agent_name,
-                                                        w.task_id,
-                                                        &Event::AgentFailed {
-                                                            reason: format!(
-                                                                "rework feed failed: {e}"
-                                                            ),
-                                                        },
-                                                    )
-                                                    .await;
-                                                    cleanup_slot(
-                                                        config,
-                                                        wt_mgr,
-                                                        name_pool,
-                                                        w,
-                                                        None,
-                                                        "agent_failed",
+                                                    fail_worker_after_rework_feed_failure(
+                                                        config, wt_mgr, name_pool, workers, wi, &e,
                                                     )
                                                     .await;
                                                 }
@@ -14050,13 +13973,14 @@ async fn tick(
                                                 "no PR or draining — cannot spawn remediation \
                                                  for task #{reviewer_task_id}"
                                             ));
-                                            fire_event(
+                                            // Sweep-aware: this fails the `rework` worker-phase
+                                            // assignment, so a same-transaction lapsed-lease reap
+                                            // settles it instead of being rolled back.
+                                            fail_worker_assignment_settled(
                                                 &db_path,
                                                 "daemon",
                                                 reviewer_task_id,
-                                                &Event::AgentFailed {
-                                                    reason: "no worker and no PR for rework".into(),
-                                                },
+                                                "no worker and no PR for rework",
                                             )
                                             .await;
                                         }
@@ -14546,25 +14470,9 @@ async fn tick(
                                                         )
                                                         .await
                                                         {
-                                                            let w = workers.remove(wi);
-                                                            fire_event(
-                                                                &db_path,
-                                                                &w.agent_name,
-                                                                w.task_id,
-                                                                &Event::AgentFailed {
-                                                                    reason: format!(
-                                                                        "rework feed failed: {e}"
-                                                                    ),
-                                                                },
-                                                            )
-                                                            .await;
-                                                            cleanup_slot(
-                                                                config,
-                                                                wt_mgr,
-                                                                name_pool,
-                                                                w,
-                                                                None,
-                                                                "agent_failed",
+                                                            fail_worker_after_rework_feed_failure(
+                                                                config, wt_mgr, name_pool, workers,
+                                                                wi, &e,
                                                             )
                                                             .await;
                                                         }
@@ -14589,15 +14497,14 @@ async fn tick(
                                                         "no PR — cannot spawn remediation \
                                                          for task #{reviewer_task_id}"
                                                     ));
-                                                    fire_event(
+                                                    // Sweep-aware: this fails the `rework` worker-phase
+                                                    // assignment, so a same-transaction lapsed-lease reap
+                                                    // settles it instead of being rolled back.
+                                                    fail_worker_assignment_settled(
                                                         &db_path,
                                                         "daemon",
                                                         reviewer_task_id,
-                                                        &Event::AgentFailed {
-                                                            reason:
-                                                                "no worker and no PR for rework"
-                                                                    .into(),
-                                                        },
+                                                        "no worker and no PR for rework",
                                                     )
                                                     .await;
                                                 } else if drain_state.draining {
@@ -14838,23 +14745,8 @@ async fn tick(
                                         )
                                         .await
                                         {
-                                            let w = workers.remove(wi);
-                                            fire_event(
-                                                &db_path,
-                                                &w.agent_name,
-                                                w.task_id,
-                                                &Event::AgentFailed {
-                                                    reason: format!("rework feed failed: {e}"),
-                                                },
-                                            )
-                                            .await;
-                                            cleanup_slot(
-                                                config,
-                                                wt_mgr,
-                                                name_pool,
-                                                w,
-                                                None,
-                                                "agent_failed",
+                                            fail_worker_after_rework_feed_failure(
+                                                config, wt_mgr, name_pool, workers, wi, &e,
                                             )
                                             .await;
                                         }
@@ -14903,13 +14795,14 @@ async fn tick(
                                         "no PR or draining — cannot spawn remediation \
                                          for task #{reviewer_task_id}"
                                     ));
-                                    fire_event(
+                                    // Sweep-aware: this fails the `rework` worker-phase
+                                    // assignment, so a same-transaction lapsed-lease reap
+                                    // settles it instead of being rolled back.
+                                    fail_worker_assignment_settled(
                                         &db_path,
                                         "daemon",
                                         reviewer_task_id,
-                                        &Event::AgentFailed {
-                                            reason: "no worker and no PR for rework".into(),
-                                        },
+                                        "no worker and no PR for rework",
                                     )
                                     .await;
                                 }
@@ -15297,16 +15190,16 @@ async fn tick(
                             workers[wi].agent_name
                         ));
                         let w = workers.remove(wi);
-                        fire_event(
+                        // Sweep-aware: when the rejection was the lapsed-lease
+                        // reap itself, commit that reap rather than roll it
+                        // back behind a second rejected transition.
+                        fail_worker_assignment_settled(
                             &db_path,
                             &w.agent_name,
                             w.task_id,
-                            &Event::AgentFailed {
-                                reason: format!(
-                                    "lifecycle transition rejected at done signal: \
-                                     {rejection_cause}"
-                                ),
-                            },
+                            &format!(
+                                "lifecycle transition rejected at done signal: {rejection_cause}"
+                            ),
                         )
                         .await;
                         cleanup_slot_inner(
@@ -27074,6 +26967,55 @@ async fn fail_worker_assignment_settled(
         .is_some()
 }
 
+/// Hard-terminate a worker on a kill request. The failure is sweep-aware: a
+/// lease that lapsed before the kill is settled by the same-transaction reap.
+/// Teardown then releases the slot without a second `AgentFailed`, which
+/// would be rejected from `open` (or double-spend the recovery budget).
+async fn kill_worker_by_request(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    worker_index: usize,
+    by: &str,
+    reason: &str,
+) {
+    let worker = workers.remove(worker_index);
+    fail_worker_assignment_settled(
+        &config.db_path,
+        &worker.agent_name,
+        worker.task_id,
+        &format!("killed by {by}: {reason}"),
+    )
+    .await;
+    // Emit agent_killed event for the log.
+    emit_kill_event(&config.db_path, &worker.agent_name, by, reason).await;
+    teardown_worker_inner(config, wt_mgr, name_pool, worker, "open", None, false).await;
+}
+
+/// Fail a live-process worker whose rework turn could not be fed and release
+/// its slot. Sweep-aware: a lapsed lease reaped in the same transaction
+/// counts as the settled failure.
+async fn fail_worker_after_rework_feed_failure(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    worker_index: usize,
+    error: &std::io::Error,
+) -> Option<tasks::WorkerFailureOutcome> {
+    let worker = workers.remove(worker_index);
+    let outcome = fail_worker_assignment(
+        &config.db_path,
+        &worker.agent_name,
+        worker.task_id,
+        &format!("rework feed failed: {error}"),
+    )
+    .await;
+    cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed").await;
+    outcome
+}
+
 async fn is_active_branch_sync_ci_fix(db_path: &Path, task_id: i64) -> Result<bool> {
     let p = db_path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<bool> {
@@ -27100,9 +27042,24 @@ async fn teardown_worker_with_body(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
+    state: SlotState,
+    task_status: &str,
+    body: Option<&str>,
+) {
+    teardown_worker_inner(config, wt_mgr, name_pool, state, task_status, body, true).await;
+}
+
+/// `fail_assignment = false` is for callers that already attempted the
+/// worker-failure transition with their own reason; an `open` teardown then
+/// releases resources without firing a second `AgentFailed`.
+async fn teardown_worker_inner(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
     mut state: SlotState,
     task_status: &str,
     body: Option<&str>,
+    fail_assignment: bool,
 ) {
     let mut usage = managed_usage_record(&state, "worker");
     log(&format!(
@@ -27144,13 +27101,15 @@ async fn teardown_worker_with_body(
     }
 
     if task_status == "open" {
-        fail_worker_assignment_settled(
-            &config.db_path,
-            &state.agent_name,
-            state.task_id,
-            "worker teardown (shutdown/cleanup)",
-        )
-        .await;
+        if fail_assignment {
+            fail_worker_assignment_settled(
+                &config.db_path,
+                &state.agent_name,
+                state.task_id,
+                "worker teardown (shutdown/cleanup)",
+            )
+            .await;
+        }
         let p = config.db_path.clone();
         let agent = state.agent_name.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -50052,6 +50011,181 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(task_event_count(&conn, 1, "task_open"), 1);
         assert_eq!(task_event_count(&conn, 1, "task_reclaimed"), 0);
         assert_eq!(errors_with_source(&conn, "lifecycle"), 0);
+    }
+
+    #[cfg(unix)]
+    async fn mailbox_failure_fixture(
+        dir: &Path,
+        status: &str,
+        lapse_lease: bool,
+    ) -> (ServeConfig, Vec<SlotState>) {
+        let db_path = dir.join("mailbox-failure.db");
+        let worktree = dir.join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        create_active_task(&db_path, DRAIN_AUTHOR, status);
+        issue_test_run(&db_path, DRAIN_AUTHOR, DRAIN_AUTHOR_CAP);
+        if lapse_lease {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let lapsed = conn
+                .execute(
+                    "UPDATE claims SET expires_at=?1 WHERE target='task#1' AND active=1",
+                    [now_unix() - 60],
+                )
+                .unwrap();
+            assert_eq!(lapsed, 1, "fixture must hold exactly one active task lease");
+        }
+        let config = pre_review_ci_test_config(db_path, dir.to_path_buf());
+        let slot = drain_test_slot(DRAIN_AUTHOR, 1, worktree, DRAIN_AUTHOR_CAP, None).await;
+        (config, vec![slot])
+    }
+
+    /// A kill row for a worker whose lease already lapsed settles once: the
+    /// same-transaction reap is committed and neither the kill nor the
+    /// teardown records a rejected `AgentFailed`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_of_lapsed_lease_worker_commits_reap_without_second_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, mut workers) = mailbox_failure_fixture(dir.path(), "working", true).await;
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+
+        kill_worker_by_request(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            0,
+            "owner",
+            "stuck",
+        )
+        .await;
+
+        assert!(workers.is_empty(), "the killed worker slot is released");
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "open", "the lapsed-lease reap must commit");
+        assert_eq!(task.assignee, None);
+        assert_eq!(task.recovery_attempts, 1, "one recovery transition only");
+        assert_eq!(task_event_count(&conn, 1, "task_reclaimed"), 1);
+        assert_eq!(task_event_count(&conn, 1, "task_open"), 0);
+        assert_eq!(
+            errors_with_source(&conn, "lifecycle"),
+            0,
+            "no invalid-transition diagnostic"
+        );
+    }
+
+    /// Negative path: a live-lease worker is failed by the kill's own
+    /// `AgentFailed`, exactly once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_of_live_lease_worker_fails_task_to_open_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, mut workers) = mailbox_failure_fixture(dir.path(), "working", false).await;
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+
+        kill_worker_by_request(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            0,
+            "owner",
+            "stuck",
+        )
+        .await;
+
+        assert!(workers.is_empty());
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert_eq!(task.recovery_attempts, 1);
+        assert_eq!(task_event_count(&conn, 1, "task_open"), 1);
+        assert_eq!(task_event_count(&conn, 1, "task_reclaimed"), 0);
+        assert_eq!(errors_with_source(&conn, "lifecycle"), 0);
+    }
+
+    /// A rework feed failure for a worker whose lease lapsed is settled by
+    /// the committed sweep reap; the caller sees the sweep outcome and the
+    /// slot is released instead of the failure replaying behind a rollback.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rework_feed_failure_of_lapsed_lease_worker_settles_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, mut workers) = mailbox_failure_fixture(dir.path(), "rework", true).await;
+        {
+            // Age the task past the sweep's post-verdict rework grace window.
+            let conn = quorum_core::db::open(&config.db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET updated_at=?1 WHERE id=1",
+                [now_unix() - 3600],
+            )
+            .unwrap();
+        }
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+
+        let outcome = fail_worker_after_rework_feed_failure(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            0,
+            &std::io::Error::other("stdin closed"),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                outcome,
+                Some(tasks::WorkerFailureOutcome::AlreadyRecoveredBySweep)
+            ),
+            "a same-transaction reap counts as settled"
+        );
+        assert!(workers.is_empty(), "the failed worker slot is released");
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "open", "the lapsed-lease reap must commit");
+        assert_eq!(task.assignee, None);
+        assert_eq!(task.recovery_attempts, 1, "one recovery transition only");
+        assert_eq!(task_event_count(&conn, 1, "task_reclaimed"), 1);
+        assert_eq!(task_event_count(&conn, 1, "task_open"), 0);
+        assert_eq!(
+            errors_with_source(&conn, "lifecycle"),
+            0,
+            "no invalid-transition diagnostic"
+        );
+    }
+
+    /// Negative path: a genuinely invalid transition at a rework feed
+    /// failure is still loud, and the dead slot is still released.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rework_feed_failure_without_worker_state_stays_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, mut workers) = mailbox_failure_fixture(dir.path(), "cancelled", false).await;
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+
+        let outcome = fail_worker_after_rework_feed_failure(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            0,
+            &std::io::Error::other("stdin closed"),
+        )
+        .await;
+
+        assert!(outcome.is_none(), "invalid transition must not be settled");
+        assert!(workers.is_empty());
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "cancelled");
+        assert_eq!(task.recovery_attempts, 0);
+        assert_eq!(errors_with_source(&conn, "lifecycle"), 1);
     }
 
     /// The exact-run disposition classifies after the write sweep, so a
