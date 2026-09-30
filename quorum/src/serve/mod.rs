@@ -15684,24 +15684,8 @@ async fn tick(
                 cleanup_slot(config, wt_mgr, name_pool, dead, None, end_reason).await;
             }
             _ => {
-                // Genuine zombie — fire AgentFailed.
-                log(&format!(
-                    "WATCHDOG: worker {} idle {}s on task #{} (limit {}s) — killing zombie",
-                    dead.agent_name, idle_secs, dead.task_id, idle_timeout
-                ));
-                fire_event(
-                    &db_path,
-                    &dead.agent_name,
-                    dead.task_id,
-                    &Event::AgentFailed {
-                        reason: format!(
-                            "worker idle {}s between turns (limit {}s) — zombie reaped",
-                            idle_secs, idle_timeout
-                        ),
-                    },
-                )
-                .await;
-                cleanup_slot(config, wt_mgr, name_pool, dead, None, "idle_reaped").await;
+                reap_idle_zombie_worker(config, wt_mgr, name_pool, dead, idle_secs, idle_timeout)
+                    .await;
             }
         }
     }
@@ -19717,6 +19701,32 @@ async fn renew_active_worker_task_leases(db_path: &Path, workers: &[SlotState]) 
 /// operator-configured limit. Extracted so the production decision is
 /// testable: a regression that lets the watchdog kill a dormant awaiting-
 /// review slot must break the same predicate the tick loop consults.
+/// Reap a genuine idle-zombie worker (Phase 4-idle): fail its assignment and
+/// release the slot. The failure is sweep-aware, so a lease that lapsed while
+/// the worker idled is settled by the committed reap rather than a rejected
+/// second `AgentFailed`.
+async fn reap_idle_zombie_worker(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    dead: SlotState,
+    idle_secs: u64,
+    idle_timeout: u64,
+) {
+    log(&format!(
+        "WATCHDOG: worker {} idle {}s on task #{} (limit {}s) — killing zombie",
+        dead.agent_name, idle_secs, dead.task_id, idle_timeout
+    ));
+    fail_worker_assignment_settled(
+        &config.db_path,
+        &dead.agent_name,
+        dead.task_id,
+        &format!("worker idle {idle_secs}s between turns (limit {idle_timeout}s) — zombie reaped"),
+    )
+    .await;
+    cleanup_slot(config, wt_mgr, name_pool, dead, None, "idle_reaped").await;
+}
+
 fn slot_is_idle_zombie_candidate(slot: &SlotState, idle_timeout_secs: u64) -> bool {
     if slot.draining || slot.error_turn_count > 0 || slot_has_pending_watchdog_outcome(slot) {
         return false;
@@ -27655,13 +27665,11 @@ async fn resume_recovered_dormant_reworks(
                 == DormantWorkerFeedFailureDisposition::LiveProcess
             {
                 let worker = workers.remove(worker_index);
-                fire_event(
+                fail_worker_assignment_settled(
                     &config.db_path,
                     &worker.agent_name,
                     worker.task_id,
-                    &Event::AgentFailed {
-                        reason: format!("recovered rework feed failed: {error}"),
-                    },
+                    &format!("recovered rework feed failed: {error}"),
                 )
                 .await;
                 cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed").await;
@@ -49946,6 +49954,77 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             0,
             "teardown must not record an invalid-transition diagnostic"
         );
+    }
+
+    /// The Phase 4-idle watchdog reap of a worker whose lease lapsed while it
+    /// idled is settled by the committed sweep reap, not left `working`
+    /// behind a rejected `AgentFailed`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_zombie_reap_of_lapsed_lease_worker_commits_reap_without_second_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("idle-zombie-lapsed.db");
+        let worktree = dir.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        create_active_task(&db_path, DRAIN_AUTHOR, "working");
+        issue_test_run(&db_path, DRAIN_AUTHOR, DRAIN_AUTHOR_CAP);
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE claims SET expires_at=?1 WHERE target='task#1' AND active=1",
+                [now_unix() - 60],
+            )
+            .unwrap();
+        }
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let slot = drain_test_slot(DRAIN_AUTHOR, 1, worktree, DRAIN_AUTHOR_CAP, None).await;
+
+        reap_idle_zombie_worker(&config, &wt_mgr, &mut name_pool, slot, 900, 600).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "open", "the lapsed-lease reap must commit");
+        assert_eq!(task.assignee, None);
+        assert_eq!(
+            task.recovery_attempts, 1,
+            "exactly one recovery transition (the reap), not a second AgentFailed"
+        );
+        assert_eq!(task_event_count(&conn, 1, "task_reclaimed"), 1);
+        assert_eq!(task_event_count(&conn, 1, "task_open"), 0);
+        assert_eq!(
+            errors_with_source(&conn, "lifecycle"),
+            0,
+            "the watchdog reap must not record an invalid-transition diagnostic"
+        );
+    }
+
+    /// Negative path: an idle zombie with a live lease is still failed back
+    /// to open through `AgentFailed`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_zombie_reap_of_live_lease_worker_still_fails_task_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("idle-zombie-live.db");
+        let worktree = dir.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        create_active_task(&db_path, DRAIN_AUTHOR, "working");
+        issue_test_run(&db_path, DRAIN_AUTHOR, DRAIN_AUTHOR_CAP);
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let slot = drain_test_slot(DRAIN_AUTHOR, 1, worktree, DRAIN_AUTHOR_CAP, None).await;
+
+        reap_idle_zombie_worker(&config, &wt_mgr, &mut name_pool, slot, 900, 600).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert_eq!(task.recovery_attempts, 1);
+        assert_eq!(task_event_count(&conn, 1, "task_open"), 1);
+        assert_eq!(task_event_count(&conn, 1, "task_reclaimed"), 0);
+        assert_eq!(errors_with_source(&conn, "lifecycle"), 0);
     }
 
     /// Negative path: a live-lease worker torn down at shutdown is still
