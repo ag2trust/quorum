@@ -3416,6 +3416,25 @@ where
         });
     }
 
+    // A reviewer rejecting a branch-sync judgment at its immutable rework cap
+    // terminalizes both authorities together. Leaving the sync row active
+    // would strand the directed branch pair after the task becomes Failed.
+    let review_rework_cap_exhausted = status == Status::InReview
+        && new_status == Status::Failed
+        && matches!(event, Event::VerdictChanges)
+        && task.rework_round >= i64::from(task.effective_rework_cap());
+    if review_rework_cap_exhausted {
+        crate::branch_sync::fail_for_task_tx(
+            &tx,
+            id,
+            &format!(
+                "task #{id}: branch sync judgment review rework cap ({}) exceeded",
+                task.effective_rework_cap()
+            ),
+            now,
+        )?;
+    }
+
     // Reset recovery counter on meaningful lifecycle handoff.
     let reset_recovery = matches!(
         (&status, &new_status, event),

@@ -329,6 +329,117 @@ pub fn build_review_prompt_for_kind_with_context_and_cycle(
     }
 }
 
+/// Build the R1 prompt for a daemon-created branch-sync judgment task. The
+/// recorded merge commit is the artifact under judgment; later commits are
+/// included because normal rework advances the same sync branch.
+pub fn build_branch_sync_review_prompt_for_kind_with_context_and_cycle(
+    kind: AgentKind,
+    spec: &ReviewerSpec,
+    effort: &str,
+    graph_context: Option<&str>,
+    review_cycle: Option<ReviewCycleContext>,
+    risk_flags: &[RiskFlag],
+    merge_sha: &str,
+) -> String {
+    let prompt = build_review_prompt_for_kind_with_context_and_cycle(
+        kind,
+        spec,
+        effort,
+        graph_context,
+        review_cycle,
+        risk_flags,
+    )
+    .replace(
+        "full PR diff and surrounding code (never hunks alone)",
+        "branch-sync review artifact specified below and surrounding code (never hunks alone)",
+    );
+    format!(
+        "{prompt}\n\n{}",
+        branch_sync_review_artifact_contract(merge_sha)
+    )
+}
+
+pub struct RereviewManagedContext<'a> {
+    pub branch_sync_merge_sha: Option<&'a str>,
+    pub risk_instruction: &'a str,
+    pub task_contract: &'a str,
+}
+
+/// Build a sticky re-review turn with all managed context inside the
+/// stream-JSON envelope. Nothing may be concatenated after this final
+/// serialization because `AgentProc::feed_turn` writes it verbatim.
+pub fn build_complete_rereview_turn_with_context(
+    reviewer_name: &str,
+    pr: i64,
+    worker_agent: &str,
+    effort: &str,
+    graph_context: Option<&str>,
+    review_cycle: ReviewCycleContext,
+    managed_context: RereviewManagedContext<'_>,
+) -> String {
+    let turn = build_rereview_turn_with_context(
+        reviewer_name,
+        pr,
+        worker_agent,
+        effort,
+        graph_context,
+        review_cycle,
+    );
+    let content = if let Some(merge_sha) = managed_context.branch_sync_merge_sha {
+        let content = rereview_turn_content(&turn).replace(
+            "full current PR diff and surrounding code",
+            "branch-sync review artifact specified below and surrounding code",
+        );
+        format!(
+            "{content}\n\n{}",
+            branch_sync_review_artifact_contract(merge_sha)
+        )
+    } else {
+        rereview_turn_content(&turn)
+    };
+    serialize_complete_rereview_turn(
+        content,
+        managed_context.risk_instruction,
+        managed_context.task_contract,
+    )
+}
+
+fn rereview_turn_content(turn: &str) -> String {
+    let envelope: serde_json::Value =
+        serde_json::from_str(turn).expect("reviewer re-review turn is valid stream JSON");
+    envelope["message"]["content"]
+        .as_str()
+        .expect("reviewer re-review turn carries string content")
+        .to_owned()
+}
+
+fn serialize_complete_rereview_turn(
+    content: String,
+    risk_instruction: &str,
+    task_contract: &str,
+) -> String {
+    let content = if risk_instruction.is_empty() {
+        format!("{content}\n\n{task_contract}")
+    } else {
+        format!("{content}\n\n{risk_instruction}\n\n{task_contract}")
+    };
+    super::agent::user_turn(&content)
+}
+
+fn branch_sync_review_artifact_contract(merge_sha: &str) -> String {
+    format!(
+        "## Branch-sync judgment review artifact\n\n\
+         This is an R1-only branch-sync judgment review. Review the recorded merge itself with \
+         exactly:\n\n`git show --remerge-diff {merge_sha}`\n\n\
+         If rework added commits after that recorded merge, review those commits too with:\n\n\
+         `git show {merge_sha}..HEAD`\n\n\
+         Those outputs together are the authoritative review artifact. Do not substitute a \
+         generic PR diff: the remerge diff must expose how the merge resolved both parents, and \
+         every later commit must also be covered. An R1 changes verdict follows the normal \
+         bounded rework path on this sync branch.\n"
+    )
+}
+
 pub(super) fn graph_review_contract(reviewer: &str, pr: i64, context: Option<&str>) -> String {
     let Some(context) = context else {
         return String::new();
@@ -1927,6 +2038,73 @@ mod tests {
                 prompt.len()
             );
         }
+    }
+
+    #[test]
+    fn branch_sync_r1_prompt_uses_remerge_diff_and_later_commits_as_artifact() {
+        let spec = ReviewerSpec {
+            pr: 42,
+            worker_agent: "Worker-1".into(),
+            reviewer_name: "Reviewer-1".into(),
+        };
+        for kind in [AgentKind::Claude, AgentKind::Codex] {
+            let prompt = build_branch_sync_review_prompt_for_kind_with_context_and_cycle(
+                kind,
+                &spec,
+                "high",
+                None,
+                None,
+                &[],
+                "merge123",
+            );
+            assert!(prompt.contains("git show --remerge-diff merge123"));
+            assert!(prompt.contains("git show merge123..HEAD"));
+            assert!(prompt.contains("authoritative review artifact"));
+            assert!(prompt.contains("normal bounded rework path on this sync branch"));
+            assert!(!prompt.contains("full PR diff"));
+        }
+    }
+
+    #[test]
+    fn branch_sync_final_rereview_turn_is_one_json_envelope_with_all_context() {
+        let risks = vec![RiskFlag {
+            flag: risk::RiskFlagName::CrossLayer,
+            evidence: "storage, review prompt, and merge gate must agree".into(),
+        }];
+        let risk_instruction = r1_risk_instruction(&risks);
+        let task_contract = task_review_contract(
+            42,
+            "branch-sync judgment",
+            Some("resolve the pinned merge"),
+            None,
+            &[],
+            &risks,
+        );
+        let rereview = build_complete_rereview_turn_with_context(
+            "Reviewer-1",
+            42,
+            "Worker-1",
+            "high",
+            None,
+            ReviewCycleContext::from_persisted_rework_round(1, quorum_core::lifecycle::REWORK_CAP),
+            RereviewManagedContext {
+                branch_sync_merge_sha: Some("merge123"),
+                risk_instruction,
+                task_contract: &task_contract,
+            },
+        );
+        let envelope: serde_json::Value = serde_json::from_str(&rereview).unwrap();
+        assert_eq!(envelope["type"], "user");
+        assert_eq!(envelope["message"]["role"], "user");
+        let content = envelope["message"]["content"].as_str().unwrap();
+        assert!(content.contains("git show --remerge-diff merge123"));
+        assert!(content.contains("git show merge123..HEAD"));
+        assert!(content.contains(risk_instruction));
+        assert!(content.contains("## Authoritative managed-task contract"));
+        assert!(
+            content.contains("- cross_layer: storage, review prompt, and merge gate must agree")
+        );
+        assert!(!content.contains("full current PR diff"));
     }
 
     /// Extracts every `quorum <subcommand> --<flag>` from all turn-template

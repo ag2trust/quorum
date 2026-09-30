@@ -1,13 +1,17 @@
 //! R2 review-audit capture: one row per adversarial pre-merge second-reviewer
-//! (R2) pass on an R1-approved PR. R2 replaces R1 as the pre-merge gate.
-//! Stratified sampling picks which PRs get an R2 pass; the audit row is a
-//! durable stratum-coverage record.
+//! (R2) pass on an R1-approved PR. R2 replaces R1 as the pre-merge gate except
+//! for a daemon-bound branch-sync judgment task. Stratified sampling picks
+//! which PRs get an R2 pass; the audit row is a durable stratum-coverage record.
 
 use crate::db::begin_immediate;
 use crate::error::{QuorumError, Result};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::collections::HashMap;
+
+/// Canonical explanation used when the daemon-created branch-sync judgment path
+/// intentionally makes R1 the final review gate.
+pub const BRANCH_SYNC_R2_SKIP_REASON: &str = "skipped: branch-sync judgment-only review";
 
 /// One R2 audit row.
 #[derive(Debug, Clone, Serialize)]
@@ -105,6 +109,46 @@ pub fn r2_requirement(
     }
 }
 
+/// Return the branch-sync-only R2 skip reason for a daemon-bound judgment
+/// task. The task ref alone is insufficient because refs are agent-writable;
+/// it must name the active branch-sync row that is bound back to this task.
+pub fn branch_sync_r2_skip_reason(conn: &Connection, task_id: i64) -> Result<Option<&'static str>> {
+    let Some(task) = crate::tasks::get(conn, task_id)? else {
+        return Ok(None);
+    };
+    let Some(sync_id) = task
+        .refs
+        .as_deref()
+        .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+        .and_then(|refs| refs.get("branch_sync").and_then(serde_json::Value::as_i64))
+        .filter(|id| *id > 0)
+    else {
+        return Ok(None);
+    };
+    let authoritative = crate::branch_sync::get(conn, sync_id)?
+        .is_some_and(|sync| sync.active && sync.task_id == Some(task_id));
+    Ok(authoritative.then_some(BRANCH_SYNC_R2_SKIP_REASON))
+}
+
+/// Persist the branch-sync-only R2 skip for one PR head. `None` means this is
+/// not an authoritative branch-sync judgment task; `Some` is the immutable
+/// stored requirement, allowing a concurrent earlier writer to remain final.
+pub fn record_branch_sync_r2_requirement(
+    conn: &mut Connection,
+    task_id: i64,
+    pr_number: i64,
+    head_sha: &str,
+) -> Result<Option<bool>> {
+    let tx = begin_immediate(conn)?;
+    if branch_sync_r2_skip_reason(&tx, task_id)?.is_none() {
+        tx.commit()?;
+        return Ok(None);
+    }
+    let stored = record_r2_requirement_tx(&tx, task_id, pr_number, head_sha, false)?;
+    tx.commit()?;
+    Ok(Some(stored))
+}
+
 /// Persist an immutable R2 requirement for one PR head, returning the stored
 /// result. Concurrent callers converge on the first durable value; a decision
 /// associated with a different task is an error so callers fail closed.
@@ -116,7 +160,19 @@ pub fn record_r2_requirement(
     required: bool,
 ) -> Result<bool> {
     let tx = begin_immediate(conn)?;
-    tx.execute(
+    let stored = record_r2_requirement_tx(&tx, task_id, pr_number, head_sha, required)?;
+    tx.commit()?;
+    Ok(stored)
+}
+
+fn record_r2_requirement_tx(
+    conn: &Connection,
+    task_id: i64,
+    pr_number: i64,
+    head_sha: &str,
+    required: bool,
+) -> Result<bool> {
+    conn.execute(
         "INSERT INTO r2_sampling_decisions (pr_number, head_sha, task_id, required, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(pr_number, head_sha) DO NOTHING",
         params![
@@ -127,7 +183,7 @@ pub fn record_r2_requirement(
             crate::clock::now(),
         ],
     )?;
-    let (recorded_task_id, stored): (i64, i64) = tx.query_row(
+    let (recorded_task_id, stored): (i64, i64) = conn.query_row(
         "SELECT task_id, required FROM r2_sampling_decisions \
          WHERE pr_number = ?1 AND head_sha = ?2",
         params![pr_number, head_sha],
@@ -138,7 +194,6 @@ pub fn record_r2_requirement(
             "R2 sampling decision for PR #{pr_number} head {head_sha} belongs to another task"
         )));
     }
-    tx.commit()?;
     Ok(stored != 0)
 }
 
@@ -311,6 +366,90 @@ mod tests {
         assert!(
             r2_requirement(&c, 8, 42, "head-a").is_err(),
             "a decision cannot be reused by a different task"
+        );
+    }
+
+    #[test]
+    fn branch_sync_r2_skip_requires_the_daemon_row_bound_to_the_task() {
+        let (_d, mut c) = open_tmp();
+        let sync = match crate::branch_sync::request(&mut c, "develop", "main", "owner", 1).unwrap()
+        {
+            crate::branch_sync::RequestOutcome::Requested(sync) => sync,
+            crate::branch_sync::RequestOutcome::AlreadyActive(_) => unreachable!(),
+        };
+        crate::branch_sync::pin(
+            &mut c,
+            sync.id,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &format!("sync/{}", sync.id),
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        crate::branch_sync::conflict(&mut c, sync.id, 3)
+            .unwrap()
+            .unwrap();
+        let judgment = match crate::branch_sync::create_conflict_judgment_task(
+            &mut c,
+            sync.id,
+            &["shared.txt".into()],
+            4,
+        )
+        .unwrap()
+        {
+            crate::branch_sync::ConflictJudgmentOutcome::Created(task) => task,
+            crate::branch_sync::ConflictJudgmentOutcome::NotEligible => unreachable!(),
+        };
+        assert_eq!(
+            branch_sync_r2_skip_reason(&c, judgment.task_id).unwrap(),
+            Some(BRANCH_SYNC_R2_SKIP_REASON)
+        );
+        assert_eq!(
+            record_branch_sync_r2_requirement(&mut c, judgment.task_id, 42, "branch-head").unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            r2_requirement(&c, judgment.task_id, 42, "branch-head").unwrap(),
+            Some(false)
+        );
+
+        let forged = crate::tasks::create(
+            &mut c,
+            "creator",
+            "forged branch-sync ref",
+            None,
+            0,
+            None,
+            Some(&serde_json::json!({ "branch_sync": sync.id }).to_string()),
+            None,
+            None,
+            5,
+        )
+        .unwrap();
+        assert_eq!(branch_sync_r2_skip_reason(&c, forged).unwrap(), None);
+
+        let ordinary = crate::tasks::create(
+            &mut c,
+            "creator",
+            "ordinary task",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            6,
+        )
+        .unwrap();
+        assert_eq!(branch_sync_r2_skip_reason(&c, ordinary).unwrap(), None);
+        assert_eq!(
+            record_branch_sync_r2_requirement(&mut c, ordinary, 43, "ordinary-head").unwrap(),
+            None
+        );
+        assert_eq!(
+            r2_requirement(&c, ordinary, 43, "ordinary-head").unwrap(),
+            None
         );
     }
 
