@@ -1642,12 +1642,16 @@ async fn spawn_and_run_classifier(
     let owned = match &request.tracker {
         Some(tracker) => {
             let agent = journal_agent(request.pr_number);
-            if let Err(error) = tracker.adopt(request, &agent, &proc).await {
+            // Declared after `proc`, so an unwinding owner hands the entry
+            // to the runner's Drop guard while the leader is still unreaped.
+            let reaping = ReapGuard { tracker, agent };
+            if let Err(error) = tracker.adopt(request, &reaping.agent, &proc).await {
+                reaping.begin();
                 let _ = proc.kill_and_reap().await;
-                tracker.release(&request.db_path, &agent).await;
+                tracker.release(&request.db_path, &reaping.agent).await;
                 return Err(error);
             }
-            Some((tracker, agent))
+            Some(reaping)
         }
         None => None,
     };
@@ -1761,9 +1765,18 @@ async fn spawn_and_run_classifier(
     // Reaping can drain a terminal event raced by the timeout. It remains
     // lifecycle-inert, but its usage is still durable telemetry.
     let kind = proc.kind();
+    // The runner may reap the leader — freeing the numeric pgid for reuse —
+    // at any await inside `kill_and_reap`, so drain must stop signalling the
+    // group before that call starts, not after it returns.
+    if let Some(reaping) = &owned {
+        reaping.begin();
+    }
     let terminal = proc.kill_and_reap().await;
-    if let Some((tracker, agent)) = owned {
-        tracker.release(&request.db_path, &agent).await;
+    if let Some(reaping) = owned {
+        reaping
+            .tracker
+            .release(&request.db_path, &reaping.agent)
+            .await;
     }
     Ok(finalize_classifier_turn(
         kind,
@@ -1819,12 +1832,48 @@ fn journal_agent(pr_number: i64) -> String {
     )
 }
 
+/// Who may still signal a tracked classifier process group by number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ownership {
+    /// The owning task has not started reaping: the leader is unreaped, so
+    /// the pgid still names this group and the tracker may signal it.
+    Live,
+    /// The owning task entered `RunnerProc::kill_and_reap` (or unwound). The
+    /// tracker SIGKILLed the group at this transition; the leader may be
+    /// reaped at any moment, so only the runner's own recycle-safe kill and
+    /// Drop guard may signal from here on.
+    Reaping,
+    /// The owning task finished reaping; only the journal row remains.
+    Reaped,
+}
+
 /// One journaled classifier process group owned by a tracked collection task.
 struct OwnedCollector {
     pgid: i32,
-    /// Set once the owning task reaped the group; drain must not signal a
-    /// pgid the kernel may already have reused.
-    reaped: bool,
+    /// Drain signals and probes `pgid` only while this is [`Ownership::Live`];
+    /// afterwards the kernel may already have reused the number.
+    ownership: Ownership,
+}
+
+/// Owner-side handle for one adopted classifier. Its Drop moves the tracker
+/// entry out of [`Ownership::Live`] on every path that stops owning the
+/// runner process — including an unwinding task — so no exit path can later
+/// signal a pgid this collector no longer holds.
+struct ReapGuard<'a> {
+    tracker: &'a CollectorTracker,
+    agent: String,
+}
+
+impl ReapGuard<'_> {
+    fn begin(&self) {
+        self.tracker.begin_reap(&self.agent);
+    }
+}
+
+impl Drop for ReapGuard<'_> {
+    fn drop(&mut self) {
+        self.begin();
+    }
 }
 
 #[derive(Default)]
@@ -1941,31 +1990,11 @@ impl CollectorTracker {
                 agent.to_string(),
                 OwnedCollector {
                     pgid,
-                    reaped: false,
+                    ownership: Ownership::Live,
                 },
             );
         }
-        let entry = quorum_core::journal::JournalEntry {
-            agent: agent.to_string(),
-            role: JOURNAL_ROLE.into(),
-            // The PR is carried only in the agent key: task-keyed journal
-            // readers must never mistake the collector for a worker/reviewer.
-            task_id: None,
-            session_id: agent.to_string(),
-            worktree: None,
-            branch: None,
-            phase: JOURNAL_ROLE.into(),
-            cost_tokens: 0,
-            agent_state: None,
-            cost_usd: 0.0,
-            log_dir: None,
-            pid: Some(pgid),
-            pr: None,
-            rework_count: 0,
-            provider: Some(proc.kind().to_string()),
-            continuation_id: None,
-            local_branch: None,
-        };
+        let entry = journal_entry(agent, pgid, proc.kind().to_string());
         let inner = self.inner.clone();
         let path = request.db_path.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
@@ -1984,11 +2013,25 @@ impl CollectorTracker {
         .map_err(|error| QuorumError::Io(format!("collector journal write failed: {error}")))
     }
 
-    /// Called by the owning task after `kill_and_reap`: stop drain from
-    /// signalling the reaped group, then delete its journal row.
+    /// Called by the owning task immediately before `kill_and_reap`, with no
+    /// await in between. Under the tracker lock — so it cannot interleave
+    /// with drain's kill pass — SIGKILL the still-owned group and retire its
+    /// pgid from every later tracker signal. Idempotent; a no-op once drain
+    /// took the entry.
+    fn begin_reap(&self, agent: &str) {
+        if let Some(owned) = self.state().owned.get_mut(agent) {
+            if owned.ownership == Ownership::Live {
+                kill_group(owned.pgid);
+                owned.ownership = Ownership::Reaping;
+            }
+        }
+    }
+
+    /// Called by the owning task after `kill_and_reap` returned: delete the
+    /// reaped group's journal row.
     async fn release(&self, db_path: &Path, agent: &str) {
         match self.state().owned.get_mut(agent) {
-            Some(owned) => owned.reaped = true,
+            Some(owned) => owned.ownership = Ownership::Reaped,
             None => return,
         }
         let path = db_path.to_path_buf();
@@ -2018,9 +2061,12 @@ impl CollectorTracker {
     ///
     /// Fail-safe and bounded by [`DRAIN_TIMEOUT`] end to end. The process
     /// groups are SIGKILLed directly from the registry — never by relying on
-    /// a dropped future — before any task is aborted. A row — restart
-    /// recovery's only evidence of the process group — is deleted only after
-    /// its group is confirmed dead, and a delete still pending at the
+    /// a dropped future — before any task is aborted. A group whose owner
+    /// already started reaping was SIGKILLed by [`Self::begin_reap`] while
+    /// still owned; drain neither signals nor probes its pgid, which the
+    /// kernel may have reused. A row — restart recovery's only evidence of
+    /// the process group — is deleted only after its group is confirmed dead
+    /// or was killed at that hand-off, and a delete still pending at the
     /// deadline is abandoned rather than awaited. An interrupted collection
     /// leaves no success row, so the interpret retry queue re-runs it.
     pub async fn drain(&self, db_path: &Path) {
@@ -2036,7 +2082,7 @@ impl CollectorTracker {
                 .owned
                 .drain()
                 .map(|(agent, owned)| {
-                    if !owned.reaped {
+                    if owned.ownership == Ownership::Live {
                         kill_group(owned.pgid);
                     }
                     (agent, owned)
@@ -2066,7 +2112,9 @@ impl CollectorTracker {
         }
         let mut dead = Vec::with_capacity(owned.len());
         for (agent, owned) in owned {
-            if owned.reaped || process_group_gone_by(owned.pgid, deadline).await {
+            if owned.ownership != Ownership::Live
+                || process_group_gone_by(owned.pgid, deadline).await
+            {
                 dead.push(agent);
             } else {
                 super::log(&format!(
@@ -2111,6 +2159,30 @@ impl CollectorTracker {
                 bound.as_secs()
             )),
         }
+    }
+}
+
+fn journal_entry(agent: &str, pgid: i32, provider: String) -> quorum_core::journal::JournalEntry {
+    quorum_core::journal::JournalEntry {
+        agent: agent.to_string(),
+        role: JOURNAL_ROLE.into(),
+        // The PR is carried only in the agent key: task-keyed journal
+        // readers must never mistake the collector for a worker/reviewer.
+        task_id: None,
+        session_id: agent.to_string(),
+        worktree: None,
+        branch: None,
+        phase: JOURNAL_ROLE.into(),
+        cost_tokens: 0,
+        agent_state: None,
+        cost_usd: 0.0,
+        log_dir: None,
+        pid: Some(pgid),
+        pr: None,
+        rework_count: 0,
+        provider: Some(provider),
+        continuation_id: None,
+        local_branch: None,
     }
 }
 
@@ -4428,6 +4500,231 @@ esac
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        assert!(rows_with_role(&db, JOURNAL_ROLE).is_empty());
+    }
+
+    // ── Reap/drain race: the tracker never signals a pgid it stopped owning ─
+
+    /// A process group the tracker does NOT own, standing in for whatever
+    /// the kernel gave a recycled pgid to. `survives` is true while nothing
+    /// has signalled it.
+    struct Bystander(std::process::Child);
+
+    impl Bystander {
+        fn spawn() -> Self {
+            use std::os::unix::process::CommandExt;
+            Self(
+                std::process::Command::new("sleep")
+                    .arg("300")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+
+        fn pgid(&self) -> i32 {
+            self.0.id() as i32
+        }
+
+        fn survives(&mut self) -> bool {
+            self.0.try_wait().unwrap().is_none()
+        }
+
+        fn killed_by_sigkill(&mut self) -> bool {
+            use std::os::unix::process::ExitStatusExt;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = self.0.try_wait().unwrap() {
+                    return status.signal() == Some(libc::SIGKILL);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    impl Drop for Bystander {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Register `pgid` in the tracker and the journal as the owner would,
+    /// in the given ownership state.
+    fn register_owned(
+        tracker: &CollectorTracker,
+        db: &Path,
+        agent: &str,
+        pgid: i32,
+        ownership: Ownership,
+    ) {
+        tracker
+            .state()
+            .owned
+            .insert(agent.to_string(), OwnedCollector { pgid, ownership });
+        let mut conn = db::open(db).unwrap();
+        journal::upsert(&mut conn, &journal_entry(agent, pgid, "claude".into())).unwrap();
+    }
+
+    fn ownership_of(tracker: &CollectorTracker, agent: &str) -> Option<Ownership> {
+        tracker
+            .state()
+            .owned
+            .get(agent)
+            .map(|owned| owned.ownership)
+    }
+
+    /// The reviewer's race: shutdown lands after the owner entered
+    /// `kill_and_reap` (or finished it) but before the journal row is gone,
+    /// and the numeric pgid now belongs to someone else. Drain must not
+    /// signal it, and must still remove the row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_never_signals_pgid_once_owner_started_reaping() {
+        for ownership in [Ownership::Reaping, Ownership::Reaped] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("q.db");
+            let _ = db::open(&db).unwrap();
+            let tracker = CollectorTracker::default();
+            let mut recycled = Bystander::spawn();
+            register_owned(
+                &tracker,
+                &db,
+                "#collector-510-x",
+                recycled.pgid(),
+                ownership,
+            );
+
+            let started = std::time::Instant::now();
+            tracker.drain(&db).await;
+            assert!(
+                recycled.survives(),
+                "{ownership:?}: drain signalled a pgid the collector no longer owns"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{ownership:?}: drain must not wait on a pgid it does not own"
+            );
+            assert!(
+                rows_with_role(&db, JOURNAL_ROLE).is_empty(),
+                "{ownership:?}: row must still be removed"
+            );
+            assert!(tracker.state().owned.is_empty());
+        }
+    }
+
+    /// Control for the test above: the same drain does kill a group that is
+    /// still `Live`, so the survival there is due to the ownership state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_kills_pgid_still_live() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let tracker = CollectorTracker::default();
+        let mut owned = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = owned.id() as i32;
+        register_owned(&tracker, &db, "#collector-511-x", pgid, Ownership::Live);
+        // Reap the leader as the dropped runner would, so drain can confirm
+        // the group gone instead of seeing this test's zombie.
+        let reaper = std::thread::spawn(move || owned.wait().unwrap());
+
+        tracker.drain(&db).await;
+        assert_eq!(
+            reaper.join().unwrap().signal(),
+            Some(libc::SIGKILL),
+            "a live owned group must be killed"
+        );
+        assert!(rows_with_role(&db, JOURNAL_ROLE).is_empty());
+    }
+
+    /// `begin_reap` kills the group exactly at the Live → Reaping hand-off
+    /// and never again: a repeat call, the guard's Drop, and a later drain
+    /// all leave whatever now holds the number alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn begin_reap_signals_only_at_the_live_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let tracker = CollectorTracker::default();
+        let agent = "#collector-512-x";
+        let mut owned = Bystander::spawn();
+        register_owned(&tracker, &db, agent, owned.pgid(), Ownership::Live);
+
+        tracker.begin_reap(agent);
+        assert!(owned.killed_by_sigkill(), "hand-off kills the owned group");
+        assert_eq!(ownership_of(&tracker, agent), Some(Ownership::Reaping));
+
+        // The leader is reaped; pretend the kernel reused its number.
+        let mut recycled = Bystander::spawn();
+        tracker.state().owned.get_mut(agent).unwrap().pgid = recycled.pgid();
+        tracker.begin_reap(agent);
+        drop(ReapGuard {
+            tracker: &tracker,
+            agent: agent.to_string(),
+        });
+        assert!(recycled.survives(), "repeat hand-off must not signal");
+
+        tracker.drain(&db).await;
+        assert!(recycled.survives(), "drain after hand-off must not signal");
+        assert!(rows_with_role(&db, JOURNAL_ROLE).is_empty());
+
+        // The owner's late calls after drain took the entry are inert.
+        tracker.begin_reap(agent);
+        tracker.release(&db, agent).await;
+        assert!(recycled.survives());
+    }
+
+    /// An owner that stops owning the runner without reaching its explicit
+    /// hand-off (unwind) still retires the pgid through the guard.
+    #[test]
+    fn dropped_owner_retires_live_pgid() {
+        let tracker = CollectorTracker::default();
+        let agent = "#collector-513-x";
+        let mut owned = Bystander::spawn();
+        tracker.state().owned.insert(
+            agent.to_string(),
+            OwnedCollector {
+                pgid: owned.pgid(),
+                ownership: Ownership::Live,
+            },
+        );
+
+        drop(ReapGuard {
+            tracker: &tracker,
+            agent: agent.to_string(),
+        });
+        assert!(owned.killed_by_sigkill());
+        assert_eq!(ownership_of(&tracker, agent), Some(Ownership::Reaping));
+    }
+
+    /// Real owner path: while the classifier is answering, the entry is
+    /// `Live`; once the turn is over the owner has handed off and released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owner_holds_live_until_reap_then_releases() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let tracker = CollectorTracker::default();
+        live_tracked_collector(&tracker, dir.path(), &db, 514).await;
+        {
+            let state = tracker.state();
+            let phases: Vec<_> = state.owned.values().map(|owned| owned.ownership).collect();
+            assert_eq!(phases, vec![Ownership::Live]);
+        }
+        tracker.drain(&db).await;
+
+        let tracker = CollectorTracker::default();
+        let mut request = live_request(dir.path(), &db, 515, None, false);
+        request.tracker = Some(tracker.clone());
+        run_live(&request).await.unwrap();
+        assert!(tracker.state().owned.is_empty());
         assert!(rows_with_role(&db, JOURNAL_ROLE).is_empty());
     }
 
