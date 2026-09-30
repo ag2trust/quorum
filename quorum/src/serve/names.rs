@@ -12,6 +12,17 @@ const WORD_LIST: &[&str] = &[
     "Gauge", "Hasp",
 ];
 
+/// Journal-key namespace owned by the daemon's doctor (`doctor-<task_id>`).
+/// `journal.agent` is one global key space, so no pooled or restored agent
+/// identity may enter it; otherwise a worker/reviewer row and a doctor row
+/// could overwrite each other's recovery PID.
+pub const RESERVED_DOCTOR_PREFIX: &str = "doctor-";
+
+/// True when `name` lies in a daemon-reserved journal-key namespace.
+pub fn is_reserved(name: &str) -> bool {
+    name.starts_with(RESERVED_DOCTOR_PREFIX)
+}
+
 pub struct Pool {
     available: Vec<String>,
     in_use: HashSet<String>,
@@ -67,6 +78,13 @@ impl Pool {
                 path.display()
             ));
         }
+        if let Some(name) = names.iter().find(|name| is_reserved(name)) {
+            return Err(format!(
+                "names file {} contains reserved name {name:?} \
+                 (prefix {RESERVED_DOCTOR_PREFIX:?} is the doctor's journal namespace)",
+                path.display()
+            ));
+        }
 
         let required = 2 * cap + 1;
         if names.len() < required {
@@ -93,7 +111,7 @@ impl Pool {
 
     /// Reacquire a durable agent identity during daemon restart recovery.
     pub fn acquire_named(&mut self, name: &str) -> Option<String> {
-        if self.in_use.contains(name) {
+        if self.in_use.contains(name) || is_reserved(name) {
             return None;
         }
         if let Some(index) = self
@@ -261,6 +279,24 @@ mod tests {
             pool.acquire_named("Reviewer-1").as_deref(),
             Some("Reviewer-1")
         );
+    }
+
+    #[test]
+    fn reserved_doctor_names_are_rejected() {
+        let (_f, path) = write_names_file(&["Alpha", "doctor-7", "Gamma"]);
+        let error = match Pool::load(&path, 1) {
+            Err(error) => error,
+            Ok(_) => panic!("a doctor journal key must not load as an agent name"),
+        };
+        assert!(error.contains("reserved name \"doctor-7\""), "{error}");
+
+        let mut pool = Pool::new_generated();
+        assert_eq!(pool.acquire_named("doctor-7"), None);
+        assert_eq!(pool.in_use_count(), 0);
+        // Generated names never enter the reserved namespace.
+        for _ in 0..64 {
+            assert!(!is_reserved(pool.acquire().name()));
+        }
     }
 
     #[test]

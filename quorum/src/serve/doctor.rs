@@ -19,9 +19,9 @@ pub const DOCTOR_EFFORT: &str = "medium";
 /// these rows; they never enter worker/reviewer task recovery.
 pub const JOURNAL_ROLE: &str = "doctor";
 
-/// Upper bound on killing and reaping the doctor's process group, matching
-/// the restart-recovery reap timeout. On expiry the dropped `AgentProc`
-/// SIGKILLs the group again from its Drop guard.
+/// Upper bound on the whole doctor reap — kill, reap, confirmation, and
+/// journal delete — matching the restart-recovery reap timeout, so no exit
+/// path (including the exit-75 self-update) waits longer on the doctor.
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// In-flight doctor state, persisted across ticks.
@@ -36,8 +36,10 @@ pub struct DoctorSlot {
 }
 
 /// Stable journal key for the doctor investigating `task_id`.
+/// The prefix is reserved in the name pool (`names::is_reserved`), so no
+/// worker/reviewer identity can share this `journal.agent` primary key.
 pub fn journal_agent(task_id: i64) -> String {
-    format!("doctor-{task_id}")
+    format!("{}{task_id}", super::names::RESERVED_DOCTOR_PREFIX)
 }
 
 /// Journal row that lets restart recovery kill an orphaned doctor. The task
@@ -67,27 +69,52 @@ pub fn journal_entry(slot: &DoctorSlot) -> JournalEntry {
 
 /// Kill and reap the in-flight doctor's process group, then delete its
 /// journal row. Reap-once: the slot is taken, so later calls are no-ops.
-/// The row delete is guarded by the exact session and pid, so it can never
-/// remove a row another daemon wrote after taking over this DB.
+///
+/// Fail-safe and bounded by [`REAP_TIMEOUT`] end to end: the row — restart
+/// recovery's only evidence of the process group — is deleted only after the
+/// group is confirmed dead, and a delete still pending at the deadline is
+/// abandoned rather than awaited. The delete is guarded by the exact session
+/// and pid, so it never removes a row another daemon wrote after a takeover.
 pub async fn reap_doctor_slot(db_path: &Path, doctor_slot: &mut Option<DoctorSlot>) {
-    let Some(slot) = doctor_slot.take() else {
+    reap_doctor_slot_within(db_path, doctor_slot, REAP_TIMEOUT).await;
+}
+
+async fn reap_doctor_slot_within(
+    db_path: &Path,
+    doctor_slot: &mut Option<DoctorSlot>,
+    bound: Duration,
+) {
+    let Some(DoctorSlot {
+        proc,
+        task_id,
+        session_id,
+        pid,
+        ..
+    }) = doctor_slot.take()
+    else {
         return;
     };
-    let agent = journal_agent(slot.task_id);
-    let session_id = slot.session_id.clone();
-    let pid = slot.pid;
-    if tokio::time::timeout(REAP_TIMEOUT, slot.proc.kill_and_reap())
+    let deadline = tokio::time::Instant::now() + bound;
+    // On expiry the dropped `AgentProc` SIGKILLs the group again (Drop guard).
+    let reaped = tokio::time::timeout_at(deadline, proc.kill_and_reap())
         .await
-        .is_err()
-    {
+        .is_ok();
+    let confirmed = reaped
+        && match pid {
+            Some(pgid) => process_group_gone_by(pgid, deadline).await,
+            None => true,
+        };
+    if !confirmed {
         log(&format!(
-            "doctor: reap of task #{} exceeded {}s — process group killed, reap abandoned",
-            slot.task_id,
-            REAP_TIMEOUT.as_secs()
+            "doctor: process group of task #{task_id} not confirmed dead within {}s — \
+             keeping its journal row for restart recovery",
+            bound.as_secs()
         ));
+        return;
     }
+    let agent = journal_agent(task_id);
     let path = db_path.to_path_buf();
-    let deleted = tokio::task::spawn_blocking(move || -> quorum_core::error::Result<()> {
+    let delete = tokio::task::spawn_blocking(move || -> quorum_core::error::Result<()> {
         let mut conn = quorum_core::db::open(&path)?;
         let tx = quorum_core::db::begin_immediate(&mut conn)?;
         tx.execute(
@@ -96,18 +123,40 @@ pub async fn reap_doctor_slot(db_path: &Path, doctor_slot: &mut Option<DoctorSlo
         )?;
         tx.commit()?;
         Ok(())
-    })
-    .await;
-    match deleted {
-        Ok(Ok(())) => {}
+    });
+    match tokio::time::timeout_at(deadline, delete).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(error))) => log(&format!(
+            "doctor: journal delete for task #{task_id} failed: {error}"
+        )),
         Ok(Err(error)) => log(&format!(
-            "doctor: journal delete for task #{} failed: {error}",
-            slot.task_id
+            "doctor: journal delete for task #{task_id} join failed: {error}"
         )),
-        Err(error) => log(&format!(
-            "doctor: journal delete for task #{} join failed: {error}",
-            slot.task_id
+        Err(_) => log(&format!(
+            "doctor: journal delete for task #{task_id} still pending at the {}s bound — \
+             not waiting; restart recovery removes the row if it never lands",
+            bound.as_secs()
         )),
+    }
+}
+
+/// Poll until no process remains in `pgid` or `deadline` passes. SIGKILLed
+/// descendants are reparented and reaped asynchronously, so absence is only
+/// confirmed by `ESRCH`.
+async fn process_group_gone_by(pgid: i32, deadline: tokio::time::Instant) -> bool {
+    if pgid <= 0 {
+        return false;
+    }
+    loop {
+        let gone = unsafe { libc::killpg(pgid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -372,6 +421,10 @@ mod tests {
         let rows = doctor_rows(&db);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].agent, "doctor-7");
+        assert!(
+            super::super::names::is_reserved(&rows[0].agent),
+            "no pooled agent identity may share the doctor's journal key"
+        );
         assert_eq!(rows[0].pid, Some(pid));
         assert_eq!(rows[0].task_id, None, "task-keyed readers must ignore it");
         assert_eq!(rows[0].worktree, None, "repo_dir is not a managed worktree");
@@ -470,6 +523,82 @@ mod tests {
         assert!(group_gone(pgid).await, "doctor process group must be dead");
     }
 
+    /// Slow reap path: a descendant that leaves the doctor's process group
+    /// but keeps its stdout open means `kill_and_reap` never sees EOF. The
+    /// helper must give up at the bound and keep the row as restart evidence.
+    #[tokio::test]
+    async fn unconfirmed_reap_keeps_recovery_row_within_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("q.db");
+        let escaped_pid = dir.path().join("escaped.pid");
+        let bin = dir.path().join("doctor-escape");
+        write_executable(
+            &bin,
+            &format!(
+                "#!/bin/sh\nperl -e 'setpgrp(0,0); open(my $f, \">\", $ARGV[0]) or die; \
+                 print $f $$; close $f; sleep 300' '{}' &\nexec sleep 300\n",
+                escaped_pid.display()
+            ),
+        );
+        let slot = spawn_doctor(7, dir.path(), bin.to_str(), true, "Bash", "owner/repo").unwrap();
+        super::super::persist_worker_journal(&db, journal_entry(&slot))
+            .await
+            .unwrap();
+        let mut slot = Some(slot);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let escaped: i32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&escaped_pid)
+                .ok()
+                .and_then(|pid| pid.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "escapee never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        let started = std::time::Instant::now();
+        reap_doctor_slot_within(&db, &mut slot, Duration::from_secs(1)).await;
+        let elapsed = started.elapsed();
+        unsafe { libc::kill(escaped, libc::SIGKILL) };
+        assert!(slot.is_none(), "reap still takes the slot");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "reap overran its bound: {elapsed:?}"
+        );
+        assert_eq!(
+            doctor_rows(&db).len(),
+            1,
+            "an unconfirmed reap must keep the journal row for restart recovery"
+        );
+    }
+
+    /// Slow delete path: a writer holding the DB lock must not hold the exit
+    /// past the bound once the group is confirmed dead.
+    #[tokio::test]
+    async fn blocked_journal_delete_is_abandoned_at_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("q.db");
+        let mut slot = journaled_doctor(dir.path(), &db, true).await;
+        let pgid = slot.as_ref().unwrap().pid.unwrap();
+        let blocker = quorum_core::db::open(&db).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = std::time::Instant::now();
+        reap_doctor_slot_within(&db, &mut slot, Duration::from_secs(1)).await;
+        let elapsed = started.elapsed();
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "blocked delete held the exit for {elapsed:?}"
+        );
+        assert!(group_gone(pgid).await, "doctor process group must be dead");
+    }
+
     fn bump_schema(db: &Path) {
         let conn = rusqlite::Connection::open(db).unwrap();
         conn.pragma_update(None, "user_version", quorum_core::db::SCHEMA_VERSION + 1)
@@ -486,7 +615,16 @@ mod tests {
 
     fn loop_fixture() -> LoopFixture {
         let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
+        let (config, instance) = loop_config(dir.path());
+        LoopFixture {
+            dir,
+            config,
+            instance,
+        }
+    }
+
+    fn loop_config(root: &Path) -> (super::super::ServeConfig, String) {
+        let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         for args in [
             &["init", "-b", "main"][..],
@@ -502,12 +640,12 @@ mod tests {
                 .unwrap();
             assert!(out.status.success(), "git {args:?} failed");
         }
-        let worktree_base = dir.path().join("worktrees");
+        let worktree_base = root.join("worktrees");
         std::fs::create_dir_all(&worktree_base).unwrap();
 
         // A stalled in-review task with no PR: no Phase 5 reviewer claims it,
         // so Phase 8b selects it for the doctor.
-        let db_path = dir.path().join("quorum.db");
+        let db_path = root.join("quorum.db");
         let mut conn = quorum_core::db::open(&db_path).unwrap();
         let now = super::super::now_unix();
         let task_id = quorum_core::tasks::create(
@@ -539,9 +677,9 @@ mod tests {
         );
         drop(conn);
 
-        let sentinel = dir.path().join("sentinel");
+        let sentinel = root.join("sentinel");
         std::fs::write(&sentinel, "").unwrap();
-        let bin = fake_doctor(dir.path(), true);
+        let bin = fake_doctor(root, true);
         let profile = crate::serve_config::ModelProfile {
             runner: "claude".into(),
             model: "claude-sonnet-5".into(),
@@ -600,11 +738,7 @@ mod tests {
             grok: Default::default(),
             pr_target_program: None,
         };
-        LoopFixture {
-            dir,
-            config,
-            instance,
-        }
+        (config, instance)
     }
 
     async fn wait_for_doctor_row(db: &Path) -> JournalEntry {
@@ -722,5 +856,115 @@ mod tests {
             ),
         }
         assert!(group_gone(pgid).await, "doctor process group must be dead");
+    }
+
+    /// Configured custom names share `journal.agent` with the doctor key, so
+    /// a names file naming a doctor key must refuse to start the daemon
+    /// before any agent — and any journal row — exists.
+    #[test]
+    fn reserved_names_file_refuses_daemon_start() {
+        on_big_stack(reserved_names_body());
+    }
+
+    async fn reserved_names_body() {
+        let mut fixture = loop_fixture();
+        let names = fixture.dir.path().join("names.txt");
+        std::fs::write(&names, "Alpha\ndoctor-1\nGamma\n").unwrap();
+        fixture.config.names_file = Some(names);
+        let error = super::super::tick_loop(
+            &fixture.config,
+            std::process::id() as i64,
+            fixture.instance.clone(),
+            super::super::planner::WritablePathResolver::default(),
+        )
+        .await
+        .expect_err("a reserved configured name must refuse startup");
+        assert!(error.to_string().contains("reserved name"), "{error}");
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        assert!(journal::list_in_flight(&conn).unwrap().is_empty());
+    }
+
+    const SIGNAL_CHILD_ROOT: &str = "QUORUM_DOCTOR_SIGNAL_CHILD_ROOT";
+
+    /// Child half of the signal test: the daemon's signal handlers are
+    /// process-wide, so the loop runs in its own test process.
+    #[test]
+    #[ignore = "spawned by signal_shutdown_reaps_journaled_doctor"]
+    fn signal_shutdown_child() {
+        let Some(root) = std::env::var_os(SIGNAL_CHILD_ROOT).map(PathBuf::from) else {
+            return;
+        };
+        on_big_stack(async move {
+            let (config, instance) = loop_config(&root);
+            std::fs::write(root.join("ready"), "").unwrap();
+            let exit = super::super::tick_loop(
+                &config,
+                std::process::id() as i64,
+                instance,
+                super::super::planner::WritablePathResolver::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(exit, 0, "signal with no in-flight agents exits 0");
+        });
+    }
+
+    #[test]
+    fn signal_shutdown_reaps_journaled_doctor() {
+        on_big_stack(signal_shutdown_body());
+    }
+
+    async fn signal_shutdown_body() {
+        let root = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "serve::doctor::tests::signal_shutdown_child",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(SIGNAL_CHILD_ROOT, root.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        struct KillOnDrop(u32);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                unsafe { libc::kill(self.0 as i32, libc::SIGKILL) };
+            }
+        }
+        let _guard = KillOnDrop(child.id());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !root.path().join("ready").exists() {
+            assert!(std::time::Instant::now() < deadline, "child never started");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let db = root.path().join("quorum.db");
+        let pgid = wait_for_doctor_row(&db)
+            .await
+            .pid
+            .expect("doctor pid is journaled");
+        assert!(group_alive(pgid), "journaled doctor is live");
+
+        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemon ignored the shutdown signal"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(status.success(), "child daemon test failed: {status:?}");
+        assert!(group_gone(pgid).await, "doctor process group must be dead");
+        assert!(
+            doctor_rows(&db).is_empty(),
+            "doctor journal row must be gone"
+        );
     }
 }
