@@ -504,8 +504,8 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   `daemon/<author>-t<id>` grammar, so task branch cleanup and orphan discovery do not reap them.
   Their preserved conflict worktrees also live beside, rather than under, the task worktree base
   that recovery garbage-collects; `cleanup.rs` only accepts a matching `task_branches` allocation.
-- **Conflict judgment task.** A `conflict` row's judgment work is the sole task the branch-sync
-  path ever creates; every clean-path phase remains daemon-internal. The daemon's intake pass
+- **Conflict judgment task.** A `conflict` row's judgment work is one of the two tasks the
+  branch-sync path may create; every successful clean-path phase remains daemon-internal. The daemon's intake pass
   scans active `conflict` rows whose `task_id IS NULL`, gathers the still-unmerged files from
   the preserved sync worktree via `git diff --name-only --diff-filter=U`, and calls
   `branch_sync::create_conflict_judgment_task` — one `BEGIN IMMEDIATE` transaction that inserts
@@ -526,6 +526,20 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   preserved conflict worktree, publication of the resolved merge, R1-only review, merge, task
   completion, and the paired cancellation path that releases the `conflict` row — is owned by
   the follow-on tasks and is deliberately out of scope for this intake step.
+- **CI-failure fix task.** An active `ci_failed` row with no bound task receives exactly one
+  daemon-created continuation task. `branch_sync::create_ci_failure_fix_task` rechecks that state
+  under `BEGIN IMMEDIATE`, inserts `created_by='daemon'`, `continue_pr` equal to the existing sync
+  PR, `target_branch` equal to the sync target, title
+  `Fix CI for branch sync: <from> → <to> (#<id>)`, and `refs={"branch_sync":<id>}`, then binds the
+  task id before commit. Its body records the preserved `merge_sha`, failing
+  `statusCheckRollup` names, and the fix-forward/no-rebase/no-force-push/no-merge-rewrite contract.
+  The ordinary continuation path provisions the exact PR head and publishes under its SHA lease;
+  the new head is stored in `pr_targets` while the sync row retains its original `merge_sha` for
+  review scope. R1 reviews only `git diff <merge_sha>..<exact-head>` and the existing authoritative
+  branch-sync predicate skips R2. A worker failure or stale publication authority fails the task
+  and sync row without an implementation retry and leaves a sync-id-bearing comment on the open
+  PR. Approval follows the normal merge path; post-merge ancestry verification marks the bound
+  `ci_failed` row `done`.
 
 ### Ops
 - `quorum status [--watch]` → read-only health snapshot. Alerts and critical messages are
@@ -1190,13 +1204,15 @@ review gate and the decision is recorded as
 binding grants no authority, and every other task continues through the ordinary
 R2 decision and gate.
 
-For branch-sync judgment R1, the review artifact is
-`git show --remerge-diff <merge_sha>` for the merge commit recorded on the sync
-row, plus every commit after that merge on the current sync-branch head. This
-preserves visibility into the merge resolution instead of replacing it with a
-generic PR diff. An R1 changes verdict uses the normal rework transition on the
-same sync branch, including the stamped rework cap; each replacement R1 reviews
-the recorded merge and all later rework commits.
+For conflict-judgment R1, the review artifact is `git show --remerge-diff
+<merge_sha>` for the merge commit recorded on the sync row, plus every commit
+after that merge on the current sync-branch head. This preserves visibility into
+the merge resolution instead of replacing it with a generic PR diff. For a
+CI-failure fix task, the artifact is only `git diff <merge_sha>..<exact-head>`;
+the preserved merge is the baseline rather than newly authored work. An R1
+changes verdict uses the normal rework transition on the same sync branch,
+including the stamped rework cap; each replacement R1 receives the matching
+artifact through the current gated head.
 
 R2 is skipped when R1 approves after `rework_round` has reached that task's
 stamped rework cap (see the Rework cap bullet earlier in this document —

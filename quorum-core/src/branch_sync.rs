@@ -723,12 +723,11 @@ pub fn publish_from_conflict(
     Ok(sync)
 }
 
-/// Settle a conflict judgment task's approved, daemon-merged delivery after
+/// Settle a branch-sync judgment task's approved, daemon-merged delivery after
 /// the caller has proven both pinned tips are ancestors of GitHub's immutable
 /// merge commit. The compare-and-set requires the row still be the task's
-/// `published` binding; a stale, terminal, or differently bound row returns
-/// `None` unchanged. `merge_commit_sha` is the remote witness recorded in the
-/// `branch_sync_merged` event, matching the clean path's completion.
+/// active `published` conflict binding or `ci_failed` fix binding; a stale,
+/// terminal, or differently bound row returns `None` unchanged.
 pub fn resolve_conflict_done(
     conn: &mut Connection,
     id: i64,
@@ -747,7 +746,8 @@ pub fn resolve_conflict_done(
             &format!(
                 "UPDATE branch_syncs
                  SET phase='done',active=0,updated_at=?1
-                 WHERE id=?2 AND task_id=?3 AND phase='published' AND active=1
+                 WHERE id=?2 AND task_id=?3
+                   AND phase IN ('published','ci_failed') AND active=1
                  RETURNING {COLS}"
             ),
             params![now, id, task_id],
@@ -841,6 +841,74 @@ pub fn active_for_task(conn: &Connection, task_id: i64) -> Result<Option<BranchS
             row_to_branch_sync,
         )
         .optional()?)
+}
+
+/// Select one failed CI-fix sync whose PR still needs the terminal daemon
+/// comment. The task's authoritative `continue_pr` distinguishes this path
+/// from conflict judgment failures that may not have published a PR.
+pub fn next_failed_ci_fix_awaiting_comment(conn: &Connection) -> Result<Option<BranchSync>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {COLS} FROM branch_syncs
+                 WHERE id=(
+                     SELECT b.id FROM branch_syncs b
+                     WHERE b.active=0 AND b.phase='failed'
+                       AND b.task_id IS NOT NULL AND b.pr IS NOT NULL
+                       AND EXISTS (
+                           SELECT 1 FROM tasks t
+                           WHERE t.id=b.task_id AND t.continue_pr=b.pr
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM events e
+                           WHERE e.kind='branch_sync_failure_commented'
+                             AND e.subject='branch_sync#' || b.id
+                       )
+                     ORDER BY b.updated_at ASC,b.id ASC
+                     LIMIT 1
+                 )"
+            ),
+            [],
+            row_to_branch_sync,
+        )
+        .optional()?)
+}
+
+/// Record successful publication of the terminal CI-fix failure comment.
+/// A stale/nonmatching row is a clean negative so restart reconciliation can
+/// race safely with administrative repair without inventing evidence.
+pub fn record_failure_comment_posted(
+    conn: &mut Connection,
+    id: i64,
+    task_id: i64,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let eligible: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM branch_syncs b
+             JOIN tasks t ON t.id=b.task_id AND t.continue_pr=b.pr
+             WHERE b.id=?1 AND b.task_id=?2 AND b.active=0 AND b.phase='failed'
+               AND NOT EXISTS (
+                   SELECT 1 FROM events e
+                   WHERE e.kind='branch_sync_failure_commented'
+                     AND e.subject='branch_sync#' || b.id
+               )
+         )",
+        params![id, task_id],
+        |row| row.get(0),
+    )?;
+    if eligible {
+        crate::events::emit(
+            &tx,
+            "branch_sync_failure_commented",
+            &format!("branch_sync#{id}"),
+            &format!("terminal CI-fix failure comment posted for task#{task_id}"),
+            now,
+        )?;
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(eligible)
 }
 
 /// Fail the active sync row bound to a judgment task inside the caller's
@@ -1030,6 +1098,23 @@ pub fn next_conflict_awaiting_task(conn: &Connection) -> Result<Option<BranchSyn
         .optional()?)
 }
 
+/// Select the oldest active CI-failed sync whose existing PR has not yet
+/// received its one daemon-created fix-forward task.
+pub fn next_ci_failed_awaiting_task(conn: &Connection) -> Result<Option<BranchSync>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {COLS} FROM branch_syncs
+                 WHERE active=1 AND phase='ci_failed' AND task_id IS NULL
+                 ORDER BY updated_at ASC, id ASC
+                 LIMIT 1"
+            ),
+            [],
+            row_to_branch_sync,
+        )
+        .optional()?)
+}
+
 /// Outcome of [`create_conflict_judgment_task`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConflictJudgmentOutcome {
@@ -1046,6 +1131,27 @@ pub enum ConflictJudgmentOutcome {
 pub struct ConflictJudgmentTask {
     pub sync_id: i64,
     pub task_id: i64,
+    pub target_branch: String,
+    pub title: String,
+    pub body: String,
+    pub refs_json: String,
+}
+
+/// Outcome of [`create_ci_failure_fix_task`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CiFailureFixOutcome {
+    /// A fresh continuation task was created and atomically bound to the sync.
+    Created(CiFailureFixTask),
+    /// The row is missing, no longer active/CI-failed, or already bound.
+    NotEligible,
+}
+
+/// The continuation task created to fix CI on an existing branch-sync PR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiFailureFixTask {
+    pub sync_id: i64,
+    pub task_id: i64,
+    pub pr: i64,
     pub target_branch: String,
     pub title: String,
     pub body: String,
@@ -1078,6 +1184,31 @@ fn conflict_task_body(
         "\nResolve the merge conflicts and commit the merge in place. \
          Do not rebase, squash, or drop either side of the merge; both \
          parents must remain reachable from the resolved commit.\n",
+    );
+    body
+}
+
+fn ci_failure_task_title(sync_id: i64, from: &str, to: &str) -> String {
+    format!("Fix CI for branch sync: {from} → {to} (#{sync_id})")
+}
+
+fn ci_failure_task_body(merge_sha: &str, pr: i64, failure_detail: &str) -> String {
+    let checks = failure_detail
+        .strip_prefix(&format!("PR #{pr} CI failed: "))
+        .unwrap_or(failure_detail);
+    let mut body = format!(
+        "merge_sha: {merge_sha}\npull_request: #{pr}\n\nFailing checks from statusCheckRollup:\n"
+    );
+    if checks.trim().is_empty() {
+        body.push_str("- (no check names reported)\n");
+    } else {
+        for check in checks.split(", ") {
+            body.push_str(&format!("- {check}\n"));
+        }
+    }
+    body.push_str(
+        "\nFix forward on the existing sync branch. Do not rebase or force push, and do not \
+         rewrite the merge commit. Commit only the changes needed to make CI pass.\n",
     );
     body
 }
@@ -1176,6 +1307,93 @@ pub fn create_conflict_judgment_task(
     Ok(ConflictJudgmentOutcome::Created(ConflictJudgmentTask {
         sync_id: row.id,
         task_id,
+        target_branch: row.target_branch,
+        title,
+        body,
+        refs_json,
+    }))
+}
+
+/// Atomically create the single continuation task for a CI-failed branch-sync
+/// PR and bind it to the sync row. The task continues the exact existing PR;
+/// its normal continuation baseline and SHA lease protect the published head.
+pub fn create_ci_failure_fix_task(
+    conn: &mut Connection,
+    sync_id: i64,
+    now: i64,
+) -> Result<CiFailureFixOutcome> {
+    let tx = begin_immediate(conn)?;
+    let Some(row) = tx
+        .query_row(
+            &format!(
+                "SELECT {COLS} FROM branch_syncs
+                 WHERE id=?1 AND active=1 AND phase='ci_failed' AND task_id IS NULL"
+            ),
+            [sync_id],
+            row_to_branch_sync,
+        )
+        .optional()?
+    else {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(CiFailureFixOutcome::NotEligible);
+    };
+    let merge_sha = row
+        .merge_sha
+        .as_deref()
+        .filter(|sha| !sha.is_empty())
+        .ok_or_else(|| QuorumError::Usage("CI-failed sync row missing merge_sha".into()))?;
+    let pr = row
+        .pr
+        .filter(|pr| *pr > 0)
+        .ok_or_else(|| QuorumError::Usage("CI-failed sync row missing PR".into()))?;
+    let failure_detail = row
+        .last_error
+        .as_deref()
+        .ok_or_else(|| QuorumError::Usage("CI-failed sync row missing failing checks".into()))?;
+    let title = ci_failure_task_title(row.id, &row.source_branch, &row.target_branch);
+    let body = ci_failure_task_body(merge_sha, pr, failure_detail);
+    let refs_json = serde_json::json!({ "branch_sync": row.id }).to_string();
+    let task_id = crate::tasks::create_task_tx(
+        &tx,
+        "daemon",
+        &title,
+        Some(&body),
+        0,
+        None,
+        Some(&refs_json),
+        None,
+        None,
+        Some(pr),
+        Some(&row.target_branch),
+        now,
+    )?;
+    let bound = tx.execute(
+        "UPDATE branch_syncs
+         SET task_id=?1,updated_at=?2
+         WHERE id=?3 AND active=1 AND phase='ci_failed' AND task_id IS NULL",
+        params![task_id, now, row.id],
+    )?;
+    if bound != 1 {
+        return Err(QuorumError::Db(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_CHECK),
+            Some("branch sync row lost CI-fix task binding race".into()),
+        )));
+    }
+    crate::events::emit(
+        &tx,
+        "branch_sync_ci_fix_task_created",
+        &format!("branch_sync#{}", row.id),
+        &format!(
+            "CI-fix task#{task_id} created for PR #{pr} ({} -> {})",
+            row.source_branch, row.target_branch
+        ),
+        now,
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(CiFailureFixOutcome::Created(CiFailureFixTask {
+        sync_id: row.id,
+        task_id,
+        pr,
         target_branch: row.target_branch,
         title,
         body,
@@ -1695,6 +1913,207 @@ mod tests {
         assert_eq!(second, ConflictJudgmentOutcome::NotEligible);
         let row = get(&conn, sync.id).unwrap().unwrap();
         assert_eq!(row.task_id, Some(task_id), "task binding must not change");
+    }
+
+    #[test]
+    fn create_ci_failure_fix_task_is_atomic_idempotent_continue_pr_intake() {
+        let (_dir, mut conn) = open_tmp();
+        let sync = requested(request(&mut conn, "develop", "main", "A", 100).unwrap());
+        pin(
+            &mut conn,
+            sync.id,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &format!("sync/{}", sync.id),
+            101,
+        )
+        .unwrap()
+        .unwrap();
+        let merge_sha = "c".repeat(40);
+        prepared(
+            &mut conn,
+            sync.id,
+            &format!("sync/{}", sync.id),
+            &merge_sha,
+            102,
+        )
+        .unwrap()
+        .unwrap();
+        published(&mut conn, sync.id, 77, 103).unwrap().unwrap();
+        begin_checks(&mut conn, sync.id, 104).unwrap().unwrap();
+        ci_failed(
+            &mut conn,
+            sync.id,
+            "PR #77 CI failed: unit-tests, clippy",
+            105,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            next_ci_failed_awaiting_task(&conn)
+                .unwrap()
+                .map(|row| row.id),
+            Some(sync.id)
+        );
+        let created = match create_ci_failure_fix_task(&mut conn, sync.id, 106).unwrap() {
+            CiFailureFixOutcome::Created(task) => task,
+            CiFailureFixOutcome::NotEligible => panic!("CI-failed row must be eligible"),
+        };
+        assert_eq!(
+            created.title,
+            format!("Fix CI for branch sync: develop → main (#{}", sync.id) + ")"
+        );
+        assert!(created.body.contains(&format!("merge_sha: {merge_sha}")));
+        assert!(created.body.contains("- unit-tests"));
+        assert!(created.body.contains("- clippy"));
+        assert!(created.body.contains("Do not rebase or force push"));
+        assert!(created.body.contains("do not rewrite the merge commit"));
+
+        let task = crate::tasks::get(&conn, created.task_id)
+            .unwrap()
+            .expect("task exists");
+        assert_eq!(task.created_by, "daemon");
+        assert_eq!(task.continue_pr, Some(77));
+        assert_eq!(task.target_branch.as_deref(), Some("main"));
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["branch_sync"], serde_json::json!(sync.id));
+        assert_eq!(
+            create_ci_failure_fix_task(&mut conn, sync.id, 107).unwrap(),
+            CiFailureFixOutcome::NotEligible
+        );
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM tasks WHERE json_extract(refs, '$.branch_sync')=?1",
+                [sync.id],
+                |row| row.get(0),
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn ci_failure_fix_worker_failure_fails_sync_without_retry_and_queues_pr_comment() {
+        let (_dir, mut conn) = open_tmp();
+        let sync = requested(request(&mut conn, "develop", "main", "A", 100).unwrap());
+        pin(
+            &mut conn,
+            sync.id,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &format!("sync/{}", sync.id),
+            101,
+        )
+        .unwrap()
+        .unwrap();
+        prepared(
+            &mut conn,
+            sync.id,
+            &format!("sync/{}", sync.id),
+            &"c".repeat(40),
+            102,
+        )
+        .unwrap()
+        .unwrap();
+        published(&mut conn, sync.id, 77, 103).unwrap().unwrap();
+        begin_checks(&mut conn, sync.id, 104).unwrap().unwrap();
+        ci_failed(&mut conn, sync.id, "PR #77 CI failed: test", 105)
+            .unwrap()
+            .unwrap();
+        let task_id = match create_ci_failure_fix_task(&mut conn, sync.id, 106).unwrap() {
+            CiFailureFixOutcome::Created(task) => task.task_id,
+            CiFailureFixOutcome::NotEligible => unreachable!(),
+        };
+        conn.execute(
+            "UPDATE tasks SET refs=json_set(refs,
+                '$.cx_est',1,'$.cx_size','S','$.cx_ready',json('true'),
+                '$.cx_not_ready_reason',json('null'),'$.cx_risk_flags',json('[]'))
+             WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        crate::tasks::claim(
+            &mut conn,
+            "worker",
+            Some(task_id),
+            &[],
+            crate::tasks::DEFAULT_LEASE_TTL_SECS,
+            107,
+        )
+        .unwrap()
+        .unwrap();
+        let transition = crate::tasks::apply_event(
+            &mut conn,
+            "worker",
+            task_id,
+            &crate::lifecycle::Event::AgentFailed {
+                reason: "worker crashed".into(),
+            },
+            108,
+        )
+        .unwrap();
+        assert_eq!(transition.task.status, "failed");
+        assert!(!transition
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, crate::lifecycle::Effect::ResumeWorker)));
+        let failed = get(&conn, sync.id).unwrap().unwrap();
+        assert_eq!(failed.phase, "failed");
+        assert!(!failed.active);
+        assert_eq!(
+            next_failed_ci_fix_awaiting_comment(&conn)
+                .unwrap()
+                .map(|row| row.id),
+            Some(sync.id)
+        );
+        assert!(record_failure_comment_posted(&mut conn, sync.id, task_id, 109).unwrap());
+        assert!(next_failed_ci_fix_awaiting_comment(&conn)
+            .unwrap()
+            .is_none());
+        assert!(!record_failure_comment_posted(&mut conn, sync.id, task_id, 110).unwrap());
+    }
+
+    #[test]
+    fn ci_failure_fix_approved_merge_completes_bound_sync_without_rewriting_merge_sha() {
+        let (_dir, mut conn) = open_tmp();
+        let sync = requested(request(&mut conn, "develop", "main", "A", 100).unwrap());
+        pin(
+            &mut conn,
+            sync.id,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &format!("sync/{}", sync.id),
+            101,
+        )
+        .unwrap()
+        .unwrap();
+        let original_merge = "c".repeat(40);
+        prepared(
+            &mut conn,
+            sync.id,
+            &format!("sync/{}", sync.id),
+            &original_merge,
+            102,
+        )
+        .unwrap()
+        .unwrap();
+        published(&mut conn, sync.id, 77, 103).unwrap().unwrap();
+        begin_checks(&mut conn, sync.id, 104).unwrap().unwrap();
+        ci_failed(&mut conn, sync.id, "PR #77 CI failed: test", 105)
+            .unwrap()
+            .unwrap();
+        let task_id = match create_ci_failure_fix_task(&mut conn, sync.id, 106).unwrap() {
+            CiFailureFixOutcome::Created(task) => task.task_id,
+            CiFailureFixOutcome::NotEligible => unreachable!(),
+        };
+        let remote_merge = "d".repeat(40);
+        let done = resolve_conflict_done(&mut conn, sync.id, task_id, &remote_merge, 107)
+            .unwrap()
+            .expect("bound CI-fix task completes the sync");
+        assert_eq!(done.phase, "done");
+        assert!(!done.active);
+        assert_eq!(done.merge_sha.as_deref(), Some(original_merge.as_str()));
     }
 
     #[test]
