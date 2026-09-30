@@ -4272,9 +4272,10 @@ esac
             "collector process group must be dead"
         );
         assert!(rows_with_role(&db, JOURNAL_ROLE).is_empty());
-        let state = tracker.state();
-        assert!(state.tasks.is_empty() && state.owned.is_empty());
-        drop(state);
+        {
+            let state = tracker.state();
+            assert!(state.tasks.is_empty() && state.owned.is_empty());
+        }
 
         // Reap-once: a second exit path finds nothing to do.
         tracker.drain(&db).await;
