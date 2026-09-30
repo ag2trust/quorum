@@ -35,11 +35,12 @@ pub struct DoctorSlot {
     pub response_text: String,
 }
 
-/// Stable journal key for the doctor investigating `task_id`.
-/// The prefix is reserved in the name pool (`names::is_reserved`), so no
-/// worker/reviewer identity can share this `journal.agent` primary key.
+/// Stable journal key for the doctor investigating `task_id`. It starts with
+/// the names-file comment prefix, which no pooled agent identity can carry,
+/// so it never shares the `journal.agent` primary key with a worker/reviewer
+/// row — including configured or legacy `doctor-*` names.
 pub fn journal_agent(task_id: i64) -> String {
-    format!("{}{task_id}", super::names::RESERVED_DOCTOR_PREFIX)
+    format!("{}doctor-{task_id}", super::names::COMMENT_PREFIX)
 }
 
 /// Journal row that lets restart recovery kill an orphaned doctor. The task
@@ -420,11 +421,7 @@ mod tests {
 
         let rows = doctor_rows(&db);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].agent, "doctor-7");
-        assert!(
-            super::super::names::is_reserved(&rows[0].agent),
-            "no pooled agent identity may share the doctor's journal key"
-        );
+        assert_eq!(rows[0].agent, "#doctor-7");
         assert_eq!(rows[0].pid, Some(pid));
         assert_eq!(rows[0].task_id, None, "task-keyed readers must ignore it");
         assert_eq!(rows[0].worktree, None, "repo_dir is not a managed worktree");
@@ -435,6 +432,54 @@ mod tests {
         );
 
         reap_doctor_slot(&db, &mut slot).await;
+    }
+
+    /// A worker/reviewer identity named like the doctor (a configured or
+    /// legacy `doctor-7`) gets its own journal row; neither upsert overwrites
+    /// the other's recovery PID.
+    #[tokio::test]
+    async fn doctor_key_never_collides_with_doctor_named_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("q.db");
+        let worker = JournalEntry {
+            agent: "doctor-7".into(),
+            role: "worker".into(),
+            task_id: Some(7),
+            session_id: "worker-session".into(),
+            worktree: None,
+            branch: None,
+            phase: "working".into(),
+            cost_tokens: 0,
+            agent_state: None,
+            cost_usd: 0.0,
+            log_dir: None,
+            pid: Some(424242),
+            pr: None,
+            rework_count: 0,
+            provider: Some("claude".into()),
+            continuation_id: None,
+            local_branch: None,
+        };
+        super::super::persist_worker_journal(&db, worker)
+            .await
+            .unwrap();
+        let mut slot = journaled_doctor(dir.path(), &db, true).await;
+        let pid = slot.as_ref().unwrap().proc.pid().unwrap();
+
+        let conn = quorum_core::db::open(&db).unwrap();
+        let rows = journal::list_in_flight(&conn).unwrap();
+        let pid_of = |agent: &str| rows.iter().find(|row| row.agent == agent).unwrap().pid;
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(pid_of("doctor-7"), Some(424242));
+        assert_eq!(pid_of(&journal_agent(7)), Some(pid));
+
+        reap_doctor_slot(&db, &mut slot).await;
+        let rows = journal::list_in_flight(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].agent, "doctor-7",
+            "reap deletes only the doctor row"
+        );
     }
 
     #[tokio::test]
@@ -858,30 +903,71 @@ mod tests {
         assert!(group_gone(pgid).await, "doctor process group must be dead");
     }
 
-    /// Configured custom names share `journal.agent` with the doctor key, so
-    /// a names file naming a doctor key must refuse to start the daemon
-    /// before any agent — and any journal row — exists.
+    /// A previously valid custom name in the `doctor-` namespace must not
+    /// block startup (doctor disabled, the default): the names file loads and
+    /// restart recovery still kills a stale journaled process group.
     #[test]
-    fn reserved_names_file_refuses_daemon_start() {
-        on_big_stack(reserved_names_body());
+    fn doctor_named_custom_name_starts_and_recovers() {
+        on_big_stack(doctor_named_custom_name_body());
     }
 
-    async fn reserved_names_body() {
+    async fn doctor_named_custom_name_body() {
+        use std::os::unix::process::CommandExt;
+
         let mut fixture = loop_fixture();
+        fixture.config.doctor_enabled = false;
         let names = fixture.dir.path().join("names.txt");
-        std::fs::write(&names, "Alpha\ndoctor-1\nGamma\n").unwrap();
+        std::fs::write(&names, "Alpha\ndoctor-1\ndoctor-alpha\n").unwrap();
         fixture.config.names_file = Some(names);
-        let error = super::super::tick_loop(
+        let mut stale = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = stale.id() as i32;
+        std::thread::spawn(move || {
+            let _ = stale.wait();
+        });
+        {
+            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            journal::upsert(
+                &mut conn,
+                &JournalEntry {
+                    agent: journal_agent(1),
+                    role: JOURNAL_ROLE.into(),
+                    task_id: None,
+                    session_id: "stale-doctor".into(),
+                    worktree: None,
+                    branch: None,
+                    phase: JOURNAL_ROLE.into(),
+                    cost_tokens: 0,
+                    agent_state: None,
+                    cost_usd: 0.0,
+                    log_dir: None,
+                    pid: Some(pid),
+                    pr: None,
+                    rework_count: 0,
+                    provider: Some("claude".into()),
+                    continuation_id: None,
+                    local_branch: None,
+                },
+            )
+            .unwrap();
+        }
+        // Exit on the first tick, after names loading and restart recovery.
+        std::fs::remove_file(fixture.config.exit_when_gone.as_ref().unwrap()).unwrap();
+
+        let exit = super::super::tick_loop(
             &fixture.config,
             std::process::id() as i64,
             fixture.instance.clone(),
             super::super::planner::WritablePathResolver::default(),
         )
         .await
-        .expect_err("a reserved configured name must refuse startup");
-        assert!(error.to_string().contains("reserved name"), "{error}");
-        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
-        assert!(journal::list_in_flight(&conn).unwrap().is_empty());
+        .expect("a doctor-* custom name must not refuse startup");
+        assert_eq!(exit, 1);
+        assert!(group_gone(pid).await, "recovery must kill the stale group");
+        assert!(doctor_rows(&fixture.config.db_path).is_empty());
     }
 
     const SIGNAL_CHILD_ROOT: &str = "QUORUM_DOCTOR_SIGNAL_CHILD_ROOT";
