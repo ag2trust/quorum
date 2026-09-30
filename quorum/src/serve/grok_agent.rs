@@ -1430,7 +1430,6 @@ impl GrokProc {
         self.failures.clone()
     }
 
-    #[allow(dead_code)] // dormant internal boundary; managed Grok routing is still rejected
     pub(super) fn set_worker_request(&mut self, request: WorkerTurnRequest) {
         self.worker_request = Some(Box::new(request));
     }
