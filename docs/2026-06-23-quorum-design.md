@@ -535,9 +535,10 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   `statusCheckRollup` names, and the fix-forward/no-rebase/no-force-push/no-merge-rewrite contract.
   The ordinary continuation path provisions the exact PR head and publishes under its SHA lease;
   the new head is stored in `pr_targets` while the sync row retains its original `merge_sha` for
-  review scope. That stored fix head remains immutable through reviewer provisioning: a later PR
-  head/ref/fork mismatch atomically fails the task and sync row before any reviewer or merge gains
-  authority. R1 reviews only `git diff <merge_sha>..<exact-head>` and the existing authoritative
+  review scope. That stored fix head remains immutable through fresh reviewer provisioning and
+  every sticky R1 re-review feed: a later PR head/ref/fork mismatch atomically fails the task and
+  sync row before any reviewer or merge gains authority. R1 reviews only
+  `git diff <merge_sha>..<exact-head>` and the existing authoritative
   branch-sync predicate skips R2. A worker failure or stale publication authority fails the task
   and sync row without an implementation retry and queues a sync-id-bearing comment on the open
   PR. Comment delivery admits at most three durable task-bound attempts with exponential backoff;
