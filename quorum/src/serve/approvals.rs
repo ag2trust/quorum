@@ -379,6 +379,7 @@ async fn adopt_stranded_verdicts(
 /// Merge a durably-approved PR and close its task. Returns `true` on a
 /// successful merge (approval + journal cleaned up), `false` if the merge did
 /// not happen (conflicting / merge failure) — the caller counts it as deferred.
+#[allow(clippy::too_many_arguments)]
 async fn merge_approved(
     db_path: &Path,
     repo_dir: &Path,
