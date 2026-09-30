@@ -9597,7 +9597,8 @@ async fn resume_reviewer_after_ci(
         .await
         .map_err(|error| QuorumError::Io(format!("branch-sync review context join: {error}")))??
     };
-    let rereview_prompt = match branch_sync_merge_sha.as_deref() {
+    let risk_instruction = reviewer::r1_risk_instruction(&risk_flags);
+    let rereview_turn = match branch_sync_merge_sha.as_deref() {
         Some(merge_sha) => reviewer::build_branch_sync_rereview_turn_with_context(
             &reviewers[reviewer_index].agent_name,
             pr,
@@ -9606,21 +9607,19 @@ async fn resume_reviewer_after_ci(
             graph_context.as_deref(),
             review_cycle,
             merge_sha,
+            risk_instruction,
+            &task_contract,
         ),
-        None => reviewer::build_rereview_turn_with_context(
+        None => reviewer::build_complete_rereview_turn_with_context(
             &reviewers[reviewer_index].agent_name,
             pr,
             &workers[worker_index].agent_name,
             &reviewers[reviewer_index].effort,
             graph_context.as_deref(),
             review_cycle,
+            risk_instruction,
+            &task_contract,
         ),
-    };
-    let risk_instruction = reviewer::r1_risk_instruction(&risk_flags);
-    let rereview_turn = if risk_instruction.is_empty() {
-        format!("{rereview_prompt}\n\n{task_contract}")
-    } else {
-        format!("{rereview_prompt}\n\n{risk_instruction}\n\n{task_contract}")
     };
     // Revalidate at the external feed boundary. This second guarded read makes
     // any cancellation/context change during CI/prompt preparation fail loud

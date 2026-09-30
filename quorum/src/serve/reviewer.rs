@@ -370,6 +370,8 @@ pub fn build_branch_sync_rereview_turn_with_context(
     graph_context: Option<&str>,
     review_cycle: ReviewCycleContext,
     merge_sha: &str,
+    risk_instruction: &str,
+    task_contract: &str,
 ) -> String {
     let turn = build_rereview_turn_with_context(
         reviewer_name,
@@ -379,20 +381,65 @@ pub fn build_branch_sync_rereview_turn_with_context(
         graph_context,
         review_cycle,
     );
-    let mut envelope: serde_json::Value =
-        serde_json::from_str(&turn).expect("reviewer re-review turn is valid stream JSON");
-    let content = envelope["message"]["content"]
-        .as_str()
-        .expect("reviewer re-review turn carries string content")
-        .replace(
-            "full current PR diff and surrounding code",
-            "branch-sync review artifact specified below and surrounding code",
-        );
-    envelope["message"]["content"] = serde_json::Value::String(format!(
+    let content = rereview_turn_content(&turn).replace(
+        "full current PR diff and surrounding code",
+        "branch-sync review artifact specified below and surrounding code",
+    );
+    let content = format!(
         "{content}\n\n{}",
         branch_sync_review_artifact_contract(merge_sha)
-    ));
-    serde_json::to_string(&envelope).expect("branch-sync re-review turn serializes")
+    );
+    serialize_complete_rereview_turn(content, risk_instruction, task_contract)
+}
+
+/// Build an ordinary sticky re-review turn with its task and risk context
+/// inside the stream-JSON envelope. Nothing may be concatenated after this
+/// final serialization because `AgentProc::feed_turn` writes it verbatim.
+pub fn build_complete_rereview_turn_with_context(
+    reviewer_name: &str,
+    pr: i64,
+    worker_agent: &str,
+    effort: &str,
+    graph_context: Option<&str>,
+    review_cycle: ReviewCycleContext,
+    risk_instruction: &str,
+    task_contract: &str,
+) -> String {
+    let turn = build_rereview_turn_with_context(
+        reviewer_name,
+        pr,
+        worker_agent,
+        effort,
+        graph_context,
+        review_cycle,
+    );
+    serialize_complete_rereview_turn(
+        rereview_turn_content(&turn),
+        risk_instruction,
+        task_contract,
+    )
+}
+
+fn rereview_turn_content(turn: &str) -> String {
+    let envelope: serde_json::Value =
+        serde_json::from_str(turn).expect("reviewer re-review turn is valid stream JSON");
+    envelope["message"]["content"]
+        .as_str()
+        .expect("reviewer re-review turn carries string content")
+        .to_owned()
+}
+
+fn serialize_complete_rereview_turn(
+    content: String,
+    risk_instruction: &str,
+    task_contract: &str,
+) -> String {
+    let content = if risk_instruction.is_empty() {
+        format!("{content}\n\n{task_contract}")
+    } else {
+        format!("{content}\n\n{risk_instruction}\n\n{task_contract}")
+    };
+    super::agent::user_turn(&content)
 }
 
 fn branch_sync_review_artifact_contract(merge_sha: &str) -> String {
@@ -2032,7 +2079,23 @@ mod tests {
             assert!(prompt.contains("normal bounded rework path on this sync branch"));
             assert!(!prompt.contains("full PR diff"));
         }
+    }
 
+    #[test]
+    fn branch_sync_final_rereview_turn_is_one_json_envelope_with_all_context() {
+        let risks = vec![RiskFlag {
+            flag: risk::RiskFlagName::CrossLayer,
+            evidence: "storage, review prompt, and merge gate must agree".into(),
+        }];
+        let risk_instruction = r1_risk_instruction(&risks);
+        let task_contract = task_review_contract(
+            42,
+            "branch-sync judgment",
+            Some("resolve the pinned merge"),
+            None,
+            &[],
+            &risks,
+        );
         let rereview = build_branch_sync_rereview_turn_with_context(
             "Reviewer-1",
             42,
@@ -2041,11 +2104,20 @@ mod tests {
             None,
             ReviewCycleContext::from_persisted_rework_round(1, quorum_core::lifecycle::REWORK_CAP),
             "merge123",
+            risk_instruction,
+            &task_contract,
         );
         let envelope: serde_json::Value = serde_json::from_str(&rereview).unwrap();
+        assert_eq!(envelope["type"], "user");
+        assert_eq!(envelope["message"]["role"], "user");
         let content = envelope["message"]["content"].as_str().unwrap();
         assert!(content.contains("git show --remerge-diff merge123"));
         assert!(content.contains("git show merge123..HEAD"));
+        assert!(content.contains(risk_instruction));
+        assert!(content.contains("## Authoritative managed-task contract"));
+        assert!(
+            content.contains("- cross_layer: storage, review prompt, and merge gate must agree")
+        );
         assert!(!content.contains("full current PR diff"));
     }
 
