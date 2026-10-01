@@ -107,22 +107,111 @@ pub fn sample_system(
 ///
 /// Sampling occurs on a detached thread because a platform syscall can stall.
 /// Failure to start, fail, or finish the sample within the resource sampler's
-/// existing timeout is fail-open and returns no snapshot.
+/// existing timeout is fail-open and returns no snapshot. At most one stalled
+/// host-memory sampler remains in flight; later callers fail open until it
+/// finishes instead of starting replacement workers.
 #[allow(dead_code)] // Exposed for planner diagnostic callers added independently.
 pub fn sample_host_resource_snapshot() -> Option<HostResourceSnapshot> {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let handle = std::thread::Builder::new()
-        .name("quorum-resource-snapshot".to_string())
-        .spawn(move || {
-            let _ = sender.send(sample_memory_snapshot_with(&SystemSampler));
-        })
-        .ok()?;
-    drop(handle);
+    host_resource_snapshot_sampler()
+        .lock()
+        .ok()?
+        .sample(Instant::now())
+}
 
-    receiver
-        .recv_timeout(RESOURCE_SAMPLE_TIMEOUT)
-        .ok()
-        .flatten()
+fn host_resource_snapshot_sampler() -> &'static std::sync::Mutex<HostResourceSnapshotSampler> {
+    static SAMPLER: std::sync::OnceLock<std::sync::Mutex<HostResourceSnapshotSampler>> =
+        std::sync::OnceLock::new();
+    SAMPLER.get_or_init(|| std::sync::Mutex::new(HostResourceSnapshotSampler::default()))
+}
+
+#[derive(Debug)]
+struct InFlightSnapshot {
+    started_at: Instant,
+    receiver: std::sync::mpsc::Receiver<Option<HostResourceSnapshot>>,
+}
+
+/// Synchronous counterpart to the daemon poller's one-in-flight policy.
+///
+/// The mutex protecting this state is held only while a caller waits for the
+/// current bounded sample. Once that sample has timed out, its detached worker
+/// remains tracked and every later caller returns immediately until it either
+/// completes or disconnects.
+#[derive(Debug)]
+struct HostResourceSnapshotSampler {
+    in_flight: Option<InFlightSnapshot>,
+    timeout: Duration,
+}
+
+impl Default for HostResourceSnapshotSampler {
+    fn default() -> Self {
+        Self {
+            in_flight: None,
+            timeout: RESOURCE_SAMPLE_TIMEOUT,
+        }
+    }
+}
+
+impl HostResourceSnapshotSampler {
+    fn sample(&mut self, now: Instant) -> Option<HostResourceSnapshot> {
+        if self.in_flight.is_none() && !self.start() {
+            return None;
+        }
+
+        let in_flight = self
+            .in_flight
+            .as_ref()
+            .expect("a successful snapshot worker start is tracked");
+        match in_flight.receiver.try_recv() {
+            Ok(snapshot) => {
+                self.in_flight = None;
+                snapshot
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.in_flight = None;
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty)
+                if now.saturating_duration_since(in_flight.started_at) >= self.timeout =>
+            {
+                None
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                let remaining = self
+                    .timeout
+                    .saturating_sub(now.saturating_duration_since(in_flight.started_at));
+                match in_flight.receiver.recv_timeout(remaining) {
+                    Ok(snapshot) => {
+                        self.in_flight = None;
+                        snapshot
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        self.in_flight = None;
+                        None
+                    }
+                }
+            }
+        }
+    }
+
+    fn start(&mut self) -> bool {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        match std::thread::Builder::new()
+            .name("quorum-resource-snapshot".to_string())
+            .spawn(move || {
+                let _ = sender.send(sample_memory_snapshot_with(&SystemSampler));
+            }) {
+            Ok(handle) => {
+                drop(handle);
+                self.in_flight = Some(InFlightSnapshot {
+                    started_at: Instant::now(),
+                    receiver,
+                });
+                true
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -704,6 +793,40 @@ mod tests {
         };
 
         assert_eq!(sample_memory_snapshot_with(&sampler), None);
+    }
+
+    #[test]
+    fn memory_snapshot_timeout_keeps_one_in_flight_worker() {
+        let start = Instant::now();
+        let timeout = Duration::from_secs(2);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut sampler = HostResourceSnapshotSampler {
+            in_flight: Some(InFlightSnapshot {
+                started_at: start,
+                receiver,
+            }),
+            timeout,
+        };
+
+        assert_eq!(sampler.sample(start + timeout), None);
+        assert!(sampler.in_flight.is_some());
+        assert_eq!(
+            sampler.sample(start + timeout + Duration::from_secs(1)),
+            None,
+            "a timed-out sample must not be replaced"
+        );
+        assert!(sampler.in_flight.is_some());
+
+        let expected = HostResourceSnapshot {
+            memory_available_bytes: gib(37),
+            swap_used_bytes: gib(2),
+        };
+        sender.send(Some(expected)).unwrap();
+        assert_eq!(
+            sampler.sample(start + timeout + Duration::from_secs(2)),
+            Some(expected)
+        );
+        assert!(sampler.in_flight.is_none());
     }
 
     fn targets() -> Vec<DiskTarget> {
