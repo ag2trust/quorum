@@ -626,6 +626,18 @@ fn render_decomposition(
         planner,
         revision,
     );
+    if let Some(stall) = &graph.drain_stall {
+        let line = truncate(
+            &format!(
+                "drain stalled {}: {}",
+                fmt_age(stall.age_secs),
+                stall.blockers.join("; ")
+            ),
+            width.saturating_sub(6),
+        );
+        let rendered = if sty.color { sty.red(&line) } else { line };
+        let _ = writeln!(w, "      {rendered}");
+    }
     let planner_effort = graph.planner_effort.as_deref().unwrap_or("pending");
     let planner_log_dir = graph
         .planner_log_dir
@@ -1042,10 +1054,31 @@ mod tests {
                 status: "failed".into(),
                 prerequisites: vec![41],
             }],
+            drain_stall: None,
         });
         let mut buf = Vec::new();
         render_with_style(&s, &Style::plain(), &mut buf);
         let output = String::from_utf8(buf).unwrap();
+        assert!(!output.contains("drain stalled"), "{output}");
+
+        let graph = s.decomposition.as_mut().unwrap();
+        graph.graph_state = "draining".into();
+        graph.drain_stall = Some(quorum_core::stats::DecompositionDrainStall {
+            age_secs: 59_400,
+            blockers: vec!["journal rows=1 (planner=1)".into()],
+        });
+        s.health = HealthVerdict::Stalled;
+        s.stalled_count = 1;
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("[X] stalled"), "{output}");
+        assert!(!output.contains("on track"), "{output}");
+        assert!(output.contains("1 stalled"), "{output}");
+        assert!(
+            output.contains("drain stalled 16h: journal rows=1 (planner=1)"),
+            "{output}"
+        );
         assert!(output.contains("DECOMPOSITION"));
         assert!(output.contains("source #40"));
         assert!(output.contains("children=1/2"));
