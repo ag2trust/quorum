@@ -15,6 +15,7 @@ use super::session_log::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -29,6 +30,7 @@ pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
 const MAX_FAILURE_SUMMARY_BYTES: usize = 2048;
 const MAX_FAILURE_REASON_BYTES: usize = 256;
 const DIAGNOSTIC_SAMPLE_LINES: usize = 2;
+const MAX_PENDING_DIAGNOSTIC_TOOL_IDS: usize = 256;
 const WRITABLE_PATH_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(1);
 pub const WORKER_WRITABILITY_GUIDANCE: &str = "Worker guidance: only the assigned worktree and repository are writable. This defense-in-depth guidance does not itself enforce that boundary.";
 const MAX_TEXT_BYTES: usize = 8 * 1024;
@@ -724,6 +726,118 @@ pub struct PlannerSlot {
     sanitized_record_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PlannerMcpStatus {
+    Connected,
+    Failed,
+    #[default]
+    Absent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlannerToolKind {
+    Bash,
+    Read,
+    Write,
+    Edit,
+    Grep,
+    Glob,
+    Skill,
+    Agent,
+    SubmitPlan,
+    Other,
+}
+
+#[derive(Default, Serialize)]
+struct PlannerToolHistogram {
+    bash: u64,
+    read: u64,
+    write: u64,
+    edit: u64,
+    grep: u64,
+    glob: u64,
+    skill: u64,
+    agent: u64,
+    submit_plan: u64,
+    other: u64,
+}
+
+impl PlannerToolHistogram {
+    fn increment(&mut self, kind: PlannerToolKind) {
+        let count = match kind {
+            PlannerToolKind::Bash => &mut self.bash,
+            PlannerToolKind::Read => &mut self.read,
+            PlannerToolKind::Write => &mut self.write,
+            PlannerToolKind::Edit => &mut self.edit,
+            PlannerToolKind::Grep => &mut self.grep,
+            PlannerToolKind::Glob => &mut self.glob,
+            PlannerToolKind::Skill => &mut self.skill,
+            PlannerToolKind::Agent => &mut self.agent,
+            PlannerToolKind::SubmitPlan => &mut self.submit_plan,
+            PlannerToolKind::Other => &mut self.other,
+        };
+        *count = count.saturating_add(1);
+    }
+}
+
+#[derive(Default, Serialize)]
+struct PlannerTokenUsage {
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    cache_write_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+}
+
+#[derive(Default, Serialize)]
+struct PlannerPermissionDenials {
+    count: u64,
+    tools: PlannerToolHistogram,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PlannerStopReason {
+    EndTurn,
+    TokenLimit,
+    MaxTurns,
+    StopSequence,
+    ToolUse,
+    PauseTurn,
+    Refusal,
+    Error,
+    Other,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PlannerResultSubtype {
+    Success,
+    MaxTurns,
+    TokenLimit,
+    ExecutionError,
+    PermissionDenied,
+    Other,
+}
+
+#[derive(Default, Serialize)]
+struct PlannerTerminalDiagnostic {
+    stop_reason: Option<PlannerStopReason>,
+    result_subtype: Option<PlannerResultSubtype>,
+    turn_count: Option<u64>,
+    error: Option<bool>,
+    usage: Option<PlannerTokenUsage>,
+    duration_ms: Option<u64>,
+    permission_denials: PlannerPermissionDenials,
+}
+
+#[derive(Default, Serialize)]
+struct PlannerFinalMessageDiagnostic {
+    bytes: u64,
+    plan_shaped: bool,
+}
+
 #[derive(Default)]
 struct PlannerDiagnostics {
     lines: u64,
@@ -732,6 +846,14 @@ struct PlannerDiagnostics {
     end: VecDeque<String>,
     terminal_response_seen: bool,
     read_boundary_truncated: bool,
+    mcp_status: PlannerMcpStatus,
+    submit_plan_advertised: bool,
+    tool_histogram: PlannerToolHistogram,
+    submit_plan_error_results: u64,
+    terminal: PlannerTerminalDiagnostic,
+    final_assistant_message: PlannerFinalMessageDiagnostic,
+    pending_submit_plan_ids: HashSet<u64>,
+    started_codex_mcp_ids: HashMap<u64, PlannerToolKind>,
 }
 
 impl PlannerDiagnostics {
@@ -741,6 +863,14 @@ impl PlannerDiagnostics {
         *self.event_types.entry(event_type).or_default() += 1;
         self.terminal_response_seen |=
             matches!(event_type, "result" | "turn.completed" | "turn.failed");
+
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+            match provider {
+                AgentKind::Claude => self.observe_claude_event(&value),
+                AgentKind::Codex => self.observe_codex_event(&value),
+                AgentKind::Grok => self.observe_grok_event(&value),
+            }
+        }
 
         // Samples deliberately retain only a structural description. Provider
         // payload strings (including tool output and assistant text) can contain
@@ -758,6 +888,384 @@ impl PlannerDiagnostics {
     fn note_read_boundary_truncation(&mut self) {
         self.read_boundary_truncated = true;
     }
+
+    fn observe_claude_event(&mut self, value: &serde_json::Value) {
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("system")
+                if value.get("subtype").and_then(serde_json::Value::as_str) == Some("init") =>
+            {
+                self.observe_claude_init(value);
+            }
+            Some("assistant") => {
+                let Some(message) = value.get("message") else {
+                    return;
+                };
+                if let Some(text) = super::stream::assistant_text(message) {
+                    self.observe_final_message(&text);
+                }
+                if let Some(blocks) = message.get("content").and_then(serde_json::Value::as_array) {
+                    for block in blocks {
+                        if block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+                        {
+                            self.observe_claude_tool_use(block);
+                        }
+                    }
+                }
+            }
+            Some("tool_use") => self.observe_claude_tool_use(value),
+            Some("user") => self.observe_claude_tool_results(
+                value
+                    .get("message")
+                    .and_then(|message| message.get("content")),
+            ),
+            Some("tool_result") => self.observe_claude_tool_result(value),
+            Some("result") => self.observe_claude_terminal(value),
+            _ => {}
+        }
+    }
+
+    fn observe_claude_init(&mut self, value: &serde_json::Value) {
+        self.mcp_status = PlannerMcpStatus::Absent;
+        if let Some(servers) = value
+            .get("mcp_servers")
+            .and_then(serde_json::Value::as_array)
+        {
+            for server in servers {
+                if server.get("name").and_then(serde_json::Value::as_str) != Some("quorum") {
+                    continue;
+                }
+                self.mcp_status = if server.get("status").and_then(serde_json::Value::as_str)
+                    == Some("connected")
+                {
+                    PlannerMcpStatus::Connected
+                } else {
+                    PlannerMcpStatus::Failed
+                };
+                if matches!(self.mcp_status, PlannerMcpStatus::Connected) {
+                    break;
+                }
+            }
+        }
+        self.submit_plan_advertised = value
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|tool| tool.as_str() == Some(super::runner::PLANNER_MCP_ALLOWED_TOOL))
+            });
+    }
+
+    fn observe_claude_tool_use(&mut self, value: &serde_json::Value) {
+        let kind = planner_tool_kind(value.get("name").and_then(serde_json::Value::as_str));
+        self.tool_histogram.increment(kind);
+        if kind == PlannerToolKind::SubmitPlan {
+            self.remember_submit_plan_id(value.get("id").and_then(serde_json::Value::as_str));
+        }
+    }
+
+    fn observe_claude_tool_results(&mut self, content: Option<&serde_json::Value>) {
+        let Some(blocks) = content.and_then(serde_json::Value::as_array) else {
+            return;
+        };
+        for block in blocks {
+            if block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result") {
+                self.observe_claude_tool_result(block);
+            }
+        }
+    }
+
+    fn observe_claude_tool_result(&mut self, value: &serde_json::Value) {
+        let Some(id) = value
+            .get("tool_use_id")
+            .and_then(serde_json::Value::as_str)
+            .map(diagnostic_id_hash)
+        else {
+            return;
+        };
+        if self.pending_submit_plan_ids.remove(&id)
+            && value
+                .get("is_error")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        {
+            self.submit_plan_error_results = self.submit_plan_error_results.saturating_add(1);
+        }
+    }
+
+    fn observe_claude_terminal(&mut self, value: &serde_json::Value) {
+        self.terminal.stop_reason = value
+            .get("stop_reason")
+            .and_then(serde_json::Value::as_str)
+            .map(planner_stop_reason);
+        self.terminal.result_subtype = value
+            .get("subtype")
+            .and_then(serde_json::Value::as_str)
+            .map(planner_result_subtype);
+        self.terminal.turn_count = value.get("num_turns").and_then(serde_json::Value::as_u64);
+        self.terminal.error = value.get("is_error").and_then(serde_json::Value::as_bool);
+        self.terminal.duration_ms = value.get("duration_ms").and_then(serde_json::Value::as_u64);
+        self.terminal.usage = value.get("usage").and_then(planner_token_usage);
+        self.terminal.permission_denials = planner_permission_denials(
+            value
+                .get("permission_denials")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::as_slice),
+        );
+    }
+
+    fn observe_codex_event(&mut self, value: &serde_json::Value) {
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("item.started") => {
+                let Some(item) = value.get("item") else {
+                    return;
+                };
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("mcp_call") {
+                    let kind = codex_mcp_tool_kind(item);
+                    self.tool_histogram.increment(kind);
+                    if let Some(id) = item
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(diagnostic_id_hash)
+                    {
+                        if self.started_codex_mcp_ids.len() < MAX_PENDING_DIAGNOSTIC_TOOL_IDS {
+                            self.started_codex_mcp_ids.insert(id, kind);
+                        }
+                        if kind == PlannerToolKind::SubmitPlan {
+                            self.remember_submit_plan_hash(id);
+                        }
+                    }
+                }
+            }
+            Some("item.completed") => {
+                let Some(item) = value.get("item") else {
+                    return;
+                };
+                match item.get("type").and_then(serde_json::Value::as_str) {
+                    Some("agent_message") => {
+                        if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
+                            self.observe_final_message(text);
+                        }
+                    }
+                    Some("command_execution") => {
+                        self.tool_histogram.increment(PlannerToolKind::Bash);
+                    }
+                    Some("file_change") => {
+                        self.tool_histogram.increment(PlannerToolKind::Edit);
+                    }
+                    Some("mcp_call") => self.observe_completed_codex_mcp_call(item),
+                    _ => {}
+                }
+            }
+            Some("turn.completed") => self.observe_codex_terminal(value, false),
+            Some("turn.failed") => self.observe_codex_terminal(value, true),
+            _ => {}
+        }
+    }
+
+    fn observe_completed_codex_mcp_call(&mut self, item: &serde_json::Value) {
+        let id = item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(diagnostic_id_hash);
+        let started_kind = id.and_then(|id| self.started_codex_mcp_ids.remove(&id));
+        let kind = started_kind.unwrap_or_else(|| codex_mcp_tool_kind(item));
+        if started_kind.is_none() {
+            self.tool_histogram.increment(kind);
+            if kind == PlannerToolKind::SubmitPlan {
+                if let Some(id) = id {
+                    self.remember_submit_plan_hash(id);
+                }
+            }
+        }
+        let is_error = item.get("error").is_some_and(|error| !error.is_null())
+            || matches!(
+                item.get("status").and_then(serde_json::Value::as_str),
+                Some("failed" | "error")
+            )
+            || item
+                .get("result")
+                .and_then(|result| result.get("is_error"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+        if kind == PlannerToolKind::SubmitPlan && is_error {
+            self.submit_plan_error_results = self.submit_plan_error_results.saturating_add(1);
+        }
+        if let Some(id) = id {
+            self.pending_submit_plan_ids.remove(&id);
+        }
+    }
+
+    fn observe_codex_terminal(&mut self, value: &serde_json::Value, failed: bool) {
+        self.terminal.stop_reason = value
+            .get("stop_reason")
+            .and_then(serde_json::Value::as_str)
+            .map(planner_stop_reason);
+        self.terminal.result_subtype = Some(if failed {
+            PlannerResultSubtype::ExecutionError
+        } else {
+            PlannerResultSubtype::Success
+        });
+        self.terminal.turn_count = value
+            .get("num_turns")
+            .or_else(|| value.get("turn_count"))
+            .and_then(serde_json::Value::as_u64);
+        self.terminal.error = Some(failed);
+        self.terminal.duration_ms = value.get("duration_ms").and_then(serde_json::Value::as_u64);
+        self.terminal.usage = value.get("usage").and_then(planner_token_usage);
+        self.terminal.permission_denials = planner_permission_denials(
+            value
+                .get("permission_denials")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::as_slice),
+        );
+    }
+
+    fn observe_grok_event(&mut self, value: &serde_json::Value) {
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("end") {
+            return;
+        }
+        let stop_reason = value
+            .get("stopReason")
+            .and_then(serde_json::Value::as_str)
+            .map(planner_stop_reason);
+        let max_turns = matches!(stop_reason, Some(PlannerStopReason::MaxTurns));
+        self.terminal.stop_reason = stop_reason;
+        self.terminal.result_subtype = Some(if max_turns {
+            PlannerResultSubtype::MaxTurns
+        } else {
+            PlannerResultSubtype::Success
+        });
+        self.terminal.error = Some(max_turns);
+        self.terminal.usage = value.get("usage").and_then(planner_token_usage);
+    }
+
+    fn observe_final_message(&mut self, text: &str) {
+        self.final_assistant_message.bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
+        self.final_assistant_message.plan_shaped = serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .is_some_and(|value| {
+                value.as_object().is_some_and(|object| {
+                    object.contains_key("tasks") || object.contains_key("outcome")
+                })
+            });
+    }
+
+    fn remember_submit_plan_id(&mut self, id: Option<&str>) {
+        if let Some(id) = id {
+            self.remember_submit_plan_hash(diagnostic_id_hash(id));
+        }
+    }
+
+    fn remember_submit_plan_hash(&mut self, id: u64) {
+        if self.pending_submit_plan_ids.len() < MAX_PENDING_DIAGNOSTIC_TOOL_IDS {
+            self.pending_submit_plan_ids.insert(id);
+        }
+    }
+}
+
+fn diagnostic_id_hash(id: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn planner_tool_kind(name: Option<&str>) -> PlannerToolKind {
+    match name {
+        Some("Bash") => PlannerToolKind::Bash,
+        Some("Read") => PlannerToolKind::Read,
+        Some("Write") => PlannerToolKind::Write,
+        Some("Edit") => PlannerToolKind::Edit,
+        Some("Grep") => PlannerToolKind::Grep,
+        Some("Glob") => PlannerToolKind::Glob,
+        Some("Skill") => PlannerToolKind::Skill,
+        Some("Agent") => PlannerToolKind::Agent,
+        Some(super::runner::PLANNER_MCP_ALLOWED_TOOL) => PlannerToolKind::SubmitPlan,
+        _ => PlannerToolKind::Other,
+    }
+}
+
+fn codex_mcp_tool_kind(item: &serde_json::Value) -> PlannerToolKind {
+    let server = item
+        .get("server")
+        .or_else(|| item.get("server_name"))
+        .and_then(serde_json::Value::as_str);
+    let tool = item
+        .get("tool")
+        .or_else(|| item.get("tool_name"))
+        .and_then(serde_json::Value::as_str);
+    if server == Some("quorum") && tool == Some("submit_plan") {
+        PlannerToolKind::SubmitPlan
+    } else {
+        PlannerToolKind::Other
+    }
+}
+
+fn planner_stop_reason(reason: &str) -> PlannerStopReason {
+    match reason {
+        "end_turn" | "completed" => PlannerStopReason::EndTurn,
+        "max_tokens" | "token_limit" => PlannerStopReason::TokenLimit,
+        "max_turns" | "max_turns_reached" => PlannerStopReason::MaxTurns,
+        "stop_sequence" => PlannerStopReason::StopSequence,
+        "tool_use" => PlannerStopReason::ToolUse,
+        "pause_turn" => PlannerStopReason::PauseTurn,
+        "refusal" => PlannerStopReason::Refusal,
+        "error" => PlannerStopReason::Error,
+        _ => PlannerStopReason::Other,
+    }
+}
+
+fn planner_result_subtype(subtype: &str) -> PlannerResultSubtype {
+    match subtype {
+        "success" => PlannerResultSubtype::Success,
+        "error_max_turns" | "max_turns" => PlannerResultSubtype::MaxTurns,
+        "error_max_tokens" | "token_limit" => PlannerResultSubtype::TokenLimit,
+        "error_during_execution" | "error" => PlannerResultSubtype::ExecutionError,
+        "permission_denied" | "error_permission_denied" => PlannerResultSubtype::PermissionDenied,
+        _ => PlannerResultSubtype::Other,
+    }
+}
+
+fn planner_token_usage(value: &serde_json::Value) -> Option<PlannerTokenUsage> {
+    value.as_object()?;
+    Some(PlannerTokenUsage {
+        input_tokens: value
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        cached_input_tokens: value
+            .get("cached_input_tokens")
+            .or_else(|| value.get("cache_read_input_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        cache_write_input_tokens: value
+            .get("cache_write_input_tokens")
+            .or_else(|| value.get("cache_creation_input_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        output_tokens: value
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        reasoning_output_tokens: value
+            .get("reasoning_output_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
+fn planner_permission_denials(denials: Option<&[serde_json::Value]>) -> PlannerPermissionDenials {
+    let mut diagnostic = PlannerPermissionDenials::default();
+    let Some(denials) = denials else {
+        return diagnostic;
+    };
+    for denial in denials {
+        diagnostic.count = diagnostic.count.saturating_add(1);
+        diagnostic.tools.increment(planner_tool_kind(
+            denial.get("tool_name").and_then(serde_json::Value::as_str),
+        ));
+    }
+    diagnostic
 }
 
 fn safe_event_type(provider: AgentKind, raw: &str) -> &'static str {
@@ -1348,6 +1856,15 @@ fn provider_failure_summary(slot: &PlannerSlot, reason: &str, byte_count_kind: &
             "stdout_lines": slot.diagnostics.lines,
             "event_types": slot.diagnostics.event_types,
             "terminal_response_seen": slot.diagnostics.terminal_response_seen,
+            "mcp": {
+                "status": slot.diagnostics.mcp_status,
+                "submit_plan_advertised": slot.diagnostics.submit_plan_advertised,
+            },
+            "tool_histogram": slot.diagnostics.tool_histogram,
+            "submit_plan_calls": slot.diagnostics.tool_histogram.submit_plan,
+            "submit_plan_error_results": slot.diagnostics.submit_plan_error_results,
+            "terminal": slot.diagnostics.terminal,
+            "final_assistant_message": slot.diagnostics.final_assistant_message,
             "samples": {
                 "beginning": beginning,
                 "end": end,
@@ -2876,6 +3393,237 @@ mod tests {
             poll_to_terminal(&mut slot).await,
             PlannerTurnEnd::Failed(ref summary) if summary.contains("provider returned an error")
         ));
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_failure_diagnostics_report_all_mcp_attachment_states() {
+        let cases = [
+            (
+                "connected",
+                serde_json::json!([{"name": "quorum", "status": "connected"}]),
+                serde_json::json!([super::super::runner::PLANNER_MCP_ALLOWED_TOOL]),
+                true,
+            ),
+            (
+                "failed",
+                serde_json::json!([{"name": "quorum", "status": "failed"}]),
+                serde_json::json!([]),
+                false,
+            ),
+            (
+                "absent",
+                serde_json::json!([{"name": "unrelated-server", "status": "connected"}]),
+                serde_json::json!(["Read"]),
+                false,
+            ),
+        ];
+
+        for (expected_status, mcp_servers, tools, expected_advertised) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let output = claude_stream(&[serde_json::json!({
+                "type": "system",
+                "subtype": "init",
+                "mcp_servers": mcp_servers,
+                "tools": tools,
+            })]);
+            let mut slot = spawn_fake_claude(dir.path(), &output).await;
+            let turn_end = poll_to_terminal(&mut slot).await;
+            let PlannerPoll::ProviderFailed(summary) = planner_outcome(&mut slot, turn_end, None)
+            else {
+                panic!("missing submit_plan must fail");
+            };
+            let diagnostic: serde_json::Value = serde_json::from_str(&summary).unwrap();
+            assert_eq!(
+                diagnostic["planner_diagnostic"]["mcp"]["status"],
+                expected_status
+            );
+            assert_eq!(
+                diagnostic["planner_diagnostic"]["mcp"]["submit_plan_advertised"],
+                expected_advertised
+            );
+            slot.kill_and_reap().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_failure_diagnostic_identifies_plan_shaped_final_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_message = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        })
+        .to_string();
+        let output = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({
+                "type": "system",
+                "subtype": "init",
+                "mcp_servers": [{"name": "quorum", "status": "connected"}],
+                "tools": [super::super::runner::PLANNER_MCP_ALLOWED_TOOL],
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": final_message}]},
+            }),
+            serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "stop_reason": "end_turn",
+                "is_error": false,
+                "num_turns": 7,
+                "duration_ms": 1234,
+                "usage": {
+                    "input_tokens": 100,
+                    "cache_read_input_tokens": 80,
+                    "cache_creation_input_tokens": 10,
+                    "output_tokens": 25,
+                },
+                "permission_denials": [],
+                "result": "",
+            }),
+        );
+        let mut slot = spawn_fake_claude(dir.path(), &output).await;
+        let turn_end = poll_to_terminal(&mut slot).await;
+        let PlannerPoll::ProviderFailed(summary) = planner_outcome(&mut slot, turn_end, None)
+        else {
+            panic!("text-only plan must fail");
+        };
+        let diagnostic: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        let planner = &diagnostic["planner_diagnostic"];
+        assert_eq!(planner["submit_plan_calls"], 0);
+        assert_eq!(planner["submit_plan_error_results"], 0);
+        assert_eq!(
+            planner["final_assistant_message"]["bytes"],
+            final_message.len()
+        );
+        assert_eq!(planner["final_assistant_message"]["plan_shaped"], true);
+        assert_eq!(planner["terminal"]["stop_reason"], "end_turn");
+        assert_eq!(planner["terminal"]["result_subtype"], "success");
+        assert_eq!(planner["terminal"]["turn_count"], 7);
+        assert_eq!(planner["terminal"]["error"], false);
+        assert_eq!(planner["terminal"]["duration_ms"], 1234);
+        assert_eq!(planner["terminal"]["usage"]["input_tokens"], 100);
+        assert_eq!(planner["terminal"]["usage"]["cached_input_tokens"], 80);
+        assert_eq!(planner["terminal"]["usage"]["cache_write_input_tokens"], 10);
+        assert_eq!(planner["terminal"]["usage"]["output_tokens"], 25);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_failure_summary_counts_rejected_submit_plan_without_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = "planner-payload-sentinel-must-not-persist";
+        let output = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            serde_json::json!({
+                "type": "system",
+                "subtype": "init",
+                "mcp_servers": [
+                    {"name": "quorum", "status": "connected"},
+                    {"name": sentinel, "status": "connected"},
+                ],
+                "tools": [super::super::runner::PLANNER_MCP_ALLOWED_TOOL, sentinel],
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "tool_use", "id": "submit-call", "name": super::super::runner::PLANNER_MCP_ALLOWED_TOOL, "input": {"payload": sentinel}},
+                    {"type": "tool_use", "id": "unknown-call", "name": sentinel, "input": {"payload": sentinel}},
+                ]},
+            }),
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "submit-call",
+                    "is_error": true,
+                    "content": sentinel,
+                }]},
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": sentinel}]},
+            }),
+            serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "num_turns": 3,
+                "duration_ms": 900,
+                "usage": {"input_tokens": 20, "output_tokens": 5},
+                "permission_denials": [
+                    {"tool_name": "Read", "tool_input": {"path": sentinel}},
+                    {"tool_name": sentinel, "tool_input": {"payload": sentinel}},
+                ],
+                "result": sentinel,
+            }),
+        );
+        let mut slot = spawn_fake_claude(dir.path(), &output).await;
+        let turn_end = poll_to_terminal(&mut slot).await;
+        let PlannerPoll::ProviderFailed(summary) = planner_outcome(&mut slot, turn_end, None)
+        else {
+            panic!("rejected submission must not become a plan");
+        };
+        assert!(
+            !summary.contains(sentinel),
+            "provider payload entered failure summary: {summary}"
+        );
+        let diagnostic: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        let planner = &diagnostic["planner_diagnostic"];
+        assert_eq!(planner["submit_plan_calls"], 1);
+        assert_eq!(planner["submit_plan_error_results"], 1);
+        assert_eq!(planner["tool_histogram"]["submit_plan"], 1);
+        assert_eq!(planner["tool_histogram"]["other"], 1);
+        assert_eq!(planner["terminal"]["permission_denials"]["count"], 2);
+        assert_eq!(
+            planner["terminal"]["permission_denials"]["tools"]["read"],
+            1
+        );
+        assert_eq!(
+            planner["terminal"]["permission_denials"]["tools"]["other"],
+            1
+        );
+        assert_eq!(planner["final_assistant_message"]["plan_shaped"], false);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_failure_diagnostic_maps_turn_and_token_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "result",
+                "subtype": "error_max_turns",
+                "stop_reason": "max_tokens",
+                "is_error": true,
+                "num_turns": 36,
+                "duration_ms": 4567,
+                "usage": {
+                    "input_tokens": 500,
+                    "cache_read_input_tokens": 400,
+                    "cache_creation_input_tokens": 30,
+                    "output_tokens": 75,
+                },
+                "permission_denials": [],
+            }),
+        );
+        let mut slot = spawn_fake_claude(dir.path(), &output).await;
+        let outcome = poll_to_terminal(&mut slot).await;
+        let diagnostic = failure_json(&outcome);
+        let terminal = &diagnostic["planner_diagnostic"]["terminal"];
+        assert_eq!(terminal["stop_reason"], "token_limit");
+        assert_eq!(terminal["result_subtype"], "max_turns");
+        assert_eq!(terminal["turn_count"], 36);
+        assert_eq!(terminal["error"], true);
+        assert_eq!(terminal["duration_ms"], 4567);
+        assert_eq!(terminal["usage"]["input_tokens"], 500);
+        assert_eq!(terminal["usage"]["output_tokens"], 75);
         slot.kill_and_reap().await;
     }
 
