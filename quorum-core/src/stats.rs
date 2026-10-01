@@ -331,6 +331,23 @@ pub struct DecompositionStatusView {
     pub failed_children: Vec<i64>,
     pub reasons: Vec<String>,
     pub members: Vec<DecompositionMemberView>,
+    /// Set when the graph has sat in `freeze-requested`/`draining` longer than
+    /// [`DECOMPOSITION_DRAIN_STALL_SECS`]; counted as stalled by `stats`.
+    pub drain_stall: Option<DecompositionDrainStall>,
+}
+
+/// A graph that has been `freeze-requested` or `draining` longer than this is
+/// reported as stalled. Draining waits for already-started tasks to finish, so
+/// the bound sits well above one ordinary work + review cycle.
+pub const DECOMPOSITION_DRAIN_STALL_SECS: i64 = 2 * 3600;
+
+/// Durable view of which daemon drain-readiness condition is holding a graph.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DecompositionDrainStall {
+    /// Seconds since the graph last changed state.
+    pub age_secs: i64,
+    /// Human-readable false drain conditions, bounded and never empty.
+    pub blockers: Vec<String>,
 }
 
 /// The server-owned task journey. Consumers render this projection and do not
@@ -716,11 +733,18 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     let (recent_errors, older_errors_silenced) = deduped_errors(conn, now)?;
     let alerts = alert_messages(conn, now)?;
     let merge_blockers = merge_blockers(conn, now)?;
-    let health = compute_health(
-        &daemon_agents,
-        !recent_errors.is_empty(),
-        !alerts.is_empty(),
-    );
+    let drain_stalled = decomposition
+        .as_ref()
+        .is_some_and(|graph| graph.drain_stall.is_some());
+    let health = if drain_stalled {
+        HealthVerdict::Stalled
+    } else {
+        compute_health(
+            &daemon_agents,
+            !recent_errors.is_empty(),
+            !alerts.is_empty(),
+        )
+    };
     let stalled_count = daemon_agents
         .iter()
         .filter(|d| is_stall_eligible(d))
@@ -728,7 +752,8 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
             matches!(d.last_activity_age_secs, Some(age) if age > 180)
                 || d.last_activity_age_secs.is_none()
         })
-        .count() as i64;
+        .count() as i64
+        + i64::from(drain_stalled);
     let session_cost: f64 = daemon_agents.iter().map(|d| d.cost_usd).sum();
     let unbacked_prs = crate::drift::unbacked_pr_events(conn, now).unwrap_or_default();
     let twin_prs = crate::drift::twin_pr_events(conn, now).unwrap_or_default();
@@ -2847,7 +2872,7 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
             "SELECT d.id, d.source_task_id, t.title, t.status, d.state, d.active,
                     d.proposal_attempts, d.provider_failures, d.planner_provider,
                     d.planner_model, a.effort, d.accepted_plan_revision, d.hold_summary,
-                    d.hold_code,d.operator_retry_count
+                    d.hold_code,d.operator_retry_count,d.freeze_active,d.updated_at
              FROM task_decompositions d
              JOIN tasks t ON t.id=d.source_task_id
              LEFT JOIN role_assignments a ON a.id=d.planner_assignment_id AND a.role='planner'
@@ -2873,6 +2898,8 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
                     r.get::<_, Option<String>>(12)?,
                     r.get::<_, Option<String>>(13)?,
                     r.get::<_, i64>(14)?,
+                    r.get::<_, bool>(15)?,
+                    r.get::<_, i64>(16)?,
                 ))
             },
         )
@@ -2893,10 +2920,19 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
         hold_summary,
         hold_code,
         operator_retry_count,
+        freeze_active,
+        graph_updated_at,
     )) = graph
     else {
         return Ok(None);
     };
+    let drain_stall = decomposition_drain_stall(
+        conn,
+        source_task_id,
+        &graph_state,
+        freeze_active,
+        now - graph_updated_at,
+    )?;
     let retryable_planning_hold =
         crate::decomposition::exhausted_planning_retry_is_eligible(conn, source_task_id, now)?;
     let planner_log_dir: Option<String> = conn
@@ -3012,7 +3048,58 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
         failed_children,
         reasons,
         members,
+        drain_stall,
     }))
+}
+
+/// Project which durable `decomposition_drain_ready` input (serve/mod.rs) is
+/// still false for a graph stuck in its freeze/drain phase. Status runs outside
+/// the daemon, so in-memory work (classifier, doctor, pre-review checks) is
+/// named only as the residual when no durable condition is false.
+fn decomposition_drain_stall(
+    conn: &Connection,
+    source_task_id: i64,
+    graph_state: &str,
+    freeze_active: bool,
+    age_secs: i64,
+) -> Result<Option<DecompositionDrainStall>> {
+    if !matches!(graph_state, "freeze-requested" | "draining")
+        || age_secs <= DECOMPOSITION_DRAIN_STALL_SECS
+    {
+        return Ok(None);
+    }
+    let mut blockers = Vec::new();
+    if !freeze_active {
+        blockers.push("repository freeze not held".to_string());
+    } else if graph_state == "freeze-requested" {
+        blockers.push("daemon has not advanced freeze-requested to draining".to_string());
+    }
+    let mut role_stmt =
+        conn.prepare("SELECT role, count(*) FROM journal GROUP BY role ORDER BY role")?;
+    let roles = role_stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let journal_rows: i64 = roles.iter().map(|(_, count)| count).sum();
+    if journal_rows > 0 {
+        let roles = roles
+            .iter()
+            .map(|(role, count)| format!("{role}={count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        blockers.push(format!("journal rows={journal_rows} ({roles})"));
+    }
+    let started = crate::tasks::count_started_non_terminal_excluding(conn, source_task_id)?;
+    if started > 0 {
+        blockers.push(format!("started non-terminal tasks={started}"));
+    }
+    if blockers.is_empty() {
+        blockers.push(
+            "no durable blocker; waiting on daemon in-memory work \
+             (worker, reviewer, classifier, doctor, or pre-review checks)"
+                .to_string(),
+        );
+    }
+    Ok(Some(DecompositionDrainStall { age_secs, blockers }))
 }
 
 /// Resolve only an explicit task tier into a display identity. Queue/blocked status
@@ -4941,6 +5028,101 @@ mod tests {
         assert_eq!(graph.members[1].prerequisites, vec![child_a]);
         assert_eq!(graph.reasons.len(), 6, "owner-facing reasons stay bounded");
         assert_eq!(graph.reasons[0], "child failed");
+    }
+
+    #[test]
+    fn long_draining_graph_is_stalled_and_names_the_drain_blocker() {
+        let (_d, mut c) = open_tmp();
+        let now = 1_000_000;
+        let source =
+            crate::tasks::create(&mut c, "A", "source", None, 0, None, None, None, None, 100)
+                .unwrap();
+        let other =
+            crate::tasks::create(&mut c, "A", "other", None, 0, None, None, None, None, 100)
+                .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='planning' WHERE id=?1",
+            params![source],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions
+             (source_task_id,state,active,freeze_active,planned_source_revision,
+              created_at,updated_at)
+             VALUES (?1,'draining',0,1,1,?2,?2)",
+            params![source, now - 60],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO journal(agent,role,task_id,session_id,phase,updated_at)
+             VALUES ('decomposition-planner-1','planner',?1,'s','working',?2)",
+            params![source, now - 60],
+        )
+        .unwrap();
+
+        // A brief drain is ordinary progress.
+        let brief = stats(&c, now, 300).unwrap();
+        assert!(brief.decomposition.unwrap().drain_stall.is_none());
+        assert_eq!(brief.health, HealthVerdict::OnTrack);
+        assert_eq!(brief.stalled_count, 0);
+
+        // Exactly at the bound is still not stalled; one second past is.
+        c.execute(
+            "UPDATE task_decompositions SET updated_at=?1",
+            params![now - DECOMPOSITION_DRAIN_STALL_SECS],
+        )
+        .unwrap();
+        assert!(stats(&c, now, 300)
+            .unwrap()
+            .decomposition
+            .unwrap()
+            .drain_stall
+            .is_none());
+        c.execute(
+            "UPDATE task_decompositions SET updated_at=?1",
+            params![now - DECOMPOSITION_DRAIN_STALL_SECS - 1],
+        )
+        .unwrap();
+        let stalled = stats(&c, now, 300).unwrap();
+        assert_eq!(stalled.health, HealthVerdict::Stalled);
+        assert_eq!(stalled.stalled_count, 1);
+        let stall = stalled.decomposition.unwrap().drain_stall.unwrap();
+        assert_eq!(stall.age_secs, DECOMPOSITION_DRAIN_STALL_SECS + 1);
+        assert_eq!(stall.blockers, vec!["journal rows=1 (planner=1)"]);
+
+        // Started non-terminal work is named; the planning source is excluded.
+        c.execute("DELETE FROM journal", []).unwrap();
+        c.execute(
+            "UPDATE tasks SET status='in-review' WHERE id=?1",
+            params![other],
+        )
+        .unwrap();
+        let stall = stats(&c, now, 300)
+            .unwrap()
+            .decomposition
+            .unwrap()
+            .drain_stall
+            .unwrap();
+        assert_eq!(stall.blockers, vec!["started non-terminal tasks=1"]);
+
+        // With no durable blocker the residual in-memory conditions are named.
+        c.execute("UPDATE tasks SET status='done' WHERE id=?1", params![other])
+            .unwrap();
+        let stall = stats(&c, now, 300)
+            .unwrap()
+            .decomposition
+            .unwrap()
+            .drain_stall
+            .unwrap();
+        assert_eq!(stall.blockers.len(), 1);
+        assert!(stall.blockers[0].contains("classifier, doctor, or pre-review checks"));
+
+        // A graph that left the drain phase is never drain-stalled.
+        c.execute("UPDATE task_decompositions SET state='planning'", [])
+            .unwrap();
+        let planning = stats(&c, now, 300).unwrap();
+        assert!(planning.decomposition.unwrap().drain_stall.is_none());
+        assert_eq!(planning.stalled_count, 0);
     }
 
     #[test]
