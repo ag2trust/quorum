@@ -26,7 +26,9 @@ use super::runner::AgentEvent;
 pub const MAX_SANITIZED_FIELD_BYTES: usize = 256;
 /// Maximum closed sanitized-event records retained for one session.
 pub const MAX_SANITIZED_RECORDS_PER_SESSION: usize = 256;
-const MAX_SANITIZED_RECORD_BYTES: usize = 1024;
+// The planner closure diagnostic contains two fixed ten-bucket histograms and
+// remains bounded even when every counter reaches `u64::MAX`.
+const MAX_SANITIZED_RECORD_BYTES: usize = 2048;
 /// Maximum regular raw-provider bytes retained in one session stream. Terminal
 /// and completed tool records remain available after this limit so a log cap
 /// cannot hide lifecycle evidence or a final tool result.
@@ -206,7 +208,7 @@ pub enum SanitizedCommandKind {
 
 /// Closed categories for a tool summary. Raw tool names are not part of the
 /// durable event shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SanitizedToolKind {
     Bash,
@@ -217,7 +219,128 @@ pub enum SanitizedToolKind {
     Glob,
     Skill,
     Agent,
+    SubmitPlan,
+    #[default]
     Other,
+}
+
+/// Content-free status of the planner's `quorum` MCP connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SanitizedPlannerMcpStatus {
+    Connected,
+    Failed,
+    #[default]
+    Absent,
+}
+
+/// Fixed-vocabulary MCP evidence retained when a planner attempt closes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SanitizedPlannerMcpDiagnostic {
+    pub status: SanitizedPlannerMcpStatus,
+    pub submit_plan_advertised: bool,
+}
+
+/// Counts of planner tool calls reduced to the durable tool allowlist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SanitizedPlannerToolHistogram {
+    pub bash: u64,
+    pub read: u64,
+    pub write: u64,
+    pub edit: u64,
+    pub grep: u64,
+    pub glob: u64,
+    pub skill: u64,
+    pub agent: u64,
+    pub submit_plan: u64,
+    pub other: u64,
+}
+
+impl SanitizedPlannerToolHistogram {
+    pub(super) fn increment(&mut self, kind: SanitizedToolKind) {
+        let count = match kind {
+            SanitizedToolKind::Bash => &mut self.bash,
+            SanitizedToolKind::Read => &mut self.read,
+            SanitizedToolKind::Write => &mut self.write,
+            SanitizedToolKind::Edit => &mut self.edit,
+            SanitizedToolKind::Grep => &mut self.grep,
+            SanitizedToolKind::Glob => &mut self.glob,
+            SanitizedToolKind::Skill => &mut self.skill,
+            SanitizedToolKind::Agent => &mut self.agent,
+            SanitizedToolKind::SubmitPlan => &mut self.submit_plan,
+            SanitizedToolKind::Other => &mut self.other,
+        };
+        *count = count.saturating_add(1);
+    }
+}
+
+/// Provider-reported token counts. These contain no provider text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SanitizedPlannerTokenUsage {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+}
+
+/// Permission denials summarized without inputs or unrecognized tool names.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SanitizedPlannerPermissionDenials {
+    pub count: u64,
+    pub tools: SanitizedPlannerToolHistogram,
+}
+
+/// Closed provider stop reasons retained for planner diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SanitizedPlannerStopReason {
+    EndTurn,
+    TokenLimit,
+    MaxTurns,
+    StopSequence,
+    ToolUse,
+    PauseTurn,
+    Refusal,
+    Error,
+    Other,
+}
+
+/// Closed provider result categories retained for planner diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SanitizedPlannerResultSubtype {
+    Success,
+    MaxTurns,
+    TokenLimit,
+    ExecutionError,
+    PermissionDenied,
+    Other,
+}
+
+/// Terminal provider evidence for one planner attempt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SanitizedPlannerTerminalDiagnostic {
+    pub stop_reason: Option<SanitizedPlannerStopReason>,
+    pub result_subtype: Option<SanitizedPlannerResultSubtype>,
+    pub turn_count: Option<u64>,
+    pub error: Option<bool>,
+    pub usage: Option<SanitizedPlannerTokenUsage>,
+    pub duration_ms: Option<u64>,
+    pub permission_denials: SanitizedPlannerPermissionDenials,
+}
+
+/// Shape-only summary of the final assistant message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SanitizedPlannerFinalMessageDiagnostic {
+    pub bytes: u64,
+    pub plan_shaped: bool,
 }
 
 /// The outcome of a bounded command or tool summary.
@@ -308,6 +431,14 @@ pub enum SanitizedSessionEvent {
         status: SanitizedTerminalStatus,
         response: SanitizedField,
     },
+    PlannerAttemptDiagnostic {
+        mcp: SanitizedPlannerMcpDiagnostic,
+        tool_histogram: SanitizedPlannerToolHistogram,
+        submit_plan_calls: u64,
+        submit_plan_error_results: u64,
+        terminal: Box<SanitizedPlannerTerminalDiagnostic>,
+        final_assistant_message: SanitizedPlannerFinalMessageDiagnostic,
+    },
     ProviderFailure {
         provider: SanitizedProvider,
         kind: SanitizedProviderFailureKind,
@@ -358,6 +489,21 @@ impl SanitizedSessionEvent {
                 status: *status,
                 response: response.bounded(),
             },
+            Self::PlannerAttemptDiagnostic {
+                mcp,
+                tool_histogram,
+                submit_plan_calls,
+                submit_plan_error_results,
+                terminal,
+                final_assistant_message,
+            } => Self::PlannerAttemptDiagnostic {
+                mcp: *mcp,
+                tool_histogram: *tool_histogram,
+                submit_plan_calls: *submit_plan_calls,
+                submit_plan_error_results: *submit_plan_error_results,
+                terminal: Box::new(**terminal),
+                final_assistant_message: *final_assistant_message,
+            },
             Self::ProviderFailure {
                 provider,
                 kind,
@@ -383,6 +529,7 @@ impl SanitizedSessionEvent {
             Self::ToolSummary { .. } => "- Tool summary",
             Self::AssistantMessage { .. } => "- Assistant message",
             Self::TerminalResponse { .. } => "- Terminal response summary",
+            Self::PlannerAttemptDiagnostic { .. } => "- Planner attempt diagnostic",
             Self::ProviderFailure { .. } => "- Provider failure summary",
             Self::SemanticRejection { .. } => "- Semantic rejection summary",
             Self::Completion { .. } => "- Session completion",
@@ -397,6 +544,7 @@ impl SanitizedSessionEvent {
             Self::ToolSummary { .. } => "tool_summary",
             Self::AssistantMessage { .. } => "assistant_message",
             Self::TerminalResponse { .. } => "terminal_response",
+            Self::PlannerAttemptDiagnostic { .. } => "planner_attempt_diagnostic",
             Self::ProviderFailure { .. } => "provider_failure",
             Self::SemanticRejection { .. } => "semantic_rejection",
             Self::Completion { .. } => "completion",
@@ -835,6 +983,18 @@ mod tests {
         let credential = "sk-session-log-secret-value";
         let oversized = format!("{credential}{}", "x".repeat(MAX_SANITIZED_FIELD_BYTES * 4));
         let malformed = format!(r#"{{"token":"{oversized}""#);
+        let max_histogram = SanitizedPlannerToolHistogram {
+            bash: u64::MAX,
+            read: u64::MAX,
+            write: u64::MAX,
+            edit: u64::MAX,
+            grep: u64::MAX,
+            glob: u64::MAX,
+            skill: u64::MAX,
+            agent: u64::MAX,
+            submit_plan: u64::MAX,
+            other: u64::MAX,
+        };
 
         let events = [
             SanitizedSessionEvent::ProviderLifecycle {
@@ -864,6 +1024,37 @@ mod tests {
             SanitizedSessionEvent::TerminalResponse {
                 status: SanitizedTerminalStatus::Success,
                 response: SanitizedField::from_text(credential),
+            },
+            SanitizedSessionEvent::PlannerAttemptDiagnostic {
+                mcp: SanitizedPlannerMcpDiagnostic {
+                    status: SanitizedPlannerMcpStatus::Connected,
+                    submit_plan_advertised: true,
+                },
+                tool_histogram: max_histogram,
+                submit_plan_calls: u64::MAX,
+                submit_plan_error_results: u64::MAX,
+                terminal: Box::new(SanitizedPlannerTerminalDiagnostic {
+                    stop_reason: Some(SanitizedPlannerStopReason::StopSequence),
+                    result_subtype: Some(SanitizedPlannerResultSubtype::PermissionDenied),
+                    turn_count: Some(u64::MAX),
+                    error: Some(true),
+                    usage: Some(SanitizedPlannerTokenUsage {
+                        input_tokens: u64::MAX,
+                        cached_input_tokens: u64::MAX,
+                        cache_write_input_tokens: u64::MAX,
+                        output_tokens: u64::MAX,
+                        reasoning_output_tokens: u64::MAX,
+                    }),
+                    duration_ms: Some(u64::MAX),
+                    permission_denials: SanitizedPlannerPermissionDenials {
+                        count: u64::MAX,
+                        tools: max_histogram,
+                    },
+                }),
+                final_assistant_message: SanitizedPlannerFinalMessageDiagnostic {
+                    bytes: u64::MAX,
+                    plan_shaped: true,
+                },
             },
             SanitizedSessionEvent::ProviderFailure {
                 provider: SanitizedProvider::Codex,
@@ -916,6 +1107,8 @@ mod tests {
         }
         assert!(stream.contains(r#""truncation":"truncated""#));
         assert!(stream.contains(r#""summary":"malformed""#));
+        assert!(stream.contains(r#""event":"planner_attempt_diagnostic""#));
+        assert!(!stream.contains("record_truncated"));
         assert_eq!(
             transcript
                 .lines()
