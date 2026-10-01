@@ -50,6 +50,16 @@ pub struct DiskTarget {
     pub path: PathBuf,
 }
 
+/// Content-free host-memory values suitable for durable diagnostics.
+///
+/// This deliberately excludes provider output and other free text. The
+/// values are the same raw counters rendered by the `RESOURCE` log lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostResourceSnapshot {
+    pub memory_available_bytes: u64,
+    pub swap_used_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MemoryReading {
     total_bytes: u64,
@@ -91,6 +101,28 @@ pub fn sample_system(
     config: ResourceMonitorConfig,
 ) -> HostResourcesView {
     sample_with(&SystemSampler, sampled_at, targets, config)
+}
+
+/// Return a bounded, content-free host-memory snapshot.
+///
+/// Sampling occurs on a detached thread because a platform syscall can stall.
+/// Failure to start, fail, or finish the sample within the resource sampler's
+/// existing timeout is fail-open and returns no snapshot.
+#[allow(dead_code)] // Exposed for planner diagnostic callers added independently.
+pub fn sample_host_resource_snapshot() -> Option<HostResourceSnapshot> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let handle = std::thread::Builder::new()
+        .name("quorum-resource-snapshot".to_string())
+        .spawn(move || {
+            let _ = sender.send(sample_memory_snapshot_with(&SystemSampler));
+        })
+        .ok()?;
+    drop(handle);
+
+    receiver
+        .recv_timeout(RESOURCE_SAMPLE_TIMEOUT)
+        .ok()
+        .flatten()
 }
 
 #[derive(Debug)]
@@ -267,14 +299,27 @@ fn sample_with(
 }
 
 fn memory_view(reading: MemoryReading, config: ResourceMonitorConfig) -> MemoryResourceView {
+    let snapshot = memory_snapshot(reading);
     let available_percent = percent(reading.available_bytes, reading.total_bytes);
     MemoryResourceView {
         total_bytes: reading.total_bytes,
-        available_bytes: reading.available_bytes,
+        available_bytes: snapshot.memory_available_bytes,
         available_percent,
         swap_total_bytes: reading.swap_total_bytes,
-        swap_used_bytes: reading.swap_used_bytes,
+        swap_used_bytes: snapshot.swap_used_bytes,
         severity: memory_severity(available_percent, config),
+    }
+}
+
+#[allow(dead_code)] // Reached through the bounded public snapshot sampler.
+fn sample_memory_snapshot_with(sampler: &dyn PlatformSampler) -> Option<HostResourceSnapshot> {
+    sampler.memory().ok().map(memory_snapshot)
+}
+
+fn memory_snapshot(reading: MemoryReading) -> HostResourceSnapshot {
+    HostResourceSnapshot {
+        memory_available_bytes: reading.available_bytes,
+        swap_used_bytes: reading.swap_used_bytes,
     }
 }
 
@@ -633,6 +678,32 @@ mod tests {
                 .collect(),
             disk_calls: Cell::new(0),
         }
+    }
+
+    #[test]
+    fn memory_snapshot_extracts_resource_log_values_from_fixture_sample() {
+        let reading = memory(37);
+        let sampler = fake(reading, &[]);
+
+        let snapshot = sample_memory_snapshot_with(&sampler).expect("fixture sample succeeds");
+        let resource_memory = memory_view(reading, ResourceMonitorConfig::default());
+
+        assert_eq!(
+            snapshot.memory_available_bytes,
+            resource_memory.available_bytes
+        );
+        assert_eq!(snapshot.swap_used_bytes, resource_memory.swap_used_bytes);
+    }
+
+    #[test]
+    fn memory_snapshot_sampler_error_is_fail_open() {
+        let sampler = FakeSampler {
+            memory: Err(std::io::Error::other("unavailable")),
+            disks: BTreeMap::new(),
+            disk_calls: Cell::new(0),
+        };
+
+        assert_eq!(sample_memory_snapshot_with(&sampler), None);
     }
 
     fn targets() -> Vec<DiskTarget> {
