@@ -97,15 +97,19 @@ pub fn render_sanitized_session_event(event: &SanitizedSessionEvent) -> String {
             optional_number(terminal.turn_count),
             terminal.error.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
             optional_number(terminal.duration_ms),
-            terminal.usage.map_or(0, |usage| usage.input_tokens),
-            terminal.usage.map_or(0, |usage| usage.cached_input_tokens),
-            terminal
-                .usage
-                .map_or(0, |usage| usage.cache_write_input_tokens),
-            terminal.usage.map_or(0, |usage| usage.output_tokens),
-            terminal
-                .usage
-                .map_or(0, |usage| usage.reasoning_output_tokens),
+            optional_number(terminal.usage.map(|usage| usage.input_tokens)),
+            optional_number(terminal.usage.map(|usage| usage.cached_input_tokens)),
+            optional_number(
+                terminal
+                    .usage
+                    .map(|usage| usage.cache_write_input_tokens)
+            ),
+            optional_number(terminal.usage.map(|usage| usage.output_tokens)),
+            optional_number(
+                terminal
+                    .usage
+                    .map(|usage| usage.reasoning_output_tokens)
+            ),
             terminal.permission_denials.count,
             final_assistant_message.bytes,
             final_assistant_message.plan_shaped,
@@ -311,7 +315,7 @@ mod tests {
     use crate::serve::session_log::{
         ProviderLifecyclePhase, SanitizedCommandKind, SanitizedCompletionOutcome, SanitizedField,
         SanitizedPlannerFinalMessageDiagnostic, SanitizedPlannerMcpDiagnostic,
-        SanitizedPlannerMcpStatus, SanitizedPlannerTerminalDiagnostic,
+        SanitizedPlannerMcpStatus, SanitizedPlannerTerminalDiagnostic, SanitizedPlannerTokenUsage,
         SanitizedPlannerToolHistogram, SanitizedProvider, SanitizedProviderFailureKind,
         SanitizedRejectionKind, SanitizedSummaryOutcome, SanitizedTerminalStatus,
         SanitizedToolKind, TurnLifecyclePhase,
@@ -405,6 +409,51 @@ mod tests {
         assert!(rendered.contains("string, 33 bytes"));
         assert!(!rendered.contains(secret));
         assert!(!rendered.contains("credential"));
+    }
+
+    #[test]
+    fn planner_attempt_renderer_distinguishes_missing_usage_from_reported_zero() {
+        let diagnostic = |usage| SanitizedSessionEvent::PlannerAttemptDiagnostic {
+            mcp: SanitizedPlannerMcpDiagnostic::default(),
+            tool_histogram: SanitizedPlannerToolHistogram::default(),
+            submit_plan_calls: 0,
+            submit_plan_error_results: 0,
+            terminal: Box::new(SanitizedPlannerTerminalDiagnostic {
+                usage,
+                ..SanitizedPlannerTerminalDiagnostic::default()
+            }),
+            final_assistant_message: SanitizedPlannerFinalMessageDiagnostic::default(),
+        };
+
+        let missing = render_sanitized_session_event(&diagnostic(None));
+        for field in [
+            "input_tokens",
+            "cached_input_tokens",
+            "cache_write_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        ] {
+            assert!(
+                missing.contains(&format!("{field}=unknown")),
+                "missing usage rendered as measured: {missing}"
+            );
+        }
+
+        let zero = render_sanitized_session_event(&diagnostic(Some(
+            SanitizedPlannerTokenUsage::default(),
+        )));
+        for field in [
+            "input_tokens",
+            "cached_input_tokens",
+            "cache_write_input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        ] {
+            assert!(
+                zero.contains(&format!("{field}=0")),
+                "reported zero usage rendered as unavailable: {zero}"
+            );
+        }
     }
 
     #[test]
