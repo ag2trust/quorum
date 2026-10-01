@@ -3,7 +3,7 @@
 //! Used by both transcript.md appends and `quorum tail`.
 
 use super::runner::AgentEvent;
-use super::session_log::{SanitizedField, SanitizedSessionEvent};
+use super::session_log::{SanitizedField, SanitizedSessionEvent, SanitizedToolKind};
 use super::stream::Event;
 
 /// Render a stream event into human-readable markdown text.
@@ -56,7 +56,7 @@ pub fn render_sanitized_session_event(event: &SanitizedSessionEvent) -> String {
             details,
         } => format!(
             "> Tool {} {} ({})\n",
-            label(tool),
+            sanitized_tool_label(*tool),
             label(outcome),
             sanitized_field_summary(details)
         ),
@@ -68,6 +68,47 @@ pub fn render_sanitized_session_event(event: &SanitizedSessionEvent) -> String {
             "> Terminal response {} ({})\n",
             label(status),
             sanitized_field_summary(response)
+        ),
+        SanitizedSessionEvent::PlannerAttemptDiagnostic {
+            mcp,
+            tool_histogram,
+            submit_plan_calls,
+            submit_plan_error_results,
+            terminal,
+            final_assistant_message,
+        } => format!(
+            "> Planner attempt: MCP {} (submit_plan advertised: {}); tools [bash={}, read={}, write={}, edit={}, grep={}, glob={}, skill={}, agent={}, submit_plan={}, other={}]; submit_plan calls={}, errors={}; terminal [stop={}, result={}, turns={}, error={}, duration_ms={}, input_tokens={}, cached_input_tokens={}, cache_write_input_tokens={}, output_tokens={}, reasoning_output_tokens={}, permission_denials={}]; final message [bytes={}, plan_shaped={}]\n",
+            label(&mcp.status),
+            mcp.submit_plan_advertised,
+            tool_histogram.bash,
+            tool_histogram.read,
+            tool_histogram.write,
+            tool_histogram.edit,
+            tool_histogram.grep,
+            tool_histogram.glob,
+            tool_histogram.skill,
+            tool_histogram.agent,
+            tool_histogram.submit_plan,
+            tool_histogram.other,
+            submit_plan_calls,
+            submit_plan_error_results,
+            optional_label(terminal.stop_reason.as_ref()),
+            optional_label(terminal.result_subtype.as_ref()),
+            optional_number(terminal.turn_count),
+            terminal.error.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+            optional_number(terminal.duration_ms),
+            terminal.usage.map_or(0, |usage| usage.input_tokens),
+            terminal.usage.map_or(0, |usage| usage.cached_input_tokens),
+            terminal
+                .usage
+                .map_or(0, |usage| usage.cache_write_input_tokens),
+            terminal.usage.map_or(0, |usage| usage.output_tokens),
+            terminal
+                .usage
+                .map_or(0, |usage| usage.reasoning_output_tokens),
+            terminal.permission_denials.count,
+            final_assistant_message.bytes,
+            final_assistant_message.plan_shaped,
         ),
         SanitizedSessionEvent::ProviderFailure {
             provider,
@@ -111,6 +152,29 @@ fn field_summary(kind: &str, bytes: usize, truncated: bool) -> String {
 
 fn label(value: &impl std::fmt::Debug) -> String {
     format!("{value:?}").to_lowercase()
+}
+
+fn sanitized_tool_label(tool: SanitizedToolKind) -> &'static str {
+    match tool {
+        SanitizedToolKind::Bash => "bash",
+        SanitizedToolKind::Read => "read",
+        SanitizedToolKind::Write => "write",
+        SanitizedToolKind::Edit => "edit",
+        SanitizedToolKind::Grep => "grep",
+        SanitizedToolKind::Glob => "glob",
+        SanitizedToolKind::Skill => "skill",
+        SanitizedToolKind::Agent => "agent",
+        SanitizedToolKind::SubmitPlan => "submit_plan",
+        SanitizedToolKind::Other => "other",
+    }
+}
+
+fn optional_label(value: Option<&impl std::fmt::Debug>) -> String {
+    value.map(label).unwrap_or_else(|| "unknown".to_string())
+}
+
+fn optional_number(value: Option<u64>) -> String {
+    value.map_or_else(|| "unknown".to_string(), |value| value.to_string())
 }
 
 fn render_assistant(message: &serde_json::Value) -> Option<String> {
@@ -246,8 +310,11 @@ mod tests {
     use super::*;
     use crate::serve::session_log::{
         ProviderLifecyclePhase, SanitizedCommandKind, SanitizedCompletionOutcome, SanitizedField,
-        SanitizedProvider, SanitizedProviderFailureKind, SanitizedRejectionKind,
-        SanitizedSummaryOutcome, SanitizedTerminalStatus, SanitizedToolKind, TurnLifecyclePhase,
+        SanitizedPlannerFinalMessageDiagnostic, SanitizedPlannerMcpDiagnostic,
+        SanitizedPlannerMcpStatus, SanitizedPlannerTerminalDiagnostic,
+        SanitizedPlannerToolHistogram, SanitizedProvider, SanitizedProviderFailureKind,
+        SanitizedRejectionKind, SanitizedSummaryOutcome, SanitizedTerminalStatus,
+        SanitizedToolKind, TurnLifecyclePhase,
     };
     use serde_json::json;
 
@@ -273,9 +340,31 @@ mod tests {
                 outcome: SanitizedSummaryOutcome::Failed,
                 details: SanitizedField::from_json(&json!({"credential": secret})),
             },
+            SanitizedSessionEvent::ToolSummary {
+                tool: SanitizedToolKind::SubmitPlan,
+                outcome: SanitizedSummaryOutcome::Started,
+                details: SanitizedField::from_text(secret),
+            },
             SanitizedSessionEvent::TerminalResponse {
                 status: SanitizedTerminalStatus::Success,
                 response: SanitizedField::from_text(secret),
+            },
+            SanitizedSessionEvent::PlannerAttemptDiagnostic {
+                mcp: SanitizedPlannerMcpDiagnostic {
+                    status: SanitizedPlannerMcpStatus::Connected,
+                    submit_plan_advertised: true,
+                },
+                tool_histogram: SanitizedPlannerToolHistogram {
+                    submit_plan: 1,
+                    ..SanitizedPlannerToolHistogram::default()
+                },
+                submit_plan_calls: 1,
+                submit_plan_error_results: 0,
+                terminal: Box::new(SanitizedPlannerTerminalDiagnostic::default()),
+                final_assistant_message: SanitizedPlannerFinalMessageDiagnostic {
+                    bytes: 33,
+                    plan_shaped: false,
+                },
             },
             SanitizedSessionEvent::ProviderFailure {
                 provider: SanitizedProvider::Codex,
@@ -301,7 +390,9 @@ mod tests {
             "Turn 3 continued",
             "Command shell succeeded",
             "Tool bash failed",
+            "Tool submit_plan started",
             "Terminal response success",
+            "Planner attempt: MCP connected",
             "Provider codex failed: protocol",
             "Rejected: validation",
             "Session completed",
