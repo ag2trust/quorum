@@ -853,7 +853,7 @@ struct PlannerDiagnostics {
     terminal: PlannerTerminalDiagnostic,
     final_assistant_message: PlannerFinalMessageDiagnostic,
     pending_submit_plan_ids: HashSet<u64>,
-    started_codex_mcp_ids: HashMap<u64, PlannerToolKind>,
+    started_codex_tool_ids: HashMap<u64, PlannerToolKind>,
 }
 
 impl PlannerDiagnostics {
@@ -1020,22 +1020,7 @@ impl PlannerDiagnostics {
                 let Some(item) = value.get("item") else {
                     return;
                 };
-                if item.get("type").and_then(serde_json::Value::as_str) == Some("mcp_call") {
-                    let kind = codex_mcp_tool_kind(item);
-                    self.tool_histogram.increment(kind);
-                    if let Some(id) = item
-                        .get("id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(diagnostic_id_hash)
-                    {
-                        if self.started_codex_mcp_ids.len() < MAX_PENDING_DIAGNOSTIC_TOOL_IDS {
-                            self.started_codex_mcp_ids.insert(id, kind);
-                        }
-                        if kind == PlannerToolKind::SubmitPlan {
-                            self.remember_submit_plan_hash(id);
-                        }
-                    }
-                }
+                self.observe_started_codex_tool(item);
             }
             Some("item.completed") => {
                 let Some(item) = value.get("item") else {
@@ -1047,13 +1032,9 @@ impl PlannerDiagnostics {
                             self.observe_final_message(text);
                         }
                     }
-                    Some("command_execution") => {
-                        self.tool_histogram.increment(PlannerToolKind::Bash);
+                    Some("command_execution" | "file_change" | "mcp_call") => {
+                        self.observe_completed_codex_tool(item);
                     }
-                    Some("file_change") => {
-                        self.tool_histogram.increment(PlannerToolKind::Edit);
-                    }
-                    Some("mcp_call") => self.observe_completed_codex_mcp_call(item),
                     _ => {}
                 }
             }
@@ -1063,13 +1044,34 @@ impl PlannerDiagnostics {
         }
     }
 
-    fn observe_completed_codex_mcp_call(&mut self, item: &serde_json::Value) {
+    fn observe_started_codex_tool(&mut self, item: &serde_json::Value) {
+        let Some(kind) = codex_tool_kind(item) else {
+            return;
+        };
+        self.tool_histogram.increment(kind);
+        if let Some(id) = item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(diagnostic_id_hash)
+        {
+            if self.started_codex_tool_ids.len() < MAX_PENDING_DIAGNOSTIC_TOOL_IDS {
+                self.started_codex_tool_ids.insert(id, kind);
+            }
+            if kind == PlannerToolKind::SubmitPlan {
+                self.remember_submit_plan_hash(id);
+            }
+        }
+    }
+
+    fn observe_completed_codex_tool(&mut self, item: &serde_json::Value) {
         let id = item
             .get("id")
             .and_then(serde_json::Value::as_str)
             .map(diagnostic_id_hash);
-        let started_kind = id.and_then(|id| self.started_codex_mcp_ids.remove(&id));
-        let kind = started_kind.unwrap_or_else(|| codex_mcp_tool_kind(item));
+        let started_kind = id.and_then(|id| self.started_codex_tool_ids.remove(&id));
+        let Some(kind) = started_kind.or_else(|| codex_tool_kind(item)) else {
+            return;
+        };
         if started_kind.is_none() {
             self.tool_histogram.increment(kind);
             if kind == PlannerToolKind::SubmitPlan {
@@ -1198,6 +1200,15 @@ fn codex_mcp_tool_kind(item: &serde_json::Value) -> PlannerToolKind {
         PlannerToolKind::SubmitPlan
     } else {
         PlannerToolKind::Other
+    }
+}
+
+fn codex_tool_kind(item: &serde_json::Value) -> Option<PlannerToolKind> {
+    match item.get("type").and_then(serde_json::Value::as_str) {
+        Some("command_execution") => Some(PlannerToolKind::Bash),
+        Some("file_change") => Some(PlannerToolKind::Edit),
+        Some("mcp_call") => Some(codex_mcp_tool_kind(item)),
+        _ => None,
     }
 }
 
@@ -3624,6 +3635,94 @@ mod tests {
         assert_eq!(terminal["duration_ms"], 4567);
         assert_eq!(terminal["usage"]["input_tokens"], 500);
         assert_eq!(terminal["usage"]["output_tokens"], 75);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_failure_diagnostic_counts_tool_starts_before_early_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "id": "command-1",
+                    "status": "in_progress",
+                },
+            }),
+            serde_json::json!({
+                "type": "item.started",
+                "item": {
+                    "type": "file_change",
+                    "id": "file-1",
+                    "status": "in_progress",
+                },
+            }),
+        );
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        let outcome = poll_to_terminal(&mut slot).await;
+        let diagnostic = failure_json(&outcome);
+        let histogram = &diagnostic["planner_diagnostic"]["tool_histogram"];
+        assert_eq!(histogram["bash"], 1);
+        assert_eq!(histogram["edit"], 1);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_failure_diagnostic_counts_started_and_completed_tools_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = [
+            serde_json::json!({
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "id": "command-1",
+                    "status": "in_progress",
+                },
+            }),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "id": "command-1",
+                    "status": "completed",
+                },
+            }),
+            serde_json::json!({
+                "type": "item.started",
+                "item": {
+                    "type": "file_change",
+                    "id": "file-1",
+                    "status": "in_progress",
+                },
+            }),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "type": "file_change",
+                    "id": "file-1",
+                    "status": "completed",
+                },
+            }),
+            serde_json::json!({"type": "turn.completed"}),
+        ]
+        .into_iter()
+        .map(|event| event.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let mut slot = spawn_fake_codex(dir.path(), &(output + "\n")).await;
+        let turn_end = poll_to_terminal(&mut slot).await;
+        let PlannerPoll::ProviderFailed(summary) = planner_outcome(&mut slot, turn_end, None)
+        else {
+            panic!("missing submit_plan must fail");
+        };
+        let diagnostic: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        let histogram = &diagnostic["planner_diagnostic"]["tool_histogram"];
+        assert_eq!(histogram["bash"], 1);
+        assert_eq!(histogram["edit"], 1);
         slot.kill_and_reap().await;
     }
 
