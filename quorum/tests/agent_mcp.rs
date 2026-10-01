@@ -746,6 +746,61 @@ fn tools_list_exposes_submit_plan() {
     assert!(planner.finish().is_empty());
 }
 
+/// Claude Code (2.1.286) speaks stateless MCP `2026-07-28`: no `initialize`,
+/// a `server/discover` probe, then requests carrying the protocol version in
+/// `_meta`. That revision requires `ttlMs` and `cacheScope` on list results;
+/// without them the client rejects the whole inventory, the planner never sees
+/// `submit_plan`, and every planning attempt ends "without submit_plan".
+/// These frames mirror the ones the CLI actually sends.
+#[test]
+fn tools_list_is_valid_for_stateless_2026_07_28_clients() {
+    let endpoint = FakeEndpoint::start();
+    let mut planner = McpProcess::start(&endpoint.path, "planner-cap", "Planner");
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "claude-code", "version": "2.1.286"},
+        "io.modelcontextprotocol/clientCapabilities": {"roots": {"listChanged": true}}
+    });
+
+    let discovered = planner.request(1, "server/discover", json!({"_meta": meta}));
+    assert!(
+        discovered["result"]["supportedVersions"]
+            .as_array()
+            .is_some_and(|versions| versions.contains(&json!("2026-07-28"))),
+        "{discovered:#}"
+    );
+
+    let listed = planner.request(2, "tools/list", json!({"_meta": meta}));
+    assert_eq!(tool_names(&listed), vec!["submit_plan"]);
+    let result = &listed["result"];
+    assert_eq!(
+        result["ttlMs"], 0,
+        "per-run inventory must never be fresh: {listed:#}"
+    );
+    assert_eq!(
+        result["cacheScope"], "private",
+        "per-run inventory must never be shared: {listed:#}"
+    );
+
+    let submitted = planner.request(
+        3,
+        "tools/call",
+        json!({
+            "_meta": meta,
+            "name": "submit_plan",
+            "arguments": {"response": {"outcome": "plan", "tasks": [plan_task("a"), plan_task("b")]}}
+        }),
+    );
+    assert_eq!(
+        tool_text(&submitted),
+        r#"{"accepted":true,"graph_id":5}"#,
+        "{submitted:#}"
+    );
+    assert_eq!(endpoint.submitted().len(), 1);
+
+    assert!(planner.finish().is_empty());
+}
+
 #[test]
 fn submit_plan_proxies_and_returns_endpoint_error_verbatim() {
     let endpoint = FakeEndpoint::start();
