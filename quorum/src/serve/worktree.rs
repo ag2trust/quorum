@@ -15,6 +15,10 @@ const GIT_PIPE_LIMIT: usize = 1024 * 1024;
 // the complete error within the serving layer's provisioning-cause bound.
 const PUSH_REJECTION_MAX_BYTES: usize = 2048;
 
+mod recover;
+pub(crate) use recover::{daemon_attribution, recover_ref_task_id, RECOVER_REFS_PER_TASK};
+pub use recover::{RecoverIdentity, RecoverRef, RecoverResume, ReleaseError};
+
 pub struct WorktreeManager {
     lock: Mutex<()>,
     git_bin: PathBuf,
@@ -26,6 +30,17 @@ pub struct WorktreeManager {
 struct WorktreeRegistration {
     path: PathBuf,
     locked_reason: Option<String>,
+    /// Full ref (`refs/heads/...`) checked out, if any.
+    branch: Option<String>,
+}
+
+/// Outcome of one startup worktree GC pass.
+#[derive(Debug, Default)]
+pub struct WorktreeGc {
+    pub removed: Vec<String>,
+    pub preserved: Vec<RecoverRef>,
+    /// `(path, error)`: work preservation failed, so the worktree was kept.
+    pub preserve_failures: Vec<(String, String)>,
 }
 
 /// A GC candidate must be a direct child of the configured base. Resolve the
@@ -1778,13 +1793,47 @@ impl WorktreeManager {
         Ok(source_sha.to_string())
     }
 
+    #[cfg(test)]
     pub async fn gc_orphaned(
         &self,
         repo_dir: &Path,
         worktree_base: &Path,
         active_worktrees: &[&str],
     ) -> Vec<String> {
+        self.gc_orphaned_detailed(
+            repo_dir,
+            worktree_base,
+            active_worktrees,
+            &[],
+            |_, _| async { Ok(()) },
+        )
+        .await
+        .removed
+    }
+
+    /// Startup GC of registered, inactive direct children of `worktree_base`.
+    /// Each candidate's work is snapshotted to a recover ref before the force
+    /// removal; a candidate whose snapshot fails is kept and reported.
+    /// `allocations` are the daemon's `(task_id, branch, worktree)` records,
+    /// used (with the daemon-created directory name) to attribute a snapshot
+    /// to a task; see [`daemon_attribution`].
+    ///
+    /// `record` durably records each candidate's created refs before its
+    /// force removal; a recording failure keeps the worktree.
+    pub async fn gc_orphaned_detailed<F, Fut>(
+        &self,
+        repo_dir: &Path,
+        worktree_base: &Path,
+        active_worktrees: &[&str],
+        allocations: &[(i64, String, String)],
+        mut record: F,
+    ) -> WorktreeGc
+    where
+        F: FnMut(RecoverIdentity, Vec<RecoverRef>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
         let _guard = self.lock.lock().await;
+        let mut gc = WorktreeGc::default();
 
         self.prune_stale_initializing_unlocked(repo_dir, worktree_base)
             .await;
@@ -1793,16 +1842,15 @@ impl WorktreeManager {
             Ok(registrations) => registrations,
             Err(error) => {
                 eprintln!("warn: {error}");
-                return Vec::new();
+                return gc;
             }
         };
 
         let entries = match std::fs::read_dir(worktree_base) {
             Ok(e) => e,
-            Err(_) => return Vec::new(),
+            Err(_) => return gc,
         };
 
-        let mut removed = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             let metadata = match std::fs::symlink_metadata(&path) {
@@ -1829,15 +1877,15 @@ impl WorktreeManager {
                     continue;
                 }
             };
-            if !registrations.iter().any(|registration| {
+            let Some(registration) = registrations.iter().find(|registration| {
                 std::fs::canonicalize(&registration.path).ok().as_ref() == Some(&canonical_path)
-            }) {
+            }) else {
                 eprintln!(
                     "warn: worktree GC leaving unregistered directory {}",
                     path.display()
                 );
                 continue;
-            }
+            };
             if active_worktrees.iter().any(|active| {
                 *active == path_str
                     || std::fs::canonicalize(active).ok().as_ref() == Some(&canonical_path)
@@ -1845,10 +1893,43 @@ impl WorktreeManager {
                 continue;
             }
 
+            let dir_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let identity = RecoverIdentity {
+                task_id: daemon_attribution(&path, registration.branch.as_deref(), allocations),
+                agent: dir_name,
+                reason: "startup_gc".into(),
+                trusted: Vec::new(),
+            };
+            let preserved = match self
+                .preserve_unlocked(repo_dir, Some(&path), None, &identity)
+                .await
+            {
+                Ok(created) if created.is_empty() => Ok(created),
+                Ok(created) => record(identity.clone(), created.clone())
+                    .await
+                    .map(|()| created)
+                    .map_err(|error| format!("recording recover refs: {error}")),
+                Err(error) => Err(error),
+            };
+            match preserved {
+                Ok(created) => gc.preserved.extend(created),
+                Err(error) => {
+                    eprintln!(
+                        "warn: worktree GC keeping {}: work preservation failed: {error}",
+                        path.display()
+                    );
+                    gc.preserve_failures.push((path_str, error));
+                    continue;
+                }
+            }
+
             let mut rm_cmd = self.git_cmd(repo_dir);
             rm_cmd.args(["worktree", "remove", &path_str, "--force"]);
             match run_git(rm_cmd, self.local_timeout, "git worktree remove").await {
-                Ok(out) if out.status.success() => removed.push(path_str),
+                Ok(out) if out.status.success() => gc.removed.push(path_str),
                 Ok(out) => eprintln!(
                     "warn: git worktree remove {} failed: {}",
                     path.display(),
@@ -1859,7 +1940,7 @@ impl WorktreeManager {
                 }
             }
         }
-        removed
+        gc
     }
 
     /// Unlock stale daemon registrations left by an interrupted worktree add,
@@ -1890,10 +1971,14 @@ impl WorktreeManager {
         let mut registrations = Vec::new();
         let mut path = None;
         let mut locked_reason = None;
+        let mut branch = None;
         for line in stdout.lines().chain(std::iter::once("")) {
             if let Some(value) = line.strip_prefix("worktree ") {
                 path = Some(PathBuf::from(value));
                 locked_reason = None;
+                branch = None;
+            } else if let Some(value) = line.strip_prefix("branch ") {
+                branch = Some(value.to_string());
             } else if let Some(reason) = line.strip_prefix("locked ") {
                 locked_reason = Some(reason.to_string());
             } else if line == "locked" {
@@ -1903,6 +1988,7 @@ impl WorktreeManager {
                     registrations.push(WorktreeRegistration {
                         path,
                         locked_reason: locked_reason.take(),
+                        branch: branch.take(),
                     });
                 }
             }
@@ -2040,12 +2126,18 @@ impl WorktreeManager {
 
     /// Remove only when git still reports the exact path/branch binding captured
     /// by a durable cleanup intent. A missing worktree is idempotent success.
-    pub async fn remove_exact(
+    pub async fn remove_exact<F, Fut>(
         &self,
         repo_dir: &Path,
         worktree_dir: &Path,
         branch: &str,
-    ) -> Result<(), String> {
+        identity: &RecoverIdentity,
+        record: F,
+    ) -> Result<Vec<RecoverRef>, String>
+    where
+        F: FnOnce(Vec<RecoverRef>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
         let _guard = self.lock.lock().await;
         let mut list = self.git_cmd(repo_dir);
         list.args(["worktree", "list", "--porcelain"]);
@@ -2083,7 +2175,7 @@ impl WorktreeManager {
         let Some(actual) = found else {
             return match std::fs::symlink_metadata(worktree_dir) {
                 Ok(_) => Err("worktree path exists without exact git registration".into()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
                 Err(error) => Err(format!("cannot prove worktree path absence: {error}")),
             };
         };
@@ -2092,13 +2184,24 @@ impl WorktreeManager {
                 "worktree identity mismatch: expected {expected_ref}, found {actual:?}"
             ));
         }
+        // Preserve the checkout's uncommitted state first (the identity comes
+        // from the durable cleanup intent) and destroy nothing if that fails.
+        let created = self
+            .preserve_unlocked(repo_dir, Some(worktree_dir), None, identity)
+            .await
+            .map_err(|error| format!("work preservation failed (worktree kept): {error}"))?;
+        if !created.is_empty() {
+            record(created.clone()).await.map_err(|error| {
+                format!("work preservation failed (worktree kept): recording recover refs: {error}")
+            })?;
+        }
         let mut rm = self.git_cmd(repo_dir);
         rm.args(["worktree", "remove"])
             .arg(worktree_dir)
             .arg("--force");
         let out = run_git(rm, self.local_timeout, "git worktree remove").await?;
         if out.status.success() {
-            Ok(())
+            Ok(created)
         } else {
             Err(format!(
                 "git worktree remove failed: {}",
@@ -5258,32 +5361,43 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let path = base.path().join("owned");
         let mgr = WorktreeManager::new();
+        let id = RecoverIdentity::new(1, "cleanup", "decomposition_cleanup");
         mgr.provision(repo.path(), "daemon/owned", &path, "main")
             .await
             .unwrap();
         let error = mgr
-            .remove_exact(repo.path(), &path, "daemon/other")
+            .remove_exact(repo.path(), &path, "daemon/other", &id, |_| async {
+                Ok(())
+            })
             .await
             .unwrap_err();
         assert!(error.contains("identity mismatch"));
         assert!(path.exists(), "mismatched binding must survive");
-        mgr.remove_exact(repo.path(), &path, "daemon/owned")
-            .await
-            .unwrap();
+        mgr.remove_exact(repo.path(), &path, "daemon/owned", &id, |_| async {
+            Ok(())
+        })
+        .await
+        .unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(mgr
-            .remove_exact(repo.path(), &path, "daemon/owned")
+            .remove_exact(repo.path(), &path, "daemon/owned", &id, |_| async {
+                Ok(())
+            })
             .await
             .unwrap_err()
             .contains("without exact git registration"));
         std::fs::remove_dir(&path).unwrap();
-        mgr.remove_exact(repo.path(), &path, "daemon/owned")
-            .await
-            .unwrap();
+        mgr.remove_exact(repo.path(), &path, "daemon/owned", &id, |_| async {
+            Ok(())
+        })
+        .await
+        .unwrap();
         assert!(!path.exists());
-        mgr.remove_exact(repo.path(), &path, "daemon/owned")
-            .await
-            .unwrap();
+        mgr.remove_exact(repo.path(), &path, "daemon/owned", &id, |_| async {
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

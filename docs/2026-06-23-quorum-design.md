@@ -2383,6 +2383,76 @@ builds, and managed worktree paths. Use `workspace-write` plus explicit writable
 only if worker, review, rework, and merge-signaling canaries pass without exceptions.
 Approval policy is always `never`; no human exists inside a managed run.
 
+### Worker work preservation (recover refs)
+
+Workers commit but never push, so a daemon teardown that force-removes a worker worktree
+or deletes its branch would destroy uncommitted edits and committed-but-unpushed commits.
+Before every such destruction (slot cleanup for every end reason, refused/failed launch
+cleanup, remediation spawn failure, startup worktree GC, and decomposition cleanup
+`remove_exact`) the daemon snapshots what would be lost into
+`refs/quorum-recover/t<task_id>/<unix_millis>/<agent>/<reason>`. The namespace is outside
+`refs/heads/`, so branch deletion, branch sweeps, and default pushes never touch it, and it
+never collides with operator-made `recover/*` branches. Uncommitted state (tracked edits,
+deletions, untracked-not-ignored files) is captured with plumbing in a throwaway
+`GIT_INDEX_FILE` (`read-tree HEAD`, `add -A`, `write-tree`, `commit-tree -p HEAD` under a
+fixed `quorum-daemon` identity), so no hooks run and the worktree and its index are
+untouched. If capturing untracked files fails (for example a huge untracked tree times
+out), the snapshot falls back to tracked changes only (`add -u`), the ref reason gains a
+`-tracked-only` suffix, and an `errors` row, owner alert, and daemon task note record what
+was skipped. If untracked capture fails and nothing new would be written (no tracked
+changes, or tracked changes already preserved), the untracked files would be lost silently,
+so the release is refused and the worktree kept (the fail-safe path below). Committed work is pinned as-is only when no other ref (excluding the deleted
+branch and the worker-writable recover namespace) reaches it. A clean worktree with nothing
+unique creates no ref. Creation is a create-only `update-ref` CAS, under the worktree-manager lock,
+ordered write ref → record `recover_refs` row → destroy: if recording fails nothing is
+destroyed. Racing teardowns of one worktree create one ref, and a daemon that dies
+mid-snapshot leaves the worktree intact.
+
+Trust: workers share the repository's ref store and can write any ref, so a recover ref is
+never authority by name. Every ref the daemon creates is recorded in `recover_refs`
+(schema v81: refname, SHA, task, kind, snapshot parent, tracked-only, agent, reason).
+Resume uses only the newest recorded row for the task and re-verifies that the ref still
+names the recorded SHA and, for a snapshot, that it is a single-parent `quorum-daemon`
+commit on the recorded parent; anything else fails loudly and is not applied. Unrecorded
+refs in a task's bucket are logged and ignored, never count as preserving a worker's
+commits, and are not retention candidates. Task attribution comes only from
+daemon-controlled provisioning records: the slot for teardown paths, the durable cleanup
+intent for `remove_exact`, and for startup GC and a leftover checkout found when the next
+worker is provisioned, a recorded allocation (`task_branches`, or the daemon-written worker
+journal for run-unique remediation checkouts) whose worktree path AND branch both equal the
+checkout's registered path and branch. Directory and branch names alone are
+worker-forgeable and never attribute. Anything else goes to the
+`unattributed` bucket (bounded, never resumed).
+
+Fail-safe: if the snapshot fails, nothing is removed or deleted, and an `errors` row
+(`source=worktree_recover`) plus at most one live owner alert per (task, subject) are
+written. A kept registered checkout is retried by the next provisioning of the same task
+(which owns the task after its atomic claim and so preserves and releases a leftover
+registered checkout at its worktree path first) or by startup GC.
+
+Resume: when the daemon provisions the next worker for the task, the newest trusted recover
+ref seeds it if it descends from the provisioning start: the kept task branch tip
+(fast-forward only) or, if the branch was deleted, the allocation's provenance base; for
+continuation and remediation checkouts, the verified PR head (before base integration).
+Worker commits resume as commits. A snapshot's uncommitted state is restored as
+uncommitted, unstaged working-tree changes (`cherry-pick --no-commit` then `reset`, after a
+clean base integration), so no daemon commit lands on the branch or in the PR. If it does
+not apply, the worktree is reset (`reset --hard`, plus `clean` of only the snapshot's added
+paths) and verified clean before the worker launches; if it cannot be proven clean,
+provisioning fails loudly. The snapshot stays in its ref. The daemon then writes a bounded
+`daemon` task note naming the ref, the prior run's agent, the teardown reason, and the
+restored new (untracked) paths (bounded list) so the next worker reviews them before
+committing. A ref that no longer applies is left in place and noted once (deduplicated by
+body); a ref already contained in the start is ignored. A task whose allocation row is gone
+(a publication-reset retry, which means "start clean") never resumes an older snapshot; it
+is noted and kept. Only the newest trusted ref is considered. Retention keeps the newest
+`RECOVER_REFS_PER_TASK` (2) recorded refs per task, and the periodic publication-ref
+housekeeping cadence retires all recover refs and rows of `done`/`cancelled` tasks once
+they have been terminal for a 7-day grace period (bounded per pass), so an owner can still
+recover work after a cancel. No ref outside the namespace is ever deleted by this mechanism.
+Reviewer and branch-sync worktrees are out of scope: reviewers author no code and kept
+sync merges are already preserved.
+
 ### Prompt composition
 
 Prompts are the common Git delivery contract plus a worker/R1/R2 role contract plus a

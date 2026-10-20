@@ -554,8 +554,30 @@ async fn cleanup_worktree(
     validate_worktree_path(&config.worktree_base, &expected.path)?;
     let owned = task_branch_binding(config, work.key.task_id).await?;
     validate_worktree_registration(owned.as_ref(), &expected)?;
-    wt.remove_exact(&config.repo_dir, &expected.path, &expected.branch)
-        .await
+    let trusted =
+        super::worker_recover::trusted_recover_refs(&config.db_path, work.key.task_id).await?;
+    let identity = crate::serve::worktree::RecoverIdentity::new(
+        work.key.task_id,
+        "cleanup",
+        "decomposition_cleanup",
+    )
+    .with_trusted(trusted);
+    let db_path = config.db_path.clone();
+    let record_identity = identity.clone();
+    let created = wt
+        .remove_exact(
+            &config.repo_dir,
+            &expected.path,
+            &expected.branch,
+            &identity,
+            |created| async move {
+                super::worker_recover::record_recover_rows(&db_path, &record_identity, &created)
+                    .await
+            },
+        )
+        .await?;
+    super::worker_recover::after_recover_refs_created(config, wt, &identity, &created).await;
+    Ok(())
 }
 
 fn validate_worktree_registration(
