@@ -1402,7 +1402,8 @@ impl AgentKind {
         } else {
             Err(format!(
                 "unknown model '{model}': cannot resolve provider \
-                 (expected claude-*/Claude alias, supported OpenAI model, grok-4.5, or grok-4.6)"
+                 (expected claude-*/Claude alias, supported OpenAI model, or supported Grok model: {})",
+                super::grok_agent::SUPPORTED_MODELS.join(", ")
             ))
         }
     }
@@ -2985,9 +2986,16 @@ mod tests {
     fn for_model_grok_is_exact_and_closed() {
         assert_eq!(AgentKind::for_model("grok-4.5").unwrap(), AgentKind::Grok);
         assert_eq!(AgentKind::for_model("grok-4.6").unwrap(), AgentKind::Grok);
+        assert_eq!(AgentKind::for_model("grok-4.7").unwrap(), AgentKind::Grok);
         assert!(AgentKind::for_model("grok").is_err());
-        assert!(AgentKind::for_model("grok-4.7").is_err());
+        assert!(AgentKind::for_model("grok-4.7-build-fast").is_err());
         assert!(AgentKind::for_model("/opt/bin/grok").is_err());
+
+        let error = AgentKind::for_model("grok-4.7-build-fast").unwrap_err();
+        assert!(
+            error.contains(&crate::serve::grok_agent::SUPPORTED_MODELS.join(", ")),
+            "{error}"
+        );
     }
 
     #[test]

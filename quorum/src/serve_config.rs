@@ -1933,7 +1933,7 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
             assert_eq!(roles.worker_model, "grok-4.5");
         }
 
-        for model in ["grok-4.5", "grok-4.6"] {
+        for model in ["grok-4.5", "grok-4.6", "grok-4.7"] {
             let worker: ServeFileConfig =
                 toml::from_str(&format!("worker_model = \"{model}\"\n")).unwrap();
             assert_eq!(
@@ -2364,7 +2364,7 @@ worktree_base = "/tmp/wt"
             cfg
         }
 
-        for model in ["grok-4.5", "grok-4.6"] {
+        for model in ["grok-4.5", "grok-4.6", "grok-4.7"] {
             validate_model_routing(&config_with_grok_worker(model)).unwrap();
 
             for role in [
@@ -2399,7 +2399,7 @@ worktree_base = "/tmp/wt"
             "grok-unknown".into(),
             ModelProfile {
                 runner: "grok".into(),
-                model: "grok-4.7".into(),
+                model: "grok-4.7-build-fast".into(),
                 effort: "high".into(),
             },
         );
