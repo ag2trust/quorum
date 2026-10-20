@@ -466,4 +466,15 @@ fn persistent_worker_needs_info_reaction_parks_task_at_turn_end() {
         )
         .unwrap();
     assert_eq!(parked, 1);
+    let note: String = conn
+        .query_row(
+            "SELECT body FROM task_notes WHERE agent='daemon' AND body LIKE 'parked:%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        note.contains("which config should I use?"),
+        "persistent park carries the worker's reason: {note}"
+    );
 }

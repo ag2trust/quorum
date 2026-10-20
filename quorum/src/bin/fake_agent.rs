@@ -211,6 +211,9 @@ fn run_quorum_submit() {
     }
 }
 
+/// Reason text the fake agent sends with every `react`.
+pub const FAKE_AGENT_REACT_REASON: &str = "fake-agent: which config should I use?";
+
 fn run_quorum_react(state: &str) {
     let Ok(agent) = std::env::var("QUORUM_AGENT") else {
         eprintln!("fake-agent: QUORUM_AGENT not set, skipping react side-effect");
@@ -219,7 +222,8 @@ fn run_quorum_react(state: &str) {
     let bin = quorum_bin_path();
     let reacted = retry_submit(
         || {
-            Command::new(&bin)
+            // `blocked` / `needs-info` require a reason; it is harmless for the rest.
+            let Ok(mut child) = Command::new(&bin)
                 .args([
                     "react",
                     "--agent",
@@ -228,11 +232,19 @@ fn run_quorum_react(state: &str) {
                     "0",
                     "--state",
                     state,
+                    "--reason-stdin",
                 ])
+                .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|status| status.success())
+                .spawn()
+            else {
+                return false;
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(FAKE_AGENT_REACT_REASON.as_bytes());
+            }
+            child.wait().is_ok_and(|status| status.success())
         },
         std::thread::sleep,
     );
