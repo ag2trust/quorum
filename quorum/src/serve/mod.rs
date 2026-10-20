@@ -59569,7 +59569,7 @@ exec /bin/cat '{stdout}'
         std::fs::write(
             &git_wrapper,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exec '{}' \"$@\"; fi\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+                "#!/bin/sh\nif [ \"$1\" = -c ] && [ \"$2\" = core.fsmonitor=false ]; then shift 2; fi\nif [ \"$1\" = rev-parse ]; then exec '{}' \"$@\"; fi\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
                 real_git,
                 archive_pid.display()
             ),

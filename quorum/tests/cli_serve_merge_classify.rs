@@ -189,6 +189,9 @@ fi
             &git_path,
             format!(
                 "#!/bin/sh\n\
+                 if [ \"${{1:-}}\" = -c ] && [ \"${{2:-}}\" = core.fsmonitor=false ]; then\n\
+                   shift 2\n\
+                 fi\n\
                  if [ \"${{1:-}}\" = ls-remote ] && [ \"${{2:-}}\" = origin ] && \
                     [ \"${{3:-}}\" = refs/heads/main ] && \
                     [ -n \"${{QUORUM_TEST_LS_REMOTE_STATE:-}}\" ]; then\n\
