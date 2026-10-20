@@ -2682,10 +2682,21 @@ source target yields NULL child targets and preserves the legacy configured-base
 Generated tasks retain ordinary independent implementation, review, rework, and protected merge.
 As terminal leaves, they dispatch directly regardless of the root size-dispatch policy and cannot
 be selected as decomposition sources. Their atomic claim additionally requires an active
-decomposed source, done prerequisites, no failed sibling or graph blocker, and fewer than two
-active implementation siblings. Eligible graph children sort before unrelated new work, but
+decomposed source, done prerequisites, no hard-failed sibling or graph blocker, and fewer than
+two active implementation siblings. Eligible graph children sort before unrelated new work, but
 reserve no idle capacity and never interrupt active unrelated work. Active siblings may finish
-after another child fails; no later child may start.
+after another child hard-fails; no later child may start.
+
+Only a hard child failure holds the graph (`generated-child-failed`). A retryable daemon park of a
+child — `status='failed'` with `refs.daemon_parked` and a `daemon_resume_status`, e.g. a
+needs-info/blocked reaction, an exhausted recovery budget, a publication or dependency park —
+neither holds the graph nor withholds sibling dispatch or review. One shared SQL predicate decides
+"retryable park" for candidate selection, the claim transaction, and the graph-hold decision; parks
+that `task-retry` refuses to resume (an unsatisfiable-dependency park or a publication park that
+observed its PR merged) remain hard. A parked child is still not `done`, so the graph cannot
+complete and the child's own dependents stay blocked until `task-retry` (which works under the
+active graph) or `task-close` resolves it. Holds already persisted by an earlier daemon keep their
+existing explicit recovery paths.
 
 A reviewer may submit a capability-bound, closed graph-blocker verdict only for a genuine safety
 or authority boundary violation where continuing the materialized graph would itself grant
