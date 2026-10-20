@@ -3627,7 +3627,7 @@ where
                 id,
                 now,
                 format!(
-                    "{WORKER_FAILURE_NOTE_PREFIX}{}: {cause}",
+                    "{WORKER_FAILURE_NOTE_PREFIX}{}\n{cause}",
                     task.recovery_attempts + 1
                 )
             ],
@@ -8125,7 +8125,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(note.starts_with("worker failure, recovery attempt 1: worker idle 900s"));
+        assert!(note.starts_with("worker failure, recovery attempt 1\nworker idle 900s"));
         assert!(!note.contains("TAIL_HIDDEN"));
         assert!(note.chars().count() < 1200);
     }
