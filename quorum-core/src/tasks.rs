@@ -738,8 +738,6 @@ pub fn validate_creator_refs(refs_json: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Daemon-owned `--review-only` outcome keys (`review_outcome*`), including
-/// the REQUEST_CHANGES outbox state. Creators can neither set nor erase them.
 /// The daemon-owned review-only close outcome (`changes_requested`,
 /// `ci_failed`, `merge_conflict`) recorded on a task's refs, if any. A `done`
 /// task carrying one closed without merge and does not satisfy dependents.
@@ -754,6 +752,8 @@ pub fn review_outcome_of(refs: Option<&str>) -> Option<String> {
         })
 }
 
+/// Daemon-owned `--review-only` outcome keys (`review_outcome*`), including
+/// the REQUEST_CHANGES outbox state. Creators can neither set nor erase them.
 fn is_review_outcome_ref(key: &str) -> bool {
     key.starts_with(REVIEW_OUTCOME_REF)
 }
