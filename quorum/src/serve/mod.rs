@@ -4271,6 +4271,9 @@ pub struct CostLimits {
     /// Max seconds an active worker/reviewer may go without emitting an
     /// event. Default: 900.
     pub max_idle_secs: Option<u64>,
+    /// Idle ceiling while the provider has an outstanding tool call or
+    /// background task. Default 3600; never below the plain idle ceiling.
+    pub max_busy_idle_secs: Option<u64>,
     pub max_task_wall_secs: Option<u64>,
     /// Legacy idle limit retained for compatibility. Prefer max_idle_secs.
     pub idle_timeout_secs: Option<u64>,
@@ -4711,6 +4714,13 @@ impl SlotState {
 
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.proc.try_wait()
+    }
+
+    /// A tool call awaits its result or a provider background task runs.
+    /// While true the idle watchdogs apply `max_busy_idle_secs` instead of
+    /// the plain idle ceiling (bounded either way).
+    fn has_outstanding_provider_work(&self) -> bool {
+        matches!(&self.proc, SlotProcess::Running(proc) if proc.has_outstanding_work())
     }
 
     fn has_pending_grok_terminal_handoff(&self) -> bool {
@@ -10250,11 +10260,15 @@ async fn resume_reviewer_after_ci(
         }
     }
     install_reviewer_rereview_pending_turn(&mut reviewers[reviewer_index], &rereview_turn);
-    if let Err(error) = reviewers[reviewer_index]
+    reviewers[reviewer_index]
         .live_process_mut()
-        .map_err(|error| QuorumError::Io(format!("reviewer has no live process: {error}")))?
-        .feed_turn(&rereview_turn)
-        .await
+        .map_err(|error| QuorumError::Io(format!("reviewer has no live process: {error}")))?;
+    if let Err(error) = feed_persistent_turn(
+        &mut reviewers[reviewer_index],
+        &rereview_turn,
+        &config.limits,
+    )
+    .await
     {
         let reason = if reviewers[reviewer_index].process_kind().turn_mode()
             == runner::TurnMode::RespawnPerTurn
@@ -15716,24 +15730,26 @@ async fn tick(
         .max_idle_secs
         .or(config.limits.idle_timeout_secs)
         .unwrap_or(900);
-    let mut idle_reviewers: Vec<usize> = Vec::new();
+    let busy_idle_timeout = max_busy_idle_secs(&config.limits);
+    let mut idle_reviewers: Vec<(usize, u64)> = Vec::new();
     for (i, r) in reviewers.iter().enumerate() {
         if r.draining || slot_has_pending_watchdog_outcome(r) {
             continue;
         }
+        let limit = between_turn_idle_limit(r, idle_timeout, busy_idle_timeout);
         if let Some(ended) = r.turn_ended_at {
-            if ended.elapsed().as_secs() > idle_timeout {
+            if ended.elapsed().as_secs() > limit {
                 log(&format!(
                     "WATCHDOG: reviewer {} idle {}s (limit {}s) — killing zombie",
                     r.agent_name,
                     ended.elapsed().as_secs(),
-                    idle_timeout
+                    limit
                 ));
-                idle_reviewers.push(i);
+                idle_reviewers.push((i, limit));
             }
         }
     }
-    for &i in idle_reviewers.iter().rev() {
+    for &(i, limit) in idle_reviewers.iter().rev() {
         let mutation = fail_reviewer_if_owner(
             &db_path,
             &reviewers[i].agent_name,
@@ -15741,7 +15757,7 @@ async fn tick(
             &format!(
                 "reviewer idle {}s between turns (limit {}s) — zombie reaped",
                 reviewers[i].turn_ended_at.unwrap().elapsed().as_secs(),
-                idle_timeout
+                limit
             ),
         )
         .await;
@@ -15829,6 +15845,34 @@ async fn tick(
         }
     }
 
+    // ── Phase 4-react: Park persistent workers that ended on blocked/needs-info ─
+    // Turn-oriented runners park through `dispose_dead_turn_runner` when their
+    // process exits. A persistent Claude child stays alive between turns, so
+    // its explicit reaction is honored here when the turn has ended.
+    let mut parked_workers = Vec::new();
+    for (i, w) in workers.iter_mut().enumerate() {
+        if !slot_is_reaction_park_candidate(w) {
+            continue;
+        }
+        match park_worker_on_reaction(&db_path, w).await {
+            Some(tasks::PersistentReactionDisposition::Parked) => parked_workers.push(i),
+            Some(tasks::PersistentReactionDisposition::NotParked) => {
+                // A delivery or ownership change outranks the reaction; stop
+                // re-checking it every tick until the worker reacts again.
+                w.agent_state = None;
+            }
+            None => {}
+        }
+    }
+    for &i in parked_workers.iter().rev() {
+        let dead = workers.remove(i);
+        log(&format!(
+            "worker {} parked task #{} on its explicit reaction",
+            dead.agent_name, dead.task_id
+        ));
+        cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
+    }
+
     // ── Phase 4-idle: Kill workers idle too long between turns ─────────
     // A worker that completed a turn (draining=false) but never gets a new
     // turn is a zombie — e.g. it asked a question in dontAsk mode (#74).
@@ -15837,13 +15881,18 @@ async fn tick(
     // firing AgentFailed (#176).
     let mut idle_workers: Vec<usize> = Vec::new();
     for (i, w) in workers.iter().enumerate() {
-        if slot_is_idle_zombie_candidate(w, idle_timeout) {
+        if slot_is_idle_zombie_candidate(w, idle_timeout, max_busy_idle_secs(&config.limits)) {
             idle_workers.push(i);
         }
     }
     for &i in idle_workers.iter().rev() {
         let task_id = workers[i].task_id;
         let idle_secs = workers[i].turn_ended_at.unwrap().elapsed().as_secs();
+        let idle_limit = between_turn_idle_limit(
+            &workers[i],
+            idle_timeout,
+            max_busy_idle_secs(&config.limits),
+        );
 
         // Look up current task status to distinguish legitimate waits from zombies.
         let p = db_path.clone();
@@ -15877,7 +15926,7 @@ async fn tick(
                 cleanup_slot(config, wt_mgr, name_pool, dead, None, end_reason).await;
             }
             _ => {
-                reap_idle_zombie_worker(config, wt_mgr, name_pool, dead, idle_secs, idle_timeout)
+                reap_idle_zombie_worker(config, wt_mgr, name_pool, dead, idle_secs, idle_limit)
                     .await;
             }
         }
@@ -18364,7 +18413,11 @@ fn take_terminal_usage_diagnostics_for_test(agent: &str) -> Vec<serde_json::Valu
 
 /// Check wall-clock limits only (called each tick for slots still draining).
 fn check_wall_clock_limits(limits: &CostLimits, slot: &SlotState) -> Option<LimitBreached> {
-    let max_idle_secs = max_idle_secs(limits);
+    let max_idle_secs = effective_idle_secs(
+        max_idle_secs(limits),
+        max_busy_idle_secs(limits),
+        slot.has_outstanding_provider_work(),
+    );
     let elapsed = slot.last_event_at.elapsed().as_secs();
     if elapsed > max_idle_secs {
         return Some(LimitBreached::IdleSecs {
@@ -18386,6 +18439,243 @@ fn check_wall_clock_limits(limits: &CostLimits, slot: &SlotState) -> Option<Limi
 /// slots always have a liveness watchdog, even when neither setting is given.
 fn max_idle_secs(limits: &CostLimits) -> u64 {
     limits.max_idle_secs.unwrap_or(900)
+}
+
+fn max_busy_idle_secs(limits: &CostLimits) -> u64 {
+    limits
+        .max_busy_idle_secs
+        .unwrap_or(crate::serve_config::DEFAULT_MAX_BUSY_IDLE_SECS)
+}
+
+/// Idle ceiling for one slot: outstanding tool/background work extends the
+/// plain ceiling to the (finite) busy ceiling, never shortens it.
+fn effective_idle_secs(idle_secs: u64, busy_idle_secs: u64, outstanding_work: bool) -> u64 {
+    if outstanding_work {
+        idle_secs.max(busy_idle_secs)
+    } else {
+        idle_secs
+    }
+}
+
+/// Bound for the pre-feed backlog drain. Lines already in the pipe return
+/// without waiting, so this only caps a provider that never stops writing;
+/// command-lifecycle attribution still protects the fed turn past the cap.
+const MAX_PRE_FEED_BACKLOG_LINES: usize = 1024;
+
+/// Observe a persistent Claude child between daemon turns.
+///
+/// Claude keeps running after a turn's `result`: background tasks finish,
+/// `task_notification` arrives, and the CLI may self-continue with a turn the
+/// daemon never fed. Reading here keeps the stdout pipe from filling (which
+/// would block the child), refreshes liveness and outstanding-work tracking,
+/// and logs the lines. It never changes lifecycle: the attribution tracker
+/// demotes every unfed `result` to `Liveness`, and a terminal event that
+/// still reaches this loop is ignored. Each read is a short poll on a reader
+/// that retains partial lines across cancellation. Returns the line count.
+async fn observe_between_turn_output(
+    slot: &mut SlotState,
+    limits: &CostLimits,
+    max_lines: usize,
+) -> usize {
+    if slot.process_kind().turn_mode() != runner::TurnMode::PersistentChild
+        || !matches!(slot.proc, SlotProcess::Running(_))
+    {
+        return 0;
+    }
+    let _ = persist_diagnostics(slot);
+    let mut observed = 0;
+    while observed < max_lines {
+        let Ok(proc) = slot.live_process_mut() else {
+            break;
+        };
+        let Ok(Some(raw_line)) = tokio::time::timeout(STREAM_READ_POLL, proc.next_raw_line()).await
+        else {
+            // Quiet pipe (poll elapsed) or EOF; exit detection owns EOF.
+            break;
+        };
+        observed += 1;
+        let Ok(proc) = slot.live_process_mut() else {
+            break;
+        };
+        let events = proc.normalize_stream_line(&raw_line);
+        if let Some(ref mut sl) = slot.session_log {
+            sl.log_raw_and_normalized(&raw_line, &events);
+        }
+        for event in &events {
+            if matches!(
+                event,
+                runner::AgentEvent::TurnCompleted { .. } | runner::AgentEvent::TurnFailed { .. }
+            ) {
+                log(&format!(
+                    "INTEGRITY: {} emitted a turn terminal between daemon turns (task #{}) — ignored",
+                    slot.agent_name, slot.task_id
+                ));
+                continue;
+            }
+            // Refresh liveness first so budget checks below never mistake a
+            // long between-turn wait for an idle breach.
+            // `turn_ended_at` is deliberately NOT re-anchored: the between-turn
+            // bound is measured from the last daemon-fed turn, so provider
+            // self-continuation can only select the busy ceiling, never extend
+            // it (see `between_turn_idle_limit`).
+            slot.last_event_at = std::time::Instant::now();
+            slot.live_stats.record_event();
+            match event {
+                runner::AgentEvent::Activity { summary, .. } => {
+                    slot.live_stats.now_label = truncate_now_label(summary);
+                }
+                runner::AgentEvent::UnfedTurnUsage { usage, cost_usd } => {
+                    if let Some(breach) = account_unfed_turn_usage(slot, limits, *usage, *cost_usd)
+                    {
+                        let breach = breach.to_string();
+                        log(&format!(
+                            "WATCHDOG: {} self-continued turn exceeded a limit ({breach}) on task #{}",
+                            slot.agent_name, slot.task_id
+                        ));
+                        if slot.pending_watchdog_breach.is_none() {
+                            slot.pending_watchdog_breach = Some(breach);
+                        }
+                    }
+                    let unfed = slot
+                        .live_process_mut()
+                        .map_or(0, |proc| proc.unfed_turns_since_feed());
+                    if unfed > MAX_UNFED_TURNS_PER_FED_TURN
+                        && slot.pending_watchdog_breach.is_none()
+                    {
+                        let breach = format!(
+                            "{unfed} self-continued provider turns since the last daemon turn (limit {MAX_UNFED_TURNS_PER_FED_TURN})"
+                        );
+                        log(&format!(
+                            "WATCHDOG: {} {breach} on task #{}",
+                            slot.agent_name, slot.task_id
+                        ));
+                        slot.pending_watchdog_breach = Some(breach);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !events.is_empty() {
+            write_live_sidecar(slot);
+        }
+    }
+    let _ = persist_diagnostics(slot);
+    observed
+}
+
+/// Feed a persistent-child turn after discarding the stale stdout backlog, so
+/// the next `result` the daemon reads belongs to this feed.
+async fn feed_persistent_turn(
+    slot: &mut SlotState,
+    turn: &str,
+    limits: &CostLimits,
+) -> std::io::Result<()> {
+    let drained = observe_between_turn_output(slot, limits, MAX_PRE_FEED_BACKLOG_LINES).await;
+    if drained == MAX_PRE_FEED_BACKLOG_LINES {
+        log(&format!(
+            "{} pre-feed backlog exceeded {MAX_PRE_FEED_BACKLOG_LINES} lines (task #{}); relying on command-lifecycle attribution",
+            slot.agent_name, slot.task_id
+        ));
+    }
+    if let Some(breach) = &slot.pending_watchdog_breach {
+        // The backlog crossed a budget. The turn is still fed so the callers'
+        // lifecycle bookkeeping stays truthful; the pending breach is consumed
+        // first by the next `actionable_slot_breach`, whose watchdog
+        // disposition tears the slot down within one tick.
+        log(&format!(
+            "{} fed on task #{} with a watchdog breach pending ({breach}); disposition follows",
+            slot.agent_name, slot.task_id
+        ));
+    }
+    slot.live_process_mut()?.feed_turn(turn).await
+}
+
+/// A new daemon turn supersedes the worker's previous reaction: only a
+/// reaction made during the latest turn may park the task (Phase 4-react and
+/// the idle reaper). Journal failures are logged; the in-memory state, which
+/// gates Phase 4-react, is always cleared.
+async fn clear_worker_reaction_before_feed(slot: &mut SlotState, db_path: &Path) {
+    if slot.agent_state.take().is_none() {
+        return;
+    }
+    let p = db_path.to_path_buf();
+    let agent = slot.agent_name.clone();
+    let task_id = slot.task_id;
+    let cleared = tokio::task::spawn_blocking(move || {
+        let mut conn = quorum_core::db::open(&p)?;
+        journal::clear_agent_state(&mut conn, &agent, task_id)
+    })
+    .await;
+    if !matches!(cleared, Ok(Ok(_))) {
+        log(&format!(
+            "worker {} could not clear its projected reaction for task #{task_id}: {cleared:?}",
+            slot.agent_name
+        ));
+    }
+}
+
+/// Self-continued provider turns tolerated per daemon-fed turn. Each one is
+/// already charged to the budgets; this bounds a provider that keeps
+/// re-arming background work and continuing on its own.
+const MAX_UNFED_TURNS_PER_FED_TURN: u32 = 8;
+
+/// Between-turn idle ceiling, measured from the last daemon-fed turn end.
+/// Outstanding work, or a self-continued provider turn in progress, selects
+/// the busy ceiling; nothing extends past it.
+fn between_turn_idle_limit(slot: &SlotState, idle_secs: u64, busy_idle_secs: u64) -> u64 {
+    let provider_active = matches!(
+        &slot.proc,
+        SlotProcess::Running(proc) if proc.has_outstanding_work() || proc.unfed_turn_open()
+    );
+    effective_idle_secs(idle_secs, busy_idle_secs, provider_active)
+}
+
+/// The provider is acting without a daemon turn: a self-continued turn has
+/// completed, or tool/background work is still running.
+fn slot_is_self_acting(slot: &SlotState) -> bool {
+    matches!(
+        &slot.proc,
+        SlotProcess::Running(proc) if proc.unfed_turns_since_feed() > 0
+            || proc.unfed_turn_open()
+            || proc.has_outstanding_work()
+    )
+}
+
+/// Charge a self-continued (unfed) provider turn to the slot's budgets.
+/// Accounting mirrors a fed terminal; a missing provider cost is treated as
+/// zero turn cost rather than a breach because the cumulative ceiling still
+/// applies on the next reported total.
+fn account_unfed_turn_usage(
+    slot: &mut SlotState,
+    limits: &CostLimits,
+    usage: Option<runner::TokenUsage>,
+    cost_usd: Option<f64>,
+) -> Option<LimitBreached> {
+    let turn_tokens = usage.map_or(0, |u| token_limit_total(u, limits.token_limit_basis));
+    let raw_turn_tokens = usage.map_or(0, |u| {
+        token_limit_total(u, crate::serve_config::TokenLimitBasis::Raw)
+    });
+    if let Some(usage) = usage {
+        slot.token_usage.saturating_add_assign(usage);
+    }
+    slot.cost_tokens = slot.cost_tokens.saturating_add(raw_turn_tokens);
+    slot.limit_tokens = slot.limit_tokens.saturating_add(turn_tokens);
+    let prev_cost = slot.cost_usd;
+    if let Some(cost) = cost_usd {
+        slot.cost_usd = cost;
+    }
+    let turn_cost_usd = Some(cost_usd.map_or(0.0, |c| (c - prev_cost).max(0.0)));
+    if let Some(ref mut sl) = slot.session_log {
+        sl.update_cost(slot.cost_tokens, cost_usd);
+    }
+    check_post_result_limits(
+        limits,
+        turn_tokens,
+        slot.limit_tokens,
+        turn_cost_usd,
+        slot.cost_usd,
+        slot,
+    )
 }
 
 /// Feed a worker turn according to the adapter's declared process lifetime.
@@ -18548,8 +18838,9 @@ async fn feed_worker_turn(
                 "continuation".into()
             };
         }
+        clear_worker_reaction_before_feed(slot, &config.db_path).await;
         let turn = agent::user_turn(raw_prompt);
-        slot.live_process_mut()?.feed_turn(&turn).await
+        feed_persistent_turn(slot, &turn, &config.limits).await
     }
 }
 
@@ -19904,6 +20195,17 @@ async fn reap_idle_zombie_worker(
     idle_secs: u64,
     idle_timeout: u64,
 ) {
+    // A reaction committed after the last mailbox snapshot is still honored.
+    if park_worker_on_reaction(&config.db_path, &dead).await
+        == Some(tasks::PersistentReactionDisposition::Parked)
+    {
+        log(&format!(
+            "worker {} idle {}s parked task #{} on its explicit reaction",
+            dead.agent_name, idle_secs, dead.task_id
+        ));
+        cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
+        return;
+    }
     log(&format!(
         "WATCHDOG: worker {} idle {}s on task #{} (limit {}s) — killing zombie",
         dead.agent_name, idle_secs, dead.task_id, idle_timeout
@@ -19918,7 +20220,55 @@ async fn reap_idle_zombie_worker(
     cleanup_slot(config, wt_mgr, name_pool, dead, None, "idle_reaped").await;
 }
 
-fn slot_is_idle_zombie_candidate(slot: &SlotState, idle_timeout_secs: u64) -> bool {
+/// A live persistent worker whose turn ended after a `blocked` /
+/// `needs-info` reaction.
+fn slot_is_reaction_park_candidate(slot: &SlotState) -> bool {
+    !slot.draining
+        && slot.error_turn_count == 0
+        && !slot_has_pending_watchdog_outcome(slot)
+        && slot.process_kind().turn_mode() == runner::TurnMode::PersistentChild
+        && matches!(slot.proc, SlotProcess::Running(_))
+        && matches!(slot.agent_state.as_deref(), Some("blocked" | "needs-info"))
+}
+
+/// Park the slot's task on the worker's latest durable reaction. `None` means
+/// the transaction failed and the caller retries on a later tick.
+async fn park_worker_on_reaction(
+    db_path: &Path,
+    slot: &SlotState,
+) -> Option<tasks::PersistentReactionDisposition> {
+    let p = db_path.to_path_buf();
+    let agent = slot.agent_name.clone();
+    let task_id = slot.task_id;
+    let result = tokio::task::spawn_blocking(move || {
+        let mut conn = quorum_core::db::open(&p)?;
+        tasks::park_persistent_worker_reaction(&mut conn, task_id, &agent, now_unix())
+    })
+    .await;
+    match result {
+        Ok(Ok(disposition)) => Some(disposition),
+        Ok(Err(error)) => {
+            log(&format!(
+                "worker {} reaction park failed for task #{task_id}: {error} — retrying",
+                slot.agent_name
+            ));
+            None
+        }
+        Err(error) => {
+            log(&format!(
+                "worker {} reaction park join failed for task #{task_id}: {error}",
+                slot.agent_name
+            ));
+            None
+        }
+    }
+}
+
+fn slot_is_idle_zombie_candidate(
+    slot: &SlotState,
+    idle_timeout_secs: u64,
+    busy_idle_secs: u64,
+) -> bool {
     if slot.draining || slot.error_turn_count > 0 || slot_has_pending_watchdog_outcome(slot) {
         return false;
     }
@@ -19927,8 +20277,9 @@ fn slot_is_idle_zombie_candidate(slot: &SlotState, idle_timeout_secs: u64) -> bo
     if matches!(slot.proc, SlotProcess::Dormant { .. }) {
         return false;
     }
+    let limit = between_turn_idle_limit(slot, idle_timeout_secs, busy_idle_secs);
     slot.turn_ended_at
-        .is_some_and(|t| t.elapsed().as_secs() > idle_timeout_secs)
+        .is_some_and(|t| t.elapsed().as_secs() > limit)
 }
 
 /// A terminal watchdog breach classified as OutcomePending preserves mailbox
@@ -21156,6 +21507,18 @@ async fn drain_events(
                     slot.live_stats.record_event();
                     write_live_sidecar(slot);
                 }
+
+                runner::AgentEvent::Liveness { .. } => {
+                    slot.live_stats.record_event();
+                    write_live_sidecar(slot);
+                }
+
+                runner::AgentEvent::UnfedTurnUsage { usage, cost_usd } => {
+                    if let Some(breach) = account_unfed_turn_usage(slot, limits, *usage, *cost_usd)
+                    {
+                        return Ok(Some(breach));
+                    }
+                }
             }
         }
         persist_diagnostics(slot).map_err(|error| {
@@ -21198,7 +21561,20 @@ async fn actionable_slot_breach(
         return Ok(Some(breach.clone()));
     }
     if !slot.draining {
-        return Ok(None);
+        observe_between_turn_output(slot, limits, MAX_STREAM_LINES_PER_TICK).await;
+        // A self-acting provider spends without a daemon turn; the task wall
+        // clock still bounds it. Idle slots awaiting review keep their
+        // established between-turn semantics.
+        if slot.pending_watchdog_breach.is_none() && slot_is_self_acting(slot) {
+            if let Some(max) = limits.max_task_wall_secs {
+                let elapsed = slot.task_started_at.elapsed().as_secs();
+                if elapsed > max {
+                    slot.pending_watchdog_breach =
+                        Some(LimitBreached::TaskWallSecs { elapsed, max }.to_string());
+                }
+            }
+        }
+        return Ok(slot.pending_watchdog_breach.clone());
     }
     let breach = check_active_slot_limits(slot, db_path, role, limits)
         .await?
@@ -35390,6 +35766,608 @@ mod tests {
         slot.kill_and_reap().await;
     }
 
+    // ── Worker liveness: outstanding tool/background work (Claude 2.1.304) ──
+    const CLAUDE_BETWEEN_TURNS_FIXTURE: &str =
+        include_str!("testdata/claude_2_1_304_background_between_turns.jsonl");
+
+    /// A Claude slot whose child replays `lines` (one per line) and then
+    /// keeps its pipes open, like a live persistent child.
+    fn claude_replay_slot(dir: &std::path::Path, lines: &[&str], then: &str) -> SlotState {
+        use tokio::io::BufReader;
+
+        let path = dir.join("replay.jsonl");
+        let mut body = lines.join("\n");
+        body.push('\n');
+        std::fs::write(&path, body).unwrap();
+        let script = format!("cat '{}'; {then}", path.display());
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", &script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        slot_with_process(runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+            child,
+            stdin,
+            BufReader::new(stdout),
+        )))
+    }
+
+    fn fixture_prefix_through(fixture: &str, kind: &str, subtype: Option<&str>) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in fixture.lines() {
+            out.push(line.to_string());
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if value["type"].as_str() == Some(kind)
+                && subtype.is_none_or(|s| value.get("subtype").and_then(|v| v.as_str()) == Some(s))
+            {
+                return out;
+            }
+        }
+        panic!("fixture lacks {kind}/{subtype:?}");
+    }
+
+    #[tokio::test]
+    async fn tool_result_line_refreshes_in_turn_liveness() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool_result = CLAUDE_BETWEEN_TURNS_FIXTURE
+            .lines()
+            .find(|line| line.starts_with(r#"{"type":"user""#))
+            .unwrap();
+        let mut slot = claude_replay_slot(dir.path(), &[tool_result], "sleep 5");
+        slot.draining = true;
+        let limits = CostLimits {
+            max_idle_secs: Some(60),
+            ..Default::default()
+        };
+        for _ in 0..40 {
+            slot.last_event_at = std::time::Instant::now() - std::time::Duration::from_secs(61);
+            if check_active_slot_limits(&mut slot, dir.path(), "worker", &limits)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                break;
+            }
+        }
+        assert!(
+            slot.last_event_at.elapsed() < std::time::Duration::from_secs(60),
+            "a returned tool call is provider progress"
+        );
+        slot.kill_and_reap().await;
+    }
+
+    #[tokio::test]
+    async fn in_turn_watchdog_spares_outstanding_background_task_until_busy_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let lines = fixture_prefix_through(CLAUDE_BETWEEN_TURNS_FIXTURE, "user", None);
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut slot = claude_replay_slot(dir.path(), &refs, "sleep 5");
+        slot.draining = true;
+        let limits = CostLimits {
+            max_idle_secs: Some(60),
+            max_busy_idle_secs: Some(600),
+            ..Default::default()
+        };
+        for _ in 0..40 {
+            drain_events(&mut slot, dir.path(), "worker", &limits)
+                .await
+                .unwrap();
+            if slot.has_outstanding_provider_work() {
+                break;
+            }
+        }
+        assert!(
+            slot.has_outstanding_provider_work(),
+            "task_started must register outstanding background work"
+        );
+        slot.last_event_at = std::time::Instant::now() - std::time::Duration::from_secs(300);
+        assert!(
+            check_wall_clock_limits(&limits, &slot).is_none(),
+            "a busy worker past max_idle_secs must not be reaped"
+        );
+        slot.last_event_at = std::time::Instant::now() - std::time::Duration::from_secs(601);
+        assert!(
+            matches!(
+                check_wall_clock_limits(&limits, &slot),
+                Some(LimitBreached::IdleSecs { max: 600, .. })
+            ),
+            "busy work is bounded by max_busy_idle_secs"
+        );
+        slot.kill_and_reap().await;
+
+        // Negative: no outstanding work keeps the ordinary idle ceiling.
+        let mut idle = make_dummy_slot_async().await;
+        idle.draining = true;
+        idle.last_event_at = std::time::Instant::now() - std::time::Duration::from_secs(61);
+        assert!(!idle.has_outstanding_provider_work());
+        assert!(matches!(
+            check_wall_clock_limits(&limits, &idle),
+            Some(LimitBreached::IdleSecs { max: 60, .. })
+        ));
+        idle.kill_and_reap().await;
+    }
+
+    async fn make_dummy_slot_async() -> SlotState {
+        let dir = tempfile::tempdir().unwrap();
+        claude_replay_slot(dir.path(), &[], "true")
+    }
+
+    /// Drain a fed turn to its terminal, then observe everything the child
+    /// emits between turns.
+    async fn run_turn_then_observe_between_turns(slot: &mut SlotState, dir: &std::path::Path) {
+        slot.draining = true;
+        for _ in 0..40 {
+            drain_events(slot, dir, "worker", &CostLimits::default())
+                .await
+                .unwrap();
+            if !slot.draining {
+                break;
+            }
+        }
+        assert!(!slot.draining, "fed turn must complete");
+        for _ in 0..40 {
+            assert!(
+                actionable_slot_breach(slot, dir, "worker", &CostLimits::default())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn between_turn_drain_observes_background_completion_without_completing_a_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let lines: Vec<&str> = CLAUDE_BETWEEN_TURNS_FIXTURE.lines().collect();
+        let mut slot = claude_replay_slot(dir.path(), &lines, "sleep 5");
+        slot.cost_usd = 0.0;
+        slot.draining = true;
+        for _ in 0..40 {
+            drain_events(&mut slot, dir.path(), "worker", &CostLimits::default())
+                .await
+                .unwrap();
+            if !slot.draining {
+                break;
+            }
+        }
+        assert!(!slot.draining);
+        assert!(
+            slot.has_outstanding_provider_work(),
+            "background task outlives the fed turn"
+        );
+        let cost_after_fed_turn = slot.cost_usd;
+        let usage_after_fed_turn = slot.token_usage;
+        let stale = std::time::Instant::now() - std::time::Duration::from_secs(500);
+        slot.last_event_at = stale;
+        slot.turn_ended_at = Some(stale);
+
+        for _ in 0..40 {
+            assert!(actionable_slot_breach(
+                &mut slot,
+                dir.path(),
+                "worker",
+                &CostLimits::default()
+            )
+            .await
+            .unwrap()
+            .is_none());
+        }
+
+        assert!(
+            !slot.has_outstanding_provider_work(),
+            "between-turn task_notification must be observed"
+        );
+        assert!(slot.last_event_at.elapsed() < std::time::Duration::from_secs(60));
+        assert!(
+            slot.turn_ended_at.unwrap().elapsed() >= std::time::Duration::from_secs(500),
+            "provider activity must never re-anchor the daemon-fed turn end"
+        );
+        // The self-continued turn's result was never fed by the daemon: it
+        // completes nothing, but its spend is charged to the slot budgets.
+        assert!(!slot.draining);
+        assert_eq!(slot.error_turn_count, 0);
+        let unfed: serde_json::Value = CLAUDE_BETWEEN_TURNS_FIXTURE
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|value| value["type"] == "result")
+            .nth(1)
+            .unwrap();
+        assert_eq!(slot.cost_usd, unfed["total_cost_usd"].as_f64().unwrap());
+        assert!(slot.cost_usd > cost_after_fed_turn);
+        assert_eq!(
+            slot.token_usage.output_tokens,
+            usage_after_fed_turn.output_tokens + unfed["usage"]["output_tokens"].as_u64().unwrap()
+        );
+        assert!(slot.pending_watchdog_breach.is_none());
+        slot.kill_and_reap().await;
+    }
+
+    #[tokio::test]
+    async fn between_turn_unfed_error_result_never_fails_a_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut slot = claude_replay_slot(
+            dir.path(),
+            &[
+                r#"{"type":"result","result":"fed","total_cost_usd":1.0}"#,
+                r#"{"type":"result","result":"boom","is_error":true,"total_cost_usd":2.0}"#,
+            ],
+            "sleep 5",
+        );
+        slot.draining = true;
+        for _ in 0..40 {
+            drain_events(&mut slot, dir.path(), "worker", &CostLimits::default())
+                .await
+                .unwrap();
+            if !slot.draining {
+                break;
+            }
+        }
+        slot.last_event_at = std::time::Instant::now() - std::time::Duration::from_secs(500);
+        for _ in 0..40 {
+            assert!(actionable_slot_breach(
+                &mut slot,
+                dir.path(),
+                "worker",
+                &CostLimits::default()
+            )
+            .await
+            .unwrap()
+            .is_none());
+        }
+        assert!(
+            slot.last_event_at.elapsed() < std::time::Duration::from_secs(60),
+            "the unfed result must be read (and ignored) between turns"
+        );
+        assert_eq!(slot.cost_usd, 2.0, "unfed spend is still charged");
+        assert_eq!(
+            slot.error_turn_count, 0,
+            "unfed error result must not count"
+        );
+        assert!(slot.last_error_text.is_none());
+        assert!(!slot.draining);
+        slot.kill_and_reap().await;
+    }
+
+    #[tokio::test]
+    async fn unfed_turn_spend_enforces_budgets_and_blocks_the_next_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut slot = claude_replay_slot(
+            dir.path(),
+            &[
+                r#"{"type":"result","result":"fed","total_cost_usd":1.0,"usage":{"input_tokens":10,"output_tokens":10}}"#,
+                r#"{"type":"result","result":"bg","total_cost_usd":3.0,"usage":{"input_tokens":400,"output_tokens":100}}"#,
+            ],
+            r#"(sleep 3; kill $$) & while read -r line; do printf '%s\n' '{"type":"result","result":"again","total_cost_usd":9.0}'; done"#,
+        );
+        slot.cost_usd = 0.0;
+        slot.cost_tokens = 0;
+        slot.limit_tokens = 0;
+        let limits = CostLimits {
+            max_task_cost_usd: Some(2.0),
+            ..Default::default()
+        };
+        slot.draining = true;
+        for _ in 0..40 {
+            drain_events(&mut slot, dir.path(), "worker", &limits)
+                .await
+                .unwrap();
+            if !slot.draining {
+                break;
+            }
+        }
+        assert_eq!(slot.cost_usd, 1.0);
+        // A long wait before the self-continuation must not read as an idle breach.
+        slot.last_event_at = std::time::Instant::now() - std::time::Duration::from_secs(5000);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        feed_persistent_turn(&mut slot, &agent::user_turn("next"), &limits)
+            .await
+            .unwrap();
+
+        assert_eq!(slot.cost_usd, 3.0);
+        assert_eq!(slot.limit_tokens, 520);
+        let breach = slot
+            .pending_watchdog_breach
+            .clone()
+            .expect("unfed spend over the task cost ceiling must breach");
+        assert!(breach.contains("cost"), "{breach}");
+        assert!(!breach.contains("idle"), "{breach}");
+        // The pending breach is consumed first on the next tick, before any
+        // output of the fed turn can be attributed.
+        slot.draining = true;
+        let actionable = actionable_slot_breach(&mut slot, dir.path(), "worker", &limits)
+            .await
+            .unwrap();
+        assert_eq!(actionable.as_deref(), Some(breach.as_str()));
+        assert_eq!(slot.cost_usd, 3.0);
+        slot.kill_and_reap().await;
+    }
+
+    fn fed_then_unfed_turns(unfed_turns: usize, leave_open: bool) -> Vec<String> {
+        let mut lines =
+            vec![r#"{"type":"result","result":"fed","total_cost_usd":0.1}"#.to_string()];
+        for i in 0..unfed_turns {
+            lines.push(r#"{"type":"system","subtype":"init"}"#.into());
+            lines.push(format!(
+                r#"{{"type":"system","subtype":"task_started","task_id":"b{i}","description":"sleep 270 && gh pr checks"}}"#
+            ));
+            lines.push(format!(
+                r#"{{"type":"system","subtype":"task_notification","task_id":"b{i}","status":"completed"}}"#
+            ));
+            lines.push(r#"{"type":"result","result":"self"}"#.into());
+        }
+        if leave_open {
+            lines.push(r#"{"type":"system","subtype":"init"}"#.into());
+            lines.push(r#"{"type":"assistant","message":{"content":"thinking"}}"#.into());
+        }
+        lines
+    }
+
+    async fn replay_fed_turn_then_between_turns(
+        dir: &std::path::Path,
+        lines: &[String],
+        limits: &CostLimits,
+    ) -> SlotState {
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut slot = claude_replay_slot(dir, &refs, "sleep 5");
+        slot.draining = true;
+        for _ in 0..40 {
+            drain_events(&mut slot, dir, "worker", limits)
+                .await
+                .unwrap();
+            if !slot.draining {
+                break;
+            }
+        }
+        assert!(!slot.draining);
+        for _ in 0..20 {
+            let _ = actionable_slot_breach(&mut slot, dir, "worker", limits)
+                .await
+                .unwrap();
+        }
+        slot
+    }
+
+    #[tokio::test]
+    async fn self_continuation_never_extends_between_turn_bound_past_busy_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = CostLimits::default();
+        // Re-armed background work and repeated unfed results, then a
+        // self-continued turn still running.
+        let mut slot =
+            replay_fed_turn_then_between_turns(dir.path(), &fed_then_unfed_turns(3, true), &limits)
+                .await;
+        assert!(slot.pending_watchdog_breach.is_none());
+        assert!(slot.last_event_at.elapsed() < std::time::Duration::from_secs(60));
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(1000));
+        assert!(
+            !slot_is_idle_zombie_candidate(&slot, 900, 3600),
+            "an in-progress self-continuation selects the busy ceiling"
+        );
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3601));
+        assert!(
+            slot_is_idle_zombie_candidate(&slot, 900, 3600),
+            "fresh provider activity must not extend the bound past the busy ceiling"
+        );
+        slot.kill_and_reap().await;
+
+        // Closed self-continuations with nothing outstanding: plain ceiling.
+        let mut slot = replay_fed_turn_then_between_turns(
+            dir.path(),
+            &fed_then_unfed_turns(3, false),
+            &limits,
+        )
+        .await;
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(1000));
+        assert!(slot_is_idle_zombie_candidate(&slot, 900, 3600));
+        slot.kill_and_reap().await;
+    }
+
+    #[tokio::test]
+    async fn unfed_turns_per_fed_turn_are_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = CostLimits::default();
+        let lines = fed_then_unfed_turns(MAX_UNFED_TURNS_PER_FED_TURN as usize + 1, false);
+        let slot = replay_fed_turn_then_between_turns(dir.path(), &lines, &limits).await;
+        let breach = slot
+            .pending_watchdog_breach
+            .clone()
+            .expect("unbounded self-continuation must breach");
+        assert!(breach.contains("self-continued"), "{breach}");
+        slot.kill_and_reap().await;
+
+        // At the cap: still tolerated.
+        let lines = fed_then_unfed_turns(MAX_UNFED_TURNS_PER_FED_TURN as usize, false);
+        let slot = replay_fed_turn_then_between_turns(dir.path(), &lines, &limits).await;
+        assert!(slot.pending_watchdog_breach.is_none());
+        slot.kill_and_reap().await;
+    }
+
+    #[tokio::test]
+    async fn task_wall_clock_bounds_a_self_acting_slot_between_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = CostLimits {
+            max_task_wall_secs: Some(10),
+            ..Default::default()
+        };
+        // Background work re-armed between turns, no unfed result yet (an
+        // unfed result is already checked against every budget on arrival).
+        let mut lines = fed_then_unfed_turns(0, false);
+        lines.push(
+            r#"{"type":"system","subtype":"task_started","task_id":"b1","description":"sleep 270"}"#
+                .into(),
+        );
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut slot = claude_replay_slot(dir.path(), &refs, "sleep 5");
+        slot.task_started_at = std::time::Instant::now() - std::time::Duration::from_secs(20);
+        slot.draining = true;
+        for _ in 0..40 {
+            if drain_events(&mut slot, dir.path(), "worker", &CostLimits::default())
+                .await
+                .unwrap()
+                .is_none()
+                && !slot.draining
+            {
+                break;
+            }
+        }
+        let mut breach = None;
+        for _ in 0..20 {
+            breach = actionable_slot_breach(&mut slot, dir.path(), "worker", &limits)
+                .await
+                .unwrap();
+            if breach.is_some() {
+                break;
+            }
+        }
+        let breach = breach.expect("self-acting slot past task wall must breach");
+        assert!(breach.contains("wall"), "{breach}");
+        slot.kill_and_reap().await;
+
+        // Negative: a quiet slot awaiting its next turn keeps the established
+        // between-turn semantics (no wall-clock teardown while idle).
+        let lines = fed_then_unfed_turns(0, false);
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut quiet = claude_replay_slot(dir.path(), &refs, "sleep 5");
+        quiet.task_started_at = std::time::Instant::now() - std::time::Duration::from_secs(20);
+        quiet.draining = true;
+        for _ in 0..40 {
+            drain_events(&mut quiet, dir.path(), "worker", &CostLimits::default())
+                .await
+                .unwrap();
+            if !quiet.draining {
+                break;
+            }
+        }
+        for _ in 0..5 {
+            assert!(
+                actionable_slot_breach(&mut quiet, dir.path(), "worker", &limits)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        quiet.kill_and_reap().await;
+    }
+
+    #[tokio::test]
+    async fn new_daemon_turn_clears_previous_reaction_before_feeding() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reaction.db");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let config = dormant_codex_test_config(db_path.clone(), worktree, None);
+        let mut slot = claude_replay_slot(dir.path(), &[], "sleep 5");
+        slot.agent_state = Some("needs-info".into());
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            journal::upsert(&mut conn, &slot_journal_entry(&slot, "worker", "working")).unwrap();
+        }
+        assert!(slot_is_reaction_park_candidate(&slot));
+
+        feed_worker_turn(&mut slot, "MESSAGE from boss: here is the info", &config)
+            .await
+            .unwrap();
+
+        assert!(slot.agent_state.is_none());
+        assert!(
+            !slot_is_reaction_park_candidate(&slot),
+            "a reaction from the previous turn must not park the new one"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let state: Option<String> = conn
+            .query_row(
+                "SELECT agent_state FROM journal WHERE agent=?1",
+                [&slot.agent_name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(state.is_none(), "journal reaction must be cleared too");
+        slot.kill_and_reap().await;
+    }
+
+    #[tokio::test]
+    async fn between_turn_idle_reap_spares_busy_worker_until_busy_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let started =
+            fixture_prefix_through(CLAUDE_BETWEEN_TURNS_FIXTURE, "system", Some("task_started"));
+        let mut lines: Vec<&str> = started.iter().map(String::as_str).collect();
+        lines.push(r#"{"type":"result","result":"started"}"#);
+        let mut slot = claude_replay_slot(dir.path(), &lines, "sleep 5");
+        run_turn_then_observe_between_turns(&mut slot, dir.path()).await;
+        assert!(slot.has_outstanding_provider_work());
+
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(1000));
+        assert!(
+            !slot_is_idle_zombie_candidate(&slot, 900, 3600),
+            "a worker waiting on its background task is not a zombie"
+        );
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(3601));
+        assert!(
+            slot_is_idle_zombie_candidate(&slot, 900, 3600),
+            "busy idle is bounded"
+        );
+        // A busy cap below the plain idle limit never shortens it.
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(800));
+        assert!(!slot_is_idle_zombie_candidate(&slot, 900, 60));
+        slot.kill_and_reap().await;
+
+        // Negative: an idle worker without outstanding work is still reaped.
+        let mut idle = make_dummy_slot_async().await;
+        idle.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(1000));
+        assert!(slot_is_idle_zombie_candidate(&idle, 900, 3600));
+        idle.kill_and_reap().await;
+    }
+
+    #[tokio::test]
+    async fn feed_discards_stale_result_backlog_so_next_turn_is_attributed_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        // R1 ends the fed turn; R2 is a self-continued turn's result sitting
+        // in the pipe when the daemon feeds; R3 answers the new feed.
+        let mut slot = claude_replay_slot(
+            dir.path(),
+            &[
+                r#"{"type":"result","result":"r1","total_cost_usd":1.0}"#,
+                r#"{"type":"result","result":"r2","total_cost_usd":2.0}"#,
+            ],
+            r#"read -r _; printf '%s\n' '{"type":"result","result":"r3","total_cost_usd":3.0}'; sleep 5"#,
+        );
+        slot.draining = true;
+        for _ in 0..40 {
+            drain_events(&mut slot, dir.path(), "worker", &CostLimits::default())
+                .await
+                .unwrap();
+            if !slot.draining {
+                break;
+            }
+        }
+        assert_eq!(slot.cost_usd, 1.0);
+        // Give the stale line time to land in the pipe before the feed.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        feed_persistent_turn(&mut slot, &agent::user_turn("next"), &CostLimits::default())
+            .await
+            .unwrap();
+        slot.draining = true;
+        for _ in 0..40 {
+            drain_events(&mut slot, dir.path(), "worker", &CostLimits::default())
+                .await
+                .unwrap();
+            if !slot.draining {
+                break;
+            }
+        }
+        assert!(!slot.draining);
+        assert_eq!(
+            slot.cost_usd, 3.0,
+            "the fed turn must complete on its own result, not the stale backlog"
+        );
+        slot.kill_and_reap().await;
+    }
+
     #[test]
     fn stream_read_poll_is_short_for_claude_and_codex_but_preserves_grok_evidence_window() {
         assert_eq!(
@@ -39277,7 +40255,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         workers[0].turn_ended_at =
             Some(std::time::Instant::now() - std::time::Duration::from_secs(3600));
         assert!(
-            !slot_is_idle_zombie_candidate(&workers[0], 300),
+            !slot_is_idle_zombie_candidate(&workers[0], 300, 3600),
             "watchdog must not reap a dormant awaiting-review slot"
         );
 
@@ -41850,7 +42828,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(400));
 
         assert!(
-            !slot_is_idle_zombie_candidate(&slot, 300),
+            !slot_is_idle_zombie_candidate(&slot, 300, 3600),
             "dormant awaiting-review slot must survive the idle watchdog"
         );
     }
@@ -41863,12 +42841,12 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         slot.draining = false;
         slot.error_turn_count = 0;
         slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(400));
-        assert!(slot_is_idle_zombie_candidate(&slot, 300));
+        assert!(slot_is_idle_zombie_candidate(&slot, 300, 3600));
         slot.draining = true;
-        assert!(!slot_is_idle_zombie_candidate(&slot, 300));
+        assert!(!slot_is_idle_zombie_candidate(&slot, 300, 3600));
         slot.draining = false;
         slot.error_turn_count = 1;
-        assert!(!slot_is_idle_zombie_candidate(&slot, 300));
+        assert!(!slot_is_idle_zombie_candidate(&slot, 300, 3600));
     }
 
     #[test]
@@ -41879,7 +42857,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(400));
         slot.pending_watchdog_breach = Some("task tokens exceeded".into());
 
-        assert!(!slot_is_idle_zombie_candidate(&slot, 300));
+        assert!(!slot_is_idle_zombie_candidate(&slot, 300, 3600));
         slot.error_turn_count = 1;
         assert!(!slot_is_error_refeed_candidate(&slot));
         assert!(!slot_is_graceful_drain_candidate(&slot));
@@ -41897,7 +42875,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
         assert!(slot_is_graceful_drain_candidate(&slot));
         slot.error_turn_count = 0;
-        assert!(slot_is_idle_zombie_candidate(&slot, 300));
+        assert!(slot_is_idle_zombie_candidate(&slot, 300, 3600));
     }
 
     #[test]

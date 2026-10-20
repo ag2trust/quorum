@@ -1217,10 +1217,28 @@ impl RunnerProc {
     /// Normalize a line for immediate stream delivery. Grok terminal records
     /// are raw evidence first; their lifecycle events are exposed separately
     /// only after the adapter proves terminal process evidence is complete.
-    pub fn normalize_stream_line(&self, raw: &str) -> Vec<AgentEvent> {
+    pub fn normalize_stream_line(&mut self, raw: &str) -> Vec<AgentEvent> {
         match self {
             Self::Grok(_) => GrokProc::normalize_stream_line(raw),
-            Self::Claude(_) | Self::Codex(_) => normalize_line(self.kind(), raw),
+            Self::Claude(proc) => proc.normalize_stream_line(raw),
+            Self::Codex(_) => normalize_line(self.kind(), raw),
+        }
+    }
+
+    /// True while the provider has a tool call or background task that has
+    /// not finished. Only Claude's persistent child reports this today.
+    pub fn has_outstanding_work(&self) -> bool {
+        matches!(self, Self::Claude(proc) if proc.has_outstanding_work())
+    }
+
+    pub fn unfed_turn_open(&self) -> bool {
+        matches!(self, Self::Claude(proc) if proc.unfed_turn_open())
+    }
+
+    pub fn unfed_turns_since_feed(&self) -> u32 {
+        match self {
+            Self::Claude(proc) => proc.unfed_turns_since_feed(),
+            Self::Codex(_) | Self::Grok(_) => 0,
         }
     }
 
@@ -1464,6 +1482,20 @@ pub enum AgentEvent {
     /// events). Not terminal.
     MidTurnUsage {
         tokens: i64,
+    },
+    /// Provider progress without turn semantics: a tool call returned, a
+    /// background task changed state, or a provider record the daemon must
+    /// observe but never act on (e.g. a result for a turn it did not feed).
+    /// Refreshes the idle watchdog only.
+    Liveness {
+        summary: String,
+    },
+    /// Usage reported by a provider `result` for a turn the daemon did not
+    /// feed (self-continuation). Never terminal, but its spend still counts
+    /// against the slot's token and cost budgets.
+    UnfedTurnUsage {
+        usage: Option<TokenUsage>,
+        cost_usd: Option<f64>,
     },
 }
 
@@ -2855,9 +2887,26 @@ mod tests {
 
     #[test]
     fn normalize_unknown_event_type_is_inert() {
-        let line = r#"{"type":"system","message":"init"}"#;
+        let line = r#"{"type":"mystery","message":"init"}"#;
         let events = normalize_claude_line(line);
         assert!(events.is_empty(), "unknown events must be inert");
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#;
+        assert!(normalize_claude_line(line).is_empty());
+    }
+
+    #[test]
+    fn normalize_system_and_tool_result_lines_are_liveness_only() {
+        for line in [
+            r#"{"type":"system","subtype":"task_started","task_id":"b1","description":"tests"}"#,
+            r#"{"type":"system","subtype":"init"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#,
+        ] {
+            let events = normalize_claude_line(line);
+            assert!(
+                matches!(events.as_slice(), [AgentEvent::Liveness { .. }]),
+                "{line} must refresh liveness without turn semantics: {events:?}"
+            );
+        }
     }
 
     #[test]

@@ -687,6 +687,39 @@ task authority, and handles the resulting failure through the normal lifecycle r
 path. This detects a genuinely stalled process without treating a long, active turn as
 stalled.
 
+Claude stream-json liveness also includes `user` lines carrying `tool_result` blocks and
+every `system` line (including the background-task records `task_started`,
+`task_updated`, `task_notification`, and `background_tasks_changed`). The daemon tracks
+outstanding work per persistent Claude child: `tool_use` ids without a matching
+`tool_result`, and background tasks started but not finished. While any is outstanding,
+both the in-turn and the between-turn idle watchdog use `max_busy_idle_secs` (default
+3600, bounded to 1..=86400, never below the plain idle limit) instead of
+`max_idle_secs`. Busy is never unbounded: a hung tool is reaped at the busy ceiling.
+
+A persistent Claude child keeps running after its turn's `result` (background tasks
+complete; the CLI may self-continue). The daemon keeps reading its stdout between turns,
+with a bounded per-tick drain, to update liveness and outstanding-work tracking.
+The between-turn idle clock stays anchored on the end of the last daemon-fed turn.
+Outstanding work, or a self-continued turn still in progress, only selects the busy
+ceiling, so a persistent worker is reaped at most `max_busy_idle_secs` after its last
+daemon-fed turn. At most 8 self-continued turns are tolerated per daemon-fed turn.
+`max_task_wall_secs` is also checked between turns while the provider is acting on its
+own. A `result` for a
+turn the daemon did not feed never completes or fails a daemon turn, but its usage and
+cost are charged to the slot's token/cost budgets; a breach becomes a pending watchdog
+outcome and no further turn is fed. Every fed user turn
+carries a fresh `uuid`. Once the CLI reports that command as `queued`, only a `result`
+that arrives after its `started` record is attributed. If the command was never seen
+queued, the first `result` after the feed is attributed, so a turn can never wedge.
+Feeding a new turn clears the worker's previous reaction. Before
+feeding a turn, the daemon drains and discards the stale stdout backlog. Submissions
+arrive through the agent endpoint, so a self-continued worker that submits takes the
+normal delivery path.
+
+A persistent worker whose turn ends on an explicit `blocked`/`needs-info` reaction is
+parked through the same tasks-layer park as a turn-oriented runner exit
+(`park_persistent_worker_reaction`). It is not left to the idle reaper.
+
 `max_task_wall_secs` remains an optional hard wall-clock cap for one live worker,
 reviewer, or remediation slot. It spans all turns and continuations handled by that
 slot and is independent of event activity: a slot that continues emitting events still

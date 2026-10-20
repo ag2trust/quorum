@@ -97,6 +97,7 @@ primary = 100
 # max_turn_cost_usd = 5.0
 # max_task_cost_usd = 50.0
 # max_idle_secs = 900
+# max_busy_idle_secs = 3600 # idle limit while a tool call/background task is outstanding
 # max_task_wall_secs = 14400
 # idle_timeout_secs = 300 # legacy alias for max_idle_secs
 
@@ -1556,6 +1557,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             max_task_cost_usd,
             max_turn_wall_secs,
             max_idle_secs,
+            max_busy_idle_secs,
             max_task_wall_secs,
             idle_timeout_secs,
             allowed_tools,
@@ -1669,6 +1671,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     "quorum serve: WARNING: max_turn_wall_secs is deprecated; it now sets the max_idle_secs idle timeout when max_idle_secs is unset"
                 );
             }
+            let r_max_busy_idle = resolve_val(
+                max_busy_idle_secs,
+                file_cfg.max_busy_idle_secs,
+                serve_config::DEFAULT_MAX_BUSY_IDLE_SECS,
+            );
+            serve_config::validate_busy_idle_secs(r_max_busy_idle.value)
+                .map_err(QuorumError::Usage)?;
             let r_max_task_wall = resolve_opt(max_task_wall_secs, file_cfg.max_task_wall_secs);
             let r_idle_timeout = resolve_opt(idle_timeout_secs, file_cfg.idle_timeout_secs);
             let r_allowed_tools =
@@ -1783,6 +1792,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 self_update_drain: &r_self_update,
                 drain_timeout_secs: &r_drain_timeout,
                 max_idle_secs: &r_max_idle,
+                max_busy_idle_secs: &r_max_busy_idle,
                 max_task_wall_secs: &r_max_task_wall,
                 idle_timeout_secs: &r_idle_timeout,
                 max_turn_tokens: &r_max_turn_tokens,
@@ -1863,6 +1873,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     max_turn_cost_usd: r_max_turn_cost.value,
                     max_task_cost_usd: r_max_task_cost.value,
                     max_idle_secs: r_max_idle.value,
+                    max_busy_idle_secs: Some(r_max_busy_idle.value),
                     max_task_wall_secs: r_max_task_wall.value,
                     idle_timeout_secs: r_idle_timeout.value,
                 },
