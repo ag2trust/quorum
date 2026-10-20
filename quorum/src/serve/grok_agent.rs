@@ -29,7 +29,7 @@ use tokio::io::ReadBuf;
 use tokio::process::{Child, ChildStdout, Command};
 
 pub const DEFAULT_MODEL: &str = "grok-4.5";
-pub const SUPPORTED_MODELS: &[&str] = &[DEFAULT_MODEL, "grok-4.6"];
+pub const SUPPORTED_MODELS: &[&str] = &[DEFAULT_MODEL, "grok-4.6", "grok-4.7"];
 pub const SUPPORTED_EFFORTS: &[&str] = &["low", "medium", "high"];
 pub const DEFAULT_SANDBOX: &str = "off";
 pub const EXPLICIT_WORKSPACE_SANDBOX: &str = "workspace";
@@ -2436,7 +2436,7 @@ mod tests {
             let args = headless_args(&spec, LaunchMode::Normal).unwrap();
             assert!(args.windows(2).any(|pair| pair == ["--model", *model]));
         }
-        spec.model = "grok-4.7".into();
+        spec.model = "grok-4.7-build-fast".into();
         assert_eq!(
             headless_args(&spec, LaunchMode::Normal).unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput

@@ -32990,7 +32990,7 @@ mod tests {
 
     #[test]
     fn grok_resolves_for_workers_but_not_other_managed_roles() {
-        for model in ["grok-4.5", "grok-4.6"] {
+        for model in ["grok-4.5", "grok-4.6", "grok-4.7"] {
             assert_eq!(resolve_provider(model).unwrap(), runner::AgentKind::Grok);
             assert_eq!(
                 resolve_worker_provider(model).unwrap(),
@@ -33022,7 +33022,7 @@ mod tests {
             }
         }
 
-        let error = resolve_worker_provider("grok-4.7").unwrap_err();
+        let error = resolve_worker_provider("grok-4.7-build-fast").unwrap_err();
         assert!(error.to_string().contains("unknown model"), "{error}");
     }
 

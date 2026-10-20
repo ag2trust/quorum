@@ -2278,7 +2278,7 @@ emulation of Claude `allowedTools`/`bare`/hooks or Codex flags.
 First turn, conceptually:
 
 ```text
-grok -p <prompt> --output-format streaming-json --model <grok-4.5|grok-4.6>
+grok -p <prompt> --output-format streaming-json --model <grok-4.5|grok-4.6|grok-4.7>
   --reasoning-effort <low|medium|high>
   --permission-mode bypassPermissions --sandbox <off|workspace>
   --max-turns <1..256> --verbatim
@@ -2288,7 +2288,7 @@ Continuation, conceptually:
 
 ```text
 grok --resume <session-id> -p <prompt> --output-format streaming-json
-  --model <grok-4.5|grok-4.6> --reasoning-effort <low|medium|high>
+  --model <grok-4.5|grok-4.6|grok-4.7> --reasoning-effort <low|medium|high>
   --permission-mode bypassPermissions --sandbox <off|workspace>
   --max-turns <1..256> --verbatim
 ```
@@ -2340,7 +2340,7 @@ the session identity late, so no continuation may be relied on before `end`.
   `grok 1.0.5 (5115b46bc909)`. Its help exposes `-p`/`--single`,
   `--output-format streaming-json`, `--resume`, `--model`,
   `--reasoning-effort`, `--permission-mode`, `--sandbox`, and `--max-turns`.
-- The installed catalog exposed `grok-4.6` (default) and `grok-4.5`; its supported
+- The installed catalog exposes `grok-4.7` (default), `grok-4.6`, and `grok-4.5`; its supported
   effort choices were `low`, `medium`, and `high` (`high` default). The adapter
   therefore treats both vocabularies as closed rather than forwarding future strings
   optimistically.
@@ -2644,7 +2644,7 @@ sandbox, and the Grok state-root read/write grant are preserved for that opt-in 
 Broader Grok lifecycle validation (remediation, R1, R2, restart, shutdown, mailbox, and
 cost-limit canaries) remains outstanding as recorded below.
 
-`grok-4.5` and `grok-4.6` may be selected only by worker routing pools. Planner,
+`grok-4.5`, `grok-4.6`, and `grok-4.7` may be selected only by worker routing pools. Planner,
 arbiter, reviewer, classifier, and collector Grok selections are rejected at startup. The
 `[routing.arbiter]` pool selects the plan-review Arbiter and defaults to the planner pool
 when omitted, so an existing configuration without it keeps working. The `[grok]`
@@ -3072,7 +3072,7 @@ labels are ignored.
   creators cannot lower, raise, or choose an individual profile.
 - `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*`
   model), `AgentKind::Codex` (known OpenAI models including `gpt-5*`), or the exact
-  `AgentKind::Grok` models `grok-4.5` and `grok-4.6`. Managed worker resolution accepts
+  `AgentKind::Grok` models `grok-4.5`, `grok-4.6`, and `grok-4.7`. Managed worker resolution accepts
   Grok; planner, arbiter, reviewer, classifier, and collector routing reject it.
 - The resolved provider, model, and effort are persisted in `agent_runs.provider`
   so continuation and recovery cannot switch providers mid-task.
