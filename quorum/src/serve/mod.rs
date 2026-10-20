@@ -5749,6 +5749,19 @@ fn classifier_queue(
     Ok((tasks, dup_context))
 }
 
+/// Durable journal rows that represent live agent/provider work a freeze
+/// must drain. A `frozen-view` row is only a recovery marker for the
+/// coordinator's cached `git archive` tree: no process runs behind it, and a
+/// graph's own marker is always released before it re-freezes. Counting it
+/// would let one graph's leftover marker stall a different graph's drain.
+fn count_drain_blocking_journal_rows(conn: &rusqlite::Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM journal WHERE role!='frozen-view'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?)
+}
+
 fn decomposition_drain_ready(
     workers: usize,
     reviewers: usize,
@@ -8536,6 +8549,22 @@ async fn tick_decomposition(
             coordinator.graph_id, snapshot.graph_id
         )));
     }
+    if coordinator
+        .graph_id
+        .is_some_and(|previous| previous != snapshot.graph_id)
+    {
+        // The selected aggregate changed (e.g. an operator-retried graph went
+        // to provider backoff and a later graph won the planning freeze). No
+        // planner/classifier slot is live here (checked above), but the
+        // coordinator may still own the previous graph's cached frozen view,
+        // its durable `frozen-view` journal marker, an Arbiter, and a cached
+        // proposal. Settle all of it against the previous graph before
+        // adopting the new one: a leaked marker would count as durable
+        // in-flight work and stall the new graph in `draining`, and a cached
+        // proposal must never be consumed for a different aggregate. When
+        // the previous graph is selected again it resumes from durable state.
+        discard_removed_decomposition(&config.db_path, coordinator).await?;
+    }
     coordinator.graph_id = Some(snapshot.graph_id);
     coordinator.classifier_source_task_id = Some(snapshot.source_task_id);
     if coordinator.proposal.is_none() {
@@ -8641,9 +8670,7 @@ async fn tick_decomposition(
     }
     let durable_in_flight = {
         let conn = quorum_core::db::open(&config.db_path)?;
-        conn.query_row("SELECT count(*) FROM journal", [], |row| {
-            row.get::<_, i64>(0)
-        })?
+        count_drain_blocking_journal_rows(&conn)?
     };
     // Every task that had already started (working/in-review/rework) must reach
     // a terminal state before we capture the frozen base. The planning source
@@ -54941,6 +54968,135 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             )
             .unwrap();
         assert_eq!(state, ("planning".into(), true, Some(expected_sha)));
+    }
+
+    /// When the selected aggregate switches from graph A (now in provider
+    /// backoff, freeze released) to graph B (which won the planning freeze),
+    /// A's cached view, durable `frozen-view` marker, and cached proposal must
+    /// be settled. Before the fix the marker leaked and B sat in `draining`
+    /// forever because the drain counted it as in-flight work.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graph_switch_releases_previous_graph_view_so_new_graph_drains() {
+        let harness = lifecycle_harness("graph-switch-releases-view");
+        let graph_a = harness.graph;
+        let snapshot = {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            load_planning_snapshot(&conn).unwrap().unwrap()
+        };
+        assert_eq!(snapshot.graph_id, graph_a);
+        let mut coordinator = DecompositionCoordinator::default();
+        let view = retain_cached_frozen_planner_view(&harness.config, &mut coordinator, &snapshot)
+            .await
+            .unwrap();
+        coordinator.graph_id = Some(graph_a);
+        coordinator.proposal = Some(arbiter_gate_proposal());
+        assert!(view.exists());
+
+        let graph_b = {
+            let mut conn = quorum_core::db::open(&harness.db_path).unwrap();
+            // A provider failure releases A's freeze (provider backoff).
+            assert!(quorum_core::decomposition::record_attempt(
+                &mut conn,
+                graph_a,
+                "provider",
+                "planner-provider",
+                "bounded provider failure",
+                5,
+            )
+            .unwrap()
+            .is_some());
+            let source_b = tasks::create(
+                &mut conn,
+                "owner",
+                "second split source",
+                Some("split this too"),
+                1,
+                None,
+                None,
+                None,
+                None,
+                6,
+            )
+            .unwrap();
+            quorum_core::decomposition::begin_planning(
+                &mut conn,
+                &quorum_core::decomposition::BeginPlanning {
+                    source_task_id: source_b,
+                    expected_revision: 1,
+                    provider: "codex",
+                    model: "gpt-5.6-sol",
+                    frozen_base_sha: "unused",
+                    now: 7,
+                },
+            )
+            .unwrap()
+            .expect("graph B wins the released planning freeze")
+        };
+
+        // B owns the freeze, so the coordinator switches to it.
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(coordinator.graph_id, Some(graph_b));
+        assert!(
+            coordinator.frozen_view.is_none(),
+            "A's cached view released"
+        );
+        assert!(!view.exists());
+        assert!(
+            coordinator.proposal.is_none(),
+            "A's cached proposal must not carry over to B"
+        );
+        {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            let markers: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM journal WHERE role='frozen-view'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(markers, 0, "A's durable marker must not leak");
+        }
+        assert_eq!(arbiter_gate_state(&harness.db_path, graph_b).0, "draining");
+
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(
+            arbiter_gate_state(&harness.db_path, graph_b).0,
+            "planning",
+            "B must drain and capture its frozen base"
+        );
+        assert_eq!(
+            arbiter_gate_state(&harness.db_path, graph_a).0,
+            "provider-backoff",
+            "A keeps its durable state and resumes once B releases the freeze"
+        );
+    }
+
+    /// A `frozen-view` row is a recovery marker for a cached archive, not live
+    /// work; only rows with a live agent behind them block a freeze drain.
+    #[test]
+    fn drain_journal_count_ignores_frozen_view_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_test_db(dir.path());
+        for (agent, role) in [
+            ("decomposition-frozen-view-1", "frozen-view"),
+            ("decomposition-frozen-view-2", "frozen-view"),
+        ] {
+            conn.execute(
+                "INSERT INTO journal(agent,role,session_id,phase,updated_at)
+                 VALUES (?1,?2,'sha','frozen-view',1)",
+                rusqlite::params![agent, role],
+            )
+            .unwrap();
+        }
+        assert_eq!(count_drain_blocking_journal_rows(&conn).unwrap(), 0);
+        conn.execute(
+            "INSERT INTO journal(agent,role,session_id,phase,updated_at)
+             VALUES ('decomposition-planner-3','planner','run','planner',1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(count_drain_blocking_journal_rows(&conn).unwrap(), 1);
     }
 
     /// A classifier rejection returns the proposal to the planner retry path

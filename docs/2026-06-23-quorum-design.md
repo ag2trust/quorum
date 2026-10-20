@@ -2668,7 +2668,13 @@ retry count/cap without exposing planner transcripts.
 Reviewer provisioning reserves task authority in `BEGIN IMMEDIATE` before external resolution or
 process creation. The same transaction checks task phase, classification, and planning freeze;
 planning freeze acquisition excludes live reservations. The daemon releases the reservation only
-after reviewer attachment or complete failed-provision cleanup.
+after reviewer attachment or complete failed-provision cleanup. Because the freeze drain waits for
+every already-started task, the ordinary classifier keeps running under a freeze for exactly that
+started set (`working`, `in-review`, `rework` — e.g. a review-only task created during the freeze,
+whose reviewer cannot dispatch unclassified); `open` tasks wait for the freeze to clear. The drain
+counts only journal rows with live work behind them, never a cached frozen-view marker, and the
+coordinator settles a previous graph's cached view, marker, and proposal whenever the selected
+aggregate changes.
 
 One `BEGIN IMMEDIATE` transaction creates the entire graph: every generated task with
 `terminal_leaf=1`, classification, edge, membership/provenance row, source `planning ->
