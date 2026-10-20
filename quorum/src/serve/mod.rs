@@ -5713,6 +5713,42 @@ struct DecompositionLiveWork {
     pre_review_checks: bool,
 }
 
+/// Select the ordinary classifier's next queue and its duplicate context.
+///
+/// Outside a decomposition freeze every unclassified task is eligible. Under
+/// a freeze only already-started work is: the freeze exists so no new
+/// implementation starts while the planner captures a quiescent frozen base,
+/// and an `open` task's classification would only feed a claim (or a planning
+/// source selection) the freeze already forbids. Started work — chiefly a
+/// review-only task created `in-review` during the freeze — is the opposite
+/// case: the drain counts it (`count_started_non_terminal_excluding`) and its
+/// reviewer cannot dispatch unclassified, so gating it would deadlock the
+/// drain against itself.
+fn classifier_queue(
+    conn: &rusqlite::Connection,
+    decomposition_freeze: bool,
+) -> Result<(
+    Vec<quorum_core::classify::TaskForClassification>,
+    Vec<quorum_core::classify::TaskForClassification>,
+)> {
+    let tasks = if decomposition_freeze {
+        quorum_core::classify::unclassified_started_tasks(conn)?
+    } else {
+        quorum_core::classify::unclassified_tasks(conn)?
+    };
+    if tasks.is_empty() {
+        return Ok((vec![], vec![]));
+    }
+    let all_open = quorum_core::classify::dup_context_tasks(conn)?;
+    let task_ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
+    let dup_context: Vec<_> = all_open
+        .into_iter()
+        .filter(|t| !task_ids.contains(&t.id))
+        .take(quorum_core::classify::DUP_CONTEXT_LIMIT)
+        .collect();
+    Ok((tasks, dup_context))
+}
+
 fn decomposition_drain_ready(
     workers: usize,
     reviewers: usize,
@@ -17286,26 +17322,16 @@ async fn tick(
             *classifier_backoff_until = None;
         }
     }
-    if classifier_slot.is_none()
-        && !drain_state.draining
-        && !decomposition_freeze
-        && classifier_backoff_until.is_none()
-    {
+    // A decomposition freeze does not stop the classifier outright: already
+    // started work (notably a review-only task, created `in-review` and
+    // unclassified) must classify before its reviewer can dispatch, and the
+    // freeze's own drain waits for that work to finish. `classifier_queue`
+    // narrows the freeze-time queue to that started set.
+    if classifier_slot.is_none() && !drain_state.draining && classifier_backoff_until.is_none() {
         let p = db_path.clone();
         let unclassified = tokio::task::spawn_blocking(move || -> Result<(Vec<quorum_core::classify::TaskForClassification>, Vec<quorum_core::classify::TaskForClassification>)> {
             let conn = quorum_core::db::open(&p)?;
-            let tasks = quorum_core::classify::unclassified_tasks(&conn)?;
-            if tasks.is_empty() {
-                return Ok((vec![], vec![]));
-            }
-            let all_open = quorum_core::classify::dup_context_tasks(&conn)?;
-            let task_ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
-            let dup_context: Vec<_> = all_open
-                .into_iter()
-                .filter(|t| !task_ids.contains(&t.id))
-                .take(quorum_core::classify::DUP_CONTEXT_LIMIT)
-                .collect();
-            Ok((tasks, dup_context))
+            classifier_queue(&conn, decomposition_freeze)
         })
         .await
         .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
@@ -47897,6 +47923,102 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 .head_sha,
             "gated-sha"
         );
+    }
+
+    /// Deadlock regression (task 410 / review-only 417): a review-only task
+    /// created while an unrelated decomposition freeze drains is `in-review`
+    /// and unclassified. The drain waits for it, and its reviewer cannot
+    /// dispatch until it is classified, so the freeze-time classifier queue
+    /// must admit it — while still withholding `open` work the freeze exists
+    /// to hold back.
+    #[test]
+    fn freeze_time_classifier_queue_admits_started_review_only_task_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_test_db(dir.path());
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('decomp source','planning','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let source_task_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 created_at,updated_at)
+             VALUES (?1,'draining',0,1,1,1,1)",
+            [source_task_id],
+        )
+        .unwrap();
+        let open_task = tasks::create(
+            &mut conn, "owner", "new work", None, 10, None, None, None, None, 2,
+        )
+        .unwrap();
+        let review_only = tasks::create(
+            &mut conn,
+            "owner",
+            "review PR #471",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(471),
+            3,
+        )
+        .unwrap();
+        let task = tasks::get(&conn, review_only).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert!(
+            !tasks::classification_is_dispatchable_for_status(
+                &task.refs,
+                true,
+                None,
+                false,
+                "in-review"
+            ),
+            "an unclassified review-only task cannot dispatch its reviewer"
+        );
+        // The drain is held by exactly this task until it reaches terminal.
+        assert_eq!(
+            tasks::count_started_non_terminal_excluding(&conn, source_task_id).unwrap(),
+            1
+        );
+
+        let (frozen, dup_context) = classifier_queue(&conn, true).unwrap();
+        assert_eq!(
+            frozen.iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec![review_only],
+            "under a freeze only started work may be classified"
+        );
+        assert!(dup_context.iter().all(|task| task.id != review_only));
+
+        let (unfrozen, _) = classifier_queue(&conn, false).unwrap();
+        assert_eq!(
+            unfrozen.first().map(|task| task.id),
+            Some(open_task),
+            "without a freeze the full queue keeps priority order"
+        );
+
+        // Once classified, the review-only task becomes reviewer-dispatchable,
+        // so the drain can make progress.
+        conn.execute(
+            "UPDATE tasks SET refs=json_set(COALESCE(refs,'{}'),
+                 '$.cx_est',3,'$.cx_size','M','$.cx_ready',json('true'),
+                 '$.cx_not_ready_reason',json('null'),'$.cx_by','test:v2')
+             WHERE id=?1",
+            [review_only],
+        )
+        .unwrap();
+        let task = tasks::get(&conn, review_only).unwrap().unwrap();
+        assert!(tasks::classification_is_dispatchable_for_status(
+            &task.refs,
+            true,
+            None,
+            false,
+            "in-review"
+        ));
+        assert!(classifier_queue(&conn, true).unwrap().0.is_empty());
     }
 
     #[test]
