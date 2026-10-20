@@ -3664,7 +3664,7 @@ where
         &tx,
         &event_kind,
         &lease_target(id),
-        &format!("by {agent}"),
+        &format!("by {agent}{}", event_cause_suffix(event)),
         now,
     )?;
 
@@ -3695,6 +3695,36 @@ where
         task: result_task,
         effects,
     })
+}
+
+const EVENT_CAUSE_MAX_CHECKS: usize = 5;
+const EVENT_CAUSE_MAX_CHECK_CHARS: usize = 80;
+
+/// Durable cause appended to the lifecycle event detail for system-driven rework.
+/// The `ci_remediation_*` refs that also carry this are cleared on the next push, so the
+/// event row is the only lasting record of why the task re-entered rework. Bounded so a
+/// pathological check list cannot grow the events table.
+fn event_cause_suffix(event: &Event) -> String {
+    match event {
+        Event::ChecksFailed { checks } => {
+            let mut names: Vec<String> = checks
+                .iter()
+                .take(EVENT_CAUSE_MAX_CHECKS)
+                .map(|c| {
+                    c.chars()
+                        .map(|ch| if ch.is_control() { ' ' } else { ch })
+                        .take(EVENT_CAUSE_MAX_CHECK_CHARS)
+                        .collect::<String>()
+                })
+                .collect();
+            if checks.len() > EVENT_CAUSE_MAX_CHECKS {
+                names.push(format!("+{} more", checks.len() - EVENT_CAUSE_MAX_CHECKS));
+            }
+            format!(": ci checks failed: {}", names.join(", "))
+        }
+        Event::MergeConflict => ": merge conflict".to_string(),
+        _ => String::new(),
+    }
 }
 
 fn clear_runner_retry_refs(refs: Option<&str>) -> Result<Option<String>> {
@@ -14803,6 +14833,69 @@ mod tests {
             None,
             "successful rework submission must consume durable CI intent"
         );
+        // The refs are gone, but the rework event still records the cause.
+        let body: String = c
+            .query_row(
+                "SELECT body FROM events WHERE subject=?1 AND kind='task_rework'",
+                [format!("task#{id}")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, "by system: ci checks failed: fmt, test");
+    }
+
+    #[test]
+    fn rework_event_cause_is_bounded_and_covers_merge_conflict() {
+        let long = "x".repeat(500);
+        let many: Vec<String> = (0..9).map(|i| format!("job{i}")).collect();
+        let suffix = event_cause_suffix(&Event::ChecksFailed { checks: many });
+        assert_eq!(
+            suffix,
+            ": ci checks failed: job0, job1, job2, job3, job4, +4 more"
+        );
+        let suffix = event_cause_suffix(&Event::ChecksFailed {
+            checks: vec![format!("{long}\nz")],
+        });
+        assert!(suffix.len() < 120 && !suffix.contains('\n'), "{suffix}");
+        assert_eq!(
+            event_cause_suffix(&Event::MergeConflict),
+            ": merge conflict"
+        );
+        assert_eq!(event_cause_suffix(&Event::VerdictApprove), "");
+
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c, "boss", "conflict", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "W1",
+            id,
+            &Event::SignaledDone { pr: "9".into() },
+            1100,
+        )
+        .unwrap();
+        apply_event(
+            &mut c,
+            "R1",
+            id,
+            &Event::ReviewerAttached { agent: "R1".into() },
+            1110,
+        )
+        .unwrap();
+        apply_event(&mut c, "R1", id, &Event::VerdictApprove, 1120).unwrap();
+        apply_actionable_rework_event(&mut c, "system", id, &Event::MergeConflict, "rebase", 1130)
+            .unwrap();
+        let body: String = c
+            .query_row(
+                "SELECT body FROM events WHERE subject=?1 AND kind='task_rework'",
+                [format!("task#{id}")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, "by system: merge conflict");
     }
 
     #[test]
