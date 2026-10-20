@@ -401,10 +401,13 @@ async fn identical_dirty_state_dedupes_only_against_trusted_snapshots() {
 async fn gc_snapshots_dirty_orphan_before_removal_with_daemon_attribution() {
     let f = fixture();
     let mgr = WorktreeManager::new();
-    let (wt, _branch) = provision_worker(&mgr, &f, 30).await;
+    let (wt, branch) = provision_worker(&mgr, &f, 30).await;
     std::fs::write(wt.join("untracked.rs"), "keep me\n").unwrap();
+    let allocations = vec![(30, branch, wt.to_string_lossy().into_owned())];
 
-    let gc = mgr.gc_orphaned_detailed(&f.repo, &f.base, &[], &[]).await;
+    let gc = mgr
+        .gc_orphaned_detailed(&f.repo, &f.base, &[], &allocations)
+        .await;
 
     assert_eq!(gc.removed.len(), 1);
     assert!(gc.preserve_failures.is_empty());
@@ -413,7 +416,7 @@ async fn gc_snapshots_dirty_orphan_before_removal_with_daemon_attribution() {
     assert_eq!(
         refs.len(),
         1,
-        "daemon-named dir + daemon branch attributes to the task"
+        "allocation-matched path and branch attribute to the task"
     );
     assert_eq!(gc.preserved[0].refname, refs[0]);
     assert_eq!(
@@ -426,12 +429,15 @@ async fn gc_snapshots_dirty_orphan_before_removal_with_daemon_attribution() {
 async fn gc_never_attributes_from_a_worker_chosen_branch() {
     let f = fixture();
     let mgr = WorktreeManager::new();
-    let (wt, _branch) = provision_worker(&mgr, &f, 31).await;
+    let (wt, branch) = provision_worker(&mgr, &f, 31).await;
+    let allocations = vec![(31, branch, wt.to_string_lossy().into_owned())];
     // The worker switches its checkout to a branch naming another task.
     git(&wt, &["checkout", "-q", "-b", "daemon/anvil-t99"]);
     std::fs::write(wt.join("tracked.txt"), "injected\n").unwrap();
 
-    let gc = mgr.gc_orphaned_detailed(&f.repo, &f.base, &[], &[]).await;
+    let gc = mgr
+        .gc_orphaned_detailed(&f.repo, &f.base, &[], &allocations)
+        .await;
 
     assert_eq!(gc.removed.len(), 1);
     assert!(
@@ -453,45 +459,75 @@ async fn gc_never_attributes_from_a_worker_chosen_branch() {
     assert_eq!(unattributed.lines().count(), 1);
 }
 
+#[tokio::test]
+async fn gc_never_attributes_a_forged_daemon_shaped_worktree() {
+    let f = fixture();
+    let mgr = WorktreeManager::new();
+    let (real_wt, real_branch) = provision_worker(&mgr, &f, 34).await;
+    let allocations = vec![(34, real_branch, real_wt.to_string_lossy().into_owned())];
+    // A worker forges a perfectly daemon-shaped checkout for task 99.
+    let forged = f.base.join("anvil-t99");
+    git(
+        &f.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "daemon/anvil-t99",
+            &forged.to_string_lossy(),
+            "origin/main",
+        ],
+    );
+    std::fs::write(forged.join("backdoor.rs"), "evil\n").unwrap();
+
+    let gc = mgr
+        .gc_orphaned_detailed(&f.repo, &f.base, &[real_wt.to_str().unwrap()], &allocations)
+        .await;
+
+    assert_eq!(gc.removed.len(), 1);
+    assert!(
+        recover_refs(&f.repo, 99).is_empty(),
+        "never credited to task 99"
+    );
+    assert_eq!(gc.preserved.len(), 1);
+    assert!(gc.preserved[0]
+        .refname
+        .starts_with("refs/quorum-recover/unattributed/"));
+}
+
 #[test]
-fn daemon_attribution_requires_daemon_assigned_branch_for_the_directory() {
-    let dir = Path::new("/wt/Anvil-t5");
+fn daemon_attribution_requires_a_matching_allocation_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("Anvil-t5");
+    std::fs::create_dir(&dir).unwrap();
     let alloc = vec![(
         5,
-        "daemon/reserved-x".to_string(),
-        "/wt/Anvil-t5".to_string(),
+        "daemon/anvil-t5".to_string(),
+        dir.to_string_lossy().into_owned(),
     )];
     assert_eq!(
-        daemon_attribution(dir, Some("refs/heads/daemon/anvil-t5"), &[]),
+        daemon_attribution(&dir, Some("refs/heads/daemon/anvil-t5"), &alloc),
         Some(5)
     );
+    // Daemon-shaped names alone are never enough.
     assert_eq!(
-        daemon_attribution(dir, Some("refs/heads/remediation/anvil-t5"), &[]),
-        Some(5)
-    );
-    assert_eq!(
-        daemon_attribution(dir, Some("refs/heads/daemon/reserved-x"), &alloc),
-        Some(5)
-    );
-    assert_eq!(
-        daemon_attribution(dir, Some("refs/heads/daemon/reserved-x"), &[]),
+        daemon_attribution(&dir, Some("refs/heads/daemon/anvil-t5"), &[]),
         None
     );
     assert_eq!(
-        daemon_attribution(dir, Some("refs/heads/daemon/anvil-t6"), &[]),
+        daemon_attribution(&dir, Some("refs/heads/remediation/anvil-t5"), &alloc),
         None
     );
     assert_eq!(
-        daemon_attribution(dir, Some("refs/heads/daemon/other-t5"), &[]),
+        daemon_attribution(&dir, Some("refs/heads/daemon/anvil-t6"), &alloc),
         None
     );
-    assert_eq!(daemon_attribution(dir, None, &[]), None);
+    assert_eq!(daemon_attribution(&dir, None, &alloc), None);
+    let other = tmp.path().join("Anvil-t6");
+    std::fs::create_dir(&other).unwrap();
     assert_eq!(
-        daemon_attribution(
-            Path::new("/wt/review-pr-5"),
-            Some("refs/heads/review/pr-5-x"),
-            &[]
-        ),
+        daemon_attribution(&other, Some("refs/heads/daemon/anvil-t5"), &alloc),
         None
     );
 }
@@ -752,12 +788,7 @@ async fn resume_worktree_fast_forwards_then_restores_uncommitted() {
 }
 
 #[test]
-fn task_id_parsing_from_daemon_names() {
-    assert_eq!(task_id_from_name("Anvil-x6tt-t318"), Some(318));
-    assert_eq!(task_id_from_name("Anvil-t12"), Some(12));
-    assert_eq!(task_id_from_name("review-pr-55"), None);
-    assert_eq!(task_id_from_name("x-t"), None);
-    assert_eq!(task_id_from_name("x-t0"), None);
+fn recover_ref_task_id_parsing() {
     assert_eq!(
         recover_ref_task_id("refs/quorum-recover/t12/1/a/b"),
         Some(12)

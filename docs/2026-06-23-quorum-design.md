@@ -2342,10 +2342,12 @@ names the recorded SHA and, for a snapshot, that it is a single-parent `quorum-d
 commit on the recorded parent; anything else fails loudly and is not applied. Unrecorded
 refs in a task's bucket are logged and ignored, never count as preserving a worker's
 commits, and are not retention candidates. Task attribution comes only from
-daemon-controlled data: the slot or allocation for teardown paths, the durable cleanup
-intent for `remove_exact`, and for startup GC the daemon-created `<agent>-t<id>` directory
-name plus a registered branch equal to the daemon-assigned branch for that directory (the
-recorded allocation, or `daemon/`/`remediation/<agent>-t<id>`). Anything else goes to the
+daemon-controlled provisioning records: the slot for teardown paths, the durable cleanup
+intent for `remove_exact`, and for startup GC and a leftover checkout found when the next
+worker is provisioned, a recorded allocation (`task_branches`, or the daemon-written worker
+journal for run-unique remediation checkouts) whose worktree path AND branch both equal the
+checkout's registered path and branch. Directory and branch names alone are
+worker-forgeable and never attribute. Anything else goes to the
 `unattributed` bucket (bounded, never resumed).
 
 Fail-safe: if the snapshot fails, nothing is removed or deleted, and an `errors` row

@@ -1038,8 +1038,9 @@ pub(crate) async fn recover(
                 .map(|recovery| recovery.intent.worktree.as_str()),
         )
         .collect::<Vec<_>>();
-    // Attribution uses only daemon-controlled allocation records and the
-    // daemon-created directory names, never a worker-writable branch alone.
+    // Attribution uses only daemon-controlled provisioning records (task
+    // allocations and the worker journal): a worktree's path AND registered
+    // branch must both match one. Names alone are worker-forgeable.
     let allocations = {
         let db_path = config.db_path.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<(i64, String, String)>> {
@@ -1053,6 +1054,26 @@ pub(crate) async fn recover(
         .await
         .map_err(|e| QuorumError::Io(format!("allocation lookup join: {e}")))??
     };
+    // Remediation checkouts are run-unique and recorded only in the worker
+    // journal (daemon-written) captured at the start of recovery.
+    let allocations: Vec<(i64, String, String)> = allocations
+        .into_iter()
+        .chain(
+            entries
+                .iter()
+                .filter(|entry| entry.role == "worker")
+                .filter_map(|entry| {
+                    Some((
+                        entry.task_id?,
+                        entry
+                            .local_branch
+                            .clone()
+                            .or_else(|| entry.branch.clone())?,
+                        entry.worktree.clone()?,
+                    ))
+                }),
+        )
+        .collect();
     let gc = wt_mgr
         .gc_orphaned_detailed(
             &config.repo_dir,

@@ -58667,4 +58667,87 @@ exec /bin/cat '{stdout}'
             "unrecorded refs are not retention candidates"
         );
     }
+
+    /// A worker forges a checkout at another task's allocated worktree path
+    /// on a non-allocated branch. The next worker of that task preserves it
+    /// unattributed and never resumes it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn forged_leftover_checkout_is_preserved_unattributed_and_not_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = recover_fixture_repo(dir.path());
+        let db_path = dir.path().join("quorum.db");
+        let task_id = recover_fixture_task(&db_path);
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo.clone());
+        config.worktree_base = dir.path().join("worktrees");
+        config.agent_bin = Some(
+            fake_stdin_holding_agent(dir.path(), "hold-worker")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let base = sync_fixture_git(&repo, &["rev-parse", "origin/main"]);
+
+        // First run records the allocation, then is reaped with no work.
+        let first = recover_spawn(&config, &wt_mgr, &mut names).await;
+        let wt = first.worktree_path.clone();
+        reap_idle_zombie_worker(&config, &wt_mgr, &mut names, first, 999, 10).await;
+        assert!(!wt.exists());
+        assert!(recover_refs_for(&repo, task_id).is_empty());
+
+        // Forge a checkout at the allocated path on a non-allocated branch.
+        sync_fixture_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "daemon/evil",
+                wt.to_str().unwrap(),
+                "origin/main",
+            ],
+        );
+        std::fs::write(wt.join("backdoor.rs"), "evil\n").unwrap();
+
+        let second = recover_spawn(&config, &wt_mgr, &mut names).await;
+
+        assert_eq!(
+            sync_fixture_git(&second.worktree_path, &["rev-parse", "HEAD"]),
+            base
+        );
+        assert!(!second.worktree_path.join("backdoor.rs").exists());
+        assert!(
+            recover_refs_for(&repo, task_id).is_empty(),
+            "never trusted for the task"
+        );
+        let unattributed = sync_fixture_git(
+            &repo,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/quorum-recover/unattributed",
+            ],
+        );
+        assert_eq!(
+            unattributed.lines().count(),
+            1,
+            "the forged work is still preserved"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert!(quorum_core::recover_refs::for_task(&conn, task_id)
+            .unwrap()
+            .is_empty());
+        let notes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_notes WHERE task_id=?1 AND agent='daemon'",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(notes, 0, "nothing was resumed");
+        drop(conn);
+        second.kill_and_reap().await;
+    }
 }

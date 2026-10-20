@@ -174,48 +174,26 @@ fn recover_component(value: &str) -> String {
     }
 }
 
-/// Task id from a daemon-created worktree directory name (`<agent>-t<id>`).
-pub(crate) fn task_id_from_name(name: &str) -> Option<i64> {
-    let (_, digits) = name.rsplit_once("-t")?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse::<i64>().ok().filter(|id| *id > 0)
-}
-
-/// Attribute an orphaned worktree to a task using only daemon-controlled
-/// data: the daemon-created directory name, and the branch the daemon
-/// assigned to that directory. The registered branch is worker-writable, so
-/// it is only accepted when it equals a daemon-assigned branch for this exact
-/// directory: the recorded allocation `(task_id, branch, worktree)`, or the
-/// daemon's deterministic `daemon/<agent>-t<id>` / `remediation/<agent>-t<id>`
-/// name for `<agent>-t<id>`. Anything else is unattributed.
+/// Attribute a worktree to a task using only daemon-controlled provisioning
+/// records `(task_id, branch, worktree)`: the registered branch AND the path
+/// must both equal one record. Directory and branch names are worker-forgeable
+/// (`git worktree add <root>/<x>-t<id> -b daemon/<x>-t<id>`), so no name-based
+/// shortcut exists. No match means unattributed (never trusted or resumed).
 pub(crate) fn daemon_attribution(
     path: &Path,
     registered_branch: Option<&str>,
     allocations: &[(i64, String, String)],
 ) -> Option<i64> {
-    let dir_name = path.file_name()?.to_str()?;
-    let task_id = task_id_from_name(dir_name)?;
     let branch = registered_branch?.strip_prefix("refs/heads/")?;
-    let agent = dir_name.rsplit_once("-t")?.0.to_lowercase();
-    let deterministic = [
-        format!("daemon/{agent}-t{task_id}"),
-        format!("remediation/{agent}-t{task_id}"),
-    ];
-    if deterministic.iter().any(|expected| expected == branch) {
-        return Some(task_id);
-    }
-    let canonical = std::fs::canonicalize(path).ok();
+    let canonical = std::fs::canonicalize(path).ok()?;
     allocations
         .iter()
-        .any(|(id, allocated_branch, worktree)| {
-            *id == task_id
-                && allocated_branch == branch
-                && (Path::new(worktree) == path
-                    || (canonical.is_some() && std::fs::canonicalize(worktree).ok() == canonical))
+        .find(|(_, allocated_branch, worktree)| {
+            allocated_branch == branch
+                && std::fs::canonicalize(worktree).ok().as_ref() == Some(&canonical)
         })
-        .then_some(task_id)
+        .map(|(task_id, _, _)| *task_id)
+        .filter(|task_id| *task_id > 0)
 }
 
 fn now_millis() -> u128 {
@@ -407,23 +385,25 @@ impl WorktreeManager {
         }
     }
 
-    /// Whether `path` is a registered worktree of `repo_dir`.
-    pub async fn is_registered_worktree(
+    /// The branch ref registered for the worktree at `path`: `None` when the
+    /// path is not a registered worktree, `Some(None)` when it is detached.
+    pub async fn registered_branch(
         &self,
         repo_dir: &Path,
         path: &Path,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<Option<String>>, String> {
         let _guard = self.lock.lock().await;
         let Ok(canonical) = std::fs::canonicalize(path) else {
-            return Ok(false);
+            return Ok(None);
         };
         Ok(self
             .list_worktrees_unlocked(repo_dir)
             .await?
-            .iter()
-            .any(|registration| {
+            .into_iter()
+            .find(|registration| {
                 std::fs::canonicalize(&registration.path).ok().as_ref() == Some(&canonical)
-            }))
+            })
+            .map(|registration| registration.branch))
     }
 
     /// Every ref in the recover namespace, newest first within each bucket.

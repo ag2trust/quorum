@@ -8,6 +8,7 @@ use crate::serve::worktree::WorktreeManager;
 use quorum_core::error::Result;
 use quorum_core::recover_refs::{self, NewRecoverRef, RecoverRefRow};
 use quorum_core::tasks;
+use rusqlite::OptionalExtension;
 use std::path::Path;
 
 pub(crate) const WORKTREE_RECOVER_TEXT_MAX: usize = 1024;
@@ -261,6 +262,12 @@ pub(crate) async fn release_worker_worktree(
 /// at `worktree` (its teardown snapshot failed, or the daemon died first).
 /// Called only after this process claimed the task, so no live worker owns
 /// it. Destroys nothing and returns an error if preservation fails.
+///
+/// The snapshot is attributed to the task (and so trusted for resume) only
+/// when the checkout's registered branch AND path equal the task's daemon
+/// allocation record; a worker-forged checkout at this path is preserved
+/// unattributed and never resumed. An unregistered directory is left to
+/// provisioning exactly as before.
 pub(crate) async fn release_leftover_worker_checkout(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -279,28 +286,51 @@ pub(crate) async fn release_leftover_worker_checkout(
         }
         Ok(_) => {}
     }
-    // Only a registered checkout can hold worker work; an unregistered
-    // directory is left to provisioning exactly as before.
-    if !wt_mgr
-        .is_registered_worktree(&config.repo_dir, worktree)
-        .await?
-    {
+    let Some(registered) = wt_mgr.registered_branch(&config.repo_dir, worktree).await? else {
         return Ok(());
-    }
+    };
+    let path = config.db_path.clone();
+    let allocation = tokio::task::spawn_blocking(move || -> Result<Option<(String, String)>> {
+        let conn = quorum_core::db::open(&path)?;
+        Ok(conn
+            .query_row(
+                "SELECT branch, worktree FROM task_branches WHERE task_id=?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    })
+    .await
+    .map_err(|e| format!("leftover allocation lookup join failure: {e}"))?
+    .map_err(|e| format!("leftover allocation lookup failed: {e}"))?;
+    let allocations: Vec<(i64, String, String)> = allocation
+        .into_iter()
+        .map(|(branch, worktree)| (task_id, branch, worktree))
+        .collect();
+    let attributed = worktree::daemon_attribution(worktree, registered.as_deref(), &allocations);
     let agent = worktree
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    release_worker_worktree(
-        config,
-        wt_mgr,
-        worktree,
-        branch,
-        delete_branch,
-        &RecoverIdentity::new(task_id, &agent, "leftover_checkout"),
-    )
-    .await
-    .map_err(|error| format!("leftover worker checkout {}: {error}", worktree.display()))
+    let identity = match attributed {
+        Some(id) if id == task_id => RecoverIdentity::new(task_id, &agent, "leftover_checkout"),
+        _ => {
+            log(&format!(
+                "task #{task_id}: leftover checkout {} ({registered:?}) does not match the task's \
+                 allocation; preserving it unattributed",
+                worktree.display()
+            ));
+            RecoverIdentity {
+                task_id: None,
+                agent,
+                reason: "leftover_checkout".into(),
+                trusted: Vec::new(),
+            }
+        }
+    };
+    release_worker_worktree(config, wt_mgr, worktree, branch, delete_branch, &identity)
+        .await
+        .map_err(|error| format!("leftover worker checkout {}: {error}", worktree.display()))
 }
 
 /// Loud, bounded record of a work-preservation problem: an `errors` row and
