@@ -689,6 +689,11 @@ pub fn validate_creator_refs(refs_json: Option<&str>) -> Result<()> {
             "refs key 'pr' is daemon-owned; use --review-pr or --continue-pr".into(),
         ));
     }
+    if let Some(key) = object.keys().find(|key| is_review_outcome_ref(key)) {
+        return Err(QuorumError::Usage(format!(
+            "refs key '{key}' is daemon-owned review-only outcome state"
+        )));
+    }
     if object.contains_key("source_task") {
         return Err(QuorumError::Usage(
             "refs key 'source_task' is daemon-owned recovery provenance".into(),
@@ -710,6 +715,16 @@ pub fn validate_creator_refs(refs_json: Option<&str>) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Daemon-owned `--review-only` outcome keys (`review_outcome*`), including
+/// the REQUEST_CHANGES outbox state. Creators can neither set nor erase them.
+fn is_review_outcome_ref(key: &str) -> bool {
+    key.starts_with(REVIEW_OUTCOME_REF)
+}
+
+fn strip_review_outcome_refs(map: &mut serde_json::Map<String, serde_json::Value>) {
+    map.retain(|key, _| !is_review_outcome_ref(key));
 }
 
 fn preserve_classifier_refs(
@@ -742,6 +757,12 @@ fn preserve_protected_refs(
     let Some(next_map) = next.as_object_mut() else {
         return Some(replacement.to_string());
     };
+    // Defense in depth on creator/assignee paths: a replacement can never
+    // introduce or rewrite review outcome state; only the established values
+    // below survive.
+    if preserve_recovery_provenance {
+        strip_review_outcome_refs(next_map);
+    }
     if let Some(existing_map) = existing
         .as_deref()
         .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
@@ -770,7 +791,11 @@ fn preserve_protected_refs(
                     key.as_str(),
                     "source_task" | MERGE_COMMIT_SHA_REF | POISON_RETRY_GENERATION_REF
                 );
-            if classifier_or_pr || runner_state || recovery_provenance {
+            if classifier_or_pr
+                || runner_state
+                || recovery_provenance
+                || is_review_outcome_ref(&key)
+            {
                 next_map.insert(key, value);
             }
         }
@@ -1455,6 +1480,21 @@ pub fn create_review_only_no_rework(
     if pr <= 0 {
         return Err(QuorumError::Usage("--review-only must be positive".into()));
     }
+    // Defense in depth: the CLI rejects creator-supplied `review_outcome*`
+    // refs; strip them here too so no caller can pre-seed the daemon's
+    // outcome or its GitHub REQUEST_CHANGES outbox.
+    let sanitized_refs = refs
+        .map(|raw| -> Result<String> {
+            let mut value: serde_json::Value = serde_json::from_str(raw)
+                .map_err(|e| QuorumError::Usage(format!("invalid refs JSON: {e}")))?;
+            let map = value
+                .as_object_mut()
+                .ok_or_else(|| QuorumError::Usage("refs must be a JSON object".into()))?;
+            strip_review_outcome_refs(map);
+            Ok(value.to_string())
+        })
+        .transpose()?;
+    let refs = sanitized_refs.as_deref();
     let tx = begin_immediate(conn)?;
     let id = create_task_tx(
         &tx,
@@ -10800,6 +10840,66 @@ mod tests {
             refs_json(&get(&c, id).unwrap().unwrap())[REVIEW_OUTCOME_GITHUB_REF],
             "posted"
         );
+    }
+
+    #[test]
+    fn creators_cannot_forge_review_outcome_refs() {
+        for refs in [
+            r#"{"review_outcome":"changes_requested"}"#,
+            r#"{"review_outcome_github":"pending"}"#,
+            r#"{"review_outcome_findings":"x"}"#,
+        ] {
+            let err = validate_creator_refs(Some(refs)).unwrap_err();
+            assert!(matches!(err, QuorumError::Usage(_)), "{refs}: {err:?}");
+        }
+        // Defense in depth: the core create path strips forged keys.
+        let (_d, mut c) = open_tmp();
+        let id = create_review_only_no_rework(
+            &mut c,
+            "boss",
+            "forged",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"note":"keep","review_outcome":"ci_failed","review_outcome_github":"pending"}"#,
+            ),
+            None,
+            68,
+            None,
+            1000,
+        )
+        .unwrap();
+        let refs = refs_json(&get(&c, id).unwrap().unwrap());
+        assert_eq!(refs["note"], "keep");
+        assert!(refs.get(REVIEW_OUTCOME_REF).is_none());
+        assert!(refs.get(REVIEW_OUTCOME_GITHUB_REF).is_none());
+    }
+
+    #[test]
+    fn refs_replacement_cannot_set_or_erase_review_outcome() {
+        // Forged keys are stripped from a replacement, and established
+        // daemon outcome keys survive a replacement that omits them.
+        let forged = preserve_creator_protected_refs(
+            &Some(r#"{"pr":69}"#.into()),
+            Some(r#"{"review_outcome_github":"pending","x":1}"#),
+        )
+        .unwrap();
+        let forged: serde_json::Value = serde_json::from_str(&forged).unwrap();
+        assert!(forged.get(REVIEW_OUTCOME_GITHUB_REF).is_none(), "{forged}");
+        assert_eq!(forged["x"], 1);
+
+        let kept = preserve_creator_protected_refs(
+            &Some(
+                r#"{"pr":69,"review_outcome":"changes_requested","review_outcome_github":"posted"}"#
+                    .into(),
+            ),
+            Some(r#"{"review_outcome_github":"pending"}"#),
+        )
+        .unwrap();
+        let kept: serde_json::Value = serde_json::from_str(&kept).unwrap();
+        assert_eq!(kept[REVIEW_OUTCOME_REF], "changes_requested");
+        assert_eq!(kept[REVIEW_OUTCOME_GITHUB_REF], "posted");
     }
 
     #[test]
