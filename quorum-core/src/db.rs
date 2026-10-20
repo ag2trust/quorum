@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 80;
+pub const SCHEMA_VERSION: i64 = 81;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1565,6 +1565,8 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 [],
             )?;
         }
+        // v81 = recover_refs (new CREATE TABLE IF NOT EXISTS in SCHEMA_SQL; additive,
+        // so fresh DBs and upgrades alike materialize it above — no ALTER needed).
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
