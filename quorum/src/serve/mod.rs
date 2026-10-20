@@ -3604,6 +3604,10 @@ fn reviewer_continuation_slot(is_r2: bool) -> ContinuationSlot {
     }
 }
 
+/// `agent_runs.end_reason` for an interrupted turn-oriented reviewer that
+/// cannot resume because no provider continuation was persisted.
+const REVIEWER_CONTINUATION_UNAVAILABLE_END_REASON: &str = "continuation-unavailable";
+
 fn resolve_reviewer_recovery(
     db_path: &std::path::Path,
     task_id: i64,
@@ -3642,10 +3646,30 @@ fn resolve_reviewer_recovery(
         })
         .flatten();
     if kind.turn_mode() == runner::TurnMode::RespawnPerTurn && continuation_id.is_none() {
-        return Err(QuorumError::Io(format!(
-            "interrupted turn-oriented reviewer run {} has no persisted continuation for {}",
-            run.id, provider,
-        )));
+        // A turn-oriented reviewer can only be resumed through its exact
+        // provider-issued continuation. Without one the run is unrecoverable,
+        // and leaving it open would make every orphan scan re-select it and
+        // fail again with no strike or backoff. End it durably (guarded so a
+        // concurrent close wins) and let the caller provision a fresh
+        // reviewer; total reviewer runs stay bounded by
+        // `MAX_TOTAL_REVIEWER_RUNS`, which counts this ended run.
+        let ended = conn.execute(
+            "UPDATE agent_runs SET ended_at=?2,end_reason=?3
+             WHERE id=?1 AND (ended_at IS NULL OR end_reason='drain')",
+            rusqlite::params![
+                run.id,
+                now_unix(),
+                REVIEWER_CONTINUATION_UNAVAILABLE_END_REASON
+            ],
+        )?;
+        if ended == 1 {
+            log(&format!(
+                "task #{task_id}: interrupted turn-oriented reviewer run {} ({}) has no \
+                 persisted {provider} continuation — ended as {}; provisioning a fresh reviewer",
+                run.id, run.agent, REVIEWER_CONTINUATION_UNAVAILABLE_END_REASON,
+            ));
+        }
+        return Ok(None);
     }
     Ok(Some(ReviewerRecovery {
         agent: run.agent,
@@ -48351,6 +48375,101 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 .map(|pair| pair[1].as_str()),
             Some("gpt-5.6-terra")
         );
+    }
+
+    /// A Codex (turn-oriented) reviewer interrupted without a persisted
+    /// continuation used to return an Io error from every orphan scan forever
+    /// (no strike, no backoff). It is now ended durably once and the caller
+    /// provisions a fresh reviewer, bounded by the total reviewer-run cap.
+    #[test]
+    fn interrupted_codex_reviewer_without_continuation_ends_and_allows_fresh_reviewer() {
+        for crashed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("reviewer-no-continuation.db");
+            let (task_id, run_id) = {
+                let mut conn = quorum_core::db::open(&db_path).unwrap();
+                let task_id = tasks::create(
+                    &mut conn,
+                    "owner",
+                    "review PR #91",
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    Some(91),
+                    10,
+                )
+                .unwrap();
+                let kind = resolve_provider("gpt-5.6-terra").unwrap();
+                let run_id = quorum_core::agent_runs::insert(
+                    &conn,
+                    task_id,
+                    "r1-terra",
+                    "reviewer",
+                    "gpt-5.6-terra",
+                    "high",
+                    &kind.to_string(),
+                    11,
+                )
+                .unwrap();
+                if !crashed {
+                    quorum_core::agent_runs::close(&conn, run_id, 12, "drain").unwrap();
+                }
+                (task_id, run_id)
+            };
+
+            let recovery = resolve_reviewer_recovery(&db_path, task_id, false)
+                .expect("an unrecoverable reviewer must not be a tick error");
+            assert!(recovery.is_none(), "crashed={crashed}: provision fresh");
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let ended: (Option<i64>, Option<String>) = conn
+                .query_row(
+                    "SELECT ended_at,end_reason FROM agent_runs WHERE id=?1",
+                    [run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert!(ended.0.is_some(), "crashed={crashed}");
+            assert_eq!(
+                ended.1.as_deref(),
+                Some(REVIEWER_CONTINUATION_UNAVAILABLE_END_REASON),
+                "crashed={crashed}"
+            );
+            assert!(
+                quorum_core::agent_runs::interrupted_reviewer(&conn, task_id, false)
+                    .unwrap()
+                    .is_none(),
+                "crashed={crashed}: the next orphan scan must not re-select the run"
+            );
+            // Replay is a clean no-op, not a loop.
+            assert!(resolve_reviewer_recovery(&db_path, task_id, false)
+                .unwrap()
+                .is_none());
+            assert!(matches!(
+                decide_provision(&conn, task_id, 91, "head").unwrap(),
+                ProvisionDecision::Needed("r1")
+            ));
+
+            // The ended run still counts toward the total reviewer-run cap.
+            for i in 1..MAX_TOTAL_REVIEWER_RUNS {
+                quorum_core::agent_runs::insert(
+                    &conn,
+                    task_id,
+                    &format!("r1-extra-{i}"),
+                    "reviewer",
+                    "gpt-5.6-terra",
+                    "high",
+                    "codex",
+                    20 + i,
+                )
+                .unwrap();
+            }
+            assert!(matches!(
+                decide_provision(&conn, task_id, 91, "head").unwrap(),
+                ProvisionDecision::Exhausted
+            ));
+        }
     }
 
     #[test]
