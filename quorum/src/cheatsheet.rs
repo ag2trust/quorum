@@ -4,7 +4,7 @@ pub fn cheatsheet() -> &'static str {
     r#"quorum — local, daemon-managed coding agents
 
 COORDINATOR
-  Create one of three task kinds:
+  Create one of four task kinds:
 
   quorum task-create --created-by <id> --title <outcome> --body-stdin
       New implementation from the configured base branch.
@@ -13,10 +13,14 @@ COORDINATOR
       Continue implementation from the exact current head of PR #N.
 
   quorum task-create --created-by <id> --title "Review PR #N" --review-pr <N> --body-stdin
-      Review an existing implementation. No worker is available for requested changes.
+      Review an existing implementation; requested changes get a managed remediation worker.
 
-  --continue-pr and --review-pr are mutually exclusive. Generic refs are metadata, not PR
-  authority. The daemon chooses complexity, model, and effort.
+  quorum task-create --created-by <id> --title "Review PR #N" --review-only <N> --body-stdin
+      Review only; Quorum never reworks the PR. Approval merges. Requested changes, failed CI,
+      or a merge conflict close the task as done with refs.review_outcome and a findings note.
+
+  --continue-pr, --review-pr, and --review-only are mutually exclusive. Generic refs are
+  metadata, not PR authority. The daemon chooses complexity, model, and effort.
 
   Send only execution-ready tasks. Interactive callers create, inspect, or cancel work;
   they do not claim tasks, impersonate managed agents, submit work, or set tasks to done.
@@ -73,6 +77,7 @@ mod tests {
         let help = cheatsheet();
         assert!(help.contains("--continue-pr <N>"));
         assert!(help.contains("--review-pr <N>"));
+        assert!(help.contains("--review-only <N>"));
         assert!(help.contains("MANAGED AGENTS"));
         assert!(help.contains("OPERATOR"));
     }

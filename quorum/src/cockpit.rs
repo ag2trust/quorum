@@ -716,6 +716,21 @@ fn render_decomposition(
 
 fn pipeline_state(p: &PipelineTask, sty: &Style) -> (String, String) {
     if p.status == "done" {
+        if let Some(outcome) = p.review_outcome.as_deref() {
+            // A review-only task that closed without merging (no rework).
+            let label = match outcome {
+                "changes_requested" => "review-only: changes requested",
+                "ci_failed" => "review-only: CI failed",
+                "merge_conflict" => "review-only: merge conflict",
+                _ => "review-only: closed",
+            };
+            let icon = if sty.color {
+                sty.dim("✋")
+            } else {
+                "[closed]".to_string()
+            };
+            return (icon, label.to_string());
+        }
         let icon = if sty.color {
             sty.green("✅")
         } else {
@@ -1281,10 +1296,30 @@ mod tests {
             pr: Some(42),
             blocked: false,
             arbiter: None,
+            mode: None,
+            review_outcome: None,
         };
         let (icon, label) = pipeline_state(&done, &sty);
         assert_eq!(icon, "[merged]");
         assert_eq!(label, "merged");
+
+        let review_only_merged = PipelineTask {
+            mode: Some("review-only".into()),
+            ..done
+        };
+        let (icon, label) = pipeline_state(&review_only_merged, &sty);
+        assert_eq!((icon.as_str(), label.as_str()), ("[merged]", "merged"));
+
+        let review_only_closed = PipelineTask {
+            review_outcome: Some("changes_requested".into()),
+            ..review_only_merged
+        };
+        let (icon, label) = pipeline_state(&review_only_closed, &sty);
+        assert_eq!(icon, "[closed]");
+        assert_eq!(
+            label, "review-only: changes requested",
+            "a closed review-only verdict must never render as merged"
+        );
 
         let pending = PipelineTask {
             id: 4,
@@ -1296,6 +1331,8 @@ mod tests {
             pr: Some(99),
             blocked: false,
             arbiter: None,
+            mode: None,
+            review_outcome: None,
         };
         let (icon, _) = pipeline_state(&pending, &sty);
         assert_eq!(icon, "[working]");

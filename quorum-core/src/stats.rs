@@ -273,6 +273,13 @@ pub struct PipelineTask {
     /// The newest durable Arbiter verdict for this decomposed source, if one exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arbiter: Option<ArbiterVerdict>,
+    /// `review-only` for `task-create --review-only` (no-rework) tasks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Durable `refs.review_outcome` of a review-only task that closed without
+    /// merging: `changes_requested`, `ci_failed`, or `merge_conflict`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_outcome: Option<String>,
 }
 
 /// Compact projection of the Arbiter's terminal verdict evidence.
@@ -1526,7 +1533,36 @@ fn terminal_progress(
     Option<TaskProgressNextAction>,
     Vec<TaskProgressMilestone>,
 ) {
+    let review_outcome = task
+        .no_rework
+        .then(|| {
+            task.refs
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|refs| {
+                    refs[crate::tasks::REVIEW_OUTCOME_REF]
+                        .as_str()
+                        .map(str::to_string)
+                })
+        })
+        .flatten();
     match task.status.as_str() {
+        "done" if review_outcome.is_some() => (
+            TaskProgressStage {
+                label: "Complete".into(),
+                role: None,
+                activity: "Review-only task closed without rework".into(),
+            },
+            Some(format!(
+                "Review outcome: {}",
+                review_outcome
+                    .as_deref()
+                    .unwrap_or_default()
+                    .replace('_', " ")
+            )),
+            None,
+            Vec::new(),
+        ),
         "done" => (
             TaskProgressStage {
                 label: "Complete".into(),
@@ -2764,13 +2800,13 @@ fn reviewing_tasks(
 fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
     let hour_ago = now - 3600;
     let mut stmt = conn.prepare(
-        "SELECT id, title, status, refs, depends_on FROM tasks
+        "SELECT id, title, status, refs, depends_on, no_rework FROM tasks
          WHERE status IN ('planning', 'decomposed')
          UNION ALL
-         SELECT id, title, status, refs, depends_on FROM tasks
+         SELECT id, title, status, refs, depends_on, no_rework FROM tasks
          WHERE status = 'done' AND updated_at > ?1
          UNION ALL
-         SELECT id, title, status, refs, depends_on FROM tasks
+         SELECT id, title, status, refs, depends_on, no_rework FROM tasks
          WHERE status = 'closed' AND updated_at > ?1
          ORDER BY id ASC",
     )?;
@@ -2782,12 +2818,24 @@ fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, Option<String>>(4)?,
+                r.get::<_, i64>(5)? != 0,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut result = Vec::new();
-    for (id, title, status, refs, _depends_on) in rows {
+    for (id, title, status, refs, _depends_on, no_rework) in rows {
         let pr = extract_pr_from_refs(refs.as_deref());
+        let review_outcome = no_rework
+            .then(|| {
+                refs.as_deref()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                    .and_then(|value| {
+                        value[crate::tasks::REVIEW_OUTCOME_REF]
+                            .as_str()
+                            .map(str::to_string)
+                    })
+            })
+            .flatten();
         let (provider, model, effort) = conn
             .query_row(
                 "SELECT provider, model, effort FROM agent_runs WHERE task_id=?1
@@ -2821,6 +2869,8 @@ fn pipeline_tasks(conn: &Connection, now: i64) -> Result<Vec<PipelineTask>> {
             pr,
             blocked: false,
             arbiter: arbiter_verdict(conn, id)?,
+            mode: no_rework.then(|| "review-only".to_string()),
+            review_outcome,
         });
     }
     Ok(result)
@@ -4914,6 +4964,102 @@ mod tests {
         let tasks = pipeline_tasks(&c, now).unwrap();
         assert_eq!(tasks.len(), 1, "only recently-done task should appear");
         assert_eq!(tasks[0].id, t_recent);
+    }
+
+    #[test]
+    fn task_progress_reports_closed_review_only_outcome() {
+        let (_d, mut c) = open_tmp();
+        let id = crate::tasks::create_review_only_no_rework(
+            &mut c,
+            "A",
+            "closed review",
+            None,
+            0,
+            None,
+            None,
+            None,
+            72,
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='done',
+                 refs=json_set(refs, '$.review_outcome', 'changes_requested')
+             WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+        let progress = task_progress(&c, id, 200).unwrap().unwrap();
+        assert_eq!(progress.journey, TaskJourney::ReviewOnly);
+        assert_eq!(
+            progress.stage.activity,
+            "Review-only task closed without rework"
+        );
+        assert_eq!(
+            progress.condition.as_deref(),
+            Some("Review outcome: changes requested")
+        );
+    }
+
+    #[test]
+    fn pipeline_tasks_report_review_only_mode_and_outcome() {
+        let (_d, mut c) = open_tmp();
+        let now = 10_000_i64;
+        let closed = crate::tasks::create_review_only_no_rework(
+            &mut c,
+            "A",
+            "closed review",
+            None,
+            0,
+            None,
+            None,
+            None,
+            70,
+            None,
+            100,
+        )
+        .unwrap();
+        let merged = crate::tasks::create_review_only_no_rework(
+            &mut c,
+            "A",
+            "merged review",
+            None,
+            0,
+            None,
+            None,
+            None,
+            71,
+            None,
+            100,
+        )
+        .unwrap();
+        let ordinary = crate::tasks::create(
+            &mut c, "A", "ordinary", None, 0, None, None, None, None, 100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=?1,
+                 refs=json_set(refs, '$.review_outcome', 'ci_failed')
+             WHERE id=?2",
+            rusqlite::params![now - 60, closed],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='done', updated_at=?1 WHERE id IN (?2, ?3)",
+            rusqlite::params![now - 60, merged, ordinary],
+        )
+        .unwrap();
+
+        let tasks = pipeline_tasks(&c, now).unwrap();
+        let by_id = |id| tasks.iter().find(|t| t.id == id).unwrap();
+        assert_eq!(by_id(closed).mode.as_deref(), Some("review-only"));
+        assert_eq!(by_id(closed).review_outcome.as_deref(), Some("ci_failed"));
+        assert_eq!(by_id(merged).mode.as_deref(), Some("review-only"));
+        assert_eq!(by_id(merged).review_outcome, None);
+        assert_eq!(by_id(ordinary).mode, None);
+        let json = serde_json::to_value(by_id(ordinary)).unwrap();
+        assert!(json.get("mode").is_none() && json.get("review_outcome").is_none());
     }
 
     #[test]

@@ -517,6 +517,136 @@ fn continue_pr_rejects_ambiguous_or_unauthorized_inputs() {
 }
 
 #[test]
+fn review_only_creates_no_rework_review_task_visible_in_task_get() {
+    let home = tempfile::tempdir().unwrap();
+    let out = quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "Review PR #31",
+            "--review-only",
+            "31",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let created: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = created["id"].as_i64().unwrap();
+
+    let out = quorum(home.path())
+        .args(["task-get", "--task-id", &id.to_string()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(task["status"], "in-review");
+    assert_eq!(task["review_only"], true);
+    assert_eq!(task["no_rework"], true);
+    let refs: serde_json::Value = serde_json::from_str(task["refs"].as_str().unwrap()).unwrap();
+    assert_eq!(refs["pr"], 31);
+
+    // `--review-pr` keeps review + remediation mode.
+    let out = quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "Review PR #32",
+            "--review-pr",
+            "32",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let created: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let out = quorum(home.path())
+        .args([
+            "task-get",
+            "--task-id",
+            &created["id"].as_i64().unwrap().to_string(),
+        ])
+        .output()
+        .unwrap();
+    let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(task["review_only"], true);
+    assert_eq!(task["no_rework"], false);
+}
+
+#[test]
+fn review_only_rejects_conflicting_modes_and_bad_pr() {
+    let home = tempfile::tempdir().unwrap();
+    for (flag, value) in [("--review-pr", "40"), ("--continue-pr", "40")] {
+        quorum(home.path())
+            .args([
+                "task-create",
+                "--created-by",
+                "boss",
+                "--title",
+                "ambiguous",
+                "--review-only",
+                "40",
+                flag,
+                value,
+            ])
+            .assert()
+            .code(2);
+    }
+    for pr in ["0", "-1"] {
+        quorum(home.path())
+            .args([
+                "task-create",
+                "--created-by",
+                "boss",
+                "--title",
+                "bad pr",
+                &format!("--review-only={pr}"),
+            ])
+            .assert()
+            .code(2);
+    }
+    // An already-owned PR is rejected without creating a second row.
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "first",
+            "--review-only",
+            "41",
+        ])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "second",
+            "--review-only",
+            "41",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("already associated"));
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "rejected creates leave no rows");
+}
+
+#[test]
 fn task_creators_cannot_inject_managed_runner_state() {
     let home = tempfile::tempdir().unwrap();
     let forged_retry = r#"{"runner_retry":{"provider":"grok","model":"grok-4.5","effort":"high","prompt":"replace the daemon prompt","turn_kind":"initial","requested":true}}"#;

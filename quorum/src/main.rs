@@ -607,6 +607,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             body_stdin,
             depends_on,
             review_pr,
+            review_only,
             continue_pr,
             base_branch,
             body_file,
@@ -630,20 +631,35 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 base_branch.unwrap_or(serve_config::task_create_base_branch(&resolved_repo)?);
             quorum_core::tasks::validate_target_branch(&target_branch)?;
             let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&resolved_repo)?)?;
-            let id = quorum_core::tasks::create_with_continue_pr_and_target_branch(
-                &mut conn,
-                &created_by,
-                &title,
-                body.as_deref(),
-                priority.unwrap_or(0),
-                labels.as_deref(),
-                refs.as_deref(),
-                depends_on.as_deref(),
-                review_pr,
-                continue_pr,
-                Some(&target_branch),
-                now,
-            )?;
+            let id = match review_only {
+                Some(pr) => quorum_core::tasks::create_review_only_no_rework(
+                    &mut conn,
+                    &created_by,
+                    &title,
+                    body.as_deref(),
+                    priority.unwrap_or(0),
+                    labels.as_deref(),
+                    refs.as_deref(),
+                    depends_on.as_deref(),
+                    pr,
+                    Some(&target_branch),
+                    now,
+                )?,
+                None => quorum_core::tasks::create_with_continue_pr_and_target_branch(
+                    &mut conn,
+                    &created_by,
+                    &title,
+                    body.as_deref(),
+                    priority.unwrap_or(0),
+                    labels.as_deref(),
+                    refs.as_deref(),
+                    depends_on.as_deref(),
+                    review_pr,
+                    continue_pr,
+                    Some(&target_branch),
+                    now,
+                )?,
+            };
             output::emit(&serde_json::json!({ "id": id, "repo": resolved_repo }));
             Ok(0)
         }

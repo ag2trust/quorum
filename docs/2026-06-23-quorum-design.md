@@ -240,6 +240,8 @@ DEFAULT 0` is required — a NULL falls *out* of the partial index and silently 
 INTEGER NOT NULL DEFAULT 0 · `labels` TEXT (json) · `assignee` TEXT · `created_by` TEXT NOT
 NULL · `created_at` · `updated_at` · `refs` TEXT (json) · `author` TEXT · `reviewer` TEXT ·
 `rework_round` INTEGER NOT NULL DEFAULT 0 · `review_only` INTEGER NOT NULL DEFAULT 0 ·
+`no_rework` INTEGER NOT NULL DEFAULT 0 (v80; `--review-only` reviewer-only mode, always set
+with `review_only=1`; historical rows stay `0`) ·
 `continue_pr` INTEGER NULL (authoritative existing-PR implementation entry; never inferred
 from `refs.pr`) · `completion_provenance` TEXT NULL (`merged`/`manual`; NULL is
 legacy or unknown and is never inferred from status or `refs.pr`) ·
@@ -386,7 +388,16 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 ### Tasks
 - `quorum task-create --created-by <id> --title <s> [--priority N] [--labels <json>] [--depends-on <json>] (--body-stdin | --body-file <p> | --json-stdin)` → `{id}` (status: `open`)
 - `quorum task-create ... --review-pr <N>` → review-only task (status: `in-review`,
-  `review_only=true`, `refs.pr=N`). Skips `open`/`working` entirely.
+  `review_only=true`, `refs.pr=N`). Skips `open`/`working` entirely. Actionable findings
+  enter bounded rework with a managed remediation worker on the same PR.
+- `quorum task-create ... --review-only <N>` → reviewer-only task: the same row as
+  `--review-pr` (`in-review`, `review_only=true`, `refs.pr=N`) plus `no_rework=true`,
+  written in the same transaction. Every review-only path (in-review entry, base validation,
+  classification/dispatch, the decomposition-freeze exemption) applies unchanged. Reviewers
+  review the PR; Quorum never reworks it. Approval (after the ordinary R1/R2 rules) merges
+  normally. An actionable-rework trigger closes the task instead — see
+  § Review-only (no-rework) close. `--review-only`, `--review-pr`, and `--continue-pr` are
+  mutually exclusive (exit 2).
 - `quorum task-create ... --continue-pr <N>` → implementation task (status: `open`,
   `continue_pr=N`) rooted at the exact head of an open same-repository PR. It follows the
   normal worker/review/rework/merge lifecycle, dispatches directly regardless of classified
@@ -768,7 +779,7 @@ only through an explicit outside request)
 | `IncrementReworkRound` | Bump `rework_round += 1` |
 | `NotifyOwner { reason }` | Alert the task creator |
 | `ReleaseLease` | Deactivate the claims row |
-| `PostFindingsNote` | Post findings as a task note (review-only terminal) |
+| `PostFindingsNote` | Post the bounded findings/outcome as a task note (no-rework close) |
 
 ### Transition table
 
@@ -795,6 +806,9 @@ only through an explicit outside request)
 - `ChecksFailed` → Rework · effects: IncrementReworkRound, ResumeWorker
 - `VerdictChanges` (review_only=true) → Rework · effects: IncrementReworkRound,
   ResumeWorker (at the rework cap → Failed · effects: NotifyOwner, ReleaseLease)
+- `VerdictChanges` / `ChecksFailed` (no_rework=true) → **Done** · effects: ReleaseLease,
+  PostFindingsNote, NotifyOwner. Takes precedence over the rework cap; never
+  IncrementReworkRound or ResumeWorker. R1 changes therefore end the task before any R2.
 - `VerdictChanges` (rework_round ≥ the task's stamped rework cap) → Failed · effects: NotifyOwner, ReleaseLease
 - `AgentFailed` → InReview (**sticky**) · effects: ReleaseLease, NotifyOwner, SpawnReviewer
 - `LeaseExpired` → InReview (**sticky**) · effects: ReleaseLease, SpawnReviewer
@@ -811,6 +825,9 @@ only through an explicit outside request)
   budget) becomes Failed.
 - Other `AgentFailed` / `LeaseExpired` → Open · effects: ReleaseLease (+NotifyOwner on failure).
   PR-less first-round recovery clears the author.
+- `AgentFailed` / `LeaseExpired` (no_rework=true, from Working or Rework) → Failed ·
+  effects: ReleaseLease, NotifyOwner. Defense in depth: a no-rework task has no worker
+  phase, so observing one fails loudly instead of resuming remediation or reopening the PR.
 - `Cancelled { by }` → Cancelled · effects: ReleaseLease
 
 **From Merging:**
@@ -818,9 +835,41 @@ only through an explicit outside request)
 - `MergeFailed { reason }` → InReview · effects: NotifyOwner, ResumeReviewer
 - `MergeConflict` → Rework · effects: IncrementReworkRound, ResumeWorker
   (at rework cap → Failed · effects: NotifyOwner, ReleaseLease)
+- `MergeConflict` (no_rework=true) → **Done** · effects: ReleaseLease, PostFindingsNote,
+  NotifyOwner. A retryable, non-conflict `MergeFailed` keeps the ordinary
+  Merging → InReview re-review path (re-review is not rework).
 - `Cancelled { by }` → Cancelled · effects: ReleaseLease
 
 **Terminals (Done, Failed, Cancelled):** reject all events.
+
+#### Review-only (no-rework) close
+
+`task-create --review-only` selects "review, never rework": the verdict is the deliverable.
+On any actionable-rework trigger — an R1 or R2 `changes` verdict, pre-review or merge-time
+failed CI (`ChecksFailed`), or a merge conflict (`MergeConflict`, including the conflict the
+`--review-pr` path would park as merge-blocked) — the daemon's lifecycle transaction moves
+the task to terminal `done` and, atomically with that transition:
+
+- records `refs.review_outcome` = `changes_requested` | `ci_failed` | `merge_conflict`, plus
+  `review_outcome_at`, bounded `review_outcome_findings` (≤ 4096 bytes, UTF-8 safe) and, for
+  `ci_failed`, bounded `review_outcome_checks` (≤ 20 names);
+- posts the findings as a task note (`PostFindingsNote`), alerts the owner, and releases the
+  lease; reviewer and worker slots are torn down by the observing site;
+- enqueues the daemon-owned GitHub REQUEST_CHANGES review as a durable outbox entry
+  (`refs.review_outcome_github=pending`). A tick phase ensures the review outside any DB
+  transaction (the § REQUEST_CHANGES verification mechanism, `gh pr review
+  --request-changes` unless one already exists), then consumes the entry (`posted`).
+  Unconfirmed posts retry on later ticks up to 5 attempts, then the entry becomes `failed`
+  and the owner is alerted; the findings remain in the note.
+
+A no-rework close is not merge provenance (`completion_provenance` stays NULL), and status
+reports it as `review-only: <outcome>`, never `merged`. It never increments `rework_round`
+and never provisions a remediation worker. Defense in depth: the lifecycle never selects
+Rework/Working for `no_rework=1`; the storage layer rejects such a transition; both guarded
+remediation claims (`claim_remediation_rework*`, `claim_provider_retry_rework`) require
+`no_rework=0`; and `spawn_remediation_worker` refuses the task before allocating a name,
+lease, or worktree. Because the close is `done`, dependents of a no-rework task become
+ready even when the PR was not merged.
 
 ### Guards and policies
 
@@ -881,7 +930,10 @@ only through an explicit outside request)
   failures, and merge conflicts on delivered work — never by infrastructure
   failures (provisioning, worker death, lease lapse), which park the task instead.
 - **Review-only entry:** `task-create --review-pr N` creates a task directly in `in-review`
-  with `review_only=true`. A blocking verdict enters normal bounded rework; it never falls
+  with `review_only=true`; `task-create --review-only N` creates the same row plus
+  `no_rework=true`, whose actionable triggers close the task (§ Review-only (no-rework)
+  close) instead of the remediation described here. For `--review-pr`, a blocking verdict
+  enters normal bounded rework; it never falls
   through to generic implementation-worker provisioning, because remediation must retain
   the adopted PR target. Before reviewer provisioning, the daemon validates the live PR base
   against the task's immutable target branch, with configured-base fallback only for legacy
@@ -907,8 +959,9 @@ only through an explicit outside request)
   closed; Quorum neither rebases onto the new
   head nor silently falls back to fresh implementation or a new PR. Existing same-task
   rework continues through the established PR association and does not create a new entry.
-- **Entry authority:** task creators select exactly one of fresh implementation (neither
-  flag), review-only (`--review-pr`), or existing-PR implementation (`--continue-pr`).
+- **Entry authority:** task creators select exactly one of fresh implementation (no
+  flag), review-only (`--review-pr`), reviewer-only/no-rework (`--review-only`), or
+  existing-PR implementation (`--continue-pr`).
   They never choose a lifecycle status. Generic `refs.pr` is display/correlation metadata,
   not Proposed Change ownership or publication authority, and creator-supplied `refs.pr`
   is rejected. Only a successful daemon lifecycle transition may establish or update the
@@ -1272,11 +1325,15 @@ approval path merges; when it requires R2, the following dual-review flow applie
 7. **REQUEST_CHANGES verification** — when any reviewer verdict is `changes` with
    blocking findings, the daemon verifies a GitHub REQUEST_CHANGES review exists
    on the PR. If not present, it posts one via `gh pr review --request-changes`.
+   A `--review-only` (no-rework) close additionally ensures this review for CI and
+   merge-conflict outcomes through the durable outbox in § Review-only (no-rework) close.
 8. **Remediation workers** — when a `changes` verdict arrives and no worker exists
-   (review-only tasks, adopted PRs, dead workers), the daemon spawns a managed
+   (`--review-pr` tasks, adopted PRs, dead workers), the daemon spawns a managed
    remediation worker with the existing PR, blocking findings, and task context.
-   The lifecycle's review-only early-fail path is removed; all tasks go through
-   normal rework (rework cap still enforced).
+   The lifecycle's review-only early-fail path is removed; `--review-pr` tasks go through
+   normal rework (rework cap still enforced). `--review-only` (no-rework) tasks never
+   reach this step: R1 `changes` closes them as `done` before R2 is provisioned, and
+   R2 `changes` closes them likewise.
 
 No new lifecycle states were added. R2 uses the existing `InReview ⇄ Rework` transitions.
 
@@ -1553,7 +1610,9 @@ remediation worker:
 
 #### Workerless review-only Codex boundary
 
-A review-only/adopted PR has no original managed worker by construction. For Codex only,
+A review-only/adopted PR has no original managed worker by construction. (A `--review-only`
+no-rework task never reaches remediation, so this boundary applies only to `--review-pr`.)
+For Codex only,
 the daemon therefore permits a fresh `codex exec` remediation turn **only** when durable
 `agent_runs` show that the task has no original managed worker and the task remains
 `review_only`. This is not a fallback for an implementation task or a lost continuation:

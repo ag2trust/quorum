@@ -116,7 +116,11 @@ hosted service or a general-purpose workflow system.
 
 Review-only tasks (`--review-pr`) intentionally skip initial managed
 implementation. If blocking feedback requires code changes, the daemon enters
-rework and provisions managed remediation for the existing PR.
+rework and provisions managed remediation for the existing PR. Reviewer-only
+tasks (`--review-only`) also skip implementation but never enter rework: an
+approval merges normally, while requested changes, failed CI, or a merge
+conflict close the task as `done` with a durable `refs.review_outcome`, a
+findings note, a daemon-owned GitHub REQUEST_CHANGES review, and an owner alert.
 
 ## Managed roles
 
@@ -316,10 +320,25 @@ Review the existing implementation and merge it if it is sound.
 EOF
 ```
 
+Review a PR without ever letting Quorum change it:
+
+```sh
+quorum task-create \
+  --created-by coordinator \
+  --title "Review PR #412" \
+  --review-only 412 \
+  --body-stdin <<'EOF'
+Review the external contribution; merge it only if it is sound.
+EOF
+```
+
 `--continue-pr` creates a managed worker from the recorded PR head. `--review-pr` skips the
-initial worker and starts with review. They are mutually exclusive. If a review-only PR
-receives blocking feedback, the daemon enters rework and provisions a managed remediation
-worker for that existing PR.
+initial worker and starts with review. If a `--review-pr` PR receives blocking feedback,
+the daemon enters rework and provisions a managed remediation worker for that existing PR.
+`--review-only` also starts with review, but Quorum never reworks the PR: approval merges,
+and requested changes, failed CI, or a merge conflict end the task as `done` with
+`refs.review_outcome` (`changes_requested`, `ci_failed`, or `merge_conflict`) and the
+findings. `--continue-pr`, `--review-pr`, and `--review-only` are mutually exclusive.
 
 Give implementation tasks a concrete outcome, relevant constraints, and a way to verify
 the result. The daemon chooses complexity, model, and effort. Managed agents receive their

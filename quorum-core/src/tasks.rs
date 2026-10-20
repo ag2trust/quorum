@@ -287,6 +287,9 @@ pub struct Task {
     pub reviewer: Option<String>,
     pub rework_round: i64,
     pub review_only: bool,
+    /// v80: `task-create --review-only`. Reviewers review the PR; Quorum never
+    /// reworks it. Always implies `review_only`.
+    pub no_rework: bool,
     pub recovery_attempts: i64,
     pub revision: i64,
     pub edit_count: i64,
@@ -445,7 +448,7 @@ pub fn effect_name(e: &Effect) -> String {
 const COLS: &str = "id, title, body, status, priority, labels, assignee, created_by, \
                     created_at, updated_at, refs, depends_on, author, reviewer, \
                     rework_round, review_only, recovery_attempts, revision, edit_count, \
-                    continue_pr, target_branch, terminal_leaf, rework_cap";
+                    continue_pr, target_branch, terminal_leaf, rework_cap, no_rework";
 
 const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
     SELECT 1 FROM json_each(depends_on) je
@@ -586,6 +589,7 @@ fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
         target_branch: r.get(20)?,
         terminal_leaf: r.get::<_, i64>(21)? != 0,
         rework_cap: r.get(22)?,
+        no_rework: r.get::<_, i64>(23)? != 0,
         ready: false,
     })
 }
@@ -885,6 +889,263 @@ pub fn recovered_remediation_retry_requested(refs: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+// ── review-only / no-rework outcome (`task-create --review-only`) ────────────
+
+/// Durable verdict of a closed review-only/no-rework task:
+/// `changes_requested`, `ci_failed`, or `merge_conflict`.
+pub const REVIEW_OUTCOME_REF: &str = "review_outcome";
+/// Bounded findings text accompanying [`REVIEW_OUTCOME_REF`].
+pub const REVIEW_OUTCOME_FINDINGS_REF: &str = "review_outcome_findings";
+/// Bounded failing check names for a `ci_failed` outcome.
+pub const REVIEW_OUTCOME_CHECKS_REF: &str = "review_outcome_checks";
+/// Unix time the outcome was recorded.
+pub const REVIEW_OUTCOME_AT_REF: &str = "review_outcome_at";
+/// Durable outbox for the daemon-owned GitHub REQUEST_CHANGES review:
+/// `pending` until the daemon has ensured it, then `posted`.
+pub const REVIEW_OUTCOME_GITHUB_REF: &str = "review_outcome_github";
+
+/// Byte bound for persisted no-rework findings (and the findings note body).
+pub const NO_REWORK_FINDINGS_MAX_BYTES: usize = 4096;
+const NO_REWORK_MAX_CHECKS: usize = 20;
+const NO_REWORK_CHECK_NAME_MAX_BYTES: usize = 200;
+
+fn truncate_utf8(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes.saturating_sub('…'.len_utf8());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// The durable outcome kind for an event that closes a no-rework task, or
+/// `None` for events that are not actionable-rework triggers.
+pub fn no_rework_outcome_kind(event: &Event) -> Option<&'static str> {
+    match event {
+        Event::VerdictChanges => Some("changes_requested"),
+        Event::ChecksFailed { .. } => Some("ci_failed"),
+        Event::MergeConflict => Some("merge_conflict"),
+        _ => None,
+    }
+}
+
+fn no_rework_outcome_label(kind: &str) -> &'static str {
+    match kind {
+        "changes_requested" => "reviewer requested changes",
+        "ci_failed" => "CI checks failed",
+        "merge_conflict" => "PR has a merge conflict",
+        _ => "closed without rework",
+    }
+}
+
+fn bounded_checks(event: &Event) -> Vec<String> {
+    match event {
+        Event::ChecksFailed { checks } => checks
+            .iter()
+            .take(NO_REWORK_MAX_CHECKS)
+            .map(|name| truncate_utf8(name, NO_REWORK_CHECK_NAME_MAX_BYTES))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Human-readable findings body shared by the task note and the daemon's
+/// GitHub REQUEST_CHANGES review. Bounded to [`NO_REWORK_FINDINGS_MAX_BYTES`]
+/// of findings plus a short header.
+fn no_rework_outcome_body(kind: &str, checks: &[String], findings: Option<&str>) -> String {
+    let mut body = format!(
+        "Quorum review-only outcome: {}. This task was created with \
+         `task-create --review-only`, so Quorum closed it without rework; \
+         the PR author owns any follow-up.",
+        no_rework_outcome_label(kind)
+    );
+    if !checks.is_empty() {
+        body.push_str("\n\nFailing checks: ");
+        body.push_str(&checks.join(", "));
+    }
+    if let Some(findings) = findings.map(str::trim).filter(|text| !text.is_empty()) {
+        body.push_str("\n\nFindings:\n");
+        body.push_str(&truncate_utf8(findings, NO_REWORK_FINDINGS_MAX_BYTES));
+    }
+    body
+}
+
+fn no_rework_findings_note(kind: &str, event: &Event, findings: Option<&str>) -> String {
+    no_rework_outcome_body(kind, &bounded_checks(event), findings)
+}
+
+fn set_no_rework_outcome_refs(
+    refs: Option<&str>,
+    kind: &str,
+    event: &Event,
+    findings: Option<&str>,
+    now: i64,
+) -> Result<String> {
+    let mut value: serde_json::Value = match refs {
+        Some(raw) => serde_json::from_str(raw)
+            .map_err(|error| QuorumError::Io(format!("invalid task refs JSON: {error}")))?,
+        None => serde_json::json!({}),
+    };
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| QuorumError::Io("task refs must be a JSON object".into()))?;
+    object.insert(REVIEW_OUTCOME_REF.into(), serde_json::json!(kind));
+    object.insert(REVIEW_OUTCOME_AT_REF.into(), serde_json::json!(now));
+    object.insert(
+        REVIEW_OUTCOME_GITHUB_REF.into(),
+        serde_json::json!("pending"),
+    );
+    let checks = bounded_checks(event);
+    if checks.is_empty() {
+        object.remove(REVIEW_OUTCOME_CHECKS_REF);
+    } else {
+        object.insert(REVIEW_OUTCOME_CHECKS_REF.into(), serde_json::json!(checks));
+    }
+    match findings.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) => {
+            object.insert(
+                REVIEW_OUTCOME_FINDINGS_REF.into(),
+                serde_json::json!(truncate_utf8(text, NO_REWORK_FINDINGS_MAX_BYTES)),
+            );
+        }
+        None => {
+            object.remove(REVIEW_OUTCOME_FINDINGS_REF);
+        }
+    }
+    serde_json::to_string(&value)
+        .map_err(|error| QuorumError::Io(format!("serialize task refs: {error}")))
+}
+
+/// One closed no-rework task whose GitHub REQUEST_CHANGES review the daemon
+/// has not yet ensured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoReworkReviewPost {
+    pub task_id: i64,
+    pub pr: i64,
+    pub body: String,
+}
+
+/// Bounded read of the durable REQUEST_CHANGES outbox. Short read: callers
+/// perform the GitHub call outside any transaction, then
+/// [`mark_no_rework_review_posted`].
+pub fn pending_no_rework_review_posts(
+    conn: &Connection,
+    limit: i64,
+) -> Result<Vec<NoReworkReviewPost>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, refs FROM tasks
+         WHERE status='done' AND no_rework=1 AND json_valid(refs)
+           AND json_extract(refs, '$.review_outcome_github')='pending'
+         ORDER BY id LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut posts = Vec::with_capacity(rows.len());
+    for (task_id, refs) in rows {
+        let Some(pr) = extract_pr_number(&refs) else {
+            continue;
+        };
+        let value: serde_json::Value = refs
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default();
+        let kind = value[REVIEW_OUTCOME_REF].as_str().unwrap_or_default();
+        let checks = value[REVIEW_OUTCOME_CHECKS_REF]
+            .as_array()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| name.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let findings = value[REVIEW_OUTCOME_FINDINGS_REF].as_str();
+        posts.push(NoReworkReviewPost {
+            task_id,
+            pr,
+            body: no_rework_outcome_body(kind, &checks, findings),
+        });
+    }
+    Ok(posts)
+}
+
+/// Bound on GitHub REQUEST_CHANGES attempts for one closed no-rework task.
+pub const NO_REWORK_REVIEW_POST_MAX_ATTEMPTS: i64 = 5;
+
+/// Record one unconfirmed REQUEST_CHANGES attempt. Returns `"retry"` while
+/// attempts remain, `"failed"` when the bounded budget is exhausted (the entry
+/// leaves the outbox and the owner is alerted), or `"already-consumed"` when
+/// the entry is no longer pending.
+pub fn record_no_rework_review_post_failure(
+    conn: &mut Connection,
+    id: i64,
+    now: i64,
+) -> Result<&'static str> {
+    let tx = begin_immediate(conn)?;
+    let attempts: Option<i64> = tx
+        .query_row(
+            "SELECT COALESCE(json_extract(refs, '$.review_outcome_github_attempts'), 0) + 1
+             FROM tasks
+             WHERE id=?1 AND status='done' AND no_rework=1 AND json_valid(refs)
+               AND json_extract(refs, '$.review_outcome_github')='pending'",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(attempts) = attempts else {
+        tx.commit()?;
+        return Ok("already-consumed");
+    };
+    let exhausted = attempts >= NO_REWORK_REVIEW_POST_MAX_ATTEMPTS;
+    tx.execute(
+        "UPDATE tasks
+         SET refs=json_set(refs,
+                 '$.review_outcome_github_attempts', ?2,
+                 '$.review_outcome_github', CASE WHEN ?3 THEN 'failed' ELSE 'pending' END),
+             updated_at=?4
+         WHERE id=?1",
+        params![id, attempts, exhausted, now],
+    )?;
+    if exhausted {
+        tx.execute(
+            "INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at, recipient)
+             VALUES (?1, 'daemon', ?2, 'alert', ?3, ?4, ?5, 'owner')",
+            params![
+                now,
+                crate::feed::DEFAULT_TOPIC,
+                format!(
+                    "task #{id}: review-only GitHub REQUEST_CHANGES review could not be \
+                     posted after {attempts} attempts; findings are in the task note"
+                ),
+                format!("task:{id}"),
+                now + crate::feed::DEFAULT_MESSAGE_TTL_SECS,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(if exhausted { "failed" } else { "retry" })
+}
+
+/// Consume one REQUEST_CHANGES outbox entry. Guarded: returns `false` when the
+/// entry is no longer pending (another tick or daemon already consumed it).
+pub fn mark_no_rework_review_posted(conn: &mut Connection, id: i64, now: i64) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET refs=json_set(refs, '$.review_outcome_github', 'posted'), updated_at=?2
+         WHERE id=?1 AND status='done' AND no_rework=1 AND json_valid(refs)
+           AND json_extract(refs, '$.review_outcome_github')='pending'",
+        params![id, now],
+    )?;
+    tx.commit()?;
+    Ok(changed == 1)
+}
+
 /// Persist a bounded exact-remediation replacement intent without disturbing
 /// the task's PR, feedback, or current rework round.
 pub fn set_recovered_remediation_retry(refs: Option<&str>) -> Result<String> {
@@ -1166,6 +1427,52 @@ pub fn create_with_continue_pr_and_target_branch(
         continue_pr,
         target_branch,
         now,
+    )?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Create a review-only/no-rework task (`task-create --review-only <N>`).
+///
+/// The row is an ordinary review-only task (`in-review`, `review_only=1`,
+/// `refs.pr=N`) so every review-only path applies unchanged, plus
+/// `no_rework=1`, written in the same transaction: reviewers review the PR and
+/// Quorum never reworks it.
+#[allow(clippy::too_many_arguments)]
+pub fn create_review_only_no_rework(
+    conn: &mut Connection,
+    created_by: &str,
+    title: &str,
+    body: Option<&str>,
+    priority: i64,
+    labels: Option<&str>,
+    refs: Option<&str>,
+    depends_on: Option<&str>,
+    pr: i64,
+    target_branch: Option<&str>,
+    now: i64,
+) -> Result<i64> {
+    if pr <= 0 {
+        return Err(QuorumError::Usage("--review-only must be positive".into()));
+    }
+    let tx = begin_immediate(conn)?;
+    let id = create_task_tx(
+        &tx,
+        created_by,
+        title,
+        body,
+        priority,
+        labels,
+        refs,
+        depends_on,
+        Some(pr),
+        None,
+        target_branch,
+        now,
+    )?;
+    tx.execute(
+        "UPDATE tasks SET no_rework=1 WHERE id=?1 AND review_only=1",
+        params![id],
     )?;
     tx.commit()?;
     Ok(id)
@@ -1470,7 +1777,7 @@ pub fn claim_provider_retry_rework(
     let updated = tx.execute(
         &format!(
             "UPDATE tasks SET assignee=?1, updated_at=?2
-         WHERE id=?3 AND status='rework' AND assignee IS NULL
+         WHERE id=?3 AND status='rework' AND assignee IS NULL AND no_rework=0
            AND {DEP_READY_CLAUSE}
            AND CASE WHEN json_valid(refs) THEN
                json_type(refs, '$.cx_est')='integer'
@@ -1705,9 +2012,11 @@ pub fn claim_remediation_rework_with_feedback(
         )?;
     }
 
+    // `no_rework=0`: a review-only/no-rework task is never remediated, so it
+    // can never install a remediation lease even if a stale caller asks.
     let status: Option<String> = tx
         .query_row(
-            &format!("SELECT status FROM tasks WHERE id=?1 AND {DEP_READY_CLAUSE}"),
+            &format!("SELECT status FROM tasks WHERE id=?1 AND no_rework=0 AND {DEP_READY_CLAUSE}"),
             params![id],
             |r| r.get(0),
         )
@@ -2107,13 +2416,17 @@ pub fn apply_actionable_rework_event(
             "actionable rework feedback must be non-empty and contain no NUL".into(),
         ));
     }
-    if !matches!(event, Event::VerdictChanges | Event::MergeConflict) {
+    if !matches!(
+        event,
+        Event::VerdictChanges | Event::MergeConflict | Event::ChecksFailed { .. }
+    ) {
         return Err(QuorumError::BadInput(
-            "actionable rework persistence requires VerdictChanges or MergeConflict".into(),
+            "actionable rework persistence requires VerdictChanges, ChecksFailed, or MergeConflict"
+                .into(),
         ));
     }
     let tx = begin_immediate(conn)?;
-    apply_event_tx(tx, agent, id, event, now, |tx| {
+    apply_event_tx_with_findings(tx, agent, id, event, now, Some(feedback), |tx| {
         tx.execute(
             "UPDATE tasks
              SET refs=json_set(COALESCE(refs, '{}'), '$.remediation_feedback', ?2)
@@ -2699,7 +3012,7 @@ pub fn apply_checks_failed_with_remediation(
     let tx = begin_immediate(conn)?;
     let checks_json = serde_json::to_string(checks)
         .map_err(|error| QuorumError::Io(format!("serialize failing checks: {error}")))?;
-    apply_event_tx(
+    apply_event_tx_with_findings(
         tx,
         "system",
         id,
@@ -2707,6 +3020,7 @@ pub fn apply_checks_failed_with_remediation(
             checks: checks.to_vec(),
         },
         now,
+        Some(feedback),
         |tx| {
             // The lifecycle update has already selected the destination. Only
             // rework receives retry intent; a rework-cap failure remains terminal.
@@ -3349,6 +3663,25 @@ where
     apply_event_tx_with_deferred_sweep(tx, agent, id, event, now, false, before_commit)
 }
 
+/// Variant of [`apply_event_tx`] that carries the actionable findings text for
+/// the transition. Only a review-only/no-rework close consumes it (durable
+/// `refs.review_outcome_findings` and the findings note); every other
+/// transition ignores it.
+fn apply_event_tx_with_findings<F>(
+    tx: Transaction<'_>,
+    agent: &str,
+    id: i64,
+    event: &Event,
+    now: i64,
+    findings: Option<&str>,
+    before_commit: F,
+) -> Result<TransitionResult>
+where
+    F: FnOnce(&Transaction<'_>) -> Result<()>,
+{
+    apply_event_tx_inner(tx, agent, id, event, now, false, findings, before_commit)
+}
+
 fn apply_event_tx_with_deferred_sweep<F>(
     tx: Transaction<'_>,
     agent: &str,
@@ -3356,6 +3689,23 @@ fn apply_event_tx_with_deferred_sweep<F>(
     event: &Event,
     now: i64,
     defer_sweep: bool,
+    before_commit: F,
+) -> Result<TransitionResult>
+where
+    F: FnOnce(&Transaction<'_>) -> Result<()>,
+{
+    apply_event_tx_inner(tx, agent, id, event, now, defer_sweep, None, before_commit)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_event_tx_inner<F>(
+    tx: Transaction<'_>,
+    agent: &str,
+    id: i64,
+    event: &Event,
+    now: i64,
+    defer_sweep: bool,
+    findings: Option<&str>,
     before_commit: F,
 ) -> Result<TransitionResult>
 where
@@ -3429,10 +3779,22 @@ where
         rework_cap: task.effective_rework_cap(),
         pr: extract_pr_from_refs(&task.refs),
         review_only: task.review_only,
+        no_rework: task.no_rework,
     };
 
     let (mut new_status, mut effects) = crate::lifecycle::transition(&view, event)
         .map_err(|e| QuorumError::Usage(e.to_string()))?;
+
+    // Storage-level backstop for the review-only/no-rework contract: no
+    // transition may ever put such a task into a remediation phase.
+    if task.no_rework && matches!(new_status, Status::Rework | Status::Working) {
+        return Err(QuorumError::Io(format!(
+            "task #{id} is review-only (no-rework) and must never enter {new_status}"
+        )));
+    }
+    let no_rework_outcome = (task.no_rework && new_status == Status::Done)
+        .then(|| no_rework_outcome_kind(event))
+        .flatten();
 
     // Recovery budget: crash-recovery transitions (Working/Rework → Open or
     // Rework via AgentFailed/LeaseExpired) are bounded. Park loudly in Failed
@@ -3538,7 +3900,10 @@ where
     // Every Failed park is owner-gated. In particular, daemon teardown must
     // not put a runnable retry marker on a terminal row: after restart the
     // pre-shutdown selection is no longer authoritative.
+    // A no-rework task is never parked for a rework resume: there is no
+    // remediation to retry, so its defensive Failed stays owner-gated.
     let is_remediation_death_park = task.review_only
+        && !task.no_rework
         && status == Status::Rework
         && new_status == Status::Failed
         && matches!(event, Event::AgentFailed { .. } | Event::LeaseExpired);
@@ -3603,14 +3968,13 @@ where
                 )?;
             }
             Effect::PostFindingsNote => {
+                let body = match no_rework_outcome {
+                    Some(kind) => no_rework_findings_note(kind, event, findings),
+                    None => "review-only task failed: reviewer requested changes".to_string(),
+                };
                 tx.execute(
                     "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        id,
-                        now,
-                        agent,
-                        "review-only task failed: reviewer requested changes"
-                    ],
+                    params![id, now, agent, body],
                 )?;
             }
             Effect::ResumeWorker => {
@@ -3626,6 +3990,15 @@ where
 
     if let Event::SignaledDone { pr } = event {
         refs = Some(merge_pr_into_refs(&task.refs, pr));
+    }
+    if let Some(kind) = no_rework_outcome {
+        refs = Some(set_no_rework_outcome_refs(
+            refs.as_deref(),
+            kind,
+            event,
+            findings,
+            now,
+        )?);
     }
     if matches!(event, Event::SignaledDone { .. } | Event::ReworkPushed)
         && new_status == Status::InReview
@@ -10150,6 +10523,344 @@ mod tests {
         assert!(r.effects.contains(&Effect::ResumeWorker));
     }
 
+    // ── review-only / no-rework (`task-create --review-only`) ──────────────
+
+    const CLASSIFIED_REFS: &str = r#"{"cx_est":3,"cx_size":"M","cx_size_reason":"bounded test classification rationale","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#;
+
+    fn create_no_rework(c: &mut Connection, pr: i64) -> i64 {
+        create_review_only_no_rework(
+            c,
+            "boss",
+            "review-only PR",
+            None,
+            100,
+            None,
+            Some(CLASSIFIED_REFS),
+            None,
+            pr,
+            Some("main"),
+            1000,
+        )
+        .unwrap()
+    }
+
+    fn refs_json(task: &Task) -> serde_json::Value {
+        serde_json::from_str(task.refs.as_deref().unwrap()).unwrap()
+    }
+
+    fn active_claim_count(c: &Connection, id: i64) -> i64 {
+        c.query_row(
+            "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+            params![lease_target(id)],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn assert_no_rework_closed(c: &mut Connection, id: i64, result: &TransitionResult, kind: &str) {
+        assert_eq!(result.task.status, "done", "no-rework {kind} must close");
+        assert_eq!(result.task.rework_round, 0, "no rework round is consumed");
+        assert!(result.task.assignee.is_none());
+        assert!(!result.effects.contains(&Effect::ResumeWorker));
+        assert!(!result.effects.contains(&Effect::IncrementReworkRound));
+        assert!(result.effects.contains(&Effect::PostFindingsNote));
+        let refs = refs_json(&result.task);
+        assert_eq!(refs[REVIEW_OUTCOME_REF], kind);
+        assert_eq!(refs[REVIEW_OUTCOME_GITHUB_REF], "pending");
+        assert!(refs[REVIEW_OUTCOME_AT_REF].is_i64());
+        assert!(
+            refs.get("remediation_feedback").is_none()
+                && refs.get(CI_REMEDIATION_REQUESTED_REF).is_none(),
+            "a closed no-rework task carries no remediation intent: {refs}"
+        );
+        assert_eq!(active_claim_count(c, id), 0, "lease released");
+        let alerts = crate::feed::peek(c, None, None, 10, 5000).unwrap();
+        assert!(
+            alerts.iter().any(|m| m.kind == "alert"
+                && m.recipient.as_deref() == Some("owner")
+                && m.body.contains("closed without rework")),
+            "owner must be notified: {alerts:?}"
+        );
+        // Defense in depth: the remediation claim refuses the closed task.
+        assert!(claim_remediation_rework(c, "Remediator", id, TTL, 5000)
+            .unwrap()
+            .is_none());
+    }
+
+    fn no_rework_notes(c: &Connection, id: i64) -> Vec<String> {
+        let mut stmt = c
+            .prepare("SELECT body FROM task_notes WHERE task_id=?1 ORDER BY id")
+            .unwrap();
+        let notes = stmt
+            .query_map(params![id], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        notes
+    }
+
+    #[test]
+    fn create_review_only_no_rework_sets_review_only_and_no_rework() {
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 55);
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert!(task.review_only && task.no_rework);
+        assert_eq!(refs_json(&task)["pr"], 55);
+        assert_eq!(task.target_branch.as_deref(), Some("main"));
+
+        // `--review-pr` keeps the remediation mode.
+        let review_pr = create(
+            &mut c,
+            "boss",
+            "review pr",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(56),
+            1000,
+        )
+        .unwrap();
+        let task = get(&c, review_pr).unwrap().unwrap();
+        assert!(task.review_only && !task.no_rework);
+    }
+
+    #[test]
+    fn create_review_only_no_rework_rejects_bad_or_owned_pr() {
+        let (_d, mut c) = open_tmp();
+        for pr in [0, -3] {
+            let err = create_review_only_no_rework(
+                &mut c, "boss", "bad", None, 0, None, None, None, pr, None, 1000,
+            )
+            .unwrap_err();
+            assert!(matches!(err, QuorumError::Usage(_)), "{err:?}");
+        }
+        create_no_rework(&mut c, 57);
+        let err = create_review_only_no_rework(
+            &mut c, "boss", "dupe", None, 0, None, None, None, 57, None, 1000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, QuorumError::Usage(_)), "{err:?}");
+        let rows: i64 = c
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "rejected creates leave no row");
+    }
+
+    #[test]
+    fn no_rework_changes_verdict_closes_done_with_durable_outcome() {
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 60);
+        claim(&mut c, "R", Some(id), &[], TTL, 1001)
+            .unwrap()
+            .unwrap();
+        let r = apply_actionable_rework_event(
+            &mut c,
+            "R",
+            id,
+            &Event::VerdictChanges,
+            "BLOCKING: the parser drops NUL checks",
+            1002,
+        )
+        .unwrap();
+        assert_no_rework_closed(&mut c, id, &r, "changes_requested");
+        let refs = refs_json(&r.task);
+        assert_eq!(
+            refs[REVIEW_OUTCOME_FINDINGS_REF],
+            "BLOCKING: the parser drops NUL checks"
+        );
+        assert!(refs.get(REVIEW_OUTCOME_CHECKS_REF).is_none());
+        let notes = no_rework_notes(&c, id);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("reviewer requested changes"), "{notes:?}");
+        assert!(
+            notes[0].contains("the parser drops NUL checks"),
+            "{notes:?}"
+        );
+        let provenance: Option<String> = c
+            .query_row(
+                "SELECT completion_provenance FROM tasks WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            provenance, None,
+            "a closed review verdict is not merge provenance"
+        );
+    }
+
+    #[test]
+    fn no_rework_failed_checks_close_done_with_check_names() {
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 61);
+        let r = apply_checks_failed_with_remediation(
+            &mut c,
+            id,
+            61,
+            "abc123",
+            &["ci-lint".into(), "ci-test".into()],
+            "CI checks failed before review for PR #61: ci-lint, ci-test",
+            1002,
+        )
+        .unwrap();
+        assert_no_rework_closed(&mut c, id, &r, "ci_failed");
+        let refs = refs_json(&r.task);
+        assert_eq!(
+            refs[REVIEW_OUTCOME_CHECKS_REF],
+            serde_json::json!(["ci-lint", "ci-test"])
+        );
+        assert!(no_rework_notes(&c, id)[0].contains("Failing checks: ci-lint, ci-test"));
+    }
+
+    #[test]
+    fn no_rework_merge_conflict_closes_done() {
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 62);
+        claim(&mut c, "R", Some(id), &[], TTL, 1001)
+            .unwrap()
+            .unwrap();
+        let approved = apply_event(&mut c, "R", id, &Event::VerdictApprove, 1002).unwrap();
+        assert_eq!(
+            approved.task.status, "merging",
+            "approve still merges normally"
+        );
+        let r = apply_actionable_rework_event(
+            &mut c,
+            "system",
+            id,
+            &Event::MergeConflict,
+            "PR #62 has conflicts with main",
+            1003,
+        )
+        .unwrap();
+        assert_no_rework_closed(&mut c, id, &r, "merge_conflict");
+    }
+
+    #[test]
+    fn no_rework_approval_merges_with_merged_provenance() {
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 63);
+        claim(&mut c, "R", Some(id), &[], TTL, 1001)
+            .unwrap()
+            .unwrap();
+        apply_event(&mut c, "R", id, &Event::VerdictApprove, 1002).unwrap();
+        let r = apply_event(&mut c, "system", id, &Event::MergeSucceeded, 1003).unwrap();
+        assert_eq!(r.task.status, "done");
+        assert!(refs_json(&r.task).get(REVIEW_OUTCOME_REF).is_none());
+        assert!(pending_no_rework_review_posts(&c, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn no_rework_findings_are_bounded() {
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 64);
+        claim(&mut c, "R", Some(id), &[], TTL, 1001)
+            .unwrap()
+            .unwrap();
+        let huge = "é".repeat(NO_REWORK_FINDINGS_MAX_BYTES);
+        let r = apply_actionable_rework_event(&mut c, "R", id, &Event::VerdictChanges, &huge, 1002)
+            .unwrap();
+        let stored = refs_json(&r.task)[REVIEW_OUTCOME_FINDINGS_REF]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            stored.len() <= NO_REWORK_FINDINGS_MAX_BYTES,
+            "{}",
+            stored.len()
+        );
+        assert!(stored.ends_with('…'));
+        assert!(no_rework_notes(&c, id)[0].len() <= NO_REWORK_FINDINGS_MAX_BYTES + 512);
+    }
+
+    #[test]
+    fn no_rework_request_changes_outbox_is_consumed_once() {
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 65);
+        claim(&mut c, "R", Some(id), &[], TTL, 1001)
+            .unwrap()
+            .unwrap();
+        apply_actionable_rework_event(&mut c, "R", id, &Event::VerdictChanges, "fix X", 1002)
+            .unwrap();
+        let posts = pending_no_rework_review_posts(&c, 10).unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!((posts[0].task_id, posts[0].pr), (id, 65));
+        assert!(posts[0].body.contains("reviewer requested changes"));
+        assert!(posts[0].body.contains("fix X"));
+        assert!(mark_no_rework_review_posted(&mut c, id, 1003).unwrap());
+        assert!(
+            !mark_no_rework_review_posted(&mut c, id, 1004).unwrap(),
+            "a consumed outbox entry is a clean negative"
+        );
+        assert!(pending_no_rework_review_posts(&c, 10).unwrap().is_empty());
+        assert_eq!(
+            refs_json(&get(&c, id).unwrap().unwrap())[REVIEW_OUTCOME_GITHUB_REF],
+            "posted"
+        );
+    }
+
+    #[test]
+    fn no_rework_task_forced_into_rework_is_never_remediated() {
+        // Defense in depth against a corrupted/legacy row: the remediation
+        // claims refuse it and worker recovery fails it instead of resuming.
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 66);
+        c.execute(
+            "UPDATE tasks SET status='rework', rework_round=1, assignee=NULL,
+                 refs=json_set(refs, '$.daemon_rework_retry_requested', json('true'))
+             WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        assert!(
+            claim_remediation_rework(&mut c, "Remediator", id, TTL, 2000)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            claim_provider_retry_rework(&mut c, "Remediator", id, TTL, 2000)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(active_claim_count(&c, id), 0);
+        let r = apply_event(&mut c, "system", id, &Event::LeaseExpired, 2001).unwrap();
+        assert_eq!(r.task.status, "failed");
+        assert!(!r.effects.contains(&Effect::ResumeWorker));
+        let refs = refs_json(&r.task);
+        assert!(
+            refs.get(PARKED_REF).is_none() && refs.get(RECOVERED_REMEDIATION_RETRY_REF).is_none(),
+            "no rework resume marker may be written for a no-rework task: {refs}"
+        );
+    }
+
+    #[test]
+    fn review_pr_task_still_enters_rework_after_no_rework_feature() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "review PR",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(67),
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "R", Some(id), &[], TTL, 1001)
+            .unwrap()
+            .unwrap();
+        let r = apply_actionable_rework_event(&mut c, "R", id, &Event::VerdictChanges, "fix", 1002)
+            .unwrap();
+        assert_eq!(r.task.status, "rework");
+        assert!(refs_json(&r.task).get(REVIEW_OUTCOME_REF).is_none());
+    }
+
     /// Walk a review-only task into `rework` (claim + changes verdict) and
     /// return its id. rework_round is 1 afterwards.
     fn review_only_task_in_rework(c: &mut Connection) -> i64 {
@@ -11554,6 +12265,7 @@ mod tests {
             rework_cap: crate::lifecycle::REWORK_CAP,
             pr: Some("343".into()),
             review_only: false,
+            no_rework: false,
         };
         let (new_status, _effects) = crate::lifecycle::transition(
             &view,
