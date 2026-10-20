@@ -1231,6 +1231,17 @@ impl RunnerProc {
         matches!(self, Self::Claude(proc) if proc.has_outstanding_work())
     }
 
+    pub fn unfed_turn_open(&self) -> bool {
+        matches!(self, Self::Claude(proc) if proc.unfed_turn_open())
+    }
+
+    pub fn unfed_turns_since_feed(&self) -> u32 {
+        match self {
+            Self::Claude(proc) => proc.unfed_turns_since_feed(),
+            Self::Codex(_) | Self::Grok(_) => 0,
+        }
+    }
+
     pub async fn authorized_grok_terminal(&mut self) -> Option<String> {
         match self {
             Self::Grok(proc) => proc.authorized_terminal().await,

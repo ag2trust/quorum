@@ -249,6 +249,15 @@ impl AgentProc {
         self.turns.has_outstanding_work()
     }
 
+    /// Self-continued provider turns completed since the latest daemon feed.
+    pub fn unfed_turns_since_feed(&self) -> u32 {
+        self.turns.unfed_results_since_feed()
+    }
+
+    pub fn unfed_turn_open(&self) -> bool {
+        self.turns.unfed_turn_open()
+    }
+
     pub(super) fn failure_observation(raw: &str) -> FailureObservation {
         if raw.is_empty() {
             return FailureObservation::inert();

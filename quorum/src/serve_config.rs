@@ -1108,7 +1108,6 @@ impl<T: std::fmt::Display> std::fmt::Display for Sourced<T> {
     }
 }
 
-/// Resolve: flag > file > default.
 /// Idle ceiling applied instead of `max_idle_secs` while a managed agent has
 /// an outstanding tool call or background task (long test suites run by the
 /// provider in the background). Always finite: a hung tool is still reaped.
@@ -1125,6 +1124,7 @@ pub fn validate_busy_idle_secs(seconds: u64) -> std::result::Result<(), String> 
     Ok(())
 }
 
+/// Resolve: flag > file > default.
 pub fn resolve_val<T: Copy>(flag: Option<T>, file: Option<T>, default: T) -> Sourced<T> {
     if let Some(v) = flag {
         return Sourced {

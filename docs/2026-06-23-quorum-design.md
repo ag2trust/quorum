@@ -688,12 +688,19 @@ both the in-turn and the between-turn idle watchdog use `max_busy_idle_secs` (de
 A persistent Claude child keeps running after its turn's `result` (background tasks
 complete; the CLI may self-continue). The daemon keeps reading its stdout between turns,
 with a bounded per-tick drain, to update liveness and outstanding-work tracking.
-Between-turn provider activity re-anchors the between-turn idle clock. A `result` for a
+The between-turn idle clock stays anchored on the end of the last daemon-fed turn.
+Outstanding work, or a self-continued turn still in progress, only selects the busy
+ceiling, so a persistent worker is reaped at most `max_busy_idle_secs` after its last
+daemon-fed turn. At most 8 self-continued turns are tolerated per daemon-fed turn.
+`max_task_wall_secs` is also checked between turns while the provider is acting on its
+own. A `result` for a
 turn the daemon did not feed never completes or fails a daemon turn, but its usage and
 cost are charged to the slot's token/cost budgets; a breach becomes a pending watchdog
 outcome and no further turn is fed. Every fed user turn
-carries a fresh `uuid`. Once the CLI reports `command_lifecycle` records, only a
-`result` that arrives after that command's `started` record is attributed. Before
+carries a fresh `uuid`. Once the CLI reports that command as `queued`, only a `result`
+that arrives after its `started` record is attributed. If the command was never seen
+queued, the first `result` after the feed is attributed, so a turn can never wedge.
+Feeding a new turn clears the worker's previous reaction. Before
 feeding a turn, the daemon drains and discards the stale stdout backlog. Submissions
 arrive through the agent endpoint, so a self-continued worker that submits takes the
 normal delivery path.

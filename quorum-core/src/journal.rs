@@ -116,6 +116,18 @@ pub fn list_in_flight(conn: &Connection) -> Result<Vec<JournalEntry>> {
     Ok(result)
 }
 
+/// Forget a worker's projected reaction when the daemon feeds it a new turn,
+/// so only a reaction made during the latest turn can park the task.
+pub fn clear_agent_state(conn: &mut Connection, agent: &str, task_id: i64) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "UPDATE journal SET agent_state = NULL WHERE agent = ?1 AND task_id = ?2",
+        params![agent, task_id],
+    )?;
+    tx.commit()?;
+    Ok(changed > 0)
+}
+
 pub fn delete(conn: &mut Connection, agent: &str) -> Result<bool> {
     let tx = begin_immediate(conn)?;
     let changed = tx.execute("DELETE FROM journal WHERE agent = ?1", params![agent])?;

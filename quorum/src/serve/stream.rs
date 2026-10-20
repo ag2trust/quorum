@@ -210,6 +210,7 @@ pub enum LineAttribution {
 #[derive(Debug)]
 struct FedTurn {
     command_uuid: Option<String>,
+    queued: bool,
     started: bool,
 }
 
@@ -218,18 +219,23 @@ struct FedTurn {
 /// and exact attribution of `result` lines to daemon-fed turns.
 ///
 /// Attribution: a fed turn is open from `begin_fed_turn` until its result.
-/// When the CLI announces `command_lifecycle` records (2.1.304 does for every
-/// user message carrying a `uuid`), a result is attributed only after the
-/// daemon's own command reported `started`; earlier results belong to a turn
-/// the daemon did not feed. Without lifecycle support the first result after
-/// a feed is attributed (legacy behaviour). Results with no fed turn open are
-/// never attributed.
+/// Once the CLI reports `queued` for the daemon's own command (2.1.304 emits
+/// `command_lifecycle` for every user message carrying a `uuid`), a result is
+/// attributed only after that command's `started`; earlier results belong to
+/// a turn the daemon did not feed. While the fed command has not been seen
+/// queued, the first result after the feed is attributed (legacy behaviour),
+/// so a CLI that stops announcing a command can never wedge a turn. Results
+/// with no fed turn open are never attributed.
 #[derive(Debug, Default)]
 pub struct ClaudeTurnTracker {
     outstanding_tools: std::collections::BTreeSet<String>,
     background_tasks: std::collections::BTreeSet<String>,
-    lifecycle_supported: bool,
     fed: Option<FedTurn>,
+    /// Results for turns the daemon did not feed since its latest feed.
+    unfed_results_since_feed: u32,
+    /// A provider turn the daemon did not feed is in progress (it began with
+    /// `system/init` or an assistant message and has not reached `result`).
+    unfed_turn_open: bool,
 }
 
 impl ClaudeTurnTracker {
@@ -245,8 +251,21 @@ impl ClaudeTurnTracker {
     pub fn begin_fed_turn(&mut self, command_uuid: Option<String>) {
         self.fed = Some(FedTurn {
             command_uuid,
+            queued: false,
             started: false,
         });
+        self.unfed_results_since_feed = 0;
+        self.unfed_turn_open = false;
+    }
+
+    /// A self-continued provider turn is running right now.
+    pub fn unfed_turn_open(&self) -> bool {
+        self.unfed_turn_open
+    }
+
+    /// Self-continued (unfed) provider turns completed since the latest feed.
+    pub fn unfed_results_since_feed(&self) -> u32 {
+        self.unfed_results_since_feed
     }
 
     pub fn has_outstanding_work(&self) -> bool {
@@ -271,6 +290,7 @@ impl ClaudeTurnTracker {
         let str_field = |name: &str| value.get(name).and_then(|v| v.as_str());
         match str_field("type") {
             Some("assistant") => {
+                self.unfed_turn_open |= self.fed.is_none();
                 for block in content_blocks(&value) {
                     if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                         if let Some(id) = block.get("id").and_then(|id| id.as_str()) {
@@ -285,6 +305,9 @@ impl ClaudeTurnTracker {
                 }
             }
             Some("system") => match (str_field("subtype"), str_field("task_id")) {
+                (Some("init"), _) => {
+                    self.unfed_turn_open |= self.fed.is_none();
+                }
                 (Some("task_started"), Some(task_id)) => {
                     Self::insert_bounded(&mut self.background_tasks, task_id);
                 }
@@ -312,25 +335,30 @@ impl ClaudeTurnTracker {
                 _ => {}
             },
             Some("command_lifecycle") => {
-                self.lifecycle_supported = true;
                 if let Some(fed) = self.fed.as_mut() {
                     let ours = fed.command_uuid.is_some()
                         && fed.command_uuid.as_deref() == str_field("command_uuid");
-                    if ours && matches!(str_field("state"), Some("started" | "completed")) {
-                        fed.started = true;
+                    if ours {
+                        fed.queued = true;
+                        if matches!(str_field("state"), Some("started" | "completed")) {
+                            fed.started = true;
+                        }
                     }
                 }
             }
             Some("result") => {
                 // A finished provider turn has no live foreground tool call.
                 self.outstanding_tools.clear();
-                let attributable = self.fed.as_ref().is_some_and(|fed| {
-                    !self.lifecycle_supported || fed.command_uuid.is_none() || fed.started
-                });
+                self.unfed_turn_open = false;
+                let attributable = self
+                    .fed
+                    .as_ref()
+                    .is_some_and(|fed| !fed.queued || fed.started);
                 return if attributable {
                     self.fed = None;
                     LineAttribution::EndsFedTurn
                 } else {
+                    self.unfed_results_since_feed = self.unfed_results_since_feed.saturating_add(1);
                     LineAttribution::Unattributed
                 };
             }
@@ -750,10 +778,14 @@ mod tests {
         }
         assert!(attributions.contains(&LineAttribution::EndsFedTurn));
 
-        // Negative: a provider that announces command lifecycles but never
-        // starts the daemon's command must not have any result attributed.
+        // Negative: once the daemon's command is queued, a result that arrives
+        // before that command started belongs to another turn.
         let mut tracker = ClaudeTurnTracker::default();
-        tracker.begin_fed_turn(Some("44444444-4444-4444-8444-444444444444".into()));
+        let other = "44444444-4444-4444-8444-444444444444";
+        tracker.begin_fed_turn(Some(other.into()));
+        tracker.observe_line(&format!(
+            r#"{{"type":"command_lifecycle","command_uuid":"{other}","state":"queued"}}"#
+        ));
         for line in COMMAND_LIFECYCLE.lines() {
             assert_ne!(
                 tracker.observe_line(line),
@@ -761,6 +793,41 @@ mod tests {
                 "result for another command must stay unattributed: {line}"
             );
         }
+    }
+
+    #[test]
+    fn tracker_never_wedges_when_the_fed_command_is_not_announced() {
+        // The CLI announced lifecycles for an earlier command, then stops
+        // announcing (or never queues) the daemon's next command: fall back to
+        // first-result-after-feed instead of leaving the turn open forever.
+        let mut tracker = ClaudeTurnTracker::default();
+        tracker.begin_fed_turn(Some("33333333-3333-4333-8333-333333333333".into()));
+        for line in COMMAND_LIFECYCLE.lines() {
+            tracker.observe_line(line);
+        }
+        tracker.begin_fed_turn(Some("55555555-5555-4555-8555-555555555555".into()));
+        assert_eq!(
+            tracker.observe_line(r#"{"type":"result","result":"next"}"#),
+            LineAttribution::EndsFedTurn
+        );
+    }
+
+    #[test]
+    fn tracker_counts_unfed_results_since_the_latest_feed() {
+        let mut tracker = ClaudeTurnTracker::default();
+        tracker.begin_fed_turn(None);
+        tracker.observe_line(r#"{"type":"result","result":"fed"}"#);
+        assert_eq!(tracker.unfed_results_since_feed(), 0);
+        assert!(!tracker.unfed_turn_open());
+        tracker.observe_line(r#"{"type":"system","subtype":"init"}"#);
+        assert!(tracker.unfed_turn_open(), "self-continuation began");
+        for _ in 0..3 {
+            tracker.observe_line(r#"{"type":"result","result":"self"}"#);
+            assert!(!tracker.unfed_turn_open());
+        }
+        assert_eq!(tracker.unfed_results_since_feed(), 3);
+        tracker.begin_fed_turn(None);
+        assert_eq!(tracker.unfed_results_since_feed(), 0);
     }
 
     #[test]
