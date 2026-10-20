@@ -4664,7 +4664,7 @@ pub fn dispose_dead_turn_runner(
                 crate::classify::truncate_for_prompt(&detail, REACT_REASON_MAX_BYTES)
             });
             let note_body = match &detail {
-                Some(detail) => format!("parked: {reason}\n\n{detail}"),
+                Some(detail) => format!("parked: {reason}\n\nworker {agent} reason:\n{detail}"),
                 None => format!("parked: {reason}"),
             };
             let excerpt = match &detail {
@@ -8015,7 +8015,10 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap();
-            assert_eq!(note, format!("parked: {state}\n\n{question}"));
+            assert_eq!(
+                note,
+                format!("parked: {state}\n\nworker worker reason:\n{question}")
+            );
             let alert: String = c
                 .query_row(
                     "SELECT body FROM messages WHERE kind='alert' AND refs=?1",
