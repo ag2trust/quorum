@@ -15,6 +15,10 @@ const GIT_PIPE_LIMIT: usize = 1024 * 1024;
 // the complete error within the serving layer's provisioning-cause bound.
 const PUSH_REJECTION_MAX_BYTES: usize = 2048;
 
+mod recover;
+pub(crate) use recover::{recover_ref_task_id, task_id_from_name};
+pub use recover::{RecoverIdentity, RecoverRef, RecoverResume, ReleaseError};
+
 pub struct WorktreeManager {
     lock: Mutex<()>,
     git_bin: PathBuf,
@@ -26,6 +30,17 @@ pub struct WorktreeManager {
 struct WorktreeRegistration {
     path: PathBuf,
     locked_reason: Option<String>,
+    /// Full ref (`refs/heads/...`) checked out, if any.
+    branch: Option<String>,
+}
+
+/// Outcome of one startup worktree GC pass.
+#[derive(Debug, Default)]
+pub struct WorktreeGc {
+    pub removed: Vec<String>,
+    pub preserved: Vec<RecoverRef>,
+    /// `(path, error)`: work preservation failed, so the worktree was kept.
+    pub preserve_failures: Vec<(String, String)>,
 }
 
 /// A GC candidate must be a direct child of the configured base. Resolve the
@@ -1751,13 +1766,29 @@ impl WorktreeManager {
         Ok(source_sha.to_string())
     }
 
+    #[cfg(test)]
     pub async fn gc_orphaned(
         &self,
         repo_dir: &Path,
         worktree_base: &Path,
         active_worktrees: &[&str],
     ) -> Vec<String> {
+        self.gc_orphaned_detailed(repo_dir, worktree_base, active_worktrees)
+            .await
+            .removed
+    }
+
+    /// Startup GC of registered, inactive direct children of `worktree_base`.
+    /// Each candidate's work is snapshotted to a recover ref before the force
+    /// removal; a candidate whose snapshot fails is kept and reported.
+    pub async fn gc_orphaned_detailed(
+        &self,
+        repo_dir: &Path,
+        worktree_base: &Path,
+        active_worktrees: &[&str],
+    ) -> WorktreeGc {
         let _guard = self.lock.lock().await;
+        let mut gc = WorktreeGc::default();
 
         self.prune_stale_initializing_unlocked(repo_dir, worktree_base)
             .await;
@@ -1766,16 +1797,15 @@ impl WorktreeManager {
             Ok(registrations) => registrations,
             Err(error) => {
                 eprintln!("warn: {error}");
-                return Vec::new();
+                return gc;
             }
         };
 
         let entries = match std::fs::read_dir(worktree_base) {
             Ok(e) => e,
-            Err(_) => return Vec::new(),
+            Err(_) => return gc,
         };
 
-        let mut removed = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             let metadata = match std::fs::symlink_metadata(&path) {
@@ -1802,15 +1832,15 @@ impl WorktreeManager {
                     continue;
                 }
             };
-            if !registrations.iter().any(|registration| {
+            let Some(registration) = registrations.iter().find(|registration| {
                 std::fs::canonicalize(&registration.path).ok().as_ref() == Some(&canonical_path)
-            }) {
+            }) else {
                 eprintln!(
                     "warn: worktree GC leaving unregistered directory {}",
                     path.display()
                 );
                 continue;
-            }
+            };
             if active_worktrees.iter().any(|active| {
                 *active == path_str
                     || std::fs::canonicalize(active).ok().as_ref() == Some(&canonical_path)
@@ -1818,10 +1848,38 @@ impl WorktreeManager {
                 continue;
             }
 
+            let dir_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let identity = RecoverIdentity {
+                task_id: registration
+                    .branch
+                    .as_deref()
+                    .and_then(task_id_from_name)
+                    .or_else(|| task_id_from_name(&dir_name)),
+                agent: dir_name,
+                reason: "startup_gc".into(),
+            };
+            match self
+                .preserve_unlocked(repo_dir, Some(&path), None, &identity)
+                .await
+            {
+                Ok(created) => gc.preserved.extend(created),
+                Err(error) => {
+                    eprintln!(
+                        "warn: worktree GC keeping {}: work preservation failed: {error}",
+                        path.display()
+                    );
+                    gc.preserve_failures.push((path_str, error));
+                    continue;
+                }
+            }
+
             let mut rm_cmd = self.git_cmd(repo_dir);
             rm_cmd.args(["worktree", "remove", &path_str, "--force"]);
             match run_git(rm_cmd, self.local_timeout, "git worktree remove").await {
-                Ok(out) if out.status.success() => removed.push(path_str),
+                Ok(out) if out.status.success() => gc.removed.push(path_str),
                 Ok(out) => eprintln!(
                     "warn: git worktree remove {} failed: {}",
                     path.display(),
@@ -1832,7 +1890,7 @@ impl WorktreeManager {
                 }
             }
         }
-        removed
+        gc
     }
 
     /// Unlock stale daemon registrations left by an interrupted worktree add,
@@ -1863,10 +1921,14 @@ impl WorktreeManager {
         let mut registrations = Vec::new();
         let mut path = None;
         let mut locked_reason = None;
+        let mut branch = None;
         for line in stdout.lines().chain(std::iter::once("")) {
             if let Some(value) = line.strip_prefix("worktree ") {
                 path = Some(PathBuf::from(value));
                 locked_reason = None;
+                branch = None;
+            } else if let Some(value) = line.strip_prefix("branch ") {
+                branch = Some(value.to_string());
             } else if let Some(reason) = line.strip_prefix("locked ") {
                 locked_reason = Some(reason.to_string());
             } else if line == "locked" {
@@ -1876,6 +1938,7 @@ impl WorktreeManager {
                     registrations.push(WorktreeRegistration {
                         path,
                         locked_reason: locked_reason.take(),
+                        branch: branch.take(),
                     });
                 }
             }
@@ -2065,6 +2128,16 @@ impl WorktreeManager {
                 "worktree identity mismatch: expected {expected_ref}, found {actual:?}"
             ));
         }
+        // Durable cleanup intents name the daemon task branch; preserve its
+        // uncommitted state first and destroy nothing if that fails.
+        let identity = RecoverIdentity {
+            task_id: task_id_from_name(branch),
+            agent: "cleanup".into(),
+            reason: "decomposition_cleanup".into(),
+        };
+        self.preserve_unlocked(repo_dir, Some(worktree_dir), None, &identity)
+            .await
+            .map_err(|error| format!("work preservation failed (worktree kept): {error}"))?;
         let mut rm = self.git_cmd(repo_dir);
         rm.args(["worktree", "remove"])
             .arg(worktree_dir)

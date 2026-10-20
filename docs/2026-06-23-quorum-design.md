@@ -2312,6 +2312,42 @@ builds, and managed worktree paths. Use `workspace-write` plus explicit writable
 only if worker, review, rework, and merge-signaling canaries pass without exceptions.
 Approval policy is always `never`; no human exists inside a managed run.
 
+### Worker work preservation (recover refs)
+
+Workers commit but never push, so a daemon teardown that force-removes a worker worktree
+or deletes its branch would destroy uncommitted edits and committed-but-unpushed commits.
+Before every such destruction (slot cleanup for every end reason, refused/failed launch
+cleanup, remediation spawn failure, startup worktree GC, and decomposition cleanup
+`remove_exact`) the daemon snapshots what would be lost into
+`refs/quorum-recover/t<task_id>/<unix_millis>/<agent>/<reason>`. The namespace is outside
+`refs/heads/`, so branch deletion, branch sweeps, and default pushes never touch it, and it
+never collides with operator-made `recover/*` branches. Uncommitted state (tracked edits,
+deletions, untracked-not-ignored files) is captured with plumbing in a throwaway
+`GIT_INDEX_FILE` (`read-tree HEAD`, `add -A`, `write-tree`, `commit-tree -p HEAD`), so no
+hooks run and the worktree and its index are untouched. Committed work is pinned as-is only
+when it is reachable from no other ref once the deleted branch is excluded. A clean
+worktree with nothing unique creates no ref; an identical snapshot (same tree and parent)
+or an already-pinned commit is not duplicated. Creation is a create-only `update-ref` CAS
+written last, under the worktree-manager lock, so racing teardowns of one worktree create
+one ref and a daemon that dies mid-snapshot leaves the worktree intact and no partial ref.
+
+Fail-safe: if the snapshot fails, nothing is removed or deleted and an `errors` row
+(`source=worktree_recover`) is written. The kept checkout is retried by the next
+provisioning of the same task (which owns the task after its atomic claim and so
+preserves and releases a leftover checkout at its worktree path first) or by startup GC.
+
+Resume: when the daemon provisions the next worker for the task, the newest recover ref
+seeds it if it descends from the provisioning start: the kept task branch tip (fast-forward
+only) or, if the branch was deleted, the allocation's provenance base; for continuation
+and remediation checkouts, the verified PR head (before base integration). The daemon then
+writes a bounded `daemon` task note naming the ref, the prior run's agent, and the teardown
+reason. A ref that no longer applies is left in place and noted once (deduplicated by body);
+a ref already contained in the start is ignored. Retention keeps the newest
+`RECOVER_REFS_PER_TASK` (2) refs per task, and the periodic publication-ref housekeeping
+cadence retires all recover refs of `done`/`cancelled` tasks (bounded per pass). No other
+ref is ever deleted by this mechanism. Reviewer and branch-sync worktrees are out of scope:
+reviewers author no code and kept sync merges are already preserved.
+
 ### Prompt composition
 
 Prompts are the common Git delivery contract plus a worker/R1/R2 role contract plus a
