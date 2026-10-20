@@ -1,5 +1,6 @@
 //! Serialized git worktree operations for agent isolation.
 
+use quorum_core::git::git_command;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -389,12 +390,9 @@ impl WorktreeManager {
         }
     }
 
-    /// Base git command for every daemon invocation. `core.fsmonitor=false` keeps a hung or
-    /// misconfigured fsmonitor daemon in a managed repo from stalling provisioning probes.
+    /// Base git command for every daemon invocation.
     fn git_base(&self) -> Command {
-        let mut cmd = Command::new(&self.git_bin);
-        cmd.args(["-c", "core.fsmonitor=false"]);
-        cmd
+        Command::from(git_command(&self.git_bin))
     }
 
     fn git_cmd(&self, repo_dir: &Path) -> Command {

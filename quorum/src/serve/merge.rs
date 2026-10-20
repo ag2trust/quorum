@@ -1498,7 +1498,7 @@ impl MergeExecutor for CommandMergeExecutor {
         // query, so use the immutable repository object the fixture exposes
         // as its simulated merge witness. Production uses GhMergeExecutor and
         // must still obtain GitHub's real mergeCommit above.
-        let output = std::process::Command::new("git")
+        let output = quorum_core::git::git_command("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(repo_dir)
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -1535,7 +1535,7 @@ impl MergeExecutor for CommandMergeExecutor {
     }
 
     fn head_sha(&self, _pr: i64, repo_dir: &Path) -> Option<String> {
-        let output = std::process::Command::new("git")
+        let output = quorum_core::git::git_command("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(repo_dir)
             .env("GIT_TERMINAL_PROMPT", "0")

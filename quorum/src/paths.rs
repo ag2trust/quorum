@@ -6,6 +6,7 @@
 //! cwd's git checkout origin remote. Resolution failure is exit 2 (no silent default).
 
 use quorum_core::error::{QuorumError, Result};
+use quorum_core::git::git_command;
 use std::path::PathBuf;
 
 /// The Quorum home directory (`$QUORUM_HOME` or `~/.quorum`).
@@ -43,7 +44,7 @@ pub fn resolve_repo() -> Result<String> {
 /// Detect the repo identity from the cwd's git checkout by parsing the `origin`
 /// remote URL. Works from linked worktrees (git-common-dir shares remotes).
 fn detect_repo_from_git() -> Result<Option<String>> {
-    let output = std::process::Command::new("git")
+    let output = git_command("git")
         .args(["remote", "get-url", "origin"])
         .stderr(std::process::Stdio::null())
         .output();
@@ -118,7 +119,7 @@ pub fn ensure_repo_dir(repo: &str) -> Result<PathBuf> {
 /// Return the git working-tree root for the current directory, or `None` if not
 /// inside a git repo. Works from linked worktrees.
 pub fn git_toplevel() -> Option<std::path::PathBuf> {
-    let output = std::process::Command::new("git")
+    let output = git_command("git")
         .args(["rev-parse", "--show-toplevel"])
         .stderr(std::process::Stdio::null())
         .output()

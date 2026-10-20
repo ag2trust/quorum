@@ -5380,7 +5380,7 @@ async fn fold_late_reviewer_verdict(
                     |r| r.get(0),
                 )
                 .ok()?;
-            let output = std::process::Command::new("git")
+            let output = quorum_core::git::git_command("git")
                 .args(["rev-parse", "HEAD"])
                 .current_dir(worktree)
                 .env("GIT_TERMINAL_PROMPT", "0")
@@ -5555,7 +5555,7 @@ fn poll_origin_self_update_sha(
     self_update_branch: &str,
 ) -> Result<String> {
     let refspec = format!("refs/heads/{}", self_update_branch);
-    let mut child = std::process::Command::new("git")
+    let mut child = quorum_core::git::git_command("git")
         .args(["ls-remote", "origin", &refspec])
         .current_dir(repo_dir)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -6360,7 +6360,8 @@ async fn frozen_planner_view_with_options(
     // of the daemon tick therefore cannot skip its bounded kill/reap path.
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + timeout;
-        let mut head_command = tokio::process::Command::new(&git_bin);
+        let mut head_command =
+            tokio::process::Command::from(quorum_core::git::git_command(&git_bin));
         head_command.args(["rev-parse", "HEAD"]).current_dir(&repo);
         let head = run_publication_gh_command_with_limit(
             head_command,
@@ -6382,7 +6383,8 @@ async fn frozen_planner_view_with_options(
             .tempdir()
             .map_err(|error| QuorumError::Io(format!("planner view failed: {error}")))?;
 
-        let mut archive_command = tokio::process::Command::new(&git_bin);
+        let mut archive_command =
+            tokio::process::Command::from(quorum_core::git::git_command(&git_bin));
         archive_command
             .args(["archive", "--format=tar", &frozen_sha])
             .current_dir(&repo)
@@ -6618,7 +6620,7 @@ async fn repository_head_sha_with_options(
     // The detached owner retains the child if an awaiting daemon tick is
     // cancelled during shutdown; it will still hit the deadline and reap.
     tokio::spawn(async move {
-        let mut command = tokio::process::Command::new(git_bin);
+        let mut command = tokio::process::Command::from(quorum_core::git::git_command(git_bin));
         command.args(["rev-parse", "HEAD"]).current_dir(repo);
         configure_planner_view_process_group(&mut command);
         let output = run_publication_gh_command_with_limit(
@@ -23730,7 +23732,7 @@ async fn remove_branch_sync_branch(
     }
 
     let git = |args: &[&str]| {
-        let mut command = tokio::process::Command::new("git");
+        let mut command = tokio::process::Command::from(quorum_core::git::git_command("git"));
         command
             .arg("-C")
             .arg(&config.repo_dir)
@@ -59567,7 +59569,7 @@ exec /bin/cat '{stdout}'
         std::fs::write(
             &git_wrapper,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = rev-parse ]; then exec '{}' \"$@\"; fi\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+                "#!/bin/sh\nif [ \"$1\" = -c ] && [ \"$2\" = core.fsmonitor=false ]; then shift 2; fi\nif [ \"$1\" = rev-parse ]; then exec '{}' \"$@\"; fi\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
                 real_git,
                 archive_pid.display()
             ),
