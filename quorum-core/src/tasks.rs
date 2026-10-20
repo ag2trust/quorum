@@ -450,12 +450,33 @@ const COLS: &str = "id, title, body, status, priority, labels, assignee, created
                     rework_round, review_only, recovery_attempts, revision, edit_count, \
                     continue_pr, target_branch, terminal_leaf, rework_cap, no_rework";
 
-const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
+/// SQL predicate over a dependency row aliased `d`: the dependency satisfies
+/// its dependents only when it is `done` WITHOUT a daemon-owned
+/// `refs.review_outcome`. A review-only (`no_rework`) task that closed on
+/// changes requested, CI failure, or merge conflict is `done` but unmerged,
+/// so its dependents stay blocked (not parked, not failed) as-is.
+macro_rules! dep_satisfied_sql {
+    () => {
+        "(d.status = 'done' AND (CASE WHEN json_valid(COALESCE(d.refs, '{}')) \
+         THEN json_extract(d.refs, '$.review_outcome') END) IS NULL)"
+    };
+}
+
+/// See [`dep_satisfied_sql`]. Every "dependency satisfied" decision —
+/// claim, selection, readiness, status, planner, graph materialization —
+/// must use this exact predicate so they cannot drift.
+pub const DEP_SATISFIED_PREDICATE: &str = dep_satisfied_sql!();
+
+pub const DEP_READY_CLAUSE: &str = concat!(
+    "(depends_on IS NULL OR NOT EXISTS (
     SELECT 1 FROM json_each(depends_on) je
     WHERE NOT EXISTS (
-        SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'done'
+        SELECT 1 FROM tasks d WHERE d.id = je.value AND ",
+    dep_satisfied_sql!(),
+    "
     )
-))";
+))"
+);
 
 // Generated implementation work has additional graph authority. This exact
 // predicate is used both by daemon-side candidate selection and by the
@@ -719,6 +740,20 @@ pub fn validate_creator_refs(refs_json: Option<&str>) -> Result<()> {
 
 /// Daemon-owned `--review-only` outcome keys (`review_outcome*`), including
 /// the REQUEST_CHANGES outbox state. Creators can neither set nor erase them.
+/// The daemon-owned review-only close outcome (`changes_requested`,
+/// `ci_failed`, `merge_conflict`) recorded on a task's refs, if any. A `done`
+/// task carrying one closed without merge and does not satisfy dependents.
+pub fn review_outcome_of(refs: Option<&str>) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(refs?).ok()?;
+    value
+        .get(REVIEW_OUTCOME_REF)
+        .filter(|outcome| !outcome.is_null())
+        .map(|outcome| match outcome.as_str() {
+            Some(text) => text.to_string(),
+            None => outcome.to_string(),
+        })
+}
+
 fn is_review_outcome_ref(key: &str) -> bool {
     key.starts_with(REVIEW_OUTCOME_REF)
 }
@@ -841,10 +876,12 @@ pub fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<b
         return Ok(true);
     };
     let unmet: i64 = conn.query_row(
-        "SELECT count(*) FROM json_each(?1)
-         WHERE NOT EXISTS (
-             SELECT 1 FROM tasks d WHERE d.id = json_each.value AND d.status = 'done'
-         )",
+        &format!(
+            "SELECT count(*) FROM json_each(?1)
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM tasks d WHERE d.id = json_each.value AND {DEP_SATISFIED_PREDICATE}
+             )"
+        ),
         params![json],
         |r| r.get(0),
     )?;
@@ -2610,6 +2647,11 @@ fn resolve_dependency_merge_commits(
                 )
             };
             return Ok(Err(description));
+        }
+        if let Some(outcome) = review_outcome_of(refs.as_deref()) {
+            return Ok(Err(format!(
+                "dependency #{task_id} is review-only closed without merge ({outcome})"
+            )));
         }
 
         let graph: Option<(String, i64, i64, Option<i64>)> = conn
@@ -10791,6 +10833,115 @@ mod tests {
         assert_eq!(r.task.status, "done");
         assert!(refs_json(&r.task).get(REVIEW_OUTCOME_REF).is_none());
         assert!(pending_no_rework_review_posts(&c, 10).unwrap().is_empty());
+    }
+
+    fn create_dependent_of(c: &mut Connection, dep: i64) -> i64 {
+        create(
+            c,
+            "boss",
+            "dependent",
+            None,
+            0,
+            None,
+            Some(CLASSIFIED_REFS),
+            Some(&format!("[{dep}]")),
+            None,
+            2000,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn review_only_closed_without_merge_never_satisfies_dependents() {
+        for (pr, outcome) in [
+            (90, "changes_requested"),
+            (91, "ci_failed"),
+            (92, "merge_conflict"),
+        ] {
+            let (_d, mut c) = open_tmp();
+            let dep = create_no_rework(&mut c, pr);
+            let closed = match outcome {
+                "ci_failed" => apply_checks_failed_with_remediation(
+                    &mut c,
+                    dep,
+                    pr,
+                    "abc123",
+                    &["ci-test".into()],
+                    "CI checks failed",
+                    1002,
+                )
+                .unwrap(),
+                _ => {
+                    claim(&mut c, "R", Some(dep), &[], TTL, 1001)
+                        .unwrap()
+                        .unwrap();
+                    let event = if outcome == "merge_conflict" {
+                        apply_event(&mut c, "R", dep, &Event::VerdictApprove, 1002).unwrap();
+                        Event::MergeConflict
+                    } else {
+                        Event::VerdictChanges
+                    };
+                    apply_actionable_rework_event(&mut c, "R", dep, &event, "BLOCKING: x", 1003)
+                        .unwrap()
+                }
+            };
+            assert_eq!(closed.task.status, "done");
+            assert_eq!(refs_json(&closed.task)[REVIEW_OUTCOME_REF], outcome);
+
+            let child = create_dependent_of(&mut c, dep);
+            assert!(!get(&c, child).unwrap().unwrap().ready, "{outcome}");
+            assert!(
+                claim(&mut c, "A", Some(child), &[], TTL, 2001)
+                    .unwrap()
+                    .is_none(),
+                "{outcome}: dependent must not be claimable by id"
+            );
+            assert!(
+                claim(&mut c, "A", None, &[], TTL, 2002).unwrap().is_none(),
+                "{outcome}: dependent must not be selected"
+            );
+            match dependency_merge_commits(&c, Some(&format!("[{dep}]"))).unwrap() {
+                DependencyMergeCommitResolution::Unresolved { reason } => assert_eq!(
+                    reason,
+                    format!("dependency #{dep} is review-only closed without merge ({outcome})")
+                ),
+                other => panic!("{outcome}: expected unresolved, got {other:?}"),
+            }
+
+            // Not parked, not failed, no cascade: sweeps leave it open as-is.
+            crate::sweep::sweep_all(&c, 999_999).unwrap();
+            crate::sweep::cascade_dead_deps(&c, 999_999, 100).unwrap();
+            let after = get(&c, child).unwrap().unwrap();
+            assert_eq!(after.status, "open", "{outcome}: dependent stays open");
+            assert!(after.assignee.is_none());
+            let refs = refs_json(&after);
+            assert!(
+                refs.get(PARKED_REF).is_none() && refs.get(PARKED_REASON_REF).is_none(),
+                "{outcome}: dependent must not be parked: {refs}"
+            );
+            assert!(!after.ready);
+        }
+    }
+
+    #[test]
+    fn review_only_merged_satisfies_dependents() {
+        let (_d, mut c) = open_tmp();
+        let dep = create_no_rework(&mut c, 93);
+        claim(&mut c, "R", Some(dep), &[], TTL, 1001)
+            .unwrap()
+            .unwrap();
+        apply_event(&mut c, "R", dep, &Event::VerdictApprove, 1002).unwrap();
+        let merged = apply_event(&mut c, "system", dep, &Event::MergeSucceeded, 1003).unwrap();
+        assert_eq!(merged.task.status, "done");
+        assert!(refs_json(&merged.task).get(REVIEW_OUTCOME_REF).is_none());
+
+        let child = create_dependent_of(&mut c, dep);
+        assert!(get(&c, child).unwrap().unwrap().ready);
+        let claimed = claim(&mut c, "A", None, &[], TTL, 2001)
+            .unwrap()
+            .expect("dependent of a merged review-only task is selectable");
+        assert_eq!(claimed.id, child);
+        assert_eq!(claimed.status, "working");
     }
 
     #[test]

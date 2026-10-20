@@ -538,9 +538,24 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
         } else {
             String::new()
         };
+        let review_unmerged_suffix = if b.review_unmerged.is_empty() {
+            String::new()
+        } else {
+            let deps: Vec<String> = b
+                .review_unmerged
+                .iter()
+                .map(|d| {
+                    format!(
+                        "dependency #{} is review-only closed without merge ({})",
+                        d.id, d.outcome
+                    )
+                })
+                .collect();
+            format!(" ({})", deps.join("; "))
+        };
         let _ = writeln!(
             w,
-            "  #{:<5} {:<8} {:<18} {:<8} {} waits on {}{}{}",
+            "  #{:<5} {:<8} {:<18} {:<8} {} waits on {}{}{}{}",
             b.id,
             b.provider.as_deref().unwrap_or("pending"),
             b.model.as_deref().unwrap_or("pending"),
@@ -549,6 +564,7 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
             dep,
             missing_suffix,
             deadlocked_suffix,
+            review_unmerged_suffix,
         );
         let _ = writeln!(w, "      {}", truncate(&b.title, width.saturating_sub(6)));
     }
@@ -1155,6 +1171,7 @@ mod tests {
             waiting_on: vec![1],
             deadlocked_on: vec![],
             missing_deps: vec![],
+            review_unmerged: vec![],
         });
 
         let mut buf = Vec::new();
@@ -1649,6 +1666,7 @@ mod tests {
             waiting_on: vec![4, 6, 9],
             deadlocked_on: vec![],
             missing_deps: vec![],
+            review_unmerged: vec![],
         });
         let mut buf = Vec::new();
         render_with_style(&s, &Style::plain(), &mut buf);
@@ -1665,6 +1683,34 @@ mod tests {
     }
 
     #[test]
+    fn blocked_names_review_only_dependency_closed_without_merge() {
+        let mut s = default_stats();
+        s.blocked.push(BlockedTask {
+            id: 30,
+            title: "waits on rejected review".into(),
+            tier_eff: "opus46·md".into(),
+            provider: None,
+            model: None,
+            effort: None,
+            waiting_on: vec![12],
+            deadlocked_on: vec![],
+            missing_deps: vec![],
+            review_unmerged: vec![quorum_core::stats::ReviewUnmergedDep {
+                id: 12,
+                outcome: "changes_requested".into(),
+            }],
+        });
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        let line = output.lines().find(|l| l.contains("#30")).unwrap();
+        assert!(
+            line.contains("dependency #12 is review-only closed without merge (changes_requested)"),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn blocked_mixed_live_and_cancelled_deps() {
         let mut s = default_stats();
         s.blocked.push(BlockedTask {
@@ -1677,6 +1723,7 @@ mod tests {
             waiting_on: vec![3, 5, 7],
             deadlocked_on: vec![5],
             missing_deps: vec![],
+            review_unmerged: vec![],
         });
         let mut buf = Vec::new();
         render_with_style(&s, &Style::plain(), &mut buf);
@@ -1705,6 +1752,7 @@ mod tests {
             waiting_on: vec![404],
             deadlocked_on: vec![],
             missing_deps: vec![404],
+            review_unmerged: vec![],
         });
         s.blocked.push(BlockedTask {
             id: 31,
@@ -1716,6 +1764,7 @@ mod tests {
             waiting_on: vec![405],
             deadlocked_on: vec![],
             missing_deps: vec![],
+            review_unmerged: vec![],
         });
 
         let mut buf = Vec::new();

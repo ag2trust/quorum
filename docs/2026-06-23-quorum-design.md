@@ -868,8 +868,19 @@ and never provisions a remediation worker. Defense in depth: the lifecycle never
 Rework/Working for `no_rework=1`; the storage layer rejects such a transition; both guarded
 remediation claims (`claim_remediation_rework*`, `claim_provider_retry_rework`) require
 `no_rework=0`; and `spawn_remediation_worker` refuses the task before allocating a name,
-lease, or worktree. Because the close is `done`, dependents of a no-rework task become
-ready even when the PR was not merged.
+lease, or worktree.
+
+A no-rework close does **not** satisfy dependents: a dependency is satisfied only when it is
+`done` **without** `refs.review_outcome` (`tasks::DEP_SATISFIED_PREDICATE`, shared by claim,
+selection, readiness, the planner candidate, graph materialization, dependency merge-commit
+admission, and status). A dependent of a review-only task that closed unmerged is simply not
+executed: it stays `open`/`rework` as-is — never parked, failed, or cascaded
+(`cascade_dead_deps` only acts on `failed`/`cancelled` deps). Status names the blocker
+(`dependency #N is review-only closed without merge (<outcome>)` in the BLOCKED section and
+the task-progress condition). `review_outcome` is daemon-owned and terminal, so the only
+existing way to release such a dependent is editing its `depends_on` (`task-update`); an
+approved-and-merged review-only task carries no `review_outcome` and satisfies dependents
+normally.
 
 ### Guards and policies
 
@@ -973,7 +984,8 @@ ready even when the PR was not merged.
 - **Verdict attestation (#206):** `--verdict approved` requires `--blocking 0`; any blocking
   finding requires `--verdict changes --feedback`. Unattested approvals are demoted to
   changes by the daemon.
-- **Dependency gating:** tasks with `depends_on` are only claimable when all deps are `done`.
+- **Dependency gating:** tasks with `depends_on` are only claimable when all deps are `done`
+  (and, for a `--review-only` dep, closed without a `refs.review_outcome`, i.e. merged).
   A daemon-observed merge also records GitHub's immutable merge commit in
   `refs.merge_commit_sha`. Before **first** allocation of a dependent's branch, the daemon
   fetches its authoritative target branch and requires every dependency's recorded merge

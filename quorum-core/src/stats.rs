@@ -128,6 +128,17 @@ pub struct BlockedTask {
     pub deadlocked_on: Vec<i64>,
     /// Dep ids with no surviving task row — will never unblock without intervention.
     pub missing_deps: Vec<i64>,
+    /// Review-only deps that closed `done` without merge (`refs.review_outcome`
+    /// set). They do not satisfy dependents; the dependent simply waits.
+    pub review_unmerged: Vec<ReviewUnmergedDep>,
+}
+
+/// A review-only dependency closed without merge, with its outcome
+/// (`changes_requested` | `ci_failed` | `merge_conflict`).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ReviewUnmergedDep {
+    pub id: i64,
+    pub outcome: String,
 }
 
 /// A recent feed message — last N rows, oldest-first within the window.
@@ -838,6 +849,8 @@ struct ProgressLiveRun {
 struct DependencyProgress {
     blocked_ids: Vec<i64>,
     cancelled_ids: Vec<i64>,
+    /// Review-only deps closed `done` without merge, with their outcome.
+    review_unmerged: Vec<(i64, String)>,
 }
 
 /// Build the bounded server-owned progress projection for one task. The caller
@@ -1130,15 +1143,24 @@ fn unsatisfied_dependency_ids(conn: &Connection, raw: Option<&str>) -> Result<De
         .into_iter()
         .take(TASK_PROGRESS_DEPENDENCY_LIMIT)
     {
-        let status = conn
-            .query_row("SELECT status FROM tasks WHERE id=?1", [id], |row| {
-                row.get::<_, String>(0)
+        let row = conn
+            .query_row("SELECT status,refs FROM tasks WHERE id=?1", [id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
             })
             .optional()?;
-        if status.as_deref() != Some("done") {
-            if status.as_deref() == Some("cancelled") {
+        let status = row.as_ref().map(|(status, _)| status.as_str());
+        if status != Some("done") {
+            if status == Some("cancelled") {
                 progress.cancelled_ids.push(id);
             }
+            progress.blocked_ids.push(id);
+        } else if let Some(outcome) = row
+            .as_ref()
+            .and_then(|(_, refs)| crate::tasks::review_outcome_of(refs.as_deref()))
+        {
+            // Same rule as `tasks::DEP_SATISFIED_PREDICATE`: a review-only
+            // dependency that closed without merge does not satisfy.
+            progress.review_unmerged.push((id, outcome));
             progress.blocked_ids.push(id);
         }
     }
@@ -1286,6 +1308,10 @@ fn execution_current_progress(
     });
     let dependency_condition = if !dependencies.cancelled_ids.is_empty() {
         Some(deadlocked_by(&dependencies.cancelled_ids))
+    } else if let Some((id, outcome)) = dependencies.review_unmerged.first() {
+        Some(bounded_progress_text(&format!(
+            "Blocked: dependency #{id} is review-only closed without merge ({outcome})"
+        )))
     } else if !dependencies.blocked_ids.is_empty() {
         Some(blocked_by("dependency tasks", &dependencies.blocked_ids))
     } else {
@@ -2161,6 +2187,7 @@ fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
         let waiting_on = unmet_deps(conn, &depends_on)?;
         let deadlocked_on = cancelled_deps(conn, &depends_on)?;
         let missing_deps = missing_deps(conn, &depends_on)?;
+        let review_unmerged = review_unmerged_deps(conn, &depends_on)?;
         blocked.push(BlockedTask {
             id,
             title,
@@ -2171,22 +2198,25 @@ fn blocked_tasks(conn: &Connection) -> Result<Vec<BlockedTask>> {
             waiting_on,
             deadlocked_on,
             missing_deps,
+            review_unmerged,
         });
     }
     Ok(blocked)
 }
 
-/// Return the subset of dep ids from `depends_on` that are NOT `closed`.
+/// Return the subset of dep ids from `depends_on` that do not satisfy the
+/// dependent (same predicate as claim readiness).
 fn unmet_deps(conn: &Connection, depends_on: &Option<String>) -> Result<Vec<i64>> {
     let Some(json) = depends_on.as_deref() else {
         return Ok(vec![]);
     };
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT je.value FROM json_each(?1) je
          WHERE NOT EXISTS (
-             SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'closed'
+             SELECT 1 FROM tasks d WHERE d.id = je.value AND {}
          )",
-    )?;
+        crate::tasks::DEP_SATISFIED_PREDICATE
+    ))?;
     let ids = stmt
         .query_map(params![json], |r| r.get::<_, i64>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2207,6 +2237,34 @@ fn cancelled_deps(conn: &Connection, depends_on: &Option<String>) -> Result<Vec<
         .query_map(params![json], |r| r.get::<_, i64>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(ids)
+}
+
+/// Review-only deps in `depends_on` that are `done` with a `review_outcome`.
+fn review_unmerged_deps(
+    conn: &Connection,
+    depends_on: &Option<String>,
+) -> Result<Vec<ReviewUnmergedDep>> {
+    let Some(json) = depends_on.as_deref() else {
+        return Ok(vec![]);
+    };
+    let mut stmt = conn.prepare(
+        "SELECT d.id, d.refs FROM json_each(?1) je
+         JOIN tasks d ON d.id = je.value
+         WHERE d.status = 'done'
+         ORDER BY je.value",
+    )?;
+    let rows = stmt
+        .query_map(params![json], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, refs)| {
+            crate::tasks::review_outcome_of(refs.as_deref())
+                .map(|outcome| ReviewUnmergedDep { id, outcome })
+        })
+        .collect())
 }
 
 /// Return the subset of dep ids from `depends_on` that have no task row.
@@ -6607,6 +6665,77 @@ mod tests {
             progress.next_action.as_ref().unwrap().label,
             "Possible next"
         );
+    }
+
+    #[test]
+    fn review_only_dependency_closed_without_merge_is_named_as_the_blocker() {
+        let (_d, mut c) = open_tmp();
+        let rejected = progress_task(&mut c, "review-only rejected");
+        let merged = progress_task(&mut c, "review-only merged");
+        c.execute(
+            "UPDATE tasks SET status='done', no_rework=1, review_only=1,
+                 refs=json_object('pr', 70, 'review_outcome', 'changes_requested')
+             WHERE id=?1",
+            [rejected],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='done', no_rework=1, review_only=1,
+                 refs=json_object('pr', 71)
+             WHERE id=?1",
+            [merged],
+        )
+        .unwrap();
+        let blocked_task = crate::tasks::create(
+            &mut c,
+            "owner",
+            "waits on rejected",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{merged},{rejected}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        let unblocked_task = crate::tasks::create(
+            &mut c,
+            "owner",
+            "waits on merged",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{merged}]")),
+            None,
+            100,
+        )
+        .unwrap();
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert!(
+            !s.blocked.iter().any(|b| b.id == unblocked_task),
+            "a merged review-only dependency satisfies: {:?}",
+            s.blocked
+        );
+        let b = s.blocked.iter().find(|b| b.id == blocked_task).unwrap();
+        assert_eq!(b.waiting_on, vec![rejected], "merged dep is not waited on");
+        assert!(b.deadlocked_on.is_empty() && b.missing_deps.is_empty());
+        assert_eq!(
+            b.review_unmerged,
+            vec![ReviewUnmergedDep {
+                id: rejected,
+                outcome: "changes_requested".into(),
+            }]
+        );
+
+        let progress = projection(&c, blocked_task);
+        let expected = format!(
+            "Blocked: dependency #{rejected} is review-only closed without merge (changes_requested)"
+        );
+        assert_eq!(progress.condition.as_deref(), Some(expected.as_str()));
+        assert_eq!(projection(&c, unblocked_task).condition, None);
     }
 
     #[test]

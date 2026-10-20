@@ -690,13 +690,8 @@ fn next_task_view(
     // `tasks::claim` uses, so a tier-matched, non-self-review, non-sticky-to-other
     // task surfaces instead of the unclaimable head. Tier gate stays exact-`==` per
     // owner — do NOT widen to `>=`.
+    use crate::tasks::DEP_READY_CLAUSE;
     use crate::tasks::SIZE_DISPATCH_POLICY_SQL;
-    const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
-        SELECT 1 FROM json_each(depends_on) je
-        WHERE NOT EXISTS (
-            SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'done'
-        )
-    ))";
     let mut sql = format!(
         "SELECT id, title, priority, labels FROM tasks
          WHERE status = 'open'

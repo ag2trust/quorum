@@ -6001,6 +6001,7 @@ fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>>
     // decomposable candidates starve behind it.
     let branch_sync_ref_present =
         quorum_core::tasks::BRANCH_SYNC_REF_PRESENT_SQL.replace("refs", "t.refs");
+    let dep_satisfied = quorum_core::tasks::DEP_SATISFIED_PREDICATE;
     Ok(conn
         .query_row(
             &format!(
@@ -6026,8 +6027,8 @@ fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>>
            AND NOT EXISTS (SELECT 1 FROM task_graph_members m WHERE m.task_id=t.id)
            AND (t.depends_on IS NULL OR NOT EXISTS (
                SELECT 1 FROM json_each(t.depends_on) dep
-               WHERE NOT EXISTS (SELECT 1 FROM tasks prerequisite
-                                 WHERE prerequisite.id=dep.value AND prerequisite.status='done')
+               WHERE NOT EXISTS (SELECT 1 FROM tasks d
+                                 WHERE d.id=dep.value AND {dep_satisfied})
            ))
          ORDER BY t.priority DESC,t.id ASC LIMIT 1"
             ),

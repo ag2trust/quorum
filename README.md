@@ -121,6 +121,8 @@ tasks (`--review-only`) also skip implementation but never enter rework: an
 approval merges normally, while requested changes, failed CI, or a merge
 conflict close the task as `done` with a durable `refs.review_outcome`, a
 findings note, a daemon-owned GitHub REQUEST_CHANGES review, and an owner alert.
+Such an unmerged close does not satisfy dependents: they stay blocked until their
+`depends_on` is edited.
 
 ## Managed roles
 
