@@ -57,12 +57,12 @@ fn init_git_repo(dir: &std::path::Path) {
         .status()
         .unwrap();
     // Align the fixture's initial origin/main with the executable under test.
-    // The daemon now compares origin directly to its embedded build SHA rather
-    // than taking a startup baseline, so a fresh fixture must represent a
-    // current build before a test advances it.
+    // The daemon compares origin to its embedded build SHA rather than worktree
+    // HEAD, so a fresh fixture must represent that compiled identity.
     let source_repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("quorum crate has repository parent");
+    let running_sha = common::compiled_build_object_id();
     Command::new("git")
         .args([
             "-C",
@@ -70,7 +70,7 @@ fn init_git_repo(dir: &std::path::Path) {
             "fetch",
             "--update-shallow",
             &source_repo.to_string_lossy(),
-            "HEAD",
+            &running_sha,
         ])
         .status()
         .unwrap();
