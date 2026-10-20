@@ -377,6 +377,13 @@ pub enum Command {
         /// One of: blocked, failed, needs-info, note.
         #[arg(long)]
         state: String,
+        /// Read the reason from stdin. REQUIRED for `blocked` and `needs-info`:
+        /// state the blocker or the full question; it is stored on the parked task.
+        #[arg(long = "reason-stdin")]
+        reason_stdin: bool,
+        /// Read the reason from a file (alternative to --reason-stdin).
+        #[arg(long = "reason-file")]
+        reason_file: Option<PathBuf>,
         /// Daemon-issued run capability token. Falls back to QUORUM_RUN_ID env var.
         #[arg(long = "run-id")]
         run_id: Option<String>,
