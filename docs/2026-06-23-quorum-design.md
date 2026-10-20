@@ -2323,30 +2323,54 @@ cleanup, remediation spawn failure, startup worktree GC, and decomposition clean
 `refs/heads/`, so branch deletion, branch sweeps, and default pushes never touch it, and it
 never collides with operator-made `recover/*` branches. Uncommitted state (tracked edits,
 deletions, untracked-not-ignored files) is captured with plumbing in a throwaway
-`GIT_INDEX_FILE` (`read-tree HEAD`, `add -A`, `write-tree`, `commit-tree -p HEAD`), so no
-hooks run and the worktree and its index are untouched. Committed work is pinned as-is only
-when it is reachable from no other ref once the deleted branch is excluded. A clean
-worktree with nothing unique creates no ref; an identical snapshot (same tree and parent)
-or an already-pinned commit is not duplicated. Creation is a create-only `update-ref` CAS
-written last, under the worktree-manager lock, so racing teardowns of one worktree create
-one ref and a daemon that dies mid-snapshot leaves the worktree intact and no partial ref.
+`GIT_INDEX_FILE` (`read-tree HEAD`, `add -A`, `write-tree`, `commit-tree -p HEAD` under a
+fixed `quorum-daemon` identity), so no hooks run and the worktree and its index are
+untouched. If capturing untracked files fails (for example a huge untracked tree times
+out), the snapshot falls back to tracked changes only (`add -u`), the ref reason gains a
+`-tracked-only` suffix, and an `errors` row, owner alert, and daemon task note record what
+was skipped. Committed work is pinned as-is only when no other ref (excluding the deleted
+branch and the worker-writable recover namespace) reaches it. A clean worktree with nothing
+unique creates no ref. Creation is a create-only `update-ref` CAS written last, under the
+worktree-manager lock, so racing teardowns of one worktree create one ref and a daemon that
+dies mid-snapshot leaves the worktree intact and no partial ref.
 
-Fail-safe: if the snapshot fails, nothing is removed or deleted and an `errors` row
-(`source=worktree_recover`) is written. The kept checkout is retried by the next
-provisioning of the same task (which owns the task after its atomic claim and so
-preserves and releases a leftover checkout at its worktree path first) or by startup GC.
+Trust: workers share the repository's ref store and can write any ref, so a recover ref is
+never authority by name. Every ref the daemon creates is recorded in `recover_refs`
+(schema v80: refname, SHA, task, kind, snapshot parent, tracked-only, agent, reason).
+Resume uses only the newest recorded row for the task and re-verifies that the ref still
+names the recorded SHA and, for a snapshot, that it is a single-parent `quorum-daemon`
+commit on the recorded parent; anything else fails loudly and is not applied. Unrecorded
+refs in a task's bucket are logged and ignored, never count as preserving a worker's
+commits, and are not retention candidates. Task attribution comes only from
+daemon-controlled data: the slot or allocation for teardown paths, the durable cleanup
+intent for `remove_exact`, and for startup GC the daemon-created `<agent>-t<id>` directory
+name plus a registered branch equal to the daemon-assigned branch for that directory (the
+recorded allocation, or `daemon/`/`remediation/<agent>-t<id>`). Anything else goes to the
+`unattributed` bucket (bounded, never resumed).
 
-Resume: when the daemon provisions the next worker for the task, the newest recover ref
-seeds it if it descends from the provisioning start: the kept task branch tip (fast-forward
-only) or, if the branch was deleted, the allocation's provenance base; for continuation
-and remediation checkouts, the verified PR head (before base integration). The daemon then
-writes a bounded `daemon` task note naming the ref, the prior run's agent, and the teardown
-reason. A ref that no longer applies is left in place and noted once (deduplicated by body);
-a ref already contained in the start is ignored. Retention keeps the newest
-`RECOVER_REFS_PER_TASK` (2) refs per task, and the periodic publication-ref housekeeping
-cadence retires all recover refs of `done`/`cancelled` tasks (bounded per pass). No other
-ref is ever deleted by this mechanism. Reviewer and branch-sync worktrees are out of scope:
-reviewers author no code and kept sync merges are already preserved.
+Fail-safe: if the snapshot fails, nothing is removed or deleted, and an `errors` row
+(`source=worktree_recover`) plus at most one live owner alert per (task, subject) are
+written. A kept registered checkout is retried by the next provisioning of the same task
+(which owns the task after its atomic claim and so preserves and releases a leftover
+registered checkout at its worktree path first) or by startup GC.
+
+Resume: when the daemon provisions the next worker for the task, the newest trusted recover
+ref seeds it if it descends from the provisioning start: the kept task branch tip
+(fast-forward only) or, if the branch was deleted, the allocation's provenance base; for
+continuation and remediation checkouts, the verified PR head (before base integration).
+Worker commits resume as commits. A snapshot's uncommitted state is restored as
+uncommitted, unstaged working-tree changes (`cherry-pick --no-commit` then `reset`, after a
+clean base integration), so no daemon commit lands on the branch or in the PR; a conflict
+leaves the worktree clean and the snapshot in its ref. The daemon then writes a bounded
+`daemon` task note naming the ref, the prior run's agent, the teardown reason, and the
+restored new (untracked) paths (bounded list) so the next worker reviews them before
+committing. A ref that no longer applies is left in place and noted once (deduplicated by
+body); a ref already contained in the start is ignored. Retention keeps the newest
+`RECOVER_REFS_PER_TASK` (2) recorded refs per task, and the periodic publication-ref
+housekeeping cadence retires all recover refs and rows of `done`/`cancelled` tasks
+(bounded per pass). No ref outside the namespace is ever deleted by this mechanism.
+Reviewer and branch-sync worktrees are out of scope: reviewers author no code and kept
+sync merges are already preserved.
 
 ### Prompt composition
 

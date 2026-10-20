@@ -16,7 +16,7 @@ const GIT_PIPE_LIMIT: usize = 1024 * 1024;
 const PUSH_REJECTION_MAX_BYTES: usize = 2048;
 
 mod recover;
-pub(crate) use recover::{recover_ref_task_id, task_id_from_name};
+pub(crate) use recover::{daemon_attribution, recover_ref_task_id, RECOVER_REFS_PER_TASK};
 pub use recover::{RecoverIdentity, RecoverRef, RecoverResume, ReleaseError};
 
 pub struct WorktreeManager {
@@ -1773,7 +1773,7 @@ impl WorktreeManager {
         worktree_base: &Path,
         active_worktrees: &[&str],
     ) -> Vec<String> {
-        self.gc_orphaned_detailed(repo_dir, worktree_base, active_worktrees)
+        self.gc_orphaned_detailed(repo_dir, worktree_base, active_worktrees, &[])
             .await
             .removed
     }
@@ -1781,11 +1781,15 @@ impl WorktreeManager {
     /// Startup GC of registered, inactive direct children of `worktree_base`.
     /// Each candidate's work is snapshotted to a recover ref before the force
     /// removal; a candidate whose snapshot fails is kept and reported.
+    /// `allocations` are the daemon's `(task_id, branch, worktree)` records,
+    /// used (with the daemon-created directory name) to attribute a snapshot
+    /// to a task; see [`daemon_attribution`].
     pub async fn gc_orphaned_detailed(
         &self,
         repo_dir: &Path,
         worktree_base: &Path,
         active_worktrees: &[&str],
+        allocations: &[(i64, String, String)],
     ) -> WorktreeGc {
         let _guard = self.lock.lock().await;
         let mut gc = WorktreeGc::default();
@@ -1853,13 +1857,10 @@ impl WorktreeManager {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let identity = RecoverIdentity {
-                task_id: registration
-                    .branch
-                    .as_deref()
-                    .and_then(task_id_from_name)
-                    .or_else(|| task_id_from_name(&dir_name)),
+                task_id: daemon_attribution(&path, registration.branch.as_deref(), allocations),
                 agent: dir_name,
                 reason: "startup_gc".into(),
+                trusted: Vec::new(),
             };
             match self
                 .preserve_unlocked(repo_dir, Some(&path), None, &identity)
@@ -2081,7 +2082,8 @@ impl WorktreeManager {
         repo_dir: &Path,
         worktree_dir: &Path,
         branch: &str,
-    ) -> Result<(), String> {
+        identity: &RecoverIdentity,
+    ) -> Result<Vec<RecoverRef>, String> {
         let _guard = self.lock.lock().await;
         let mut list = self.git_cmd(repo_dir);
         list.args(["worktree", "list", "--porcelain"]);
@@ -2119,7 +2121,7 @@ impl WorktreeManager {
         let Some(actual) = found else {
             return match std::fs::symlink_metadata(worktree_dir) {
                 Ok(_) => Err("worktree path exists without exact git registration".into()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
                 Err(error) => Err(format!("cannot prove worktree path absence: {error}")),
             };
         };
@@ -2128,14 +2130,10 @@ impl WorktreeManager {
                 "worktree identity mismatch: expected {expected_ref}, found {actual:?}"
             ));
         }
-        // Durable cleanup intents name the daemon task branch; preserve its
-        // uncommitted state first and destroy nothing if that fails.
-        let identity = RecoverIdentity {
-            task_id: task_id_from_name(branch),
-            agent: "cleanup".into(),
-            reason: "decomposition_cleanup".into(),
-        };
-        self.preserve_unlocked(repo_dir, Some(worktree_dir), None, &identity)
+        // Preserve the checkout's uncommitted state first (the identity comes
+        // from the durable cleanup intent) and destroy nothing if that fails.
+        let created = self
+            .preserve_unlocked(repo_dir, Some(worktree_dir), None, identity)
             .await
             .map_err(|error| format!("work preservation failed (worktree kept): {error}"))?;
         let mut rm = self.git_cmd(repo_dir);
@@ -2144,7 +2142,7 @@ impl WorktreeManager {
             .arg("--force");
         let out = run_git(rm, self.local_timeout, "git worktree remove").await?;
         if out.status.success() {
-            Ok(())
+            Ok(created)
         } else {
             Err(format!(
                 "git worktree remove failed: {}",
@@ -5175,30 +5173,31 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let path = base.path().join("owned");
         let mgr = WorktreeManager::new();
+        let id = RecoverIdentity::new(1, "cleanup", "decomposition_cleanup");
         mgr.provision(repo.path(), "daemon/owned", &path, "main")
             .await
             .unwrap();
         let error = mgr
-            .remove_exact(repo.path(), &path, "daemon/other")
+            .remove_exact(repo.path(), &path, "daemon/other", &id)
             .await
             .unwrap_err();
         assert!(error.contains("identity mismatch"));
         assert!(path.exists(), "mismatched binding must survive");
-        mgr.remove_exact(repo.path(), &path, "daemon/owned")
+        mgr.remove_exact(repo.path(), &path, "daemon/owned", &id)
             .await
             .unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(mgr
-            .remove_exact(repo.path(), &path, "daemon/owned")
+            .remove_exact(repo.path(), &path, "daemon/owned", &id)
             .await
             .unwrap_err()
             .contains("without exact git registration"));
         std::fs::remove_dir(&path).unwrap();
-        mgr.remove_exact(repo.path(), &path, "daemon/owned")
+        mgr.remove_exact(repo.path(), &path, "daemon/owned", &id)
             .await
             .unwrap();
         assert!(!path.exists());
-        mgr.remove_exact(repo.path(), &path, "daemon/owned")
+        mgr.remove_exact(repo.path(), &path, "daemon/owned", &id)
             .await
             .unwrap();
     }

@@ -115,6 +115,24 @@ fn failing_git_shim(dir: &Path, fail_on: &str) -> PathBuf {
     shim
 }
 
+fn commit_in(wt: &Path, file: &str, body: &str) -> String {
+    std::fs::write(wt.join(file), body).unwrap();
+    git(wt, &["add", file]);
+    git(
+        wt,
+        &[
+            "-c",
+            "user.email=w@w",
+            "-c",
+            "user.name=W",
+            "commit",
+            "-qm",
+            "work",
+        ],
+    );
+    git(wt, &["rev-parse", "HEAD"])
+}
+
 #[tokio::test]
 async fn release_snapshots_uncommitted_tracked_and_untracked_before_force_remove() {
     let f = fixture();
@@ -124,8 +142,6 @@ async fn release_snapshots_uncommitted_tracked_and_untracked_before_force_remove
     std::fs::write(wt.join("tracked.txt"), "finished work\n").unwrap();
     std::fs::write(wt.join("new_module.rs"), "pub fn done() {}\n").unwrap();
     std::fs::write(wt.join("ignored.log"), "noise\n").unwrap();
-    // The worker's own index is not consulted or modified.
-    let index_before = git(&wt, &["diff", "--cached", "--name-only"]);
 
     let created = mgr
         .release_preserving(&f.repo, &wt, &branch, true, &ident(412))
@@ -141,6 +157,8 @@ async fn release_snapshots_uncommitted_tracked_and_untracked_before_force_remove
     let snap = &created[0];
     assert!(snap.refname.starts_with("refs/quorum-recover/t412/"));
     assert_eq!(snap.provenance(), ("anvil".into(), "idle_reaped".into()));
+    assert_eq!(snap.snapshot_parent.as_deref(), Some(head.as_str()));
+    assert!(!snap.tracked_only);
     assert_eq!(recover_refs(&f.repo, 412), vec![snap.refname.clone()]);
     assert_eq!(
         git(&f.repo, &["rev-parse", &format!("{}^", snap.sha)]),
@@ -158,7 +176,6 @@ async fn release_snapshots_uncommitted_tracked_and_untracked_before_force_remove
         &f.repo,
         &["cat-file", "-e", &format!("{}:ignored.log", snap.sha)]
     ));
-    assert!(index_before.is_empty());
 }
 
 #[tokio::test]
@@ -166,21 +183,7 @@ async fn release_snapshots_committed_unpushed_work_before_branch_delete() {
     let f = fixture();
     let mgr = WorktreeManager::new();
     let (wt, branch) = provision_worker(&mgr, &f, 7).await;
-    std::fs::write(wt.join("feature.rs"), "x\n").unwrap();
-    git(&wt, &["add", "feature.rs"]);
-    git(
-        &wt,
-        &[
-            "-c",
-            "user.email=w@w",
-            "-c",
-            "user.name=W",
-            "commit",
-            "-m",
-            "work",
-        ],
-    );
-    let tip = git(&wt, &["rev-parse", "HEAD"]);
+    let tip = commit_in(&wt, "feature.rs", "x\n");
 
     let created = mgr
         .release_preserving(&f.repo, &wt, &branch, true, &ident(7))
@@ -189,10 +192,40 @@ async fn release_snapshots_committed_unpushed_work_before_branch_delete() {
 
     assert_eq!(created.len(), 1);
     assert_eq!(created[0].sha, tip, "clean committed work is pinned as-is");
+    assert_eq!(created[0].snapshot_parent, None);
     assert!(!git_ok(
         &f.repo,
         &["rev-parse", "--verify", &format!("refs/heads/{branch}")]
     ));
+}
+
+#[tokio::test]
+async fn forged_recover_ref_does_not_count_as_preserving_commits() {
+    let f = fixture();
+    let mgr = WorktreeManager::new();
+    let (wt, branch) = provision_worker(&mgr, &f, 70).await;
+    let tip = commit_in(&wt, "feature.rs", "x\n");
+    // A worker forges a recover ref at its own commit.
+    git(
+        &f.repo,
+        &[
+            "update-ref",
+            "refs/quorum-recover/t70/9999999999999/evil/forged",
+            &tip,
+        ],
+    );
+
+    let created = mgr
+        .release_preserving(&f.repo, &wt, &branch, true, &ident(70))
+        .await
+        .unwrap();
+
+    assert_eq!(created.len(), 1, "a daemon ref must still be created");
+    assert_ne!(
+        created[0].refname,
+        "refs/quorum-recover/t70/9999999999999/evil/forged"
+    );
+    assert_eq!(created[0].sha, tip);
 }
 
 #[tokio::test]
@@ -216,20 +249,7 @@ async fn release_keeping_branch_does_not_pin_commits_the_branch_still_holds() {
     let f = fixture();
     let mgr = WorktreeManager::new();
     let (wt, branch) = provision_worker(&mgr, &f, 9).await;
-    std::fs::write(wt.join("feature.rs"), "x\n").unwrap();
-    git(&wt, &["add", "feature.rs"]);
-    git(
-        &wt,
-        &[
-            "-c",
-            "user.email=w@w",
-            "-c",
-            "user.name=W",
-            "commit",
-            "-m",
-            "work",
-        ],
-    );
+    commit_in(&wt, "feature.rs", "x\n");
 
     let created = mgr
         .release_preserving(&f.repo, &wt, &branch, false, &ident(9))
@@ -274,7 +294,6 @@ async fn release_destroys_nothing_when_snapshot_fails_then_retry_preserves() {
     ));
     assert!(recover_refs(&f.repo, 10).is_empty(), "no partial ref");
 
-    // A later attempt (e.g. after a daemon restart) completes the release.
     let created = WorktreeManager::new()
         .release_preserving(&f.repo, &wt, &branch, true, &ident(10))
         .await
@@ -283,115 +302,197 @@ async fn release_destroys_nothing_when_snapshot_fails_then_retry_preserves() {
     assert!(!wt.exists());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn untracked_capture_failure_falls_back_to_tracked_only_snapshot() {
+    let f = fixture();
+    let shim_dir = tempfile::tempdir().unwrap();
+    let failing = WorktreeManager::with_config(
+        failing_git_shim(shim_dir.path(), "-A"),
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(30),
+    );
+    let (wt, branch) = provision_worker(&failing, &f, 11).await;
+    std::fs::write(wt.join("tracked.txt"), "tracked edit\n").unwrap();
+    std::fs::write(wt.join("untracked.rs"), "lost\n").unwrap();
+
+    let created = failing
+        .release_preserving(&f.repo, &wt, &branch, true, &ident(11))
+        .await
+        .unwrap();
+
+    assert_eq!(created.len(), 1);
+    let snap = &created[0];
+    assert!(snap.tracked_only);
+    assert!(snap.untracked_skip.as_deref().unwrap().contains("injected"));
+    assert!(
+        snap.refname.ends_with("/idle_reaped-tracked-only"),
+        "{}",
+        snap.refname
+    );
+    assert_eq!(
+        git(&f.repo, &["show", &format!("{}:tracked.txt", snap.sha)]),
+        "tracked edit"
+    );
+    assert!(!git_ok(
+        &f.repo,
+        &["cat-file", "-e", &format!("{}:untracked.rs", snap.sha)]
+    ));
+    assert!(!wt.exists());
+}
+
 #[tokio::test]
 async fn concurrent_and_repeated_releases_create_one_snapshot() {
     let f = fixture();
     let mgr = WorktreeManager::new();
-    let (wt, branch) = provision_worker(&mgr, &f, 11).await;
+    let (wt, branch) = provision_worker(&mgr, &f, 12).await;
     std::fs::write(wt.join("tracked.txt"), "work\n").unwrap();
 
-    let id = ident(11);
+    let id = ident(12);
     let (a, b) = tokio::join!(
         mgr.release_preserving(&f.repo, &wt, &branch, true, &id),
         mgr.release_preserving(&f.repo, &wt, &branch, true, &id),
     );
     a.unwrap();
     b.unwrap();
-    mgr.release_preserving(&f.repo, &wt, &branch, true, &ident(11))
+    mgr.release_preserving(&f.repo, &wt, &branch, true, &id)
         .await
         .unwrap();
 
-    assert_eq!(recover_refs(&f.repo, 11).len(), 1);
+    assert_eq!(recover_refs(&f.repo, 12).len(), 1);
 }
 
 #[tokio::test]
-async fn identical_dirty_state_is_not_snapshotted_twice() {
+async fn identical_dirty_state_dedupes_only_against_trusted_snapshots() {
     let f = fixture();
     let mgr = WorktreeManager::new();
-    let (wt, branch) = provision_worker(&mgr, &f, 12).await;
+    let (wt, _branch) = provision_worker(&mgr, &f, 13).await;
     std::fs::write(wt.join("tracked.txt"), "same\n").unwrap();
-    let _g = mgr.lock.lock().await;
+    let guard = mgr.lock.lock().await;
     let first = mgr
-        .preserve_unlocked(&f.repo, Some(&wt), None, &ident(12))
+        .preserve_unlocked(&f.repo, Some(&wt), None, &ident(13))
         .await
         .unwrap();
-    let second = mgr
-        .preserve_unlocked(&f.repo, Some(&wt), None, &ident(12))
-        .await
-        .unwrap();
-    drop(_g);
-    assert_eq!(first.len(), 1);
-    assert!(second.is_empty());
-    let _ = branch;
-}
-
-#[tokio::test]
-async fn retention_keeps_newest_per_task_and_never_touches_other_refs() {
-    let f = fixture();
-    let mgr = WorktreeManager::new();
-    let base = git(&f.repo, &["rev-parse", "HEAD"]);
-    // A human-made recover branch and another task's ref must survive.
-    git(&f.repo, &["branch", "recover/t20-manual", &base]);
-    let (wt, branch) = provision_worker(&mgr, &f, 21).await;
-    std::fs::write(wt.join("other.txt"), "other task\n").unwrap();
-    mgr.release_preserving(&f.repo, &wt, &branch, true, &ident(21))
-        .await
-        .unwrap();
-
-    let mut made = Vec::new();
-    for round in 0..3 {
-        let (wt, branch) = provision_worker(&mgr, &f, 20).await;
-        std::fs::write(wt.join("tracked.txt"), format!("round {round}\n")).unwrap();
-        let created = mgr
-            .release_preserving(&f.repo, &wt, &branch, true, &ident(20))
-            .await
-            .unwrap();
-        made.extend(created);
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-
-    let kept = recover_refs(&f.repo, 20);
-    assert_eq!(kept.len(), RECOVER_REFS_PER_TASK);
-    assert!(!kept.contains(&made[0].refname), "oldest pruned");
-    assert!(kept.contains(&made[2].refname), "newest kept");
-    assert_eq!(recover_refs(&f.repo, 21).len(), 1);
-    assert!(git_ok(
-        &f.repo,
-        &["rev-parse", "--verify", "refs/heads/recover/t20-manual"]
-    ));
-
-    let latest = mgr.latest_recover_ref(&f.repo, 20).await.unwrap().unwrap();
-    assert_eq!(latest.refname, made[2].refname);
-    let error = mgr
-        .delete_recover_refs(
+    let trusted = mgr
+        .preserve_unlocked(
             &f.repo,
-            &[RecoverRef {
-                refname: "refs/heads/recover/t20-manual".into(),
-                sha: base,
-            }],
+            Some(&wt),
+            None,
+            &ident(13).with_trusted(first.clone()),
         )
         .await
-        .unwrap_err();
-    assert!(error.contains("non-recover"), "{error}");
+        .unwrap();
+    // A forged identical ref (same tree/parent) is not trusted: no dedupe.
+    let forged = vec![RecoverRef {
+        refname: "refs/quorum-recover/t13/0000000000000/evil/forged".into(),
+        ..first[0].clone()
+    }];
+    let untrusted = mgr
+        .preserve_unlocked(&f.repo, Some(&wt), None, &ident(13).with_trusted(forged))
+        .await
+        .unwrap();
+    drop(guard);
+    assert_eq!(first.len(), 1);
+    assert!(trusted.is_empty());
+    assert_eq!(untrusted.len(), 1);
 }
 
 #[tokio::test]
-async fn gc_snapshots_dirty_orphan_before_removal() {
+async fn gc_snapshots_dirty_orphan_before_removal_with_daemon_attribution() {
     let f = fixture();
     let mgr = WorktreeManager::new();
     let (wt, _branch) = provision_worker(&mgr, &f, 30).await;
     std::fs::write(wt.join("untracked.rs"), "keep me\n").unwrap();
 
-    let gc = mgr.gc_orphaned_detailed(&f.repo, &f.base, &[]).await;
+    let gc = mgr.gc_orphaned_detailed(&f.repo, &f.base, &[], &[]).await;
 
     assert_eq!(gc.removed.len(), 1);
     assert!(gc.preserve_failures.is_empty());
     assert!(!wt.exists());
     let refs = recover_refs(&f.repo, 30);
-    assert_eq!(refs.len(), 1, "branch-attributed task bucket");
+    assert_eq!(
+        refs.len(),
+        1,
+        "daemon-named dir + daemon branch attributes to the task"
+    );
+    assert_eq!(gc.preserved[0].refname, refs[0]);
     assert_eq!(
         git(&f.repo, &["show", &format!("{}:untracked.rs", refs[0])]),
         "keep me"
+    );
+}
+
+#[tokio::test]
+async fn gc_never_attributes_from_a_worker_chosen_branch() {
+    let f = fixture();
+    let mgr = WorktreeManager::new();
+    let (wt, _branch) = provision_worker(&mgr, &f, 31).await;
+    // The worker switches its checkout to a branch naming another task.
+    git(&wt, &["checkout", "-q", "-b", "daemon/anvil-t99"]);
+    std::fs::write(wt.join("tracked.txt"), "injected\n").unwrap();
+
+    let gc = mgr.gc_orphaned_detailed(&f.repo, &f.base, &[], &[]).await;
+
+    assert_eq!(gc.removed.len(), 1);
+    assert!(
+        recover_refs(&f.repo, 99).is_empty(),
+        "never credited to task 99"
+    );
+    assert!(
+        recover_refs(&f.repo, 31).is_empty(),
+        "mismatched branch is unattributed"
+    );
+    let unattributed = git(
+        &f.repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/quorum-recover/unattributed",
+        ],
+    );
+    assert_eq!(unattributed.lines().count(), 1);
+}
+
+#[test]
+fn daemon_attribution_requires_daemon_assigned_branch_for_the_directory() {
+    let dir = Path::new("/wt/Anvil-t5");
+    let alloc = vec![(
+        5,
+        "daemon/reserved-x".to_string(),
+        "/wt/Anvil-t5".to_string(),
+    )];
+    assert_eq!(
+        daemon_attribution(dir, Some("refs/heads/daemon/anvil-t5"), &[]),
+        Some(5)
+    );
+    assert_eq!(
+        daemon_attribution(dir, Some("refs/heads/remediation/anvil-t5"), &[]),
+        Some(5)
+    );
+    assert_eq!(
+        daemon_attribution(dir, Some("refs/heads/daemon/reserved-x"), &alloc),
+        Some(5)
+    );
+    assert_eq!(
+        daemon_attribution(dir, Some("refs/heads/daemon/reserved-x"), &[]),
+        None
+    );
+    assert_eq!(
+        daemon_attribution(dir, Some("refs/heads/daemon/anvil-t6"), &[]),
+        None
+    );
+    assert_eq!(
+        daemon_attribution(dir, Some("refs/heads/daemon/other-t5"), &[]),
+        None
+    );
+    assert_eq!(daemon_attribution(dir, None, &[]), None);
+    assert_eq!(
+        daemon_attribution(
+            Path::new("/wt/review-pr-5"),
+            Some("refs/heads/review/pr-5-x"),
+            &[]
+        ),
+        None
     );
 }
 
@@ -405,10 +506,12 @@ async fn gc_keeps_orphan_when_snapshot_fails() {
         std::time::Duration::from_secs(30),
         std::time::Duration::from_secs(30),
     );
-    let (wt, _branch) = provision_worker(&failing, &f, 31).await;
+    let (wt, _branch) = provision_worker(&failing, &f, 32).await;
     std::fs::write(wt.join("tracked.txt"), "precious\n").unwrap();
 
-    let gc = failing.gc_orphaned_detailed(&f.repo, &f.base, &[]).await;
+    let gc = failing
+        .gc_orphaned_detailed(&f.repo, &f.base, &[], &[])
+        .await;
 
     assert!(gc.removed.is_empty());
     assert_eq!(gc.preserve_failures.len(), 1);
@@ -419,96 +522,173 @@ async fn gc_keeps_orphan_when_snapshot_fails() {
 async fn remove_exact_snapshots_dirty_worktree() {
     let f = fixture();
     let mgr = WorktreeManager::new();
-    let (wt, branch) = provision_worker(&mgr, &f, 32).await;
+    let (wt, branch) = provision_worker(&mgr, &f, 33).await;
     std::fs::write(wt.join("tracked.txt"), "cleanup intent\n").unwrap();
 
-    mgr.remove_exact(&f.repo, &wt, &branch).await.unwrap();
-
-    assert!(!wt.exists());
-    assert_eq!(recover_refs(&f.repo, 32).len(), 1);
-}
-
-#[tokio::test]
-async fn resume_branch_creates_deleted_branch_from_recover_ref() {
-    let f = fixture();
-    let mgr = WorktreeManager::new();
-    let base = git(&f.repo, &["rev-parse", "origin/main"]);
-    let (wt, branch) = provision_worker(&mgr, &f, 40).await;
-    std::fs::write(wt.join("tracked.txt"), "half done\n").unwrap();
-    let snap = mgr
-        .release_preserving(&f.repo, &wt, &branch, true, &ident(40))
-        .await
-        .unwrap()
-        .remove(0);
-
-    let outcome = mgr
-        .resume_branch_from_recover(&f.repo, 40, &branch, &base)
+    let created = mgr
+        .remove_exact(&f.repo, &wt, &branch, &ident(33))
         .await
         .unwrap();
 
+    assert!(!wt.exists());
+    assert_eq!(created.len(), 1);
+    assert_eq!(recover_refs(&f.repo, 33).len(), 1);
+}
+
+async fn dirty_snapshot(
+    mgr: &WorktreeManager,
+    f: &Fixture,
+    task: i64,
+    keep_branch: bool,
+) -> RecoverRef {
+    let (wt, branch) = provision_worker(mgr, f, task).await;
+    commit_in(&wt, "committed.rs", "c\n");
+    std::fs::write(wt.join("tracked.txt"), "half done\n").unwrap();
+    std::fs::write(wt.join("new_file.rs"), "new\n").unwrap();
+    mgr.release_preserving(&f.repo, &wt, &branch, !keep_branch, &ident(task))
+        .await
+        .unwrap()
+        .remove(0)
+}
+
+#[tokio::test]
+async fn resume_branch_restores_snapshot_as_uncommitted_changes() {
+    let f = fixture();
+    let mgr = WorktreeManager::new();
+    let base = git(&f.repo, &["rev-parse", "origin/main"]);
+    let snap = dirty_snapshot(&mgr, &f, 40, false).await;
+    let parent = snap.snapshot_parent.clone().unwrap();
+
+    let outcome = mgr
+        .resume_branch_from_recover(&f.repo, &snap, "daemon/anvil-t40", &base)
+        .await
+        .unwrap();
     assert_eq!(
         outcome,
         RecoverResume::Resumed {
             recover: snap.clone(),
-            previous: None
+            previous: None,
+            restore_uncommitted: true
         }
     );
+    assert_eq!(
+        git(&f.repo, &["rev-parse", "daemon/anvil-t40"]),
+        parent,
+        "worker commits only"
+    );
+
     let (wt, _) = provision_worker(&mgr, &f, 40).await;
-    assert_eq!(git(&wt, &["rev-parse", "HEAD"]), snap.sha);
+    let added = mgr
+        .restore_snapshot_as_uncommitted(&f.repo, &wt, &snap)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        git(&wt, &["rev-parse", "HEAD"]),
+        parent,
+        "no daemon commit on the branch"
+    );
+    assert!(wt.join("committed.rs").exists());
     assert_eq!(
         std::fs::read_to_string(wt.join("tracked.txt")).unwrap(),
         "half done\n"
     );
-
-    // Provisioning the same start again is a no-op.
-    assert_eq!(
-        mgr.resume_branch_from_recover(&f.repo, 40, "daemon/other-t40", &snap.sha)
-            .await
-            .unwrap(),
-        RecoverResume::AlreadyIncorporated(snap)
+    assert_eq!(added, vec!["new_file.rs".to_string()]);
+    let status = git(&wt, &["status", "--porcelain"]);
+    assert!(status.contains("M tracked.txt"), "{status}");
+    assert!(status.contains("?? new_file.rs"), "{status}");
+    assert!(
+        git(&wt, &["diff", "--cached", "--name-only"]).is_empty(),
+        "nothing staged"
     );
 }
 
 #[tokio::test]
-async fn resume_branch_fast_forwards_kept_branch() {
+async fn resume_branch_fast_forwards_kept_branch_to_pinned_commits() {
     let f = fixture();
     let mgr = WorktreeManager::new();
     let base = git(&f.repo, &["rev-parse", "origin/main"]);
     let (wt, branch) = provision_worker(&mgr, &f, 41).await;
-    std::fs::write(wt.join("tracked.txt"), "uncommitted\n").unwrap();
-    let snap = mgr
-        .release_preserving(&f.repo, &wt, &branch, false, &ident(41))
+    let tip = commit_in(&wt, "committed.rs", "c\n");
+    let pinned = mgr
+        .release_preserving(&f.repo, &wt, &branch, true, &ident(41))
         .await
         .unwrap()
         .remove(0);
+    assert_eq!(pinned.sha, tip);
+    git(&f.repo, &["branch", &branch, &base]);
 
     let outcome = mgr
-        .resume_branch_from_recover(&f.repo, 41, &branch, &base)
+        .resume_branch_from_recover(&f.repo, &pinned, &branch, &base)
         .await
         .unwrap();
 
     assert_eq!(
         outcome,
         RecoverResume::Resumed {
-            recover: snap.clone(),
-            previous: Some(base)
+            recover: pinned,
+            previous: Some(base),
+            restore_uncommitted: false
         }
     );
-    assert_eq!(git(&f.repo, &["rev-parse", &branch]), snap.sha);
+    assert_eq!(git(&f.repo, &["rev-parse", &branch]), tip);
+}
+
+#[tokio::test]
+async fn resume_refuses_a_recorded_ref_a_worker_moved() {
+    let f = fixture();
+    let mgr = WorktreeManager::new();
+    let base = git(&f.repo, &["rev-parse", "origin/main"]);
+    let snap = dirty_snapshot(&mgr, &f, 42, false).await;
+    // A worker repoints the recorded ref at its own injected commit.
+    let (wt, _) = provision_worker(&mgr, &f, 142).await;
+    let injected = commit_in(&wt, "evil.rs", "evil\n");
+    git(&f.repo, &["update-ref", &snap.refname, &injected]);
+
+    let error = mgr
+        .resume_branch_from_recover(&f.repo, &snap, "daemon/anvil-t42", &base)
+        .await
+        .unwrap_err();
+
+    assert!(error.contains("no longer names recorded commit"), "{error}");
+    assert!(!git_ok(
+        &f.repo,
+        &["rev-parse", "--verify", "refs/heads/daemon/anvil-t42"]
+    ));
+}
+
+#[tokio::test]
+async fn resume_refuses_a_snapshot_that_is_not_the_recorded_daemon_commit() {
+    let f = fixture();
+    let mgr = WorktreeManager::new();
+    let base = git(&f.repo, &["rev-parse", "origin/main"]);
+    let (wt, _) = provision_worker(&mgr, &f, 43).await;
+    let worker_commit = commit_in(&wt, "evil.rs", "evil\n");
+    let forged = RecoverRef {
+        refname: "refs/quorum-recover/t43/0000000000001/anvil/idle_reaped".into(),
+        sha: worker_commit.clone(),
+        snapshot_parent: Some(base.clone()),
+        tracked_only: false,
+        untracked_skip: None,
+    };
+    git(&f.repo, &["update-ref", &forged.refname, &worker_commit]);
+
+    let error = mgr
+        .resume_branch_from_recover(&f.repo, &forged, "daemon/other-t43", &base)
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.contains("not the recorded daemon snapshot"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
 async fn resume_branch_leaves_stale_recover_ref_alone() {
     let f = fixture();
     let mgr = WorktreeManager::new();
-    let (wt, branch) = provision_worker(&mgr, &f, 42).await;
-    std::fs::write(wt.join("tracked.txt"), "old\n").unwrap();
-    let snap = mgr
-        .release_preserving(&f.repo, &wt, &branch, true, &ident(42))
-        .await
-        .unwrap()
-        .remove(0);
-    // An unrelated base the snapshot does not descend from.
+    let snap = dirty_snapshot(&mgr, &f, 44, false).await;
     git(&f.repo, &["checkout", "-q", "--orphan", "other"]);
     git(
         &f.repo,
@@ -517,7 +697,7 @@ async fn resume_branch_leaves_stale_recover_ref_alone() {
     let other = git(&f.repo, &["rev-parse", "HEAD"]);
 
     let outcome = mgr
-        .resume_branch_from_recover(&f.repo, 42, &branch, &other)
+        .resume_branch_from_recover(&f.repo, &snap, "daemon/anvil-t44", &other)
         .await
         .unwrap();
 
@@ -530,64 +710,60 @@ async fn resume_branch_leaves_stale_recover_ref_alone() {
     );
     assert!(!git_ok(
         &f.repo,
-        &["rev-parse", "--verify", &format!("refs/heads/{branch}")]
+        &["rev-parse", "--verify", "refs/heads/daemon/anvil-t44"]
     ));
-    assert_eq!(recover_refs(&f.repo, 42), vec![snap.refname]);
+    assert_eq!(recover_refs(&f.repo, 44), vec![snap.refname]);
 }
 
 #[tokio::test]
-async fn resume_without_recover_ref_is_none() {
+async fn resume_worktree_fast_forwards_then_restores_uncommitted() {
     let f = fixture();
     let mgr = WorktreeManager::new();
-    let base = git(&f.repo, &["rev-parse", "origin/main"]);
-    assert_eq!(
-        mgr.resume_branch_from_recover(&f.repo, 43, "daemon/anvil-t43", &base)
-            .await
-            .unwrap(),
-        RecoverResume::None
-    );
-}
-
-#[tokio::test]
-async fn resume_worktree_fast_forwards_continuation_checkout() {
-    let f = fixture();
-    let mgr = WorktreeManager::new();
-    let (wt, branch) = provision_worker(&mgr, &f, 44).await;
-    std::fs::write(wt.join("tracked.txt"), "rework in progress\n").unwrap();
-    let snap = mgr
-        .release_preserving(&f.repo, &wt, &branch, true, &ident(44))
-        .await
-        .unwrap()
-        .remove(0);
-    let wt2 = f.base.join("remediation-t44");
-    mgr.provision(&f.repo, "remediation/forge-t44", &wt2, "origin/main")
+    let snap = dirty_snapshot(&mgr, &f, 45, false).await;
+    let parent = snap.snapshot_parent.clone().unwrap();
+    let wt2 = f.base.join("forge-t45");
+    mgr.provision(&f.repo, "remediation/forge-t45", &wt2, "origin/main")
         .await
         .unwrap();
 
     let outcome = mgr
-        .resume_worktree_from_recover(&f.repo, &wt2, 44)
+        .resume_worktree_from_recover(&f.repo, &wt2, &snap)
         .await
         .unwrap();
-
     assert!(
-        matches!(outcome, RecoverResume::Resumed { .. }),
+        matches!(
+            outcome,
+            RecoverResume::Resumed {
+                restore_uncommitted: true,
+                ..
+            }
+        ),
         "{outcome:?}"
     );
-    assert_eq!(git(&wt2, &["rev-parse", "HEAD"]), snap.sha);
+    assert_eq!(git(&wt2, &["rev-parse", "HEAD"]), parent);
+    mgr.restore_snapshot_as_uncommitted(&f.repo, &wt2, &snap)
+        .await
+        .unwrap();
     assert_eq!(
         std::fs::read_to_string(wt2.join("tracked.txt")).unwrap(),
-        "rework in progress\n"
+        "half done\n"
     );
-    assert!(git(&wt2, &["status", "--porcelain"]).is_empty());
+    assert_eq!(git(&wt2, &["rev-parse", "HEAD"]), parent);
 }
 
 #[test]
 fn task_id_parsing_from_daemon_names() {
-    assert_eq!(task_id_from_name("daemon/anvil-x6tt-t318"), Some(318));
-    assert_eq!(task_id_from_name("remediation/forge-t4"), Some(4));
+    assert_eq!(task_id_from_name("Anvil-x6tt-t318"), Some(318));
     assert_eq!(task_id_from_name("Anvil-t12"), Some(12));
-    assert_eq!(task_id_from_name("review/pr-55-rev-1"), None);
-    assert_eq!(task_id_from_name("sync/3"), None);
+    assert_eq!(task_id_from_name("review-pr-55"), None);
     assert_eq!(task_id_from_name("x-t"), None);
     assert_eq!(task_id_from_name("x-t0"), None);
+    assert_eq!(
+        recover_ref_task_id("refs/quorum-recover/t12/1/a/b"),
+        Some(12)
+    );
+    assert_eq!(
+        recover_ref_task_id("refs/quorum-recover/unattributed/1/a/b"),
+        None
+    );
 }

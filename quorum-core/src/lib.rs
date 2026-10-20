@@ -39,6 +39,7 @@ pub mod pinned;
 pub mod planner_submissions;
 pub mod pr_targets;
 pub mod provision_attempts;
+pub mod recover_refs;
 pub mod review_audits;
 pub mod review_findings;
 pub mod review_followup_assessments;

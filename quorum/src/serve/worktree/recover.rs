@@ -12,33 +12,48 @@
 //!
 //! The namespace is outside `refs/heads/` so `git branch -D`, branch sweeps,
 //! and ordinary pushes never touch it, and outside `recover/*` branches an
-//! operator may create by hand, so retention can never delete those. Any ref
-//! keeps its objects reachable after the worktree is pruned.
+//! operator may create by hand. Any ref keeps its objects reachable after the
+//! worktree is pruned.
 //!
-//! The snapshot uses plumbing only (temporary `GIT_INDEX_FILE`, `add -A`,
+//! Trust: managed workers share this repository's ref store and can write any
+//! ref, including this namespace. A ref is therefore never authority by name.
+//! The serving layer records every ref this module creates (`recover_refs`
+//! table) and passes only recorded refs back in as `trusted`; resume
+//! re-verifies that the ref still names the recorded SHA (and, for a
+//! snapshot, the recorded parent and daemon identity). Unrecorded refs are
+//! never resumed and never count as preserving a worker's commits.
+//!
+//! The snapshot uses plumbing only (temporary `GIT_INDEX_FILE`, `add`,
 //! `write-tree`, `commit-tree`, `update-ref`): no hooks run, the worktree's
 //! real index and files are untouched, and the ref is written last with a
-//! create-only CAS. A daemon that dies mid-snapshot therefore leaves the
-//! worktree intact and no partial ref; the next teardown attempt (including
-//! startup GC) simply snapshots again.
+//! create-only CAS. A daemon that dies mid-snapshot leaves the worktree intact
+//! and no partial ref; the next teardown attempt simply snapshots again.
 
 use super::{git_diagnostic, run_git, WorktreeManager};
 use std::path::Path;
 
 pub(crate) const RECOVER_REF_ROOT: &str = "refs/quorum-recover";
-/// Bounded retention: newest snapshots kept per task bucket.
+/// Bounded retention: newest recorded snapshots kept per task.
 pub(crate) const RECOVER_REFS_PER_TASK: usize = 2;
+/// Unattributed refs are never resumed; keep a small bounded tail for
+/// manual recovery.
+const UNATTRIBUTED_KEEP: usize = 8;
 const RECOVER_COMPONENT_MAX: usize = 48;
 const UNATTRIBUTED_BUCKET: &str = "unattributed";
 const SNAPSHOT_IDENTITY_NAME: &str = "quorum-daemon";
 const SNAPSHOT_IDENTITY_EMAIL: &str = "quorum-daemon@localhost";
+const SNAPSHOT_SUBJECT_PREFIX: &str = "quorum recover snapshot";
 
-/// Who and why a worktree is being torn down. `task_id` selects the bucket.
+/// Who and why a worktree is being torn down. `task_id` selects the bucket
+/// and must come from daemon-controlled state, never from worker-writable
+/// data such as the checked-out branch name. `trusted` lists the recorded
+/// recover refs of that task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoverIdentity {
     pub task_id: Option<i64>,
     pub agent: String,
     pub reason: String,
+    pub trusted: Vec<RecoverRef>,
 }
 
 impl RecoverIdentity {
@@ -47,7 +62,13 @@ impl RecoverIdentity {
             task_id: Some(task_id),
             agent: agent.to_string(),
             reason: reason.to_string(),
+            trusted: Vec::new(),
         }
+    }
+
+    pub fn with_trusted(mut self, trusted: Vec<RecoverRef>) -> Self {
+        self.trusted = trusted;
+        self
     }
 }
 
@@ -55,9 +76,26 @@ impl RecoverIdentity {
 pub struct RecoverRef {
     pub refname: String,
     pub sha: String,
+    /// `Some(parent)` when `sha` is a daemon snapshot commit of uncommitted
+    /// state on top of `parent`; `None` for pinned worker commits.
+    pub snapshot_parent: Option<String>,
+    /// Untracked files could not be captured; only tracked changes are in it.
+    pub tracked_only: bool,
+    /// Why untracked files were skipped (only on a freshly created ref).
+    pub untracked_skip: Option<String>,
 }
 
 impl RecoverRef {
+    pub fn listed(refname: &str, sha: &str) -> Self {
+        Self {
+            refname: refname.to_string(),
+            sha: sha.to_string(),
+            snapshot_parent: None,
+            tracked_only: false,
+            untracked_skip: None,
+        }
+    }
+
     /// `(agent, reason)` encoded in the ref leaf.
     pub fn provenance(&self) -> (String, String) {
         let mut parts = self.refname.rsplit('/');
@@ -86,14 +124,17 @@ impl std::fmt::Display for ReleaseError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoverResume {
-    /// No recover ref exists for the task.
+    /// No recorded recover ref exists for the task.
     None,
     /// The newest recover ref is already contained in the provisioning start.
     AlreadyIncorporated(RecoverRef),
-    /// The provisioning start now points at the recover ref.
+    /// The provisioning start now points at the recover ref's commits. When
+    /// `restore_uncommitted`, the snapshot's uncommitted changes must still be
+    /// restored into the provisioned worktree as working-tree changes.
     Resumed {
         recover: RecoverRef,
         previous: Option<String>,
+        restore_uncommitted: bool,
     },
     /// The recover ref does not descend from the provisioning start; left as is.
     Stale { recover: RecoverRef, onto: String },
@@ -133,13 +174,48 @@ fn recover_component(value: &str) -> String {
     }
 }
 
-/// Task id from a daemon worker branch or worktree name (`...-t<id>`).
+/// Task id from a daemon-created worktree directory name (`<agent>-t<id>`).
 pub(crate) fn task_id_from_name(name: &str) -> Option<i64> {
     let (_, digits) = name.rsplit_once("-t")?;
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     digits.parse::<i64>().ok().filter(|id| *id > 0)
+}
+
+/// Attribute an orphaned worktree to a task using only daemon-controlled
+/// data: the daemon-created directory name, and the branch the daemon
+/// assigned to that directory. The registered branch is worker-writable, so
+/// it is only accepted when it equals a daemon-assigned branch for this exact
+/// directory: the recorded allocation `(task_id, branch, worktree)`, or the
+/// daemon's deterministic `daemon/<agent>-t<id>` / `remediation/<agent>-t<id>`
+/// name for `<agent>-t<id>`. Anything else is unattributed.
+pub(crate) fn daemon_attribution(
+    path: &Path,
+    registered_branch: Option<&str>,
+    allocations: &[(i64, String, String)],
+) -> Option<i64> {
+    let dir_name = path.file_name()?.to_str()?;
+    let task_id = task_id_from_name(dir_name)?;
+    let branch = registered_branch?.strip_prefix("refs/heads/")?;
+    let agent = dir_name.rsplit_once("-t")?.0.to_lowercase();
+    let deterministic = [
+        format!("daemon/{agent}-t{task_id}"),
+        format!("remediation/{agent}-t{task_id}"),
+    ];
+    if deterministic.iter().any(|expected| expected == branch) {
+        return Some(task_id);
+    }
+    let canonical = std::fs::canonicalize(path).ok();
+    allocations
+        .iter()
+        .any(|(id, allocated_branch, worktree)| {
+            *id == task_id
+                && allocated_branch == branch
+                && (Path::new(worktree) == path
+                    || (canonical.is_some() && std::fs::canonicalize(worktree).ok() == canonical))
+        })
+        .then_some(task_id)
 }
 
 fn now_millis() -> u128 {
@@ -153,7 +229,8 @@ impl WorktreeManager {
     /// Snapshot any work that destroying `worktree_dir` and/or deleting
     /// `deleting_branch` would lose. Returns the refs created (empty when the
     /// worktree is clean and nothing is unique to the branch, or when an
-    /// identical snapshot already exists). Caller MUST hold `self.lock`.
+    /// identical trusted snapshot already exists). Caller MUST hold
+    /// `self.lock`.
     pub(super) async fn preserve_unlocked(
         &self,
         repo_dir: &Path,
@@ -162,8 +239,8 @@ impl WorktreeManager {
         identity: &RecoverIdentity,
     ) -> Result<Vec<RecoverRef>, String> {
         let bucket = recover_bucket(identity.task_id);
-        // (commit, freshly_created_snapshot)
-        let mut candidates: Vec<(String, bool)> = Vec::new();
+        // (commit, snapshot_parent, untracked_skip)
+        let mut candidates: Vec<(String, Option<String>, Option<String>)> = Vec::new();
         let mut worktree_head = None;
 
         if let Some(worktree) = worktree_dir {
@@ -178,22 +255,25 @@ impl WorktreeManager {
                     .rev_parse_unlocked(worktree, "HEAD^{tree}")
                     .await?
                     .ok_or_else(|| "worktree HEAD tree is unresolvable".to_string())?;
-                let tree = self.snapshot_tree_unlocked(worktree).await?;
+                let (tree, untracked_skip) = self.snapshot_tree_unlocked(worktree).await?;
                 if tree != head_tree {
-                    match self
-                        .find_equivalent_snapshot_unlocked(repo_dir, &bucket, &tree, &head)
+                    if !self
+                        .trusted_snapshot_exists_unlocked(repo_dir, &identity.trusted, &tree, &head)
                         .await?
                     {
-                        Some(_) => {}
-                        None => {
-                            let commit = self
-                                .commit_snapshot_unlocked(repo_dir, &tree, &head, identity)
-                                .await?;
-                            candidates.push((commit, true));
-                        }
+                        let commit = self
+                            .commit_snapshot_unlocked(
+                                repo_dir,
+                                &tree,
+                                &head,
+                                identity,
+                                untracked_skip.is_some(),
+                            )
+                            .await?;
+                        candidates.push((commit, Some(head.clone()), untracked_skip));
                     }
                 } else {
-                    candidates.push((head.clone(), false));
+                    candidates.push((head.clone(), None, untracked_skip));
                 }
                 worktree_head = Some(head);
             }
@@ -204,32 +284,39 @@ impl WorktreeManager {
                 .await?
             {
                 if worktree_head.as_deref() != Some(tip.as_str()) {
-                    candidates.push((tip, false));
+                    candidates.push((tip, None, None));
                 }
             }
         }
 
         let mut created = Vec::new();
         let millis = now_millis();
-        for (index, (commit, fresh)) in candidates.into_iter().enumerate() {
-            if !fresh
+        for (index, (commit, snapshot_parent, untracked_skip)) in candidates.into_iter().enumerate()
+        {
+            if snapshot_parent.is_none()
                 && !self
-                    .commit_unique_unlocked(repo_dir, &commit, deleting_branch)
+                    .commit_unique_unlocked(repo_dir, &commit, deleting_branch, &identity.trusted)
                     .await?
             {
                 continue;
             }
+            let tracked_only = snapshot_parent.is_some() && untracked_skip.is_some();
+            let reason = if tracked_only {
+                format!("{}-tracked-only", identity.reason)
+            } else {
+                identity.reason.clone()
+            };
             let refname = format!(
                 "{bucket}/{:013}/{}/{}",
                 millis + index as u128,
                 recover_component(&identity.agent),
-                recover_component(&identity.reason),
+                recover_component(&reason),
             );
             let mut update = self.git_cmd(repo_dir);
             update.args([
                 "update-ref",
                 "-m",
-                "quorum recover snapshot",
+                SNAPSHOT_SUBJECT_PREFIX,
                 &refname,
                 &commit,
                 "",
@@ -249,10 +336,13 @@ impl WorktreeManager {
             created.push(RecoverRef {
                 refname,
                 sha: commit,
+                snapshot_parent,
+                tracked_only,
+                untracked_skip: if tracked_only { untracked_skip } else { None },
             });
         }
-        if !created.is_empty() {
-            self.prune_bucket_unlocked(repo_dir, &bucket, RECOVER_REFS_PER_TASK)
+        if !created.is_empty() && identity.task_id.is_none() {
+            self.prune_bucket_unlocked(repo_dir, &bucket, UNATTRIBUTED_KEEP)
                 .await?;
         }
         Ok(created)
@@ -317,64 +407,60 @@ impl WorktreeManager {
         }
     }
 
-    /// Every recover ref, newest first within each bucket.
+    /// Whether `path` is a registered worktree of `repo_dir`.
+    pub async fn is_registered_worktree(
+        &self,
+        repo_dir: &Path,
+        path: &Path,
+    ) -> Result<bool, String> {
+        let _guard = self.lock.lock().await;
+        let Ok(canonical) = std::fs::canonicalize(path) else {
+            return Ok(false);
+        };
+        Ok(self
+            .list_worktrees_unlocked(repo_dir)
+            .await?
+            .iter()
+            .any(|registration| {
+                std::fs::canonicalize(&registration.path).ok().as_ref() == Some(&canonical)
+            }))
+    }
+
+    /// Every ref in the recover namespace, newest first within each bucket.
+    /// Includes refs the daemon did not create; callers must not trust them.
     pub async fn list_recover_refs(&self, repo_dir: &Path) -> Result<Vec<RecoverRef>, String> {
         let _guard = self.lock.lock().await;
         self.list_bucket_unlocked(repo_dir, RECOVER_REF_ROOT).await
     }
 
-    /// Newest recover ref for `task_id`.
-    #[cfg(test)]
-    pub async fn latest_recover_ref(
+    /// Delete one recover ref if it still names `sha`. A missing ref is
+    /// success; a ref moved to another SHA is left alone and reported.
+    /// Refs outside the recover namespace are refused.
+    pub async fn delete_recover_ref(
         &self,
         repo_dir: &Path,
-        task_id: i64,
-    ) -> Result<Option<RecoverRef>, String> {
+        recover: &RecoverRef,
+    ) -> Result<(), String> {
         let _guard = self.lock.lock().await;
-        Ok(self
-            .list_bucket_unlocked(repo_dir, &recover_bucket(Some(task_id)))
-            .await?
-            .into_iter()
-            .next())
+        self.delete_recover_ref_unlocked(repo_dir, recover).await
     }
 
-    /// Delete exactly these recover refs (CAS on the listed SHA). Refs outside
-    /// the recover namespace are refused.
-    pub async fn delete_recover_refs(
-        &self,
-        repo_dir: &Path,
-        refs: &[RecoverRef],
-    ) -> Result<usize, String> {
-        let _guard = self.lock.lock().await;
-        let mut deleted = 0;
-        for recover in refs {
-            self.delete_recover_ref_unlocked(repo_dir, recover).await?;
-            deleted += 1;
-        }
-        Ok(deleted)
-    }
-
-    /// Point the task's local branch at its newest recover ref before a
-    /// fresh worker provisions it. With an existing branch the recover ref
-    /// must descend from the branch tip (fast-forward only); without one it
-    /// must descend from `base_rev` (the task's allocation provenance, or
-    /// the remote base for a legacy allocation without one).
+    /// Point the task's local branch at a trusted recover ref's commits
+    /// before a fresh worker provisions it. With an existing branch the
+    /// recover ref must descend from the branch tip (fast-forward only);
+    /// without one it must descend from `base_rev` (the task's allocation
+    /// provenance, or the remote base for a legacy allocation). A snapshot
+    /// of uncommitted state positions the branch at the snapshot's parent;
+    /// the caller restores the uncommitted changes after provisioning.
     pub async fn resume_branch_from_recover(
         &self,
         repo_dir: &Path,
-        task_id: i64,
+        recover: &RecoverRef,
         branch: &str,
         base_rev: &str,
     ) -> Result<RecoverResume, String> {
         let _guard = self.lock.lock().await;
-        let Some(recover) = self
-            .list_bucket_unlocked(repo_dir, &recover_bucket(Some(task_id)))
-            .await?
-            .into_iter()
-            .next()
-        else {
-            return Ok(RecoverResume::None);
-        };
+        self.verify_trusted_unlocked(repo_dir, recover).await?;
         let branch_ref = format!("refs/heads/{branch}");
         let tip = self
             .rev_parse_unlocked(repo_dir, &format!("{branch_ref}^{{commit}}"))
@@ -390,64 +476,69 @@ impl WorktreeManager {
             .is_ancestor_unlocked(repo_dir, &recover.sha, &onto)
             .await?
         {
-            return Ok(RecoverResume::AlreadyIncorporated(recover));
+            return Ok(RecoverResume::AlreadyIncorporated(recover.clone()));
         }
         if !self
             .is_ancestor_unlocked(repo_dir, &onto, &recover.sha)
             .await?
         {
-            return Ok(RecoverResume::Stale { recover, onto });
+            return Ok(RecoverResume::Stale {
+                recover: recover.clone(),
+                onto,
+            });
         }
-        if tip.is_some()
-            && self
-                .branch_checked_out_unlocked(repo_dir, &branch_ref)
-                .await?
-        {
-            return Err(format!(
-                "cannot resume {branch} from {}: branch is checked out in a worktree",
-                recover.refname
-            ));
-        }
-        let mut update = self.git_cmd(repo_dir);
-        update.args([
-            "update-ref",
-            "-m",
-            "quorum resume from recover snapshot",
-            &branch_ref,
-            &recover.sha,
-            tip.as_deref().unwrap_or(""),
-        ]);
-        let out = run_git(update, self.local_timeout, "git update-ref resume branch").await?;
-        if !out.status.success() {
-            return Err(format!(
-                "cannot resume {branch} from {}: {}",
-                recover.refname,
-                git_diagnostic(&out.stderr)
-            ));
+        let target = recover
+            .snapshot_parent
+            .clone()
+            .unwrap_or_else(|| recover.sha.clone());
+        if tip.as_deref() != Some(target.as_str()) {
+            if tip.is_some()
+                && self
+                    .branch_checked_out_unlocked(repo_dir, &branch_ref)
+                    .await?
+            {
+                return Err(format!(
+                    "cannot resume {branch} from {}: branch is checked out in a worktree",
+                    recover.refname
+                ));
+            }
+            let mut update = self.git_cmd(repo_dir);
+            update.args([
+                "update-ref",
+                "-m",
+                "quorum resume from recover snapshot",
+                &branch_ref,
+                &target,
+                tip.as_deref().unwrap_or(""),
+            ]);
+            let out = run_git(update, self.local_timeout, "git update-ref resume branch").await?;
+            if !out.status.success() {
+                return Err(format!(
+                    "cannot resume {branch} from {}: {}",
+                    recover.refname,
+                    git_diagnostic(&out.stderr)
+                ));
+            }
         }
         Ok(RecoverResume::Resumed {
-            recover,
+            recover: recover.clone(),
             previous: tip,
+            restore_uncommitted: recover.snapshot_parent.is_some(),
         })
     }
 
     /// Fast-forward a freshly provisioned continuation worktree (HEAD at the
-    /// PR head) to the task's newest recover ref when it descends from HEAD.
+    /// PR head) to a trusted recover ref's commits when it descends from
+    /// HEAD. A snapshot's uncommitted changes are restored by the caller
+    /// (after base integration) with [`Self::restore_snapshot_as_uncommitted`].
     pub async fn resume_worktree_from_recover(
         &self,
         repo_dir: &Path,
         worktree_dir: &Path,
-        task_id: i64,
+        recover: &RecoverRef,
     ) -> Result<RecoverResume, String> {
         let _guard = self.lock.lock().await;
-        let Some(recover) = self
-            .list_bucket_unlocked(repo_dir, &recover_bucket(Some(task_id)))
-            .await?
-            .into_iter()
-            .next()
-        else {
-            return Ok(RecoverResume::None);
-        };
+        self.verify_trusted_unlocked(repo_dir, recover).await?;
         let head = self
             .rev_parse_unlocked(worktree_dir, "HEAD^{commit}")
             .await?
@@ -456,34 +547,142 @@ impl WorktreeManager {
             .is_ancestor_unlocked(repo_dir, &recover.sha, &head)
             .await?
         {
-            return Ok(RecoverResume::AlreadyIncorporated(recover));
+            return Ok(RecoverResume::AlreadyIncorporated(recover.clone()));
         }
         if !self
             .is_ancestor_unlocked(repo_dir, &head, &recover.sha)
             .await?
         {
             return Ok(RecoverResume::Stale {
-                recover,
+                recover: recover.clone(),
                 onto: head,
             });
         }
-        let mut reset = self.git_cmd(worktree_dir);
-        reset.args(["reset", "--keep", &recover.sha]);
-        let out = run_git(reset, self.local_timeout, "git reset --keep recover").await?;
+        let target = recover
+            .snapshot_parent
+            .clone()
+            .unwrap_or_else(|| recover.sha.clone());
+        if target != head {
+            let mut reset = self.git_cmd(worktree_dir);
+            reset.args(["reset", "--keep", &target]);
+            let out = run_git(reset, self.local_timeout, "git reset --keep recover").await?;
+            if !out.status.success() {
+                return Err(format!(
+                    "cannot fast-forward worktree to {}: {}",
+                    recover.refname,
+                    git_diagnostic(&out.stderr)
+                ));
+            }
+        }
+        Ok(RecoverResume::Resumed {
+            recover: recover.clone(),
+            previous: Some(head),
+            restore_uncommitted: recover.snapshot_parent.is_some(),
+        })
+    }
+
+    /// Re-apply a trusted snapshot's uncommitted changes to `worktree_dir` as
+    /// unstaged working-tree changes (new files come back untracked); no
+    /// commit is created. Returns the paths the snapshot added. On a conflict
+    /// the worktree is restored to its prior clean state and an error returned.
+    pub async fn restore_snapshot_as_uncommitted(
+        &self,
+        repo_dir: &Path,
+        worktree_dir: &Path,
+        recover: &RecoverRef,
+    ) -> Result<Vec<String>, String> {
+        let _guard = self.lock.lock().await;
+        let parent = recover
+            .snapshot_parent
+            .as_deref()
+            .ok_or_else(|| format!("{} is not a snapshot", recover.refname))?;
+        self.verify_trusted_unlocked(repo_dir, recover).await?;
+        let mut pick = self.git_cmd(worktree_dir);
+        pick.env("GIT_AUTHOR_NAME", SNAPSHOT_IDENTITY_NAME)
+            .env("GIT_AUTHOR_EMAIL", SNAPSHOT_IDENTITY_EMAIL)
+            .env("GIT_COMMITTER_NAME", SNAPSHOT_IDENTITY_NAME)
+            .env("GIT_COMMITTER_EMAIL", SNAPSHOT_IDENTITY_EMAIL)
+            .args(["cherry-pick", "--no-commit", &recover.sha]);
+        let out = run_git(pick, self.local_timeout, "git cherry-pick snapshot").await?;
         if !out.status.success() {
+            let mut abort = self.git_cmd(worktree_dir);
+            abort.args(["cherry-pick", "--abort"]);
+            let _ = run_git(abort, self.local_timeout, "git cherry-pick --abort").await;
             return Err(format!(
-                "cannot fast-forward worktree to {}: {}",
+                "snapshot {} does not apply cleanly: {}",
                 recover.refname,
                 git_diagnostic(&out.stderr)
             ));
         }
-        Ok(RecoverResume::Resumed {
-            recover,
-            previous: Some(head),
-        })
+        let mut unstage = self.git_cmd(worktree_dir);
+        unstage.args(["reset", "-q"]);
+        let out = run_git(unstage, self.local_timeout, "git reset unstage snapshot").await?;
+        if !out.status.success() {
+            return Err(format!(
+                "cannot unstage restored snapshot: {}",
+                git_diagnostic(&out.stderr)
+            ));
+        }
+        let mut added = self.git_cmd(repo_dir);
+        added.args([
+            "diff",
+            "--no-renames",
+            "--name-only",
+            "--diff-filter=A",
+            parent,
+            &recover.sha,
+        ]);
+        let out = run_git(added, self.local_timeout, "git diff snapshot added paths").await?;
+        if !out.status.success() {
+            return Err(format!(
+                "cannot list snapshot paths: {}",
+                git_diagnostic(&out.stderr)
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect())
     }
 
     // ── helpers (caller MUST hold `self.lock`) ──────────────────────────────
+
+    /// A recorded ref must still name its recorded SHA; a recorded snapshot
+    /// must be a single-parent daemon commit on the recorded parent.
+    async fn verify_trusted_unlocked(
+        &self,
+        repo_dir: &Path,
+        recover: &RecoverRef,
+    ) -> Result<(), String> {
+        let current = self.rev_parse_unlocked(repo_dir, &recover.refname).await?;
+        if current.as_deref() != Some(recover.sha.as_str()) {
+            return Err(format!(
+                "recover ref {} no longer names recorded commit {} (found {current:?})",
+                recover.refname, recover.sha
+            ));
+        }
+        if let Some(parent) = recover.snapshot_parent.as_deref() {
+            let mut show = self.git_cmd(repo_dir);
+            show.args(["log", "-1", "--format=%an%x00%P%x00%s", &recover.sha]);
+            let out = run_git(show, self.local_timeout, "git inspect snapshot").await?;
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut fields = text.trim_end_matches('\n').split('\0');
+            let author = fields.next().unwrap_or_default();
+            let parents = fields.next().unwrap_or_default();
+            let subject = fields.next().unwrap_or_default();
+            if !out.status.success()
+                || author != SNAPSHOT_IDENTITY_NAME
+                || parents != parent
+                || !subject.starts_with(SNAPSHOT_SUBJECT_PREFIX)
+            {
+                return Err(format!(
+                    "recover ref {} is not the recorded daemon snapshot on {parent}",
+                    recover.refname
+                ));
+            }
+        }
+        Ok(())
+    }
 
     async fn rev_parse_unlocked(&self, dir: &Path, rev: &str) -> Result<Option<String>, String> {
         let mut cmd = self.git_cmd(dir);
@@ -522,15 +721,30 @@ impl WorktreeManager {
         Ok(top.is_some() && top == dir)
     }
 
-    /// Tree of the worktree's full state (tracked edits, deletions, and
-    /// untracked-not-ignored files) built in a throwaway index.
-    async fn snapshot_tree_unlocked(&self, worktree: &Path) -> Result<String, String> {
+    /// Tree of the worktree's full state built in a throwaway index. When
+    /// capturing untracked files fails (e.g. a huge untracked tree times
+    /// out), fall back to tracked changes only and report why; fail only if
+    /// even that fails.
+    async fn snapshot_tree_unlocked(
+        &self,
+        worktree: &Path,
+    ) -> Result<(String, Option<String>), String> {
+        match self.build_tree_unlocked(worktree, "-A").await {
+            Ok(tree) => Ok((tree, None)),
+            Err(full) => match self.build_tree_unlocked(worktree, "-u").await {
+                Ok(tree) => Ok((tree, Some(full))),
+                Err(tracked) => Err(format!("{full}; tracked-only fallback: {tracked}")),
+            },
+        }
+    }
+
+    async fn build_tree_unlocked(&self, worktree: &Path, add_mode: &str) -> Result<String, String> {
         let scratch = tempfile::tempdir()
             .map_err(|error| format!("cannot create snapshot index dir: {error}"))?;
         let index = scratch.path().join("index");
         let steps: [(&[&str], &str); 3] = [
             (&["read-tree", "HEAD"], "git read-tree snapshot"),
-            (&["add", "-A", "--", "."], "git add snapshot"),
+            (&["add", add_mode, "--", "."], "git add snapshot"),
             (&["write-tree"], "git write-tree snapshot"),
         ];
         let mut tree = String::new();
@@ -555,15 +769,21 @@ impl WorktreeManager {
         tree: &str,
         parent: &str,
         identity: &RecoverIdentity,
+        tracked_only: bool,
     ) -> Result<String, String> {
         let message = format!(
-            "quorum recover snapshot: task {} agent {} ({})\n\n\
-             Uncommitted worktree state preserved by the daemon before teardown.\n",
+            "{SNAPSHOT_SUBJECT_PREFIX}: task {} agent {} ({})\n\n\
+             Uncommitted worktree state preserved by the daemon before teardown.{}\n",
             identity
                 .task_id
                 .map_or_else(|| "unknown".to_string(), |id| format!("#{id}")),
             recover_component(&identity.agent),
             recover_component(&identity.reason),
+            if tracked_only {
+                " Untracked files were NOT captured."
+            } else {
+                ""
+            },
         );
         let mut cmd = self.git_cmd(repo_dir);
         cmd.env("GIT_AUTHOR_NAME", SNAPSHOT_IDENTITY_NAME)
@@ -590,57 +810,61 @@ impl WorktreeManager {
         Ok(sha)
     }
 
-    /// An existing snapshot in `bucket` with the same tree on the same parent.
-    async fn find_equivalent_snapshot_unlocked(
+    /// A trusted snapshot that still exists with the same tree on `parent`.
+    async fn trusted_snapshot_exists_unlocked(
         &self,
         repo_dir: &Path,
-        bucket: &str,
+        trusted: &[RecoverRef],
         tree: &str,
         parent: &str,
-    ) -> Result<Option<String>, String> {
-        let mut cmd = self.git_cmd(repo_dir);
-        cmd.args([
-            "for-each-ref",
-            "--format=%(refname) %(tree) %(parent)",
-            bucket,
-        ]);
-        let out = run_git(cmd, self.local_timeout, "git list recover snapshots").await?;
-        if !out.status.success() {
-            return Err(format!(
-                "cannot list recover refs: {}",
-                git_diagnostic(&out.stderr)
-            ));
+    ) -> Result<bool, String> {
+        for recover in trusted {
+            if recover.snapshot_parent.as_deref() != Some(parent) {
+                continue;
+            }
+            if self
+                .rev_parse_unlocked(repo_dir, &recover.refname)
+                .await?
+                .as_deref()
+                != Some(recover.sha.as_str())
+            {
+                continue;
+            }
+            if self
+                .rev_parse_unlocked(repo_dir, &format!("{}^{{tree}}", recover.sha))
+                .await?
+                .as_deref()
+                == Some(tree)
+            {
+                return Ok(true);
+            }
         }
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .find_map(|line| {
-                let mut parts = line.split(' ');
-                let refname = parts.next()?;
-                (parts.next() == Some(tree)
-                    && parts.next() == Some(parent)
-                    && parts.next().is_none())
-                .then(|| refname.to_string())
-            }))
+        Ok(false)
     }
 
     /// True when `commit` has history reachable from no ref other than the
     /// branch about to be deleted (i.e. deleting it would lose commits).
-    /// Remote-tracking, PR, publication, and earlier recover refs all count
-    /// as already preserved.
+    /// Remote-tracking, PR, and publication refs count as preserving; the
+    /// worker-writable recover namespace counts only through trusted refs.
     async fn commit_unique_unlocked(
         &self,
         repo_dir: &Path,
         commit: &str,
         deleting_branch: Option<&str>,
+        trusted: &[RecoverRef],
     ) -> Result<bool, String> {
         let mut cmd = self.git_cmd(repo_dir);
         cmd.args(["rev-list", "-n", "1", commit, "--not"]);
         if let Some(branch) = deleting_branch {
             cmd.arg(format!("--exclude=refs/heads/{branch}"));
         }
+        cmd.arg(format!("--exclude={RECOVER_REF_ROOT}/*"));
         // Every ref, but not `--all`: that also counts worktree HEADs, and
         // the worktree being destroyed must not vouch for its own commits.
         cmd.arg("--glob=refs/*");
+        for recover in trusted {
+            cmd.arg(&recover.sha);
+        }
         let out = run_git(cmd, self.local_timeout, "git rev-list unique work").await?;
         if !out.status.success() {
             return Err(format!(
@@ -682,7 +906,7 @@ impl WorktreeManager {
             .any(|registration| registration.branch.as_deref() == Some(branch_ref)))
     }
 
-    /// Recover refs under `prefix`, newest first (fixed-width millis sort).
+    /// Refs under `prefix`, newest first (fixed-width millis sort).
     async fn list_bucket_unlocked(
         &self,
         repo_dir: &Path,
@@ -708,10 +932,7 @@ impl WorktreeManager {
                 let (refname, sha) = line
                     .split_once(' ')
                     .ok_or_else(|| format!("malformed recover ref listing: {line}"))?;
-                Ok(RecoverRef {
-                    refname: refname.to_string(),
-                    sha: sha.to_string(),
-                })
+                Ok(RecoverRef::listed(refname, sha))
             })
             .collect()
     }
@@ -739,6 +960,16 @@ impl WorktreeManager {
                 "refusing to delete non-recover ref {}",
                 recover.refname
             ));
+        }
+        match self.rev_parse_unlocked(repo_dir, &recover.refname).await? {
+            None => return Ok(()),
+            Some(current) if current != recover.sha => {
+                return Err(format!(
+                    "recover ref {} moved to {current}; left in place",
+                    recover.refname
+                ))
+            }
+            Some(_) => {}
         }
         let mut cmd = self.git_cmd(repo_dir);
         cmd.args(["update-ref", "-d", &recover.refname, &recover.sha]);

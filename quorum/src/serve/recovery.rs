@@ -1038,44 +1038,54 @@ pub(crate) async fn recover(
                 .map(|recovery| recovery.intent.worktree.as_str()),
         )
         .collect::<Vec<_>>();
+    // Attribution uses only daemon-controlled allocation records and the
+    // daemon-created directory names, never a worker-writable branch alone.
+    let allocations = {
+        let db_path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<(i64, String, String)>> {
+            let conn = quorum_core::db::open(&db_path)?;
+            let mut stmt = conn.prepare("SELECT task_id, branch, worktree FROM task_branches")?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("allocation lookup join: {e}")))??
+    };
     let gc = wt_mgr
-        .gc_orphaned_detailed(&config.repo_dir, &config.worktree_base, &active_worktrees)
+        .gc_orphaned_detailed(
+            &config.repo_dir,
+            &config.worktree_base,
+            &active_worktrees,
+            &allocations,
+        )
         .await;
     if !gc.removed.is_empty() {
         log(&format!("recovery: GC'd {} worktree(s)", gc.removed.len()));
     }
     for recover in &gc.preserved {
-        log(&format!(
-            "recovery: preserved orphaned worktree work at {} ({})",
-            recover.refname, recover.sha
-        ));
+        let identity = super::worktree::RecoverIdentity {
+            task_id: super::worktree::recover_ref_task_id(&recover.refname),
+            agent: recover.provenance().0,
+            reason: "startup_gc".into(),
+            trusted: Vec::new(),
+        };
+        super::worker_recover::record_created_recover_refs(
+            config,
+            wt_mgr,
+            &identity,
+            std::slice::from_ref(recover),
+        )
+        .await;
     }
-    if !gc.preserve_failures.is_empty() {
-        // Fail loud but keep starting: the kept checkouts are retried by the
-        // next provisioning of their task or the next startup GC.
-        let failures = gc.preserve_failures.clone();
-        let db_path = config.db_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let conn = quorum_core::db::open(&db_path)?;
-            for (path, error) in failures {
-                let detail =
-                    format!("startup GC kept worktree {path}: work preservation failed: {error}");
-                quorum_core::errlog::log_error(
-                    &conn,
-                    super::now_unix(),
-                    "worktree_recover",
-                    super::truncate_utf8_bytes(&detail, super::WORKTREE_RECOVER_TEXT_MAX),
-                );
-            }
-            Ok(())
-        })
-        .await
-        .ok();
-        for (path, error) in &gc.preserve_failures {
-            log(&format!(
-                "recovery: kept worktree {path}: work preservation failed: {error}"
-            ));
-        }
+    // Fail loud but keep starting: the kept checkouts are retried by the
+    // next provisioning of their task or the next startup GC.
+    for (path, error) in &gc.preserve_failures {
+        let detail = format!("startup GC kept worktree {path}: work preservation failed: {error}");
+        log(&format!("recovery: {detail}"));
+        super::worker_recover::record_worktree_recover_error(&config.db_path, None, path, &detail)
+            .await;
     }
 
     // ── Phase 4: Reset non-terminal tasks to tick-loop-handleable states ─

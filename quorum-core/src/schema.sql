@@ -1242,3 +1242,23 @@ BEFORE UPDATE OF operation_id, client_request_id, attempt_id, created_by_run_id,
 BEGIN
     SELECT RAISE(ABORT, 'github operation request is immutable after enqueue');
 END;
+
+-- Daemon-created worker-work recover refs (`refs/quorum-recover/t<task>/...`).
+-- Workers share the repository's ref store, so a ref alone is not authority:
+-- the daemon resumes only from a ref whose exact name and SHA it recorded here
+-- for the same task. Rows are retired with their refs (bounded retention and
+-- done/cancelled housekeeping).
+CREATE TABLE IF NOT EXISTS recover_refs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    refname      TEXT NOT NULL UNIQUE,
+    task_id      INTEGER NOT NULL,
+    sha          TEXT NOT NULL,
+    kind         TEXT NOT NULL CHECK (kind IN ('snapshot', 'commits')),
+    parent_sha   TEXT,
+    tracked_only INTEGER NOT NULL DEFAULT 0 CHECK (tracked_only IN (0, 1)),
+    agent        TEXT NOT NULL,
+    reason       TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    CHECK ((kind = 'snapshot') = (parent_sha IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS recover_refs_task ON recover_refs(task_id, id);
