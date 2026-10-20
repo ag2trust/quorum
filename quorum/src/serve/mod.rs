@@ -3778,7 +3778,7 @@ fn resolve_reviewer_recovery(
     task_id: i64,
     is_r2: bool,
 ) -> Result<Option<ReviewerRecovery>> {
-    let conn = quorum_core::db::open(db_path)?;
+    let mut conn = quorum_core::db::open(db_path)?;
     let task = tasks::get(&conn, task_id)?;
     let task_refs = task.as_ref().and_then(|task| task.refs.as_deref());
     let Some(run) = quorum_core::agent_runs::interrupted_reviewer(&conn, task_id, is_r2)? else {
@@ -3818,15 +3818,31 @@ fn resolve_reviewer_recovery(
         // concurrent close wins) and let the caller provision a fresh
         // reviewer; total reviewer runs stay bounded by
         // `MAX_TOTAL_REVIEWER_RUNS`, which counts this ended run.
-        let ended = conn.execute(
+        let ended_at = now_unix();
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        let ended = tx.execute(
             "UPDATE agent_runs SET ended_at=?2,end_reason=?3
              WHERE id=?1 AND (ended_at IS NULL OR end_reason='drain')",
             rusqlite::params![
                 run.id,
-                now_unix(),
+                ended_at,
                 REVIEWER_CONTINUATION_UNAVAILABLE_END_REASON
             ],
         )?;
+        if ended == 1 {
+            quorum_core::events::emit(
+                &tx,
+                "reviewer_interrupted_no_continuation",
+                &format!("task#{task_id}"),
+                &format!(
+                    "interrupted reviewer run {} for task #{task_id} provider {provider} had no \
+                     persisted continuation; closed as {}",
+                    run.id, REVIEWER_CONTINUATION_UNAVAILABLE_END_REASON,
+                ),
+                ended_at,
+            )?;
+        }
+        tx.commit()?;
         if ended == 1 {
             log(&format!(
                 "task #{task_id}: interrupted turn-oriented reviewer run {} ({}) has no \
@@ -50462,7 +50478,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     None,
                     0,
                     None,
-                    None,
+                    Some(
+                        r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null}"#,
+                    ),
                     None,
                     Some(91),
                     10,
@@ -50489,7 +50507,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             let recovery = resolve_reviewer_recovery(&db_path, task_id, false)
                 .expect("an unrecoverable reviewer must not be a tick error");
             assert!(recovery.is_none(), "crashed={crashed}: provision fresh");
-            let conn = quorum_core::db::open(&db_path).unwrap();
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
             let ended: (Option<i64>, Option<String>) = conn
                 .query_row(
                     "SELECT ended_at,end_reason FROM agent_runs WHERE id=?1",
@@ -50509,17 +50527,91 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     .is_none(),
                 "crashed={crashed}: the next orphan scan must not re-select the run"
             );
+            let replacement_events = quorum_core::events::list(
+                &conn,
+                0,
+                Some(&format!("task#{task_id}")),
+                100,
+                now_unix(),
+            )
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "reviewer_interrupted_no_continuation")
+            .collect::<Vec<_>>();
+            assert_eq!(replacement_events.len(), 1, "crashed={crashed}");
+            assert!(replacement_events[0]
+                .body
+                .contains(&format!("reviewer run {run_id}")));
+            assert!(replacement_events[0]
+                .body
+                .contains(&format!("task #{task_id}")));
+            assert!(replacement_events[0].body.contains("provider codex"));
             // Replay is a clean no-op, not a loop.
             assert!(resolve_reviewer_recovery(&db_path, task_id, false)
                 .unwrap()
                 .is_none());
+            let replacement_event_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE subject=?1 AND kind='reviewer_interrupted_no_continuation'",
+                    [format!("task#{task_id}")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                replacement_event_count, 1,
+                "crashed={crashed}: repeated orphan scans must not repeat the recovery event"
+            );
             assert!(matches!(
                 decide_provision(&conn, task_id, 91, "head").unwrap(),
                 ProvisionDecision::Needed("r1")
             ));
 
+            // Model the remainder of the orphan path through the same atomic
+            // reservation and attachment primitives used by
+            // `provision_reviewer`: the replacement gets a new identity and
+            // exactly one task-scoped lease.
+            let token = format!("replacement-{crashed}");
+            assert!(
+                tasks::reserve_reviewer_provision(&mut conn, task_id, &token, "r1", 30,).unwrap()
+            );
+            let fresh_reviewer = format!("r1-fresh-{crashed}");
+            quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                &fresh_reviewer,
+                "reviewer",
+                "gpt-5.6-terra",
+                "high",
+                "codex",
+                31,
+            )
+            .unwrap();
+            assert!(tasks::attach_reserved_reviewer(
+                &mut conn,
+                task_id,
+                &token,
+                "r1",
+                &fresh_reviewer,
+                tasks::DEFAULT_LEASE_TTL_SECS,
+                32,
+            )
+            .unwrap());
+            assert!(tasks::release_reviewer_provision(&mut conn, task_id, &token).unwrap());
+            let attached = tasks::get(&conn, task_id).unwrap().unwrap();
+            assert_eq!(attached.reviewer.as_deref(), Some(fresh_reviewer.as_str()));
+            let live_reviewer_claims: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM claims
+                     WHERE target=?1 AND holder=?2 AND active=1",
+                    rusqlite::params![tasks::lease_target(task_id), fresh_reviewer],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(live_reviewer_claims, 1, "crashed={crashed}");
+
             // The ended run still counts toward the total reviewer-run cap.
-            for i in 1..MAX_TOTAL_REVIEWER_RUNS {
+            for i in 2..MAX_TOTAL_REVIEWER_RUNS {
                 quorum_core::agent_runs::insert(
                     &conn,
                     task_id,

@@ -908,6 +908,14 @@ fn retryable_merge_sends_rework_turn() {
 }
 
 #[test]
+fn parse_quorum_version_build_sha_reads_parenthesized_short_sha() {
+    assert_eq!(
+        common::parse_quorum_version_build_sha("quorum 0.3.3 (0a25309)"),
+        "0a25309"
+    );
+}
+
+#[test]
 fn graceful_drain_defers_merge_remediation_until_restart() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
@@ -924,20 +932,11 @@ fn graceful_drain_defers_merge_remediation_until_restart() {
     );
 
     let _origin = init_git_repo_with_bare_origin(repo_dir.path());
-    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap();
-    let running_sha = Command::new("git")
-        .args(["-C", &source.to_string_lossy(), "rev-parse", "HEAD"])
-        .output()
-        .unwrap();
-    assert!(running_sha.status.success());
-    let running_sha = String::from_utf8(running_sha.stdout).unwrap();
-    std::fs::write(
-        &sha_state,
-        format!("{}\trefs/heads/main\n", running_sha.trim()),
-    )
-    .unwrap();
+    // Seed origin/main from the SHA compiled into the binary. Worktree HEAD can
+    // lead or lag that identity, and the daemon treats a remote as current when
+    // remote == running_sha or remote.starts_with(running_sha).
+    let running_sha = common::compiled_build_sha_short();
+    std::fs::write(&sha_state, format!("{}\trefs/heads/main\n", running_sha)).unwrap();
     Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
