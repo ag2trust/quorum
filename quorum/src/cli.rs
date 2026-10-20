@@ -571,7 +571,8 @@ pub enum Command {
         doctor_enabled: bool,
     },
     /// Stream rendered events from an agent's session log. Resolves the agent's
-    /// latest session log directory via the journal. Default: print events so far
+    /// in-flight session log via the journal, else the newest retained session
+    /// directory (`<log_dir>/<agent>-<start>`, kept ~7 days). Default: print events so far
     /// and exit. `--follow` keeps tailing until Ctrl-C.
     Tail {
         /// Agent name whose session log to tail.
