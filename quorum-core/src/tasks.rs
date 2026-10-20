@@ -10,6 +10,7 @@
 
 use crate::db::begin_immediate;
 use crate::error::{QuorumError, Result};
+use crate::git::git_command;
 use crate::lifecycle::{Effect, Event, Status, TaskView};
 use crate::runner_state::{
     self, ContinuationSlot, InitialWorkerSession, PendingTurn, ProviderBlock,
@@ -17,7 +18,6 @@ use crate::runner_state::{
 use crate::sweep::SWEEP_LIMIT;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use serde::Serialize;
-use std::process::Command;
 
 pub const STATUSES: &[&str] = &[
     "open",
@@ -1499,7 +1499,7 @@ pub fn validate_target_branch(branch: &str) -> Result<()> {
         ));
     }
 
-    let output = Command::new("git")
+    let output = git_command("git")
         .args(["check-ref-format", "--branch", branch])
         .output()
         .map_err(|error| QuorumError::Io(format!("run git check-ref-format: {error}")))?;
