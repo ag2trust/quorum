@@ -517,6 +517,228 @@ fn continue_pr_rejects_ambiguous_or_unauthorized_inputs() {
 }
 
 #[test]
+fn review_only_creates_no_rework_review_task_visible_in_task_get() {
+    let home = tempfile::tempdir().unwrap();
+    let out = quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "Review PR #31",
+            "--review-only",
+            "31",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let created: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = created["id"].as_i64().unwrap();
+
+    let out = quorum(home.path())
+        .args(["task-get", "--task-id", &id.to_string()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(task["status"], "in-review");
+    assert_eq!(task["review_only"], true);
+    assert_eq!(task["no_rework"], true);
+    let refs: serde_json::Value = serde_json::from_str(task["refs"].as_str().unwrap()).unwrap();
+    assert_eq!(refs["pr"], 31);
+
+    // `--review-pr` keeps review + remediation mode.
+    let out = quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "Review PR #32",
+            "--review-pr",
+            "32",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let created: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let out = quorum(home.path())
+        .args([
+            "task-get",
+            "--task-id",
+            &created["id"].as_i64().unwrap().to_string(),
+        ])
+        .output()
+        .unwrap();
+    let task: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(task["review_only"], true);
+    assert_eq!(task["no_rework"], false);
+}
+
+#[test]
+fn review_only_rejects_conflicting_modes_and_bad_pr() {
+    let home = tempfile::tempdir().unwrap();
+    for (flag, value) in [("--review-pr", "40"), ("--continue-pr", "40")] {
+        quorum(home.path())
+            .args([
+                "task-create",
+                "--created-by",
+                "boss",
+                "--title",
+                "ambiguous",
+                "--review-only",
+                "40",
+                flag,
+                value,
+            ])
+            .assert()
+            .code(2);
+    }
+    for pr in ["0", "-1"] {
+        quorum(home.path())
+            .args([
+                "task-create",
+                "--created-by",
+                "boss",
+                "--title",
+                "bad pr",
+                &format!("--review-only={pr}"),
+            ])
+            .assert()
+            .code(2);
+    }
+    // An already-owned PR is rejected without creating a second row.
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "first",
+            "--review-only",
+            "41",
+        ])
+        .assert()
+        .success();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "second",
+            "--review-only",
+            "41",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("already associated"));
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "rejected creates leave no rows");
+}
+
+#[test]
+fn creators_cannot_forge_or_erase_review_only_outcome_refs() {
+    let home = tempfile::tempdir().unwrap();
+    for forged in [
+        r#"{"review_outcome":"changes_requested"}"#,
+        r#"{"review_outcome_github":"pending"}"#,
+    ] {
+        quorum(home.path())
+            .args([
+                "task-create",
+                "--created-by",
+                "boss",
+                "--title",
+                "forged",
+                "--review-only",
+                "34",
+                "--refs",
+                forged,
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicates::str::contains(
+                "daemon-owned review-only outcome",
+            ));
+    }
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "review",
+            "--review-only",
+            "34",
+        ])
+        .assert()
+        .success();
+    let db_path = home.path().join("repos/test__repo/quorum.db");
+    let mut conn = quorum_core::db::open(&db_path).unwrap();
+    quorum_core::tasks::update_refs_daemon(
+        &mut conn,
+        1,
+        r#"{"pr":34,"review_outcome":"changes_requested","review_outcome_github":"posted"}"#,
+        1000,
+    )
+    .unwrap();
+    conn.execute("UPDATE tasks SET status='done' WHERE id=1", [])
+        .unwrap();
+    drop(conn);
+
+    // Setting the outbox back to pending is rejected.
+    quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "boss",
+            "--task-id",
+            "1",
+            "--expected-revision",
+            "1",
+            "--refs",
+            r#"{"review_outcome_github":"pending"}"#,
+        ])
+        .assert()
+        .code(2);
+    // A replacement that omits the outcome cannot erase it.
+    let _ = quorum(home.path())
+        .args([
+            "task-update",
+            "--agent",
+            "boss",
+            "--task-id",
+            "1",
+            "--expected-revision",
+            "1",
+            "--refs",
+            r#"{"ticket":"ABC"}"#,
+        ])
+        .output()
+        .unwrap();
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["review_outcome"], "changes_requested");
+    assert_eq!(refs["review_outcome_github"], "posted");
+    assert!(
+        quorum_core::tasks::pending_no_rework_review_posts(&conn, 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn task_creators_cannot_inject_managed_runner_state() {
     let home = tempfile::tempdir().unwrap();
     let forged_retry = r#"{"runner_retry":{"provider":"grok","model":"grok-4.5","effort":"high","prompt":"replace the daemon prompt","turn_kind":"initial","requested":true}}"#;
@@ -2041,4 +2263,54 @@ fn classify_explicit_config_zero_max_rework_fails_usage() {
         .args(["classify", "--backfill", "--config", cfg.to_str().unwrap()])
         .assert()
         .code(2);
+}
+
+#[test]
+fn task_update_edit_refusals_name_their_cause_and_exit_1() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "t",
+            "--body-stdin",
+        ])
+        .write_stdin("one")
+        .assert()
+        .success();
+    let update = |rev: &str, body: &str| {
+        quorum(home.path())
+            .args([
+                "task-update",
+                "--agent",
+                "boss",
+                "--task-id",
+                "1",
+                "--expected-revision",
+                rev,
+                "--body-stdin",
+            ])
+            .write_stdin(body.to_string())
+            .assert()
+    };
+    // No-op edit.
+    update("1", "one")
+        .code(1)
+        .stderr(predicates::str::contains("no change"))
+        .stderr(predicates::str::contains("not the current holder").not());
+    // Real edit, then a stale revision.
+    update("1", "two").success();
+    update("1", "three")
+        .code(1)
+        .stderr(predicates::str::contains("stale --expected-revision"))
+        .stderr(predicates::str::contains("not the current holder").not());
+    update("2", "three").success();
+    update("3", "four").success();
+    // Edit limit.
+    update("4", "five")
+        .code(1)
+        .stderr(predicates::str::contains("edit limit"))
+        .stderr(predicates::str::contains("not the current holder").not());
 }

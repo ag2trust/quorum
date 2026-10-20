@@ -1686,7 +1686,10 @@ fn materialize_terminal_children_in_tx(
             ));
         }
         let done: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND status='done')",
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM tasks d WHERE d.id=?1 AND {})",
+                crate::tasks::DEP_SATISFIED_PREDICATE
+            ),
             [dependency],
             |r| r.get(0),
         )?;
@@ -3394,12 +3397,13 @@ fn complete_graph_if_final_child_with_explicit_recovery(
     Ok(true)
 }
 
-/// Fold a terminal generated-child park into its active graph aggregate.
+/// Fold a terminal generated-child hard failure into its active graph aggregate.
 ///
 /// Callers own the surrounding `BEGIN IMMEDIATE` transaction so the child
-/// park, graph blocker, event, and owner alert become visible together. A
+/// failure, graph blocker, event, and owner alert become visible together. A
 /// staged retry/remediation keeps the graph active because the failed child
-/// still has daemon-owned continuation authority.
+/// still has daemon-owned continuation authority, and a retryable daemon park
+/// keeps it active by owner policy (see `RETRYABLE_DAEMON_PARK_CHILD_SQL`).
 pub(crate) fn block_graph_if_child_failed(
     conn: &Connection,
     task_id: i64,
@@ -3411,15 +3415,24 @@ pub(crate) fn block_graph_if_child_failed(
             "embedded NUL in graph child failure reason".into(),
         ));
     }
+    // Owner policy: only a hard child failure holds the graph. A retryable
+    // daemon park (needs-info/blocked reaction, recovery budget, publication,
+    // dependency-base wait, ...) leaves the graph active so independent
+    // siblings keep dispatching; the parked child still keeps the graph from
+    // completing and still blocks its own dependents.
     let graph: Option<(i64, Option<String>)> = conn
         .query_row(
-            "SELECT d.id,child.refs
+            &format!(
+                "SELECT d.id,child.refs
              FROM task_graph_members m
              JOIN task_decompositions d ON d.id=m.graph_id
              JOIN tasks child ON child.id=m.task_id
              WHERE m.task_id=?1 AND m.active=1
                AND d.state='active' AND d.active=1
-               AND child.status='failed'",
+               AND child.status='failed'
+               AND NOT {}",
+                crate::tasks::RETRYABLE_DAEMON_PARK_CHILD_SQL
+            ),
             [task_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -4598,14 +4611,28 @@ mod tests {
                 .unwrap()
         }
 
+        /// A structured generated-child hold naming the parked original. Under
+        /// the current policy a retryable park no longer creates this hold, but
+        /// graphs held by earlier daemons (or by a hard failure) still carry it
+        /// and explicit recovery must keep resolving them.
         fn block_on_modern_generated_child_failure(&mut self) {
-            assert!(block_graph_if_child_failed(
-                &self.conn,
-                self.original,
-                "daemon-owned publication failed",
-                45,
-            )
-            .unwrap());
+            let summary = serde_json::json!({
+                "affected_task": self.original,
+                "reason": "daemon-owned publication failed",
+            })
+            .to_string();
+            assert_eq!(
+                self.conn
+                    .execute(
+                        "UPDATE task_decompositions
+                         SET state='blocked',hold_code='generated-child-failed',
+                             hold_summary=?2,updated_at=45
+                         WHERE id=?1 AND state='active' AND active=1",
+                        params![self.graph, summary],
+                    )
+                    .unwrap(),
+                1
+            );
         }
 
         fn make_legacy_prepublication_eligible(&mut self) {
@@ -7918,19 +7945,12 @@ mod tests {
         let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
             .unwrap()
             .unwrap();
-        let reason = "push rejected after protected-branch update";
+        let reason = "worker reported failed";
         let tx = begin_immediate(&mut conn).unwrap();
+        // A hard failure carries no retryable daemon-park marker.
         tx.execute(
-            "UPDATE tasks SET status='failed',refs=?2,updated_at=5 WHERE id=?1",
-            params![
-                ids[0],
-                serde_json::json!({
-                    "daemon_parked": true,
-                    "daemon_parked_reason": reason,
-                    "daemon_resume_status": "rework"
-                })
-                .to_string()
-            ],
+            "UPDATE tasks SET status='failed',refs='{}',updated_at=5 WHERE id=?1",
+            params![ids[0]],
         )
         .unwrap();
         assert!(block_graph_if_child_failed(&tx, ids[0], reason, 5).unwrap());
@@ -7976,6 +7996,195 @@ mod tests {
         assert_eq!(alert.2, format!("task:{}", ids[0]));
         assert!(alert.3.contains("task graph blocked"));
         assert!(alert.3.contains(reason));
+    }
+
+    fn graph_state_and_hold(conn: &Connection, graph: i64) -> (String, i64, Option<String>) {
+        conn.query_row(
+            "SELECT state,active,hold_code FROM task_decompositions WHERE id=?1",
+            [graph],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    fn implementation_ready_ids(conn: &Connection) -> Vec<i64> {
+        crate::tasks::list_implementation_ready_open(conn)
+            .unwrap()
+            .into_iter()
+            .map(|task| task.id)
+            .collect()
+    }
+
+    /// Owner policy: a retryable daemon park (needs-info/blocked reaction,
+    /// recovery budget, publication, ...) never holds its graph and never
+    /// withholds sibling dispatch. Its own dependents stay blocked.
+    #[test]
+    fn daemon_parked_child_keeps_graph_active_and_siblings_claimable() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[]), child("c", &["a"])],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        for reason in [
+            "needs-info",
+            "remediation reaped; recovery budget exhausted (3/3)",
+        ] {
+            crate::tasks::park(&mut conn, ids[0], reason, "open", 10)
+                .unwrap()
+                .expect("open child must park");
+            assert_eq!(
+                graph_state_and_hold(&conn, graph),
+                ("active".into(), 1, None),
+                "{reason}: a daemon park must not hold the graph"
+            );
+            let blocked_events: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM events WHERE kind='task_graph_blocked'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(blocked_events, 0, "{reason}");
+            let ready = implementation_ready_ids(&conn);
+            assert!(
+                ready.contains(&ids[1]),
+                "{reason}: sibling stays selectable"
+            );
+            assert!(
+                !ready.contains(&ids[2]),
+                "{reason}: the parked child's dependent stays blocked"
+            );
+            // Restore for the next reason.
+            assert!(
+                crate::tasks::retry_parked(&mut conn, ids[0], "owner", true, 11)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        crate::tasks::park(&mut conn, ids[0], "blocked", "open", 12)
+            .unwrap()
+            .expect("open child must park");
+        let claimed = crate::tasks::claim(&mut conn, "worker", Some(ids[1]), &[], 300, 13)
+            .unwrap()
+            .expect("the authoritative claim must admit the sibling of a parked child");
+        assert_eq!(claimed.status, "working");
+        assert!(
+            crate::tasks::claim(&mut conn, "worker-2", Some(ids[2]), &[], 300, 13)
+                .unwrap()
+                .is_none(),
+            "a dependent of the parked child must not be claimable"
+        );
+    }
+
+    /// Hard failures, and parks that `task-retry` cannot resume, still hold
+    /// the graph and withhold sibling dispatch in both selection and claim.
+    #[test]
+    fn hard_failed_or_terminal_parked_sibling_still_blocks_graph_dispatch() {
+        for (name, refs) in [
+            ("hard failure", serde_json::json!({})),
+            (
+                "park without resume status",
+                serde_json::json!({"daemon_parked": true}),
+            ),
+            (
+                "unsatisfiable dependency park",
+                serde_json::json!({
+                    "daemon_parked": true,
+                    "daemon_resume_status": "open",
+                    "daemon_parked_unsatisfiable": true
+                }),
+            ),
+            (
+                "merged-PR publication park",
+                serde_json::json!({
+                    "daemon_parked": true,
+                    "daemon_resume_status": "in-review",
+                    "daemon_publication_failure_kind": "pr-merged"
+                }),
+            ),
+        ] {
+            let mut conn = setup();
+            let graph = begin(&mut conn);
+            let ids =
+                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+                    .unwrap()
+                    .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='failed',refs=?2,updated_at=5 WHERE id=?1",
+                params![ids[0], refs.to_string()],
+            )
+            .unwrap();
+            // Even before (or without) the graph hold, the shared claim
+            // clause withholds the sibling.
+            assert!(!implementation_ready_ids(&conn).contains(&ids[1]), "{name}");
+            assert!(
+                crate::tasks::claim(&mut conn, "worker", Some(ids[1]), &[], 300, 6)
+                    .unwrap()
+                    .is_none(),
+                "{name}: claim must reject the sibling"
+            );
+            let tx = begin_immediate(&mut conn).unwrap();
+            assert!(
+                block_graph_if_child_failed(&tx, ids[0], name, 7).unwrap(),
+                "{name}: hard failure must hold the graph"
+            );
+            tx.commit().unwrap();
+            assert_eq!(
+                graph_state_and_hold(&conn, graph),
+                ("blocked".into(), 1, Some("generated-child-failed".into())),
+                "{name}"
+            );
+        }
+    }
+
+    /// A parked child keeps the graph from completing even after every other
+    /// child merges; retrying and finishing the parked child completes it.
+    #[test]
+    fn graph_does_not_complete_while_a_parked_child_is_unresolved() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        crate::tasks::park(&mut conn, ids[0], "needs-info", "open", 5)
+            .unwrap()
+            .expect("child must park");
+        assert!(crate::tasks::close_after_merge(&mut conn, ids[1], "merged", 6).unwrap());
+        let state: (String, i64, String) = conn
+            .query_row(
+                "SELECT d.state,d.active,t.status FROM task_decompositions d
+                 JOIN tasks t ON t.id=d.source_task_id WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("active".into(), 1, "decomposed".into()));
+
+        let retried = crate::tasks::retry_parked(&mut conn, ids[0], "owner", true, 7)
+            .unwrap()
+            .expect("the parked child must resume under an active graph");
+        assert_eq!(retried.status, "open");
+        assert!(
+            crate::tasks::claim(&mut conn, "worker", Some(ids[0]), &[], 300, 8)
+                .unwrap()
+                .is_some()
+        );
+        assert!(crate::tasks::close_after_merge(&mut conn, ids[0], "merged", 9).unwrap());
+        let completed: (String, i64, String) = conn
+            .query_row(
+                "SELECT d.state,d.active,t.status FROM task_decompositions d
+                 JOIN tasks t ON t.id=d.source_task_id WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(completed, ("completed".into(), 0, "done".into()));
     }
 
     #[test]

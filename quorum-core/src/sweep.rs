@@ -694,8 +694,9 @@ fn delete_reclaimable_tasks_unbounded(conn: &Connection, now: i64) -> Result<()>
     Ok(())
 }
 
-/// Park unleased open or rework tasks whose dependencies cannot currently be satisfied: every
-/// dep is terminal (done/failed/cancelled) but at least one is failed or cancelled. They stay
+/// Park unleased open or rework tasks whose dependencies cannot currently be satisfied: any dep
+/// is cancelled (never reactivated, so parked immediately), or every dep is terminal
+/// (done/failed/cancelled) with at least one genuinely failed. They stay
 /// excluded from provisioning until an explicit retry, without losing their dependency context.
 pub fn cascade_dead_deps(conn: &Connection, now: i64, limit: usize) -> Result<usize> {
     // sweep_on_write and sweep_all already call us inside their write
@@ -741,32 +742,39 @@ fn cascade_dead_deps_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
                    SELECT 1 FROM claims c
                    WHERE c.target = 'task#' || t.id AND c.active=1 AND c.expires_at > ?1
                )
-               -- every dep is terminal …
-               AND NOT EXISTS (
-                   SELECT 1 FROM json_each(t.depends_on) j2
-                   LEFT JOIN tasks d ON d.id = j2.value
-                   WHERE d.status NOT IN ('done','failed','cancelled')
-                      OR (
-                          d.status='failed'
-                          AND json_valid(COALESCE(d.refs, '{}'))
-                          AND json_extract(d.refs, '$.daemon_parked')=1
-                          AND json_extract(d.refs, '$.daemon_resume_status') IS NOT NULL
-                      )
-                      OR d.id IS NULL
-               )
-               -- … and at least one dep is NOT done
-               AND EXISTS (
-                   SELECT 1 FROM json_each(t.depends_on) j3
-                   JOIN tasks d ON d.id = j3.value
-                   WHERE d.status IN ('cancelled')
-                      OR (
-                          d.status='failed'
-                          AND NOT (
-                              json_valid(COALESCE(d.refs, '{}'))
-                              AND json_extract(d.refs, '$.daemon_parked')=1
-                              AND json_extract(d.refs, '$.daemon_resume_status') IS NOT NULL
-                          )
-                      )
+               AND (
+                   -- a cancelled dep is never reactivated, so the dependent is
+                   -- unsatisfiable immediately, whatever the other deps are doing …
+                   EXISTS (
+                       SELECT 1 FROM json_each(t.depends_on) j3
+                       JOIN tasks d ON d.id = j3.value
+                       WHERE d.status = 'cancelled'
+                   )
+                   -- … while a failed dep only parks once every dep is terminal
+                   OR (
+                       NOT EXISTS (
+                           SELECT 1 FROM json_each(t.depends_on) j2
+                           LEFT JOIN tasks d ON d.id = j2.value
+                           WHERE d.status NOT IN ('done','failed','cancelled')
+                              OR (
+                                  d.status='failed'
+                                  AND json_valid(COALESCE(d.refs, '{}'))
+                                  AND json_extract(d.refs, '$.daemon_parked')=1
+                                  AND json_extract(d.refs, '$.daemon_resume_status') IS NOT NULL
+                              )
+                              OR d.id IS NULL
+                       )
+                       AND EXISTS (
+                           SELECT 1 FROM json_each(t.depends_on) j4
+                           JOIN tasks d ON d.id = j4.value
+                           WHERE d.status='failed'
+                             AND NOT (
+                                 json_valid(COALESCE(d.refs, '{}'))
+                                 AND json_extract(d.refs, '$.daemon_parked')=1
+                                 AND json_extract(d.refs, '$.daemon_resume_status') IS NOT NULL
+                             )
+                       )
+                   )
                )
              LIMIT ?2",
         )?;
@@ -2050,8 +2058,11 @@ mod tests {
         (graph, child, dependency)
     }
 
+    /// Owner policy: a dependency park is a retryable daemon park, so it no
+    /// longer holds the graph. The parked child still keeps the graph from
+    /// completing; independent siblings keep dispatching.
     #[test]
-    fn dependency_park_blocks_active_generated_child_graph_in_same_transaction() {
+    fn dependency_park_keeps_active_generated_child_graph_active() {
         let (_d, mut c) = open_tmp();
         let (graph, child, dependency) = active_graph_with_dependency_park_child(&mut c, None);
         c.execute(
@@ -2062,42 +2073,32 @@ mod tests {
 
         assert_eq!(cascade_dead_deps(&c, 300, SWEEP_LIMIT).unwrap(), 1);
 
-        let reason = format!("dependency #{dependency} is terminal-not-done");
-        let aggregate: (String, String, String, i64) = c
+        let parked: (String, i64) = c
             .query_row(
-                "SELECT state,hold_code,hold_summary,updated_at
-                 FROM task_decompositions WHERE id=?1",
-                [graph],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                "SELECT status,json_extract(refs,'$.daemon_parked') FROM tasks WHERE id=?1",
+                [child],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(aggregate.0, "blocked");
-        assert_eq!(aggregate.1, "generated-child-failed");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&aggregate.2).unwrap(),
-            serde_json::json!({"affected_task": child, "reason": reason})
-        );
-        assert_eq!(aggregate.3, 300);
-        let event: (String, String, String) = c
+        assert_eq!(parked, ("failed".into(), 1));
+        let aggregate: (String, Option<String>, Option<String>) = c
             .query_row(
-                "SELECT kind,subject,body FROM events WHERE kind='task_graph_blocked'",
-                [],
+                "SELECT state,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
+                [graph],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(event.0, "task_graph_blocked");
-        assert_eq!(event.1, format!("task#{child}"));
-        assert!(event.2.contains(&reason));
-        let graph_alerts: i64 = c
+        assert_eq!(aggregate, ("active".into(), None, None));
+        let side_effects: (i64, i64) = c
             .query_row(
-                "SELECT count(*) FROM messages
-                 WHERE author='daemon' AND kind='alert' AND recipient='owner'
-                   AND refs=?1 AND body LIKE '%task graph blocked%'",
-                [format!("task:{child}")],
-                |row| row.get(0),
+                "SELECT (SELECT count(*) FROM events WHERE kind='task_graph_blocked'),
+                        (SELECT count(*) FROM messages
+                         WHERE kind='alert' AND body LIKE '%task graph blocked%')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(graph_alerts, 1);
+        assert_eq!(side_effects, (0, 0));
     }
 
     #[test]
@@ -2302,7 +2303,7 @@ mod tests {
     }
 
     #[test]
-    fn cascade_handles_mixed_deps_one_cancelled_one_still_working() {
+    fn cascade_parks_immediately_when_one_dep_cancelled_and_another_still_working() {
         let (_d, mut c) = open_tmp();
         let dep1 =
             crate::tasks::create(&mut c, "boss", "dep1", None, 0, None, None, None, None, 100)
@@ -2310,7 +2311,7 @@ mod tests {
         let dep2 =
             crate::tasks::create(&mut c, "boss", "dep2", None, 0, None, None, None, None, 100)
                 .unwrap();
-        let _child = crate::tasks::create(
+        let child = crate::tasks::create(
             &mut c,
             "boss",
             "child",
@@ -2323,7 +2324,6 @@ mod tests {
             100,
         )
         .unwrap();
-        // dep1 cancelled, dep2 still working.
         c.execute(
             "UPDATE tasks SET status='cancelled', updated_at=200 WHERE id=?1",
             params![dep1],
@@ -2335,7 +2335,58 @@ mod tests {
         )
         .unwrap();
         let n = cascade_dead_deps(&c, 300, 100).unwrap();
-        assert_eq!(n, 0, "should not cascade when a dep is still non-terminal");
+        assert_eq!(
+            n, 1,
+            "cancelled dep is unsatisfiable even with a live sibling dep"
+        );
+        let t = crate::tasks::get(&c, child).unwrap().unwrap();
+        assert_eq!(t.status, "failed");
+        let refs: serde_json::Value = serde_json::from_str(t.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_parked_unsatisfiable"], true);
+        assert!(refs["daemon_parked_reason"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("#{dep1} is cancelled")));
+    }
+
+    #[test]
+    fn cascade_does_not_park_failed_dep_while_sibling_dep_still_working() {
+        let (_d, mut c) = open_tmp();
+        let dep1 =
+            crate::tasks::create(&mut c, "boss", "dep1", None, 0, None, None, None, None, 100)
+                .unwrap();
+        let dep2 =
+            crate::tasks::create(&mut c, "boss", "dep2", None, 0, None, None, None, None, 100)
+                .unwrap();
+        let child = crate::tasks::create(
+            &mut c,
+            "boss",
+            "child",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{dep1},{dep2}]")),
+            None,
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed', updated_at=200 WHERE id=?1",
+            params![dep1],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='working', updated_at=200 WHERE id=?1",
+            params![dep2],
+        )
+        .unwrap();
+        let n = cascade_dead_deps(&c, 300, 100).unwrap();
+        assert_eq!(n, 0, "retryable failed dep must wait for live siblings");
+        assert_eq!(
+            crate::tasks::get(&c, child).unwrap().unwrap().status,
+            "open"
+        );
     }
 
     #[test]

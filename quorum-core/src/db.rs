@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 79;
+pub const SCHEMA_VERSION: i64 = 80;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1556,6 +1556,15 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                      ON agent_runs(failed_agent_run_id)",
             )?;
         }
+        // v80 adds the owner-selected review-only/no-rework mode. Additive: every
+        // historical row keeps `0`, so existing `--review-pr` tasks retain their
+        // review + remediation lifecycle.
+        if current < 80 && !column_exists(conn, "tasks", "no_rework")? {
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN no_rework INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1758,6 +1767,53 @@ mod tests {
         ] {
             assert!(column_exists(&reopened, "decomposition_attempts", column).unwrap());
         }
+    }
+
+    /// A v79 database predates the review-only/no-rework mode. Upgrading adds
+    /// `tasks.no_rework` with a zero default for existing rows (so historical
+    /// `--review-pr` tasks keep remediation), and a second open is a no-op.
+    #[test]
+    fn v79_to_v80_adds_no_rework_column_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v79-no-rework.db");
+        {
+            let raw = Connection::open(&path).unwrap();
+            apply_pragmas(&raw).unwrap();
+            migrate(&raw).unwrap();
+            raw.execute_batch(
+                "INSERT INTO tasks(title, status, created_by, created_at, updated_at, review_only)
+                     VALUES ('legacy review', 'in-review', 'owner', 1, 1, 1);
+                 ALTER TABLE tasks DROP COLUMN no_rework;
+                 PRAGMA user_version=79;",
+            )
+            .unwrap();
+            assert!(!column_exists(&raw, "tasks", "no_rework").unwrap());
+        }
+        let migrated = open(&path).unwrap();
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert!(column_exists(&migrated, "tasks", "no_rework").unwrap());
+        let (review_only, no_rework): (i64, i64) = migrated
+            .query_row(
+                "SELECT review_only, no_rework FROM tasks WHERE title='legacy review'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((review_only, no_rework), (1, 0));
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        assert!(column_exists(&reopened, "tasks", "no_rework").unwrap());
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
     }
 
     /// A v73 database (schema fixed at `PRAGMA user_version=73` before v74's

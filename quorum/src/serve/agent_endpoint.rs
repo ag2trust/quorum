@@ -75,6 +75,9 @@ enum Operation {
     },
     React {
         state: String,
+        /// Required for `blocked` / `needs-info`; absent from older clients.
+        #[serde(default)]
+        reason: Option<String>,
     },
     /// Planner-only plan delivery. Authority comes from a `planner` run
     /// capability; every other operation rejects that role, and this one
@@ -683,7 +686,7 @@ fn process_request_blocking(
             )?;
             Response::success(ResponseResult::Mailbox { mailbox_id })
         }
-        Operation::React { state } => {
+        Operation::React { state, reason } => {
             let context = resolve(&tx, &request.capability, "worker")?;
             if !matches!(state.as_str(), "blocked" | "failed" | "needs-info" | "note") {
                 return Err(EndpointFailure::new(
@@ -691,13 +694,20 @@ fn process_request_blocking(
                     "invalid reaction state",
                 ));
             }
+            let reason = quorum_core::tasks::validate_react_reason(&state, reason.as_deref())
+                .map_err(|_| {
+                    EndpointFailure::new(
+                        "invalid_operation",
+                        "react requires a non-empty reason (max 8192 bytes, no NUL) for blocked/needs-info",
+                    )
+                })?;
             let mailbox_id = insert_mailbox(
                 &tx,
                 &context,
                 "task_update",
                 None,
                 None,
-                None,
+                reason.as_deref(),
                 Some(&state),
                 None,
             )?;
@@ -1638,6 +1648,7 @@ mod tests {
             },
             Operation::React {
                 state: "blocked".into(),
+                reason: Some("planner should not react".into()),
             },
             Operation::AppendNote {
                 task_id: 1,

@@ -837,6 +837,40 @@ fn create_session_dir(log_dir: &Path, agent: &str, start_time: i64) -> io::Resul
     }
 }
 
+/// Find the most recent session directory (`<agent>-<start>[-<nonce>]`) for `agent`
+/// under `log_dir`. Returns `Ok(None)` when the log dir is missing or holds none.
+pub fn latest_session_dir(log_dir: &Path, agent: &str) -> io::Result<Option<PathBuf>> {
+    let entries = match fs::read_dir(log_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let prefix = format!("{agent}-");
+    let mut best: Option<((i64, u64), PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let (start, nonce) = match rest.split_once('-') {
+            Some((a, b)) => (a, b),
+            None => (rest, "0"),
+        };
+        // Strict suffix shape keeps agent "w" from matching agent "w-2"'s dirs.
+        let (Ok(start), Ok(nonce)) = (start.parse::<i64>(), nonce.parse::<u64>()) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(k, _)| (start, nonce) > *k) {
+            best = Some(((start, nonce), path));
+        }
+    }
+    Ok(best.map(|(_, p)| p))
+}
+
 /// Delete session log directories older than `max_age_secs`.
 pub fn sweep_logs(log_dir: &Path, max_age_secs: u64) -> io::Result<u64> {
     let mut removed = 0u64;

@@ -1315,6 +1315,19 @@ pub struct BannerData<'a> {
 }
 
 /// Format the startup banner showing resolved config + sources.
+/// Idle limit as the runtime resolves it (serve/mod.rs): `max_idle_secs`, then
+/// the legacy `idle_timeout_secs`, then 900. Returns the value and its origin.
+fn effective_idle_limit(
+    max_idle_secs: Option<u64>,
+    idle_timeout_secs: Option<u64>,
+) -> (u64, &'static str) {
+    match (max_idle_secs, idle_timeout_secs) {
+        (Some(v), _) => (v, "max_idle_secs"),
+        (None, Some(v)) => (v, "idle_timeout_secs"),
+        (None, None) => (900, "default"),
+    }
+}
+
 pub fn banner(d: &BannerData<'_>) -> String {
     let mut lines = Vec::new();
     lines.push("─── resolved serve config ───".to_string());
@@ -1397,9 +1410,14 @@ pub fn banner(d: &BannerData<'_>) -> String {
     lines.push(format!(
         "  idle_timeout_secs:         {}",
         match d.idle_timeout_secs.value {
-            Some(v) => format!("{v} ({src})", src = d.idle_timeout_secs.source),
-            None => format!("300 ({src}, default)", src = d.idle_timeout_secs.source),
+            Some(v) => format!("{v} ({src}, legacy)", src = d.idle_timeout_secs.source),
+            None => format!("unset ({src}, legacy)", src = d.idle_timeout_secs.source),
         }
+    ));
+    let (effective_idle, effective_origin) =
+        effective_idle_limit(d.max_idle_secs.value, d.idle_timeout_secs.value);
+    lines.push(format!(
+        "  effective idle limit:      {effective_idle} ({effective_origin}; max_idle_secs overrides idle_timeout_secs, default 900)"
     ));
     lines.push(format!(
         "  max_turn_tokens:           {}",
@@ -2674,6 +2692,19 @@ worktree_base = "/tmp/wt"
     }
 
     #[test]
+    fn effective_idle_limit_prefers_max_idle_then_legacy_then_900() {
+        assert_eq!(
+            effective_idle_limit(Some(60), Some(300)),
+            (60, "max_idle_secs")
+        );
+        assert_eq!(
+            effective_idle_limit(None, Some(300)),
+            (300, "idle_timeout_secs")
+        );
+        assert_eq!(effective_idle_limit(None, None), (900, "default"));
+    }
+
+    #[test]
     fn banner_shows_config_path() {
         let routing_cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
         let token_limit_basis = Sourced {
@@ -2821,5 +2852,14 @@ worktree_base = "/tmp/wt"
             "max_busy_idle_secs should default to 3600: {b}"
         );
         assert!(b.contains("(default)"), "defaults should be labeled: {b}");
+        assert!(
+            b.contains("idle_timeout_secs:         unset (default, legacy)"),
+            "unset legacy idle timeout must not claim a 300s default: {b}"
+        );
+        assert!(!b.contains("300 (default, default)"), "{b}");
+        assert!(
+            b.contains("effective idle limit:      900 (default; max_idle_secs overrides"),
+            "effective idle limit should be 900 by default: {b}"
+        );
     }
 }

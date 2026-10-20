@@ -97,6 +97,22 @@ pub fn clear_for_task(conn: &mut Connection, task_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Lifetime cap on reviewer runs per task; at the cap the daemon parks the task
+/// instead of spawning another reviewer.
+pub const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
+/// Consecutive reviewer provision failures at one head SHA before the daemon stops retrying.
+pub const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
+
+/// Highest recorded provision-attempt count for a task (any PR/role). Used by
+/// read-only status to explain a task that has no live reviewer.
+pub fn max_attempts_for_task(conn: &Connection, task_id: i64) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(attempts), 0) FROM reviewer_provision_attempts WHERE task_id = ?1",
+        params![task_id],
+        |r| r.get(0),
+    )?)
+}
+
 /// Count total reviewer agent_runs for a task.
 pub fn total_reviewer_runs(conn: &Connection, task_id: i64) -> Result<i64> {
     let count: i64 = conn.query_row(

@@ -843,7 +843,8 @@ fn task_retry_reopens_live_provisioning_poison_budget_once() {
         &git_shim,
         format!(
             "#!/bin/sh\n\
-             if [ \"$1\" = -C ] && [ \"$3\" = worktree ] && [ \"$4\" = add ] && [ ! -f '{}' ]; then\n\
+             case \" $* \" in *\" worktree add \"*) is_add=1;; *) is_add=0;; esac\n\
+             if [ \"$is_add\" = 1 ] && [ ! -f '{}' ]; then\n\
                echo 'intentional worktree provisioning failure' >&2\n\
                exit 1\n\
              fi\n\

@@ -46,6 +46,8 @@ enum Operation<'a> {
     },
     React {
         state: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<&'a str>,
     },
     SubmitPlan {
         response: &'a serde_json::Value,
@@ -107,8 +109,8 @@ pub fn submit(request: Submit<'_>) -> Result<i64> {
     )?)
 }
 
-pub fn react(capability: &str, state: &str) -> Result<i64> {
-    mailbox_id(exchange(capability, Operation::React { state })?)
+pub fn react(capability: &str, state: &str, reason: Option<&str>) -> Result<i64> {
+    mailbox_id(exchange(capability, Operation::React { state, reason })?)
 }
 
 /// Outcome of one planner plan submission.
