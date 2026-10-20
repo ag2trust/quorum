@@ -6171,6 +6171,7 @@ fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>>
     // decomposable candidates starve behind it.
     let branch_sync_ref_present =
         quorum_core::tasks::BRANCH_SYNC_REF_PRESENT_SQL.replace("refs", "t.refs");
+    let dep_satisfied = quorum_core::tasks::DEP_SATISFIED_PREDICATE;
     Ok(conn
         .query_row(
             &format!(
@@ -6196,8 +6197,8 @@ fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>>
            AND NOT EXISTS (SELECT 1 FROM task_graph_members m WHERE m.task_id=t.id)
            AND (t.depends_on IS NULL OR NOT EXISTS (
                SELECT 1 FROM json_each(t.depends_on) dep
-               WHERE NOT EXISTS (SELECT 1 FROM tasks prerequisite
-                                 WHERE prerequisite.id=dep.value AND prerequisite.status='done')
+               WHERE NOT EXISTS (SELECT 1 FROM tasks d
+                                 WHERE d.id=dep.value AND {dep_satisfied})
            ))
          ORDER BY t.priority DESC,t.id ASC LIMIT 1"
             ),
@@ -9636,11 +9637,12 @@ async fn handle_pre_review_checks_failure(
          Fix the failing checks, commit, and submit the existing PR again without pushing."
     );
 
-    let review_only = {
+    let (review_only, no_rework) = {
         let path = config.db_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<bool> {
+        tokio::task::spawn_blocking(move || -> Result<(bool, bool)> {
             let conn = quorum_core::db::open(&path)?;
-            Ok(tasks::get(&conn, task_id)?.is_some_and(|task| task.review_only))
+            Ok(tasks::get(&conn, task_id)?
+                .map_or((false, false), |task| (task.review_only, task.no_rework)))
         })
         .await
         .map_err(|error| {
@@ -9649,15 +9651,24 @@ async fn handle_pre_review_checks_failure(
             ))
         })??
     };
-    if review_only {
+    if review_only && !no_rework {
         // `park_task_result` emits the sole terminal park log after the transition.
         park_task_result(&config.db_path, task_id, &feedback, "in-review").await?;
         return Ok(());
     }
 
-    log(&format!(
-        "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} failed ({names}) — entering rework without spawning a reviewer"
-    ));
+    if no_rework {
+        // `--review-only`: the ChecksFailed transition closes the task as
+        // `done` with refs.review_outcome=ci_failed; no remediation follows.
+        log(&format!(
+            "PRE-REVIEW CI GATE: review-only task #{task_id} PR #{pr} failed ({names}) — \
+             closing without rework"
+        ));
+    } else {
+        log(&format!(
+            "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} failed ({names}) — entering rework without spawning a reviewer"
+        ));
+    }
 
     let transition = {
         let p = config.db_path.clone();
@@ -9793,10 +9804,19 @@ async fn handle_pre_review_checks_failure(
                 ));
             }
         }
-        Some(_) => {
+        Some(ref result) => {
+            log_no_rework_close(&result.task);
             if let Some(worker_index) = workers.iter().position(|w| w.task_id == task_id) {
                 let worker = workers.remove(worker_index);
-                cleanup_slot(config, wt_mgr, name_pool, worker, None, "rework_cap").await;
+                cleanup_slot(
+                    config,
+                    wt_mgr,
+                    name_pool,
+                    worker,
+                    None,
+                    terminal_rework_slot_reason(&result.task),
+                )
+                .await;
             }
         }
         None => {
@@ -13114,13 +13134,13 @@ async fn tick(
                         // only decides whether to feed the original worker or provision
                         // a remediation worker; an implementation task does not become
                         // review-only merely because its worker exited after submit.
-                        let review_only = {
+                        let (review_only, no_rework) = {
                             let p = db_path.clone();
                             let tid = reviewer_task_id;
-                            tokio::task::spawn_blocking(move || -> Result<bool> {
+                            tokio::task::spawn_blocking(move || -> Result<(bool, bool)> {
                                 let conn = quorum_core::db::open(&p)?;
                                 tasks::get(&conn, tid)?
-                                    .map(|task| task.review_only)
+                                    .map(|task| (task.review_only, task.no_rework))
                                     .ok_or_else(|| {
                                         QuorumError::Io(format!(
                                             "task #{tid} disappeared during merge conflict"
@@ -13135,7 +13155,10 @@ async fn tick(
                             })??
                         };
 
-                        if review_only {
+                        // `--review-only` (no_rework) is not parked: the
+                        // MergeConflict below closes it as `done` with
+                        // refs.review_outcome=merge_conflict, never rework.
+                        if review_only && !no_rework {
                             // Review-only: the external author owns rebasing. Fire MergeFailed
                             // (merging → in-review) and park as merge-blocked;
                             // orphan handler retries when PR becomes MERGEABLE.
@@ -13309,7 +13332,8 @@ async fn tick(
                                         }
                                     }
                                 }
-                                Some(_) => {
+                                Some(ref closed) => {
+                                    log_no_rework_close(&closed.task);
                                     // Rework cap exceeded → failed. Clean up.
                                     let r = reviewers.remove(ri);
                                     teardown_reviewer_after_recorded_outcome(
@@ -13330,7 +13354,7 @@ async fn tick(
                                             name_pool,
                                             w,
                                             None,
-                                            "rework_cap",
+                                            terminal_rework_slot_reason(&closed.task),
                                         )
                                         .await;
                                     }
@@ -13460,17 +13484,27 @@ async fn tick(
                                 },
                             )
                             .await;
-                            // in-review → rework (lifecycle checks rework cap)
+                            // in-review → rework (lifecycle checks rework cap).
+                            // A `--review-only` task records the CI outcome
+                            // instead and closes as done (never rework).
                             let reviewer_name = reviewers[ri].agent_name.clone();
                             let rework_msg = format!(
                                 "CI checks failed for PR #{pr_num}: {names}\n\n\
                                  Fix the failing checks, commit, and submit again without pushing.",
                             );
+                            let actionable_event =
+                                if task_is_no_rework(&db_path, reviewer_task_id).await {
+                                    Event::ChecksFailed {
+                                        checks: failing_checks.clone(),
+                                    }
+                                } else {
+                                    Event::VerdictChanges
+                                };
                             let vc = fire_actionable_rework_event(
                                 &db_path,
                                 &reviewer_name,
                                 reviewer_task_id,
-                                &Event::VerdictChanges,
+                                &actionable_event,
                                 &rework_msg,
                             )
                             .await;
@@ -13594,7 +13628,8 @@ async fn tick(
                                         }
                                     }
                                 }
-                                Some(_) => {
+                                Some(ref closed) => {
+                                    log_no_rework_close(&closed.task);
                                     // Rework cap exceeded → failed. Clean up.
                                     let r = reviewers.remove(ri);
                                     teardown_reviewer_after_recorded_outcome(
@@ -13615,7 +13650,7 @@ async fn tick(
                                             name_pool,
                                             w,
                                             None,
-                                            "rework_cap",
+                                            terminal_rework_slot_reason(&closed.task),
                                         )
                                         .await;
                                     }
@@ -13813,7 +13848,8 @@ async fn tick(
                                             }
                                         }
                                     }
-                                    Some(_) => {
+                                    Some(ref closed) => {
+                                        log_no_rework_close(&closed.task);
                                         let r = reviewers.remove(ri);
                                         teardown_reviewer_after_recorded_outcome(
                                             config,
@@ -13834,7 +13870,7 @@ async fn tick(
                                                 name_pool,
                                                 w,
                                                 None,
-                                                "rework_cap",
+                                                terminal_rework_slot_reason(&closed.task),
                                             )
                                             .await;
                                         }
@@ -14156,7 +14192,8 @@ async fn tick(
                                         }
                                     }
                                 }
-                                Some(_) => {
+                                Some(ref closed) => {
+                                    log_no_rework_close(&closed.task);
                                     let r = reviewers.remove(ri);
                                     teardown_reviewer_after_recorded_outcome(
                                         config,
@@ -14176,7 +14213,7 @@ async fn tick(
                                             name_pool,
                                             w,
                                             None,
-                                            "rework_cap",
+                                            terminal_rework_slot_reason(&closed.task),
                                         )
                                         .await;
                                     }
@@ -14720,7 +14757,8 @@ async fn tick(
                                                 }
                                             }
                                         }
-                                        Some(_) => {
+                                        Some(ref closed) => {
+                                            log_no_rework_close(&closed.task);
                                             // Rework cap exceeded → failed. Clean up.
                                             let r = reviewers.remove(ri);
                                             teardown_reviewer_after_recorded_outcome(
@@ -14742,7 +14780,7 @@ async fn tick(
                                                     name_pool,
                                                     w,
                                                     None,
-                                                    "rework_cap",
+                                                    terminal_rework_slot_reason(&closed.task),
                                                 )
                                                 .await;
                                             }
@@ -14848,7 +14886,8 @@ async fn tick(
                         let executor = Arc::clone(&config.merge_executor);
                         let feedback_for_gh = feedback_owned.clone();
                         tokio::task::spawn_blocking(move || {
-                            executor.ensure_changes_requested(pr_num, &repo, &feedback_for_gh);
+                            let _ =
+                                executor.ensure_changes_requested(pr_num, &repo, &feedback_for_gh);
                         })
                         .await
                         .ok();
@@ -14988,7 +15027,8 @@ async fn tick(
                                 }
                             }
                         }
-                        Some(_) => {
+                        Some(ref closed) => {
+                            log_no_rework_close(&closed.task);
                             // Rework cap exceeded → failed. Clean up both.
                             let r = reviewers.remove(ri);
                             teardown_reviewer_after_recorded_outcome(
@@ -15003,8 +15043,15 @@ async fn tick(
                                 workers.iter().position(|w| w.task_id == reviewer_task_id)
                             {
                                 let w = workers.remove(wi);
-                                cleanup_slot(config, wt_mgr, name_pool, w, None, "rework_cap")
-                                    .await;
+                                cleanup_slot(
+                                    config,
+                                    wt_mgr,
+                                    name_pool,
+                                    w,
+                                    None,
+                                    terminal_rework_slot_reason(&closed.task),
+                                )
+                                .await;
                             }
                         }
                         None => {
@@ -16692,6 +16739,14 @@ async fn tick(
     // return to in-review and request only its first missing role in the same
     // tick. A valid replay never allocates a reviewer or worker.
     reconcile_merge_retries(config, wt_mgr, drain_state.draining).await?;
+
+    // ── Phase 4f: GitHub REQUEST_CHANGES outbox for review-only closes ──
+    // `task-create --review-only` tasks close as `done` in the lifecycle
+    // transaction; the formal review is a network call, so it is reconciled
+    // here from the durable outbox, outside any DB transaction.
+    if !drain_state.draining {
+        reconcile_no_rework_review_posts(config).await?;
+    }
 
     // ── Phase 5: Spawn reviewers for workers with PRs ──────────────────
     // Each worker that has a PR and no paired reviewer (and is not draining)
@@ -24702,6 +24757,117 @@ async fn fire_event(
     fire_event_result(db_path, agent, task_id, event).await.ok()
 }
 
+/// Bounded per-tick batch for the review-only REQUEST_CHANGES outbox.
+const NO_REWORK_REVIEW_POSTS_PER_TICK: i64 = 8;
+
+/// Ensure the daemon-owned GitHub REQUEST_CHANGES review exists for each
+/// closed `--review-only` task whose outbox entry is pending. The GitHub call
+/// runs outside any DB transaction; a confirmed review consumes the entry,
+/// and a failed one is retried on later ticks up to a bounded attempt count.
+async fn reconcile_no_rework_review_posts(config: &ServeConfig) -> Result<()> {
+    let posts = {
+        let p = config.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<tasks::NoReworkReviewPost>> {
+            let conn = quorum_core::db::open(&p)?;
+            tasks::pending_no_rework_review_posts(&conn, NO_REWORK_REVIEW_POSTS_PER_TICK)
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("review-only outbox read join: {error}")))??
+    };
+    for post in posts {
+        let ensured = {
+            let repo = config.repo_dir.clone();
+            let executor = Arc::clone(&config.merge_executor);
+            let body = post.body.clone();
+            let pr = post.pr;
+            tokio::task::spawn_blocking(move || executor.ensure_changes_requested(pr, &repo, &body))
+                .await
+                .map_err(|error| {
+                    QuorumError::Io(format!("review-only REQUEST_CHANGES join: {error}"))
+                })?
+        };
+        let p = config.db_path.clone();
+        let task_id = post.task_id;
+        let disposition = tokio::task::spawn_blocking(move || -> Result<&'static str> {
+            let mut conn = quorum_core::db::open(&p)?;
+            if ensured {
+                Ok(
+                    if tasks::mark_no_rework_review_posted(&mut conn, task_id, now_unix())? {
+                        "posted"
+                    } else {
+                        "already-consumed"
+                    },
+                )
+            } else {
+                tasks::record_no_rework_review_post_failure(&mut conn, task_id, now_unix())
+            }
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("review-only outbox write join: {error}")))??;
+        match disposition {
+            "posted" => log(&format!(
+                "review-only task #{task_id}: ensured GitHub REQUEST_CHANGES review on PR #{}",
+                post.pr
+            )),
+            "failed" => log(&format!(
+                "ERROR: review-only task #{task_id}: could not post GitHub REQUEST_CHANGES \
+                 review on PR #{} — attempts exhausted; findings remain in the task note",
+                post.pr
+            )),
+            "retry" => log(&format!(
+                "review-only task #{task_id}: GitHub REQUEST_CHANGES review on PR #{} \
+                 not confirmed — will retry",
+                post.pr
+            )),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Whether the task is `--review-only` (no_rework). A failed lookup answers
+/// `false`: the lifecycle still closes a no-rework task on any actionable
+/// event, so this only selects the more precise outcome label.
+async fn task_is_no_rework(db_path: &Path, task_id: i64) -> bool {
+    let p = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let conn = quorum_core::db::open(&p)?;
+        Ok(tasks::get(&conn, task_id)?.is_some_and(|task| task.no_rework))
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or(false)
+}
+
+/// Log a review-only/no-rework close observed by an actionable-rework site.
+/// The lifecycle already recorded the durable outcome, findings note, owner
+/// alert, and REQUEST_CHANGES outbox entry in the same transaction.
+fn log_no_rework_close(task: &tasks::Task) {
+    if task.no_rework && task.status == "done" {
+        let outcome = task
+            .refs
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|refs| refs[tasks::REVIEW_OUTCOME_REF].as_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown".into());
+        log(&format!(
+            "review-only task #{}: closed as done ({outcome}) without rework — \
+             no remediation worker",
+            task.id
+        ));
+    }
+}
+
+/// Slot-cleanup reason for a terminal actionable-rework outcome.
+fn terminal_rework_slot_reason(task: &tasks::Task) -> &'static str {
+    if task.no_rework && task.status == "done" {
+        "review_only_closed"
+    } else {
+        "rework_cap"
+    }
+}
+
 async fn fire_actionable_rework_event(
     db_path: &std::path::Path,
     agent: &str,
@@ -28184,10 +28350,10 @@ async fn spawn_remediation_worker(
         effective_task_base_branch(db_path, task_id, &config.base_branch).await?;
 
     // Fetch task body + author for context and branch resolution.
-    let (task_body, task_author, task_review_only) = {
+    let (task_body, task_author, task_review_only, task_no_rework) = {
         let p = db_path.clone();
         let tid = task_id;
-        tokio::task::spawn_blocking(move || -> (String, String, bool) {
+        tokio::task::spawn_blocking(move || -> (String, String, bool, bool) {
             let conn = quorum_core::db::open(&p).ok();
             let t = conn
                 .as_ref()
@@ -28197,13 +28363,25 @@ async fn spawn_remediation_worker(
                     task.body.unwrap_or_default(),
                     task.author.unwrap_or_default(),
                     task.review_only,
+                    task.no_rework,
                 ),
-                None => (String::new(), String::new(), false),
+                None => (String::new(), String::new(), false, false),
             }
         })
         .await
-        .unwrap_or((String::new(), String::new(), false))
+        .unwrap_or((String::new(), String::new(), false, false))
     };
+    // Defense in depth for `task-create --review-only`: Quorum never reworks
+    // such a PR. The lifecycle never routes it into rework and the guarded
+    // remediation claim refuses it; refuse here too before any name, lease,
+    // or worktree is allocated. Treated as a clean lost claim (no park).
+    if task_no_rework {
+        log(&format!(
+            "remediation: refusing task #{task_id} PR #{pr} — review-only (no-rework) \
+             tasks are never reworked"
+        ));
+        return Ok(RemediationSpawnOutcome::ClaimLost);
+    }
 
     let prior_runs = {
         let p = db_path.clone();
@@ -31311,6 +31489,240 @@ mod tests {
         assert!(
             matches!(error, QuorumError::SchemaTooNew { .. }),
             "database failure was collapsed into a claim loss: {error}"
+        );
+    }
+
+    fn create_no_rework_review_task(db_path: &Path, pr: i64) -> i64 {
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        tasks::create_review_only_no_rework(
+            &mut conn,
+            "owner",
+            "review-only, never rework",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            ),
+            None,
+            pr,
+            Some("main"),
+            now_unix(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn no_rework_failed_pre_review_ci_closes_done_without_remediation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("no-rework-pre-review-ci.db");
+        let pr = 554;
+        let task_id = create_no_rework_review_task(&db_path, pr);
+
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        handle_pre_review_checks_failure(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut roster,
+            task_id,
+            pr,
+            "0123456789abcdef0123456789abcdef01234567",
+            &["ci-lint".into(), "ci-test".into()],
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            workers.is_empty(),
+            "no remediation worker may be provisioned"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "done");
+        assert_eq!(task.rework_round, 0);
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[tasks::REVIEW_OUTCOME_REF], "ci_failed");
+        assert_eq!(
+            refs[tasks::REVIEW_OUTCOME_CHECKS_REF],
+            serde_json::json!(["ci-lint", "ci-test"])
+        );
+        assert!(refs.get(tasks::CI_REMEDIATION_REQUESTED_REF).is_none());
+        assert!(refs.get(tasks::PARKED_REF).is_none(), "closed, not parked");
+        let runs = quorum_core::agent_runs::runs_for_task(&conn, task_id).unwrap();
+        assert!(runs.is_empty(), "no worker or reviewer run: {runs:?}");
+        let active_claims: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+                [tasks::lease_target(task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_claims, 0);
+    }
+
+    #[tokio::test]
+    async fn spawn_remediation_worker_refuses_no_rework_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("no-rework-remediation-guard.db");
+        let pr = 555;
+        let task_id = create_no_rework_review_task(&db_path, pr);
+        {
+            // A corrupted/legacy row that somehow reached rework.
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='rework', rework_round=1 WHERE id=?1",
+                [task_id],
+            )
+            .unwrap();
+        }
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let mut workers = Vec::new();
+        let outcome = spawn_remediation_worker(
+            &config,
+            &WorktreeManager::new(),
+            &mut Pool::new_generated(),
+            &mut workers,
+            &mut LifetimeRoster::new(),
+            task_id,
+            pr,
+            "fix the finding",
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, RemediationSpawnOutcome::ClaimLost);
+        assert!(workers.is_empty());
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let active_claims: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+                [tasks::lease_target(task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_claims, 0, "no remediation lease installed");
+        assert!(quorum_core::agent_runs::runs_for_task(&conn, task_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[derive(Default)]
+    struct RecordingChangesRequested {
+        confirm: bool,
+        calls: std::sync::Mutex<Vec<(i64, String)>>,
+    }
+
+    impl merge::MergeExecutor for RecordingChangesRequested {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: true,
+                message: String::new(),
+                failure_kind: None,
+            }
+        }
+
+        fn ensure_changes_requested(&self, pr: i64, _repo_dir: &Path, body: &str) -> bool {
+            self.calls.lock().unwrap().push((pr, body.to_string()));
+            self.confirm
+        }
+    }
+
+    fn close_no_rework_with_changes(db_path: &Path, pr: i64) -> i64 {
+        let task_id = create_no_rework_review_task(db_path, pr);
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        tasks::claim(&mut conn, "R1", Some(task_id), &[], 3600, now_unix())
+            .unwrap()
+            .unwrap();
+        let closed = tasks::apply_actionable_rework_event(
+            &mut conn,
+            "R1",
+            task_id,
+            &Event::VerdictChanges,
+            "BLOCKING: unbounded retry loop",
+            now_unix(),
+        )
+        .unwrap();
+        assert_eq!(closed.task.status, "done");
+        task_id
+    }
+
+    #[tokio::test]
+    async fn no_rework_request_changes_outbox_posts_findings_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("no-rework-outbox.db");
+        let task_id = close_no_rework_with_changes(&db_path, 556);
+        let executor = Arc::new(RecordingChangesRequested {
+            confirm: true,
+            ..Default::default()
+        });
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.merge_executor = executor.clone();
+
+        reconcile_no_rework_review_posts(&config).await.unwrap();
+        reconcile_no_rework_review_posts(&config).await.unwrap();
+
+        let calls = executor.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "a confirmed review is posted exactly once");
+        assert_eq!(calls[0].0, 556);
+        assert!(calls[0].1.contains("reviewer requested changes"));
+        assert!(calls[0].1.contains("unbounded retry loop"));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let refs: serde_json::Value = serde_json::from_str(
+            tasks::get(&conn, task_id)
+                .unwrap()
+                .unwrap()
+                .refs
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(refs[tasks::REVIEW_OUTCOME_GITHUB_REF], "posted");
+    }
+
+    #[tokio::test]
+    async fn no_rework_request_changes_outbox_retries_boundedly_then_alerts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("no-rework-outbox-failure.db");
+        let task_id = close_no_rework_with_changes(&db_path, 557);
+        let executor = Arc::new(RecordingChangesRequested::default());
+        let mut config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        config.merge_executor = executor.clone();
+
+        for _ in 0..(tasks::NO_REWORK_REVIEW_POST_MAX_ATTEMPTS + 3) {
+            reconcile_no_rework_review_posts(&config).await.unwrap();
+        }
+        assert_eq!(
+            executor.calls.lock().unwrap().len() as i64,
+            tasks::NO_REWORK_REVIEW_POST_MAX_ATTEMPTS,
+            "unconfirmed posts retry only up to the bounded budget"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let refs: serde_json::Value = serde_json::from_str(
+            tasks::get(&conn, task_id)
+                .unwrap()
+                .unwrap()
+                .refs
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(refs[tasks::REVIEW_OUTCOME_GITHUB_REF], "failed");
+        let alerts = quorum_core::feed::peek(&conn, None, None, 20, now_unix()).unwrap();
+        assert!(
+            alerts
+                .iter()
+                .any(|m| m.kind == "alert" && m.body.contains("could not be posted")),
+            "exhaustion must alert the owner: {alerts:?}"
         );
     }
 

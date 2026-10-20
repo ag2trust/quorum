@@ -1686,7 +1686,10 @@ fn materialize_terminal_children_in_tx(
             ));
         }
         let done: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND status='done')",
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM tasks d WHERE d.id=?1 AND {})",
+                crate::tasks::DEP_SATISFIED_PREDICATE
+            ),
             [dependency],
             |r| r.get(0),
         )?;

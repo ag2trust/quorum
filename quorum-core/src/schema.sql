@@ -122,7 +122,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- `max_rework` config at first ownership; immutable once populated. NULL
     -- means unstamped and falls back to the compiled REWORK_CAP, preserving
     -- historic behaviour for existing rows.
-    rework_cap INTEGER
+    rework_cap INTEGER,
+    -- v80: `task-create --review-only`. Reviewers review the PR; Quorum never reworks it.
+    -- Always set together with review_only=1. Actionable-rework triggers close the task as
+    -- `done` with refs.review_outcome instead of entering `rework`.
+    no_rework INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC);
 -- Bounded REVIEWING projection: each status is read newest-first, then at most two

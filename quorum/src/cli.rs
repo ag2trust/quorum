@@ -60,8 +60,8 @@ pub enum Command {
         /// JSON array of labels, e.g. '["ui","p1"]'.
         #[arg(long)]
         labels: Option<String>,
-        /// JSON of non-authoritative external refs. PR association requires --review-pr or
-        /// --continue-pr; refs.pr is rejected.
+        /// JSON of non-authoritative external refs. PR association requires --review-pr,
+        /// --review-only, or --continue-pr; refs.pr is rejected.
         #[arg(long)]
         refs: Option<String>,
         /// JSON array of task ids this task depends on, e.g. '[1,3]'. Claim (auto-pick AND
@@ -69,12 +69,20 @@ pub enum Command {
         /// + finalized). Validated as a JSON array of ints at create — malformed exits 2.
         #[arg(long = "depends-on")]
         depends_on: Option<String>,
-        /// Create as a review-only task (starts in in-review). The PR number is stored in refs.pr.
-        #[arg(long = "review-pr", conflicts_with = "continue_pr")]
+        /// Create a review + remediate task (starts in in-review). The PR number is stored in
+        /// refs.pr. Blocking findings, failed CI, or merge conflicts enter bounded rework with a
+        /// daemon-managed remediation worker on the same PR.
+        #[arg(long = "review-pr", conflicts_with_all = ["continue_pr", "review_only"])]
         review_pr: Option<i64>,
+        /// Create a reviewer-only task for PR N (starts in in-review). Reviewers review the PR;
+        /// Quorum never reworks it. Approval merges normally. Requested changes, failed CI, or a
+        /// merge conflict close the task as `done` with refs.review_outcome, a findings note, a
+        /// daemon-owned GitHub REQUEST_CHANGES review, and an owner alert — no remediation worker.
+        #[arg(long = "review-only", value_name = "N", conflicts_with_all = ["continue_pr", "review_pr"])]
+        review_only: Option<i64>,
         /// Continue implementation from an existing PR. Starts as an open implementation task;
         /// the daemon provisions the worker from this PR rather than the configured base.
-        #[arg(long = "continue-pr", conflicts_with = "review_pr")]
+        #[arg(long = "continue-pr", conflicts_with_all = ["review_pr", "review_only"])]
         continue_pr: Option<i64>,
         /// Local branch to target. Defaults to this repository's configured daemon base branch.
         #[arg(long = "base-branch")]
