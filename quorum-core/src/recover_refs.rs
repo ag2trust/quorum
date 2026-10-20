@@ -115,18 +115,21 @@ pub fn for_task(conn: &Connection, task_id: i64) -> Result<Vec<RecoverRefRow>> {
     Ok(rows)
 }
 
-/// Rows of tasks that reached done/cancelled, oldest first, bounded.
-pub fn terminal_rows(conn: &Connection, limit: i64) -> Result<Vec<RecoverRefRow>> {
+/// Rows of tasks that reached done/cancelled at or before `cutoff`
+/// (`tasks.updated_at`), oldest first, bounded. The grace period keeps a
+/// just-cancelled task's snapshots available to its owner.
+pub fn terminal_rows(conn: &Connection, cutoff: i64, limit: i64) -> Result<Vec<RecoverRefRow>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {} FROM recover_refs r JOIN tasks t ON t.id = r.task_id
-         WHERE t.status IN ('done', 'cancelled') ORDER BY r.id ASC LIMIT ?1",
+         WHERE t.status IN ('done', 'cancelled') AND t.updated_at <= ?1
+         ORDER BY r.id ASC LIMIT ?2",
         COLS.split(", ")
             .map(|c| format!("r.{c}"))
             .collect::<Vec<_>>()
             .join(", ")
     ))?;
     let rows = stmt
-        .query_map(params![limit], row_to)?
+        .query_map(params![cutoff, limit], row_to)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }

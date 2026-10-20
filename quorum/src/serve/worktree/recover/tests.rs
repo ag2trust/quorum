@@ -115,6 +115,14 @@ fn failing_git_shim(dir: &Path, fail_on: &str) -> PathBuf {
     shim
 }
 
+async fn noop(_: Vec<RecoverRef>) -> Result<(), String> {
+    Ok(())
+}
+
+async fn noop2(_: RecoverIdentity, _: Vec<RecoverRef>) -> Result<(), String> {
+    Ok(())
+}
+
 fn commit_in(wt: &Path, file: &str, body: &str) -> String {
     std::fs::write(wt.join(file), body).unwrap();
     git(wt, &["add", file]);
@@ -144,7 +152,7 @@ async fn release_snapshots_uncommitted_tracked_and_untracked_before_force_remove
     std::fs::write(wt.join("ignored.log"), "noise\n").unwrap();
 
     let created = mgr
-        .release_preserving(&f.repo, &wt, &branch, true, &ident(412))
+        .release_preserving(&f.repo, &wt, &branch, true, &ident(412), noop)
         .await
         .unwrap();
 
@@ -186,7 +194,7 @@ async fn release_snapshots_committed_unpushed_work_before_branch_delete() {
     let tip = commit_in(&wt, "feature.rs", "x\n");
 
     let created = mgr
-        .release_preserving(&f.repo, &wt, &branch, true, &ident(7))
+        .release_preserving(&f.repo, &wt, &branch, true, &ident(7), noop)
         .await
         .unwrap();
 
@@ -216,7 +224,7 @@ async fn forged_recover_ref_does_not_count_as_preserving_commits() {
     );
 
     let created = mgr
-        .release_preserving(&f.repo, &wt, &branch, true, &ident(70))
+        .release_preserving(&f.repo, &wt, &branch, true, &ident(70), noop)
         .await
         .unwrap();
 
@@ -235,7 +243,7 @@ async fn release_clean_worktree_without_unique_commits_creates_no_ref() {
     let (wt, branch) = provision_worker(&mgr, &f, 8).await;
 
     let created = mgr
-        .release_preserving(&f.repo, &wt, &branch, true, &ident(8))
+        .release_preserving(&f.repo, &wt, &branch, true, &ident(8), noop)
         .await
         .unwrap();
 
@@ -252,7 +260,7 @@ async fn release_keeping_branch_does_not_pin_commits_the_branch_still_holds() {
     commit_in(&wt, "feature.rs", "x\n");
 
     let created = mgr
-        .release_preserving(&f.repo, &wt, &branch, false, &ident(9))
+        .release_preserving(&f.repo, &wt, &branch, false, &ident(9), noop)
         .await
         .unwrap();
 
@@ -278,7 +286,7 @@ async fn release_destroys_nothing_when_snapshot_fails_then_retry_preserves() {
     std::fs::write(wt.join("tracked.txt"), "precious\n").unwrap();
 
     let error = failing
-        .release_preserving(&f.repo, &wt, &branch, true, &ident(10))
+        .release_preserving(&f.repo, &wt, &branch, true, &ident(10), noop)
         .await
         .unwrap_err();
 
@@ -295,7 +303,7 @@ async fn release_destroys_nothing_when_snapshot_fails_then_retry_preserves() {
     assert!(recover_refs(&f.repo, 10).is_empty(), "no partial ref");
 
     let created = WorktreeManager::new()
-        .release_preserving(&f.repo, &wt, &branch, true, &ident(10))
+        .release_preserving(&f.repo, &wt, &branch, true, &ident(10), noop)
         .await
         .unwrap();
     assert_eq!(created.len(), 1);
@@ -317,7 +325,7 @@ async fn untracked_capture_failure_falls_back_to_tracked_only_snapshot() {
     std::fs::write(wt.join("untracked.rs"), "lost\n").unwrap();
 
     let created = failing
-        .release_preserving(&f.repo, &wt, &branch, true, &ident(11))
+        .release_preserving(&f.repo, &wt, &branch, true, &ident(11), noop)
         .await
         .unwrap();
 
@@ -350,12 +358,12 @@ async fn concurrent_and_repeated_releases_create_one_snapshot() {
 
     let id = ident(12);
     let (a, b) = tokio::join!(
-        mgr.release_preserving(&f.repo, &wt, &branch, true, &id),
-        mgr.release_preserving(&f.repo, &wt, &branch, true, &id),
+        mgr.release_preserving(&f.repo, &wt, &branch, true, &id, noop),
+        mgr.release_preserving(&f.repo, &wt, &branch, true, &id, noop),
     );
     a.unwrap();
     b.unwrap();
-    mgr.release_preserving(&f.repo, &wt, &branch, true, &id)
+    mgr.release_preserving(&f.repo, &wt, &branch, true, &id, noop)
         .await
         .unwrap();
 
@@ -406,7 +414,7 @@ async fn gc_snapshots_dirty_orphan_before_removal_with_daemon_attribution() {
     let allocations = vec![(30, branch, wt.to_string_lossy().into_owned())];
 
     let gc = mgr
-        .gc_orphaned_detailed(&f.repo, &f.base, &[], &allocations)
+        .gc_orphaned_detailed(&f.repo, &f.base, &[], &allocations, noop2)
         .await;
 
     assert_eq!(gc.removed.len(), 1);
@@ -436,7 +444,7 @@ async fn gc_never_attributes_from_a_worker_chosen_branch() {
     std::fs::write(wt.join("tracked.txt"), "injected\n").unwrap();
 
     let gc = mgr
-        .gc_orphaned_detailed(&f.repo, &f.base, &[], &allocations)
+        .gc_orphaned_detailed(&f.repo, &f.base, &[], &allocations, noop2)
         .await;
 
     assert_eq!(gc.removed.len(), 1);
@@ -482,7 +490,13 @@ async fn gc_never_attributes_a_forged_daemon_shaped_worktree() {
     std::fs::write(forged.join("backdoor.rs"), "evil\n").unwrap();
 
     let gc = mgr
-        .gc_orphaned_detailed(&f.repo, &f.base, &[real_wt.to_str().unwrap()], &allocations)
+        .gc_orphaned_detailed(
+            &f.repo,
+            &f.base,
+            &[real_wt.to_str().unwrap()],
+            &allocations,
+            noop2,
+        )
         .await;
 
     assert_eq!(gc.removed.len(), 1);
@@ -546,7 +560,7 @@ async fn gc_keeps_orphan_when_snapshot_fails() {
     std::fs::write(wt.join("tracked.txt"), "precious\n").unwrap();
 
     let gc = failing
-        .gc_orphaned_detailed(&f.repo, &f.base, &[], &[])
+        .gc_orphaned_detailed(&f.repo, &f.base, &[], &[], noop2)
         .await;
 
     assert!(gc.removed.is_empty());
@@ -562,7 +576,7 @@ async fn remove_exact_snapshots_dirty_worktree() {
     std::fs::write(wt.join("tracked.txt"), "cleanup intent\n").unwrap();
 
     let created = mgr
-        .remove_exact(&f.repo, &wt, &branch, &ident(33))
+        .remove_exact(&f.repo, &wt, &branch, &ident(33), noop)
         .await
         .unwrap();
 
@@ -581,7 +595,7 @@ async fn dirty_snapshot(
     commit_in(&wt, "committed.rs", "c\n");
     std::fs::write(wt.join("tracked.txt"), "half done\n").unwrap();
     std::fs::write(wt.join("new_file.rs"), "new\n").unwrap();
-    mgr.release_preserving(&f.repo, &wt, &branch, !keep_branch, &ident(task))
+    mgr.release_preserving(&f.repo, &wt, &branch, !keep_branch, &ident(task), noop)
         .await
         .unwrap()
         .remove(0)
@@ -617,6 +631,7 @@ async fn resume_branch_restores_snapshot_as_uncommitted_changes() {
     let added = mgr
         .restore_snapshot_as_uncommitted(&f.repo, &wt, &snap)
         .await
+        .unwrap()
         .unwrap();
 
     assert_eq!(
@@ -647,7 +662,7 @@ async fn resume_branch_fast_forwards_kept_branch_to_pinned_commits() {
     let (wt, branch) = provision_worker(&mgr, &f, 41).await;
     let tip = commit_in(&wt, "committed.rs", "c\n");
     let pinned = mgr
-        .release_preserving(&f.repo, &wt, &branch, true, &ident(41))
+        .release_preserving(&f.repo, &wt, &branch, true, &ident(41), noop)
         .await
         .unwrap()
         .remove(0);
@@ -779,6 +794,7 @@ async fn resume_worktree_fast_forwards_then_restores_uncommitted() {
     assert_eq!(git(&wt2, &["rev-parse", "HEAD"]), parent);
     mgr.restore_snapshot_as_uncommitted(&f.repo, &wt2, &snap)
         .await
+        .unwrap()
         .unwrap();
     assert_eq!(
         std::fs::read_to_string(wt2.join("tracked.txt")).unwrap(),
@@ -797,4 +813,155 @@ fn recover_ref_task_id_parsing() {
         recover_ref_task_id("refs/quorum-recover/unattributed/1/a/b"),
         None
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn untracked_only_work_is_never_destroyed_when_capture_fails() {
+    let f = fixture();
+    let shim_dir = tempfile::tempdir().unwrap();
+    let failing = WorktreeManager::with_config(
+        failing_git_shim(shim_dir.path(), "-A"),
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(30),
+    );
+    let (wt, branch) = provision_worker(&failing, &f, 50).await;
+    // Only new files; no tracked change and nothing committed.
+    std::fs::write(wt.join("brand_new.rs"), "only copy\n").unwrap();
+
+    let error = failing
+        .release_preserving(&f.repo, &wt, &branch, true, &ident(50), noop)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ReleaseError::Preserve(_)), "{error:?}");
+    assert!(error
+        .to_string()
+        .contains("untracked files could not be captured"));
+    assert!(
+        wt.join("brand_new.rs").exists(),
+        "the only copy must survive"
+    );
+    assert!(git_ok(
+        &f.repo,
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")]
+    ));
+    assert!(recover_refs(&f.repo, 50).is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn untracked_capture_failure_with_already_preserved_tracked_state_keeps_worktree() {
+    let f = fixture();
+    let mgr = WorktreeManager::new();
+    let (wt, branch) = provision_worker(&mgr, &f, 51).await;
+    std::fs::write(wt.join("tracked.txt"), "tracked edit\n").unwrap();
+    let guard = mgr.lock.lock().await;
+    let trusted = mgr
+        .preserve_unlocked(&f.repo, Some(&wt), None, &ident(51))
+        .await
+        .unwrap();
+    drop(guard);
+    std::fs::write(wt.join("later_untracked.rs"), "new\n").unwrap();
+    let shim_dir = tempfile::tempdir().unwrap();
+    let failing = WorktreeManager::with_config(
+        failing_git_shim(shim_dir.path(), "-A"),
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(30),
+    );
+
+    let error = failing
+        .release_preserving(
+            &f.repo,
+            &wt,
+            &branch,
+            true,
+            &ident(51).with_trusted(trusted),
+            noop,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ReleaseError::Preserve(_)), "{error:?}");
+    assert!(wt.join("later_untracked.rs").exists());
+}
+
+#[tokio::test]
+async fn recording_failure_destroys_nothing() {
+    let f = fixture();
+    let mgr = WorktreeManager::new();
+    let (wt, branch) = provision_worker(&mgr, &f, 52).await;
+    std::fs::write(wt.join("tracked.txt"), "work\n").unwrap();
+
+    let error = mgr
+        .release_preserving(&f.repo, &wt, &branch, true, &ident(52), |_| async {
+            Err("db unavailable".to_string())
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ReleaseError::Preserve(_)), "{error:?}");
+    assert!(wt.exists(), "write ref -> record row -> destroy");
+    assert!(git_ok(
+        &f.repo,
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")]
+    ));
+}
+
+/// The snapshot conflicts with the checkout it is restored into (e.g. the
+/// base integration touched the same lines): the worktree must come back
+/// verified clean, never half-applied.
+#[tokio::test]
+async fn conflicting_restore_reverts_to_a_verified_clean_worktree() {
+    let f = fixture();
+    let mgr = WorktreeManager::new();
+    let snap = dirty_snapshot(&mgr, &f, 53, false).await;
+    let parent = snap.snapshot_parent.clone().unwrap();
+    let wt = f.base.join("forge-t53");
+    mgr.provision(&f.repo, "remediation/forge-t53", &wt, &parent)
+        .await
+        .unwrap();
+    let conflicting = commit_in(&wt, "tracked.txt", "base changed these lines\n");
+
+    let restored = mgr
+        .restore_snapshot_as_uncommitted(&f.repo, &wt, &snap)
+        .await
+        .expect("worktree must be provably clean")
+        .unwrap_err();
+
+    assert!(restored.contains("does not apply cleanly"), "{restored}");
+    assert_eq!(git(&wt, &["rev-parse", "HEAD"]), conflicting);
+    assert!(git(&wt, &["status", "--porcelain", "--untracked-files=all"]).is_empty());
+    assert!(!wt.join("new_file.rs").exists());
+    assert_eq!(
+        std::fs::read_to_string(wt.join("tracked.txt")).unwrap(),
+        "base changed these lines\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn conflicting_restore_that_cannot_be_reverted_fails_hard() {
+    let f = fixture();
+    let mgr = WorktreeManager::new();
+    let snap = dirty_snapshot(&mgr, &f, 54, false).await;
+    let parent = snap.snapshot_parent.clone().unwrap();
+    let wt = f.base.join("forge-t54");
+    mgr.provision(&f.repo, "remediation/forge-t54", &wt, &parent)
+        .await
+        .unwrap();
+    commit_in(&wt, "tracked.txt", "base changed these lines\n");
+    let shim_dir = tempfile::tempdir().unwrap();
+    let failing = WorktreeManager::with_config(
+        failing_git_shim(shim_dir.path(), "--hard"),
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(30),
+    );
+
+    let fatal = failing
+        .restore_snapshot_as_uncommitted(&f.repo, &wt, &snap)
+        .await
+        .unwrap_err();
+
+    assert!(fatal.contains("cannot reset worktree"), "{fatal}");
 }

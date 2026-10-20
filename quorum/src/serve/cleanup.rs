@@ -562,15 +562,21 @@ async fn cleanup_worktree(
         "decomposition_cleanup",
     )
     .with_trusted(trusted);
+    let db_path = config.db_path.clone();
+    let record_identity = identity.clone();
     let created = wt
         .remove_exact(
             &config.repo_dir,
             &expected.path,
             &expected.branch,
             &identity,
+            |created| async move {
+                super::worker_recover::record_recover_rows(&db_path, &record_identity, &created)
+                    .await
+            },
         )
         .await?;
-    super::worker_recover::record_created_recover_refs(config, wt, &identity, &created).await;
+    super::worker_recover::after_recover_refs_created(config, wt, &identity, &created).await;
     Ok(())
 }
 

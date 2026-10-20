@@ -138,6 +138,9 @@ pub enum RecoverResume {
     },
     /// The recover ref does not descend from the provisioning start; left as is.
     Stale { recover: RecoverRef, onto: String },
+    /// Deliberately not applied (e.g. the task restarted from a fresh
+    /// allocation after a publication reset); left as is.
+    Skipped { recover: RecoverRef, reason: String },
 }
 
 /// Task id of a recover ref (`refs/quorum-recover/t<id>/...`).
@@ -234,11 +237,27 @@ impl WorktreeManager {
                     .await?
                     .ok_or_else(|| "worktree HEAD tree is unresolvable".to_string())?;
                 let (tree, untracked_skip) = self.snapshot_tree_unlocked(worktree).await?;
+                // A tracked-only fallback is acceptable only when it actually
+                // records a new snapshot (loudly). If untracked capture failed
+                // and nothing new would be written, the untracked files would
+                // be destroyed silently: refuse instead.
+                let refuse_untracked_loss = |why: &str| {
+                    format!(
+                        "untracked files could not be captured ({}) and {why}; \
+                         refusing to destroy the worktree",
+                        untracked_skip.as_deref().unwrap_or_default()
+                    )
+                };
                 if tree != head_tree {
-                    if !self
+                    let duplicate = self
                         .trusted_snapshot_exists_unlocked(repo_dir, &identity.trusted, &tree, &head)
-                        .await?
-                    {
+                        .await?;
+                    if duplicate && untracked_skip.is_some() {
+                        return Err(refuse_untracked_loss(
+                            "the tracked changes are already preserved",
+                        ));
+                    }
+                    if !duplicate {
                         let commit = self
                             .commit_snapshot_unlocked(
                                 repo_dir,
@@ -251,7 +270,10 @@ impl WorktreeManager {
                         candidates.push((commit, Some(head.clone()), untracked_skip));
                     }
                 } else {
-                    candidates.push((head.clone(), None, untracked_skip));
+                    if untracked_skip.is_some() {
+                        return Err(refuse_untracked_loss("there are no tracked changes"));
+                    }
+                    candidates.push((head.clone(), None, None));
                 }
                 worktree_head = Some(head);
             }
@@ -328,20 +350,33 @@ impl WorktreeManager {
 
     /// Preserve, then force-remove the worktree and optionally delete its
     /// branch. A preservation failure destroys nothing.
-    pub async fn release_preserving(
+    ///
+    /// `record` durably records the created refs (write ref → record row →
+    /// destroy). If recording fails nothing is destroyed.
+    pub async fn release_preserving<F, Fut>(
         &self,
         repo_dir: &Path,
         worktree_dir: &Path,
         branch: &str,
         delete_branch: bool,
         identity: &RecoverIdentity,
-    ) -> Result<Vec<RecoverRef>, ReleaseError> {
+        record: F,
+    ) -> Result<Vec<RecoverRef>, ReleaseError>
+    where
+        F: FnOnce(Vec<RecoverRef>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
         let _guard = self.lock.lock().await;
         let deleting = delete_branch.then_some(branch);
         let created = self
             .preserve_unlocked(repo_dir, Some(worktree_dir), deleting, identity)
             .await
             .map_err(ReleaseError::Preserve)?;
+        if !created.is_empty() {
+            record(created.clone()).await.map_err(|error| {
+                ReleaseError::Preserve(format!("recording recover refs: {error}"))
+            })?;
+        }
 
         let mut remove_error = None;
         match std::fs::symlink_metadata(worktree_dir) {
@@ -563,66 +598,128 @@ impl WorktreeManager {
 
     /// Re-apply a trusted snapshot's uncommitted changes to `worktree_dir` as
     /// unstaged working-tree changes (new files come back untracked); no
-    /// commit is created. Returns the paths the snapshot added. On a conflict
-    /// the worktree is restored to its prior clean state and an error returned.
+    /// commit is created.
+    ///
+    /// Outer `Err`: the worktree could not be returned to a clean state; the
+    /// caller must fail provisioning. Inner `Err`: the snapshot did not apply
+    /// and the worktree was verified clean again (the work stays in the ref).
+    /// `Ok(Ok(paths))`: restored; `paths` are the files the snapshot added.
     pub async fn restore_snapshot_as_uncommitted(
         &self,
         repo_dir: &Path,
         worktree_dir: &Path,
         recover: &RecoverRef,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Result<Vec<String>, String>, String> {
         let _guard = self.lock.lock().await;
-        let parent = recover
-            .snapshot_parent
-            .as_deref()
-            .ok_or_else(|| format!("{} is not a snapshot", recover.refname))?;
-        self.verify_trusted_unlocked(repo_dir, recover).await?;
-        let mut pick = self.git_cmd(worktree_dir);
-        pick.env("GIT_AUTHOR_NAME", SNAPSHOT_IDENTITY_NAME)
-            .env("GIT_AUTHOR_EMAIL", SNAPSHOT_IDENTITY_EMAIL)
-            .env("GIT_COMMITTER_NAME", SNAPSHOT_IDENTITY_NAME)
-            .env("GIT_COMMITTER_EMAIL", SNAPSHOT_IDENTITY_EMAIL)
-            .args(["cherry-pick", "--no-commit", &recover.sha]);
-        let out = run_git(pick, self.local_timeout, "git cherry-pick snapshot").await?;
-        if !out.status.success() {
-            let mut abort = self.git_cmd(worktree_dir);
-            abort.args(["cherry-pick", "--abort"]);
-            let _ = run_git(abort, self.local_timeout, "git cherry-pick --abort").await;
-            return Err(format!(
-                "snapshot {} does not apply cleanly: {}",
-                recover.refname,
-                git_diagnostic(&out.stderr)
-            ));
-        }
-        let mut unstage = self.git_cmd(worktree_dir);
-        unstage.args(["reset", "-q"]);
-        let out = run_git(unstage, self.local_timeout, "git reset unstage snapshot").await?;
-        if !out.status.success() {
-            return Err(format!(
-                "cannot unstage restored snapshot: {}",
-                git_diagnostic(&out.stderr)
-            ));
+        let Some(parent) = recover.snapshot_parent.as_deref() else {
+            return Ok(Err(format!("{} is not a snapshot", recover.refname)));
+        };
+        if let Err(error) = self.verify_trusted_unlocked(repo_dir, recover).await {
+            return Ok(Err(error));
         }
         let mut added = self.git_cmd(repo_dir);
         added.args([
             "diff",
             "--no-renames",
             "--name-only",
+            "-z",
             "--diff-filter=A",
             parent,
             &recover.sha,
         ]);
         let out = run_git(added, self.local_timeout, "git diff snapshot added paths").await?;
         if !out.status.success() {
-            return Err(format!(
+            return Ok(Err(format!(
                 "cannot list snapshot paths: {}",
+                git_diagnostic(&out.stderr)
+            )));
+        }
+        let added: Vec<String> = out
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect();
+
+        let mut pick = self.git_cmd(worktree_dir);
+        pick.env("GIT_AUTHOR_NAME", SNAPSHOT_IDENTITY_NAME)
+            .env("GIT_AUTHOR_EMAIL", SNAPSHOT_IDENTITY_EMAIL)
+            .env("GIT_COMMITTER_NAME", SNAPSHOT_IDENTITY_NAME)
+            .env("GIT_COMMITTER_EMAIL", SNAPSHOT_IDENTITY_EMAIL)
+            .args(["cherry-pick", "--no-commit", &recover.sha]);
+        let picked = run_git(pick, self.local_timeout, "git cherry-pick snapshot").await;
+        let failure = match picked {
+            Ok(out) if out.status.success() => {
+                let mut unstage = self.git_cmd(worktree_dir);
+                unstage.args(["reset", "-q"]);
+                match run_git(unstage, self.local_timeout, "git reset unstage snapshot").await {
+                    Ok(out) if out.status.success() => return Ok(Ok(added)),
+                    Ok(out) => format!(
+                        "cannot unstage restored snapshot: {}",
+                        git_diagnostic(&out.stderr)
+                    ),
+                    Err(error) => error,
+                }
+            }
+            Ok(out) => format!(
+                "snapshot {} does not apply cleanly: {}",
+                recover.refname,
+                git_diagnostic(&out.stderr)
+            ),
+            Err(error) => error,
+        };
+        // `cherry-pick --no-commit` leaves no CHERRY_PICK_HEAD, so `--abort`
+        // cannot undo it. Reset tracked state, remove only the paths the
+        // snapshot added, then prove the worktree is clean.
+        self.revert_to_clean_unlocked(worktree_dir, &added).await?;
+        Ok(Err(failure))
+    }
+
+    async fn revert_to_clean_unlocked(
+        &self,
+        worktree_dir: &Path,
+        added: &[String],
+    ) -> Result<(), String> {
+        let mut reset = self.git_cmd(worktree_dir);
+        reset.args(["reset", "-q", "--hard", "HEAD"]);
+        let out = run_git(
+            reset,
+            self.local_timeout,
+            "git reset --hard after failed restore",
+        )
+        .await?;
+        if !out.status.success() {
+            return Err(format!(
+                "cannot reset worktree after failed restore: {}",
                 git_diagnostic(&out.stderr)
             ));
         }
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::to_string)
-            .collect())
+        if !added.is_empty() {
+            let mut clean = self.git_cmd(worktree_dir);
+            clean.args(["clean", "-q", "-f", "--"]).args(added);
+            let out = run_git(clean, self.local_timeout, "git clean restored paths").await?;
+            if !out.status.success() {
+                return Err(format!(
+                    "cannot remove partially restored files: {}",
+                    git_diagnostic(&out.stderr)
+                ));
+            }
+        }
+        let mut status = self.git_cmd(worktree_dir);
+        status.args(["status", "--porcelain", "--untracked-files=all"]);
+        let out = run_git(
+            status,
+            self.local_timeout,
+            "git status after failed restore",
+        )
+        .await?;
+        if !out.status.success() || !out.stdout.is_empty() {
+            return Err(format!(
+                "worktree is not clean after a failed snapshot restore: {}",
+                String::from_utf8_lossy(&out.stdout).trim()
+            ));
+        }
+        Ok(())
     }
 
     // ── helpers (caller MUST hold `self.lock`) ──────────────────────────────

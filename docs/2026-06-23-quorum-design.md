@@ -2328,11 +2328,14 @@ fixed `quorum-daemon` identity), so no hooks run and the worktree and its index 
 untouched. If capturing untracked files fails (for example a huge untracked tree times
 out), the snapshot falls back to tracked changes only (`add -u`), the ref reason gains a
 `-tracked-only` suffix, and an `errors` row, owner alert, and daemon task note record what
-was skipped. Committed work is pinned as-is only when no other ref (excluding the deleted
+was skipped. If untracked capture fails and nothing new would be written (no tracked
+changes, or tracked changes already preserved), the untracked files would be lost silently,
+so the release is refused and the worktree kept (the fail-safe path below). Committed work is pinned as-is only when no other ref (excluding the deleted
 branch and the worker-writable recover namespace) reaches it. A clean worktree with nothing
-unique creates no ref. Creation is a create-only `update-ref` CAS written last, under the
-worktree-manager lock, so racing teardowns of one worktree create one ref and a daemon that
-dies mid-snapshot leaves the worktree intact and no partial ref.
+unique creates no ref. Creation is a create-only `update-ref` CAS, under the worktree-manager lock,
+ordered write ref → record `recover_refs` row → destroy: if recording fails nothing is
+destroyed. Racing teardowns of one worktree create one ref, and a daemon that dies
+mid-snapshot leaves the worktree intact.
 
 Trust: workers share the repository's ref store and can write any ref, so a recover ref is
 never authority by name. Every ref the daemon creates is recorded in `recover_refs`
@@ -2362,15 +2365,20 @@ ref seeds it if it descends from the provisioning start: the kept task branch ti
 continuation and remediation checkouts, the verified PR head (before base integration).
 Worker commits resume as commits. A snapshot's uncommitted state is restored as
 uncommitted, unstaged working-tree changes (`cherry-pick --no-commit` then `reset`, after a
-clean base integration), so no daemon commit lands on the branch or in the PR; a conflict
-leaves the worktree clean and the snapshot in its ref. The daemon then writes a bounded
+clean base integration), so no daemon commit lands on the branch or in the PR. If it does
+not apply, the worktree is reset (`reset --hard`, plus `clean` of only the snapshot's added
+paths) and verified clean before the worker launches; if it cannot be proven clean,
+provisioning fails loudly. The snapshot stays in its ref. The daemon then writes a bounded
 `daemon` task note naming the ref, the prior run's agent, the teardown reason, and the
 restored new (untracked) paths (bounded list) so the next worker reviews them before
 committing. A ref that no longer applies is left in place and noted once (deduplicated by
-body); a ref already contained in the start is ignored. Retention keeps the newest
+body); a ref already contained in the start is ignored. A task whose allocation row is gone
+(a publication-reset retry, which means "start clean") never resumes an older snapshot; it
+is noted and kept. Only the newest trusted ref is considered. Retention keeps the newest
 `RECOVER_REFS_PER_TASK` (2) recorded refs per task, and the periodic publication-ref
-housekeeping cadence retires all recover refs and rows of `done`/`cancelled` tasks
-(bounded per pass). No ref outside the namespace is ever deleted by this mechanism.
+housekeeping cadence retires all recover refs and rows of `done`/`cancelled` tasks once
+they have been terminal for a 7-day grace period (bounded per pass), so an owner can still
+recover work after a cancel. No ref outside the namespace is ever deleted by this mechanism.
 Reviewer and branch-sync worktrees are out of scope: reviewers author no code and kept
 sync merges are already preserved.
 

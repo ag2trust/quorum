@@ -16,6 +16,9 @@ pub(crate) const WORKTREE_RECOVER_TEXT_MAX: usize = 1024;
 const RESTORED_PATHS_MAX: usize = 20;
 /// Bound on recover refs retired per housekeeping pass.
 const RECOVER_REF_HOUSEKEEPING_MAX_DELETES: i64 = 64;
+/// Recover refs of done/cancelled tasks are kept this long after the task's
+/// last update so an owner can still recover work after a cancel.
+pub(crate) const RECOVER_REF_TERMINAL_GRACE_SECS: i64 = 7 * 24 * 60 * 60;
 
 fn row_to_ref(row: &RecoverRefRow) -> RecoverRef {
     RecoverRef {
@@ -69,9 +72,58 @@ pub(crate) async fn latest_trusted_recover(
     Ok(trusted.into_iter().next())
 }
 
-/// Record refs the daemon just created, surface tracked-only snapshots, and
-/// enforce bounded per-task retention over recorded refs only.
-pub(crate) async fn record_created_recover_refs(
+/// Durably record refs the daemon just created, BEFORE anything is
+/// destroyed. Unattributed refs are never recorded (never trusted). Any
+/// failure is returned so the caller destroys nothing.
+pub(crate) async fn record_recover_rows(
+    db_path: &Path,
+    identity: &RecoverIdentity,
+    created: &[RecoverRef],
+) -> std::result::Result<(), String> {
+    let Some(task_id) = identity.task_id else {
+        return Ok(());
+    };
+    let path = db_path.to_path_buf();
+    let rows: Vec<RecoverRef> = created.to_vec();
+    let (agent, reason) = (identity.agent.clone(), identity.reason.clone());
+    let recorded = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+        let mut conn = quorum_core::db::open(&path)?;
+        let mut refused = Vec::new();
+        for recover in &rows {
+            if !recover_refs::record(
+                &mut conn,
+                &NewRecoverRef {
+                    refname: &recover.refname,
+                    task_id,
+                    sha: &recover.sha,
+                    parent_sha: recover.snapshot_parent.as_deref(),
+                    tracked_only: recover.tracked_only,
+                    agent: &agent,
+                    reason: &reason,
+                },
+                now_unix(),
+            )? {
+                refused.push(recover.refname.clone());
+            }
+        }
+        Ok(refused)
+    })
+    .await
+    .map_err(|e| format!("recover ref record join failure: {e}"))?
+    .map_err(|e| format!("recover ref record failed: {e}"))?;
+    if recorded.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "recover ref name(s) already recorded with another SHA: {}",
+            recorded.join(", ")
+        ))
+    }
+}
+
+/// After a successful preserve+destroy: log, surface tracked-only snapshots
+/// (errors row, owner alert, daemon note), and enforce bounded retention.
+pub(crate) async fn after_recover_refs_created(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     identity: &RecoverIdentity,
@@ -91,49 +143,6 @@ pub(crate) async fn record_created_recover_refs(
             "preserved worker work for task #{task_id} ({}, {}) at {} ({})",
             identity.agent, identity.reason, recover.refname, recover.sha
         ));
-        let path = config.db_path.clone();
-        let row = (
-            recover.refname.clone(),
-            recover.sha.clone(),
-            recover.snapshot_parent.clone(),
-            recover.tracked_only,
-            identity.agent.clone(),
-            identity.reason.clone(),
-        );
-        let recorded = tokio::task::spawn_blocking(move || -> Result<bool> {
-            let mut conn = quorum_core::db::open(&path)?;
-            recover_refs::record(
-                &mut conn,
-                &NewRecoverRef {
-                    refname: &row.0,
-                    task_id,
-                    sha: &row.1,
-                    parent_sha: row.2.as_deref(),
-                    tracked_only: row.3,
-                    agent: &row.4,
-                    reason: &row.5,
-                },
-                now_unix(),
-            )
-        })
-        .await;
-        match recorded {
-            Ok(Ok(true)) => {}
-            other => {
-                let detail = format!(
-                    "task #{task_id}: recover ref {} ({}) could not be recorded ({other:?}); \
-                     it will not be resumed automatically",
-                    recover.refname, recover.sha
-                );
-                record_worktree_recover_error(
-                    &config.db_path,
-                    Some(task_id),
-                    &recover.refname,
-                    &detail,
-                )
-                .await;
-            }
-        }
         if let Some(skip) = recover.untracked_skip.as_deref() {
             let body = format!(
                 "teardown of worker {} ({}) preserved TRACKED changes only at {}: untracked \
@@ -227,12 +236,21 @@ pub(crate) async fn release_worker_worktree(
             )),
         }
     }
+    let db_path = config.db_path.clone();
+    let record_identity = identity.clone();
     match wt_mgr
-        .release_preserving(&config.repo_dir, worktree, branch, delete_branch, &identity)
+        .release_preserving(
+            &config.repo_dir,
+            worktree,
+            branch,
+            delete_branch,
+            &identity,
+            |created| async move { record_recover_rows(&db_path, &record_identity, &created).await },
+        )
         .await
     {
         Ok(created) => {
-            record_created_recover_refs(config, wt_mgr, &identity, &created).await;
+            after_recover_refs_created(config, wt_mgr, &identity, &created).await;
             Ok(())
         }
         Err(error) => {
@@ -408,24 +426,24 @@ async fn add_daemon_note(db_path: &Path, task_id: i64, body: &str) {
 }
 
 /// Restore a resumed snapshot's uncommitted changes into the provisioned
-/// worktree. `None` when the outcome needs no restore.
+/// worktree. `Ok(None)` when the outcome needs no restore; `Err` when the
+/// worktree could not be returned to a clean state (fail provisioning).
 pub(crate) async fn restore_resumed_snapshot(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     worktree: &Path,
-    outcome: &std::result::Result<RecoverResume, String>,
-) -> Option<std::result::Result<Vec<String>, String>> {
+    outcome: Option<&std::result::Result<RecoverResume, String>>,
+) -> std::result::Result<Option<std::result::Result<Vec<String>, String>>, String> {
     match outcome {
-        Ok(RecoverResume::Resumed {
+        Some(Ok(RecoverResume::Resumed {
             recover,
             restore_uncommitted: true,
             ..
-        }) => Some(
-            wt_mgr
-                .restore_snapshot_as_uncommitted(&config.repo_dir, worktree, recover)
-                .await,
-        ),
-        _ => None,
+        })) => wt_mgr
+            .restore_snapshot_as_uncommitted(&config.repo_dir, worktree, recover)
+            .await
+            .map(Some),
+        _ => Ok(None),
     }
 }
 
@@ -481,6 +499,11 @@ pub(crate) fn recover_resume_note(
             }
             body
         }
+        Ok(RecoverResume::Skipped { recover, reason }) => format!(
+            "recover ref {} ({}) was NOT applied: {reason}. It is preserved for manual \
+             recovery; this run starts without it.",
+            recover.refname, recover.sha
+        ),
         Ok(RecoverResume::Stale { recover, onto }) => {
             let (prior, reason) = recover.provenance();
             format!(
@@ -524,8 +547,9 @@ pub(crate) async fn record_recover_resume(
     add_daemon_note(db_path, task_id, &body).await;
 }
 
-/// Retire recover refs and records of tasks that reached `done`/`cancelled`,
-/// including unrecorded refs in those tasks' buckets. Refs of unknown or
+/// Retire recover refs and records of tasks that reached `done`/`cancelled`
+/// more than the grace period ago, including unrecorded refs in those tasks'
+/// buckets. Refs of unknown or
 /// live tasks, and every non-recover ref, are left untouched.
 pub(crate) async fn prune_terminal_recover_refs(
     config: &ServeConfig,
@@ -534,7 +558,11 @@ pub(crate) async fn prune_terminal_recover_refs(
     let path = config.db_path.clone();
     let rows = tokio::task::spawn_blocking(move || -> Result<Vec<RecoverRefRow>> {
         let conn = quorum_core::db::open(&path)?;
-        recover_refs::terminal_rows(&conn, RECOVER_REF_HOUSEKEEPING_MAX_DELETES)
+        recover_refs::terminal_rows(
+            &conn,
+            now_unix() - RECOVER_REF_TERMINAL_GRACE_SECS,
+            RECOVER_REF_HOUSEKEEPING_MAX_DELETES,
+        )
     })
     .await
     .map_err(|e| format!("recover ref housekeeping join failure: {e}"))?
@@ -555,11 +583,14 @@ pub(crate) async fn prune_terminal_recover_refs(
         let task_ids: Vec<i64> = by_task.keys().copied().collect();
         let terminal = tokio::task::spawn_blocking(move || -> Result<Vec<i64>> {
             let conn = quorum_core::db::open(&path)?;
-            let mut stmt =
-                conn.prepare("SELECT 1 FROM tasks WHERE id=?1 AND status IN ('done','cancelled')")?;
+            let mut stmt = conn.prepare(
+                "SELECT 1 FROM tasks WHERE id=?1 AND status IN ('done','cancelled') \
+                 AND updated_at <= ?2",
+            )?;
+            let cutoff = now_unix() - RECOVER_REF_TERMINAL_GRACE_SECS;
             let mut terminal = Vec::new();
             for task_id in task_ids {
-                if stmt.exists([task_id])? {
+                if stmt.exists(rusqlite::params![task_id, cutoff])? {
                     terminal.push(task_id);
                 }
             }

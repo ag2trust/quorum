@@ -1074,12 +1074,19 @@ pub(crate) async fn recover(
                 }),
         )
         .collect();
+    let record_db = config.db_path.clone();
     let gc = wt_mgr
         .gc_orphaned_detailed(
             &config.repo_dir,
             &config.worktree_base,
             &active_worktrees,
             &allocations,
+            |identity, created| {
+                let db_path = record_db.clone();
+                async move {
+                    super::worker_recover::record_recover_rows(&db_path, &identity, &created).await
+                }
+            },
         )
         .await;
     if !gc.removed.is_empty() {
@@ -1092,7 +1099,7 @@ pub(crate) async fn recover(
             reason: "startup_gc".into(),
             trusted: Vec::new(),
         };
-        super::worker_recover::record_created_recover_refs(
+        super::worker_recover::after_recover_refs_created(
             config,
             wt_mgr,
             &identity,

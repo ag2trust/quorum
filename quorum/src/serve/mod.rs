@@ -2947,26 +2947,26 @@ async fn restore_after_continuation_base(
     worktree: &Path,
     resume: &std::result::Result<worktree::RecoverResume, String>,
     base_merge: ContinuationBaseMerge,
-) -> Option<std::result::Result<Vec<String>, String>> {
+) -> std::result::Result<Option<std::result::Result<Vec<String>, String>>, String> {
     let Ok(worktree::RecoverResume::Resumed {
         recover,
         restore_uncommitted: true,
         ..
     }) = resume
     else {
-        return None;
+        return Ok(None);
     };
-    Some(match base_merge {
-        ContinuationBaseMerge::Clean => {
-            wt_mgr
-                .restore_snapshot_as_uncommitted(repo_dir, worktree, recover)
-                .await
-        }
-        ContinuationBaseMerge::Conflicted => Err(
+    match base_merge {
+        // Outer `Err` (worktree not provably clean) fails provisioning.
+        ContinuationBaseMerge::Clean => wt_mgr
+            .restore_snapshot_as_uncommitted(repo_dir, worktree, recover)
+            .await
+            .map(Some),
+        ContinuationBaseMerge::Conflicted => Ok(Some(Err(
             "base integration left a merge conflict; uncommitted changes were not restored"
                 .to_string(),
-        ),
-    })
+        ))),
+    }
 }
 
 /// Provision a continuation checkout at the exact PR head, resume it from
@@ -2990,7 +2990,7 @@ async fn prepare_continue_pr_worktree(
         .integrate_continuation_base(&path, base_branch)
         .await?;
     let restored =
-        restore_after_continuation_base(wt_mgr, repo_dir, &path, &resume, base_merge).await;
+        restore_after_continuation_base(wt_mgr, repo_dir, &path, &resume, base_merge).await?;
     Ok((path, base_merge, (resume, restored)))
 }
 
@@ -23643,6 +23643,7 @@ async fn spawn_worker(
         }
     };
     let mut branch_resume: Option<std::result::Result<worktree::RecoverResume, String>> = None;
+    let mut branch_restored: Option<std::result::Result<Vec<String>, String>> = None;
     // Persist immutable allocation provenance before git creates anything.
     // Ref resolution is external I/O and completes before the short DB write.
     if continue_target.is_none() {
@@ -23688,6 +23689,16 @@ async fn spawn_worker(
                 .or_else(|| verified_dependency_base.clone())
                 .unwrap_or_else(|| format!("origin/{effective_base_branch}"));
             branch_resume = Some(match trusted_recover.as_ref() {
+                // No allocation row means a fresh branch allocation: a
+                // publication-reset retry deliberately starts clean.
+                Some(recover) if existing_allocation.is_none() => {
+                    Ok(worktree::RecoverResume::Skipped {
+                        recover: recover.clone(),
+                        reason: "the task restarted from a fresh branch allocation \
+                                 (publication reset), which starts clean"
+                            .to_string(),
+                    })
+                }
                 Some(recover) => {
                     wt_mgr
                         .resume_branch_from_recover(worker_repo_dir, recover, &branch, &resume_base)
@@ -23811,7 +23822,7 @@ async fn spawn_worker(
             .await
             .map(|path| (path, None))
     } else {
-        wt_mgr
+        match wt_mgr
             .provision(
                 worker_repo_dir,
                 &branch,
@@ -23819,7 +23830,20 @@ async fn spawn_worker(
                 &format!("origin/{effective_base_branch}"),
             )
             .await
-            .map(|path| (path, None))
+        {
+            Ok(path) => {
+                match restore_resumed_snapshot(config, wt_mgr, &wt_path, branch_resume.as_ref())
+                    .await
+                {
+                    Ok(restored) => {
+                        branch_restored = restored;
+                        Ok((path, None))
+                    }
+                    Err(fatal) => Err(fatal),
+                }
+            }
+            Err(error) => Err(error),
+        }
     };
     let continuation_context = match provision_result {
         Ok((_, prepared)) => {
@@ -23839,15 +23863,13 @@ async fn spawn_worker(
                 }
                 None => {
                     if let Some(resume) = branch_resume.as_ref() {
-                        let restored =
-                            restore_resumed_snapshot(config, wt_mgr, &wt_path, resume).await;
                         record_recover_resume(
                             &db_path,
                             task.id,
                             &agent_name,
                             "task branch",
                             resume,
-                            restored.as_ref(),
+                            branch_restored.as_ref(),
                         )
                         .await;
                     }
@@ -28434,7 +28456,7 @@ async fn spawn_remediation_worker(
                         resume,
                         base_merge,
                     )
-                    .await;
+                    .await?;
                 }
                 wt_mgr.disable_push(&wt_path).await.map_err(|error| {
                     format!("remediation push lockout failed for PR #{pr}: {error}")
@@ -28463,7 +28485,7 @@ async fn spawn_remediation_worker(
                     resume,
                     ContinuationBaseMerge::Clean,
                 )
-                .await;
+                .await?;
             }
             wt_mgr.disable_push(&wt_path).await.map_err(|error| {
                 format!("remediation push lockout failed for PR #{pr}: {error}")
@@ -58468,18 +58490,29 @@ exec /bin/cat '{stdout}'
         let done = recover_fixture_task(&db_path);
         let cancelled = recover_fixture_task(&db_path);
         let open = recover_fixture_task(&db_path);
+        let recent = recover_fixture_task(&db_path);
         {
             let conn = quorum_core::db::open(&db_path).unwrap();
-            conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [done])
-                .unwrap();
+            let past_grace = now_unix() - worker_recover::RECOVER_REF_TERMINAL_GRACE_SECS - 60;
             conn.execute(
-                "UPDATE tasks SET status='cancelled' WHERE id=?1",
-                [cancelled],
+                "UPDATE tasks SET status='done', updated_at=?2 WHERE id=?1",
+                rusqlite::params![done, past_grace],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='cancelled', updated_at=?2 WHERE id=?1",
+                rusqlite::params![cancelled, past_grace],
+            )
+            .unwrap();
+            // Cancelled just now: still inside the owner's grace period.
+            conn.execute(
+                "UPDATE tasks SET status='cancelled', updated_at=?2 WHERE id=?1",
+                rusqlite::params![recent, now_unix()],
             )
             .unwrap();
         }
         let head = sync_fixture_git(&repo, &["rev-parse", "HEAD"]);
-        for task in [done, cancelled, open, 9999] {
+        for task in [done, cancelled, open, recent, 9999] {
             sync_fixture_git(
                 &repo,
                 &[
@@ -58495,7 +58528,7 @@ exec /bin/cat '{stdout}'
         );
         {
             let mut conn = quorum_core::db::open(&db_path).unwrap();
-            for task in [done, open] {
+            for task in [done, open, recent] {
                 quorum_core::recover_refs::record(
                     &mut conn,
                     &quorum_core::recover_refs::NewRecoverRef {
@@ -58538,6 +58571,14 @@ exec /bin/cat '{stdout}'
                 .len(),
             1
         );
+        assert_eq!(
+            quorum_core::recover_refs::for_task(&conn, recent)
+                .unwrap()
+                .len(),
+            1,
+            "a just-cancelled task keeps its snapshot for the grace period"
+        );
+        assert_eq!(recover_refs_for(&repo, recent).len(), 1);
     }
 
     /// A worker can write any ref in the shared repository. A ref in a task's
@@ -58747,6 +58788,139 @@ exec /bin/cat '{stdout}'
             )
             .unwrap();
         assert_eq!(notes, 0, "nothing was resumed");
+        drop(conn);
+        second.kill_and_reap().await;
+    }
+
+    /// Continuation path: the base integration changed the snapshot's lines.
+    /// Restoring must leave a verified-clean worktree (never half-applied)
+    /// and report the failure; the work stays in the recover ref.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn continuation_restore_conflict_leaves_clean_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = recover_fixture_repo(dir.path());
+        let base_dir = dir.path().join("worktrees");
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let wt_mgr = WorktreeManager::new();
+        let wt = base_dir.join("Anvil-t7");
+        wt_mgr
+            .provision(&repo, "daemon/anvil-t7", &wt, "origin/main")
+            .await
+            .unwrap();
+        std::fs::write(wt.join("feature.rs"), "f\n").unwrap();
+        sync_fixture_git(&wt, &["add", "feature.rs"]);
+        sync_fixture_git(&wt, &["commit", "-qm", "worker"]);
+        let pr_head = sync_fixture_git(&wt, &["rev-parse", "HEAD"]);
+        std::fs::write(wt.join("state.txt"), "snapshot edit\n").unwrap();
+        let snap = wt_mgr
+            .release_preserving(
+                &repo,
+                &wt,
+                "daemon/anvil-t7",
+                true,
+                &worktree::RecoverIdentity::new(7, "Anvil", "idle_reaped"),
+                |_| async { Ok(()) },
+            )
+            .await
+            .unwrap()
+            .remove(0);
+        std::fs::write(repo.join("state.txt"), "base edit\n").unwrap();
+        sync_fixture_git(&repo, &["commit", "-qam", "base"]);
+        sync_fixture_git(&repo, &["push", "-q", "origin", "main"]);
+        let wt2 = base_dir.join("Forge-t7");
+        wt_mgr
+            .provision(&repo, "remediation/forge-t7", &wt2, &pr_head)
+            .await
+            .unwrap();
+
+        let resume = resume_continuation_checkout(&wt_mgr, &repo, &wt2, Some(&snap)).await;
+        assert!(matches!(
+            resume,
+            Ok(worktree::RecoverResume::Resumed {
+                restore_uncommitted: true,
+                ..
+            })
+        ));
+        let base_merge = wt_mgr
+            .integrate_continuation_base(&wt2, "main")
+            .await
+            .unwrap();
+        assert_eq!(base_merge, ContinuationBaseMerge::Clean);
+        let restored = restore_after_continuation_base(&wt_mgr, &repo, &wt2, &resume, base_merge)
+            .await
+            .expect("a reverted restore must not fail provisioning");
+
+        assert!(matches!(restored, Some(Err(_))), "{restored:?}");
+        assert!(
+            sync_fixture_git(&wt2, &["status", "--porcelain", "--untracked-files=all"]).is_empty()
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt2.join("state.txt")).unwrap(),
+            "base edit\n"
+        );
+        let note =
+            worker_recover::recover_resume_note("Forge", "PR head", &resume, restored.as_ref())
+                .unwrap();
+        assert!(note.contains("FAILED"), "{note}");
+        assert!(note.contains(&snap.refname), "{note}");
+    }
+
+    /// A publication-reset retry deletes the task's allocation and means
+    /// "start clean": an old snapshot must not be resumed onto it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_reset_retry_does_not_resume_old_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = recover_fixture_repo(dir.path());
+        let db_path = dir.path().join("quorum.db");
+        let task_id = recover_fixture_task(&db_path);
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo.clone());
+        config.worktree_base = dir.path().join("worktrees");
+        config.agent_bin = Some(
+            fake_stdin_holding_agent(dir.path(), "hold-worker")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let base = sync_fixture_git(&repo, &["rev-parse", "origin/main"]);
+
+        let first = recover_spawn(&config, &wt_mgr, &mut names).await;
+        std::fs::write(first.worktree_path.join("state.txt"), "old attempt\n").unwrap();
+        reap_idle_zombie_worker(&config, &wt_mgr, &mut names, first, 999, 10).await;
+        assert_eq!(recover_refs_for(&repo, task_id).len(), 1);
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute("DELETE FROM task_branches WHERE task_id=?1", [task_id])
+                .unwrap();
+        }
+
+        let second = recover_spawn(&config, &wt_mgr, &mut names).await;
+
+        assert_eq!(
+            sync_fixture_git(&second.worktree_path, &["rev-parse", "HEAD"]),
+            base
+        );
+        assert_eq!(
+            std::fs::read_to_string(second.worktree_path.join("state.txt")).unwrap(),
+            "base\n"
+        );
+        assert_eq!(
+            recover_refs_for(&repo, task_id).len(),
+            1,
+            "kept for manual recovery"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let skipped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_notes WHERE task_id=?1 AND agent='daemon' \
+                 AND body LIKE '%publication reset%'",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(skipped, 1);
         drop(conn);
         second.kill_and_reap().await;
     }
