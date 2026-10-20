@@ -2042,3 +2042,53 @@ fn classify_explicit_config_zero_max_rework_fails_usage() {
         .assert()
         .code(2);
 }
+
+#[test]
+fn task_update_edit_refusals_name_their_cause_and_exit_1() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "t",
+            "--body-stdin",
+        ])
+        .write_stdin("one")
+        .assert()
+        .success();
+    let update = |rev: &str, body: &str| {
+        quorum(home.path())
+            .args([
+                "task-update",
+                "--agent",
+                "boss",
+                "--task-id",
+                "1",
+                "--expected-revision",
+                rev,
+                "--body-stdin",
+            ])
+            .write_stdin(body.to_string())
+            .assert()
+    };
+    // No-op edit.
+    update("1", "one")
+        .code(1)
+        .stderr(predicates::str::contains("no change"))
+        .stderr(predicates::str::contains("not the current holder").not());
+    // Real edit, then a stale revision.
+    update("1", "two").success();
+    update("1", "three")
+        .code(1)
+        .stderr(predicates::str::contains("stale --expected-revision"))
+        .stderr(predicates::str::contains("not the current holder").not());
+    update("2", "three").success();
+    update("3", "four").success();
+    // Edit limit.
+    update("4", "five")
+        .code(1)
+        .stderr(predicates::str::contains("edit limit"))
+        .stderr(predicates::str::contains("not the current holder").not());
+}

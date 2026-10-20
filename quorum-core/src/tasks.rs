@@ -85,6 +85,8 @@ pub const TERMINAL_RETRY_RECONCILE_LIMIT: i64 = 8;
 /// Legacy one-shot remediation head-check marker. New terminal parks never
 /// write it; restart reconciliation removes it without reviving the task.
 pub const PARKED_HEAD_CHECK_REF: &str = "daemon_parked_head_check";
+/// Maximum number of body/refs/depends-on edits per task.
+pub const MAX_TASK_EDITS: i64 = 3;
 pub const CI_REMEDIATION_REQUESTED_REF: &str = "ci_remediation_requested";
 pub const CI_REMEDIATION_PR_REF: &str = "ci_remediation_pr";
 pub const CI_REMEDIATION_HEAD_SHA_REF: &str = "ci_remediation_head_sha";
@@ -3861,10 +3863,26 @@ pub fn update(
             .is_some_and(|depends_on| existing_depends_on.as_deref() != Some(depends_on))
         || (fields.refs.is_some() && preserved_refs != existing_refs);
 
-    if edit_requested
-        && (fields.expected_revision != Some(revision) || !edit_changed || edit_count >= 3)
-    {
-        return Err(QuorumError::NotHolder);
+    if edit_requested {
+        if fields.expected_revision != Some(revision) {
+            return Err(QuorumError::EditRejected(format!(
+                "stale --expected-revision: task #{id} is at revision {revision}, \
+                 expected {}; re-read the task and retry",
+                fields
+                    .expected_revision
+                    .map_or_else(|| "none".to_string(), |r| r.to_string())
+            )));
+        }
+        if edit_count >= MAX_TASK_EDITS {
+            return Err(QuorumError::EditRejected(format!(
+                "task #{id} has reached the edit limit ({MAX_TASK_EDITS} edits)"
+            )));
+        }
+        if !edit_changed {
+            return Err(QuorumError::EditRejected(format!(
+                "no change: the supplied body/refs/depends-on match task #{id} at revision {revision}"
+            )));
+        }
     }
 
     let generated_member: bool = tx.query_row(
@@ -4012,11 +4030,13 @@ pub fn update(
     if edit_requested {
         let revision_rows = tx.execute(
             "UPDATE tasks SET revision=revision+1,edit_count=edit_count+1,updated_at=?3
-             WHERE id=?1 AND revision=?2 AND edit_count < 3",
-            params![id, revision, now],
+             WHERE id=?1 AND revision=?2 AND edit_count < ?4",
+            params![id, revision, now, MAX_TASK_EDITS],
         )?;
         if revision_rows != 1 {
-            return Err(QuorumError::NotHolder);
+            return Err(QuorumError::EditRejected(format!(
+                "task #{id} changed concurrently or reached the edit limit; re-read and retry"
+            )));
         }
         // An accepted edit before materialization cancels the pending admission
         // aggregate and returns the new revision to ordinary classification.
@@ -15381,7 +15401,29 @@ mod tests {
             },
             20,
         );
-        assert!(matches!(replay, Err(QuorumError::NotHolder)));
+        match replay {
+            Err(QuorumError::EditRejected(m)) => {
+                assert!(m.contains("stale --expected-revision"), "{m}");
+                assert!(m.contains("revision 4") && m.contains("expected 3"), "{m}");
+            }
+            other => panic!("stale revision must be EditRejected, got {other:?}"),
+        }
+        let noop = update(
+            &mut c,
+            "owner",
+            id,
+            &TaskUpdate {
+                body: Some("three"),
+                expected_revision: Some(4),
+                ..Default::default()
+            },
+            20,
+        );
+        // At the cap the limit is reported before the no-op check.
+        assert!(
+            matches!(&noop, Err(QuorumError::EditRejected(m)) if m.contains("edit limit")),
+            "{noop:?}"
+        );
         let fourth = update(
             &mut c,
             "owner",
@@ -15393,10 +15435,62 @@ mod tests {
             },
             21,
         );
-        assert!(matches!(fourth, Err(QuorumError::NotHolder)));
+        match fourth {
+            Err(QuorumError::EditRejected(m)) => assert!(m.contains("edit limit"), "{m}"),
+            other => panic!("edit cap must be EditRejected, got {other:?}"),
+        }
         let task = get(&c, id).unwrap().unwrap();
         assert_eq!(task.body.as_deref(), Some("three"));
         assert_eq!((task.revision, task.edit_count), (4, 3));
+    }
+
+    #[test]
+    fn noop_edit_is_reported_as_no_change_not_authority_failure() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "owner",
+            "t",
+            Some("same"),
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let err = update(
+            &mut c,
+            "owner",
+            id,
+            &TaskUpdate {
+                body: Some("same"),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            2,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, QuorumError::EditRejected(m) if m.contains("no change")),
+            "{err:?}"
+        );
+        assert_eq!(err.exit_code(), 1);
+        // A genuine authority failure stays NotHolder.
+        let other = update(
+            &mut c,
+            "stranger",
+            id,
+            &TaskUpdate {
+                body: Some("different"),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            3,
+        )
+        .unwrap_err();
+        assert!(matches!(other, QuorumError::NotHolder), "{other:?}");
     }
 
     #[test]

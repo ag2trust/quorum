@@ -129,8 +129,14 @@ fn tail_falls_back_to_latest_retained_session_when_agent_not_in_flight() {
 fn tail_unknown_agent_without_retained_logs_exits_2_with_clear_message() {
     let home = tempfile::tempdir().unwrap();
     quorum(home.path()).arg("init").assert().success();
-    let out = quorum(home.path()).args(["tail", "ghost"]).output().unwrap();
+    let out = quorum(home.path())
+        .args(["tail", "ghost"])
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(2), "{out:?}");
     let err = String::from_utf8(out.stderr).unwrap();
-    assert!(err.contains("no session log found for agent 'ghost'"), "{err}");
+    assert!(
+        err.contains("no session log found for agent 'ghost'"),
+        "{err}"
+    );
 }

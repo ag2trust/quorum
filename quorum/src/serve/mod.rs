@@ -8990,6 +8990,7 @@ fn classify_tick_error(e: &QuorumError) -> TickErrorAction {
         // Transient / retryable: a lost race, momentary lock contention, or a one-off
         // I/O or DB hiccup that a later tick may clear.
         QuorumError::NotHolder
+        | QuorumError::EditRejected(_)
         | QuorumError::Usage(_)
         | QuorumError::BadInput(_)
         | QuorumError::Busy

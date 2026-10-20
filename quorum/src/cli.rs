@@ -114,6 +114,8 @@ pub enum Command {
         #[arg(long = "task-id")]
         task_id: i64,
         /// Current task revision. Required when changing body, refs, or dependencies.
+        /// A stale revision, a no-op edit, or the 3-edit limit is refused (exit 1) with
+        /// a message naming the cause.
         #[arg(long = "expected-revision")]
         expected_revision: Option<i64>,
         #[arg(long)]
@@ -132,7 +134,7 @@ pub enum Command {
         note_file: Option<PathBuf>,
         /// Replace this task's dependency list. JSON array of task ids, e.g. '[1,3]'.
         /// Pass '[]' to clear all dependencies. Creator or assignee guard; blocked on
-        /// terminal tasks (done/failed).
+        /// done and cancelled tasks, and on failed tasks unless the daemon parked them.
         #[arg(long = "depends-on")]
         depends_on: Option<String>,
     },

@@ -2342,7 +2342,10 @@ mod tests {
         )
         .unwrap();
         let n = cascade_dead_deps(&c, 300, 100).unwrap();
-        assert_eq!(n, 1, "cancelled dep is unsatisfiable even with a live sibling dep");
+        assert_eq!(
+            n, 1,
+            "cancelled dep is unsatisfiable even with a live sibling dep"
+        );
         let t = crate::tasks::get(&c, child).unwrap().unwrap();
         assert_eq!(t.status, "failed");
         let refs: serde_json::Value = serde_json::from_str(t.refs.as_deref().unwrap()).unwrap();
@@ -2387,7 +2390,10 @@ mod tests {
         .unwrap();
         let n = cascade_dead_deps(&c, 300, 100).unwrap();
         assert_eq!(n, 0, "retryable failed dep must wait for live siblings");
-        assert_eq!(crate::tasks::get(&c, child).unwrap().unwrap().status, "open");
+        assert_eq!(
+            crate::tasks::get(&c, child).unwrap().unwrap().status,
+            "open"
+        );
     }
 
     #[test]
