@@ -59957,7 +59957,10 @@ exec /bin/cat '{stdout}'
             .is_empty());
         let notes: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM task_notes WHERE task_id=?1 AND agent='daemon'",
+                // Recovery bookkeeping (e.g. the reap's failure note) is expected;
+                // only a resume / recover-ref note would mean the forgery was trusted.
+                "SELECT COUNT(*) FROM task_notes WHERE task_id=?1 AND agent='daemon'
+                   AND (body LIKE '%resum%' OR body LIKE '%recover ref%')",
                 [task_id],
                 |row| row.get(0),
             )
