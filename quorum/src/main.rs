@@ -1186,6 +1186,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             agent,
             task_id,
             state,
+            reason_stdin,
+            reason_file,
             run_id,
         } => {
             match state.as_str() {
@@ -1196,11 +1198,14 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     )));
                 }
             }
+            let reason =
+                read_optional_text(reason_stdin, reason_file, "--reason-stdin", "--reason-file")?;
+            let reason = quorum_core::tasks::validate_react_reason(&state, reason.as_deref())?;
             let rid = resolve_run_id(run_id, "react")?;
             // Retain the legacy intent flags, but never trust them as target
             // authority: the endpoint derives agent and task from `rid`.
             let _ = (agent, task_id);
-            let id = agent_client::react(&rid, &state)?;
+            let id = agent_client::react(&rid, &state, reason.as_deref())?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
             Ok(0)
         }

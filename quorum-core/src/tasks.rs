@@ -107,6 +107,64 @@ pub const MAX_DEPENDENCY_BASE_WAIT_ATTEMPTS: i64 = 3;
 /// data cannot turn one admission read into unbounded work.
 pub const MAX_DEPENDENCY_DECOMPOSITION_DEPTH: usize = 8;
 
+/// Prefix of the durable note recorded on every crash-recovery transition.
+pub const WORKER_FAILURE_NOTE_PREFIX: &str = "worker failure, recovery attempt ";
+const WORKER_FAILURE_CAUSE_LIMIT: usize = 1024;
+
+/// Upper bound on a worker's `react` reason (bytes), enforced at the CLI and
+/// again at the endpoint.
+pub const REACT_REASON_MAX_BYTES: usize = 8 * 1024;
+/// Bounded excerpt of a reaction reason carried in owner alerts and events.
+const PARK_REASON_EXCERPT_CHARS: usize = 300;
+
+/// Validate a `react` reason. `blocked` and `needs-info` require a non-empty
+/// reason (it is the only durable carrier of the question or blocker); other
+/// states accept an optional one. Text safety (invariant 9): no NUL.
+pub fn validate_react_reason(state: &str, reason: Option<&str>) -> Result<Option<String>> {
+    let reason = reason.map(str::trim).filter(|r| !r.is_empty());
+    if matches!(state, "blocked" | "needs-info") && reason.is_none() {
+        return Err(QuorumError::Usage(format!(
+            "react --state {state} requires a reason: pass --reason-stdin or --reason-file"
+        )));
+    }
+    if let Some(reason) = reason {
+        if reason.contains('\0') {
+            return Err(QuorumError::BadInput("embedded NUL byte in reason".into()));
+        }
+        if reason.len() > REACT_REASON_MAX_BYTES {
+            return Err(QuorumError::Usage(format!(
+                "react reason is {} bytes; the limit is {REACT_REASON_MAX_BYTES}",
+                reason.len()
+            )));
+        }
+    }
+    Ok(reason.map(str::to_string))
+}
+
+/// The reason attached to the worker's latest reaction, when that reaction is
+/// `state`. Reactions are consumed into the journal state (which carries no
+/// reason), so the mailbox row stays the durable carrier.
+fn latest_reaction_reason(
+    conn: &Connection,
+    agent: &str,
+    task_id: i64,
+    state: &str,
+) -> Result<Option<String>> {
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT note, feedback FROM mailbox
+             WHERE agent=?1 AND kind='task_update' AND task_id=?2
+             ORDER BY id DESC LIMIT 1",
+            params![agent, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(row
+        .filter(|(note, _)| note.as_deref() == Some(state))
+        .and_then(|(_, reason)| reason)
+        .filter(|reason| !reason.trim().is_empty()))
+}
+
 /// Return the durable poison-retry generation encoded in task refs. Missing
 /// and malformed values deliberately read as the legacy generation zero: a
 /// malformed external edit can never advance a live daemon's poison budget.
@@ -3602,6 +3660,23 @@ where
         assignee = None;
     }
 
+    if is_crash_recovery {
+        // Durable, bounded record of why the worker died so the replacement
+        // worker's prompt can carry it (owner alerts are ephemeral).
+        let cause = crate::classify::truncate_for_prompt(failure_cause, WORKER_FAILURE_CAUSE_LIMIT);
+        tx.execute(
+            "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, 'daemon', ?3)",
+            params![
+                id,
+                now,
+                format!(
+                    "{WORKER_FAILURE_NOTE_PREFIX}{}\n{cause}",
+                    task.recovery_attempts + 1
+                )
+            ],
+        )?;
+    }
+
     for eff in &effects {
         match eff {
             Effect::SetAuthor { agent } => {
@@ -4628,6 +4703,20 @@ pub fn dispose_dead_turn_runner(
         }
         Some("blocked" | "needs-info") => {
             let reason = reaction.as_deref().expect("matched explicit reaction");
+            let detail = latest_reaction_reason(&tx, agent, id, reason)?.map(|detail| {
+                crate::classify::truncate_for_prompt(&detail, REACT_REASON_MAX_BYTES)
+            });
+            let note_body = match &detail {
+                Some(detail) => format!("parked: {reason}\n\nworker {agent} reason:\n{detail}"),
+                None => format!("parked: {reason}"),
+            };
+            let excerpt = match &detail {
+                Some(detail) => format!(
+                    "{reason}: {}",
+                    crate::classify::truncate_for_prompt(detail, PARK_REASON_EXCERPT_CHARS)
+                ),
+                None => reason.to_string(),
+            };
             // Preserve the lifecycle phase that the reacting worker owned.
             // `task-retry` can only reopen `working`, while a rework retry
             // must remain `rework` for its eventual `ReworkPushed` event.
@@ -4642,10 +4731,10 @@ pub fn dispose_dead_turn_runner(
             tx.execute(
                 "INSERT INTO task_notes(task_id, ts, agent, body)
                  VALUES (?1, ?2, 'daemon', ?3)",
-                params![id, now, format!("parked: {reason}")],
+                params![id, now, note_body],
             )?;
-            crate::events::emit(&tx, "task_parked", &lease_target(id), reason, now)?;
-            alert_owner_of_park(&tx, id, reason, now)?;
+            crate::events::emit(&tx, "task_parked", &lease_target(id), &excerpt, now)?;
+            alert_owner_of_park(&tx, id, &excerpt, now)?;
             crate::decomposition::block_graph_if_child_failed(&tx, id, reason, now)?;
             consume_pending_worker_reactions_tx(&tx, agent, id, now)?;
             tx.commit()?;
@@ -7874,6 +7963,214 @@ mod tests {
         assert_eq!(task.status, "failed");
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
         assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
+    }
+
+    #[test]
+    fn validate_react_reason_requires_bounded_text_for_blocked_and_needs_info() {
+        for state in ["blocked", "needs-info"] {
+            assert_eq!(
+                validate_react_reason(state, None).unwrap_err().exit_code(),
+                2
+            );
+            assert_eq!(
+                validate_react_reason(state, Some("  \n"))
+                    .unwrap_err()
+                    .exit_code(),
+                2
+            );
+            let too_big = "x".repeat(REACT_REASON_MAX_BYTES + 1);
+            assert_eq!(
+                validate_react_reason(state, Some(&too_big))
+                    .unwrap_err()
+                    .exit_code(),
+                2
+            );
+            assert!(validate_react_reason(state, Some("a\0b")).is_err());
+            assert_eq!(
+                validate_react_reason(state, Some(" why \n")).unwrap(),
+                Some("why".to_string())
+            );
+        }
+        assert_eq!(validate_react_reason("failed", None).unwrap(), None);
+        assert_eq!(validate_react_reason("note", None).unwrap(), None);
+    }
+
+    #[test]
+    fn dead_turn_runner_park_persists_reaction_reason_in_note_alert_and_event() {
+        for state in ["blocked", "needs-info"] {
+            let (_d, mut c) = open_tmp();
+            let id = create(
+                &mut c,
+                "boss",
+                "t",
+                None,
+                0,
+                None,
+                Some(r#"{"branch":"daemon/worker-t1"}"#),
+                None,
+                None,
+                1000,
+            )
+            .unwrap();
+            claim(&mut c, "worker", Some(id), &[], TTL, 1000).unwrap();
+            let question = format!(
+                "QUESTION-{state}: which schema should {}?",
+                "x".repeat(2000)
+            );
+            crate::mailbox::append(
+                &mut c,
+                &crate::mailbox::MailboxRow {
+                    agent: "worker".into(),
+                    kind: crate::mailbox::MailboxKind::TaskUpdate,
+                    task_id: Some(id),
+                    pr: None,
+                    verdict: None,
+                    feedback: Some(question.clone()),
+                    note: Some(state.into()),
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            // Phase 2 consumed the row and projected only the state.
+            worker_reacts(&mut c, id, state);
+            c.execute("UPDATE mailbox SET consumed_at=1000", [])
+                .unwrap();
+
+            let disposition = dispose_dead_turn_runner(
+                &mut c,
+                id,
+                "worker",
+                &ProviderBlock {
+                    provider: "codex".into(),
+                    reason: "process exited".into(),
+                },
+                &dead_turn_retry(),
+                1001,
+            )
+            .unwrap();
+            assert_eq!(disposition, DeadTurnRunnerDisposition::ReactionParked);
+
+            let note: String = c
+                .query_row(
+                    "SELECT body FROM task_notes WHERE task_id=?1 AND body LIKE 'parked:%'",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                note,
+                format!("parked: {state}\n\nworker worker reason:\n{question}")
+            );
+            let alert: String = c
+                .query_row(
+                    "SELECT body FROM messages WHERE kind='alert' AND refs=?1",
+                    [format!("task:{id}")],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(alert.contains(&format!("QUESTION-{state}")), "{alert}");
+            assert!(
+                alert.len() < 700,
+                "alert excerpt must be bounded: {}",
+                alert.len()
+            );
+            let event: String = c
+                .query_row(
+                    "SELECT body FROM events WHERE kind='task_parked' AND subject=?1",
+                    [lease_target(id)],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                event.starts_with(&format!("{state}: QUESTION-{state}")),
+                "{event}"
+            );
+            assert!(event.chars().count() < 400);
+        }
+    }
+
+    #[test]
+    fn dead_turn_runner_park_ignores_a_reason_from_a_different_reaction_state() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "t",
+            None,
+            0,
+            None,
+            Some(r#"{"branch":"daemon/worker-t1"}"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "worker", Some(id), &[], TTL, 1000).unwrap();
+        crate::mailbox::append(
+            &mut c,
+            &crate::mailbox::MailboxRow {
+                agent: "worker".into(),
+                kind: crate::mailbox::MailboxKind::TaskUpdate,
+                task_id: Some(id),
+                pr: None,
+                verdict: None,
+                feedback: Some("STALE needs-info question".into()),
+                note: Some("needs-info".into()),
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap();
+        append_worker_reaction(&mut c, id, "blocked");
+        let disposition = dispose_dead_turn_runner(
+            &mut c,
+            id,
+            "worker",
+            &ProviderBlock {
+                provider: "codex".into(),
+                reason: "process exited".into(),
+            },
+            &dead_turn_retry(),
+            1001,
+        )
+        .unwrap();
+        assert_eq!(disposition, DeadTurnRunnerDisposition::ReactionParked);
+        let note: String = c
+            .query_row(
+                "SELECT body FROM task_notes WHERE body LIKE 'parked:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(note, "parked: blocked");
+    }
+
+    #[test]
+    fn agent_failed_records_a_durable_bounded_failure_note() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c, "boss", "t", None, 0, None,
+            Some(r#"{"branch":"daemon/worker-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None, None, 1000,
+        )
+        .unwrap();
+        claim(&mut c, "worker", Some(id), &[], TTL, 1000).unwrap();
+        let reason = format!(
+            "worker idle 900s - zombie reaped {}TAIL_HIDDEN",
+            "z".repeat(3000)
+        );
+        apply_event(&mut c, "worker", id, &Event::AgentFailed { reason }, 1001).unwrap();
+        let note: String = c
+            .query_row(
+                "SELECT body FROM task_notes WHERE task_id=?1 AND body LIKE ?2",
+                params![id, format!("{WORKER_FAILURE_NOTE_PREFIX}%")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(note.starts_with("worker failure, recovery attempt 1\nworker idle 900s"));
+        assert!(!note.contains("TAIL_HIDDEN"));
+        assert!(note.chars().count() < 1200);
     }
 
     #[test]

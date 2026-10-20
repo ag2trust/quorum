@@ -512,6 +512,49 @@ fn daemon_endpoint_is_bounded_authoritative_and_torn_down() {
         &request("worker-cap", json!({"type":"react","state":"note"})),
     );
     assert_eq!(reaction["ok"], true);
+    // blocked/needs-info without a reason are rejected and write nothing.
+    let mailbox_before = quorum_core::db::open(&db)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM mailbox", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    for state in ["blocked", "needs-info"] {
+        for body in [
+            json!({"type":"react","state":state}),
+            json!({"type":"react","state":state,"reason":"   "}),
+            json!({"type":"react","state":state,"reason":"x".repeat(9000)}),
+        ] {
+            let rejected = exchange(&endpoint, &request("worker-cap", body));
+            assert_eq!(rejected["ok"], false, "{rejected}");
+            assert_eq!(rejected["error"]["code"], "invalid_operation", "{rejected}");
+        }
+    }
+    let with_reason = exchange(
+        &endpoint,
+        &request(
+            "worker-cap",
+            json!({"type":"react","state":"needs-info","reason":"which API version?"}),
+        ),
+    );
+    assert_eq!(with_reason["ok"], true);
+    let conn = quorum_core::db::open(&db).unwrap();
+    let (note, feedback): (String, String) = conn
+        .query_row(
+            "SELECT note, feedback FROM mailbox WHERE id=?1",
+            [with_reason["result"]["mailbox_id"].as_i64().unwrap()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (note.as_str(), feedback.as_str()),
+        ("needs-info", "which API version?")
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM mailbox", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        mailbox_before + 1,
+        "rejected reactions must not write mailbox rows"
+    );
+    drop(conn);
     let worker_note = exchange(
         &endpoint,
         &request(
