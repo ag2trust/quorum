@@ -1437,21 +1437,29 @@ mod tests {
         let mut log =
             SessionLog::create(dir.path(), "Agent", "worker", Some(1), "s", "b", 1000).unwrap();
 
-        let raw = r#"{"type":"system","message":"init","custom":42}"#;
+        let raw = r#"{"type":"mystery","message":"init","custom":42}"#;
         let events = crate::serve::runner::normalize_claude_line(raw);
         assert!(events.is_empty());
         log.log_raw_and_normalized(raw, &events);
+        // System lines are liveness-only: kept raw, never rendered.
+        let system = r#"{"type":"system","subtype":"task_started","custom":43}"#;
+        let system_events = crate::serve::runner::normalize_claude_line(system);
+        assert!(matches!(
+            system_events.as_slice(),
+            [crate::serve::runner::AgentEvent::Liveness { .. }]
+        ));
+        log.log_raw_and_normalized(system, &system_events);
 
         let stream = fs::read_to_string(log.dir().join("stream.jsonl")).unwrap();
         assert!(
-            stream.contains("custom"),
+            stream.contains("custom") && stream.contains("43"),
             "unknown events must still appear in stream.jsonl"
         );
 
         let transcript = fs::read_to_string(log.dir().join("transcript.md")).unwrap();
         assert!(
-            !transcript.contains("custom"),
-            "unknown events must not render to transcript"
+            !transcript.contains("custom") && !transcript.contains("task_started"),
+            "unknown and liveness events must not render to transcript"
         );
     }
 }

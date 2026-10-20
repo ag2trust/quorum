@@ -515,6 +515,10 @@ pub enum Command {
         /// Max seconds an active worker/reviewer may go without emitting an event.
         #[arg(long)]
         max_idle_secs: Option<u64>,
+        /// Idle limit while an agent has an outstanding tool call or background
+        /// task (default: 3600, max: 86400; never below max_idle_secs).
+        #[arg(long)]
+        max_busy_idle_secs: Option<u64>,
         /// Max wall-clock seconds per task (across all turns).
         #[arg(long)]
         max_task_wall_secs: Option<u64>,

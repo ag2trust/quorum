@@ -21,6 +21,8 @@
 //!   `quorum submit --agent $QUORUM_AGENT` as a real subprocess, creating a mailbox row.
 //! - `FAKE_AGENT_ERROR_RESULT=N`: emits `is_error: true` on the first N turns,
 //!   then succeeds on subsequent turns. Used to test the daemon's error-refeed logic.
+//! - `FAKE_AGENT_REACT=<state>`: on turn 1, calls `quorum react --state <state>`
+//!   as a real subprocess before ending the turn (no submit).
 
 use std::io::{self, BufRead, Write};
 use std::process::{Command, Stdio};
@@ -209,6 +211,36 @@ fn run_quorum_submit() {
     }
 }
 
+fn run_quorum_react(state: &str) {
+    let Ok(agent) = std::env::var("QUORUM_AGENT") else {
+        eprintln!("fake-agent: QUORUM_AGENT not set, skipping react side-effect");
+        return;
+    };
+    let bin = quorum_bin_path();
+    let reacted = retry_submit(
+        || {
+            Command::new(&bin)
+                .args([
+                    "react",
+                    "--agent",
+                    &agent,
+                    "--task-id",
+                    "0",
+                    "--state",
+                    state,
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        },
+        std::thread::sleep,
+    );
+    if !reacted {
+        eprintln!("fake-agent: quorum react failed after {SUBMIT_ATTEMPTS} attempts");
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let bare = args.iter().any(|a| a == "--bare");
@@ -324,6 +356,11 @@ fn main() {
         let is_error = error_result_count > 0 && turn <= error_result_count;
         if side_effects && turn == 1 {
             run_quorum_submit();
+        }
+        if turn == 1 {
+            if let Ok(state) = std::env::var("FAKE_AGENT_REACT") {
+                run_quorum_react(&state);
+            }
         }
         emit_result(turn, cumulative_cost, is_error);
     }

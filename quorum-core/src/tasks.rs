@@ -4541,34 +4541,7 @@ pub fn dispose_dead_turn_runner(
         return Ok(DeadTurnRunnerDisposition::OwnershipTransferred);
     }
 
-    let durable_reaction: Option<String> = tx
-        .query_row(
-            "SELECT note FROM mailbox
-             WHERE agent=?1 AND kind='task_update' AND task_id=?2
-               AND consumed_at IS NULL
-             ORDER BY id DESC
-             LIMIT 1",
-            params![agent, id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .map(|state| state.unwrap_or_else(|| "note".into()));
-    // Phase 2 projects consumed reactions into the journal. A durable row
-    // written after its Phase 1 snapshot cannot appear there yet; prefer that
-    // later reaction so the classification has the same last-reaction-wins
-    // semantics as mailbox delivery.
-    let reaction = match durable_reaction {
-        Some(state) => Some(state),
-        None => tx
-            .query_row(
-                "SELECT agent_state FROM journal
-                 WHERE agent=?1 AND role='worker' AND task_id=?2",
-                params![agent, id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten(),
-    };
+    let reaction = latest_worker_reaction_tx(&tx, agent, id)?;
     match reaction.as_deref() {
         Some("failed") => {
             return apply_event_tx(
@@ -4585,26 +4558,7 @@ pub fn dispose_dead_turn_runner(
         }
         Some("blocked" | "needs-info") => {
             let reason = reaction.as_deref().expect("matched explicit reaction");
-            // Preserve the lifecycle phase that the reacting worker owned.
-            // `task-retry` can only reopen `working`, while a rework retry
-            // must remain `rework` for its eventual `ReworkPushed` event.
-            let refs = set_parked_refs(refs_raw.as_deref(), reason, &status, None)?;
-            tx.execute(
-                "UPDATE tasks
-                 SET status='failed', assignee=NULL, refs=?2, updated_at=?3
-                 WHERE id=?1",
-                params![id, refs, now],
-            )?;
-            deactivate_lease(&tx, id, now)?;
-            tx.execute(
-                "INSERT INTO task_notes(task_id, ts, agent, body)
-                 VALUES (?1, ?2, 'daemon', ?3)",
-                params![id, now, format!("parked: {reason}")],
-            )?;
-            crate::events::emit(&tx, "task_parked", &lease_target(id), reason, now)?;
-            alert_owner_of_park(&tx, id, reason, now)?;
-            crate::decomposition::block_graph_if_child_failed(&tx, id, reason, now)?;
-            consume_pending_worker_reactions_tx(&tx, agent, id, now)?;
+            park_worker_on_reaction_tx(&tx, id, agent, reason, &status, refs_raw.as_deref(), now)?;
             tx.commit()?;
             return Ok(DeadTurnRunnerDisposition::ReactionParked);
         }
@@ -4634,6 +4588,140 @@ pub fn dispose_dead_turn_runner(
     consume_pending_worker_reactions_tx(&tx, agent, id, now)?;
     tx.commit()?;
     Ok(DeadTurnRunnerDisposition::ProviderBlocked)
+}
+
+/// The worker's latest explicit reaction for this task. Phase 2 projects
+/// consumed reactions into the journal. A durable row written after its
+/// Phase 1 snapshot cannot appear there yet; prefer that later reaction so the
+/// classification has the same last-reaction-wins semantics as mailbox
+/// delivery.
+fn latest_worker_reaction_tx(
+    tx: &rusqlite::Transaction<'_>,
+    agent: &str,
+    id: i64,
+) -> Result<Option<String>> {
+    let durable_reaction: Option<String> = tx
+        .query_row(
+            "SELECT note FROM mailbox
+             WHERE agent=?1 AND kind='task_update' AND task_id=?2
+               AND consumed_at IS NULL
+             ORDER BY id DESC
+             LIMIT 1",
+            params![agent, id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .map(|state| state.unwrap_or_else(|| "note".into()));
+    Ok(match durable_reaction {
+        Some(state) => Some(state),
+        None => tx
+            .query_row(
+                "SELECT agent_state FROM journal
+                 WHERE agent=?1 AND role='worker' AND task_id=?2",
+                params![agent, id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten(),
+    })
+}
+
+/// Park a worker-owned task on its explicit `blocked` / `needs-info`
+/// reaction. Shared by turn-oriented runner exits and persistent workers
+/// whose turn ended on such a reaction. The caller commits.
+fn park_worker_on_reaction_tx(
+    tx: &rusqlite::Transaction<'_>,
+    id: i64,
+    agent: &str,
+    reason: &str,
+    status: &str,
+    refs_raw: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    // Preserve the lifecycle phase that the reacting worker owned.
+    // `task-retry` can only reopen `working`, while a rework retry
+    // must remain `rework` for its eventual `ReworkPushed` event.
+    let refs = set_parked_refs(refs_raw, reason, status, None)?;
+    tx.execute(
+        "UPDATE tasks
+         SET status='failed', assignee=NULL, refs=?2, updated_at=?3
+         WHERE id=?1",
+        params![id, refs, now],
+    )?;
+    deactivate_lease(tx, id, now)?;
+    tx.execute(
+        "INSERT INTO task_notes(task_id, ts, agent, body)
+         VALUES (?1, ?2, 'daemon', ?3)",
+        params![id, now, format!("parked: {reason}")],
+    )?;
+    crate::events::emit(tx, "task_parked", &lease_target(id), reason, now)?;
+    alert_owner_of_park(tx, id, reason, now)?;
+    crate::decomposition::block_graph_if_child_failed(tx, id, reason, now)?;
+    consume_pending_worker_reactions_tx(tx, agent, id, now)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistentReactionDisposition {
+    /// The task was parked on the worker's explicit reaction.
+    Parked,
+    /// No parkable reaction, a delivery outranks it, or the worker no longer
+    /// owns the working/rework phase. Nothing changed.
+    NotParked,
+}
+
+/// A persistent (stream-json) worker ended its turn after an explicit
+/// `blocked` / `needs-info` reaction. Turn-oriented runners reach the same
+/// park through `dispose_dead_turn_runner` when their process exits; a
+/// persistent child stays alive between turns, so without this the reaction
+/// would only be projected and the worker later idle-reaped as `AgentFailed`.
+/// A recorded or pending delivery always wins over the reaction.
+pub fn park_persistent_worker_reaction(
+    conn: &mut Connection,
+    id: i64,
+    agent: &str,
+    now: i64,
+) -> Result<PersistentReactionDisposition> {
+    let tx = begin_immediate(conn)?;
+    match classify_managed_exit_tx(&tx, ManagedRunRole::Worker, agent, id, None)? {
+        ManagedExitClassification::OutcomePending | ManagedExitClassification::OutcomeRecorded => {
+            tx.commit()?;
+            return Ok(PersistentReactionDisposition::NotParked);
+        }
+        ManagedExitClassification::OwnershipTransferred
+        | ManagedExitClassification::ActiveWithoutOutcome => {}
+    }
+    let task = tx
+        .query_row(
+            "SELECT status, refs, assignee FROM tasks WHERE id=?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((status, refs_raw, assignee)) = task else {
+        tx.commit()?;
+        return Ok(PersistentReactionDisposition::NotParked);
+    };
+    let owns_worker_phase = assignee.as_deref() == Some(agent)
+        || crate::capabilities::active_for_agent_task(&tx, agent, id, "worker")?.is_some();
+    if (status != "working" && status != "rework") || !owns_worker_phase {
+        tx.commit()?;
+        return Ok(PersistentReactionDisposition::NotParked);
+    }
+    let reaction = latest_worker_reaction_tx(&tx, agent, id)?;
+    let Some(reason @ ("blocked" | "needs-info")) = reaction.as_deref() else {
+        tx.commit()?;
+        return Ok(PersistentReactionDisposition::NotParked);
+    };
+    park_worker_on_reaction_tx(&tx, id, agent, reason, &status, refs_raw.as_deref(), now)?;
+    tx.commit()?;
+    Ok(PersistentReactionDisposition::Parked)
 }
 
 /// A turn-exit classifier may run after Phase 1 captured its mailbox batch.
@@ -7831,6 +7919,132 @@ mod tests {
         assert_eq!(task.status, "failed");
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
         assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
+    }
+
+    fn persistent_worker_task(c: &mut Connection) -> i64 {
+        let id = create(
+            c,
+            "boss",
+            "t",
+            None,
+            0,
+            None,
+            Some(r#"{"branch":"daemon/worker-t1"}"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(c, "worker", Some(id), &[], TTL, 1000).unwrap();
+        id
+    }
+
+    #[test]
+    fn persistent_worker_reaction_parks_like_dead_turn_runner() {
+        for (state, durable) in [
+            ("blocked", false),
+            ("needs-info", false),
+            ("needs-info", true),
+        ] {
+            let (_d, mut c) = open_tmp();
+            let id = persistent_worker_task(&mut c);
+            if durable {
+                // Committed after the daemon's mailbox snapshot: not yet
+                // projected into the journal.
+                late_worker_identity(&mut c, id, "worker", None);
+                append_worker_reaction(&mut c, id, state);
+            } else {
+                worker_reacts(&mut c, id, state);
+            }
+            let attempts_before = get(&c, id).unwrap().unwrap().recovery_attempts;
+
+            let disposition = park_persistent_worker_reaction(&mut c, id, "worker", 1001).unwrap();
+
+            assert_eq!(
+                disposition,
+                PersistentReactionDisposition::Parked,
+                "{state}"
+            );
+            let task = get(&c, id).unwrap().unwrap();
+            assert_eq!(task.status, "failed");
+            assert!(task.assignee.is_none());
+            assert_eq!(
+                task.recovery_attempts, attempts_before,
+                "a park is not an AgentFailed recovery attempt"
+            );
+            let refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            assert_eq!(refs[PARKED_REASON_REF], state);
+            assert_eq!(refs[PARKED_RESUME_STATUS_REF], "working");
+            let parked_events: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE kind='task_parked'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(parked_events, 1);
+            let unconsumed: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM mailbox
+                     WHERE kind='task_update' AND task_id=?1 AND consumed_at IS NULL",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(unconsumed, 0, "reactions are consumed with the park");
+        }
+    }
+
+    #[test]
+    fn persistent_worker_without_parkable_reaction_is_untouched() {
+        for state in [None, Some("note"), Some("failed")] {
+            let (_d, mut c) = open_tmp();
+            let id = persistent_worker_task(&mut c);
+            if let Some(state) = state {
+                worker_reacts(&mut c, id, state);
+            }
+            let disposition = park_persistent_worker_reaction(&mut c, id, "worker", 1001).unwrap();
+            assert_eq!(disposition, PersistentReactionDisposition::NotParked);
+            let task = get(&c, id).unwrap().unwrap();
+            assert_eq!(task.status, "working", "{state:?}");
+            assert_eq!(task.assignee.as_deref(), Some("worker"));
+        }
+    }
+
+    #[test]
+    fn persistent_worker_pending_delivery_outranks_reaction() {
+        let (_d, mut c) = open_tmp();
+        let id = persistent_worker_task(&mut c);
+        worker_reacts(&mut c, id, "needs-info");
+        crate::mailbox::append(
+            &mut c,
+            &crate::mailbox::MailboxRow {
+                agent: "worker".into(),
+                kind: crate::mailbox::MailboxKind::Done,
+                task_id: Some(id),
+                pr: Some(7),
+                verdict: None,
+                feedback: None,
+                note: None,
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap();
+        let disposition = park_persistent_worker_reaction(&mut c, id, "worker", 1001).unwrap();
+        assert_eq!(disposition, PersistentReactionDisposition::NotParked);
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "working");
+    }
+
+    #[test]
+    fn persistent_worker_reaction_from_non_owner_is_ignored() {
+        let (_d, mut c) = open_tmp();
+        let id = persistent_worker_task(&mut c);
+        worker_reacts(&mut c, id, "blocked");
+        let disposition = park_persistent_worker_reaction(&mut c, id, "intruder", 1001).unwrap();
+        assert_eq!(disposition, PersistentReactionDisposition::NotParked);
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "working");
     }
 
     #[test]

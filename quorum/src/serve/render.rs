@@ -292,7 +292,9 @@ pub fn render_agent_event(event: &AgentEvent) -> Option<String> {
             Some(format!("---\n*Turn complete: {tokens} tokens{cost_str}*\n"))
         }
         AgentEvent::TurnFailed { message, .. } => Some(format!("---\n*Turn failed: {message}*\n")),
-        AgentEvent::MidTurnUsage { .. } => None,
+        AgentEvent::MidTurnUsage { .. }
+        | AgentEvent::Liveness { .. }
+        | AgentEvent::UnfedTurnUsage { .. } => None,
     }
 }
 

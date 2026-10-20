@@ -406,3 +406,64 @@ fn repeated_error_results_fire_agent_failed() {
 
     handle.stop();
 }
+
+/// A persistent (stream-json) worker that reacts `needs-info` and ends its
+/// turn must be parked like a turn-oriented runner exit — not left to the
+/// idle reaper, whose AgentFailed reopens the task for another worker.
+#[test]
+fn persistent_worker_needs_info_reaction_parks_task_at_turn_end() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    let log_dir = tempfile::tempdir().unwrap();
+
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    seed_task(home.path(), "Needs-info park test");
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        log_dir.path(),
+        &[("FAKE_AGENT_REACT", "needs-info")],
+    );
+
+    assert!(
+        handle.wait_for("on its explicit reaction", 45),
+        "daemon must park the task when the persistent worker's turn ends on needs-info. Lines: {:?}",
+        handle.lines
+    );
+    handle.stop();
+
+    let conn = quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
+    let (status, assignee, refs, attempts): (String, Option<String>, Option<String>, i64) = conn
+        .query_row(
+            "SELECT status, assignee, refs, recovery_attempts FROM tasks ORDER BY id LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "failed", "parked, not reopened");
+    assert!(assignee.is_none());
+    assert_eq!(attempts, 0, "no AgentFailed recovery attempt consumed");
+    let refs: serde_json::Value = serde_json::from_str(refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["daemon_parked_reason"], "needs-info", "{refs}");
+    let parked: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE kind='task_parked'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(parked, 1);
+}
