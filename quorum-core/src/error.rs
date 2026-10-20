@@ -9,6 +9,11 @@ pub enum QuorumError {
     /// Caller is not the current active holder/assignee. Exit 1 (expected, not logged).
     #[error("not the current holder")]
     NotHolder,
+    /// A `task-update` edit was refused for a reason other than authority: stale
+    /// `--expected-revision`, edit limit reached, or no effective change. State is
+    /// untouched; the message names the actual cause. Exit 1 (expected clean negative).
+    #[error("edit rejected: {0}")]
+    EditRejected(String),
     /// Bad usage / arguments. Exit 2.
     #[error("usage: {0}")]
     Usage(String),
@@ -43,7 +48,7 @@ impl QuorumError {
     /// Stable process exit code. Agents branch on this without parsing JSON.
     pub fn exit_code(&self) -> i32 {
         match self {
-            QuorumError::NotHolder => 1,
+            QuorumError::NotHolder | QuorumError::EditRejected(_) => 1,
             QuorumError::Usage(_) | QuorumError::BadInput(_) => 2,
             _ => 3,
         }

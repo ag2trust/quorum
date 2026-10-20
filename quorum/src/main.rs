@@ -607,6 +607,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             body_stdin,
             depends_on,
             review_pr,
+            review_only,
             continue_pr,
             base_branch,
             body_file,
@@ -630,20 +631,35 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 base_branch.unwrap_or(serve_config::task_create_base_branch(&resolved_repo)?);
             quorum_core::tasks::validate_target_branch(&target_branch)?;
             let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&resolved_repo)?)?;
-            let id = quorum_core::tasks::create_with_continue_pr_and_target_branch(
-                &mut conn,
-                &created_by,
-                &title,
-                body.as_deref(),
-                priority.unwrap_or(0),
-                labels.as_deref(),
-                refs.as_deref(),
-                depends_on.as_deref(),
-                review_pr,
-                continue_pr,
-                Some(&target_branch),
-                now,
-            )?;
+            let id = match review_only {
+                Some(pr) => quorum_core::tasks::create_review_only_no_rework(
+                    &mut conn,
+                    &created_by,
+                    &title,
+                    body.as_deref(),
+                    priority.unwrap_or(0),
+                    labels.as_deref(),
+                    refs.as_deref(),
+                    depends_on.as_deref(),
+                    pr,
+                    Some(&target_branch),
+                    now,
+                )?,
+                None => quorum_core::tasks::create_with_continue_pr_and_target_branch(
+                    &mut conn,
+                    &created_by,
+                    &title,
+                    body.as_deref(),
+                    priority.unwrap_or(0),
+                    labels.as_deref(),
+                    refs.as_deref(),
+                    depends_on.as_deref(),
+                    review_pr,
+                    continue_pr,
+                    Some(&target_branch),
+                    now,
+                )?,
+            };
             output::emit(&serde_json::json!({ "id": id, "repo": resolved_repo }));
             Ok(0)
         }
@@ -1186,6 +1202,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             agent,
             task_id,
             state,
+            reason_stdin,
+            reason_file,
             run_id,
         } => {
             match state.as_str() {
@@ -1196,11 +1214,14 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     )));
                 }
             }
+            let reason =
+                read_optional_text(reason_stdin, reason_file, "--reason-stdin", "--reason-file")?;
+            let reason = quorum_core::tasks::validate_react_reason(&state, reason.as_deref())?;
             let rid = resolve_run_id(run_id, "react")?;
             // Retain the legacy intent flags, but never trust them as target
             // authority: the endpoint derives agent and task from `rid`.
             let _ = (agent, task_id);
-            let id = agent_client::react(&rid, &state)?;
+            let id = agent_client::react(&rid, &state, reason.as_deref())?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
             Ok(0)
         }
@@ -1872,13 +1893,31 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         cli::Command::Tail { agent, follow, raw } => {
             let conn = quorum_core::db::open(&paths::db_path()?)?;
             let entries = quorum_core::journal::list_in_flight(&conn)?;
-            let entry = entries.iter().find(|e| e.agent == agent);
-            let log_dir = entry.and_then(|e| e.log_dir.as_deref()).ok_or_else(|| {
-                QuorumError::Usage(format!(
-                    "no active session log for agent '{agent}' (agent unknown or no log dir)"
-                ))
-            })?;
-            let stream_path = std::path::Path::new(log_dir).join("stream.jsonl");
+            let in_flight_dir = entries
+                .iter()
+                .find(|e| e.agent == agent)
+                .and_then(|e| e.log_dir.clone())
+                .map(std::path::PathBuf::from);
+            let session_dir = match in_flight_dir {
+                Some(dir) => dir,
+                None => {
+                    // Not in flight: fall back to the newest retained session dir.
+                    let repo = paths::resolve_repo()?;
+                    let serve_config_path = serve_config::default_config_path(&repo)?;
+                    let configured = serve_config::load(&serve_config_path, false)?.log_dir;
+                    let log_root = resolve_web_log_dir(None, configured, paths::home_dir()?);
+                    serve::session_log::latest_session_dir(&log_root, &agent)
+                        .map_err(|e| QuorumError::Io(e.to_string()))?
+                        .ok_or_else(|| {
+                            QuorumError::Usage(format!(
+                                "no session log found for agent '{agent}' (not in flight, and no retained session directory under {})",
+                                log_root.display()
+                            ))
+                        })?
+                }
+            };
+            let log_dir = session_dir.as_path();
+            let stream_path = log_dir.join("stream.jsonl");
             if !stream_path.exists() {
                 return Err(QuorumError::Usage(format!(
                     "stream.jsonl not found at {}",

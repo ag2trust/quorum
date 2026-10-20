@@ -151,6 +151,10 @@ pub struct TaskView {
     pub rework_cap: u32,
     pub pr: Option<String>,
     pub review_only: bool,
+    /// `task-create --review-only`: reviewers review the PR, Quorum never
+    /// reworks it. Every actionable-rework trigger closes the task as `done`
+    /// with a durable review outcome instead of entering `rework`.
+    pub no_rework: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +215,44 @@ fn recover_rework_worker(t: &TaskView, reason: String) -> Option<(Status, Vec<Ef
     ))
 }
 
+/// Bound on failing check names quoted in a no-rework owner notification.
+const NO_REWORK_REASON_CHECKS: usize = 10;
+
+/// Close a review-only/no-rework task on an actionable-rework trigger.
+///
+/// The owner chose "review, never rework": the verdict is the deliverable.
+/// The task becomes terminal `done` (its storage layer records the durable
+/// `refs.review_outcome`), posts the findings note, notifies the owner, and
+/// releases the lease. It never increments a rework round or resumes a worker.
+fn close_no_rework(outcome: &str) -> (Status, Vec<Effect>) {
+    (
+        Status::Done,
+        vec![
+            Effect::ReleaseLease,
+            Effect::PostFindingsNote,
+            Effect::NotifyOwner {
+                reason: format!("review-only: {outcome}; closed without rework"),
+            },
+        ],
+    )
+}
+
+fn no_rework_checks_outcome(checks: &[String]) -> String {
+    if checks.is_empty() {
+        return "CI checks failed".into();
+    }
+    let mut names = checks
+        .iter()
+        .take(NO_REWORK_REASON_CHECKS)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if checks.len() > NO_REWORK_REASON_CHECKS {
+        names.push_str(", …");
+    }
+    format!("CI checks failed ({names})")
+}
+
 // ---------------------------------------------------------------------------
 // transition — the exhaustive match
 // ---------------------------------------------------------------------------
@@ -225,6 +267,36 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
     };
 
     match (&t.status, e) {
+        // ---- Review-only / no-rework (`task-create --review-only`) ----
+        // Every actionable-rework trigger closes the task; none enters Rework.
+        (Status::InReview, Event::VerdictChanges) if t.no_rework => {
+            Ok(close_no_rework("reviewer requested changes"))
+        }
+        (Status::InReview, Event::ChecksFailed { checks }) if t.no_rework => {
+            Ok(close_no_rework(&no_rework_checks_outcome(checks)))
+        }
+        (Status::Merging, Event::MergeConflict) if t.no_rework => {
+            Ok(close_no_rework("PR has a merge conflict"))
+        }
+        // Defense in depth: a no-rework task has no worker phase. Observing
+        // one is a broken invariant, so fail loudly rather than resuming a
+        // remediation worker or reopening the PR for implementation.
+        (Status::Working | Status::Rework, Event::AgentFailed { .. } | Event::LeaseExpired)
+            if t.no_rework =>
+        {
+            Ok((
+                Status::Failed,
+                vec![
+                    Effect::ReleaseLease,
+                    Effect::NotifyOwner {
+                        reason: "review-only (no-rework) task observed in a worker phase; \
+                                 refusing remediation"
+                            .into(),
+                    },
+                ],
+            ))
+        }
+
         // ---- Open ----
         (Status::Open, Event::PlanningStarted) => Ok((Status::Planning, vec![])),
         (Status::Open, Event::Claimed { agent }) => Ok((
@@ -582,6 +654,7 @@ mod tests {
             rework_cap: REWORK_CAP,
             pr: None,
             review_only: false,
+            no_rework: false,
         }
     }
 
@@ -594,6 +667,7 @@ mod tests {
             rework_cap: REWORK_CAP,
             pr: Some("123".to_string()),
             review_only: false,
+            no_rework: false,
         }
     }
 
@@ -1698,6 +1772,152 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Guard: review-only/no-rework (`task-create --review-only`) never reworks
+    // -----------------------------------------------------------------------
+
+    fn no_rework_view(status: Status) -> TaskView {
+        let mut t = view_with_author(Status::InReview, "W1");
+        t.status = status;
+        t.author = None;
+        t.review_only = true;
+        t.no_rework = true;
+        t.pr = Some("42".into());
+        t
+    }
+
+    fn assert_no_rework_closed(t: &TaskView, event: &Event, reason_fragment: &str) {
+        let (next, effects) = transition(t, event)
+            .unwrap_or_else(|err| panic!("no-rework {event:?} must close: {err}"));
+        assert_eq!(next, Status::Done, "no-rework {event:?} must close as done");
+        assert!(effects.contains(&Effect::ReleaseLease), "{event:?}");
+        assert!(effects.contains(&Effect::PostFindingsNote), "{event:?}");
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::NotifyOwner { reason } if reason.contains(reason_fragment)
+            )),
+            "{event:?} must notify the owner with {reason_fragment:?}: {effects:?}"
+        );
+        for forbidden in [
+            Effect::ResumeWorker,
+            Effect::IncrementReworkRound,
+            Effect::SpawnReviewer,
+            Effect::ResumeReviewer,
+        ] {
+            assert!(
+                !effects.contains(&forbidden),
+                "{event:?} must never produce {forbidden:?}: {effects:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_rework_r1_or_r2_changes_close_done_without_rework() {
+        // R1 and R2 both deliver VerdictChanges from in-review.
+        assert_no_rework_closed(
+            &no_rework_view(Status::InReview),
+            &Event::VerdictChanges,
+            "reviewer requested changes",
+        );
+    }
+
+    #[test]
+    fn no_rework_checks_failed_closes_done_without_rework() {
+        assert_no_rework_closed(
+            &no_rework_view(Status::InReview),
+            &Event::ChecksFailed {
+                checks: vec!["ci-test".into()],
+            },
+            "CI checks failed",
+        );
+    }
+
+    #[test]
+    fn no_rework_merge_conflict_closes_done_without_rework() {
+        assert_no_rework_closed(
+            &no_rework_view(Status::Merging),
+            &Event::MergeConflict,
+            "merge conflict",
+        );
+    }
+
+    #[test]
+    fn no_rework_closes_even_at_rework_cap() {
+        // The closed outcome is the owner-selected contract, not cap exhaustion.
+        let mut t = no_rework_view(Status::InReview);
+        t.rework_round = REWORK_CAP;
+        assert_no_rework_closed(&t, &Event::VerdictChanges, "reviewer requested changes");
+    }
+
+    #[test]
+    fn no_rework_approve_merges_normally() {
+        assert_ok(
+            &no_rework_view(Status::InReview),
+            &Event::VerdictApprove,
+            Status::Merging,
+            &[Effect::MergePr { pr: "42".into() }],
+        );
+        assert_ok(
+            &no_rework_view(Status::Merging),
+            &Event::MergeSucceeded,
+            Status::Done,
+            &[Effect::ReleaseLease],
+        );
+    }
+
+    #[test]
+    fn no_rework_retryable_merge_failure_returns_to_review_not_rework() {
+        let (next, effects) = transition(
+            &no_rework_view(Status::Merging),
+            &Event::MergeFailed {
+                reason: "head branch was modified".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(next, Status::InReview);
+        assert!(!effects.contains(&Effect::ResumeWorker));
+    }
+
+    #[test]
+    fn no_rework_worker_recovery_never_routes_into_rework() {
+        // Defense in depth: a no-rework task has no worker phase. If one is
+        // ever observed, recovery fails loudly instead of resuming rework or
+        // reopening the PR for a fresh implementation worker.
+        for status in [Status::Working, Status::Rework] {
+            for event in [
+                Event::AgentFailed {
+                    reason: "crash".into(),
+                },
+                Event::LeaseExpired,
+            ] {
+                let mut t = no_rework_view(status);
+                t.rework_round = 1;
+                let (next, effects) = transition(&t, &event).unwrap();
+                assert_eq!(next, Status::Failed, "{status:?} + {event:?}");
+                assert!(effects.contains(&Effect::ReleaseLease));
+                assert!(
+                    !effects.contains(&Effect::ResumeWorker)
+                        && !effects.contains(&Effect::IncrementReworkRound),
+                    "{status:?} + {event:?}: {effects:?}"
+                );
+                assert!(effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::NotifyOwner { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn review_pr_without_no_rework_still_reworks() {
+        // `--review-pr` keeps review + remediation semantics.
+        let mut t = no_rework_view(Status::InReview);
+        t.no_rework = false;
+        let (next, effects) = transition(&t, &Event::VerdictChanges).unwrap();
+        assert_eq!(next, Status::Rework);
+        assert!(effects.contains(&Effect::ResumeWorker));
+    }
+
+    // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
 
@@ -2330,6 +2550,7 @@ mod proptests {
             rework_cap: REWORK_CAP,
             pr: None,
             review_only: false,
+            no_rework: false,
         };
         let mut history = Vec::new();
 
@@ -2395,6 +2616,7 @@ mod proptests {
                 rework_cap: REWORK_CAP,
                 pr: None,
                 review_only: false,
+                no_rework: false,
             };
             let mut prev_round = 0u32;
 
@@ -2467,6 +2689,7 @@ mod proptests {
                 rework_cap: REWORK_CAP,
                 pr: Some("1".into()),
                 review_only: false,
+                no_rework: false,
             };
             let result = transition(&t, &Event::Cancelled { by: "x".into() });
             prop_assert!(result.is_ok(), "Cancelled rejected from {:?}", status);
@@ -2485,6 +2708,7 @@ mod proptests {
                 rework_cap: REWORK_CAP,
                 pr: None,
                 review_only: false,
+                no_rework: false,
             };
 
             for event in &events {
@@ -2531,6 +2755,7 @@ mod proptests {
                 rework_cap: REWORK_CAP,
                 pr: None,
                 review_only: false,
+                no_rework: false,
             };
 
             for event in &events {
@@ -2570,6 +2795,7 @@ mod proptests {
                 rework_cap: REWORK_CAP,
                 pr: None,
                 review_only: false,
+                no_rework: false,
             };
 
             for event in &events {

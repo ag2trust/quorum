@@ -344,7 +344,10 @@ fn blocked_task_summaries(
     // failed-but-parked rows with a cancelled prerequisite are retained as disposition work.
     state_band(
         conn,
-        "depends_on IS NOT NULL AND ((status='open' AND EXISTS (SELECT 1 FROM json_each(depends_on) dependency WHERE NOT EXISTS (SELECT 1 FROM tasks prerequisite WHERE prerequisite.id=dependency.value AND prerequisite.status='done'))) OR (status='failed' AND json_valid(refs) AND json_extract(refs, '$.daemon_parked')=1 AND EXISTS (SELECT 1 FROM json_each(depends_on) dependency JOIN tasks prerequisite ON prerequisite.id=dependency.value WHERE prerequisite.status='cancelled')))",
+        &format!(
+            "depends_on IS NOT NULL AND ((status='open' AND EXISTS (SELECT 1 FROM json_each(depends_on) dependency WHERE NOT EXISTS (SELECT 1 FROM tasks d WHERE d.id=dependency.value AND {}))) OR (status='failed' AND json_valid(refs) AND json_extract(refs, '$.daemon_parked')=1 AND EXISTS (SELECT 1 FROM json_each(depends_on) dependency JOIN tasks prerequisite ON prerequisite.id=dependency.value WHERE prerequisite.status='cancelled')))",
+            quorum_core::tasks::DEP_SATISFIED_PREDICATE
+        ),
         now,
     )
 }

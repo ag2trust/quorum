@@ -336,6 +336,7 @@ impl Case {
             labels,
             None,
             None,
+            false,
             None,
             None,
             None,
@@ -355,6 +356,7 @@ impl Case {
             labels,
             role_config,
             None,
+            false,
             None,
             None,
             None,
@@ -374,6 +376,7 @@ impl Case {
             labels,
             role_config,
             None,
+            false,
             None,
             None,
             None,
@@ -393,6 +396,7 @@ impl Case {
             None,
             role_config,
             None,
+            false,
             None,
             None,
             Some(merge_checks_cmd),
@@ -407,6 +411,22 @@ impl Case {
             None,
             None,
             Some(1),
+            false,
+            None,
+            None,
+            None,
+            false,
+        )
+    }
+
+    fn start_review_only_no_rework(default_provider: &str, model: &str) -> Self {
+        Self::start_with_pr_assignment(
+            default_provider,
+            model,
+            None,
+            None,
+            Some(1),
+            true,
             None,
             None,
             None,
@@ -421,6 +441,7 @@ impl Case {
             None,
             None,
             None,
+            false,
             Some(pr),
             None,
             None,
@@ -435,6 +456,7 @@ impl Case {
             None,
             None,
             None,
+            false,
             None,
             Some(ParkedPublicationFixture {
                 pr: 10,
@@ -453,6 +475,7 @@ impl Case {
             None,
             None,
             None,
+            false,
             None,
             Some(ParkedPublicationFixture {
                 pr: 10,
@@ -471,6 +494,7 @@ impl Case {
         labels: Option<&str>,
         role_config: Option<&str>,
         review_pr: Option<i64>,
+        review_pr_no_rework: bool,
         continue_pr: Option<i64>,
         parked_publication: Option<ParkedPublicationFixture>,
         merge_checks_cmd: Option<&str>,
@@ -516,7 +540,12 @@ impl Case {
             ]);
         if let Some(pr) = review_pr {
             let pr_string = pr.to_string();
-            create.args(["--review-pr", &pr_string]);
+            let flag = if review_pr_no_rework {
+                "--review-only"
+            } else {
+                "--review-pr"
+            };
+            create.args([flag, &pr_string]);
         } else if let Some(pr) = continue_pr {
             let pr_string = pr.to_string();
             create.args(["--continue-pr", &pr_string]);
@@ -2373,6 +2402,79 @@ fn workerless_review_only_changes_start_fresh_codex_remediation_on_verified_pr()
     assert_eq!(task.status, "in-review");
     assert_eq!(task.rework_round, 1);
     drop(conn);
+    case.handle.stop();
+}
+
+#[test]
+fn review_only_no_rework_changes_close_done_without_remediation_worker() {
+    let mut case = Case::start_review_only_no_rework("codex", "gpt-5.6-terra");
+
+    case.handle.wait_for("spawning reviewer ");
+    let reviewer = case.handle.agent_after("spawning reviewer ");
+    case.handle.wait_for("result");
+    case.done(
+        &reviewer,
+        &[
+            "--pr",
+            "1",
+            "--verdict",
+            "changes",
+            "--blocking",
+            "1",
+            "--feedback",
+            "fix the review finding",
+        ],
+    );
+
+    case.handle
+        .wait_for("review-only task #1: closed as done (changes_requested) without rework");
+    case.handle
+        .wait_for("review-only task #1: ensured GitHub REQUEST_CHANGES review on PR #1");
+
+    let conn = case.db();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "done");
+    assert!(task.review_only && task.no_rework);
+    assert_eq!(task.rework_round, 0, "no rework round is consumed");
+    assert!(task.assignee.is_none());
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["review_outcome"], "changes_requested");
+    assert!(refs["review_outcome_findings"]
+        .as_str()
+        .unwrap()
+        .contains("fix the review finding"));
+    assert_eq!(refs["review_outcome_github"], "posted");
+    let runs = quorum_core::agent_runs::runs_for_task(&conn, 1).unwrap();
+    assert_eq!(
+        run_routes(&runs),
+        [("reviewer", None, "gpt-5.6-terra", "codex")],
+        "a review-only task gets its reviewer and never a remediation worker or R2"
+    );
+    let note: String = conn
+        .query_row(
+            "SELECT body FROM task_notes WHERE task_id=1 ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(note.contains("reviewer requested changes"), "{note}");
+    let active_claims: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM claims WHERE target='task#1' AND active=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active_claims, 0, "the lease is released");
+    drop(conn);
+    assert!(
+        !case
+            .handle
+            .lines
+            .iter()
+            .any(|line| line.contains("spawning remediation worker")),
+        "a review-only task must never spawn a remediation worker"
+    );
     case.handle.stop();
 }
 
