@@ -255,6 +255,12 @@ pub struct ReviewingTask {
     pub reviewer: Option<String>,
     /// `reviewing`, `awaiting reviewer`, or `merging`.
     pub state: String,
+    /// Why an `awaiting reviewer` task has no live reviewer, when that is derivable from
+    /// durable DB state alone (classification pending, reviewer cap exhausted, provisioning
+    /// strikes exhausted). Absent means the cause is not visible to a read-only status
+    /// process (for example live CI state, which only the daemon queries from GitHub).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Task pipeline row: active daemon-owned coordinators plus tasks merged in the last hour (#204).
@@ -2697,8 +2703,9 @@ fn extract_pr_from_refs(refs_json: Option<&str>) -> Option<i64> {
 
 /// Tasks that have been submitted and still require review or merging.
 ///
-/// This is derived from durable task state so CI waits and reviewer-spawn failures
-/// remain visible when no reviewer process is live.
+/// This is derived from durable task state so classification gaps and reviewer-spawn
+/// failures remain visible when no reviewer process is live. Live CI state is not stored
+/// in the DB, so a CI wait surfaces only as the generic `awaiting reviewer` state.
 fn reviewing_tasks(
     conn: &Connection,
     daemon_agents: &[DaemonAgentView],
@@ -2733,29 +2740,88 @@ fn reviewing_tasks(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    Ok(rows
-        .into_iter()
-        .map(|(id, title, status, refs)| {
-            let reviewer = daemon_agents
-                .iter()
-                .find(|agent| agent.role == "reviewer" && agent.task_id == Some(id))
-                .map(|agent| agent.agent.clone());
-            let state = if status == "merging" {
-                "merging".to_string()
-            } else if reviewer.is_some() {
-                "reviewing".to_string()
-            } else {
-                "awaiting reviewer".to_string()
-            };
-            ReviewingTask {
-                id,
-                title,
-                pr: extract_pr_from_refs(refs.as_deref()),
-                reviewer,
-                state,
-            }
-        })
-        .collect())
+    let freeze_active: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_decompositions WHERE freeze_active=1)",
+        [],
+        |r| r.get(0),
+    )?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (id, title, status, refs) in rows {
+        let reviewer = daemon_agents
+            .iter()
+            .find(|agent| agent.role == "reviewer" && agent.task_id == Some(id))
+            .map(|agent| agent.agent.clone());
+        let (state, reason) = if status == "merging" {
+            ("merging".to_string(), None)
+        } else if reviewer.is_some() {
+            ("reviewing".to_string(), None)
+        } else {
+            (
+                "awaiting reviewer".to_string(),
+                awaiting_reviewer_reason(conn, id, refs.as_deref(), freeze_active)?,
+            )
+        };
+        out.push(ReviewingTask {
+            id,
+            title,
+            pr: extract_pr_from_refs(refs.as_deref()),
+            reviewer,
+            state,
+            reason,
+        });
+    }
+    Ok(out)
+}
+
+/// True when the refs carry the complete classification the reviewer claim requires
+/// (mirrors the `cx_*` guard in `tasks::claim`).
+fn classification_complete(refs: Option<&str>) -> bool {
+    let Some(v) = refs.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()) else {
+        return false;
+    };
+    let est_ok = v
+        .get("cx_est")
+        .and_then(serde_json::Value::as_i64)
+        .is_some_and(|n| (1..=5).contains(&n));
+    let size_ok = v
+        .get("cx_size")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| matches!(s, "S" | "M" | "L" | "XL"));
+    let ready = v.get("cx_ready") == Some(&serde_json::Value::Bool(true));
+    let no_reason = v
+        .get("cx_not_ready_reason")
+        .is_some_and(serde_json::Value::is_null);
+    est_ok && size_ok && ready && no_reason
+}
+
+/// Specific, DB-visible reason an in-review task has no live reviewer; `None` when unknown.
+fn awaiting_reviewer_reason(
+    conn: &Connection,
+    task_id: i64,
+    refs: Option<&str>,
+    freeze_active: bool,
+) -> Result<Option<String>> {
+    if !classification_complete(refs) {
+        return Ok(Some(if freeze_active {
+            "classification pending (a decomposition freeze is active)".to_string()
+        } else {
+            "classification pending".to_string()
+        }));
+    }
+    let total = crate::provision_attempts::total_reviewer_runs(conn, task_id)?;
+    if total >= crate::provision_attempts::MAX_TOTAL_REVIEWER_RUNS {
+        return Ok(Some(format!(
+            "reviewer run cap exhausted ({total}/{})",
+            crate::provision_attempts::MAX_TOTAL_REVIEWER_RUNS
+        )));
+    }
+    let strikes = crate::provision_attempts::max_attempts_for_task(conn, task_id)?;
+    if strikes >= i64::from(crate::provision_attempts::MAX_REVIEWER_PROVISION_STRIKES) {
+        return Ok(Some(format!(
+            "reviewer provisioning failed {strikes} times at the current head"
+        )));
+    }
+    Ok(None)
 }
 
 /// Task pipeline view: daemon-owned source stages + recently done/closed (#204).
@@ -5543,6 +5609,83 @@ mod tests {
                 && row["state"] == "awaiting reviewer"
                 && row["reviewer"].is_null()
         }));
+    }
+
+    #[test]
+    fn awaiting_reviewer_reports_specific_db_visible_reasons() {
+        let (_d, mut c) = open_tmp();
+        let classified = r#""cx_est":2,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null"#;
+        let mut mk = |title: &str, refs: String| {
+            let id = crate::tasks::create(&mut c, "A", title, None, 0, None, None, None, None, 100)
+                .unwrap();
+            c.execute(
+                "UPDATE tasks SET status='in-review', refs=?1 WHERE id=?2",
+                params![refs, id],
+            )
+            .unwrap();
+            id
+        };
+        let unclassified = mk("unclassified", r#"{"pr":1}"#.into());
+        let capped = mk("capped", format!(r#"{{"pr":2,{classified}}}"#));
+        let struck = mk("struck", format!(r#"{{"pr":3,{classified}}}"#));
+        let unknown = mk("unknown", format!(r#"{{"pr":4,{classified}}}"#));
+        for i in 0..crate::provision_attempts::MAX_TOTAL_REVIEWER_RUNS {
+            c.execute("INSERT INTO agent_runs(task_id,agent_name,role,model,effort,spawned_at) VALUES (?1,'R',  'reviewer','m','e',?2)", params![capped, i]).unwrap();
+        }
+        for _ in 0..crate::provision_attempts::MAX_REVIEWER_PROVISION_STRIKES {
+            crate::provision_attempts::record_attempt(&mut c, struck, 3, "r1", "sha").unwrap();
+        }
+
+        let snap = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let json = serde_json::to_value(&snap).unwrap();
+        let row = |id: i64| {
+            json["reviewing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        for id in [unclassified, capped, struck, unknown] {
+            assert_eq!(row(id)["state"], "awaiting reviewer");
+        }
+        assert_eq!(row(unclassified)["reason"], "classification pending");
+        assert!(row(capped)["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("reviewer run cap exhausted"));
+        assert!(row(struck)["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("reviewer provisioning failed 3 times"));
+        assert!(
+            row(unknown).get("reason").is_none(),
+            "unknown cause keeps the generic label with no reason"
+        );
+
+        // A freeze is surfaced as context on a classification gap only.
+        c.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,planned_source_revision,created_at,updated_at)
+             VALUES (?1,'planning',1,1,0,100,100)",
+            params![unknown],
+        )
+        .unwrap();
+        let json = serde_json::to_value(stats(&c, 200, 60).unwrap()).unwrap();
+        let reason = |id: i64| {
+            json["reviewing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap()["reason"]
+                .clone()
+        };
+        assert_eq!(
+            reason(unclassified),
+            "classification pending (a decomposition freeze is active)"
+        );
+        assert!(reason(unknown).is_null());
     }
 
     #[test]

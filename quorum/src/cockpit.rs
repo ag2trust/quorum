@@ -475,7 +475,10 @@ fn render_reviewing(reviewing: &[ReviewingTask], sty: &Style, w: &mut dyn Write,
             truncate(&task.title, 36),
             pr,
             truncate(reviewer, 16),
-            task.state,
+            match task.reason.as_deref() {
+                Some(reason) => format!("{} — {reason}", task.state),
+                None => task.state.clone(),
+            },
         );
     }
 }
@@ -1335,6 +1338,7 @@ mod tests {
             pr: Some(193),
             reviewer: Some("R1".into()),
             state: "reviewing".into(),
+            reason: None,
         });
         let sty = Style::plain();
         let mut buf = Vec::new();
@@ -1471,6 +1475,7 @@ mod tests {
             pr: Some(400),
             reviewer: None,
             state: "merging".into(),
+            reason: None,
         });
         let sty = Style::plain();
         let mut buf = Vec::new();
@@ -1479,6 +1484,26 @@ mod tests {
         assert!(
             output.contains("merging"),
             "merging state must render: {output}"
+        );
+    }
+
+    #[test]
+    fn reviewing_section_renders_awaiting_reason() {
+        let mut s = default_stats();
+        s.reviewing.push(ReviewingTask {
+            id: 11,
+            title: "unclassified".into(),
+            pr: Some(401),
+            reviewer: None,
+            state: "awaiting reviewer".into(),
+            reason: Some("classification pending".into()),
+        });
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("awaiting reviewer — classification pending"),
+            "{output}"
         );
     }
 
@@ -1918,6 +1943,7 @@ mod tests {
             pr: None,
             reviewer: Some("R-err".into()),
             state: "reviewing".into(),
+            reason: None,
         });
         let sty = Style::plain();
         let mut buf = Vec::new();

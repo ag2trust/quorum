@@ -160,7 +160,8 @@ use worktree::{
 };
 
 const MAX_POISON_STRIKES: u32 = 3;
-const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
+const MAX_REVIEWER_PROVISION_STRIKES: u32 =
+    quorum_core::provision_attempts::MAX_REVIEWER_PROVISION_STRIKES;
 const MAX_CI_REMEDIATION_PROVISION_STRIKES: i64 = 3;
 const MAX_ERROR_RETRIES: u32 = 3;
 /// An installer retry replays exactly the same durable failure evidence, so
@@ -171,7 +172,7 @@ const MAX_FALLBACK_INSTALL_RETRIES: u32 = 3;
 // original fatal handoff outcome or synchronous reap.
 const FAILED_WORKER_HANDOFF_CAPTURE_TIMEOUT: Duration = Duration::from_secs(1);
 const FAILED_WORKER_HANDOFF_CAPTURE_BYTES: usize = 64 * 1024;
-const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
+const MAX_TOTAL_REVIEWER_RUNS: i64 = quorum_core::provision_attempts::MAX_TOTAL_REVIEWER_RUNS;
 /// Limit per-slot stream work so one noisy provider cannot starve other slots.
 const MAX_STREAM_LINES_PER_TICK: usize = 64;
 /// Claude and Codex readers retain partial records across cancelled polls, so a short readiness
