@@ -3604,6 +3604,10 @@ fn reviewer_continuation_slot(is_r2: bool) -> ContinuationSlot {
     }
 }
 
+/// `agent_runs.end_reason` for an interrupted turn-oriented reviewer that
+/// cannot resume because no provider continuation was persisted.
+const REVIEWER_CONTINUATION_UNAVAILABLE_END_REASON: &str = "continuation-unavailable";
+
 fn resolve_reviewer_recovery(
     db_path: &std::path::Path,
     task_id: i64,
@@ -3642,10 +3646,30 @@ fn resolve_reviewer_recovery(
         })
         .flatten();
     if kind.turn_mode() == runner::TurnMode::RespawnPerTurn && continuation_id.is_none() {
-        return Err(QuorumError::Io(format!(
-            "interrupted turn-oriented reviewer run {} has no persisted continuation for {}",
-            run.id, provider,
-        )));
+        // A turn-oriented reviewer can only be resumed through its exact
+        // provider-issued continuation. Without one the run is unrecoverable,
+        // and leaving it open would make every orphan scan re-select it and
+        // fail again with no strike or backoff. End it durably (guarded so a
+        // concurrent close wins) and let the caller provision a fresh
+        // reviewer; total reviewer runs stay bounded by
+        // `MAX_TOTAL_REVIEWER_RUNS`, which counts this ended run.
+        let ended = conn.execute(
+            "UPDATE agent_runs SET ended_at=?2,end_reason=?3
+             WHERE id=?1 AND (ended_at IS NULL OR end_reason='drain')",
+            rusqlite::params![
+                run.id,
+                now_unix(),
+                REVIEWER_CONTINUATION_UNAVAILABLE_END_REASON
+            ],
+        )?;
+        if ended == 1 {
+            log(&format!(
+                "task #{task_id}: interrupted turn-oriented reviewer run {} ({}) has no \
+                 persisted {provider} continuation — ended as {}; provisioning a fresh reviewer",
+                run.id, run.agent, REVIEWER_CONTINUATION_UNAVAILABLE_END_REASON,
+            ));
+        }
+        return Ok(None);
     }
     Ok(Some(ReviewerRecovery {
         agent: run.agent,
@@ -5711,6 +5735,55 @@ struct DecompositionLiveWork {
     ordinary_classifier: bool,
     doctor: bool,
     pre_review_checks: bool,
+}
+
+/// Select the ordinary classifier's next queue and its duplicate context.
+///
+/// Outside a decomposition freeze every unclassified task is eligible. Under
+/// a freeze only already-started work is: the freeze exists so no new
+/// implementation starts while the planner captures a quiescent frozen base,
+/// and an `open` task's classification would only feed a claim (or a planning
+/// source selection) the freeze already forbids. Started work — chiefly a
+/// review-only task created `in-review` during the freeze — is the opposite
+/// case: the drain counts it (`count_started_non_terminal_excluding`) and its
+/// reviewer cannot dispatch unclassified, so gating it would deadlock the
+/// drain against itself.
+fn classifier_queue(
+    conn: &rusqlite::Connection,
+    decomposition_freeze: bool,
+) -> Result<(
+    Vec<quorum_core::classify::TaskForClassification>,
+    Vec<quorum_core::classify::TaskForClassification>,
+)> {
+    let tasks = if decomposition_freeze {
+        quorum_core::classify::unclassified_started_tasks(conn)?
+    } else {
+        quorum_core::classify::unclassified_tasks(conn)?
+    };
+    if tasks.is_empty() {
+        return Ok((vec![], vec![]));
+    }
+    let all_open = quorum_core::classify::dup_context_tasks(conn)?;
+    let task_ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
+    let dup_context: Vec<_> = all_open
+        .into_iter()
+        .filter(|t| !task_ids.contains(&t.id))
+        .take(quorum_core::classify::DUP_CONTEXT_LIMIT)
+        .collect();
+    Ok((tasks, dup_context))
+}
+
+/// Durable journal rows that represent live agent/provider work a freeze
+/// must drain. A `frozen-view` row is only a recovery marker for the
+/// coordinator's cached `git archive` tree: no process runs behind it, and a
+/// graph's own marker is always released before it re-freezes. Counting it
+/// would let one graph's leftover marker stall a different graph's drain.
+fn count_drain_blocking_journal_rows(conn: &rusqlite::Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM journal WHERE role!='frozen-view'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?)
 }
 
 fn decomposition_drain_ready(
@@ -8500,6 +8573,22 @@ async fn tick_decomposition(
             coordinator.graph_id, snapshot.graph_id
         )));
     }
+    if coordinator
+        .graph_id
+        .is_some_and(|previous| previous != snapshot.graph_id)
+    {
+        // The selected aggregate changed (e.g. an operator-retried graph went
+        // to provider backoff and a later graph won the planning freeze). No
+        // planner/classifier slot is live here (checked above), but the
+        // coordinator may still own the previous graph's cached frozen view,
+        // its durable `frozen-view` journal marker, an Arbiter, and a cached
+        // proposal. Settle all of it against the previous graph before
+        // adopting the new one: a leaked marker would count as durable
+        // in-flight work and stall the new graph in `draining`, and a cached
+        // proposal must never be consumed for a different aggregate. When
+        // the previous graph is selected again it resumes from durable state.
+        discard_removed_decomposition(&config.db_path, coordinator).await?;
+    }
     coordinator.graph_id = Some(snapshot.graph_id);
     coordinator.classifier_source_task_id = Some(snapshot.source_task_id);
     if coordinator.proposal.is_none() {
@@ -8605,9 +8694,7 @@ async fn tick_decomposition(
     }
     let durable_in_flight = {
         let conn = quorum_core::db::open(&config.db_path)?;
-        conn.query_row("SELECT count(*) FROM journal", [], |row| {
-            row.get::<_, i64>(0)
-        })?
+        count_drain_blocking_journal_rows(&conn)?
     };
     // Every task that had already started (working/in-review/rework) must reach
     // a terminal state before we capture the frozen base. The planning source
@@ -17286,26 +17373,16 @@ async fn tick(
             *classifier_backoff_until = None;
         }
     }
-    if classifier_slot.is_none()
-        && !drain_state.draining
-        && !decomposition_freeze
-        && classifier_backoff_until.is_none()
-    {
+    // A decomposition freeze does not stop the classifier outright: already
+    // started work (notably a review-only task, created `in-review` and
+    // unclassified) must classify before its reviewer can dispatch, and the
+    // freeze's own drain waits for that work to finish. `classifier_queue`
+    // narrows the freeze-time queue to that started set.
+    if classifier_slot.is_none() && !drain_state.draining && classifier_backoff_until.is_none() {
         let p = db_path.clone();
         let unclassified = tokio::task::spawn_blocking(move || -> Result<(Vec<quorum_core::classify::TaskForClassification>, Vec<quorum_core::classify::TaskForClassification>)> {
             let conn = quorum_core::db::open(&p)?;
-            let tasks = quorum_core::classify::unclassified_tasks(&conn)?;
-            if tasks.is_empty() {
-                return Ok((vec![], vec![]));
-            }
-            let all_open = quorum_core::classify::dup_context_tasks(&conn)?;
-            let task_ids: Vec<i64> = tasks.iter().map(|t| t.id).collect();
-            let dup_context: Vec<_> = all_open
-                .into_iter()
-                .filter(|t| !task_ids.contains(&t.id))
-                .take(quorum_core::classify::DUP_CONTEXT_LIMIT)
-                .collect();
-            Ok((tasks, dup_context))
+            classifier_queue(&conn, decomposition_freeze)
         })
         .await
         .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
@@ -47899,6 +47976,102 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
     }
 
+    /// Deadlock regression (task 410 / review-only 417): a review-only task
+    /// created while an unrelated decomposition freeze drains is `in-review`
+    /// and unclassified. The drain waits for it, and its reviewer cannot
+    /// dispatch until it is classified, so the freeze-time classifier queue
+    /// must admit it — while still withholding `open` work the freeze exists
+    /// to hold back.
+    #[test]
+    fn freeze_time_classifier_queue_admits_started_review_only_task_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_test_db(dir.path());
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('decomp source','planning','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let source_task_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 created_at,updated_at)
+             VALUES (?1,'draining',0,1,1,1,1)",
+            [source_task_id],
+        )
+        .unwrap();
+        let open_task = tasks::create(
+            &mut conn, "owner", "new work", None, 10, None, None, None, None, 2,
+        )
+        .unwrap();
+        let review_only = tasks::create(
+            &mut conn,
+            "owner",
+            "review PR #471",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(471),
+            3,
+        )
+        .unwrap();
+        let task = tasks::get(&conn, review_only).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert!(
+            !tasks::classification_is_dispatchable_for_status(
+                &task.refs,
+                true,
+                None,
+                false,
+                "in-review"
+            ),
+            "an unclassified review-only task cannot dispatch its reviewer"
+        );
+        // The drain is held by exactly this task until it reaches terminal.
+        assert_eq!(
+            tasks::count_started_non_terminal_excluding(&conn, source_task_id).unwrap(),
+            1
+        );
+
+        let (frozen, dup_context) = classifier_queue(&conn, true).unwrap();
+        assert_eq!(
+            frozen.iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec![review_only],
+            "under a freeze only started work may be classified"
+        );
+        assert!(dup_context.iter().all(|task| task.id != review_only));
+
+        let (unfrozen, _) = classifier_queue(&conn, false).unwrap();
+        assert_eq!(
+            unfrozen.first().map(|task| task.id),
+            Some(open_task),
+            "without a freeze the full queue keeps priority order"
+        );
+
+        // Once classified, the review-only task becomes reviewer-dispatchable,
+        // so the drain can make progress.
+        conn.execute(
+            "UPDATE tasks SET refs=json_set(COALESCE(refs,'{}'),
+                 '$.cx_est',3,'$.cx_size','M','$.cx_ready',json('true'),
+                 '$.cx_not_ready_reason',json('null'),'$.cx_by','test:v2')
+             WHERE id=?1",
+            [review_only],
+        )
+        .unwrap();
+        let task = tasks::get(&conn, review_only).unwrap().unwrap();
+        assert!(tasks::classification_is_dispatchable_for_status(
+            &task.refs,
+            true,
+            None,
+            false,
+            "in-review"
+        ));
+        assert!(classifier_queue(&conn, true).unwrap().0.is_empty());
+    }
+
     #[test]
     fn reviewer_target_identity_mismatches_leave_durable_tuple_byte_for_byte_unchanged() {
         let dir = tempfile::tempdir().unwrap();
@@ -48202,6 +48375,101 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 .map(|pair| pair[1].as_str()),
             Some("gpt-5.6-terra")
         );
+    }
+
+    /// A Codex (turn-oriented) reviewer interrupted without a persisted
+    /// continuation used to return an Io error from every orphan scan forever
+    /// (no strike, no backoff). It is now ended durably once and the caller
+    /// provisions a fresh reviewer, bounded by the total reviewer-run cap.
+    #[test]
+    fn interrupted_codex_reviewer_without_continuation_ends_and_allows_fresh_reviewer() {
+        for crashed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("reviewer-no-continuation.db");
+            let (task_id, run_id) = {
+                let mut conn = quorum_core::db::open(&db_path).unwrap();
+                let task_id = tasks::create(
+                    &mut conn,
+                    "owner",
+                    "review PR #91",
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    Some(91),
+                    10,
+                )
+                .unwrap();
+                let kind = resolve_provider("gpt-5.6-terra").unwrap();
+                let run_id = quorum_core::agent_runs::insert(
+                    &conn,
+                    task_id,
+                    "r1-terra",
+                    "reviewer",
+                    "gpt-5.6-terra",
+                    "high",
+                    &kind.to_string(),
+                    11,
+                )
+                .unwrap();
+                if !crashed {
+                    quorum_core::agent_runs::close(&conn, run_id, 12, "drain").unwrap();
+                }
+                (task_id, run_id)
+            };
+
+            let recovery = resolve_reviewer_recovery(&db_path, task_id, false)
+                .expect("an unrecoverable reviewer must not be a tick error");
+            assert!(recovery.is_none(), "crashed={crashed}: provision fresh");
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let ended: (Option<i64>, Option<String>) = conn
+                .query_row(
+                    "SELECT ended_at,end_reason FROM agent_runs WHERE id=?1",
+                    [run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert!(ended.0.is_some(), "crashed={crashed}");
+            assert_eq!(
+                ended.1.as_deref(),
+                Some(REVIEWER_CONTINUATION_UNAVAILABLE_END_REASON),
+                "crashed={crashed}"
+            );
+            assert!(
+                quorum_core::agent_runs::interrupted_reviewer(&conn, task_id, false)
+                    .unwrap()
+                    .is_none(),
+                "crashed={crashed}: the next orphan scan must not re-select the run"
+            );
+            // Replay is a clean no-op, not a loop.
+            assert!(resolve_reviewer_recovery(&db_path, task_id, false)
+                .unwrap()
+                .is_none());
+            assert!(matches!(
+                decide_provision(&conn, task_id, 91, "head").unwrap(),
+                ProvisionDecision::Needed("r1")
+            ));
+
+            // The ended run still counts toward the total reviewer-run cap.
+            for i in 1..MAX_TOTAL_REVIEWER_RUNS {
+                quorum_core::agent_runs::insert(
+                    &conn,
+                    task_id,
+                    &format!("r1-extra-{i}"),
+                    "reviewer",
+                    "gpt-5.6-terra",
+                    "high",
+                    "codex",
+                    20 + i,
+                )
+                .unwrap();
+            }
+            assert!(matches!(
+                decide_provision(&conn, task_id, 91, "head").unwrap(),
+                ProvisionDecision::Exhausted
+            ));
+        }
     }
 
     #[test]
@@ -54819,6 +55087,135 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             )
             .unwrap();
         assert_eq!(state, ("planning".into(), true, Some(expected_sha)));
+    }
+
+    /// When the selected aggregate switches from graph A (now in provider
+    /// backoff, freeze released) to graph B (which won the planning freeze),
+    /// A's cached view, durable `frozen-view` marker, and cached proposal must
+    /// be settled. Before the fix the marker leaked and B sat in `draining`
+    /// forever because the drain counted it as in-flight work.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn graph_switch_releases_previous_graph_view_so_new_graph_drains() {
+        let harness = lifecycle_harness("graph-switch-releases-view");
+        let graph_a = harness.graph;
+        let snapshot = {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            load_planning_snapshot(&conn).unwrap().unwrap()
+        };
+        assert_eq!(snapshot.graph_id, graph_a);
+        let mut coordinator = DecompositionCoordinator::default();
+        let view = retain_cached_frozen_planner_view(&harness.config, &mut coordinator, &snapshot)
+            .await
+            .unwrap();
+        coordinator.graph_id = Some(graph_a);
+        coordinator.proposal = Some(arbiter_gate_proposal());
+        assert!(view.exists());
+
+        let graph_b = {
+            let mut conn = quorum_core::db::open(&harness.db_path).unwrap();
+            // A provider failure releases A's freeze (provider backoff).
+            assert!(quorum_core::decomposition::record_attempt(
+                &mut conn,
+                graph_a,
+                "provider",
+                "planner-provider",
+                "bounded provider failure",
+                5,
+            )
+            .unwrap()
+            .is_some());
+            let source_b = tasks::create(
+                &mut conn,
+                "owner",
+                "second split source",
+                Some("split this too"),
+                1,
+                None,
+                None,
+                None,
+                None,
+                6,
+            )
+            .unwrap();
+            quorum_core::decomposition::begin_planning(
+                &mut conn,
+                &quorum_core::decomposition::BeginPlanning {
+                    source_task_id: source_b,
+                    expected_revision: 1,
+                    provider: "codex",
+                    model: "gpt-5.6-sol",
+                    frozen_base_sha: "unused",
+                    now: 7,
+                },
+            )
+            .unwrap()
+            .expect("graph B wins the released planning freeze")
+        };
+
+        // B owns the freeze, so the coordinator switches to it.
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(coordinator.graph_id, Some(graph_b));
+        assert!(
+            coordinator.frozen_view.is_none(),
+            "A's cached view released"
+        );
+        assert!(!view.exists());
+        assert!(
+            coordinator.proposal.is_none(),
+            "A's cached proposal must not carry over to B"
+        );
+        {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            let markers: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM journal WHERE role='frozen-view'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(markers, 0, "A's durable marker must not leak");
+        }
+        assert_eq!(arbiter_gate_state(&harness.db_path, graph_b).0, "draining");
+
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(
+            arbiter_gate_state(&harness.db_path, graph_b).0,
+            "planning",
+            "B must drain and capture its frozen base"
+        );
+        assert_eq!(
+            arbiter_gate_state(&harness.db_path, graph_a).0,
+            "provider-backoff",
+            "A keeps its durable state and resumes once B releases the freeze"
+        );
+    }
+
+    /// A `frozen-view` row is a recovery marker for a cached archive, not live
+    /// work; only rows with a live agent behind them block a freeze drain.
+    #[test]
+    fn drain_journal_count_ignores_frozen_view_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_test_db(dir.path());
+        for (agent, role) in [
+            ("decomposition-frozen-view-1", "frozen-view"),
+            ("decomposition-frozen-view-2", "frozen-view"),
+        ] {
+            conn.execute(
+                "INSERT INTO journal(agent,role,session_id,phase,updated_at)
+                 VALUES (?1,?2,'sha','frozen-view',1)",
+                rusqlite::params![agent, role],
+            )
+            .unwrap();
+        }
+        assert_eq!(count_drain_blocking_journal_rows(&conn).unwrap(), 0);
+        conn.execute(
+            "INSERT INTO journal(agent,role,session_id,phase,updated_at)
+             VALUES ('decomposition-planner-3','planner','run','planner',1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(count_drain_blocking_journal_rows(&conn).unwrap(), 1);
     }
 
     /// A classifier rejection returns the proposal to the planner retry path

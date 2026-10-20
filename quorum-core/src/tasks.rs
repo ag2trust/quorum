@@ -454,10 +454,49 @@ const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
     )
 ))";
 
+/// SQL shape that is true when the aliased `failed` task row is a retryable
+/// daemon park rather than a hard failure: it carries the daemon park marker
+/// and a resume status, its dependencies are not unsatisfiable, and it is not
+/// a publication park that observed the PR already merged (delivery evidence
+/// that `task-retry` refuses). Owner policy: such a park neither holds its
+/// decomposition graph nor blocks sibling dispatch; only hard failures do.
+/// The park still keeps the graph incomplete (the child is not `done`) and
+/// still blocks its own dependents through ordinary dependency readiness.
+macro_rules! retryable_daemon_park_sql {
+    ($t:literal) => {
+        // COALESCE keeps the predicate two-valued: missing keys or NULL refs
+        // must read as "not a retryable park", never as SQL NULL, so that
+        // `NOT <predicate>` stays true for a hard failure.
+        concat!(
+            "(COALESCE((json_valid(",
+            $t,
+            ".refs)
+              AND json_extract(",
+            $t,
+            ".refs,'$.daemon_parked')=1
+              AND json_type(",
+            $t,
+            ".refs,'$.daemon_resume_status')='text'
+              AND COALESCE(json_extract(",
+            $t,
+            ".refs,'$.daemon_parked_unsatisfiable'),0)=0
+              AND COALESCE(json_extract(",
+            $t,
+            ".refs,'$.daemon_publication_failure_kind'),'')!='pr-merged'),0)=1)"
+        )
+    };
+}
+
+/// [`retryable_daemon_park_sql`] over a row aliased `child`, for graph-hold
+/// decisions outside this module.
+pub(crate) const RETRYABLE_DAEMON_PARK_CHILD_SQL: &str = retryable_daemon_park_sql!("child");
+
 // Generated implementation work has additional graph authority. This exact
 // predicate is used both by daemon-side candidate selection and by the
-// authoritative claim transaction so the two paths cannot drift.
-const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
+// authoritative claim transaction so the two paths cannot drift. Only a
+// hard-failed sibling withholds dispatch; a retryable daemon park does not.
+const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = concat!(
+    "(NOT EXISTS (
     SELECT 1 FROM task_graph_members own_member
     WHERE own_member.task_id=tasks.id
 ) OR EXISTS (
@@ -473,6 +512,9 @@ const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
           JOIN tasks sibling ON sibling.id=sibling_member.task_id
           WHERE sibling_member.graph_id=own_member.graph_id
             AND sibling_member.active=1 AND sibling.status='failed'
+            AND NOT ",
+    retryable_daemon_park_sql!("sibling"),
+    "
       )
       AND 2 > (
           SELECT COUNT(*) FROM task_graph_members sibling_member
@@ -480,7 +522,8 @@ const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
           WHERE sibling_member.graph_id=own_member.graph_id
             AND sibling_member.active=1 AND sibling.status='working'
       )
-))";
+))"
+);
 
 /// SQL shape for the only flagged root route that requires decomposition.
 /// Missing flags are intentionally equivalent to an empty array.
@@ -12357,7 +12400,10 @@ mod tests {
     }
 
     #[test]
-    fn daemon_push_rejection_park_blocks_parent_graph() {
+    /// Owner policy: a retryable daemon park (here a push-rejection park) never
+    /// holds its decomposition graph; siblings keep reviewer and dispatch
+    /// authority and `task-retry` resumes the child under the active graph.
+    fn daemon_push_rejection_park_keeps_parent_graph_active() {
         let (_dir, mut conn) = open_tmp();
         conn.execute(
             "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
@@ -12413,71 +12459,50 @@ mod tests {
             .unwrap()
             .expect("child must park");
 
-        let (state, hold_code, hold_summary): (String, String, String) = conn
-            .query_row(
-                "SELECT state,hold_code,hold_summary
-                 FROM task_decompositions WHERE id=?1",
-                [graph],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(state, "blocked");
-        assert_eq!(hold_code, "generated-child-failed");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&hold_summary).unwrap(),
-            serde_json::json!({"affected_task": ids[0], "reason": reason})
-        );
-
-        let event_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE kind='task_graph_blocked'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(event_count, 1);
-
-        let graph_alert: String = conn
-            .query_row(
-                "SELECT body FROM messages
-                 WHERE kind='alert' AND recipient='owner'
-                   AND body LIKE '%task graph blocked%'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("graph-blocked alert must exist");
-        assert!(graph_alert.contains("task graph blocked"));
-        assert!(graph_alert.contains(reason));
-
-        assert!(
-            !crate::decomposition_review::is_reviewable_graph_member(&conn, ids[1]).unwrap(),
-            "a blocked graph must withhold sibling reviewer authority"
-        );
-        let retried = retry_parked(&mut conn, ids[0], "operator", true, 11)
-            .unwrap()
-            .expect("parked child must resume");
-        assert_eq!(retried.status, "open");
-        let graph_state: (String, Option<String>, Option<String>) = conn
-            .query_row(
+        let graph_state = |conn: &Connection| -> (String, Option<String>, Option<String>) {
+            conn.query_row(
                 "SELECT state,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
                 [graph],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
+            .unwrap()
+        };
+        assert_eq!(graph_state(&conn), ("active".into(), None, None));
+        let graph_side_effects: (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM events WHERE kind='task_graph_blocked'),
+                        (SELECT COUNT(*) FROM messages
+                         WHERE kind='alert' AND body LIKE '%task graph blocked%')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .unwrap();
-        assert_eq!(graph_state, ("active".into(), None, None));
+        assert_eq!(graph_side_effects, (0, 0));
+        assert!(
+            crate::decomposition_review::is_reviewable_graph_member(&conn, ids[1]).unwrap(),
+            "a parked sibling must not withhold reviewer authority"
+        );
+        assert!(
+            list_implementation_ready_open(&conn)
+                .unwrap()
+                .iter()
+                .any(|task| task.id == ids[1]),
+            "a parked sibling must not withhold dispatch"
+        );
+
+        let retried = retry_parked(&mut conn, ids[0], "operator", true, 11)
+            .unwrap()
+            .expect("parked child must resume");
+        assert_eq!(retried.status, "open");
+        assert_eq!(graph_state(&conn), ("active".into(), None, None));
         let unblocked: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM events
-                 WHERE kind='task_graph_unblocked' AND subject=?1",
-                [lease_target(ids[0])],
+                "SELECT COUNT(*) FROM events WHERE kind='task_graph_unblocked'",
+                [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(unblocked, 1);
-        assert!(
-            crate::decomposition_review::is_reviewable_graph_member(&conn, ids[1]).unwrap(),
-            "reactivating the graph must restore sibling reviewer authority"
-        );
+        assert_eq!(unblocked, 0, "a graph that was never held is not unblocked");
     }
 
     fn blocked_graph_with_parked_children(

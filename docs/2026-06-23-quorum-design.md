@@ -2668,7 +2668,13 @@ retry count/cap without exposing planner transcripts.
 Reviewer provisioning reserves task authority in `BEGIN IMMEDIATE` before external resolution or
 process creation. The same transaction checks task phase, classification, and planning freeze;
 planning freeze acquisition excludes live reservations. The daemon releases the reservation only
-after reviewer attachment or complete failed-provision cleanup.
+after reviewer attachment or complete failed-provision cleanup. Because the freeze drain waits for
+every already-started task, the ordinary classifier keeps running under a freeze for exactly that
+started set (`working`, `in-review`, `rework` — e.g. a review-only task created during the freeze,
+whose reviewer cannot dispatch unclassified); `open` tasks wait for the freeze to clear. The drain
+counts only journal rows with live work behind them, never a cached frozen-view marker, and the
+coordinator settles a previous graph's cached view, marker, and proposal whenever the selected
+aggregate changes.
 
 One `BEGIN IMMEDIATE` transaction creates the entire graph: every generated task with
 `terminal_leaf=1`, classification, edge, membership/provenance row, source `planning ->
@@ -2682,10 +2688,21 @@ source target yields NULL child targets and preserves the legacy configured-base
 Generated tasks retain ordinary independent implementation, review, rework, and protected merge.
 As terminal leaves, they dispatch directly regardless of the root size-dispatch policy and cannot
 be selected as decomposition sources. Their atomic claim additionally requires an active
-decomposed source, done prerequisites, no failed sibling or graph blocker, and fewer than two
-active implementation siblings. Eligible graph children sort before unrelated new work, but
+decomposed source, done prerequisites, no hard-failed sibling or graph blocker, and fewer than
+two active implementation siblings. Eligible graph children sort before unrelated new work, but
 reserve no idle capacity and never interrupt active unrelated work. Active siblings may finish
-after another child fails; no later child may start.
+after another child hard-fails; no later child may start.
+
+Only a hard child failure holds the graph (`generated-child-failed`). A retryable daemon park of a
+child — `status='failed'` with `refs.daemon_parked` and a `daemon_resume_status`, e.g. a
+needs-info/blocked reaction, an exhausted recovery budget, a publication or dependency park —
+neither holds the graph nor withholds sibling dispatch or review. One shared SQL predicate decides
+"retryable park" for candidate selection, the claim transaction, and the graph-hold decision; parks
+that `task-retry` refuses to resume (an unsatisfiable-dependency park or a publication park that
+observed its PR merged) remain hard. A parked child is still not `done`, so the graph cannot
+complete and the child's own dependents stay blocked until `task-retry` (which works under the
+active graph) or `task-close` resolves it. Holds already persisted by an earlier daemon keep their
+existing explicit recovery paths.
 
 A reviewer may submit a capability-bound, closed graph-blocker verdict only for a genuine safety
 or authority boundary violation where continuing the materialized graph would itself grant

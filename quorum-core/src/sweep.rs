@@ -2050,8 +2050,11 @@ mod tests {
         (graph, child, dependency)
     }
 
+    /// Owner policy: a dependency park is a retryable daemon park, so it no
+    /// longer holds the graph. The parked child still keeps the graph from
+    /// completing; independent siblings keep dispatching.
     #[test]
-    fn dependency_park_blocks_active_generated_child_graph_in_same_transaction() {
+    fn dependency_park_keeps_active_generated_child_graph_active() {
         let (_d, mut c) = open_tmp();
         let (graph, child, dependency) = active_graph_with_dependency_park_child(&mut c, None);
         c.execute(
@@ -2062,42 +2065,32 @@ mod tests {
 
         assert_eq!(cascade_dead_deps(&c, 300, SWEEP_LIMIT).unwrap(), 1);
 
-        let reason = format!("dependency #{dependency} is terminal-not-done");
-        let aggregate: (String, String, String, i64) = c
+        let parked: (String, i64) = c
             .query_row(
-                "SELECT state,hold_code,hold_summary,updated_at
-                 FROM task_decompositions WHERE id=?1",
-                [graph],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                "SELECT status,json_extract(refs,'$.daemon_parked') FROM tasks WHERE id=?1",
+                [child],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(aggregate.0, "blocked");
-        assert_eq!(aggregate.1, "generated-child-failed");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&aggregate.2).unwrap(),
-            serde_json::json!({"affected_task": child, "reason": reason})
-        );
-        assert_eq!(aggregate.3, 300);
-        let event: (String, String, String) = c
+        assert_eq!(parked, ("failed".into(), 1));
+        let aggregate: (String, Option<String>, Option<String>) = c
             .query_row(
-                "SELECT kind,subject,body FROM events WHERE kind='task_graph_blocked'",
-                [],
+                "SELECT state,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
+                [graph],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(event.0, "task_graph_blocked");
-        assert_eq!(event.1, format!("task#{child}"));
-        assert!(event.2.contains(&reason));
-        let graph_alerts: i64 = c
+        assert_eq!(aggregate, ("active".into(), None, None));
+        let side_effects: (i64, i64) = c
             .query_row(
-                "SELECT count(*) FROM messages
-                 WHERE author='daemon' AND kind='alert' AND recipient='owner'
-                   AND refs=?1 AND body LIKE '%task graph blocked%'",
-                [format!("task:{child}")],
-                |row| row.get(0),
+                "SELECT (SELECT count(*) FROM events WHERE kind='task_graph_blocked'),
+                        (SELECT count(*) FROM messages
+                         WHERE kind='alert' AND body LIKE '%task graph blocked%')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(graph_alerts, 1);
+        assert_eq!(side_effects, (0, 0));
     }
 
     #[test]
