@@ -7,7 +7,7 @@
 //! 4. Remediation worker pushes → in-review + re-review fed to reviewer
 //!
 //! Unit-level tests cover:
-//! - Expired-lease review-only rework recovers to in-review (not open)
+//! - Expired-lease PR-bound review-only rework retains rework (not open)
 //! - Healthy remediation lease survives reaper
 //! - Claim race produces no errors rows
 //!
@@ -362,7 +362,7 @@ fn errors_count(home: &std::path::Path) -> i64 {
         .unwrap()
 }
 
-/// Seed a review-only task directly in the DB with a known author and PR.
+/// Seed an externally-authored review-only task directly in the DB.
 fn seed_review_only_task(home: &std::path::Path, pr: i64) -> i64 {
     let mut conn = quorum_core::db::open(&db_path(home)).unwrap();
     let now = std::time::SystemTime::now()
@@ -392,6 +392,7 @@ fn seed_review_only_task(home: &std::path::Path, pr: i64) -> i64 {
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
+            risk_flags: vec![],
         }],
         "test:v2",
         now,
@@ -432,6 +433,7 @@ fn seed_in_review_task(home: &std::path::Path, author: &str, pr: i64) -> i64 {
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
+            risk_flags: vec![],
         }],
         "test:v2",
         now,
@@ -531,7 +533,7 @@ fn orphan_reviewer_waits_for_complete_v3_classification() {
         .lines
         .iter()
         .position(|line| line.contains("classifier: stored 1 classification"))
-        .expect("v3 classification was not persisted");
+        .expect("v4 classification was not persisted");
     let spawned = handle
         .lines
         .iter()
@@ -539,14 +541,14 @@ fn orphan_reviewer_waits_for_complete_v3_classification() {
         .expect("reviewer spawn log missing");
     assert!(
         gated < classified && classified < spawned,
-        "reviewer must not spawn before v3 classification: {:?}",
+        "reviewer must not spawn before v4 classification: {:?}",
         handle.lines
     );
 
     let task = get_task(home.path(), task_id);
     let refs: serde_json::Value =
         serde_json::from_str(task.refs.as_deref().expect("classified refs")).unwrap();
-    assert_eq!(refs["cx_by"], "claude-opus-4-6:v3");
+    assert_eq!(refs["cx_by"], "claude-opus-4-6:v4");
     assert_eq!(refs["cx_size"], "S");
     assert_eq!(
         refs["cx_size_reason"],
@@ -994,6 +996,233 @@ fn orphan_r2_does_not_reuse_torn_down_worker_or_r1_name() {
     drop(handle);
 }
 
+/// An external review-only PR has no implementation author. Its approval
+/// authority must therefore use the review counterpart sentinel without
+/// mutating `tasks.author`, across both R1 and final R2 approval persistence.
+#[test]
+fn review_only_null_author_records_external_approvals_and_merges() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let pr = 42;
+    let task_id = seed_review_only_task(home.path(), pr);
+    assert!(get_task(home.path(), task_id).review_only);
+    assert_eq!(get_task(home.path(), task_id).author, None);
+    // The test GH shim resolves this as the external PR head. It is not a
+    // task author and must remain absent from the task row.
+    create_author_branch(repo_dir.path(), "OrigWorker", task_id);
+    let names = write_named_pool(home.path(), &["R1".into(), "R2".into()]);
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+    );
+    assert!(
+        handle.wait_for("spawning reviewer", 30),
+        "R1 reviewer was not provisioned: {:?}",
+        handle.lines
+    );
+    let r1 = handle.extract_agent_name("spawning reviewer ").unwrap();
+    assert!(
+        handle.wait_for("result", 15),
+        "R1 reviewer did not produce a result: {:?}",
+        handle.lines
+    );
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r1,
+            "--pr",
+            &pr.to_string(),
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+
+    assert!(
+        handle.wait_for("R2: pre-merge reviewer", 30),
+        "R2 reviewer was not provisioned after R1 approval: {:?}",
+        handle.lines
+    );
+    {
+        let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+        let approval = quorum_core::approvals::get(&conn, pr, "r1")
+            .unwrap()
+            .expect("R1 approval must be durable before R2 is provisioned");
+        assert_eq!(approval.task_id, task_id);
+        assert_eq!(approval.author, "external");
+        assert_eq!(approval.reviewer, r1);
+        assert_ne!(approval.reviewer, approval.author);
+        assert_eq!(get_task(home.path(), task_id).author, None);
+    }
+
+    let r2 = handle
+        .extract_agent_name("R2: pre-merge reviewer ")
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(
+        handle.wait_for("result", 15),
+        "R2 reviewer did not produce a result: {:?}",
+        handle.lines
+    );
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &r2,
+            "--pr",
+            &pr.to_string(),
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    assert!(
+        handle.wait_for("PR #42 merged — firing MergeSucceeded", 30),
+        "review-only external approvals did not merge: {:?}",
+        handle.lines
+    );
+    handle.drain_pending_lines();
+
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    for role in ["r1", "r2"] {
+        let approval = quorum_core::approvals::get(&conn, pr, role)
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing durable {role} approval"));
+        assert_eq!(approval.task_id, task_id);
+        assert_eq!(approval.author, "external");
+        assert_ne!(approval.reviewer, approval.author);
+    }
+    let discarded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE task_id=?1 AND end_reason='approval-no-author'",
+            rusqlite::params![task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(discarded, 0, "external approval must not be discarded");
+    assert_eq!(get_task(home.path(), task_id).author, None);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while get_task(home.path(), task_id).status != "done" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "merge success did not complete the review-only task: {:?}",
+            handle.lines
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !handle
+            .lines
+            .iter()
+            .any(|line| line.contains("approval-no-author") || line.contains("tick error")),
+        "approval must not be discarded or abort the tick: {:?}",
+        handle.lines
+    );
+}
+
+/// Non-review-only rows retain fail-closed behavior when no live or durable
+/// implementation author exists.
+#[test]
+fn non_review_only_null_author_discards_approval() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let pr = 42;
+    let task_id = seed_in_review_task(home.path(), "Worker", pr);
+    create_author_branch(repo_dir.path(), "OrigWorker", task_id);
+    {
+        let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+        conn.execute("UPDATE tasks SET author=NULL WHERE id=?1", [task_id])
+            .unwrap();
+    }
+    let names = write_named_pool(home.path(), &["Reviewer".into()]);
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+    );
+    assert!(
+        handle.wait_for("spawning reviewer", 30),
+        "reviewer was not provisioned: {:?}",
+        handle.lines
+    );
+    let reviewer = handle.extract_agent_name("spawning reviewer ").unwrap();
+    assert!(
+        handle.wait_for("result", 15),
+        "reviewer did not produce a result: {:?}",
+        handle.lines
+    );
+    quorum_done(
+        home.path(),
+        &[
+            "--agent",
+            &reviewer,
+            "--pr",
+            &pr.to_string(),
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+    assert!(
+        handle.wait_for("has no durable author — discarding verdict", 30),
+        "authorless implementation approval was not rejected: {:?}",
+        handle.lines
+    );
+    assert!(
+        handle.wait_for("reviewer Reviewer torn down", 15),
+        "discarded reviewer was not torn down: {:?}",
+        handle.lines
+    );
+
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    assert!(quorum_core::approvals::get(&conn, pr, "r1")
+        .unwrap()
+        .is_none());
+    let discarded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE task_id=?1 AND end_reason='approval-no-author'",
+            rusqlite::params![task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(discarded, 1);
+}
+
 /// PR #3806 regression: in-review task through R1 changes → remediation →
 /// sweep survival → rework push → re-review feed.
 ///
@@ -1237,11 +1466,11 @@ fn review_only_orphan_full_lifecycle() {
     );
 }
 
-/// Negative: an expired remediation lease parks the review-only task (never
-/// bounces to in-review) — a replacement reviewer on the unchanged PR head
-/// would burn a rework round with zero remediation applied (D5b).
+/// An expired PR-bound remediation lease retains the review-only task's rework
+/// context, so the daemon can provision one replacement worker without
+/// re-reviewing the unchanged PR head or burning a round.
 #[test]
-fn review_only_rework_expired_lease_parks_for_retry() {
+fn review_only_rework_expired_lease_retains_rework_for_recovery() {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
 
@@ -1309,43 +1538,39 @@ fn review_only_rework_expired_lease_parks_for_retry() {
         quorum_core::sweep::reap_lapsed_tasks(&conn, now, 100).unwrap();
     }
 
-    // Verify: parked (failed + daemon_parked, resume rework), never in-review.
+    // Verify: retained rework with the same PR/round and one durable recovery
+    // intent, never in-review or open.
     let task = get_task(home.path(), task_id);
     assert_eq!(
-        task.status, "failed",
-        "expired-lease review-only rework must park, got: {}",
+        task.status, "rework",
+        "expired-lease review-only rework must retain rework, got: {}",
         task.status
     );
+    assert_eq!(quorum_core::tasks::extract_pr_number(&task.refs), Some(pr));
     assert_eq!(
         task.rework_round, 1,
         "infra failure must not consume a rework round"
     );
     let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-    assert_eq!(refs["daemon_parked"], true);
-    assert_eq!(refs["daemon_resume_status"], "rework");
     assert!(
-        refs.get("daemon_parked_head_check").is_none(),
-        "terminal park must not carry automatic head-check authority"
-    );
-    assert!(
-        refs.get("daemon_rework_retry_requested").is_none(),
-        "terminal park must stay owner-gated until explicit task-retry"
+        refs["daemon_recovered_remediation_retry"].as_bool() == Some(true),
+        "rework recovery must persist the exact replacement-worker intent"
     );
 
     let events = events_for_task(home.path(), task_id);
-    let parked = events
+    let reclaimed = events
         .iter()
-        .find(|(k, _)| k == "task_parked")
+        .find(|(k, _)| k == "task_reclaimed")
         .map(|(_, b)| b.clone());
-    assert!(parked.is_some(), "reaper must emit task_parked event");
+    assert!(reclaimed.is_some(), "reaper must emit task_reclaimed event");
     assert!(
-        parked.as_ref().unwrap().contains("lease lapsed"),
-        "park event must say 'lease lapsed' (not 'no lease installed'), got: {:?}",
-        parked
+        reclaimed.as_ref().unwrap().contains("lease lapsed"),
+        "reclaim event must say 'lease lapsed', got: {:?}",
+        reclaimed
     );
     assert!(
-        !events.iter().any(|(k, _)| k == "task_reclaimed"),
-        "parked task must not also emit task_reclaimed"
+        !events.iter().any(|(k, _)| k == "task_parked"),
+        "reclaimed task must not also emit task_parked"
     );
 }
 

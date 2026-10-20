@@ -9,10 +9,10 @@ use crate::agent_client::SubmitPlanOutcome;
 use quorum_core::error::{QuorumError, Result};
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorCode,
-        Implementation, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
-        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
-        ToolAnnotations,
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+        ErrorCode, Implementation, ListPromptsResult, ListResourceTemplatesResult,
+        ListResourcesResult, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
+        ServerInfo, Tool, ToolAnnotations,
     },
     service::{Peer, RequestContext},
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
@@ -673,7 +673,13 @@ impl ServerHandler for QuorumServer {
         if planner {
             tools.push(submit_plan_tool());
         }
-        Ok(ListToolsResult::with_all_items(tools))
+        // MCP 2026-07-28 requires `ttlMs` and `cacheScope` on list results;
+        // rmcp leaves both unset, and Claude Code then rejects the whole
+        // inventory (the planner loses `submit_plan`). The inventory is
+        // per-run and phase-derived, so it is never fresh and never shared.
+        Ok(ListToolsResult::with_all_items(tools)
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private))
     }
 
     async fn call_tool(

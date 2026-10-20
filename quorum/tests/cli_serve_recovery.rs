@@ -1212,7 +1212,24 @@ fn recovery_orphaned_worktree_gc() {
     let env = TestEnv::new();
 
     let orphan_dir = env.wt_base.path().join("orphan-stale-wt");
-    std::fs::create_dir_all(&orphan_dir).unwrap();
+    let created = Command::new("git")
+        .args([
+            "-C",
+            &env.repo_dir.path().to_string_lossy(),
+            "worktree",
+            "add",
+            "-b",
+            "daemon/orphan-stale-wt",
+            &orphan_dir.to_string_lossy(),
+            "main",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "failed to create registered orphan worktree: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
     assert!(orphan_dir.exists());
 
     let mut handle = env.start_serve();

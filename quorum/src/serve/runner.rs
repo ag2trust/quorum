@@ -1024,6 +1024,18 @@ impl RunnerProc {
         }
     }
 
+    /// Return Grok's validated terminal session when its configured turn
+    /// budget was exhausted. This is provider evidence only: lifecycle owns
+    /// the durable checkpoint and retry decision.
+    pub fn grok_max_turn_exhaustion(&self) -> Option<String> {
+        match self {
+            Self::Grok(proc) => proc
+                .max_turn_exhaustion()
+                .map(|exhaustion| exhaustion.session_id),
+            Self::Claude(_) | Self::Codex(_) => None,
+        }
+    }
+
     pub async fn kill_and_reap(self) -> Vec<CapturedOutput> {
         match self {
             Self::Claude(proc) => proc.kill_and_reap().await,

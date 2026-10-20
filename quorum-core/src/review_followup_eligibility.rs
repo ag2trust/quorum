@@ -166,6 +166,7 @@ mod tests {
             "owner",
             task_id,
             "resolved outside the managed merge lifecycle",
+            None,
             102,
         )
         .unwrap()

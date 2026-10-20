@@ -570,7 +570,13 @@ async fn verify_dormant_worktree(
         .map_err(|error| invalid(format!("worktree base is unavailable: {error}")))?;
     let canonical_worktree = std::fs::canonicalize(&worktree)
         .map_err(|error| invalid(format!("worktree is unavailable: {error}")))?;
-    if canonical_worktree.parent() != Some(canonical_base.as_path()) {
+    // A parked branch-sync judgment worker lives in the kept sync worktree,
+    // which sits in the daemon's sibling namespace rather than worktree_base.
+    let canonical_sync_root = std::fs::canonicalize(super::branch_sync_worktree_root(config)).ok();
+    let parent = canonical_worktree.parent();
+    if parent != Some(canonical_base.as_path())
+        && (canonical_sync_root.is_none() || parent != canonical_sync_root.as_deref())
+    {
         return Err(invalid(format!(
             "worktree {} is outside the managed worktree base",
             worktree.display()
@@ -714,6 +720,7 @@ fn reconstruct_dormant_slots(
             session_log: None,
             live_stats: LiveStats::new(),
             error_turn_count: 0,
+            fallback_install_error_count: 0,
             last_error_text: None,
             agent_run_id: Some(recovery.agent_run_id),
             cap_run_id: Some(recovery.cap_run_id.clone()),
@@ -782,7 +789,10 @@ async fn await_process_exit(pid: i32, timeout: std::time::Duration) -> bool {
 
 fn remove_journaled_decomposition_views(entries: &[JournalEntry]) {
     for entry in entries {
-        if !matches!(entry.role.as_str(), "planner" | "classifier") {
+        if !matches!(
+            entry.role.as_str(),
+            "planner" | "classifier" | "arbiter" | "frozen-view"
+        ) {
             continue;
         }
         let Some(view) = entry.worktree.as_deref().map(std::path::Path::new) else {
@@ -849,7 +859,10 @@ pub(crate) async fn recover(
         .collect::<Vec<_>>();
     // #130: all unjournaled working/rework tasks are orphaned and follow
     // normal recovery (no passive exemption). Journal entries identify
-    // daemon-managed agents whose stale processes must be killed.
+    // daemon-managed agents whose stale processes must be killed. Doctor and
+    // collector rows (roles "doctor"/"collector", NULL task_id) are only
+    // killed here and deleted in Phase 2: dormant/fallback recovery admits
+    // worker/reviewer roles alone.
 
     if !entries.is_empty() {
         log(&format!(
@@ -885,8 +898,9 @@ pub(crate) async fn recover(
     reserve_dormant_names(&pending_entries, name_pool, workers)?;
 
     // Decomposition planner views are ordinary temporary archives rather
-    // than Git worktrees. Their exact path is journaled with the provider
-    // process so abrupt daemon death cannot leak the frozen repository view.
+    // than Git worktrees. Their exact path is journaled with every provider
+    // and a graph-owned cache marker, so abrupt daemon death cannot leak the
+    // frozen repository tree between attempts.
     remove_journaled_decomposition_views(&entries);
 
     let dispositions = {
@@ -1372,25 +1386,31 @@ mod tests {
     }
 
     fn dormant_fixture() -> DormantFixture {
+        dormant_fixture_at("worktrees/Dormant-t1", "daemon/dormant-t1")
+    }
+
+    /// Dormant worker fixture whose worktree is `worktree_rel` under the
+    /// fixture root (the managed base is always `<root>/worktrees`).
+    fn dormant_fixture_at(worktree_rel: &str, branch: &str) -> DormantFixture {
+        dormant_fixture_named("Dormant", worktree_rel, branch)
+    }
+
+    fn dormant_fixture_named(agent: &str, worktree_rel: &str, branch: &str) -> DormantFixture {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
         let worktree_base = dir.path().join("worktrees");
-        let worktree = worktree_base.join("Dormant-t1");
+        let worktree = dir.path().join(worktree_rel);
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&worktree_base).unwrap();
+        std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
         run_git(&repo, &["init", "-b", "main"]);
         run_git(&repo, &["config", "user.email", "test@example.com"]);
         run_git(&repo, &["config", "user.name", "Test"]);
         run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
-        run_git(&repo, &["branch", "daemon/dormant-t1"]);
+        run_git(&repo, &["branch", branch]);
         run_git(
             &repo,
-            &[
-                "worktree",
-                "add",
-                worktree.to_str().unwrap(),
-                "daemon/dormant-t1",
-            ],
+            &["worktree", "add", worktree.to_str().unwrap(), branch],
         );
 
         let db_path = dir.path().join("quorum.db");
@@ -1411,12 +1431,12 @@ mod tests {
             now,
         )
         .unwrap();
-        tasks::claim(&mut conn, "Dormant", Some(task_id), &[], 3600, now)
+        tasks::claim(&mut conn, agent, Some(task_id), &[], 3600, now)
             .unwrap()
             .unwrap();
         tasks::apply_event(
             &mut conn,
-            "Dormant",
+            agent,
             task_id,
             &Event::SignaledDone { pr: "901".into() },
             now + 1,
@@ -1436,14 +1456,14 @@ mod tests {
         tasks::update_refs_daemon(&mut conn, task_id, &refs.to_string(), now + 2).unwrap();
         conn.execute(
             "INSERT INTO task_branches(task_id,branch,worktree,allocated_by,allocated_at)
-             VALUES (?1,'daemon/dormant-t1',?2,'Dormant',?3)",
-            rusqlite::params![task_id, worktree.to_string_lossy(), now],
+             VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params![task_id, branch, worktree.to_string_lossy(), agent, now],
         )
         .unwrap();
         let run_id = quorum_core::agent_runs::insert(
             &conn,
             task_id,
-            "Dormant",
+            agent,
             "worker",
             "gpt-5.6-terra",
             "medium",
@@ -1471,24 +1491,17 @@ mod tests {
             now + 2,
         )
         .unwrap();
-        quorum_core::capabilities::issue(
-            &mut conn,
-            "cap-dormant",
-            task_id,
-            "Dormant",
-            "worker",
-            now,
-        )
-        .unwrap();
+        quorum_core::capabilities::issue(&mut conn, "cap-dormant", task_id, agent, "worker", now)
+            .unwrap();
         journal::upsert(
             &mut conn,
             &JournalEntry {
-                agent: "Dormant".into(),
+                agent: agent.into(),
                 role: "worker".into(),
                 task_id: Some(task_id),
                 session_id: "session-dormant".into(),
                 worktree: Some(worktree.to_string_lossy().into_owned()),
-                branch: Some("daemon/dormant-t1".into()),
+                branch: Some(branch.into()),
                 phase: "awaiting-review".into(),
                 cost_tokens: 123,
                 agent_state: None,
@@ -1499,7 +1512,7 @@ mod tests {
                 rework_count: 0,
                 provider: Some("codex".into()),
                 continuation_id: Some("thread-dormant".into()),
-                local_branch: Some("daemon/dormant-t1".into()),
+                local_branch: Some(branch.into()),
             },
         )
         .unwrap();
@@ -1728,6 +1741,62 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "recovery duplicated {table}");
         }
+    }
+
+    #[tokio::test]
+    async fn restart_reconstructs_dormant_branch_sync_judgment_worker() {
+        let fixture = dormant_fixture_at("branch-sync-worktrees/7", "sync/7");
+        let repo = &fixture.config.repo_dir;
+        let git = |dir: &Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        // Kept sync merge: both sides edited f.txt, leaving MERGE_HEAD and an
+        // unmerged path in the adopted worktree.
+        std::fs::write(repo.join("f.txt"), "source\n").unwrap();
+        run_git(repo, &["add", "f.txt"]);
+        run_git(repo, &["commit", "-m", "source"]);
+        std::fs::write(fixture.worktree.join("f.txt"), "target\n").unwrap();
+        run_git(&fixture.worktree, &["add", "f.txt"]);
+        run_git(&fixture.worktree, &["commit", "-m", "target"]);
+        assert!(!git(&fixture.worktree, &["merge", "main"]).status.success());
+        let merge_head = || {
+            let output = git(&fixture.worktree, &["rev-parse", "--verify", "MERGE_HEAD"]);
+            assert!(output.status.success(), "MERGE_HEAD must survive recovery");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let before = merge_head();
+
+        let wt_mgr = WorktreeManager::new();
+        let mut names = super::super::names::Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        recover(
+            &fixture.config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut roster,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].task_id, fixture.task_id);
+        assert_eq!(workers[0].worktree_path, fixture.worktree);
+        assert!(matches!(workers[0].proc, SlotProcess::Dormant { .. }));
+        assert_eq!(merge_head(), before);
+        let unmerged = git(
+            &fixture.worktree,
+            &["diff", "--name-only", "--diff-filter=U"],
+        );
+        assert_eq!(String::from_utf8(unmerged.stdout).unwrap(), "f.txt\n");
+        let branch = git(repo, &["rev-parse", "--verify", "refs/heads/sync/7"]);
+        assert!(branch.status.success(), "sync/7 must survive recovery");
     }
 
     #[tokio::test]
@@ -3047,6 +3116,7 @@ exec sleep 30
         let outcome = super::super::approvals::recover(
             &fixture.config.db_path,
             &fixture.config.repo_dir,
+            &super::super::worktree::WorktreeManager::new(),
             &executor,
             &fixture.config.base_branch,
             1,
@@ -3148,7 +3218,7 @@ exec sleep 30
     }
 
     #[tokio::test]
-    async fn pidless_remediation_provision_follows_generic_cleanup() {
+    async fn pidless_remediation_provision_retains_rework_context() {
         let fixture = dormant_fixture();
         let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
         tasks::apply_event(
@@ -3233,7 +3303,14 @@ exec sleep 30
         assert!(!roster.owns("Remediation"));
         let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
         let task = tasks::get(&conn, fixture.task_id).unwrap().unwrap();
-        assert_eq!(task.status, "open");
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.rework_round, 1, "reaping must not consume a round");
+        assert_eq!(
+            task.recovery_attempts, 1,
+            "reaping consumes one bounded retry"
+        );
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["pr"], 901, "recovery must retain the remediation PR");
         assert!(journal::list_in_flight(&conn)
             .unwrap()
             .iter()
@@ -3558,7 +3635,256 @@ exec sleep 30
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn journaled_planner_and_classifier_process_groups_are_reaped_with_frozen_views() {
+    async fn recover_kills_journaled_doctor_without_task_recovery() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let worktree_base = dir.path().join("worktrees");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&worktree_base).unwrap();
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test"]);
+        run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+
+        let db_path = dir.path().join("quorum.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('stalled','in-review','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let task_id = conn.last_insert_rowid();
+
+        // The daemon died with its doctor still running in its own group.
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: super::super::doctor::journal_agent(task_id),
+                role: super::super::doctor::JOURNAL_ROLE.into(),
+                task_id: None,
+                session_id: "doctor-session".into(),
+                worktree: None,
+                branch: None,
+                phase: super::super::doctor::JOURNAL_ROLE.into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: Some(pid),
+                pr: None,
+                rework_count: 0,
+                provider: Some("claude".into()),
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let config = dormant_test_config(db_path.clone(), repo, worktree_base);
+        let wt_mgr = WorktreeManager::new();
+        let mut names = super::super::names::Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        recover(&config, &wt_mgr, &mut names, &mut workers, &mut roster)
+            .await
+            .unwrap();
+
+        assert!(
+            await_process_exit(pid, std::time::Duration::from_secs(5)).await,
+            "journaled doctor pid must be dead after recovery"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert!(
+            journal::list_in_flight(&conn).unwrap().is_empty(),
+            "doctor journal row must be removed"
+        );
+        assert!(workers.is_empty(), "a doctor row never becomes a worker");
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(
+            task.status, "in-review",
+            "doctor row triggers no task recovery"
+        );
+    }
+
+    /// A daemon that died uncleanly leaves its detached collector classifier
+    /// running; its journal row is killed and removed like a doctor row.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recover_kills_journaled_collector_without_task_recovery() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let worktree_base = dir.path().join("worktrees");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&worktree_base).unwrap();
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test"]);
+        run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+
+        let db_path = dir.path().join("quorum.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('merged','done','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let task_id = conn.last_insert_rowid();
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: "#collector-42-stale".into(),
+                role: super::super::collector::JOURNAL_ROLE.into(),
+                task_id: None,
+                session_id: "#collector-42-stale".into(),
+                worktree: None,
+                branch: None,
+                phase: super::super::collector::JOURNAL_ROLE.into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: Some(pid),
+                pr: None,
+                rework_count: 0,
+                provider: Some("claude".into()),
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let config = dormant_test_config(db_path.clone(), repo, worktree_base);
+        let wt_mgr = WorktreeManager::new();
+        let mut names = super::super::names::Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        recover(&config, &wt_mgr, &mut names, &mut workers, &mut roster)
+            .await
+            .unwrap();
+
+        assert!(
+            await_process_exit(pid, std::time::Duration::from_secs(5)).await,
+            "journaled collector pid must be dead after recovery"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert!(
+            journal::list_in_flight(&conn).unwrap().is_empty(),
+            "collector journal row must be removed"
+        );
+        assert!(workers.is_empty(), "a collector row never becomes a worker");
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(
+            task.status, "done",
+            "collector row triggers no task recovery"
+        );
+    }
+
+    /// A legacy worker identity named like the doctor (`doctor-1`) is still
+    /// restored as a durable identity, while a stale doctor row for the same
+    /// task — a distinct journal key — is killed and removed alongside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_doctor_named_identity_recovers_beside_stale_doctor() {
+        use std::os::unix::process::CommandExt;
+
+        let fixture =
+            dormant_fixture_named("doctor-1", "worktrees/doctor-1-t1", "daemon/doctor-1-t1");
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: super::super::doctor::journal_agent(fixture.task_id),
+                role: super::super::doctor::JOURNAL_ROLE.into(),
+                task_id: None,
+                session_id: "doctor-session".into(),
+                worktree: None,
+                branch: None,
+                phase: super::super::doctor::JOURNAL_ROLE.into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: Some(pid),
+                pr: None,
+                rework_count: 0,
+                provider: Some("claude".into()),
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let wt_mgr = WorktreeManager::new();
+        let mut names = super::super::names::Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        recover(
+            &fixture.config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut roster,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].agent_name, "doctor-1");
+        assert!(matches!(workers[0].proc, SlotProcess::Dormant { .. }));
+        assert!(roster.owns("doctor-1"));
+        assert!(
+            await_process_exit(pid, std::time::Duration::from_secs(5)).await,
+            "stale doctor pid must be dead after recovery"
+        );
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let agents: Vec<String> = journal::list_in_flight(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.agent)
+            .collect();
+        assert_eq!(agents, vec!["doctor-1".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn journaled_decomposition_process_groups_are_reaped_with_frozen_views() {
         use std::os::unix::process::CommandExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -3595,7 +3921,7 @@ exec sleep 30
 
         let mut children = Vec::new();
         let mut view_paths = Vec::new();
-        for role in ["planner", "classifier"] {
+        for role in ["planner", "classifier", "arbiter"] {
             let view = tempfile::Builder::new()
                 .prefix("quorum-planner-")
                 .tempdir()
@@ -3634,8 +3960,38 @@ exec sleep 30
             children.push((child, pid));
             view_paths.push(view);
         }
+        let orphaned_view = tempfile::Builder::new()
+            .prefix("quorum-planner-")
+            .tempdir()
+            .unwrap()
+            .keep();
+        std::fs::write(orphaned_view.join("frozen.txt"), "cached between attempts").unwrap();
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: format!("decomposition-frozen-view-{graph_id}"),
+                role: "frozen-view".into(),
+                task_id: Some(1),
+                session_id: "frozen-sha".into(),
+                worktree: Some(orphaned_view.to_string_lossy().into_owned()),
+                branch: None,
+                phase: "frozen-view".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+        view_paths.push(orphaned_view);
         let entries = journal::list_in_flight(&conn).unwrap();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 4);
         for entry in &entries {
             kill_stale_process_group(entry.pid);
         }

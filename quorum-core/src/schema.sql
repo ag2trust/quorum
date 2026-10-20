@@ -1,4 +1,4 @@
--- Quorum schema (SCHEMA_VERSION = 70). All statements idempotent (IF NOT EXISTS) so the
+-- Quorum schema (SCHEMA_VERSION = 78). All statements idempotent (IF NOT EXISTS) so the
 -- migration is safe to run on every open. See docs/2026-06-23-quorum-design.md §Data model.
 
 CREATE TABLE IF NOT EXISTS agents (
@@ -115,6 +115,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- v53: authoritative nullable target branch. Resolved to the daemon-configured
     -- base before first execution; immutable once populated.
     target_branch TEXT,
+    -- v73: generated decomposition children are terminal implementation leaves.
+    -- They may bypass the ordinary size dispatch policy, but can never plan children.
+    terminal_leaf INTEGER NOT NULL DEFAULT 0,
     -- v56: nullable per-task rework ceiling. Stamped from the daemon's
     -- `max_rework` config at first ownership; immutable once populated. NULL
     -- means unstamped and falls back to the compiled REWORK_CAP, preserving
@@ -126,6 +129,41 @@ CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC)
 -- REVIEWING_TASK_LIMIT-sized candidate sets are merged for global ordering.
 CREATE INDEX IF NOT EXISTS tasks_reviewing_newest
     ON tasks(status, updated_at DESC, id DESC);
+
+-- v76/v77: daemon-internal branch synchronization. A clean synchronization never
+-- creates a task; task_id is reserved only for the later judgment-required
+-- conflict/CI paths. The explicit active sentinel makes the partial unique
+-- index the cross-process authority for one live synchronization per directed
+-- pair.
+CREATE TABLE IF NOT EXISTS branch_syncs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_branch TEXT NOT NULL,
+    target_branch TEXT NOT NULL,
+    source_sha    TEXT,
+    target_sha    TEXT,
+    sync_branch   TEXT,
+    merge_sha     TEXT,
+    pr            INTEGER,
+    phase         TEXT NOT NULL CHECK(phase IN (
+                      'requested','pinned','prepared','published','checks',
+                      'merging','done','noop','conflict','ci_failed','failed',
+                      'cancelled')),
+    ci_attempts   INTEGER NOT NULL DEFAULT 0 CHECK(ci_attempts >= 0),
+    ci_next_attempt_at INTEGER,
+    ci_wait_inflight INTEGER NOT NULL DEFAULT 0 CHECK(ci_wait_inflight IN (0,1)),
+    task_id       INTEGER REFERENCES tasks(id),
+    active        INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)),
+    requested_by  TEXT NOT NULL,
+    last_error    TEXT,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS branch_syncs_one_active_pair
+    ON branch_syncs(source_branch, target_branch) WHERE active = 1;
+-- Keep the sweep-on-write durable-task guard index-bounded when a conflict or
+-- CI-failure path has attached a judgment task.
+CREATE INDEX IF NOT EXISTS branch_syncs_task_id
+    ON branch_syncs(task_id) WHERE task_id IS NOT NULL;
 -- v36: durable candidate representation for corrupt terminal retry authority.
 -- These partial indexes contain only rows reconciliation/status need to inspect,
 -- so proving the healthy steady state does not scan the unbounded terminal task
@@ -238,6 +276,22 @@ CREATE TABLE IF NOT EXISTS decomposition_attempts (
     reason_code      TEXT NOT NULL,
     summary          TEXT NOT NULL,
     created_at       INTEGER NOT NULL,
+    -- v72 (observational, additive): per-attempt eligibility/rank the future
+    -- fewest-L best-attempt fallback reads. Populated on proposal rejections
+    -- only; NULL on every other attempt kind.
+    eligible         INTEGER,
+    oversized_count  INTEGER,
+    max_oversized_cx INTEGER,
+    total_children   INTEGER,
+    submission_id    TEXT,
+    -- v74 (additive): serialized Vec<PlannedChild> for the terminal-leaf
+    -- best-attempt fallback. Populated on eligible size-only proposal
+    -- rejections whose classifier pairing succeeded; NULL on every other
+    -- attempt kind or where the classified payload was unavailable. Bounded to
+    -- hold a proposal payload plus its per-child classifications.
+    plan_snapshot_json TEXT
+        CHECK(plan_snapshot_json IS NULL
+              OR length(CAST(plan_snapshot_json AS BLOB)) <= 131072),
     UNIQUE (graph_id, source_revision, kind, ordinal)
 );
 
@@ -510,11 +564,19 @@ CREATE TABLE IF NOT EXISTS routing_attempts (
                                   'retryable-same-route',
                                   'non-failover',
                                   'unclassified')),
+    -- v79: distinct failed agent_run identity that authorized this attempt.
+    -- A second failure of the same profile under the same role assignment now
+    -- gets its own routing_attempts row (keyed by failed_agent_run_id), so a
+    -- replay of the first failure cannot mask a later generation. NULL is
+    -- reserved for grandfathered pre-v79 rows and non-failure attempts.
+    failed_agent_run_id   INTEGER REFERENCES agent_runs(id),
     recorded_at           INTEGER NOT NULL,
-    UNIQUE(role_assignment_id, profile_id)
+    UNIQUE(role_assignment_id, profile_id, failed_agent_run_id)
 );
 CREATE INDEX IF NOT EXISTS routing_attempts_responsibility
     ON routing_attempts(responsibility_key, id);
+-- v79's `routing_attempts_failed_agent_run` index is created in the
+-- migration branch after the routing_attempts rebuild that adds the column.
 
 CREATE TRIGGER IF NOT EXISTS routing_attempts_assignment_guard
 BEFORE INSERT ON routing_attempts
@@ -588,9 +650,20 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     configured_profile_id TEXT,
     configured_provider   TEXT,
     configured_model      TEXT,
-    configured_effort     TEXT
+    configured_effort     TEXT,
+    -- v79: the exact failed managed run this row is the alternate for. NULL
+    -- retains legacy (assignment, configured_profile) deduplication for
+    -- pre-v79 fallback rows and every non-alternate run. Populated by the
+    -- fallback installer so a second same-profile failure of the same
+    -- assignment materialises its own alternate run instead of colliding
+    -- with the first generation's persisted evidence.
+    failed_agent_run_id INTEGER REFERENCES agent_runs(id)
 );
 CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id);
+-- v79's `agent_runs_failed_agent_run` index is created in the migration
+-- branch after the ALTER TABLE that adds the column; putting it here would
+-- fail on upgrades because SCHEMA_SQL is a no-op for the CREATE TABLE but
+-- would evaluate the CREATE INDEX before the ALTER runs.
 -- v62: the UNIQUE partial index `agent_runs_configured_route` is defined only in
 -- the migration branch below because it names `role_assignment_id` and
 -- `configured_profile_id`, both of which pre-v42 / pre-v61 legacy tables lack.
@@ -992,6 +1065,12 @@ CREATE TABLE IF NOT EXISTS fallback_launch_intents (
                               AND json_type(pending_turn_json, '$.continuation_id') IS NULL),
     agent_run_id        INTEGER NOT NULL REFERENCES agent_runs(id),
     capability_run_id   TEXT NOT NULL REFERENCES run_capabilities(run_id),
+    -- v79: the exact failed agent_run whose retirement authorized this
+    -- fallback generation. Recovery/replay uses this identity so a second
+    -- failure of the same profile under the same role assignment installs
+    -- its own alternate instead of colliding with the first generation's
+    -- worktree and head. NULL is reserved for grandfathered pre-v79 rows.
+    failed_agent_run_id INTEGER REFERENCES agent_runs(id),
     created_at          INTEGER NOT NULL,
     CHECK((pr_number IS NULL AND head_sha IS NULL)
           OR (pr_number > 0 AND head_sha IS NOT NULL)),
@@ -1001,6 +1080,8 @@ CREATE INDEX IF NOT EXISTS fallback_launch_intents_task
     ON fallback_launch_intents(task_id);
 CREATE INDEX IF NOT EXISTS fallback_launch_intents_agent_run
     ON fallback_launch_intents(agent_run_id);
+-- v79's `fallback_launch_intents_failed_agent_run` index is created in the
+-- migration branch after the ALTER TABLE that adds the column.
 
 -- v27: prospective-only boundary for PR-interaction performance analytics
 -- (#158). Single row (id=1) recording the unix timestamp at which
@@ -1025,6 +1106,11 @@ CREATE TABLE IF NOT EXISTS planner_submissions (
     rejections    INTEGER NOT NULL DEFAULT 0,
     accepted_at   INTEGER
 );
+-- v75: facts reads planner invocation evidence by graph. This exact lookup
+-- index keeps its per-source prefix/probe bounded even with retained planner
+-- submissions for unrelated graphs.
+CREATE INDEX IF NOT EXISTS planner_submissions_graph_id
+    ON planner_submissions(graph_id);
 
 -- v61: durable storage for GitHub collaboration attempts, their agent operation outbox, and
 -- pending-review publication ownership. Runtime claiming/execution is deliberately separate.

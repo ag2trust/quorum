@@ -1029,13 +1029,19 @@ fn rework_feed_failure_releases_task() {
     );
 
     // VerdictChanges moves the task to rework, then AgentFailed from the
-    // failed feed releases it to open. Journal absence proves cleanup finished.
-    wait_for_task_status(home.path(), 1, "open");
+    // failed feed retains that remediation context long enough to attempt one
+    // exact replacement. Journal absence proves cleanup finished.
+    wait_for_task_status(home.path(), 1, "rework");
     wait_for_journal_absent(home.path(), &worker_name);
 
+    // This fixture intentionally has no published original-worker branch, so
+    // the exact replacement's structural fetch failure must take the bounded
+    // terminal path rather than retrying indefinitely.
+    wait_for_task_status(home.path(), 1, "failed");
     handle.stop();
 
-    // The failed rework delivery releases the task for a replacement worker.
+    // The recovery preserved its PR/round before the replacement failure
+    // parked it; this verifies the feed failure did not bounce it to open.
     let get_out = Command::new(cargo_bin("quorum"))
         .env("QUORUM_HOME", home.path())
         .env("QUORUM_REPO", "test/repo")
@@ -1047,7 +1053,12 @@ fn rework_feed_failure_releases_task() {
     let task: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
         task["status"].as_str(),
-        Some("open"),
-        "task was not released after rework feed failure: {stdout}"
+        Some("failed"),
+        "structural replacement failure must park the task: {stdout}"
     );
+    assert_eq!(task["rework_round"].as_i64(), Some(1));
+    let refs: serde_json::Value = serde_json::from_str(task["refs"].as_str().unwrap()).unwrap();
+    assert_eq!(refs["pr"].as_i64(), Some(1));
+    assert_eq!(refs["daemon_parked"].as_bool(), Some(true));
+    assert_eq!(refs["daemon_resume_status"].as_str(), Some("rework"));
 }

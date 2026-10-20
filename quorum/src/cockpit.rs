@@ -1,8 +1,8 @@
 use quorum_core::drift::{TwinPr, UnbackedPr};
 use quorum_core::stats::{
-    AlertMessage, BlockedTask, DaemonAgentView, DaemonLiveness, DecompositionStatusView,
-    DedupedError, HealthVerdict, HostResourcesView, MergeBlockerView, PipelineTask, QueueTask,
-    ResourceSeverity, ReviewingTask, Stats,
+    AlertMessage, BlockedTask, BranchSyncSummary, DaemonAgentView, DaemonLiveness,
+    DecompositionStatusView, DedupedError, HealthVerdict, HostResourcesView, MergeBlockerView,
+    PipelineTask, QueueTask, ResourceSeverity, ReviewingTask, Stats,
 };
 use std::io::Write;
 
@@ -141,6 +141,7 @@ fn render_with_style_at_width(s: &Stats, sty: &Style, w: &mut dyn Write, width: 
     render_pipeline(&s.pipeline, sty, w, width);
     render_decomposition(s.decomposition.as_ref(), sty, w, width);
     render_merge_wait(&s.merge_blockers, sty, w, width);
+    render_branch_syncs(&s.branch_syncs, sty, w, width);
     render_unbacked_prs(&s.unbacked_prs, &s.twin_prs, sty, w, width);
     render_alerts(&s.alerts, sty, w, width);
     render_errors(&s.recent_errors, s.older_errors_silenced, sty, w, width);
@@ -501,8 +502,15 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        let has_missing_deps = !b.missing_deps.is_empty();
         let is_deadlocked = !b.deadlocked_on.is_empty();
-        let block_icon = if is_deadlocked {
+        let block_icon = if has_missing_deps {
+            if sty.color {
+                "⚠️"
+            } else {
+                "[MISSING]"
+            }
+        } else if is_deadlocked {
             if sty.color {
                 "💀"
             } else {
@@ -515,7 +523,16 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
                 "[blocked]"
             }
         };
-        let suffix = if is_deadlocked {
+        let missing_suffix = if has_missing_deps {
+            let missing_ids: Vec<String> = b.missing_deps.iter().map(|d| format!("#{d}")).collect();
+            format!(
+                " (MISSING — dependency row not found; will never unblock: {})",
+                missing_ids.join(", ")
+            )
+        } else {
+            String::new()
+        };
+        let deadlocked_suffix = if is_deadlocked {
             let dead_ids: Vec<String> = b.deadlocked_on.iter().map(|d| format!("#{d}")).collect();
             format!(" (CANCELLED — will never unblock: {})", dead_ids.join(", "))
         } else {
@@ -523,14 +540,15 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
         };
         let _ = writeln!(
             w,
-            "  #{:<5} {:<8} {:<18} {:<8} {} waits on {}{}",
+            "  #{:<5} {:<8} {:<18} {:<8} {} waits on {}{}{}",
             b.id,
             b.provider.as_deref().unwrap_or("pending"),
             b.model.as_deref().unwrap_or("pending"),
             b.effort.as_deref().unwrap_or("pending"),
             block_icon,
             dep,
-            suffix,
+            missing_suffix,
+            deadlocked_suffix,
         );
         let _ = writeln!(w, "      {}", truncate(&b.title, width.saturating_sub(6)));
     }
@@ -608,6 +626,18 @@ fn render_decomposition(
         planner,
         revision,
     );
+    if let Some(stall) = &graph.drain_stall {
+        let line = truncate(
+            &format!(
+                "drain stalled {}: {}",
+                fmt_age(stall.age_secs),
+                stall.blockers.join("; ")
+            ),
+            width.saturating_sub(6),
+        );
+        let rendered = if sty.color { sty.red(&line) } else { line };
+        let _ = writeln!(w, "      {rendered}");
+    }
     let planner_effort = graph.planner_effort.as_deref().unwrap_or("pending");
     let planner_log_dir = graph
         .planner_log_dir
@@ -741,6 +771,34 @@ fn render_unbacked_prs(
             warn,
             t.task_id,
             prs.join(", "),
+        );
+    }
+}
+
+fn render_branch_syncs(syncs: &[BranchSyncSummary], sty: &Style, w: &mut dyn Write, width: usize) {
+    if syncs.is_empty() {
+        return;
+    }
+    let _ = writeln!(w);
+    let _ = writeln!(w, "{}", sty.section_rule("BRANCH SYNCS", width));
+    for sync in syncs {
+        let pr = sync
+            .pr
+            .map(|n| format!("#{n}"))
+            .unwrap_or_else(|| "—".into());
+        let task = sync
+            .task_id
+            .map(|n| format!("task#{n}"))
+            .unwrap_or_else(|| "—".into());
+        let pair = format!("{} → {}", sync.from, sync.to);
+        let _ = writeln!(
+            w,
+            "  #{:<4} {:<28} {:<10} PR {:<6} {:<10}",
+            sync.id,
+            truncate(&pair, 28),
+            truncate(&sync.phase, 10),
+            pr,
+            task,
         );
     }
 }
@@ -996,10 +1054,31 @@ mod tests {
                 status: "failed".into(),
                 prerequisites: vec![41],
             }],
+            drain_stall: None,
         });
         let mut buf = Vec::new();
         render_with_style(&s, &Style::plain(), &mut buf);
         let output = String::from_utf8(buf).unwrap();
+        assert!(!output.contains("drain stalled"), "{output}");
+
+        let graph = s.decomposition.as_mut().unwrap();
+        graph.graph_state = "draining".into();
+        graph.drain_stall = Some(quorum_core::stats::DecompositionDrainStall {
+            age_secs: 59_400,
+            blockers: vec!["journal rows=1 (planner=1)".into()],
+        });
+        s.health = HealthVerdict::Stalled;
+        s.stalled_count = 1;
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("[X] stalled"), "{output}");
+        assert!(!output.contains("on track"), "{output}");
+        assert!(output.contains("1 stalled"), "{output}");
+        assert!(
+            output.contains("drain stalled 16h: journal rows=1 (planner=1)"),
+            "{output}"
+        );
         assert!(output.contains("DECOMPOSITION"));
         assert!(output.contains("source #40"));
         assert!(output.contains("children=1/2"));
@@ -1060,6 +1139,7 @@ mod tests {
             tier_eff: "opus46·hi".into(),
             waiting_on: vec![1],
             deadlocked_on: vec![],
+            missing_deps: vec![],
         });
 
         let mut buf = Vec::new();
@@ -1531,6 +1611,7 @@ mod tests {
             effort: None,
             waiting_on: vec![4, 6, 9],
             deadlocked_on: vec![],
+            missing_deps: vec![],
         });
         let mut buf = Vec::new();
         render_with_style(&s, &Style::plain(), &mut buf);
@@ -1558,6 +1639,7 @@ mod tests {
             effort: None,
             waiting_on: vec![3, 5, 7],
             deadlocked_on: vec![5],
+            missing_deps: vec![],
         });
         let mut buf = Vec::new();
         render_with_style(&s, &Style::plain(), &mut buf);
@@ -1570,6 +1652,49 @@ mod tests {
         assert!(
             line.contains("CANCELLED") && line.contains("#5"),
             "cancelled dep detail must appear: {line}"
+        );
+    }
+
+    #[test]
+    fn blocked_missing_dependency_is_explicitly_never_resolvable() {
+        let mut s = default_stats();
+        s.blocked.push(BlockedTask {
+            id: 30,
+            title: "missing-dependency task".into(),
+            tier_eff: "opus46·md".into(),
+            provider: None,
+            model: None,
+            effort: None,
+            waiting_on: vec![404],
+            deadlocked_on: vec![],
+            missing_deps: vec![404],
+        });
+        s.blocked.push(BlockedTask {
+            id: 31,
+            title: "ordinary-pending task".into(),
+            tier_eff: "opus46·md".into(),
+            provider: None,
+            model: None,
+            effort: None,
+            waiting_on: vec![405],
+            deadlocked_on: vec![],
+            missing_deps: vec![],
+        });
+
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        let missing_line = output.lines().find(|l| l.contains("#30")).unwrap();
+        assert!(
+            missing_line.contains("[MISSING]")
+                && missing_line.contains("#404")
+                && missing_line.contains("will never unblock"),
+            "missing dependency must be explicit: {missing_line}"
+        );
+        let pending_line = output.lines().find(|l| l.contains("#31")).unwrap();
+        assert!(
+            pending_line.contains("waits on #405") && !pending_line.contains("MISSING"),
+            "ordinary pending dependency must remain ordinary: {pending_line}"
         );
     }
 

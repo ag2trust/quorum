@@ -22,6 +22,7 @@ mod web;
 
 use clap::Parser;
 use quorum_core::error::{QuorumError, Result};
+use serve::merge::MergeExecutor as _;
 
 const EMBEDDED_SKILL: &str = include_str!("../../.claude/skills/quorum/SKILL.md");
 const MIN_EXTERNAL_POLL_INTERVAL_SECS: u64 = 30;
@@ -80,13 +81,14 @@ primary = 100
 # no_bare_agent = true   # default: use operator's Claude login (no --bare)
 # allowed_tools = \"Bash,Read,Write,Edit,Grep,Glob\"
 # base_branch = \"main\" # task/PR base: worktrees, PRs, validation, and merges
+# sync_pairs = [[\"main\", \"develop\"], [\"develop\", \"main\"]] # disabled when omitted
 # self_update_branch = \"main\" # daemon update poll; defaults to resolved base_branch
 
 ## Grok Build settings for managed worker roles only.
 # [grok]
 # sandbox = \"off\"                        # off|workspace (default: off)
 # permission_mode = \"bypassPermissions\"
-# max_turns = 64                         # 1..=256
+# max_turns = 256                        # 1..=256
 
 ## Token / cost / wall-clock limits (unlimited when absent)
 # max_turn_tokens = 200000
@@ -113,7 +115,7 @@ primary = 100
 # sha_poll_interval_secs = 600 # minimum: 30 seconds
 
 ## Diagnostics
-# log_dir = \"/path/to/logs\"
+# log_dir = \"/path/to/logs\" # daemon serve.log rotates at 1 MiB; keeps 3 files
 # doctor_enabled = false
 # resource_poll_secs = 30                  # range: 5..=3600
 # disk_warn_free_gib = 80
@@ -161,6 +163,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::TaskUpdate { .. } => "task-update",
         cli::Command::TaskList { .. } => "task-list",
         cli::Command::TaskGet { .. } => "task-get",
+        cli::Command::BranchSync { .. } => "branch-sync",
         cli::Command::Post { .. } => "post",
         cli::Command::Read { .. } => "read",
         cli::Command::Log { .. } => "log",
@@ -431,6 +434,39 @@ fn resolve_gh_repo(repo_dir: &str) -> Option<String> {
     }
 }
 
+fn manual_close_reason_marks_obsolete(reason: &str) -> bool {
+    let words = reason
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+
+    // `obsolete:` is an explicit operator marker. Otherwise require an
+    // affirmative declaration about the task itself, rather than treating an
+    // incidental or negated mention (for example, "not obsolete") as
+    // authorization to close an open PR.
+    matches!(words.first().map(String::as_str), Some("obsolete"))
+        || words.windows(3).any(|words| {
+            matches!(
+                words,
+                [subject, copula, obsolete]
+                    if matches!(subject.as_str(), "task" | "this" | "it")
+                        && matches!(copula.as_str(), "is" | "was")
+                        && obsolete == "obsolete"
+            )
+        })
+        || words.windows(4).any(|words| {
+            matches!(
+                words,
+                [article, subject, copula, obsolete]
+                    if matches!(article.as_str(), "the" | "this")
+                        && subject == "task"
+                        && matches!(copula.as_str(), "is" | "was")
+                        && obsolete == "obsolete"
+            )
+        })
+}
+
 /// Wait for a spawned child with a timeout. Returns stdout on success, None on
 /// failure/timeout. On timeout the child is killed and a warning is emitted.
 fn wait_child_stdout(
@@ -610,6 +646,114 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             )?;
             output::emit(&serde_json::json!({ "id": id, "repo": resolved_repo }));
             Ok(0)
+        }
+        cli::Command::BranchSync {
+            by,
+            from,
+            to,
+            list,
+            cancel,
+            repo,
+        } => {
+            let resolved_repo = resolve_repo_override(repo.as_deref())?;
+            let db_path = paths::ensure_repo_dir(&resolved_repo)?;
+            if list {
+                if by.is_some() {
+                    return Err(QuorumError::Usage(
+                        "branch-sync --list does not take --by".into(),
+                    ));
+                }
+                let conn = quorum_core::db::open(&db_path)?;
+                let active: Vec<_> = quorum_core::branch_sync::list_active(&conn)?
+                    .iter()
+                    .map(quorum_core::stats::BranchSyncSummary::from)
+                    .collect();
+                let recent: Vec<_> = quorum_core::branch_sync::list_recent_terminal(&conn, 10)?
+                    .iter()
+                    .map(quorum_core::stats::BranchSyncSummary::from)
+                    .collect();
+                output::emit(&serde_json::json!({
+                    "active": active,
+                    "recent_terminal": recent,
+                }));
+                return Ok(0);
+            }
+            if let Some(id) = cancel {
+                let Some(by) = by else {
+                    return Err(QuorumError::Usage(
+                        "branch-sync --cancel requires --by <agent>".into(),
+                    ));
+                };
+                let mut conn = quorum_core::db::open(&db_path)?;
+                match quorum_core::branch_sync::cancel_request(&mut conn, id, &by, now)? {
+                    quorum_core::branch_sync::CancelOutcome::Cancelled(sync) => {
+                        output::emit(&serde_json::json!({
+                            "ok": true,
+                            "id": sync.id,
+                            "phase": sync.phase,
+                            "from": sync.source_branch,
+                            "to": sync.target_branch,
+                        }));
+                        Ok(0)
+                    }
+                    quorum_core::branch_sync::CancelOutcome::NotFound => {
+                        output::emit(&serde_json::json!({
+                            "ok": false,
+                            "reason": "no branch-sync row at that id",
+                            "id": id,
+                        }));
+                        Ok(1)
+                    }
+                    quorum_core::branch_sync::CancelOutcome::NotCancellable(sync) => {
+                        output::emit(&serde_json::json!({
+                            "ok": false,
+                            "reason": "row is not in a coordinator-cancellable state",
+                            "id": sync.id,
+                            "phase": sync.phase,
+                            "active": sync.active,
+                            "task_id": sync.task_id,
+                        }));
+                        Ok(1)
+                    }
+                }
+            } else {
+                let (Some(by), Some(from), Some(to)) = (by, from, to) else {
+                    return Err(QuorumError::Usage(
+                        "branch-sync requires --by, --from, and --to (or --list / --cancel)".into(),
+                    ));
+                };
+                quorum_core::tasks::validate_target_branch(&from)?;
+                quorum_core::tasks::validate_target_branch(&to)?;
+                if from == to {
+                    return Err(QuorumError::Usage(
+                        "branch-sync --from and --to must differ".into(),
+                    ));
+                }
+                let configured = serve_config::branch_sync_pairs(&resolved_repo)?;
+                if !configured
+                    .iter()
+                    .any(|pair| pair[0] == from && pair[1] == to)
+                {
+                    return Err(QuorumError::Usage(format!(
+                        "branch sync pair {from:?} -> {to:?} is not configured in sync_pairs"
+                    )));
+                }
+                let mut conn = quorum_core::db::open(&db_path)?;
+                match quorum_core::branch_sync::request(&mut conn, &from, &to, &by, now)? {
+                    quorum_core::branch_sync::RequestOutcome::Requested(sync) => {
+                        output::emit(&serde_json::json!({ "id": sync.id, "phase": sync.phase }));
+                        Ok(0)
+                    }
+                    quorum_core::branch_sync::RequestOutcome::AlreadyActive(sync) => {
+                        output::emit(&serde_json::json!({
+                            "ok": false,
+                            "id": sync.id,
+                            "phase": sync.phase,
+                        }));
+                        Ok(1)
+                    }
+                }
+            }
         }
         cli::Command::TaskUpdate {
             agent,
@@ -1177,8 +1321,61 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     "--reason-stdin or --reason-file is required for `task-close`".into(),
                 )
             })?;
-            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            match quorum_core::tasks::close_manual(&mut conn, &agent, task_id, &reason, now)? {
+            let repo = paths::resolve_repo()?;
+            let db_path = paths::db_path_for_repo(&repo)?;
+            let conn = quorum_core::db::open(&db_path)?;
+            let pr = quorum_core::tasks::task_pr_reference(&conn, task_id)?;
+            drop(conn);
+            // This network lookup deliberately precedes the close transaction:
+            // task-close must never keep a SQLite write lock while asking
+            // GitHub whether its retained PR actually merged.
+            let merge_commit_sha = if let Some(pr) = pr {
+                let executor = serve::merge::GhMergeExecutor {
+                    token_file: None,
+                    gh_repo: Some(repo),
+                    // task-close only queries PR state; these merge-policy
+                    // fields are not consulted by merge_commit_status.
+                    base_branch: "main".into(),
+                    self_update_branch: "main".into(),
+                };
+                match executor.merge_commit_status(pr, std::path::Path::new(".")) {
+                    serve::merge::MergeCommitStatus::Merged {
+                        merge_commit_sha: Some(sha),
+                    } => Some(sha),
+                    serve::merge::MergeCommitStatus::Merged {
+                        merge_commit_sha: None,
+                    } => {
+                        return Err(QuorumError::Io(format!(
+                            "PR #{pr} is merged but GitHub did not return its merge commit SHA"
+                        )));
+                    }
+                    serve::merge::MergeCommitStatus::Open
+                        if !manual_close_reason_marks_obsolete(&reason) =>
+                    {
+                        return Err(QuorumError::Usage(format!(
+                            "PR #{pr} is still open; task-close requires a reason explicitly marking the task obsolete"
+                        )));
+                    }
+                    serve::merge::MergeCommitStatus::Open
+                    | serve::merge::MergeCommitStatus::Closed => None,
+                    serve::merge::MergeCommitStatus::Unknown => {
+                        return Err(QuorumError::Io(format!(
+                            "could not determine whether PR #{pr} is merged; refusing manual close"
+                        )));
+                    }
+                }
+            } else {
+                None
+            };
+            let mut conn = quorum_core::db::open(&db_path)?;
+            match quorum_core::tasks::close_manual(
+                &mut conn,
+                &agent,
+                task_id,
+                &reason,
+                merge_commit_sha.as_deref(),
+                now,
+            )? {
                 Some(task) => {
                     let compact = quorum_core::tasks::TaskCompact::from(&task);
                     output::emit(&compact);
@@ -1733,14 +1930,26 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
 
             Ok(0)
         }
-        cli::Command::Perf { by, all, json } => {
+        cli::Command::Perf {
+            by,
+            all,
+            json,
+            facts,
+        } => {
+            if facts {
+                let conn = quorum_core::db::open(&paths::db_path()?)?;
+                let report = quorum_core::perf::perf_facts(&conn, all)?;
+                output::emit(&report);
+                return Ok(0);
+            }
             let cut = match by.as_deref() {
                 None => quorum_core::perf::PerfCut::Default,
                 Some("complexity") => quorum_core::perf::PerfCut::Complexity,
                 Some("reviewer") => quorum_core::perf::PerfCut::Reviewer,
+                Some("risk-flag" | "risk_flag") => quorum_core::perf::PerfCut::RiskFlag,
                 Some(other) => {
                     return Err(QuorumError::Usage(format!(
-                        "unknown --by value '{other}'; valid: complexity, reviewer"
+                        "unknown --by value '{other}'; valid: complexity, reviewer, risk-flag"
                     )));
                 }
             };
@@ -1820,9 +2029,6 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 }
                 let pending_task_ids: Vec<i64> = tasks.iter().map(|task| task.id).collect();
                 let pending_inputs = quorum_core::classify::classification_inputs(&tasks);
-                let recommendations = quorum_core::complexity::recommendation_lines(
-                    quorum_core::complexity::RecommendationProvider::Claude,
-                );
 
                 let results = rt.block_on(async {
                     let mut slot = serve::classifier::spawn_classifier_configured(
@@ -1833,7 +2039,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                         serve::classifier::CLASSIFIER_MODEL,
                         serve::classifier::CLASSIFIER_EFFORT,
                         "workspace-write",
-                        &recommendations,
+                        "",
                     )
                     .await
                     .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
@@ -2313,8 +2519,39 @@ fn main() {
 mod tests {
     use super::{
         assemble_status_snapshot, parse_ttl, resolve_repo_override, resolve_web_log_dir,
-        tail_output_for_line, validate_external_poll_interval, wait_child_stdout,
+        tail_output_for_line, validate_external_poll_interval, wait_child_stdout, TaskGetView,
     };
+
+    #[test]
+    fn task_get_view_serializes_terminal_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("task-get.db")).unwrap();
+        let id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "terminal child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET terminal_leaf=1 WHERE id=?1", [id])
+            .unwrap();
+        let task = quorum_core::tasks::get_with_notes(&conn, id)
+            .unwrap()
+            .unwrap();
+
+        let json = serde_json::to_value(TaskGetView {
+            task: &task,
+            arbiter: None,
+        })
+        .unwrap();
+        assert_eq!(json["terminal_leaf"], true);
+    }
 
     #[test]
     fn web_log_dir_prefers_explicit_then_configured_then_home_default() {

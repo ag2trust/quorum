@@ -37,6 +37,10 @@ pub const MAX_RECOVERY_ATTEMPTS: i64 = 3;
 pub const PARKED_REF: &str = "daemon_parked";
 pub const PARKED_REASON_REF: &str = "daemon_parked_reason";
 pub const PARKED_RESUME_STATUS_REF: &str = "daemon_resume_status";
+/// Monotonic, daemon-owned generation incremented by each successful explicit
+/// `task-retry`. A live daemon consumes a newer generation to discard only
+/// the matching task's in-memory zero-output poison budget.
+pub const POISON_RETRY_GENERATION_REF: &str = "poison_retry_generation";
 /// Durable "the dependency this park names cannot ever satisfy" bit (#473).
 /// Only the dependency-sweep path sets it; every other park path clears it so
 /// status's BLOCKED section renders no false unsatisfiable rows.
@@ -61,6 +65,11 @@ pub const PUBLICATION_FAILURE_KIND_PR_MERGED: &str = "pr-merged";
 pub const ABANDONED_PUBLICATION_REF: &str = "abandoned_publication";
 pub const CLASSIFIER_POLICY_PARKED_REF: &str = "classifier_policy_parked";
 pub const PARKED_REWORK_RETRY_REF: &str = "daemon_rework_retry_requested";
+/// One exact remediation replacement is due after a PR-bound remediation
+/// worker dies or its lease lapses.  The remediation claim consumes this bit
+/// atomically with installing the replacement lease; a later reap writes a
+/// fresh bit and spends the bounded recovery budget again.
+pub const RECOVERED_REMEDIATION_RETRY_REF: &str = "daemon_recovered_remediation_retry";
 /// Durable merge-call admission state. The CLI writes `requested` for an
 /// explicit replay; the single daemon atomically advances it to `attempting`
 /// before any GitHub/CI call. The live reviewed path also writes `attempting`
@@ -93,11 +102,70 @@ pub const MERGE_COMMIT_SHA_REF: &str = "merge_commit_sha";
 pub const DEPENDENCY_BASE_WAIT_ATTEMPTS_REF: &str = "dependency_base_wait_attempts";
 pub const DEPENDENCY_BASE_WAIT_REASON_REF: &str = "dependency_base_wait_reason";
 pub const MAX_DEPENDENCY_BASE_WAIT_ATTEMPTS: i64 = 3;
+/// A completed decomposition can itself contain completed decomposition
+/// sources. Bound recursive dependency provenance expansion so corrupt graph
+/// data cannot turn one admission read into unbounded work.
+pub const MAX_DEPENDENCY_DECOMPOSITION_DEPTH: usize = 8;
+
+/// Return the durable poison-retry generation encoded in task refs. Missing
+/// and malformed values deliberately read as the legacy generation zero: a
+/// malformed external edit can never advance a live daemon's poison budget.
+pub fn poison_retry_generation(refs: Option<&str>) -> i64 {
+    refs.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|refs| refs.get(POISON_RETRY_GENERATION_REF).cloned())
+        .and_then(|value| value.as_i64())
+        .filter(|generation| *generation >= 0)
+        .unwrap_or(0)
+}
+
+fn next_poison_retry_generation(refs: &str) -> Result<i64> {
+    let value: serde_json::Value = serde_json::from_str(refs).map_err(|error| {
+        QuorumError::Io(format!(
+            "invalid task refs while advancing {POISON_RETRY_GENERATION_REF}: {error}"
+        ))
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        QuorumError::Io(format!(
+            "invalid task refs while advancing {POISON_RETRY_GENERATION_REF}: expected object"
+        ))
+    })?;
+    let current = match object.get(POISON_RETRY_GENERATION_REF) {
+        None => 0,
+        Some(value) => value
+            .as_i64()
+            .filter(|generation| *generation >= 0)
+            .ok_or_else(|| {
+                QuorumError::Io(format!(
+                    "invalid daemon-owned {POISON_RETRY_GENERATION_REF}"
+                ))
+            })?,
+    };
+    current
+        .checked_add(1)
+        .ok_or_else(|| QuorumError::Io(format!("{POISON_RETRY_GENERATION_REF} overflow")))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyMergeCommit {
     pub task_id: i64,
+    /// The dependency named directly by the dependent task. This differs from
+    /// `task_id` when a completed decomposition source contributes the merge
+    /// commits of its completed graph children.
+    pub root_dependency_id: i64,
+    /// The completed dependency's PR, when durable task metadata associates
+    /// one. A missing merge SHA can be recovered from this authoritative PR
+    /// before a dependent branch is allocated.
+    pub pr_number: Option<i64>,
     pub merge_commit_sha: Option<String>,
+}
+
+/// Result of resolving merge provenance for a dependent task's completed
+/// prerequisites. A graph inconsistency is an expected fail-closed admission
+/// result, not a database failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependencyMergeCommitResolution {
+    Resolved(Vec<DependencyMergeCommit>),
+    Unresolved { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +292,9 @@ pub struct Task {
     pub edit_count: i64,
     pub continue_pr: Option<i64>,
     pub target_branch: Option<String>,
+    /// Generated decomposition children are terminal leaves. They dispatch
+    /// directly but never become another decomposition source.
+    pub terminal_leaf: bool,
     /// Per-task rework ceiling, stamped from the daemon's `max_rework` config at
     /// first ownership. `None` means unstamped — see [`Task::effective_rework_cap`].
     pub rework_cap: Option<i64>,
@@ -374,7 +445,7 @@ pub fn effect_name(e: &Effect) -> String {
 const COLS: &str = "id, title, body, status, priority, labels, assignee, created_by, \
                     created_at, updated_at, refs, depends_on, author, reviewer, \
                     rework_round, review_only, recovery_attempts, revision, edit_count, \
-                    continue_pr, target_branch, rework_cap";
+                    continue_pr, target_branch, terminal_leaf, rework_cap";
 
 const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
     SELECT 1 FROM json_each(depends_on) je
@@ -411,33 +482,83 @@ const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
       )
 ))";
 
-/// SQL counterpart of [`size_is_dispatchable`] over the `refs` column of the
-/// enclosing `tasks` row. This is the single implementation-size policy:
-/// `S`/`M` at any complexity, or `L` at complexity 4 or lower. Every query that
-/// gates implementation work on classified size must interpolate this fragment
-/// instead of restating it, so the SQL and Rust policies cannot drift.
+/// SQL shape for the only flagged root route that requires decomposition.
+/// Missing flags are intentionally equivalent to an empty array.
+macro_rules! flagged_large_cx_four_sql {
+    () => {
+        "(json_extract(refs, '$.cx_size')='L'
+          AND json_extract(refs, '$.cx_est')=4
+          AND COALESCE(json_array_length(refs, '$.cx_risk_flags'), 0) >= 1)"
+    };
+}
+
+/// SQL counterpart of the ordinary root-task [`size_is_dispatchable`] policy
+/// over the enclosing `tasks` row. `S`/`M` dispatch at any complexity and `L`
+/// dispatches at complexity 4 or lower unless it carries a risk flag. Queries
+/// for ordinary root implementation work interpolate this fragment instead of
+/// restating it, so the SQL and Rust policies cannot drift.
 macro_rules! size_dispatch_policy_sql {
     () => {
-        "(
+        concat!(
+            "(
     (json_extract(refs, '$.cx_size') IN ('S','M') OR (
         json_extract(refs, '$.cx_size')='L'
         AND json_extract(refs, '$.cx_est') <= 4
+        AND NOT ",
+            flagged_large_cx_four_sql!(),
+            "
     ))
     AND NOT (json_extract(refs, '$.cx_est')=5
              AND json_extract(refs, '$.cx_size')='L')
-)"
+)",
+        )
     };
 }
 pub(crate) const SIZE_DISPATCH_POLICY_SQL: &str = size_dispatch_policy_sql!();
 
+/// SQL fragment that is true when `tasks.refs` carries a non-null
+/// `branch_sync` reference — the daemon-created conflict judgment task
+/// bound to a `branch_syncs` row. Kept alongside the direct-dispatch
+/// macros so the SQL and Rust skip predicates share a single source.
+macro_rules! branch_sync_ref_present_sql {
+    () => {
+        "(json_valid(COALESCE(refs, '{}')) \
+          AND json_type(COALESCE(refs, '{}'), '$.branch_sync') IS NOT NULL \
+          AND json_type(COALESCE(refs, '{}'), '$.branch_sync') != 'null')"
+    };
+}
+pub const BRANCH_SYNC_REF_PRESENT_SQL: &str = branch_sync_ref_present_sql!();
+
 // SQL counterpart of the implementation branch in
 // `classification_is_dispatchable`. Callers that need implementation work
-// additionally require `review_only=0`; continuation tasks remain eligible at
-// every classified size, just as they are in the Rust policy.
-const DIRECT_DISPATCH_CLAUSE: &str = concat!(
-    "(review_only=1 OR continue_pr IS NOT NULL OR ",
-    size_dispatch_policy_sql!(),
-    ")"
+// additionally require `review_only=0`; continuation tasks, tasks bound to a
+// `branch_syncs` conflict row, and terminal leaves remain eligible outside the
+// ordinary size policy. Terminal leaves still reject XL, which is disallowed
+// when a decomposition plan is accepted.
+macro_rules! direct_dispatch_clause_sql {
+    () => {
+        concat!(
+            "(review_only=1 OR continue_pr IS NOT NULL OR ",
+            branch_sync_ref_present_sql!(),
+            " OR ",
+            "(terminal_leaf=1 AND json_extract(refs, '$.cx_size') != 'XL') OR ",
+            size_dispatch_policy_sql!(),
+            ")"
+        )
+    };
+}
+#[cfg(test)]
+const DIRECT_DISPATCH_CLAUSE: &str = direct_dispatch_clause_sql!();
+
+// The root routing policy applies only before a task starts. A flagged L/cx4
+// task admitted under an older policy must finish its reviewer/rework lifecycle
+// rather than becoming stranded: planner selection accepts open tasks only.
+const STARTED_TASK_DISPATCH_CLAUSE: &str = concat!(
+    "(",
+    direct_dispatch_clause_sql!(),
+    " OR (status != 'open' AND ",
+    flagged_large_cx_four_sql!(),
+    "))"
 );
 
 fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
@@ -463,7 +584,8 @@ fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
         edit_count: r.get(18)?,
         continue_pr: r.get(19)?,
         target_branch: r.get(20)?,
-        rework_cap: r.get(21)?,
+        terminal_leaf: r.get::<_, i64>(21)? != 0,
+        rework_cap: r.get(22)?,
         ready: false,
     })
 }
@@ -563,9 +685,24 @@ pub fn validate_creator_refs(refs_json: Option<&str>) -> Result<()> {
             "refs key 'pr' is daemon-owned; use --review-pr or --continue-pr".into(),
         ));
     }
+    if object.contains_key("source_task") {
+        return Err(QuorumError::Usage(
+            "refs key 'source_task' is daemon-owned recovery provenance".into(),
+        ));
+    }
+    if object.contains_key(MERGE_COMMIT_SHA_REF) {
+        return Err(QuorumError::Usage(format!(
+            "refs key '{MERGE_COMMIT_SHA_REF}' is daemon-owned merge provenance"
+        )));
+    }
     if object.contains_key(MERGE_RETRY_REF) {
         return Err(QuorumError::Usage(format!(
             "refs key '{MERGE_RETRY_REF}' is daemon-owned; use task-retry"
+        )));
+    }
+    if object.contains_key(POISON_RETRY_GENERATION_REF) {
+        return Err(QuorumError::Usage(format!(
+            "refs key '{POISON_RETRY_GENERATION_REF}' is daemon-owned; use task-retry"
         )));
     }
     Ok(())
@@ -575,23 +712,25 @@ fn preserve_classifier_refs(
     existing: &Option<String>,
     replacement: Option<&str>,
 ) -> Option<String> {
-    preserve_protected_refs(existing, replacement, false)
+    preserve_protected_refs(existing, replacement, false, false)
 }
 
 /// Creator and assignee metadata replacement cannot mutate or erase durable
-/// runner state. The daemon uses `preserve_classifier_refs` directly so its
-/// authoritative refs path can still replace or clear these keys.
+/// runner state or recovery provenance. The daemon uses
+/// `preserve_classifier_refs` directly so its authoritative refs path can
+/// still replace or clear these keys.
 fn preserve_creator_protected_refs(
     existing: &Option<String>,
     replacement: Option<&str>,
 ) -> Option<String> {
-    preserve_protected_refs(existing, replacement, true)
+    preserve_protected_refs(existing, replacement, true, true)
 }
 
 fn preserve_protected_refs(
     existing: &Option<String>,
     replacement: Option<&str>,
     preserve_runner_state: bool,
+    preserve_recovery_provenance: bool,
 ) -> Option<String> {
     let replacement = replacement?;
     let mut next: serde_json::Value =
@@ -617,11 +756,17 @@ fn preserve_protected_refs(
                     | "cx_not_ready_reason"
                     | "cx_by"
                     | "cx_dup_of"
+                    | "cx_risk_flags"
                     | MERGE_RETRY_REF
             );
             let runner_state =
                 preserve_runner_state && (key.starts_with("runner_") || key.starts_with("codex_"));
-            if classifier_or_pr || runner_state {
+            let recovery_provenance = preserve_recovery_provenance
+                && matches!(
+                    key.as_str(),
+                    "source_task" | MERGE_COMMIT_SHA_REF | POISON_RETRY_GENERATION_REF
+                );
+            if classifier_or_pr || runner_state || recovery_provenance {
                 next_map.insert(key, value);
             }
         }
@@ -653,6 +798,7 @@ fn invalidate_classifier_refs(
         "cx_not_ready_reason",
         "cx_by",
         "cx_dup_of",
+        "cx_risk_flags",
         "cx_flags",
         "cx_tags",
     ] {
@@ -726,13 +872,64 @@ fn extract_pr_from_refs(refs: &Option<String>) -> Option<String> {
     })
 }
 
+/// Whether a PR-bound remediation recovery still needs its exact replacement
+/// worker.  This is deliberately separate from owner-requested parked retry:
+/// the latter has different admission and feedback authority.
+pub fn recovered_remediation_retry_requested(refs: Option<&str>) -> bool {
+    refs.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| {
+            value
+                .get(RECOVERED_REMEDIATION_RETRY_REF)
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+/// Persist a bounded exact-remediation replacement intent without disturbing
+/// the task's PR, feedback, or current rework round.
+pub fn set_recovered_remediation_retry(refs: Option<&str>) -> Result<String> {
+    let mut value: serde_json::Value = match refs {
+        Some(raw) => serde_json::from_str(raw)
+            .map_err(|error| QuorumError::Io(format!("invalid task refs JSON: {error}")))?,
+        None => serde_json::json!({}),
+    };
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| QuorumError::Io("task refs must be a JSON object".into()))?;
+    object.insert(
+        RECOVERED_REMEDIATION_RETRY_REF.into(),
+        serde_json::Value::Bool(true),
+    );
+    serde_json::to_string(&value)
+        .map_err(|error| QuorumError::Io(format!("serialize task refs: {error}")))
+}
+
+/// Drop an unconsumed recovery intent when the task moves beyond its current
+/// remediation turn or becomes terminal.
+pub fn clear_recovered_remediation_retry(refs: Option<&str>) -> Result<Option<String>> {
+    let Some(raw) = refs else {
+        return Ok(None);
+    };
+    let mut value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| QuorumError::Io(format!("invalid task refs JSON: {error}")))?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove(RECOVERED_REMEDIATION_RETRY_REF);
+    }
+    serde_json::to_string(&value)
+        .map(Some)
+        .map_err(|error| QuorumError::Io(format!("serialize task refs: {error}")))
+}
+
 pub fn extract_pr_number(refs: &Option<String>) -> Option<i64> {
     let s = refs.as_deref()?;
     let v: serde_json::Value = serde_json::from_str(s).ok()?;
-    v.get("pr").and_then(|p| {
-        p.as_i64()
-            .or_else(|| p.as_str().and_then(|s| s.parse().ok()))
-    })
+    v.get("pr").and_then(pr_number_from_json)
+}
+
+fn pr_number_from_json(value: &serde_json::Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
 }
 
 pub fn extract_repo(refs: &Option<String>) -> Option<String> {
@@ -955,6 +1152,44 @@ pub fn create_with_continue_pr_and_target_branch(
     target_branch: Option<&str>,
     now: i64,
 ) -> Result<i64> {
+    let tx = begin_immediate(conn)?;
+    let id = create_task_tx(
+        &tx,
+        created_by,
+        title,
+        body,
+        priority,
+        labels,
+        refs,
+        depends_on,
+        review_pr,
+        continue_pr,
+        target_branch,
+        now,
+    )?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Insert one task row inside an existing write transaction and emit
+/// `task_created`. Callers own commit and any additional writes that must
+/// land atomically with the task creation (e.g. binding a `branch_syncs`
+/// judgment task to its sync row).
+#[allow(clippy::too_many_arguments)]
+pub fn create_task_tx(
+    tx: &rusqlite::Transaction<'_>,
+    created_by: &str,
+    title: &str,
+    body: Option<&str>,
+    priority: i64,
+    labels: Option<&str>,
+    refs: Option<&str>,
+    depends_on: Option<&str>,
+    review_pr: Option<i64>,
+    continue_pr: Option<i64>,
+    target_branch: Option<&str>,
+    now: i64,
+) -> Result<i64> {
     if review_pr.is_some() && continue_pr.is_some() {
         return Err(QuorumError::Usage(
             "--review-pr and --continue-pr are mutually exclusive".into(),
@@ -991,20 +1226,50 @@ pub fn create_with_continue_pr_and_target_branch(
     } else {
         ("open", 0_i64, refs.map(|s| s.to_string()))
     };
-    let tx = begin_immediate(conn)?;
     if let Some(pr) = review_pr.or(continue_pr) {
-        if let Some(owner) = active_pr_owner_in(&tx, pr, None)? {
+        if let Some(owner) = active_pr_owner_in(tx, pr, None)? {
             return Err(QuorumError::Usage(format!(
                 "PR #{pr} is already associated with active task #{owner}"
             )));
         }
     }
-    crate::agents::touch(&tx, created_by, now)?;
-    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    crate::agents::touch(tx, created_by, now)?;
+    crate::sweep::sweep_on_write(tx, now, SWEEP_LIMIT)?;
+    // A continuation of a failed generated child is a recovery candidate for
+    // that exact child, not merely another task that happens to use the same
+    // PR. Stamp the durable provenance while creating the continuation so the
+    // evidence-gated adoption path can later distinguish the named pair. The
+    // graph predicates keep inactive/old plans from influencing new work.
+    let recovery_source_task = continue_pr
+        .map(|pr| {
+            tx.query_row(
+                "SELECT original.id
+                 FROM task_graph_members member
+                 JOIN task_decompositions graph ON graph.id=member.graph_id
+                 JOIN tasks original ON original.id=member.task_id
+                 WHERE member.active=1
+                   AND member.plan_revision=graph.accepted_plan_revision
+                   AND graph.active=1 AND graph.state IN ('active','blocked')
+                   AND original.status='failed'
+                   AND json_valid(COALESCE(original.refs, '{}'))
+                   AND (json_extract(original.refs, '$.pr')=?1
+                        OR json_extract(original.refs, '$.pr')=CAST(?1 AS TEXT))
+                 ORDER BY original.id LIMIT 1",
+                [pr],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+        })
+        .transpose()?;
     tx.execute(
         "INSERT INTO tasks(title, body, status, priority, labels, assignee, created_by, \
          created_at, updated_at, refs, depends_on, review_only, continue_pr, target_branch) \
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?7, ?8, ?9, ?10, ?11, ?12)",
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?7,
+                 CASE WHEN ?13 IS NOT NULL
+                           AND json_extract(COALESCE(?8, '{}'), '$.source_task') IS NULL
+                      THEN json_set(COALESCE(?8, '{}'), '$.source_task', ?13)
+                      ELSE ?8 END,
+                 ?9, ?10, ?11, ?12)",
         params![
             title,
             body,
@@ -1018,6 +1283,7 @@ pub fn create_with_continue_pr_and_target_branch(
             review_only,
             continue_pr,
             target_branch,
+            recovery_source_task,
         ],
     )?;
     let id = tx.last_insert_rowid();
@@ -1025,8 +1291,7 @@ pub fn create_with_continue_pr_and_target_branch(
         Some(l) => format!("created (prio {priority}, labels {l})"),
         None => format!("created (prio {priority})"),
     };
-    crate::events::emit(&tx, "task_created", &lease_target(id), &body_str, now)?;
-    tx.commit()?;
+    crate::events::emit(tx, "task_created", &lease_target(id), &body_str, now)?;
     Ok(id)
 }
 
@@ -1085,7 +1350,7 @@ pub fn claim(
                        AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                        AND json_type(refs, '$.cx_size')='text'
                        AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
-                       AND {DIRECT_DISPATCH_CLAUSE}
+                       AND {STARTED_TASK_DISPATCH_CLAUSE}
                        AND json_type(refs, '$.cx_ready')='true'
                        AND json_type(refs, '$.cx_not_ready_reason')='null'
                        AND {CONTINUE_PR_UNOWNED_CLAUSE}
@@ -1110,7 +1375,7 @@ pub fn claim(
                    AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                    AND json_type(refs, '$.cx_size')='text'
                    AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
-                   AND {DIRECT_DISPATCH_CLAUSE}
+                   AND {STARTED_TASK_DISPATCH_CLAUSE}
                    AND json_type(refs, '$.cx_ready')='true'
                    AND json_type(refs, '$.cx_not_ready_reason')='null'
                    AND {CONTINUE_PR_UNOWNED_CLAUSE}
@@ -1212,7 +1477,7 @@ pub fn claim_provider_retry_rework(
                AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                AND json_type(refs, '$.cx_size')='text'
                AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
-               AND {DIRECT_DISPATCH_CLAUSE}
+               AND {STARTED_TASK_DISPATCH_CLAUSE}
                AND json_type(refs, '$.cx_ready')='true'
                AND json_type(refs, '$.cx_not_ready_reason')='null'
                AND (
@@ -1459,7 +1724,7 @@ pub fn claim_remediation_rework_with_feedback(
                  OR COALESCE(json_extract(refs, '$.cx_size'), '') NOT IN ('S','M','L','XL')
                  OR json_type(refs, '$.cx_ready') IS NOT 'true'
                  OR json_type(refs, '$.cx_not_ready_reason') IS NOT 'null'
-                 OR NOT {DIRECT_DISPATCH_CLAUSE})
+                 OR NOT {STARTED_TASK_DISPATCH_CLAUSE})
          )"
         ),
         params![id],
@@ -1498,9 +1763,24 @@ pub fn claim_remediation_rework_with_feedback(
         Err(e) => return Err(e.into()),
     }
 
+    // A recovered-remediation intent represents exactly one replacement
+    // worker.  Consume it in this same transaction as the unique lease
+    // installation, so a restart or a second reconciler tick cannot launch a
+    // duplicate worker for the same reap.
     tx.execute(
-        "UPDATE tasks SET assignee=?1, updated_at=?2 WHERE id=?3",
-        params![agent, now, id],
+        "UPDATE tasks
+         SET assignee=?1,
+             refs=CASE WHEN json_valid(COALESCE(refs, '{}'))
+                       THEN json_remove(COALESCE(refs, '{}'), ?4)
+                       ELSE refs END,
+             updated_at=?2
+         WHERE id=?3",
+        params![
+            agent,
+            now,
+            id,
+            format!("$.{RECOVERED_REMEDIATION_RETRY_REF}")
+        ],
     )?;
     crate::events::emit(
         &tx,
@@ -1563,7 +1843,7 @@ pub fn reserve_reviewer_provision(
                AND json_extract(t.refs,'$.cx_est') BETWEEN 1 AND 5
                AND json_type(t.refs,'$.cx_size')='text'
                AND json_extract(t.refs,'$.cx_size') IN ('S','M','L','XL')
-               AND {DIRECT_DISPATCH_CLAUSE}
+               AND {STARTED_TASK_DISPATCH_CLAUSE}
                AND json_type(t.refs,'$.cx_ready')='true'
                AND json_type(t.refs,'$.cx_not_ready_reason')='null'
                AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations WHERE task_id=t.id)
@@ -1905,21 +2185,57 @@ pub fn complete_detected_merge(
     })
 }
 
-/// Load the durable merge commit recorded for each dependency. A `done` task
-/// without a recorded commit is deliberately returned as `None`: callers must
-/// defer rather than silently allocate a child from an unverifiable base.
+/// Load durable merge and PR metadata for each dependency. A completed
+/// decomposition source contributes every active-plan graph child's merge
+/// provenance, recursively for nested completed sources. A `done` leaf
+/// without a recorded commit remains `None` until the serving layer resolves
+/// its retained PR; callers must never silently allocate from that state.
 pub fn dependency_merge_commits(
     conn: &Connection,
     depends_on: Option<&str>,
-) -> Result<Vec<DependencyMergeCommit>> {
+) -> Result<DependencyMergeCommitResolution> {
     let Some(depends_on) = depends_on else {
-        return Ok(Vec::new());
+        return Ok(DependencyMergeCommitResolution::Resolved(Vec::new()));
     };
     let dependency_ids = serde_json::from_str::<Vec<i64>>(depends_on).map_err(|error| {
         QuorumError::Io(format!("invalid persisted task dependencies: {error}"))
     })?;
     let mut result = Vec::with_capacity(dependency_ids.len());
     for task_id in dependency_ids {
+        let mut visiting = std::collections::HashSet::new();
+        if let Err(reason) =
+            resolve_dependency_merge_commits(conn, task_id, task_id, 0, &mut visiting, &mut result)?
+        {
+            return Ok(DependencyMergeCommitResolution::Unresolved { reason });
+        }
+    }
+    Ok(DependencyMergeCommitResolution::Resolved(result))
+}
+
+/// Resolve one direct dependency to its durable merge-provenance leaves. The
+/// return value deliberately models graph state as an expected unresolved
+/// outcome: callers must defer admission rather than mistake inconsistent
+/// graph membership for a database outage.
+fn resolve_dependency_merge_commits(
+    conn: &Connection,
+    root_dependency_id: i64,
+    task_id: i64,
+    depth: usize,
+    visiting: &mut std::collections::HashSet<i64>,
+    result: &mut Vec<DependencyMergeCommit>,
+) -> Result<std::result::Result<(), String>> {
+    if depth >= MAX_DEPENDENCY_DECOMPOSITION_DEPTH {
+        return Ok(Err(format!(
+            "dependency #{root_dependency_id} nested decomposition exceeds the depth limit"
+        )));
+    }
+    if !visiting.insert(task_id) {
+        return Ok(Err(format!(
+            "dependency #{root_dependency_id} has a cyclic completed decomposition membership at task #{task_id}"
+        )));
+    }
+
+    let outcome = (|| -> Result<std::result::Result<(), String>> {
         let row: Option<(String, Option<String>)> = conn
             .query_row(
                 "SELECT status,refs FROM tasks WHERE id=?1",
@@ -1927,22 +2243,141 @@ pub fn dependency_merge_commits(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let merge_commit_sha = row
-            .filter(|(status, _)| status == "done")
-            .and_then(|(_, refs)| refs)
-            .and_then(|refs| serde_json::from_str::<serde_json::Value>(&refs).ok())
-            .and_then(|refs| {
-                refs.get(MERGE_COMMIT_SHA_REF)
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|sha| !sha.is_empty() && !sha.contains('\0'))
-                    .map(str::to_owned)
+        let Some((status, refs)) = row else {
+            return Ok(Err(format!(
+                "dependency #{root_dependency_id} completed decomposition membership references missing task #{task_id}"
+            )));
+        };
+        if status != "done" {
+            let description = if task_id == root_dependency_id {
+                format!("dependency #{task_id} is not done")
+            } else {
+                format!(
+                    "dependency #{root_dependency_id} completed decomposition graph child #{task_id} is not done"
+                )
+            };
+            return Ok(Err(description));
+        }
+
+        let graph: Option<(String, i64, i64, Option<i64>)> = conn
+            .query_row(
+                "SELECT state,active,freeze_active,accepted_plan_revision
+                 FROM task_decompositions WHERE source_task_id=?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((state, active, freeze_active, accepted_plan_revision)) = graph else {
+            let (pr_number, merge_commit_sha) = refs
+                .and_then(|refs| serde_json::from_str::<serde_json::Value>(&refs).ok())
+                .map(|refs| {
+                    let pr_number = refs
+                        .get("pr")
+                        .and_then(pr_number_from_json)
+                        .filter(|pr| *pr > 0);
+                    let merge_commit_sha = refs
+                        .get(MERGE_COMMIT_SHA_REF)
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|sha| !sha.is_empty() && !sha.contains('\0'))
+                        .map(str::to_owned);
+                    (pr_number, merge_commit_sha)
+                })
+                .unwrap_or((None, None));
+            result.push(DependencyMergeCommit {
+                task_id,
+                root_dependency_id,
+                pr_number,
+                merge_commit_sha,
             });
-        result.push(DependencyMergeCommit {
-            task_id,
-            merge_commit_sha,
-        });
+            return Ok(Ok(()));
+        };
+
+        let Some(accepted_plan_revision) = accepted_plan_revision else {
+            return Ok(Err(format!(
+                "dependency #{root_dependency_id} decomposition graph is not completed"
+            )));
+        };
+        if state != "completed" || active != 0 || freeze_active != 0 {
+            return Ok(Err(format!(
+                "dependency #{root_dependency_id} decomposition graph is not completed"
+            )));
+        }
+        let mismatched_active_members: i64 = conn.query_row(
+            "SELECT count(*) FROM task_graph_members
+             WHERE graph_id=(SELECT id FROM task_decompositions WHERE source_task_id=?1)
+               AND active=1 AND plan_revision!=?2",
+            rusqlite::params![task_id, accepted_plan_revision],
+            |row| row.get(0),
+        )?;
+        if mismatched_active_members != 0 {
+            return Ok(Err(format!(
+                "dependency #{root_dependency_id} completed decomposition graph membership is ambiguous"
+            )));
+        }
+        let mut statement = conn.prepare(
+            "SELECT member.task_id
+             FROM task_graph_members member
+             JOIN task_decompositions graph ON graph.id=member.graph_id
+             WHERE graph.source_task_id=?1 AND member.active=1
+               AND member.plan_revision=graph.accepted_plan_revision
+             ORDER BY member.task_id",
+        )?;
+        let child_ids = statement
+            .query_map([task_id], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if child_ids.is_empty() {
+            return Ok(Err(format!(
+                "dependency #{root_dependency_id} completed decomposition graph membership is ambiguous"
+            )));
+        }
+        for child_id in child_ids {
+            if let Err(reason) = resolve_dependency_merge_commits(
+                conn,
+                root_dependency_id,
+                child_id,
+                depth + 1,
+                visiting,
+                result,
+            )? {
+                return Ok(Err(reason));
+            }
+        }
+        Ok(Ok(()))
+    })();
+    visiting.remove(&task_id);
+    outcome
+}
+
+/// Persist a merge commit recovered for a completed dependency. The PR lookup
+/// happens before this function; this short transaction only joins that
+/// external evidence to the exact still-done task. An existing value wins so
+/// a retry or racing daemon never rewrites provenance.
+pub fn record_dependency_merge_commit(
+    conn: &mut Connection,
+    task_id: i64,
+    pr_number: i64,
+    merge_commit_sha: &str,
+    now: i64,
+) -> Result<bool> {
+    if pr_number <= 0 || merge_commit_sha.is_empty() || merge_commit_sha.contains('\0') {
+        return Err(QuorumError::BadInput(
+            "dependency merge commit evidence is invalid".into(),
+        ));
     }
-    Ok(result)
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET refs=json_set(COALESCE(refs, '{}'), '$.merge_commit_sha', ?3),
+             updated_at=?4
+         WHERE id=?1 AND status='done'
+           AND json_valid(COALESCE(refs, '{}'))
+           AND (json_extract(refs, '$.pr')=?2
+                OR json_extract(refs, '$.pr')=CAST(?2 AS TEXT))
+           AND json_extract(refs, '$.merge_commit_sha') IS NULL",
+        params![task_id, pr_number, merge_commit_sha, now],
+    )?;
+    tx.commit()?;
+    Ok(changed == 1)
 }
 
 /// Fail closed from an admitted merge attempt to ordinary review. Only the
@@ -2403,7 +2838,9 @@ pub fn reset_ci_remediation_for_recovery(conn: &mut Connection, id: i64, now: i6
 ///
 /// Reviewer processes are turn-oriented and may exit after their verdict has
 /// already transferred the task to remediation. The ownership predicate and
-/// `AgentFailed` transition must therefore share one write transaction.
+/// `AgentFailed` transition must therefore share one write transaction. An
+/// unconsumed verdict from the same reviewer also returns `None`: Phase 2 must
+/// consume that durable authority before a failure can release the reviewer.
 pub fn fail_reviewer_if_owner(
     conn: &mut Connection,
     reviewer: &str,
@@ -2426,6 +2863,25 @@ pub fn fail_reviewer_if_owner(
         return Ok(None);
     }
 
+    // A reviewer can submit after the daemon's Phase 1 mailbox snapshot but
+    // before a later phase attempts this failure. The Done row is durable
+    // lifecycle authority even though Phase 2 has not folded it yet. Check it
+    // in this same write transaction so AgentFailed cannot clear the reviewer
+    // and orphan that verdict for next tick's phantom-row handling.
+    let pending_verdict: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM mailbox
+             WHERE agent=?1 AND kind='done' AND task_id=?2
+               AND verdict IS NOT NULL AND consumed_at IS NULL
+         )",
+        params![reviewer, id],
+        |row| row.get(0),
+    )?;
+    if pending_verdict {
+        tx.commit()?;
+        return Ok(None);
+    }
+
     apply_event_tx(
         tx,
         reviewer,
@@ -2437,6 +2893,67 @@ pub fn fail_reviewer_if_owner(
         |_| Ok(()),
     )
     .map(Some)
+}
+
+/// Terminalize a CI-fix task and its bound branch-sync row when the PR target
+/// no longer matches the exact fix head published under the daemon's lease.
+/// The caller owns an immediate transaction and has already resolved the live
+/// target. This guarded write re-proves the active binding, review phase, and
+/// persisted publication head before revoking all task authority.
+pub fn fail_branch_sync_ci_fix_stale_authority_tx(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: i64,
+    pr: i64,
+    expected_head: &str,
+    observed_target: &str,
+    now: i64,
+) -> Result<bool> {
+    let reason = format!(
+        "branch sync CI-fix stale authority: expected PR #{pr} head {expected_head}, observed {observed_target}"
+    );
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET status='failed',assignee=NULL,reviewer=NULL,updated_at=?1
+         WHERE id=?2 AND status='in-review'
+           AND EXISTS (
+               SELECT 1 FROM branch_syncs b
+               WHERE b.task_id=tasks.id AND b.pr=?3 AND b.phase='ci_failed' AND b.active=1
+           )
+           AND EXISTS (
+               SELECT 1 FROM pr_targets p
+               WHERE p.task_id=tasks.id AND p.pr_number=?3 AND p.head_sha=?4
+           )",
+        params![now, task_id, pr, expected_head],
+    )?;
+    if changed != 1 {
+        return Ok(false);
+    }
+    deactivate_lease(tx, task_id, now)?;
+    let failed_sync = crate::branch_sync::fail_for_task_tx(tx, task_id, &reason, now)?;
+    if failed_sync.is_none() {
+        return Err(QuorumError::Io(format!(
+            "task #{task_id} lost its branch-sync binding during stale-authority failure"
+        )));
+    }
+    tx.execute(
+        "INSERT INTO task_notes(task_id,ts,agent,body)
+         VALUES (?1,?2,'daemon',?3)",
+        params![task_id, now, reason],
+    )?;
+    crate::events::emit(tx, "task_failed", &lease_target(task_id), &reason, now)?;
+    tx.execute(
+        "INSERT INTO messages(ts,author,topic,kind,body,refs,expires_at,recipient)
+         VALUES (?1,'daemon',?2,'alert',?3,?4,?5,'owner')",
+        params![
+            now,
+            crate::feed::DEFAULT_TOPIC,
+            format!("task #{task_id}: {reason}; no automatic retry"),
+            format!("task:{task_id}"),
+            now + crate::feed::DEFAULT_MESSAGE_TTL_SECS,
+        ],
+    )?;
+    crate::decomposition::block_graph_if_child_failed(tx, task_id, &reason, now)?;
+    Ok(true)
 }
 
 /// Verdict supplied to late-review recovery. R1/R2 is deliberately not an
@@ -2917,10 +3434,10 @@ where
     let (mut new_status, mut effects) = crate::lifecycle::transition(&view, event)
         .map_err(|e| QuorumError::Usage(e.to_string()))?;
 
-    // Recovery budget: crash-recovery transitions (Working/Rework → Open via
-    // AgentFailed/LeaseExpired) are bounded. Park loudly in Failed when exhausted;
-    // only an explicit caller may originate Cancelled.
-    let is_crash_recovery = new_status == Status::Open
+    // Recovery budget: crash-recovery transitions (Working/Rework → Open or
+    // Rework via AgentFailed/LeaseExpired) are bounded. Park loudly in Failed
+    // when exhausted; only an explicit caller may originate Cancelled.
+    let is_crash_recovery = matches!(new_status, Status::Open | Status::Rework)
         && matches!(status, Status::Working | Status::Rework)
         && matches!(event, Event::AgentFailed { .. } | Event::LeaseExpired);
 
@@ -2930,9 +3447,24 @@ where
         _ => "unknown",
     };
 
-    if is_crash_recovery && task.recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
+    // A branch-sync judgment worker gets no crash-recovery retry: a failed or
+    // lease-expired worker fails the task and its bound sync row together.
+    let branch_sync_failure =
+        is_crash_recovery && crate::branch_sync::active_for_task(&tx, id)?.is_some();
+    if branch_sync_failure {
         new_status = Status::Failed;
-        effects.retain(|e| !matches!(e, Effect::NotifyOwner { .. }));
+        effects.retain(|e| !matches!(e, Effect::NotifyOwner { .. } | Effect::ResumeWorker));
+        if !effects.contains(&Effect::ReleaseLease) {
+            effects.push(Effect::ReleaseLease);
+        }
+        let reason = format!("branch sync judgment worker failed without retry: {failure_cause}");
+        crate::branch_sync::fail_for_task_tx(&tx, id, &format!("task #{id}: {reason}"), now)?;
+        effects.push(Effect::NotifyOwner { reason });
+    } else if is_crash_recovery && task.recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
+        new_status = Status::Failed;
+        // A terminal recovery exhaustion must not retain the rework respawn
+        // effect selected before this storage-level budget guard.
+        effects.retain(|e| !matches!(e, Effect::NotifyOwner { .. } | Effect::ResumeWorker));
         if !effects.contains(&Effect::ReleaseLease) {
             effects.push(Effect::ReleaseLease);
         }
@@ -2943,6 +3475,25 @@ where
                 task.recovery_attempts,
             ),
         });
+    }
+
+    // A reviewer rejecting a branch-sync judgment at its immutable rework cap
+    // terminalizes both authorities together. Leaving the sync row active
+    // would strand the directed branch pair after the task becomes Failed.
+    let review_rework_cap_exhausted = status == Status::InReview
+        && new_status == Status::Failed
+        && matches!(event, Event::VerdictChanges)
+        && task.rework_round >= i64::from(task.effective_rework_cap());
+    if review_rework_cap_exhausted {
+        crate::branch_sync::fail_for_task_tx(
+            &tx,
+            id,
+            &format!(
+                "task #{id}: branch sync judgment review rework cap ({}) exceeded",
+                task.effective_rework_cap()
+            ),
+            now,
+        )?;
     }
 
     // Reset recovery counter on meaningful lifecycle handoff.
@@ -2956,7 +3507,7 @@ where
     );
     let recovery_attempts = if reset_recovery {
         0
-    } else if is_crash_recovery && new_status == Status::Open {
+    } else if is_crash_recovery && matches!(new_status, Status::Open | Status::Rework) {
         task.recovery_attempts + 1
     } else {
         task.recovery_attempts
@@ -2969,6 +3520,7 @@ where
     let mut assignee = task.assignee.clone();
     let mut refs = task.refs.clone();
     if is_crash_recovery && new_status == Status::Failed {
+        refs = clear_recovered_remediation_retry(refs.as_deref())?;
         refs = Some(set_parked_refs(
             refs.as_deref(),
             failure_cause,
@@ -2980,10 +3532,9 @@ where
             None,
         )?);
     }
-    // Review-only remediation death: the lifecycle layer already chose Failed
-    // (park, never bounce to review — a replacement reviewer on the unchanged
-    // head burns a rework round with zero remediation applied). Write durable
-    // owner-gated park markers only.
+    // A terminal remediation recovery (the immutable rework cap or recovery
+    // budget is exhausted) remains owner-gated. Write durable park markers
+    // only after the lifecycle layer has selected Failed.
     // Every Failed park is owner-gated. In particular, daemon teardown must
     // not put a runnable retry marker on a terminal row: after restart the
     // pre-shutdown selection is no longer authoritative.
@@ -2992,12 +3543,20 @@ where
         && new_status == Status::Failed
         && matches!(event, Event::AgentFailed { .. } | Event::LeaseExpired);
     if is_remediation_death_park {
+        refs = clear_recovered_remediation_retry(refs.as_deref())?;
         refs = Some(set_parked_refs(
             refs.as_deref(),
             failure_cause,
             "rework",
             None,
         )?);
+    }
+    if is_crash_recovery && new_status == Status::Rework {
+        refs = Some(set_recovered_remediation_retry(refs.as_deref())?);
+        // The prior worker is gone.  Keep the durable author identity, but
+        // leave the task unassigned so the exact-remediation reconciler is
+        // visibly responsible for installing its replacement lease.
+        assignee = None;
     }
 
     for eff in &effects {
@@ -3154,6 +3713,7 @@ fn clear_runner_retry_refs(refs: Option<&str>) -> Result<Option<String>> {
             "remediation_feedback",
             PARKED_HEAD_CHECK_REF,
             PARKED_REWORK_RETRY_REF,
+            RECOVERED_REMEDIATION_RETRY_REF,
             CI_REMEDIATION_REQUESTED_REF,
             CI_REMEDIATION_PR_REF,
             CI_REMEDIATION_HEAD_SHA_REF,
@@ -3776,6 +4336,73 @@ pub fn dispose_managed_run_exit(
     dispose_managed_exit_inner(conn, role, agent, id, Some(run_id), reason, now)
 }
 
+/// Outcome of applying a sweep-aware failure to a worker assignment.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkerFailureOutcome {
+    /// `AgentFailed` was applied to the task's current status.
+    Applied(Box<TransitionResult>),
+    /// The write-path sweep in this same transaction already moved the task
+    /// out of the worker's `working`/`rework` assignment (normally a lapsed
+    /// lease reaped to `open`/`rework`, which also spends a recovery
+    /// attempt). A second `AgentFailed` would be an invalid double
+    /// transition, so the sweep's result is committed on its own.
+    AlreadyRecoveredBySweep,
+}
+
+/// Fail a worker assignment without double-transitioning a task the storage
+/// sweep already recovered.
+///
+/// `apply_event` sweeps inside its transaction *before* reading the task. For
+/// a worker whose lease lapsed (for example while the daemon was wedged and
+/// could not renew it), that sweep reaps `working` to `open`, the subsequent
+/// `AgentFailed` is rejected as a transition from `open`, and the rollback
+/// discards the reap as well. Here the pre-sweep assignment is read first in
+/// the same immediate transaction; if the sweep changed it, the sweep's
+/// recovery is committed and no event is applied. Every other status keeps
+/// the ordinary `AgentFailed` transition (and its loud rejection when
+/// genuinely invalid).
+pub fn fail_worker_assignment(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    reason: &str,
+    now: i64,
+) -> Result<WorkerFailureOutcome> {
+    let tx = begin_immediate(conn)?;
+    let read_assignment = |tx: &Transaction<'_>| -> Result<Option<(String, Option<String>)>> {
+        Ok(tx
+            .query_row(
+                "SELECT status, assignee FROM tasks WHERE id=?1",
+                params![id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?)
+    };
+    let before = read_assignment(&tx)?;
+    crate::sweep::sweep_on_write(&tx, now, crate::sweep::SWEEP_LIMIT)?;
+    let after = read_assignment(&tx)?;
+    let was_worker_assignment = before
+        .as_ref()
+        .is_some_and(|(status, _)| matches!(status.as_str(), "working" | "rework"));
+    if was_worker_assignment && before != after {
+        crate::agents::touch(&tx, agent, now)?;
+        tx.commit()?;
+        return Ok(WorkerFailureOutcome::AlreadyRecoveredBySweep);
+    }
+    apply_event_tx_with_deferred_sweep(
+        tx,
+        agent,
+        id,
+        &Event::AgentFailed {
+            reason: reason.to_string(),
+        },
+        now,
+        true,
+        |_| Ok(()),
+    )
+    .map(|transition| WorkerFailureOutcome::Applied(Box::new(transition)))
+}
+
 fn dispose_managed_exit_inner(
     conn: &mut Connection,
     role: ManagedRunRole,
@@ -3786,6 +4413,12 @@ fn dispose_managed_exit_inner(
     now: i64,
 ) -> Result<ManagedExitDisposition> {
     let tx = begin_immediate(conn)?;
+    // Sweep before classifying. `apply_event_tx` otherwise sweeps after the
+    // classification read, so a lapsed lease would be reaped to `open`
+    // inside this transaction and the `AgentFailed` below rejected as a
+    // transition from `open` (rolling the reap back with it). Classifying the
+    // post-sweep state treats a reaped run as no longer owning its phase.
+    crate::sweep::sweep_on_write(&tx, now, crate::sweep::SWEEP_LIMIT)?;
     let role_name = match role {
         ManagedRunRole::Worker => "worker",
         ManagedRunRole::Reviewer => "reviewer",
@@ -3818,7 +4451,7 @@ fn dispose_managed_exit_inner(
         ManagedExitClassification::ActiveWithoutOutcome => {}
     }
 
-    apply_event_tx(
+    apply_event_tx_with_deferred_sweep(
         tx,
         agent,
         id,
@@ -3826,6 +4459,7 @@ fn dispose_managed_exit_inner(
             reason: reason.to_string(),
         },
         now,
+        true,
         |tx| {
             if let Some(run_id) = run_id {
                 crate::capabilities::revoke_managed_run_tx(tx, run_id, agent, id, role_name, now)?;
@@ -4050,6 +4684,8 @@ pub(crate) fn set_parked_refs(
     // sets this marker. Clear any stale bit left over from a prior park so
     // status's BLOCKED section never renders a false unsatisfiable row.
     object.remove(PARKED_UNSATISFIABLE_REF);
+    // A terminal task cannot retain an automatic replacement-worker intent.
+    object.remove(RECOVERED_REMEDIATION_RETRY_REF);
     // Reset the publication-failure classification on every park so a prior
     // pr-closed park cannot contaminate a subsequent generic park.
     match publication_failure_kind {
@@ -4141,20 +4777,47 @@ pub fn classification_is_complete(refs: &Option<String>) -> bool {
     (1..=5).contains(&cx) && matches!(size, "S" | "M" | "L" | "XL") && reason_is_valid
 }
 
+/// Whether `refs` carries a non-null `branch_sync` reference — the durable
+/// binding written by the daemon when it creates the judgment task for a
+/// `conflict` branch-sync row. Match with [`BRANCH_SYNC_REF_PRESENT_SQL`].
+pub fn refs_have_branch_sync_ref(refs: Option<&str>) -> bool {
+    let Some(refs) = refs else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(refs) else {
+        return false;
+    };
+    value.get("branch_sync").is_some_and(|v| !v.is_null())
+}
+
 /// Classification policy is intentionally separate from model routing: difficult
 /// focused work may run, while unready or compound work is parked.
 pub fn classification_is_dispatchable(
     refs: &Option<String>,
     review_only: bool,
     continue_pr: Option<i64>,
+    terminal_leaf: bool,
+) -> bool {
+    classification_is_dispatchable_for_status(refs, review_only, continue_pr, terminal_leaf, "open")
+}
+
+/// Classification policy for a task in its current lifecycle state. The root
+/// route applies to open tasks; an already-started flagged L/cx4 task remains
+/// eligible only to drain its admitted reviewer or rework lifecycle.
+pub fn classification_is_dispatchable_for_status(
+    refs: &Option<String>,
+    review_only: bool,
+    continue_pr: Option<i64>,
+    terminal_leaf: bool,
+    status: &str,
 ) -> bool {
     if !classification_is_complete(refs) {
         return false;
     }
-    let Some(refs) = refs else {
+    let Some(refs_str) = refs else {
         return false;
     };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(refs) else {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(refs_str) else {
         return false;
     };
     let Some(cx) = v.get("cx_est").and_then(|v| v.as_i64()) else {
@@ -4163,19 +4826,36 @@ pub fn classification_is_dispatchable(
     let Some(size) = v.get("cx_size").and_then(|v| v.as_str()) else {
         return false;
     };
+    let has_risk_flags = v
+        .get("cx_risk_flags")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|flags| !flags.is_empty());
     let ready = v.get("cx_ready").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_branch_sync = refs_have_branch_sync_ref(Some(refs_str));
     ready
         && (1..=5).contains(&cx)
-        && (review_only || continue_pr.is_some() || size_is_dispatchable(size, cx))
+        && (review_only
+            || continue_pr.is_some()
+            || is_branch_sync
+            || (terminal_leaf && size != "XL")
+            || (status != "open" && is_flagged_large_cx_four(size, cx, has_risk_flags))
+            || size_is_dispatchable(size, cx, has_risk_flags))
 }
 
-/// The single implementation-size dispatch policy shared by root-task dispatch
-/// and decomposition child preclassification: `S`/`M` at any complexity, or
-/// `L` at complexity 4 or lower. `L` at complexity 5 and every `XL`
-/// classification stay outside automatic implementation dispatch.
+/// The ordinary root-task implementation-size dispatch policy: `S`/`M` at any
+/// complexity, or `L` at complexity 4 or lower. `L` at complexity 5 and every
+/// `XL` classification stay outside automatic root dispatch. A flagged L/cx4
+/// root task also stays outside automatic root dispatch for planning. Generated
+/// terminal leaves use their separate S/M/L plan-acceptance and direct-dispatch
+/// policy.
 /// [`SIZE_DISPATCH_POLICY_SQL`] is the SQL counterpart.
-pub fn size_is_dispatchable(size: &str, cx_est: i64) -> bool {
-    matches!(size, "S" | "M") || (size == "L" && cx_est <= 4)
+pub fn size_is_dispatchable(size: &str, cx_est: i64, has_risk_flags: bool) -> bool {
+    matches!(size, "S" | "M")
+        || (size == "L" && cx_est <= 4 && !is_flagged_large_cx_four(size, cx_est, has_risk_flags))
+}
+
+fn is_flagged_large_cx_four(size: &str, cx_est: i64, has_risk_flags: bool) -> bool {
+    size == "L" && cx_est == 4 && has_risk_flags
 }
 
 pub(crate) fn park_classified_task_tx(
@@ -4341,17 +5021,18 @@ pub(crate) fn park_complexity_five_tx(
 pub fn park_classified_complexity_five(conn: &mut Connection, now: i64) -> Result<usize> {
     let tx = begin_immediate(conn)?;
     let ids: Vec<i64> = {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare(&format!(
             "SELECT id FROM tasks
              WHERE status NOT IN ('done','failed','cancelled')
                AND json_valid(refs)
+               AND NOT {BRANCH_SYNC_REF_PRESENT_SQL}
                AND (json_extract(refs, '$.cx_ready')!=1
                     OR (review_only=0 AND continue_pr IS NULL
                         AND json_extract(refs, '$.cx_size')='XL'
                         AND json_extract(refs, '$.cx_est') <= 3))
              ORDER BY id
-             LIMIT ?1",
-        )?;
+             LIMIT ?1"
+        ))?;
         let rows = stmt
             .query_map(params![SWEEP_LIMIT as i64], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -4928,6 +5609,21 @@ pub fn retry_parked(
             )));
         }
     }
+    // A successful owner retry advances a durable generation in the exact
+    // transaction that restores the task. The daemon uses this value only to
+    // consume its own poison budget; stale retry events, timestamps, and task
+    // edits cannot manufacture a newer generation.
+    let poison_retry_generation = {
+        let refs: String =
+            tx.query_row("SELECT refs FROM tasks WHERE id=?1", params![id], |row| {
+                row.get(0)
+            })?;
+        if reset_recovery_budget {
+            next_poison_retry_generation(&refs)?
+        } else {
+            poison_retry_generation(Some(&refs))
+        }
+    };
     if policy_parked {
         // Retry of a policy park is a request to estimate remaining work.  Keep
         // the durable park/resume context but make it a classifier candidate.
@@ -4937,21 +5633,25 @@ pub fn retry_parked(
         // leave a stale `true` here (policy retry keeps status='failed').
         tx.execute(
             "UPDATE tasks
-             SET refs=json_remove(
-                     refs,
-                     '$.cx_est',
-                     '$.cx_size',
-                     '$.cx_size_reason',
-                     '$.cx_ready',
-                     '$.cx_not_ready_reason',
-                     '$.cx_by',
-                     '$.cx_dup_of',
-                     '$.daemon_parked_unsatisfiable'
+             SET refs=json_set(
+                     json_remove(
+                         refs,
+                         '$.cx_est',
+                         '$.cx_size',
+                         '$.cx_size_reason',
+                         '$.cx_ready',
+                         '$.cx_not_ready_reason',
+                         '$.cx_by',
+                         '$.cx_dup_of',
+                         '$.cx_risk_flags',
+                         '$.daemon_parked_unsatisfiable'
+                     ),
+                     '$.poison_retry_generation', ?4
                  ),
                  recovery_attempts=CASE WHEN ?3 THEN 0 ELSE recovery_attempts END,
                  updated_at=?2
              WHERE id=?1",
-            params![id, now, reset_recovery_budget],
+            params![id, now, reset_recovery_budget, poison_retry_generation],
         )?;
         crate::events::emit(
             &tx,
@@ -5069,62 +5769,65 @@ pub fn retry_parked(
              author=CASE WHEN ?6 THEN NULL ELSE author END,
              continue_pr=CASE WHEN ?7 THEN NULL ELSE continue_pr END,
              recovery_attempts=CASE WHEN ?5 THEN 0 ELSE recovery_attempts END,
-             refs=CASE
-                  WHEN ?6
-                  THEN json_remove(
-                      refs,
-                      '$.daemon_parked',
-                      '$.daemon_parked_reason',
-                      '$.daemon_parked_unsatisfiable',
-                      '$.daemon_resume_status',
-                      '$.daemon_rework_retry_requested',
-                      '$.daemon_parked_head_check',
-                      '$.daemon_merge_retry',
-                      '$.daemon_publication',
-                      '$.daemon_publication_failure_kind',
-                      '$.runner_continuation'
-                  )
-                  WHEN ?4='rework'
-                  THEN json_set(
-                      json_remove(
-                          refs,
-                          '$.daemon_parked',
-                          '$.daemon_parked_reason',
-                          '$.daemon_parked_unsatisfiable',
-                          '$.daemon_resume_status',
-                          '$.daemon_parked_head_check',
-                          '$.daemon_publication_failure_kind'
-                      ),
-                      '$.daemon_rework_retry_requested',
-                      json('true')
-                  )
-                  WHEN ?4='merging'
-                  THEN json_set(
-                      json_remove(
-                          refs,
-                          '$.daemon_parked',
-                          '$.daemon_parked_reason',
-                          '$.daemon_parked_unsatisfiable',
-                          '$.daemon_resume_status',
-                          '$.daemon_rework_retry_requested',
-                          '$.daemon_parked_head_check',
-                          '$.daemon_publication_failure_kind'
-                      ),
-                      '$.daemon_merge_retry',
-                      'requested'
-                  )
-                  ELSE json_remove(
-                      refs,
-                      '$.daemon_parked',
-                      '$.daemon_parked_reason',
-                      '$.daemon_parked_unsatisfiable',
-                      '$.daemon_resume_status',
-                      '$.daemon_rework_retry_requested',
-                      '$.daemon_parked_head_check',
-                      '$.daemon_merge_retry',
-                      '$.daemon_publication_failure_kind'
-                  )
-             END,
+             refs=json_set(
+                 CASE
+                     WHEN ?6
+                     THEN json_remove(
+                         refs,
+                         '$.daemon_parked',
+                         '$.daemon_parked_reason',
+                         '$.daemon_parked_unsatisfiable',
+                         '$.daemon_resume_status',
+                         '$.daemon_rework_retry_requested',
+                         '$.daemon_parked_head_check',
+                         '$.daemon_merge_retry',
+                         '$.daemon_publication',
+                         '$.daemon_publication_failure_kind',
+                         '$.runner_continuation'
+                     )
+                     WHEN ?4='rework'
+                     THEN json_set(
+                         json_remove(
+                             refs,
+                             '$.daemon_parked',
+                             '$.daemon_parked_reason',
+                             '$.daemon_parked_unsatisfiable',
+                             '$.daemon_resume_status',
+                             '$.daemon_parked_head_check',
+                             '$.daemon_publication_failure_kind'
+                         ),
+                         '$.daemon_rework_retry_requested',
+                         json('true')
+                     )
+                     WHEN ?4='merging'
+                     THEN json_set(
+                         json_remove(
+                             refs,
+                             '$.daemon_parked',
+                             '$.daemon_parked_reason',
+                             '$.daemon_parked_unsatisfiable',
+                             '$.daemon_resume_status',
+                             '$.daemon_rework_retry_requested',
+                             '$.daemon_parked_head_check',
+                             '$.daemon_publication_failure_kind'
+                         ),
+                         '$.daemon_merge_retry',
+                         'requested'
+                     )
+                     ELSE json_remove(
+                         refs,
+                         '$.daemon_parked',
+                         '$.daemon_parked_reason',
+                         '$.daemon_parked_unsatisfiable',
+                         '$.daemon_resume_status',
+                         '$.daemon_rework_retry_requested',
+                         '$.daemon_parked_head_check',
+                         '$.daemon_merge_retry',
+                         '$.daemon_publication_failure_kind'
+                     )
+                 END,
+                 '$.poison_retry_generation', ?8
+             ),
              updated_at=?3
          WHERE id=?1 AND status='failed'
            AND json_valid(refs)
@@ -5138,6 +5841,7 @@ pub fn retry_parked(
             reset_recovery_budget,
             reset_publication,
             retire_closed_continuation,
+            poison_retry_generation,
         ],
     )?;
     if updated == 0 {
@@ -5422,6 +6126,8 @@ pub fn retry_provider_blocked(
         tx.commit()?;
         return Ok(None);
     }
+    let poison_retry_generation = next_poison_retry_generation(&refs_raw)?;
+    refs[POISON_RETRY_GENERATION_REF] = serde_json::json!(poison_retry_generation);
     let next_status = if status == "working" {
         "open"
     } else {
@@ -5572,11 +6278,16 @@ pub fn close_manual(
     agent: &str,
     id: i64,
     reason: &str,
+    merge_commit_sha: Option<&str>,
     now: i64,
 ) -> Result<Option<Task>> {
+    if merge_commit_sha.is_some_and(|sha| sha.is_empty() || sha.contains('\0')) {
+        return Err(QuorumError::BadInput(
+            "merge commit SHA must be non-empty and contain no NUL".into(),
+        ));
+    }
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
-    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     let active_graph_source: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM task_decompositions
          WHERE source_task_id=?1 AND active=1 AND state IN ('active','blocked'))",
@@ -5591,14 +6302,29 @@ pub fn close_manual(
     }
     let n = tx.execute(
         "UPDATE tasks SET status='done', assignee=NULL, updated_at=?2,
-                          completion_provenance=?3
+                          completion_provenance=?3,
+                          refs=CASE
+                              WHEN ?4 IS NOT NULL
+                                   AND json_extract(COALESCE(refs, '{}'), '$.merge_commit_sha')
+                                       IS NULL
+                              THEN json_set(
+                                  COALESCE(refs, '{}'), '$.merge_commit_sha', ?4
+                              )
+                              ELSE refs
+                          END
          WHERE id=?1 AND status NOT IN ('done', 'cancelled')",
-        params![id, now, COMPLETION_PROVENANCE_MANUAL],
+        params![id, now, COMPLETION_PROVENANCE_MANUAL, merge_commit_sha],
     )?;
     if n == 0 {
+        crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
         tx.commit()?;
         return Ok(None);
     }
+    // Mark this dependency done before the opportunistic failed-dependency
+    // sweep. A recovered failed task can otherwise cause the same write to
+    // park all of its dependents just before this manual resolution unblocks
+    // them, leaving a graph stranded despite a valid merged PR.
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
     deactivate_lease(&tx, id, now)?;
     tx.execute(
         "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, ?3, ?4)",
@@ -5611,7 +6337,7 @@ pub fn close_manual(
         &format!("by {agent}: {reason}"),
         now,
     )?;
-    crate::decomposition::complete_graph_if_final_child(&tx, id, now)?;
+    crate::decomposition::complete_graph_after_manual_close(&tx, id, now)?;
     let mut task = tx.query_row(
         &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
         params![id],
@@ -5711,7 +6437,7 @@ pub fn list_implementation_ready_open_limited(conn: &Connection, limit: i64) -> 
                AND json_extract(refs, '$.cx_est') BETWEEN 1 AND 5
                AND json_type(refs, '$.cx_size')='text'
                AND json_extract(refs, '$.cx_size') IN ('S','M','L','XL')
-               AND {DIRECT_DISPATCH_CLAUSE}
+               AND {STARTED_TASK_DISPATCH_CLAUSE}
                AND json_type(refs, '$.cx_ready')='true'
                AND json_type(refs, '$.cx_not_ready_reason')='null'
            ELSE 0 END
@@ -5952,6 +6678,76 @@ mod tests {
             review_pr,
             now,
         )
+    }
+
+    #[test]
+    fn fail_worker_assignment_returns_applied_transition() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 1_000,
+        )
+        .unwrap();
+        claim(&mut conn, "worker", Some(task_id), &[], TTL, 1_000).unwrap();
+
+        let outcome =
+            fail_worker_assignment(&mut conn, "worker", task_id, "worker process exited", 1_001)
+                .unwrap();
+
+        let WorkerFailureOutcome::Applied(transition) = outcome else {
+            panic!("live worker failure must apply AgentFailed");
+        };
+        assert_eq!(transition.task.status, "open");
+        assert_eq!(transition.task.recovery_attempts, 1);
+        assert_eq!(get(&conn, task_id).unwrap().unwrap(), transition.task);
+    }
+
+    #[test]
+    fn fail_worker_assignment_reports_recovery_by_same_transaction_sweep() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 1_000,
+        )
+        .unwrap();
+        claim(&mut conn, "worker", Some(task_id), &[], TTL, 1_000).unwrap();
+        conn.execute(
+            "UPDATE claims SET expires_at=1001 WHERE target=?1 AND active=1",
+            [lease_target(task_id)],
+        )
+        .unwrap();
+
+        let outcome =
+            fail_worker_assignment(&mut conn, "worker", task_id, "worker process exited", 1_001)
+                .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkerFailureOutcome::AlreadyRecoveredBySweep
+        ));
+        let task = get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert_eq!(task.assignee, None);
+        assert_eq!(task.recovery_attempts, 1);
+    }
+
+    #[test]
+    fn fail_worker_assignment_rejects_task_without_worker_state() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 1_000,
+        )
+        .unwrap();
+
+        let error =
+            fail_worker_assignment(&mut conn, "worker", task_id, "worker process exited", 1_001)
+                .unwrap_err();
+
+        let QuorumError::Usage(message) = error else {
+            panic!("open-task AgentFailed must be an invalid transition");
+        };
+        assert!(message.contains("invalid transition"), "{message}");
+        let task = get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "open");
+        assert_eq!(task.recovery_attempts, 0);
     }
 
     #[test]
@@ -6890,6 +7686,66 @@ mod tests {
         assert!(result.task.assignee.is_none());
     }
 
+    #[test]
+    fn reviewer_failure_preserves_verdict_submitted_after_mailbox_snapshot() {
+        let (_d, mut c) = open_tmp();
+        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        claim(&mut c, "author", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "author",
+            id,
+            &Event::SignaledDone {
+                pr: "99".to_string(),
+            },
+            1001,
+        )
+        .unwrap();
+        claim(&mut c, "reviewer", Some(id), &[], TTL, 1002).unwrap();
+
+        assert!(crate::mailbox::poll_unconsumed(&c).unwrap().is_empty());
+        let mailbox_id = crate::mailbox::append(
+            &mut c,
+            &crate::mailbox::MailboxRow {
+                agent: "reviewer".into(),
+                kind: crate::mailbox::MailboxKind::Done,
+                task_id: Some(id),
+                pr: Some(99),
+                verdict: Some("changes".into()),
+                feedback: Some("fix it".into()),
+                note: None,
+                to_agent: None,
+                payload: Some(r#"{"blocking":1}"#.into()),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            fail_reviewer_if_owner(&mut c, "reviewer", id, "reviewer process died", 1003)
+                .unwrap()
+                .is_none(),
+            "the post-snapshot durable verdict must suppress AgentFailed"
+        );
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(task.reviewer.as_deref(), Some("reviewer"));
+        assert!(crate::mailbox::has_unconsumed(
+            &c,
+            "reviewer",
+            crate::mailbox::MailboxKind::Done,
+            id,
+        )
+        .unwrap());
+        let consumed: Option<i64> = c
+            .query_row(
+                "SELECT consumed_at FROM mailbox WHERE id=?1",
+                [mailbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(consumed.is_none());
+    }
+
     fn dead_turn_retry() -> PendingTurn {
         PendingTurn {
             provider: "codex".into(),
@@ -7444,7 +8300,7 @@ mod tests {
             disposition,
             ManagedExitDisposition::AgentFailed(_)
         ));
-        assert_eq!(get(&c, id).unwrap().unwrap().status, "open");
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "rework");
     }
 
     #[test]
@@ -7998,7 +8854,7 @@ mod tests {
         claim(&mut c, "R", Some(id), &[], TTL, 1002).unwrap();
         apply_event(&mut c, "R", id, &Event::VerdictChanges, 1003).unwrap();
 
-        // A fails during rework → open (author=A preserved because PR exists)
+        // A fails during rework → rework (author=A and the remediation context persist)
         apply_event(
             &mut c,
             "A",
@@ -8010,24 +8866,15 @@ mod tests {
         )
         .unwrap();
 
-        // B reclaims → assignee=B, author=A (preserved)
-        let t = claim(&mut c, "B", Some(id), &[], TTL, 1005)
+        // B receives the replacement remediation lease → assignee=B, author=A.
+        let t = claim_remediation_rework(&mut c, "B", id, TTL, 1005)
             .unwrap()
             .unwrap();
         assert_eq!(t.assignee.as_deref(), Some("B"));
         assert_eq!(t.author.as_deref(), Some("A"), "author must be preserved");
 
-        // B signals done — authorized by assignee, not author
-        let r = apply_event(
-            &mut c,
-            "B",
-            id,
-            &Event::SignaledDone {
-                pr: "51".to_string(),
-            },
-            1006,
-        )
-        .unwrap();
+        // B pushes the same remediation round — authorized by assignee, not author.
+        let r = apply_event(&mut c, "B", id, &Event::ReworkPushed, 1006).unwrap();
         assert_eq!(r.task.status, "in-review");
         assert_eq!(
             r.task.author.as_deref(),
@@ -8119,6 +8966,106 @@ mod tests {
         assert_eq!(task.continue_pr, Some(50));
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs, serde_json::json!({"ticket":"ABC-1"}));
+    }
+
+    #[test]
+    fn continue_pr_stamps_string_pr_child_and_preserves_recovery_source_on_edits() {
+        let (_d, mut c) = open_tmp();
+        let source = create(
+            &mut c, "owner", "source", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let child = create(
+            &mut c,
+            "owner",
+            "failed child",
+            None,
+            0,
+            None,
+            Some(r#"{"pr":"77"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        c.execute("UPDATE tasks SET status='decomposed' WHERE id=?1", [source])
+            .unwrap();
+        c.execute("UPDATE tasks SET status='failed' WHERE id=?1", [child])
+            .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 plan_revision,accepted_plan_revision,created_at,updated_at
+             ) VALUES (?1,'blocked',1,0,1,1,1,1,1)",
+            [source],
+        )
+        .unwrap();
+        let graph = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (?1,?2,'child',1,1)",
+            params![graph, child],
+        )
+        .unwrap();
+
+        let recovery = create_with_continue_pr(
+            &mut c,
+            "owner",
+            "continue child PR",
+            None,
+            0,
+            None,
+            Some(r#"{"ticket":"REC-1"}"#),
+            None,
+            None,
+            Some(77),
+            2,
+        )
+        .unwrap();
+        let refs: serde_json::Value =
+            serde_json::from_str(get(&c, recovery).unwrap().unwrap().refs.as_deref().unwrap())
+                .unwrap();
+        assert_eq!(refs["source_task"], child);
+        assert_eq!(refs["ticket"], "REC-1");
+
+        // A creator can replace ordinary metadata before delivery. That must
+        // neither remove the daemon-stamped pair nor stop automatic recovery.
+        let metadata = update(
+            &mut c,
+            "owner",
+            recovery,
+            &TaskUpdate {
+                refs: Some(r#"{"ticket":"REC-2"}"#),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            3,
+        )
+        .unwrap();
+        let refs: serde_json::Value =
+            serde_json::from_str(metadata.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["source_task"], child);
+        assert_eq!(refs["ticket"], "REC-2");
+
+        // Classifier-invalidating content edits take the same creator refs
+        // path and must preserve the recovery pair too.
+        let edited = update(
+            &mut c,
+            "owner",
+            recovery,
+            &TaskUpdate {
+                body: Some("continue the recovered child"),
+                refs: Some(r#"{"ticket":"REC-3"}"#),
+                expected_revision: Some(2),
+                ..Default::default()
+            },
+            4,
+        )
+        .unwrap();
+        let refs: serde_json::Value =
+            serde_json::from_str(edited.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["source_task"], child);
+        assert_eq!(refs["ticket"], "REC-3");
     }
 
     #[test]
@@ -8380,6 +9327,7 @@ mod tests {
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
+                risk_flags: vec![],
             }],
             "test:v2",
             1004,
@@ -8577,7 +9525,7 @@ mod tests {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
-        let t = close_manual(&mut c, "owner", id, "fixed elsewhere", 1001)
+        let t = close_manual(&mut c, "owner", id, "fixed elsewhere", None, 1001)
             .unwrap()
             .unwrap();
         assert_eq!(t.status, "done");
@@ -8592,7 +9540,7 @@ mod tests {
     fn close_manual_from_open() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
-        let t = close_manual(&mut c, "owner", id, "obsolete", 1001)
+        let t = close_manual(&mut c, "owner", id, "obsolete", None, 1001)
             .unwrap()
             .unwrap();
         assert_eq!(t.status, "done");
@@ -8605,7 +9553,7 @@ mod tests {
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         cancel(&mut c, "A", id, 1001).unwrap();
         assert!(
-            close_manual(&mut c, "owner", id, "too late", 1002)
+            close_manual(&mut c, "owner", id, "too late", None, 1002)
                 .unwrap()
                 .is_none(),
             "already cancelled — should return None"
@@ -8633,7 +9581,7 @@ mod tests {
             .unwrap();
         assert!(!get(&c, child).unwrap().unwrap().ready);
 
-        let t = close_manual(&mut c, "owner", dep, "PR merged by hand", 1001)
+        let t = close_manual(&mut c, "owner", dep, "PR merged by hand", None, 1001)
             .unwrap()
             .unwrap();
         assert_eq!(t.status, "done");
@@ -8644,11 +9592,212 @@ mod tests {
     }
 
     #[test]
+    fn close_manual_reactivates_the_named_generated_child_failure_hold() {
+        let (_d, mut c) = open_tmp();
+        let source = create(
+            &mut c, "owner", "source", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let resolved = create(
+            &mut c,
+            "owner",
+            "resolved child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let sibling = create(
+            &mut c,
+            "owner",
+            "pending sibling",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            ),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        c.execute("UPDATE tasks SET status='decomposed' WHERE id=?1", [source])
+            .unwrap();
+        c.execute("UPDATE tasks SET status='failed' WHERE id=?1", [resolved])
+            .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 plan_revision,accepted_plan_revision,hold_code,hold_summary,created_at,updated_at
+             ) VALUES (?1,'blocked',1,0,1,1,1,'generated-child-failed',?2,1,1)",
+            params![
+                source,
+                serde_json::json!({"affected_task": resolved, "reason": "worker failed"})
+                    .to_string()
+            ],
+        )
+        .unwrap();
+        let graph = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (?1,?2,'resolved',1,1),(?1,?3,'sibling',1,1)",
+            params![graph, resolved, sibling],
+        )
+        .unwrap();
+
+        close_manual(&mut c, "owner", resolved, "merged by hand", None, 2)
+            .unwrap()
+            .unwrap();
+
+        let graph_state: (String, Option<String>, Option<String>) = c
+            .query_row(
+                "SELECT state,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(graph_state, ("active".into(), None, None));
+        assert!(
+            list_implementation_ready_open(&c)
+                .unwrap()
+                .iter()
+                .any(|task| task.id == sibling),
+            "the formerly held sibling must dispatch on the next daemon tick"
+        );
+        assert_eq!(
+            claim(&mut c, "worker", Some(sibling), &[], TTL, 3)
+                .unwrap()
+                .map(|task| task.id),
+            Some(sibling)
+        );
+        let unblocked: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events
+                 WHERE kind='task_graph_unblocked' AND subject=?1",
+                [lease_target(resolved)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unblocked, 1);
+    }
+
+    #[test]
+    fn close_manual_does_not_clear_another_childs_generated_failure_hold() {
+        let (_d, mut c) = open_tmp();
+        let source = create(
+            &mut c, "owner", "source", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let named = create(
+            &mut c,
+            "owner",
+            "named failed child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let closed = create(
+            &mut c,
+            "owner",
+            "other failed child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let sibling = create(
+            &mut c,
+            "owner",
+            "pending sibling",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            ),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        c.execute("UPDATE tasks SET status='decomposed' WHERE id=?1", [source])
+            .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed' WHERE id IN (?1,?2)",
+            params![named, closed],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 plan_revision,accepted_plan_revision,hold_code,hold_summary,created_at,updated_at
+             ) VALUES (?1,'blocked',1,0,1,1,1,'generated-child-failed',?2,1,1)",
+            params![
+                source,
+                serde_json::json!({"affected_task": named, "reason": "worker failed"}).to_string()
+            ],
+        )
+        .unwrap();
+        let graph = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (?1,?2,'named',1,1),(?1,?3,'closed',1,1),(?1,?4,'sibling',1,1)",
+            params![graph, named, closed, sibling],
+        )
+        .unwrap();
+
+        close_manual(&mut c, "owner", closed, "fixed elsewhere", None, 2)
+            .unwrap()
+            .unwrap();
+
+        let graph_state: (String, String) = c
+            .query_row(
+                "SELECT state,hold_code FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            graph_state,
+            ("blocked".into(), "generated-child-failed".into())
+        );
+        assert!(
+            !list_implementation_ready_open(&c)
+                .unwrap()
+                .iter()
+                .any(|task| task.id == sibling),
+            "a close unrelated to the held child must not release the graph"
+        );
+        let unblocked: i64 = c
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='task_graph_unblocked'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unblocked, 0);
+    }
+
+    #[test]
     fn close_manual_emits_distinct_event() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
-        close_manual(&mut c, "owner", id, "merged by hand", 1001).unwrap();
+        close_manual(&mut c, "owner", id, "merged by hand", None, 1001).unwrap();
         let events = crate::events::list(&c, 0, Some(&lease_target(id)), 100, 2000).unwrap();
         assert!(
             events.iter().any(|e| e.kind == "task_closed_manual"),
@@ -8785,11 +9934,21 @@ mod tests {
 
         let moderate_refs = get(&conn, moderate_l).unwrap().unwrap().refs;
         assert!(classification_is_complete(&moderate_refs));
-        assert!(classification_is_dispatchable(&moderate_refs, false, None));
+        assert!(classification_is_dispatchable(
+            &moderate_refs,
+            false,
+            None,
+            false
+        ));
         // L at complexity 4 is now directly dispatchable; only L at complexity 5
         // (and every XL) stays outside automatic dispatch.
         let boundary_refs = get(&conn, boundary_l).unwrap().unwrap().refs;
-        assert!(classification_is_dispatchable(&boundary_refs, false, None));
+        assert!(classification_is_dispatchable(
+            &boundary_refs,
+            false,
+            None,
+            false
+        ));
         assert!(claim(&mut conn, "moderate", Some(moderate_l), &[], TTL, 3)
             .unwrap()
             .is_some());
@@ -8826,7 +9985,8 @@ mod tests {
             assert!(classification_is_dispatchable(
                 &task.refs,
                 task.review_only,
-                task.continue_pr
+                task.continue_pr,
+                task.terminal_leaf,
             ));
             assert!(claim(
                 &mut conn,
@@ -9012,10 +10172,9 @@ mod tests {
     }
 
     #[test]
-    fn remediation_agent_failed_parks_review_only_rework() {
-        // D5b: a remediation worker lost at runtime must park the task, not
-        // hand the unchanged PR head back to a fresh reviewer (whose changes
-        // verdict would burn a rework round with zero remediation applied).
+    fn remediation_agent_failed_resumes_review_only_rework() {
+        // A remediation worker lost at runtime returns to the existing
+        // remediation context, never to a fresh reviewer on the unchanged PR.
         let (_d, mut c) = open_tmp();
         let id = review_only_task_in_rework(&mut c);
 
@@ -9030,23 +10189,24 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(r.task.status, "failed");
+        assert_eq!(r.task.status, "rework");
         assert_eq!(
             r.task.rework_round, 1,
             "infra failure must not consume a rework round"
         );
+        assert_eq!(r.task.recovery_attempts, 1);
+        assert!(r.effects.contains(&Effect::ResumeWorker));
         assert!(
             !r.effects.contains(&Effect::SpawnReviewer),
             "remediation death must not spawn a reviewer"
         );
         let refs: serde_json::Value =
             serde_json::from_str(r.task.refs.as_deref().unwrap()).unwrap();
-        assert_eq!(refs[PARKED_REF], true);
-        assert_eq!(refs[PARKED_RESUME_STATUS_REF], "rework");
-        assert!(refs.get(PARKED_HEAD_CHECK_REF).is_none());
+        assert_eq!(refs["pr"], 50);
+        assert_eq!(refs[RECOVERED_REMEDIATION_RETRY_REF], true);
         assert!(
-            refs.get(PARKED_REWORK_RETRY_REF).is_none(),
-            "a genuine crash park must stay owner-gated — no auto-retry flag"
+            refs.get(PARKED_REF).is_none(),
+            "a resumable remediation failure must not park the task"
         );
         let active_claims: i64 = c
             .query_row(
@@ -9055,35 +10215,71 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(active_claims, 0, "park releases the remediation lease");
+        assert_eq!(active_claims, 0, "recovery releases the remediation lease");
         // Failures are loud: owner alert delivered.
         let msgs = crate::feed::peek(&c, None, None, 10, 1003).unwrap();
         assert!(
             msgs.iter().any(|m| m.kind == "alert"
                 && m.recipient.as_deref() == Some("owner")
-                && m.body.contains("task-retry")),
-            "owner alert with retry hint missing"
+                && m.body.contains("worker killed by watchdog")),
+            "owner alert is missing"
         );
     }
 
     #[test]
-    fn remediation_lease_expired_parks_review_only_rework() {
+    fn remediation_lease_expired_resumes_review_only_rework() {
         let (_d, mut c) = open_tmp();
         let id = review_only_task_in_rework(&mut c);
 
         let r = apply_event(&mut c, "system", id, &Event::LeaseExpired, 1003).unwrap();
-        assert_eq!(r.task.status, "failed");
+        assert_eq!(r.task.status, "rework");
         assert_eq!(r.task.rework_round, 1);
+        assert_eq!(r.task.recovery_attempts, 1);
+        assert!(r.effects.contains(&Effect::ResumeWorker));
         assert!(!r.effects.contains(&Effect::SpawnReviewer));
         let refs: serde_json::Value =
             serde_json::from_str(r.task.refs.as_deref().unwrap()).unwrap();
-        assert_eq!(refs[PARKED_REF], true);
-        assert_eq!(refs[PARKED_RESUME_STATUS_REF], "rework");
-        assert!(refs.get(PARKED_HEAD_CHECK_REF).is_none());
+        assert_eq!(refs["pr"], 50);
+        assert_eq!(refs[RECOVERED_REMEDIATION_RETRY_REF], true);
+        assert!(refs.get(PARKED_REF).is_none());
     }
 
     #[test]
-    fn daemon_caused_park_is_owner_gated_even_with_budget() {
+    fn recovered_remediation_intent_is_consumed_by_one_exact_claim() {
+        let (_d, mut c) = open_tmp();
+        let id = review_only_task_in_rework(&mut c);
+        let recovered = apply_event(&mut c, "system", id, &Event::LeaseExpired, 1003).unwrap();
+        assert_eq!(recovered.task.status, "rework");
+        assert!(recovered_remediation_retry_requested(
+            recovered.task.refs.as_deref()
+        ));
+
+        let claimed = claim_remediation_rework_with_feedback(
+            &mut c,
+            "replacement",
+            id,
+            TTL,
+            1004,
+            Some("fix the persisted blocker"),
+        )
+        .unwrap()
+        .expect("the recovery intent must admit one exact remediation worker");
+        assert_eq!(claimed.status, "rework");
+        assert_eq!(claimed.rework_round, 1);
+        assert_eq!(extract_pr_number(&claimed.refs), Some(50));
+        assert!(!recovered_remediation_retry_requested(
+            claimed.refs.as_deref()
+        ));
+        assert!(
+            claim_remediation_rework(&mut c, "duplicate", id, TTL, 1005)
+                .unwrap()
+                .is_none(),
+            "the live replacement lease is the duplicate-spawn authority"
+        );
+    }
+
+    #[test]
+    fn daemon_caused_rework_recovery_spends_budget() {
         let (_d, mut c) = open_tmp();
         let id = review_only_task_in_rework(&mut c);
 
@@ -9097,23 +10293,14 @@ mod tests {
             1003,
         )
         .unwrap();
-        assert_eq!(r.task.status, "failed");
+        assert_eq!(r.task.status, "rework");
         let refs: serde_json::Value =
             serde_json::from_str(r.task.refs.as_deref().unwrap()).unwrap();
-        assert_eq!(refs[PARKED_REF], true);
-        assert!(refs.get(PARKED_REWORK_RETRY_REF).is_none());
+        assert_eq!(refs["pr"], 50);
+        assert!(refs.get(PARKED_REF).is_none());
         assert_eq!(
-            r.task.recovery_attempts, 0,
-            "owner-gated park must not spend an automatic retry budget"
-        );
-
-        let resumed = retry_parked(&mut c, id, "boss", true, 1004)
-            .unwrap()
-            .unwrap();
-        assert_eq!(resumed.status, "rework");
-        assert_eq!(
-            resumed.recovery_attempts, 0,
-            "owner retry refills the budget"
+            r.task.recovery_attempts, 1,
+            "automatic remediation recovery must spend its bounded retry budget"
         );
     }
 
@@ -9144,6 +10331,10 @@ mod tests {
         assert!(
             refs.get(PARKED_REWORK_RETRY_REF).is_none(),
             "terminal park must never carry an auto-retry flag"
+        );
+        assert!(
+            refs.get(RECOVERED_REMEDIATION_RETRY_REF).is_none(),
+            "terminal park must never retain a recovery intent"
         );
         assert_eq!(
             r.task.recovery_attempts, MAX_RECOVERY_ATTEMPTS,
@@ -9554,7 +10745,21 @@ mod tests {
     #[test]
     fn body_update_invalidates_classifier_refs_but_preserves_unrelated_refs() {
         let (_d, mut c) = open_tmp();
-        let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        let id = create(
+            &mut c,
+            "boss",
+            "t",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":3,"cx_size":"M","cx_size_reason":"bounded seam","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v4","cx_risk_flags":[{"flag":"public_contract","evidence":"The task changes CLI JSON output."}]}"#,
+            ),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
         claim(&mut c, "A", Some(id), &[], TTL, 1000).unwrap();
         let t = update(
             &mut c,
@@ -9576,6 +10781,7 @@ mod tests {
         assert!(refs.get("cx_size").is_none());
         assert!(refs.get("cx_size_reason").is_none());
         assert!(refs.get("cx_ready").is_none());
+        assert!(refs.get("cx_risk_flags").is_none());
         assert_eq!(t.status, "working");
     }
 
@@ -9896,6 +11102,39 @@ mod tests {
     }
 
     #[test]
+    fn task_creation_accepts_opus_55_tier_label_and_rejects_unknown_tier() {
+        let (_d, mut c) = open_tmp();
+        assert!(super::create(
+            &mut c,
+            "daemon",
+            "opus 5.5 task",
+            None,
+            0,
+            Some(r#"["tier:opus-55"]"#),
+            None,
+            None,
+            None,
+            1000,
+        )
+        .is_ok());
+
+        let err = super::create(
+            &mut c,
+            "daemon",
+            "unknown tier task",
+            None,
+            0,
+            Some(r#"["tier:opus-99"]"#),
+            None,
+            None,
+            None,
+            1001,
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
     fn creator_refs_cannot_forge_classifier_authority() {
         for refs in [
             r#"{"cx_est":5}"#,
@@ -9908,9 +11147,17 @@ mod tests {
         }
         let pr_err = validate_creator_refs(Some(r#"{"pr":42,"repo":"o/r"}"#)).unwrap_err();
         assert!(format!("{pr_err}").contains("--continue-pr"));
+        let source_err = validate_creator_refs(Some(r#"{"source_task":42}"#)).unwrap_err();
+        assert!(format!("{source_err}").contains("recovery provenance"));
+        let merge_err =
+            validate_creator_refs(Some(r#"{"merge_commit_sha":"deadbeef"}"#)).unwrap_err();
+        assert!(format!("{merge_err}").contains("merge provenance"));
         let retry_err =
             validate_creator_refs(Some(r#"{"daemon_merge_retry":"requested"}"#)).unwrap_err();
         assert!(format!("{retry_err}").contains("task-retry"));
+        let poison_retry_err =
+            validate_creator_refs(Some(r#"{"poison_retry_generation":1}"#)).unwrap_err();
+        assert!(format!("{poison_retry_err}").contains("task-retry"));
         assert!(validate_creator_refs(Some(r#"{"ticket":"ABC","repo":"o/r"}"#)).is_ok());
     }
 
@@ -9928,7 +11175,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_update_preserves_daemon_pr_and_classifier_refs() {
+    fn metadata_update_preserves_daemon_pr_classifier_and_merge_refs() {
         let (_d, mut c) = open_tmp();
         let id = create(
             &mut c,
@@ -9937,14 +11184,14 @@ mod tests {
             None,
             0,
             None,
-            Some(r#"{"cx_est":5,"cx_by":"classifier:v1","pr":41}"#),
+            Some(r#"{"cx_est":5,"cx_by":"classifier:v1","cx_risk_flags":[{"flag":"many_consumers","evidence":"Three consumers must update together."}],"pr":41,"merge_commit_sha":"trusted","poison_retry_generation":1}"#),
             None,
             None,
             1000,
         )
         .unwrap();
         let fields = TaskUpdate {
-            refs: Some(r#"{"pr":42,"ticket":"ABC"}"#),
+            refs: Some(r#"{"pr":42,"ticket":"ABC","merge_commit_sha":"forged"}"#),
             expected_revision: Some(1),
             ..Default::default()
         };
@@ -9955,6 +11202,15 @@ mod tests {
         assert_eq!(refs["ticket"], "ABC");
         assert_eq!(refs["cx_est"], 5);
         assert_eq!(refs["cx_by"], "classifier:v1");
+        assert_eq!(
+            refs["cx_risk_flags"],
+            serde_json::json!([{
+                "flag": "many_consumers",
+                "evidence": "Three consumers must update together."
+            }])
+        );
+        assert_eq!(refs[MERGE_COMMIT_SHA_REF], "trusted");
+        assert_eq!(refs[POISON_RETRY_GENERATION_REF], 1);
     }
 
     #[test]
@@ -9981,6 +11237,7 @@ mod tests {
             ready: true,
             not_ready_reason: None,
             duplicate_of: Vec::new(),
+            risk_flags: vec![],
         }];
         crate::classify::store_classifications(&mut conn, &classifications, "test:v2", 1001)
             .unwrap();
@@ -10169,7 +11426,7 @@ mod tests {
     /// and never overwrite it (#340). The branch (derived from author) stays
     /// stable across re-claims, preventing duplicate PRs.
     #[test]
-    fn rework_reclaim_preserves_original_author() {
+    fn rework_recovery_claim_preserves_original_author() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
 
@@ -10195,11 +11452,11 @@ mod tests {
         claim(&mut c, "Optic-c6at", Some(id), &[], TTL, 1002).unwrap();
         apply_event(&mut c, "Optic-c6at", id, &Event::VerdictChanges, 1003).unwrap();
 
-        // Author's lease lapsed — rework → open
+        // Author's lease lapsed — rework context remains resumable.
         apply_event(&mut c, "system", id, &Event::LeaseExpired, 1004).unwrap();
 
-        // Different agent claims the reopened task
-        let t = claim(&mut c, "Lever-lx89", Some(id), &[], TTL, 1005)
+        // Different agent claims the replacement remediation lease.
+        let t = claim_remediation_rework(&mut c, "Lever-lx89", id, TTL, 1005)
             .unwrap()
             .unwrap();
 
@@ -10215,9 +11472,9 @@ mod tests {
         );
     }
 
-    /// Auto-select claim (task_id=None) also preserves author on rework re-claim (#340).
+    /// Replacement remediation claims preserve the original author after a lease lapse (#340).
     #[test]
-    fn rework_reclaim_auto_select_preserves_author() {
+    fn rework_recovery_replacement_preserves_author() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
 
@@ -10240,11 +11497,11 @@ mod tests {
         claim(&mut c, "R", Some(id), &[], TTL, 1002).unwrap();
         apply_event(&mut c, "R", id, &Event::VerdictChanges, 1003).unwrap();
 
-        // Lease lapse → open
+        // Lease lapse → resumable rework.
         apply_event(&mut c, "system", id, &Event::LeaseExpired, 1004).unwrap();
 
-        // New agent auto-selects (no task_id)
-        let t = claim(&mut c, "Lever-lx89", None, &[], TTL, 1005)
+        // New remediation agent claims the retained rework task.
+        let t = claim_remediation_rework(&mut c, "Lever-lx89", id, TTL, 1005)
             .unwrap()
             .unwrap();
         assert_eq!(t.id, id);
@@ -10480,6 +11737,81 @@ mod tests {
     }
 
     #[test]
+    fn rework_recovery_budget_parks_without_respawning() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "rework recovery budget",
+            None,
+            5,
+            None,
+            None,
+            None,
+            None,
+            100,
+        )
+        .unwrap();
+        claim(&mut c, "author", Some(id), &[], TTL, 200).unwrap();
+        apply_event(
+            &mut c,
+            "author",
+            id,
+            &Event::SignaledDone { pr: "42".into() },
+            300,
+        )
+        .unwrap();
+        apply_event(
+            &mut c,
+            "reviewer",
+            id,
+            &Event::ReviewerAttached {
+                agent: "reviewer".into(),
+            },
+            400,
+        )
+        .unwrap();
+        apply_event(&mut c, "reviewer", id, &Event::VerdictChanges, 500).unwrap();
+
+        for attempt in 1..=MAX_RECOVERY_ATTEMPTS {
+            claim_remediation_rework(&mut c, "replacement", id, TTL, 600 + attempt)
+                .unwrap()
+                .expect("retained remediation context must be claimable");
+            let recovered = apply_event(
+                &mut c,
+                "daemon",
+                id,
+                &Event::AgentFailed {
+                    reason: "remediation crashed".into(),
+                },
+                650 + attempt,
+            )
+            .unwrap();
+            assert_eq!(recovered.task.status, "rework", "attempt {attempt}");
+            assert_eq!(
+                recovered.task.recovery_attempts, attempt,
+                "attempt {attempt}"
+            );
+            assert_eq!(recovered.task.rework_round, 1, "attempt {attempt}");
+            assert_eq!(extract_pr_number(&recovered.task.refs), Some(42));
+            assert!(recovered.effects.contains(&Effect::ResumeWorker));
+        }
+
+        claim_remediation_rework(&mut c, "replacement", id, TTL, 700)
+            .unwrap()
+            .expect("the final bounded attempt must claim");
+        let exhausted = apply_event(&mut c, "daemon", id, &Event::LeaseExpired, 750).unwrap();
+        assert_eq!(exhausted.task.status, "failed");
+        assert_eq!(exhausted.task.recovery_attempts, MAX_RECOVERY_ATTEMPTS);
+        assert_eq!(exhausted.task.rework_round, 1);
+        assert_eq!(extract_pr_number(&exhausted.task.refs), Some(42));
+        assert!(
+            !exhausted.effects.contains(&Effect::ResumeWorker),
+            "a terminal budget exhaustion must not request another worker"
+        );
+    }
+
+    #[test]
     fn recovery_budget_resets_on_signaled_done() {
         let (_d, mut c) = open_tmp();
         let tid = create(
@@ -10563,7 +11895,7 @@ mod tests {
         // Install remediation lease (as the daemon would).
         claim_remediation_rework(&mut c, "w1", tid, TTL, 510).unwrap();
 
-        // Rework crash → open, recovery_attempts = 1
+        // Rework crash → rework, recovery_attempts = 1
         apply_event(
             &mut c,
             "daemon",
@@ -10575,21 +11907,15 @@ mod tests {
         )
         .unwrap();
         let t = get(&c, tid).unwrap().unwrap();
+        assert_eq!(t.status, "rework");
         assert_eq!(t.recovery_attempts, 1);
 
-        // Re-claim (w1 is still author since PR exists) → working → submit → in-review
-        claim(&mut c, "w1", Some(tid), &[], TTL, 700).unwrap();
-        apply_event(
-            &mut c,
-            "w1",
-            tid,
-            &Event::SignaledDone { pr: "10".into() },
-            800,
-        )
-        .unwrap();
-        // SignaledDone resets recovery_attempts
+        // The replacement worker finishes the retained remediation round.
+        claim_remediation_rework(&mut c, "w1", tid, TTL, 700).unwrap();
+        apply_event(&mut c, "w1", tid, &Event::ReworkPushed, 800).unwrap();
+        // ReworkPushed resets recovery_attempts.
         let t = get(&c, tid).unwrap().unwrap();
-        assert_eq!(t.recovery_attempts, 0, "SignaledDone resets counter");
+        assert_eq!(t.recovery_attempts, 0, "ReworkPushed resets counter");
 
         // New rework cycle to test ReworkPushed specifically:
         // Bump recovery_attempts via raw SQL to simulate prior crashes
@@ -10988,6 +12314,7 @@ mod tests {
             serde_json::from_str(retried.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs["pr"], 419);
         assert!(refs.get("daemon_parked").is_none());
+        assert_eq!(refs[POISON_RETRY_GENERATION_REF], 1);
     }
 
     #[test]
@@ -11591,6 +12918,7 @@ mod tests {
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
+                risk_flags: vec![],
             }],
             "unit-test:v2",
             10,
@@ -11783,10 +13111,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             commits,
-            vec![DependencyMergeCommit {
+            DependencyMergeCommitResolution::Resolved(vec![DependencyMergeCommit {
                 task_id: dependency,
+                root_dependency_id: dependency,
+                pr_number: None,
                 merge_commit_sha: Some("deadbeef".into()),
-            }]
+            }])
         );
 
         let reason = "fetched origin/develop does not yet contain dependency merge commit deadbeef";
@@ -11817,6 +13147,262 @@ mod tests {
         let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
         assert_eq!(refs[DEPENDENCY_BASE_WAIT_ATTEMPTS_REF], 3);
         assert_eq!(refs[PARKED_REASON_REF], reason);
+    }
+
+    fn mark_done_for_dependency_provenance(conn: &Connection, task_id: i64) {
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [task_id])
+            .unwrap();
+    }
+
+    fn insert_completed_dependency_graph(
+        conn: &Connection,
+        source_task_id: i64,
+        child_ids: &[i64],
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 plan_revision,accepted_plan_revision,created_at,updated_at
+             ) VALUES (?1,'completed',0,0,1,1,1,1,1)",
+            [source_task_id],
+        )
+        .unwrap();
+        let graph_id = conn.last_insert_rowid();
+        for (index, child_id) in child_ids.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+                 VALUES (?1,?2,?3,1,1)",
+                rusqlite::params![graph_id, child_id, format!("child-{index}")],
+            )
+            .unwrap();
+        }
+        graph_id
+    }
+
+    #[test]
+    fn dependency_merge_commits_expands_every_completed_graph_child() {
+        let (_dir, mut conn) = open_tmp();
+        let source = create(
+            &mut conn, "owner", "source", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let first = create(
+            &mut conn,
+            "owner",
+            "first child",
+            None,
+            0,
+            None,
+            Some(r#"{"merge_commit_sha":"1111111111111111111111111111111111111111"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let second = create(
+            &mut conn,
+            "owner",
+            "second child",
+            None,
+            0,
+            None,
+            Some(r#"{"merge_commit_sha":"2222222222222222222222222222222222222222"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        for task_id in [source, first, second] {
+            mark_done_for_dependency_provenance(&conn, task_id);
+        }
+        insert_completed_dependency_graph(&conn, source, &[first, second]);
+
+        assert_eq!(
+            dependency_merge_commits(&conn, Some(&format!("[{source}]"))).unwrap(),
+            DependencyMergeCommitResolution::Resolved(vec![
+                DependencyMergeCommit {
+                    task_id: first,
+                    root_dependency_id: source,
+                    pr_number: None,
+                    merge_commit_sha: Some("1111111111111111111111111111111111111111".into()),
+                },
+                DependencyMergeCommit {
+                    task_id: second,
+                    root_dependency_id: source,
+                    pr_number: None,
+                    merge_commit_sha: Some("2222222222222222222222222222222222222222".into()),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn dependency_merge_commits_expands_nested_completed_graphs() {
+        let (_dir, mut conn) = open_tmp();
+        let source = create(
+            &mut conn, "owner", "source", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let nested_source = create(
+            &mut conn,
+            "owner",
+            "nested source",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let outer_leaf = create(
+            &mut conn,
+            "owner",
+            "outer leaf",
+            None,
+            0,
+            None,
+            Some(r#"{"merge_commit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let nested_leaf = create(
+            &mut conn,
+            "owner",
+            "nested leaf",
+            None,
+            0,
+            None,
+            Some(r#"{"merge_commit_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        for task_id in [source, nested_source, outer_leaf, nested_leaf] {
+            mark_done_for_dependency_provenance(&conn, task_id);
+        }
+        insert_completed_dependency_graph(&conn, nested_source, &[nested_leaf]);
+        insert_completed_dependency_graph(&conn, source, &[nested_source, outer_leaf]);
+
+        assert_eq!(
+            dependency_merge_commits(&conn, Some(&format!("[{source}]"))).unwrap(),
+            DependencyMergeCommitResolution::Resolved(vec![
+                DependencyMergeCommit {
+                    task_id: nested_leaf,
+                    root_dependency_id: source,
+                    pr_number: None,
+                    merge_commit_sha: Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()),
+                },
+                DependencyMergeCommit {
+                    task_id: outer_leaf,
+                    root_dependency_id: source,
+                    pr_number: None,
+                    merge_commit_sha: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn dependency_merge_commits_fails_closed_for_incomplete_graph_or_child() {
+        let (_dir, mut conn) = open_tmp();
+        let source = create(
+            &mut conn, "owner", "source", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let child = create(
+            &mut conn, "owner", "child", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        mark_done_for_dependency_provenance(&conn, source);
+        insert_completed_dependency_graph(&conn, source, &[child]);
+        assert_eq!(
+            dependency_merge_commits(&conn, Some(&format!("[{source}]"))).unwrap(),
+            DependencyMergeCommitResolution::Unresolved {
+                reason: format!(
+                    "dependency #{source} completed decomposition graph child #{child} is not done"
+                ),
+            }
+        );
+
+        conn.execute(
+            "UPDATE task_decompositions SET state='active',active=1 WHERE source_task_id=?1",
+            [source],
+        )
+        .unwrap();
+        mark_done_for_dependency_provenance(&conn, child);
+        assert_eq!(
+            dependency_merge_commits(&conn, Some(&format!("[{source}]"))).unwrap(),
+            DependencyMergeCommitResolution::Unresolved {
+                reason: format!("dependency #{source} decomposition graph is not completed"),
+            }
+        );
+
+        conn.execute("UPDATE tasks SET status='decomposed' WHERE id=?1", [source])
+            .unwrap();
+        let dependent = create(
+            &mut conn,
+            "owner",
+            "dependent of active graph",
+            None,
+            0,
+            None,
+            None,
+            Some(&format!("[{source}]")),
+            None,
+            2,
+        )
+        .unwrap();
+        assert!(
+            !get(&conn, dependent).unwrap().unwrap().ready,
+            "the established dependency-ready gate keeps active decomposition sources out of admission"
+        );
+        assert!(
+            claim(&mut conn, "worker", Some(dependent), &[], TTL, 2)
+                .unwrap()
+                .is_none(),
+            "the established dependency claim gate must remain authoritative"
+        );
+
+        let stale_member = create(
+            &mut conn,
+            "owner",
+            "stale active member",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            3,
+        )
+        .unwrap();
+        mark_done_for_dependency_provenance(&conn, stale_member);
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [source])
+            .unwrap();
+        conn.execute(
+            "UPDATE task_decompositions SET state='completed',active=0 WHERE source_task_id=?1",
+            [source],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             SELECT id,?2,'stale',2,1 FROM task_decompositions WHERE source_task_id=?1",
+            rusqlite::params![source, stale_member],
+        )
+        .unwrap();
+        assert_eq!(
+            dependency_merge_commits(&conn, Some(&format!("[{source}]"))).unwrap(),
+            DependencyMergeCommitResolution::Unresolved {
+                reason: format!(
+                    "dependency #{source} completed decomposition graph membership is ambiguous"
+                ),
+            }
+        );
     }
 
     #[test]
@@ -12248,6 +13834,7 @@ mod tests {
         assert_eq!(refs["keep"], "yes");
         assert_eq!(refs["pr"], 419);
         assert_eq!(refs["codex_thread_id"], "thread-old");
+        assert_eq!(refs[POISON_RETRY_GENERATION_REF], 1);
         assert!(crate::runner_state::requested_retry(&refs, "codex").is_some());
         assert!(refs.get("codex_retry_requested").is_none());
         assert_eq!(retried.rework_round, 2);
@@ -12377,7 +13964,7 @@ mod tests {
             .unwrap()
             .is_none());
         update_refs_daemon(&mut conn, id, r#"{"codex_provider_blocked":true}"#, 12).unwrap();
-        close_manual(&mut conn, "owner", id, "obsolete", 13).unwrap();
+        close_manual(&mut conn, "owner", id, "obsolete", None, 13).unwrap();
         assert!(retry_provider_blocked(&mut conn, id, "operator", 14)
             .unwrap()
             .is_none());
@@ -13111,7 +14698,13 @@ mod tests {
         // grace=60, so 1400+60=1460 < 1500).
         crate::sweep::reap_lapsed_tasks(&c, 1500, 100).unwrap();
         let t = get(&c, id).unwrap().unwrap();
-        assert_eq!(t.status, "open", "expired remediation lease must be reaped");
+        assert_eq!(
+            t.status, "rework",
+            "expired remediation lease stays in rework"
+        );
+        assert_eq!(t.rework_round, 1, "a reap must not burn a rework round");
+        assert_eq!(extract_pr_number(&t.refs), Some(42));
+        assert!(recovered_remediation_retry_requested(t.refs.as_deref()));
     }
 
     #[test]
@@ -13285,7 +14878,8 @@ mod tests {
             assert!(classification_is_dispatchable(
                 &task.refs,
                 task.review_only,
-                task.continue_pr
+                task.continue_pr,
+                task.terminal_leaf,
             ));
 
             let token = format!("review-{size}");
@@ -13345,6 +14939,65 @@ mod tests {
             )
             .unwrap();
         assert_eq!(parked, 0);
+    }
+
+    #[test]
+    fn flagged_large_cx_four_started_task_drains_review_and_rework() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "owner",
+            "legacy flagged large task",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"cx_est":4,"cx_size":"L","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v4","cx_risk_flags":[{"flag":"many_consumers","evidence":"Several consumers change together."}]}"#,
+            ),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        assert!(
+            !classification_is_dispatchable(
+                &get(&c, id).unwrap().unwrap().refs,
+                false,
+                None,
+                false
+            ),
+            "a new flagged L/cx4 root must route to planning"
+        );
+
+        // Simulate a task admitted before the policy existed. It cannot become
+        // a planning candidate once it has left open, so its lifecycle drains.
+        c.execute(
+            "UPDATE tasks SET status='in-review',author='legacy-worker' WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+        let started = get(&c, id).unwrap().unwrap();
+        assert!(classification_is_dispatchable_for_status(
+            &started.refs,
+            started.review_only,
+            started.continue_pr,
+            started.terminal_leaf,
+            &started.status,
+        ));
+
+        assert!(reserve_reviewer_provision(&mut c, id, "r1-token", "r1", 1001).unwrap());
+        assert!(
+            attach_reserved_reviewer(&mut c, id, "r1-token", "r1", "reviewer", TTL, 1002,).unwrap()
+        );
+        assert!(release_reviewer_provision(&mut c, id, "r1-token").unwrap());
+
+        let rework = apply_event(&mut c, "reviewer", id, &Event::VerdictChanges, 1003).unwrap();
+        assert_eq!(rework.task.status, "rework");
+        assert!(
+            claim_remediation_rework(&mut c, "remediation", id, TTL, 1004)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -14888,48 +16541,166 @@ mod tests {
     /// in status BLOCKED. The policy branch must strip the marker.
     #[test]
     fn size_policy_table_agrees_between_rust_and_sql() {
-        let table: &[(&str, i64, bool)] = &[
-            ("S", 1, true),
-            ("S", 5, true),
-            ("M", 1, true),
-            ("M", 5, true),
-            ("L", 1, true),
-            ("L", 3, true),
-            ("L", 4, true),
-            ("L", 5, false),
-            ("XL", 1, false),
-            ("XL", 3, false),
-            ("XL", 5, false),
-        ];
-        let conn = Connection::open_in_memory().unwrap();
-        let sql = format!("SELECT {SIZE_DISPATCH_POLICY_SQL} FROM (SELECT ?1 AS refs)");
-        for (size, cx_est, expected) in table {
-            assert_eq!(
-                size_is_dispatchable(size, *cx_est),
-                *expected,
-                "rust policy for {size}/{cx_est}"
-            );
-            let refs = format!(
-                r#"{{"cx_est":{cx_est},"cx_size":"{size}","cx_ready":true,"cx_not_ready_reason":null}}"#
-            );
-            let sql_verdict: bool = conn
-                .query_row(&sql, params![refs], |row| row.get(0))
-                .unwrap();
-            assert_eq!(sql_verdict, *expected, "sql policy for {size}/{cx_est}");
-            assert_eq!(
-                classification_is_dispatchable(&Some(refs.clone()), false, None),
-                *expected,
-                "root dispatch policy for {size}/{cx_est}"
-            );
-            // Review-only and continuation work stay eligible at every size.
-            assert!(classification_is_dispatchable(
-                &Some(refs.clone()),
-                true,
-                None
-            ));
-            assert!(classification_is_dispatchable(&Some(refs), false, Some(9)));
+        let (_dir, conn) = open_tmp();
+        let size_sql = format!("SELECT {SIZE_DISPATCH_POLICY_SQL} FROM (SELECT ?1 AS refs)");
+        let direct_sql = format!(
+            "SELECT {DIRECT_DISPATCH_CLAUSE} FROM (
+                SELECT ?1 AS refs, 0 AS review_only, NULL AS continue_pr, 0 AS terminal_leaf
+             )"
+        );
+        let started_sql = format!(
+            "SELECT {STARTED_TASK_DISPATCH_CLAUSE} FROM (
+                SELECT ?1 AS refs, 0 AS review_only, NULL AS continue_pr,
+                       0 AS terminal_leaf, 'rework' AS status
+             )"
+        );
+        for size in ["S", "M", "L", "XL"] {
+            for cx_est in 1..=5 {
+                for has_risk_flags in [false, true] {
+                    let expected = matches!(size, "S" | "M")
+                        || (size == "L" && cx_est <= 4 && !(cx_est == 4 && has_risk_flags));
+                    assert_eq!(
+                        size_is_dispatchable(size, cx_est, has_risk_flags),
+                        expected,
+                        "rust policy for {size}/{cx_est}/flags={has_risk_flags}"
+                    );
+                    let flags = if has_risk_flags {
+                        r#"[{"flag":"many_consumers","evidence":"Several consumers change together."}]"#
+                    } else {
+                        "[]"
+                    };
+                    let refs = format!(
+                        r#"{{"cx_est":{cx_est},"cx_size":"{size}","cx_ready":true,"cx_not_ready_reason":null,"cx_risk_flags":{flags}}}"#
+                    );
+                    let size_sql_verdict: bool = conn
+                        .query_row(&size_sql, params![refs], |row| row.get(0))
+                        .unwrap();
+                    assert_eq!(
+                        size_sql_verdict, expected,
+                        "sql policy for {size}/{cx_est}/flags={has_risk_flags}"
+                    );
+                    let direct_sql_verdict: bool = conn
+                        .query_row(&direct_sql, params![refs], |row| row.get(0))
+                        .unwrap();
+                    assert_eq!(
+                        classification_is_dispatchable(&Some(refs.clone()), false, None, false),
+                        direct_sql_verdict,
+                        "root dispatch policy for {size}/{cx_est}/flags={has_risk_flags}"
+                    );
+                    let started_sql_verdict: bool = conn
+                        .query_row(&started_sql, params![refs], |row| row.get(0))
+                        .unwrap();
+                    assert_eq!(
+                        classification_is_dispatchable_for_status(
+                            &Some(refs.clone()),
+                            false,
+                            None,
+                            false,
+                            "rework",
+                        ),
+                        started_sql_verdict,
+                        "started dispatch policy for {size}/{cx_est}/flags={has_risk_flags}"
+                    );
+                    // Review-only and continuation work stay eligible at every size.
+                    assert!(classification_is_dispatchable(
+                        &Some(refs.clone()),
+                        true,
+                        None,
+                        false,
+                    ));
+                    assert!(classification_is_dispatchable(
+                        &Some(refs.clone()),
+                        false,
+                        Some(9),
+                        false
+                    ));
+                    assert_eq!(
+                        classification_is_dispatchable(&Some(refs.clone()), false, None, true,),
+                        size != "XL",
+                        "terminal leaf policy for {size}/{cx_est}/flags={has_risk_flags}"
+                    );
+                }
+            }
         }
+        let missing_flags =
+            r#"{"cx_est":4,"cx_size":"L","cx_ready":true,"cx_not_ready_reason":null}"#;
+        assert!(conn
+            .query_row(&size_sql, params![missing_flags], |row| row
+                .get::<_, bool>(0))
+            .unwrap());
         assert!(DIRECT_DISPATCH_CLAUSE.contains(SIZE_DISPATCH_POLICY_SQL));
+    }
+
+    #[test]
+    fn branch_sync_ref_task_is_dispatchable_like_review_only_and_continue_pr() {
+        // A conflict judgment task carries `refs.branch_sync=<id>` and, once
+        // classified, must dispatch directly at every size — exactly matching
+        // the existing review-only and continue-pr skip semantics.
+        let (_dir, conn) = open_tmp();
+        let direct_sql = format!(
+            "SELECT {DIRECT_DISPATCH_CLAUSE} FROM (
+                SELECT ?1 AS refs, 0 AS review_only, NULL AS continue_pr, 0 AS terminal_leaf
+             )"
+        );
+        for size in ["S", "M", "L", "XL"] {
+            for cx_est in 1..=5 {
+                let refs = format!(
+                    r#"{{"branch_sync":42,"cx_est":{cx_est},"cx_size":"{size}","cx_ready":true,"cx_not_ready_reason":null,"cx_risk_flags":[]}}"#
+                );
+                assert!(
+                    classification_is_dispatchable(&Some(refs.clone()), false, None, false),
+                    "branch_sync ref must dispatch at {size}/{cx_est}"
+                );
+                let direct_sql_verdict: bool = conn
+                    .query_row(&direct_sql, params![refs.clone()], |row| row.get(0))
+                    .unwrap();
+                assert!(
+                    direct_sql_verdict,
+                    "SQL dispatch clause must accept branch_sync ref at {size}/{cx_est}"
+                );
+
+                let without_ref = format!(
+                    r#"{{"cx_est":{cx_est},"cx_size":"{size}","cx_ready":true,"cx_not_ready_reason":null,"cx_risk_flags":[]}}"#
+                );
+                let sql_without: bool = conn
+                    .query_row(&direct_sql, params![without_ref.clone()], |row| row.get(0))
+                    .unwrap();
+                let rust_without =
+                    classification_is_dispatchable(&Some(without_ref), false, None, false);
+                assert_eq!(
+                    sql_without, rust_without,
+                    "reference behavior for {size}/{cx_est} without branch_sync ref must match"
+                );
+            }
+        }
+        assert!(refs_have_branch_sync_ref(Some(r#"{"branch_sync":1}"#)));
+        assert!(!refs_have_branch_sync_ref(Some(r#"{"other":1}"#)));
+        assert!(!refs_have_branch_sync_ref(Some(r#"{"branch_sync":null}"#)));
+        assert!(!refs_have_branch_sync_ref(None));
+    }
+
+    #[test]
+    fn task_detail_json_surfaces_terminal_leaf() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(
+            &mut conn,
+            "owner",
+            "terminal child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET terminal_leaf=1 WHERE id=?1", [id])
+            .unwrap();
+
+        let detail = get_with_notes(&conn, id).unwrap().unwrap();
+        let json = serde_json::to_value(detail).unwrap();
+        assert_eq!(json["terminal_leaf"], true);
     }
 
     #[test]
@@ -14949,14 +16720,15 @@ mod tests {
         )
         .unwrap();
         c.execute(
-            "UPDATE tasks SET status='failed', refs=json_object(
+            r#"UPDATE tasks SET status='failed', refs=json_object(
                  'daemon_parked', json('true'),
                  'daemon_parked_reason', 'classifier declined',
                  'daemon_resume_status', 'open',
                  'classifier_policy_parked', json('true'),
                  'daemon_parked_unsatisfiable', json('true'),
-                 'cx_est', 3
-             ) WHERE id=?1",
+                 'cx_est', 3,
+                 'cx_risk_flags', json('[{"flag":"public_contract","evidence":"The task changes CLI JSON output."}]')
+             ) WHERE id=?1"#,
             params![id],
         )
         .unwrap();
@@ -14972,6 +16744,7 @@ mod tests {
         );
         assert_eq!(refs[CLASSIFIER_POLICY_PARKED_REF], true);
         assert!(refs.get("cx_est").is_none());
+        assert!(refs.get("cx_risk_flags").is_none());
     }
 
     /// Task #473 review blocker: `set_parked_refs` is the shared builder for

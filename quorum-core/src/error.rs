@@ -21,6 +21,16 @@ pub enum QuorumError {
     /// On-disk schema is newer than this binary understands. Exit 3.
     #[error("db schema version {db} is newer than this binary ({bin})")]
     SchemaTooNew { db: i64, bin: i64 },
+    /// A fallback launch replay contradicts immutable committed evidence.
+    /// Lifecycle code must surface this rather than retrying the same install.
+    #[error("fallback launch intent replay conflicts with immutable evidence")]
+    FallbackInstallConflict,
+    /// A provider-issued terminal session identity failed validation against
+    /// the durable run, assignment, task, or handoff record. This is a
+    /// delivery failure for that run, not a storage failure: callers classify
+    /// it structurally instead of parsing the message. Exit 3.
+    #[error("terminal identity rejected: {0}")]
+    TerminalIdentityRejected(String),
     /// Underlying SQLite error. Exit 3.
     #[error(transparent)]
     Db(#[from] rusqlite::Error),
@@ -53,6 +63,11 @@ mod tests {
         assert_eq!(QuorumError::BadInput("x".into()).exit_code(), 2);
         assert_eq!(QuorumError::Busy.exit_code(), 3);
         assert_eq!(QuorumError::SchemaTooNew { db: 2, bin: 1 }.exit_code(), 3);
+        assert_eq!(QuorumError::FallbackInstallConflict.exit_code(), 3);
+        assert_eq!(
+            QuorumError::TerminalIdentityRejected("x".into()).exit_code(),
+            3
+        );
         assert_eq!(QuorumError::Io("x".into()).exit_code(), 3);
     }
 }

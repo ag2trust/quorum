@@ -54,6 +54,12 @@ accepted task
   → daemon-controlled approval and merge
 ```
 
+Configured branch synchronization is the narrow daemon-internal carve-out: it
+deterministically carries commits between owner-selected branch pairs and does
+not create a task on the clean path. A task is created only when a merge
+conflict or CI failure requires judgment; the daemon remains the sole owner of
+the clean synchronization workflow.
+
 This boundary is intentional. Quorum is **not** a general-purpose agent orchestrator,
 model gateway, arbitrary workflow engine, or agent-provider plugin host. The task,
 worktree, PR, review, rework, CI, and merge lifecycle is the product. A coding CLI is
@@ -392,19 +398,26 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   same atomic UPDATE, records `refs.abandoned_publication={pr,branch,local_sha,continue_pr}`
   as a bounded audit trail so the orphaned PR stays traceable, and the next dispatch mints a
   fresh branch/PR. A `pr-merged` classification is delivery evidence: the park is terminal
-  and retry refuses to restore it (§ Explicit cancellation and durable parking).
+  and retry refuses to restore it (§ Explicit cancellation and durable parking). When the
+  continuation PR belongs to a failed active graph child, creation stamps that exact child as
+  `refs.source_task` if the ref is absent; this is recovery provenance, not caller authority,
+  and creator/assignee metadata replacement preserves it. Recovery discovery and adoption compare
+  `refs.pr` to the durable PR target as either an integer or canonical decimal string.
 - ~~`quorum task-claim`~~ — **Removed (PR #161).** Daemon claims internally via
   `quorum_core::tasks::claim`. The atomic claim primitive, branch allocation,
   dependency gating, and reviewer attachment are all preserved as internal functions.
-- `quorum task-update --agent <id> --task-id <n> [--status open|cancelled] [--verdict approve|changes] [--blocking N] [--refs <json>] [--body-stdin|--body-file]` → fails loud if not assignee. Creator/agent updates may not add, replace, or remove `refs.pr`; that association is daemon-owned. Only `open` (release/reopen) and `cancelled` are directly settable; `working`, `in-review`, `rework`, `merging`, `failed` go through lifecycle events. **(v2: `--status` restricted to `cancelled` only; `--verdict`/`--blocking` removed — verdicts go through run-scoped `submit`. See § Daemon-only execution.)**
+- `quorum task-update --agent <id> --task-id <n> [--status open|cancelled] [--verdict approve|changes] [--blocking N] [--refs <json>] [--body-stdin|--body-file]` → fails loud if not assignee. Creator/agent updates may not add, replace, or remove `refs.pr` or persisted `refs.source_task`; those are daemon-owned association and recovery provenance. Only `open` (release/reopen) and `cancelled` are directly settable; `working`, `in-review`, `rework`, `merging`, `failed` go through lifecycle events. **(v2: `--status` restricted to `cancelled` only; `--verdict`/`--blocking` removed — verdicts go through run-scoped `submit`. See § Daemon-only execution.)**
 - `quorum task-close --agent <id> --task-id <n> --reason-stdin|--reason-file` → explicit
   manual/external terminal close (merged by hand, fixed elsewhere, obsolete). From any
   state except `done`/`cancelled`, but never an active decomposition source, which must use
   graph cancellation — `failed` is included, because a task whose PR landed outside the
   managed lifecycle has no other route to `done` and its dependents stay parked until it
   gets there (`compute_ready` counts only `done`). Closing a generated child performs final
-  graph/source reconciliation in the same transaction. Reason REQUIRED. Sets `done` but
-  records `completion_provenance=manual` without removing `refs.pr`, and emits
+  graph/source reconciliation in the same transaction; closing the child named by a structured
+  `generated-child-failed` hold clears that hold and restores its pending siblings. If its retained PR is merged,
+  `task-close` records that immutable merge SHA in `refs.merge_commit_sha`; it refuses an open
+  PR unless the required reason explicitly marks the task obsolete. Reason REQUIRED. Sets `done`
+  but records `completion_provenance=manual` without removing `refs.pr`, and emits
   `task_closed_manual` event
   (never `task_done`) — the audit log distinction is the guardrail. Owner/manual use;
   agents finishing work must use `quorum submit` (`quorum done` is a deprecated alias).
@@ -437,6 +450,101 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   Unblocked and terminal tasks return the clean-negative exit 1.
 - `quorum task-list [--status <s>] [--label <l>] [--assignee <id>]` (read-filtered)
 - `quorum task-get --task-id <n>`
+
+### Branch sync
+- `quorum branch-sync --by <agent> --from <branch> --to <branch> [--repo owner/name]` →
+  `{id, phase}` (0) when the exact directed pair is configured in serve
+  `sync_pairs`; an unconfigured pair or identical source/target exits 2. One active row for
+  the pair exits 1 as a clean negative. `quorum sync` remains the agent-compass command;
+  branch synchronization always uses the spelled-out `branch-sync` name.
+- `branch_syncs` records the request and executor evidence: source/target branches and pinned
+  SHAs, temporary sync branch, merge SHA, PR, optional judgment task, requestor/error details,
+  and timestamps. `UNIQUE(source_branch, target_branch) WHERE active=1` is the durable
+  cross-process guard for a single live synchronization per directed pair.
+- Phases advance through the one-way clean path `requested` → `pinned` → `prepared` →
+  `published` → `checks` → `merging` → `done`. The daemon fetches and pins both remote tips
+  before it allocates the bounded deterministic `sync/<id>` branch from the pinned target. The
+  source/target names remain in the durable row and PR title, so supported long branch names
+  never overflow a filesystem-backed Git ref component. It first proves a no-op by ancestry;
+  otherwise it runs an explicit `--no-ff` merge of the pinned source, records
+  the resulting merge SHA, pushes only that new branch, and creates the PR against the pinned
+  target branch. A restart reuses those pins: `pinned` rebuilds only from the stored SHAs,
+  `prepared` rechecks the local tip before publishing, and `published` verifies the live open PR
+  head/base before later work receives authority. Branch sync requires a non-empty effective
+  `required_jobs` configuration: an empty gate fails the row loudly with
+  `branch sync requires a non-empty required_jobs gate`, an `errors` row, and a
+  `branch_sync_failed` event. Its CI wait never accepts an empty `statusCheckRollup`; the
+  ordinary task merge two-empty-polls compatibility rule does not apply. Failed checks enter
+  active `ci_failed` with `branch_sync_ci_failed` for later judgment work. At most two pending
+  CI waits run daemon-wide, so configured pairs cannot exhaust the blocking pool; excess due
+  `checks` rows remain durable and selectable when a slot opens. Each wait records its attempt
+  count, due time, and in-flight admission on the row. The initial wait plus the bounded merge
+  retry budget is the finite lifetime allowance; pending or timed-out attempts use a capped
+  exponential delay, and exhausting that allowance fails the row loudly with
+  `branch_sync_failed`. Restart preserves the attempt and schedule, and reconstructs an
+  interrupted in-flight wait without granting another allowance. Green checks cross
+  the durable `checks` → `merging` admission before one daemon-owned `gh pr merge` call, with
+  the prepared merge SHA and target branch revalidated but no formal approval review. After a
+  reported merge, the daemon fetches the target, reads GitHub's immutable `mergeCommit`, and
+  proves both pinned source and target tips are ancestors before `done` and
+  `branch_sync_merged`. Any missing metadata or ancestry failure is loud `failed`, never
+  silently done. Restart reconciliation of `merging` reads PR state: merged verifies ancestry,
+  open receives one pinned-head retry, and closed/unknown fails with evidence. `pinned` may end
+  `noop` or become `conflict`; `failed` and `cancelled` may end any active phase. Phase changes
+  are guarded compare-and-set updates and reject backward, skipped, and same-phase writes, so
+  stale or restarted executors cannot overwrite or reorder durable progress. Every terminal
+  transition except judgment-pending `conflict` and `ci_failed` clears `active` in the same
+  statement, releasing the pair for a later request. Published/check/merge reconciliation yields
+  to newly requested, pinned, or prepared rows so an older sync cannot starve fresh clean-path
+  work.
+- The daemon executes the clean path internally; no task is created merely to merge, publish,
+  wait for checks, or complete a no-op. A conflict preserves the daemon-owned worktree's
+  `MERGE_HEAD` and unmerged index, stays active for the later judgment task, and is never pushed.
+  Sync branches deliberately use the `sync/` namespace rather than the task-only
+  `daemon/<author>-t<id>` grammar, so task branch cleanup and orphan discovery do not reap them.
+  Their preserved conflict worktrees also live beside, rather than under, the task worktree base
+  that recovery garbage-collects; `cleanup.rs` only accepts a matching `task_branches` allocation.
+- **Conflict judgment task.** A `conflict` row's judgment work is one of the two tasks the
+  branch-sync path may create; every successful clean-path phase remains daemon-internal. The daemon's intake pass
+  scans active `conflict` rows whose `task_id IS NULL`, gathers the still-unmerged files from
+  the preserved sync worktree via `git diff --name-only --diff-filter=U`, and calls
+  `branch_sync::create_conflict_judgment_task` — one `BEGIN IMMEDIATE` transaction that inserts
+  a task with `created_by='daemon'`, `target_branch` equal to the sync `to`,
+  title `Resolve branch-sync conflict: <from> → <to> (#<id>)`, and `refs={"branch_sync":<id>}`,
+  then binds `branch_syncs.task_id` to the new id inside the same statement. The body lists the
+  pinned `source_sha`, pinned `target_sha`, the conflicted file list, and the instruction to
+  resolve and commit the merge in place without rebasing or dropping either side. Because task
+  provisioning and the row binding are one transaction, a restart or a concurrent tick can
+  never produce a second task for the same conflict; a row that already carries a `task_id` is
+  a clean negative with no side effects. A missing worktree or a git failure fails the
+  `conflict` row loudly on its current phase rather than looping. Tasks carrying a
+  `branch_sync` ref skip classifier parking, planner selection, and decomposition dispatch
+  exactly as `review-only` and `continue-pr` tasks do: `parking_reason` returns `None` for
+  them, planner/decomposition eligibility SQL excludes `refs.branch_sync IS NOT NULL`, and the
+  direct-dispatch clause (`classification_is_dispatchable` and `direct_dispatch_clause_sql!`)
+  admits them at any size. The remainder of the lifecycle — worker provisioning against the
+  preserved conflict worktree, publication of the resolved merge, R1-only review, merge, task
+  completion, and the paired cancellation path that releases the `conflict` row — is owned by
+  the follow-on tasks and is deliberately out of scope for this intake step.
+- **CI-failure fix task.** An active `ci_failed` row with no bound task receives exactly one
+  daemon-created continuation task. `branch_sync::create_ci_failure_fix_task` rechecks that state
+  under `BEGIN IMMEDIATE`, inserts `created_by='daemon'`, `continue_pr` equal to the existing sync
+  PR, `target_branch` equal to the sync target, title
+  `Fix CI for branch sync: <from> → <to> (#<id>)`, and `refs={"branch_sync":<id>}`, then binds the
+  task id before commit. Its body records the preserved `merge_sha`, failing
+  `statusCheckRollup` names, and the fix-forward/no-rebase/no-force-push/no-merge-rewrite contract.
+  The ordinary continuation path provisions the exact PR head and publishes under its SHA lease;
+  the new head is stored in `pr_targets` while the sync row retains its original `merge_sha` for
+  review scope. That stored fix head remains immutable through fresh reviewer provisioning and
+  every sticky R1 re-review feed: a later PR head/ref/fork mismatch atomically fails the task and
+  sync row before any reviewer or merge gains authority. R1 reviews only
+  `git diff <merge_sha>..<exact-head>` and the existing authoritative
+  branch-sync predicate skips R2. A worker failure or stale publication authority fails the task
+  and sync row without an implementation retry and queues a sync-id-bearing comment on the open
+  PR. Comment delivery admits at most three durable task-bound attempts with exponential backoff;
+  a backed-off or exhausted row cannot starve later failed rows, and only an actually failed task
+  is eligible for the worker-failure wording. Approval follows the normal merge path; post-merge
+  ancestry verification marks the bound `ci_failed` row `done`.
 
 ### Ops
 - `quorum status [--watch]` → read-only health snapshot. Alerts and critical messages are
@@ -670,7 +778,14 @@ only through an explicit outside request)
 
 **From Working:**
 - `SignaledDone { pr }` → InReview · effects: SpawnReviewer
-- `AgentFailed` / `LeaseExpired` → Open · effects: ReleaseLease (+NotifyOwner on failure)
+- `AgentFailed` / `LeaseExpired` with an existing PR and `rework_round > 0` → Rework ·
+  effects: ReleaseLease, ResumeWorker, NotifyOwner. The daemon persists one exact-remediation
+  recovery intent and provisions the replacement through the existing PR-bound remediation path.
+  The PR, author, and round are retained; the reap does not increment `rework_round`.
+  Recovery is bounded by the task's rework cap and recovery budget; cap- or budget-exhausted
+  rows become Failed.
+- Other `AgentFailed` / `LeaseExpired` → Open · effects: ReleaseLease (+NotifyOwner on failure).
+  A PR-less first-round recovery also clears the author.
 - `Cancelled { by }` → Cancelled · effects: ReleaseLease
 
 **From InReview:**
@@ -687,14 +802,15 @@ only through an explicit outside request)
 
 **From Rework:**
 - `ReworkPushed` → InReview · effects: ResumeReviewer
-- `AgentFailed` / `LeaseExpired` → Open · effects: ReleaseLease (+NotifyOwner on failure)
-- `AgentFailed` / `LeaseExpired` (review_only=true) → Failed (parked, resume `rework`) ·
-  effects: ReleaseLease, NotifyOwner. A lost remediation worker must not hand the
-  unchanged PR head back to a fresh reviewer — that changes verdict would burn a rework
-  round with zero remediation applied. The terminal park is never selected for
-  automatic retry, including after daemon restart; only an explicit `task-retry`
-  restores it to `rework`. The lapsed-lease sweep applies the same owner-gated park
-  instead of reclaiming to `in-review`.
+- `AgentFailed` / `LeaseExpired` with an existing PR and `rework_round > 0` → Rework ·
+  effects: ReleaseLease, ResumeWorker, NotifyOwner. The exact-remediation recovery intent
+  survives daemon restart and is consumed atomically with the replacement lease, so a
+  recovered remediation never falls through to a fresh initial worker or reviewer. The PR,
+  author, and round remain intact and no reap burns a rework round. Repeated reaps are bounded
+  by the existing recovery budget; a round already at its rework cap (or an exhausted recovery
+  budget) becomes Failed.
+- Other `AgentFailed` / `LeaseExpired` → Open · effects: ReleaseLease (+NotifyOwner on failure).
+  PR-less first-round recovery clears the author.
 - `Cancelled { by }` → Cancelled · effects: ReleaseLease
 
 **From Merging:**
@@ -806,13 +922,30 @@ only through an explicit outside request)
   changes by the daemon.
 - **Dependency gating:** tasks with `depends_on` are only claimable when all deps are `done`.
   A daemon-observed merge also records GitHub's immutable merge commit in
-  `refs.merge_commit_sha`. Before allocating a dependent task's branch or worktree, the
-  daemon fetches its authoritative target branch and requires every dependency's recorded
-  merge commit to be an ancestor of that fetched base SHA; that exact verified SHA is the
-  allocation provenance. A just-merged commit absent from the fetched ref is a bounded,
+  `refs.merge_commit_sha`. Before **first** allocation of a dependent's branch, the daemon
+  fetches its authoritative target branch and requires every dependency's recorded merge
+  commit to be an ancestor of that fetched base SHA; a completed decomposition source instead
+  contributes every active member of its accepted completed graph (recursively for a completed
+  nested source). The source itself never receives fabricated PR or merge-SHA evidence. Any
+  incomplete graph, non-done child, missing leaf provenance, or ambiguous membership fails
+  closed through the same bounded dependency-base wait. That exact verified SHA is the
+  allocation provenance. On **resume** (an existing `task_branches` row), the daemon
+  instead verifies each dependency merge commit is an ancestor of the branch itself
+  (local `refs/heads/<branch>`, falling back to `refs/remotes/origin/<branch>`); the
+  stored provenance is preserved unchanged. Base staleness between allocation and resume
+  is never a resume failure — it is resolved at merge time by the ordinary
+  rebase/merge-in path. A just-merged commit absent from the fetched ref is a bounded,
   claim-free deferral (logged once); after three attempts, or when a completed dependency
-  lacks its merge SHA, the task parks loudly with the named commit/dependency. The daemon
-  never cuts the dependent branch from an unverifiable base.
+  lacks its merge SHA, or when an existing dependent branch does not contain a
+  dependency's merge commit, the task parks loudly with the named commit/dependency. If a
+  completed dependency has `refs.pr` but no SHA (for example, it was manually closed after a
+  recovery), the daemon resolves its merged PR outside the DB transaction, falling back to an
+  exact GitHub merge subject match on `origin/<base>`, then conditionally stamps the
+  still-missing ref under the write lock. The durable PR ref may be either an integer or a
+  canonical decimal string. An open or unmerged PR parks the dependent with the named
+  dependency and PR; no SHA is invented. The
+  daemon never cuts the dependent branch from an unverifiable base, and never resumes
+  onto a branch that does not already include every dependency's merge.
 - **Concurrency cap:** `--cap N` limits the daemon to N concurrent tasks (≤ 2N agents:
   one worker + one reviewer per task).
 - **No passive execution (v2).** External/interactive agents cannot claim, execute,
@@ -842,14 +975,19 @@ a durable parked state. Parking atomically:
 - excludes the task from automatic worker/reviewer provisioning.
 
 This applies to exhausted crash recovery, repeated instant worker death, merge-policy
-blocks, reviewer repository mismatch, reviewer provision exhaustion, and terminal
-not-done dependencies. The dependency cascade parks the dependent with resume status
-`open`; readiness remains false until all dependencies are `done`. The cascade also
-distinguishes a merely-`failed` dependency (recoverable — the dep itself may still
-retry to `done`) from a `cancelled` dependency (terminal-terminal — no path exists
-back to `done` without a `depends_on` edit or closing the dependent). The park reason
-names the specific failing dep — a `cancelled` dep is preferred over a `failed`
-sibling because it drives the operator disposition — and the durable
+blocks, reviewer repository mismatch, reviewer provision exhaustion, and genuinely
+terminal not-done dependencies. Although parking retains `failed` as its storage
+representation, `daemon_parked=true` plus a resume status is a logically distinct,
+nonterminal hold. A dependent of such a task stays `open` but unready; it is never
+cascade-parked merely because its prerequisite awaits `task-retry`, and it becomes
+ready normally when that prerequisite reaches `done`.
+
+The dependency cascade therefore considers only an unparked `failed` task or a
+`cancelled` task terminal-not-done. It parks the dependent with resume status `open`.
+A `cancelled` dependency is terminal-terminal — no path exists back to `done` without
+a `depends_on` edit or closing the dependent — and wins over a genuinely failed
+sibling because it drives the operator disposition. The park reason names the
+specific terminal dependency, and the durable
 `daemon_parked_unsatisfiable=true` bit records the distinction in refs. Every other
 park path (`set_parked_refs`) clears any stale value so the marker is authoritative
 for the current park only. `quorum status` includes `daemon_parked_unsatisfiable=1`
@@ -970,7 +1108,10 @@ from comment text. Concretely:
   `--blocking` count covers that complete blocker set. Before a verdict,
   reviewers derive a bounded, task-specific affected-path model from the
   embedded managed-task contract when provided and the mechanisms changed by
-  the PR. They choose a useful representation — a short matrix, checklist,
+  the PR. That contract retains up to 16,000 task-body characters and at least
+  4,096 characters from each of four recent recovery notes; a bounded database
+  lookahead makes every cut visible with an explicit truncation marker. They
+  choose a useful representation — a short matrix, checklist,
   state/event map, or equivalent — to review applicable related lifecycle and
   compatibility paths together and determine whether the proposed remedy
   closes each relevant path. This does not prescribe a fixed format, require
@@ -1060,7 +1201,23 @@ before merge. R2 sampling is opt-in: absent config resolves to
 lower `r2_steady_state_p` (for example, to 0.30) and optionally set a per-stratum
 coverage floor. A negative floor or probability outside `0.0..=1.0` is a usage
 error; values are never clamped. `r2_enabled = false` disables sampling, not the
-R2 safety gate, and therefore also leaves R2 mandatory.
+R2 safety gate, and therefore also leaves R2 mandatory. The one workflow-specific
+exception is a daemon-created branch-sync judgment task: when its `branch_sync`
+ref names the active `branch_syncs` row bound back to that task, R1 is the final
+review gate and the decision is recorded as
+`skipped: branch-sync judgment-only review`. A ref without that matching daemon
+binding grants no authority, and every other task continues through the ordinary
+R2 decision and gate.
+
+For conflict-judgment R1, the review artifact is `git show --remerge-diff
+<merge_sha>` for the merge commit recorded on the sync row, plus every commit
+after that merge on the current sync-branch head. This preserves visibility into
+the merge resolution instead of replacing it with a generic PR diff. For a
+CI-failure fix task, the artifact is only `git diff <merge_sha>..<exact-head>`;
+the preserved merge is the baseline rather than newly authored work. An R1
+changes verdict uses the normal rework transition on the same sync branch,
+including the stamped rework cap; each replacement R1 receives the matching
+artifact through the current gated head.
 
 R2 is skipped when R1 approves after `rework_round` has reached that task's
 stamped rework cap (see the Rework cap bullet earlier in this document —
@@ -1073,10 +1230,13 @@ prior decision requiring R2 remains authoritative if the branch later returns
 to that head.
 
 When R1 approves, Quorum records a sampling decision in a daemon-owned table,
-keyed by both PR number and head SHA; it is not task refs because task refs are
-agent-writable metadata and cannot authorize a merge-gate bypass. Later rework
-heads append rather than overwrite earlier decisions. The seed is derived only
-from those stable values; the persisted decision prevents a restart, advancing
+keyed by both PR number and head SHA. Task refs are not otherwise consulted for
+this gate because they are agent-writable metadata and cannot authorize a
+merge-gate bypass. The narrow exception is the daemon-set `branch_sync` ref
+described above, which is authoritative only when the referenced active sync row
+is bound back to the same task; the ref alone is insufficient. Later rework heads
+append rather than overwrite earlier decisions. The seed is derived only from
+those stable values; the persisted decision prevents a restart, advancing
 coverage count, or force-push back to a prior head from changing that head's
 review requirement. Missing, unreadable, or task-mismatched persisted state
 fails closed to mandatory R2. R1 and R2 both bind their approval to the head
@@ -1154,8 +1314,11 @@ provisioning and merge.
 - Immediately before acquiring or feeding a reviewer, the daemon re-resolves the
   authoritative PR head and requires it still equals the gated SHA. Reviewer worktree
   provisioning then verifies the fetched `HEAD` is that exact SHA. A mismatch discards
-  the cached result and restarts gating without spawning a reviewer; the SHA recorded for
-  stale-verdict detection is the same SHA that passed both checks.
+  the cached result and any persisted tuple for the disproven head, then restarts gating
+  without spawning a reviewer or consuming a provisioning strike. This also covers a short
+  propagation window where PR API metadata repeats the old SHA while the fetched branch is
+  already newer. The SHA recorded for stale-verdict detection is the same SHA that passed
+  both checks.
 - Before `ChecksFailed` commits `in-review → rework`, the daemon atomically persists the
   exact CI remediation PR, head SHA, failing checks, feedback, and bounded provision
   attempt count in task refs. Reaper and restart recovery preserve this rework intent,
@@ -1688,6 +1851,65 @@ restarts and binary upgrades (persisted in SQLite, read on every `perf` call).
 Historical collector artifacts (collection runs, findings, errors) created by a
 prior backfill are retained as audit data but do not affect the default report.
 
+**Risk-flag performance cut (#277):** `quorum perf --by risk-flag` is a
+read-only cut over the classifier-owned risk flags exposed by the facts report.
+An included intent contributes once to every known flag it carries; an intent
+without a valid flag set contributes once to `untagged`. The report has at most
+eight rows (the seven closed classifier flags plus `untagged`) and does not
+further split these rows by model or effort. Each row reports verified merged
+and irrecoverable failed intent counts from the facts cohort.
+
+`late_blocker_count` and `late_blocker_rate` use the facts report's covered
+review-quality evidence. An intent counts once per flag when its durable,
+complete collector evidence contains a blocking finding and its facts rework
+count is at least 2; the rate denominator is the row's intent count. The report
+renders both late-blocker fields as a dash if any intent in the row lacks that
+evidence. It never changes lifecycle or routing state.
+
+**Performance facts report (#249):** `quorum perf --facts --json [--all]` is a
+versioned, read-only evidence surface. `--facts` requires `--json` and conflicts
+with the aggregate-report cut `--by`; invalid combinations are usage errors
+(exit 2). It uses the same prospective-by-default cohort as `perf`, and `--all`
+bypasses the watermark for historical inclusion.
+
+The JSON report has the stable top-level shape
+`{facts_version, cohort, query_limits, counts, coverage, excluded_reasons, intents}`
+with `facts_version: "perf-facts-v1"`. `cohort` declares the watermark and
+whether the request is prospective-only; `query_limits` declares the bounded
+intent and contributing-task limits; `counts`, `coverage`, and
+`excluded_reasons` make selection and evidence completeness auditable. Each
+`intents` entry represents one ordinary managed terminal implementation task,
+with its identity, contributing task IDs, inclusion reason, evidence fields,
+and per-field coverage flags. Uncollected evidence is represented explicitly as
+JSON `null` with a false coverage flag, rather than fabricated values.
+Each intent also carries its root task's normalized `risk_flags`; absent or
+malformed flag metadata is represented as `['untagged']`, matching the
+aggregate risk-flag cut.
+
+This report only reads durable task evidence. It is not a QPS calculation,
+score or leaderboard, budget/weight definition, or durable analytics snapshot;
+it performs no writes and does not establish any of those future contracts.
+
+**Aggregate performance projection (#303):** the non-`--facts` human table and
+aggregate JSON are projections of the included intents in `perf-facts-v1`, not
+an independent task query. Complexity uses the root classifier's covered
+`cx_est` value (1–5), with `untagged` reserved for absent evidence. Model and
+effort use the first durably attributed worker attempt; `pending/pending` means
+there is no worker attempt, while an attempt with a missing execution value is
+shown as `unreported`. Reviewer cuts likewise use the first attributed reviewer
+attempt. Consequently, each single-valued cut totals to the facts report's
+included intent count; the multi-valued risk cut may count an intent once per
+flag by design.
+
+The table labels its token column `EFF_TOKENS` and sums the facts report's
+`provisional_effective_token_total`. A dash means at least one intent in the row
+lacks complete token coverage. The rework, wall-time, and reviewer metrics also
+render a dash rather than a numeric zero when their facts evidence is
+incomplete. Effective tokens are not a provider bill or USD estimate. The legacy
+approval-rate, average-blocker, and journal-cost columns are omitted: the first
+two were not backed by complete facts evidence and the journal cost was not
+durable provider-reported cost. `perf-facts-v1` itself is unchanged.
+
 ## Built-in coding runners: Claude, Codex, and Grok Build
 
 **Date:** 2026-07-24 (provider-neutral launch and recovery state 2026-08-05)
@@ -2043,6 +2265,15 @@ the session identity late, so no continuation may be relied on before `end`.
   successful model call. Some authentication failures did not promptly terminate after
   emitting the error, so bounded group kill/reap is part of the transport contract.
 
+**Verified facts (2026-09-28):**
+
+- `~/.grok/bin/grok` reported `grok 1.0.40 (eb1a2256660d) [stable]`. A successful
+  normal-mode worker invocation using the adapter's argument shape ended with a
+  `streaming-json` `end` event whose `stopReason` was `end_turn` (with `sessionId`,
+  `requestId`, usage, `num_turns`, and `total_cost_usd`). The adapter accepts this exact
+  snake_case spelling alongside the older `EndTurn` spelling; other terminal reasons
+  remain failures.
+
 **Hypotheses and deliberately unverified behavior:**
 
 - Grok has not passed attended real-CLI worker, remediation, R1, R2, restart, shutdown,
@@ -2179,7 +2410,7 @@ effort = "high"
 
 [model_profiles.opus]
 runner = "claude"
-model = "claude-opus-4-8"
+model = "claude-opus-5-5"
 effort = "high"
 
 [routing.classifier]
@@ -2221,7 +2452,7 @@ Grok worker adapter configuration:
 [grok]
 sandbox = "off"                    # off | workspace (default: off)
 permission_mode = "bypassPermissions"
-max_turns = 64                      # 1..=256
+max_turns = 256                     # 1..=256
 ```
 
 `sandbox = "off"` is the production-capable default. Quorum provisions every managed
@@ -2265,16 +2496,25 @@ filename. Runner-specific process options remain scoped under `[claude]`, `[code
 
 ### Bounded task decomposition
 
-A non-continuation, admission-ready implementation task is a decomposition source only when its
-classified size is L or XL and `cx_est` is 4 or 5. After its dependencies are done, the daemon
-serializes decomposition per repository: it stops new managed delivery, lets active delivery
-finish, and plans against the resulting frozen base. S/M implementation tasks dispatch normally
-regardless of complexity; non-continuation L tasks with `cx_est` 1–3 also dispatch directly to one
-worker. Every `continue_pr` task dispatches directly because only the source task carries authority
+A non-continuation, admission-ready, non-terminal-leaf implementation task is a decomposition
+source only when it is L at `cx_est` 5 or XL at `cx_est` 4 or 5. After its dependencies are done,
+the daemon serializes decomposition per repository: it stops new managed delivery, lets active
+delivery finish, and plans against the resulting frozen base. S/M implementation tasks dispatch
+normally regardless of complexity; non-continuation L tasks with `cx_est` 1–4 also dispatch
+directly to one worker. Every `continue_pr` task dispatches directly because only the source task carries authority
 to publish to the bound PR. Every review-only task dispatches directly to reviewer provisioning at
 any classified size because it has no implementation work to decompose. A non-continuation XL task
 with `cx_est` 1–3 violates the classification rubric and is parked with an explicit
 reclassify-or-rescope reason.
+
+Accepted plans materialize generated children as durable terminal leaves (`tasks.terminal_leaf=1`).
+The child admission policy intentionally differs from the root policy: a complete S, M, or L child
+classification is accepted at every valid complexity, including L at `cx_est` 4 or 5. An XL child
+classification rejects the plan before materialization. A terminal leaf dispatches directly to a
+worker under its graph claim guards, rather than through the root size-dispatch gate, and it is
+excluded from planning-source selection even when its classification would otherwise qualify it
+for decomposition. This is the one-level decomposition boundary; a terminal leaf never creates or
+re-enters a decomposition graph.
 
 Planning uses the profile selected from the planner routing pool. The planner receives a
 read-only repository view and bounded source context but no network, database, coordination
@@ -2316,9 +2556,9 @@ behavior and regression-only expectations remain criteria or non-goals rather th
 implementation work. A child that changes a function/API signature or shared type, trait, or
 struct shape must own every affected caller needed for its workspace build and preflight after
 its prerequisites merge; a definition/signature child must not reserve those callers for a
-sibling. A compile-closed seam that fits one dispatchable child (S or M, or L at complexity 4 or
-lower) remains one child. The planner returns a `no_safe_split` blocker only when the closure
-cannot fit in one dispatchable child, rather than manufacturing definition and wiring siblings.
+sibling. A compile-closed seam that fits one terminal child classified S, M, or L remains one
+child. The planner returns a `no_safe_split` blocker only when the closure cannot fit in one
+terminal child, rather than manufacturing definition and wiring siblings.
 Before any task row is created,
 deterministic validation checks the closed shape, references, cycles, prohibited synthetic
 integration work, mechanically visible compile-atomic signature-seam reservations, and the
@@ -2330,12 +2570,12 @@ plan is coherent — is judged by the Arbiter plan-review gate (below), not by a
 literal match. Once deterministic validation passes, the complete proposal is classified as one
 closed-book batch (`preclassifying`) *before* the Arbiter reviews it (`validating`): the
 classifier is cheap and rejects most oversized plans, so the expensive Arbiter run is spent only
-on classifier-accepted proposals. Every child must be
-admission-ready, nonduplicate, and sized within the same implementation-size policy that
-dispatches root tasks directly: S or M at any complexity, or L at `cx_est` 1–3. One Rust
-predicate and one SQL fragment define that policy for dispatch, sync, materialization, and child
-preclassification, so the daemon cannot reject a child it would have dispatched as a root. The
-classifier receives each planned child's whole contract in a stable order (delta, paths,
+on classifier-accepted proposals. Every child must be admission-ready, nonduplicate, and
+classified S, M, or L at a valid complexity. XL rejects the entire proposal at plan acceptance.
+This is deliberately not the root dispatch policy: materialization persists `terminal_leaf=1` for
+every accepted child, the direct-dispatch predicate recognizes that marker, and planning-source
+selection excludes it. The classifier receives each planned child's whole contract in a stable
+order (delta, paths,
 deliverables, non-goals, outcome, criteria, constraints, verification), bounded per field rather
 than truncated as one blob, with every prerequisite rendered as its sibling or source title so
 responsibilities delivered by dependencies are not counted against the child's own surface.
@@ -2430,24 +2670,30 @@ process creation. The same transaction checks task phase, classification, and pl
 planning freeze acquisition excludes live reservations. The daemon releases the reservation only
 after reviewer attachment or complete failed-provision cleanup.
 
-One `BEGIN IMMEDIATE` transaction creates the entire graph: every generated task, classification,
-edge, membership/provenance row, source `planning -> decomposed` transition, and active-graph
-record. It then releases the freeze. Partial materialization is never visible. A partial unique
-index permits one materialized active or blocked graph per repository, and source uniqueness
-permits only one graph aggregate per source. Generated work is one level only and is immutable
-after materialization.
+One `BEGIN IMMEDIATE` transaction creates the entire graph: every generated task with
+`terminal_leaf=1`, classification, edge, membership/provenance row, source `planning ->
+decomposed` transition, and active-graph record. It then releases the freeze. Partial
+materialization is never visible. A partial unique index permits one materialized active or
+blocked graph per repository, and source uniqueness permits only one graph aggregate per source.
+Generated work is one level only and is immutable after materialization.
 
 Generated tasks inherit the source task's immutable `target_branch` at materialization; a NULL
 source target yields NULL child targets and preserves the legacy configured-base fallback.
 Generated tasks retain ordinary independent implementation, review, rework, and protected merge.
-Their atomic claim additionally requires an active decomposed source, done prerequisites, no
-failed sibling or graph blocker, and fewer than two active implementation siblings. Eligible graph
-children sort before unrelated new work, but reserve no idle capacity and never interrupt active
-unrelated work. Active siblings may finish after another child fails; no later child may start.
+As terminal leaves, they dispatch directly regardless of the root size-dispatch policy and cannot
+be selected as decomposition sources. Their atomic claim additionally requires an active
+decomposed source, done prerequisites, no failed sibling or graph blocker, and fewer than two
+active implementation siblings. Eligible graph children sort before unrelated new work, but
+reserve no idle capacity and never interrupt active unrelated work. Active siblings may finish
+after another child fails; no later child may start.
 
 A reviewer may submit a capability-bound, closed graph-blocker verdict only for a genuine safety
-or authority boundary violation: a change that would grant authority, break restricted-role or
-phase isolation, escape the managed repository, or expose secrets. A correct, safe change that
+or authority boundary violation where continuing the materialized graph would itself grant
+authority, break restricted-role or phase isolation, escape the managed repository, or expose
+secrets and no safe repair can be expressed on the current PR. A repairable source-code defect,
+including one that could expose a secret if merged, receives a BLOCKING `changes` verdict and a
+separate redacted critical owner notification; notification urgency never decides graph validity.
+A correct, safe change that
 requires a bounded edit outside a generated child's `write` deliverables, including a
 `read_only_reference` path, instead receives a BLOCKING `changes` verdict. That feedback names the
 specific required edit and explicitly authorizes the rework worker to make the minimal, justified
@@ -2463,8 +2709,8 @@ naming that child can restore the graph's existing sibling authority. Neither pa
 grants new authority beyond the materialized graph.
 
 A narrow incident-recovery primitive may adopt the exact merged delivery of a done managed
-continuation task for the final failed member of an otherwise complete live graph (`state` active
-or blocked, with `active=1`), or for the failed child named by a modern structured
+continuation task for a failed member of a live graph (`state` active or blocked, with `active=1`),
+including while sibling children remain pending, or for the failed child named by a modern structured
 `generated-child-failed` block while siblings remain. The automatic path's immediate transaction requires the same repository and PR,
 creator-selected `continue_pr`, explicit `source_task` provenance, live daemon publication and
 merge events (`expires_at > now`), immutable managed-review authority, and one consistent PR
@@ -2488,10 +2734,11 @@ events; the winner emits bounded child-completion events once.
 For a coordinator/operator-selected incident pair, `quorum decomposition-adopt-recovery
 --original-child-id <child> --recovery-task-id <continuation> --by <operator>` is the sole explicit
 recovery-authority surface. The same `BEGIN IMMEDIATE` transaction rechecks active membership,
-failed-child state (and final-child state except for the structured generated-child-failed case),
+failed-child state,
 repository and PR identity, creator-selected continuation authority,
 and exact target/head agreement. It permits absent `source_task` metadata because the caller has
-named the exact pair, but rejects conflicting metadata. Instead of expiring feed events it requires
+named the exact pair, but rejects conflicting metadata; normal `--continue-pr` creation stamps the
+failed child's source provenance when that exact relationship is already known. Instead of expiring feed events it requires
 the durable daemon chain: the final assigned worker run is either `completed` before the persisted
 final PR target, `merged` (which may end after that target resolves), `submitted` with a
 `task_in_review` event naming that worker within its run and at or before target resolution, or
@@ -2612,15 +2859,24 @@ labels are ignored.
   does not inspect source, Git, CI, or external systems. Readiness is permissive: ordinary
   repository discovery and bounded engineering choices are execution work, not a reason to
   reject the task.
-- Direct dispatch and decomposition partition admission-ready implementation work. S/M tasks
-  dispatch directly for every valid `cx_est`; non-continuation L tasks dispatch directly at
-  `cx_est` 1–3 and decompose at 4–5; non-continuation XL tasks decompose at 4–5 and park at 1–3
-  as a rubric mismatch. A `continue_pr` task always takes the direct route and never the
-  decomposition route, regardless of classified size. A review-only task likewise always takes
-  the direct reviewer route at any classified size. The daemon atomically parks an unready
-  classification. Parking writes the standard refs, note, and event with no claim, run, or error
-  row; an explicit retry requests reclassification of remaining work and a newly dispatchable
-  result restores the saved lifecycle status.
+- The classifier input envelope retains at least 4,096 characters from each authoritative root
+  task body and recovery note. Database reads include one bounded lookahead character so any cut
+  is rendered with an explicit truncation marker; structural titles, dependency labels, and
+  duplicate-detection snippets keep their smaller independent bounds. Before provider launch the
+  complete serialized prompt is limited to 512 KiB. An oversized prompt is rejected as a loud
+  classifier error with its measured and allowed byte counts; requested tasks and duplicate
+  context are never silently removed to make the batch fit.
+- Direct dispatch and decomposition partition admission-ready implementation work. S/M root tasks
+  dispatch directly for every valid `cx_est`; non-continuation L root tasks dispatch directly at
+  `cx_est` 1–4 and decompose at 5; non-continuation XL root tasks decompose at 4–5 and park at
+  1–3 as a rubric mismatch. In contrast, an accepted generated S/M/L child is a terminal leaf and
+  dispatches directly at every valid complexity; XL rejects the plan before it can become a leaf.
+  A terminal leaf never takes the decomposition route. A `continue_pr` task always takes the
+  direct route and never the decomposition route, regardless of classified size. A review-only
+  task likewise always takes the direct reviewer route at any classified size. The daemon
+  atomically parks an unready classification. Parking writes the standard refs, note, and event
+  with no claim, run, or error row; an explicit retry requests reclassification of remaining work
+  and a newly dispatchable result restores the saved lifecycle status.
 - A new worker assignment selects from the complexity-specific worker routing pool. Task
   creators cannot lower, raise, or choose an individual profile.
 - `resolve_provider` maps the selected model to `AgentKind::Claude` (any `claude-*`
@@ -2690,6 +2946,19 @@ the startup fallback pass then revalidates lifecycle and reviewer head authority
 stored turn verbatim. A launch-time provider/profile failure is recorded like any later failure and
 may advance to another bounded eligible route. Reviewer attachment transfers the task lease to the
 reviewer, so fallback currency can never be borrowed from a prior worker or replacement reviewer.
+
+Fallback identity is a per-failed-run generation. Each routing attempt, attributed alternate
+`agent_runs` row, and durable fallback launch intent is keyed by the exact failed managed
+`agent_runs.id` it replaces, not by the responsibility and profile pair alone. A second failure of
+the same profile under the same role assignment therefore materializes its own routing-attempt
+row, its own alternate agent_run and capability, and its own launch intent with the fresh
+worktree/head instead of colliding with the first generation's persisted evidence. Replay of the
+same failed run (same worktree/head) still resolves to the persisted intent so crash-restart
+remains idempotent, and the pre-launch stale-evidence guard stays strict because it now only ever
+compares against the intent for the exact failure being installed. The provider/profile exclusion
+set continues to derive from every classified attempt, and route exhaustion is still bounded by
+the count of distinct configured profiles in the eligible pool — not the total number of attempt
+rows — so a repeated same-profile failure does not weaken or accelerate route exhaustion.
 
 ### Verification gates
 

@@ -12,6 +12,7 @@ repo_dir = "/home/user/dev/quorum"
 
 # ── paths (under ~/.quorum/serve/<repo>/ — survives reboots, unlike /tmp) ──
 worktree_base = "/home/user/.quorum/serve/quorum/worktrees"
+# Includes per-agent session directories and serve.log (1 MiB rotation; 3 files kept).
 log_dir       = "/home/user/.quorum/serve/quorum/logs"
 
 # ── agent spawn and model routing ─────────────────────────────────────
@@ -31,7 +32,7 @@ effort = "high"
 
 [model_profiles.opus]
 runner = "claude"
-model = "claude-opus-4-8"
+model = "claude-opus-5-5"
 effort = "high"
 
 [routing.classifier]
@@ -63,6 +64,12 @@ opus = 100
 [routing.reviewer.5]
 opus = 100
 
+# Grok profiles may appear only in worker routing pools; other roles are rejected at startup.
+# [grok]
+# sandbox = "off"   # off|workspace
+# permission_mode = "bypassPermissions"
+# max_turns = 256   # 1..=256
+
 # ── cost ceilings ────────────────────────────────────────────────────
 max_idle_secs = 900              # 15 min without an event
 max_task_wall_secs = 14400      # 4h
@@ -76,6 +83,9 @@ max_task_cost_usd  = 100.0
 # merge_token_file         = "/home/user/.quorum/serve/merge-token"
 merge_checks_timeout_secs  = 900
 # merge_checks_poll_secs   = 30
+# Required for every configured branch sync. Syncs fail closed once published
+# when this is empty, even though ordinary task merges may leave it unset.
+required_jobs = ["ci"]
 
 # ── self-update ───────────────────────────────────────────────────────
 self_update_drain = true
@@ -84,6 +94,17 @@ drain_timeout_secs = 900
 
 # ── misc ──────────────────────────────────────────────────────────────
 base_branch = "main"
+# Directed source/target pairs eligible for daemon-internal branch sync.
+# Each pair is one-way; configure both directions explicitly when main and
+# develop should each receive the other's changes. Omit or set [] to disable.
+# The clean path is task-less: pin → prepare → publish → checks → merge; a
+# conflict or CI failure creates one judgment task with R1-only scoped review.
+# Inspect active syncs with `quorum status` or `quorum branch-sync --list`;
+# cancel a clean-path row with `quorum branch-sync --cancel <id> --by <agent>`.
+#
+# Every enabled sync pair REQUIRES the non-empty `required_jobs` gate above:
+# a branch sync fails loudly once published if the effective gate is empty.
+sync_pairs = [["main", "develop"], ["develop", "main"]]
 
 # ── observational host resources ─────────────────────────────────────
 # These values affect status severity and transition-only daemon warnings.

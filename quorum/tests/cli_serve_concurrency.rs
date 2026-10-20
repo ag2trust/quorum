@@ -977,6 +977,7 @@ fn stable_graph_rejection_is_filtered_without_skip_or_spawn() {
                 ready: true,
                 not_ready_reason: None,
                 duplicate_of: vec![],
+                risk_flags: vec![],
             }],
             "test:v2",
             now,

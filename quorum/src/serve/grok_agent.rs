@@ -34,12 +34,14 @@ pub const SUPPORTED_EFFORTS: &[&str] = &["low", "medium", "high"];
 pub const DEFAULT_SANDBOX: &str = "off";
 pub const EXPLICIT_WORKSPACE_SANDBOX: &str = "workspace";
 pub const DEFAULT_PERMISSION_MODE: &str = "bypassPermissions";
-pub const DEFAULT_MAX_TURNS: u32 = 64;
+pub const DEFAULT_MAX_TURNS: u32 = 256;
 pub const MAX_CONFIGURED_TURNS: u32 = 256;
 
 const RESTRICTED_SANDBOX: &str = "read-only";
 const RESTRICTED_PERMISSION_MODE: &str = "dontAsk";
 const RESTRICTED_MAX_TURNS: u32 = 8;
+const SUCCESSFUL_STOP_REASONS: &[&str] = &["EndTurn", "end_turn"];
+const MAX_TURNS_REACHED_STOP_REASON: &str = "max_turns_reached";
 const MANAGED_WORKSPACE_SANDBOX: &str = "quorum_managed_workspace";
 const STDOUT_LINE_BYTES: usize = 1024 * 1024;
 const TERMINAL_STDOUT_LINES: usize = 256;
@@ -1108,6 +1110,11 @@ impl BoundedStdout {
 pub struct GrokProc {
     child: Child,
     process_group_id: libc::pid_t,
+    // A successful wait releases the pid namespace entry. Do not signal that
+    // numeric process group again after it could have been recycled.
+    process_group_reaped: bool,
+    #[cfg(test)]
+    killpg_calls: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     reader: BoundedStdout,
     diagnostics: DiagnosticBuffer,
     failures: FailureTracker,
@@ -1124,6 +1131,14 @@ pub struct GrokProc {
     // Keeps the invocation-local full config layer alive until the child and
     // its MCP subprocess have been killed and reaped.
     _mcp_config_home: Option<GrokMcpConfigHome>,
+}
+
+/// Provider evidence that a valid Grok session exhausted its configured turn
+/// limit. This is deliberately not a lifecycle decision; its future consumer
+/// must still establish any process-evidence requirements it needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MaxTurnsExhaustion {
+    pub(super) session_id: String,
 }
 
 impl GrokProc {
@@ -1255,6 +1270,9 @@ impl GrokProc {
         Ok(Self {
             child,
             process_group_id,
+            process_group_reaped: false,
+            #[cfg(test)]
+            killpg_calls: None,
             reader,
             diagnostics,
             failures,
@@ -1327,6 +1345,9 @@ impl GrokProc {
             Self {
                 child,
                 process_group_id,
+                process_group_reaped: false,
+                #[cfg(test)]
+                killpg_calls: None,
                 reader,
                 diagnostics,
                 failures,
@@ -1361,15 +1382,14 @@ impl GrokProc {
             );
         };
         match value.get("type").and_then(serde_json::Value::as_str) {
-            Some("end")
-                if value
-                    .get("sessionId")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(valid_session_id) =>
-            {
+            Some("end") if successful_end_session_id(&value).is_some() => {
                 FailureObservation::success()
             }
-            Some("end" | "provider.stdout_invalid_utf8" | "provider.stdout_bytes_truncated") => {
+            Some("end") => FailureObservation::classified(
+                FailureDisposition::NonFailover,
+                "Grok terminal did not report the successful stopReason",
+            ),
+            Some("provider.stdout_invalid_utf8" | "provider.stdout_bytes_truncated") => {
                 FailureObservation::classified(
                     FailureDisposition::NonFailover,
                     "Grok terminal protocol was invalid",
@@ -1410,7 +1430,6 @@ impl GrokProc {
         self.failures.clone()
     }
 
-    #[allow(dead_code)] // dormant internal boundary; managed Grok routing is still rejected
     pub(super) fn set_worker_request(&mut self, request: WorkerTurnRequest) {
         self.worker_request = Some(Box::new(request));
     }
@@ -1535,6 +1554,13 @@ impl GrokProc {
             && self.failures.observed_strict_failure().is_none()
     }
 
+    #[allow(dead_code)] // consumed by the later checkpoint/resume lifecycle work
+    pub(super) fn max_turn_exhaustion(&self) -> Option<MaxTurnsExhaustion> {
+        self.pending_terminal
+            .as_deref()
+            .and_then(max_turns_exhaustion)
+    }
+
     pub(super) fn set_raw_drain_budget_exhausted(&mut self, exhausted: bool) {
         self.raw_drain_budget_exhausted = exhausted;
     }
@@ -1604,6 +1630,23 @@ impl GrokProc {
         self.process_group_id
     }
 
+    fn kill_process_group(&self) {
+        #[cfg(test)]
+        if let Some(calls) = &self.killpg_calls {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        unsafe {
+            libc::killpg(self.process_group_id, libc::SIGKILL);
+        }
+    }
+
+    #[cfg(test)]
+    fn track_killpg_calls(&mut self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.killpg_calls = Some(calls.clone());
+        calls
+    }
+
     pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.child.try_wait()
     }
@@ -1616,10 +1659,10 @@ impl GrokProc {
         // Always target the spawn-time process group, even when `try_wait`
         // already observed and reaped the leader. Descendants can otherwise
         // retain stdout/stderr and make the drains below wait forever.
-        unsafe {
-            libc::killpg(self.process_group_id, libc::SIGKILL);
+        self.kill_process_group();
+        if self.child.wait().await.is_ok() {
+            self.process_group_reaped = true;
         }
-        let _ = self.child.wait().await;
 
         let mut terminal = VecDeque::new();
         let mut dropped = 0usize;
@@ -1641,6 +1684,14 @@ impl GrokProc {
         output.extend(terminal);
         output.extend(diagnostics.drain());
         output
+    }
+}
+
+impl Drop for GrokProc {
+    fn drop(&mut self) {
+        if !self.process_group_reaped {
+            self.kill_process_group();
+        }
     }
 }
 
@@ -1699,6 +1750,13 @@ fn normalize_end(value: &serde_json::Value) -> Vec<AgentEvent> {
             cost_usd: None,
         }];
     }
+    if !successful_stop_reason(value.get("stopReason").and_then(serde_json::Value::as_str)) {
+        return vec![AgentEvent::TurnFailed {
+            message: "Grok end event did not report the successful stopReason".into(),
+            usage: terminal_usage(value),
+            cost_usd: None,
+        }];
+    }
     vec![
         AgentEvent::ThreadStarted {
             thread_id: session_id.to_string(),
@@ -1712,6 +1770,31 @@ fn normalize_end(value: &serde_json::Value) -> Vec<AgentEvent> {
 
 fn terminal_session_id(raw: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    valid_end_session_id(&value).map(str::to_string)
+}
+
+fn successful_end_session_id(value: &serde_json::Value) -> Option<&str> {
+    successful_stop_reason(value.get("stopReason").and_then(serde_json::Value::as_str))
+        .then(|| valid_end_session_id(value))?
+}
+
+fn successful_stop_reason(stop_reason: Option<&str>) -> bool {
+    stop_reason.is_some_and(|stop_reason| SUCCESSFUL_STOP_REASONS.contains(&stop_reason))
+}
+
+fn max_turns_exhaustion(raw: &str) -> Option<MaxTurnsExhaustion> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    if value.get("stopReason").and_then(serde_json::Value::as_str)
+        != Some(MAX_TURNS_REACHED_STOP_REASON)
+    {
+        return None;
+    }
+    Some(MaxTurnsExhaustion {
+        session_id: valid_end_session_id(&value)?.to_string(),
+    })
+}
+
+fn valid_end_session_id(value: &serde_json::Value) -> Option<&str> {
     if value.get("type").and_then(serde_json::Value::as_str) != Some("end") {
         return None;
     }
@@ -1719,7 +1802,6 @@ fn terminal_session_id(raw: &str) -> Option<String> {
         .get("sessionId")
         .and_then(serde_json::Value::as_str)
         .filter(|session_id| valid_session_id(session_id))
-        .map(str::to_string)
 }
 
 fn valid_session_id(session_id: &str) -> bool {
@@ -2235,10 +2317,18 @@ mod tests {
                 "--sandbox",
                 "off",
                 "--max-turns",
-                "64",
+                "256",
                 "--verbatim",
             ]
         );
+    }
+
+    #[test]
+    fn normal_shape_preserves_explicit_turn_cap() {
+        let mut spec = test_spec(std::path::Path::new("/tmp/repo"));
+        spec.max_turns = 12;
+        let args = headless_args(&spec, LaunchMode::Normal).unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["--max-turns", "12"]));
     }
 
     #[test]
@@ -2361,34 +2451,99 @@ mod tests {
         spec.permission_mode = "auto".into();
         assert!(headless_args(&spec, LaunchMode::Normal).is_err());
         spec.permission_mode = DEFAULT_PERMISSION_MODE.into();
-        spec.max_turns = 0;
-        assert!(headless_args(&spec, LaunchMode::Normal).is_err());
+        for max_turns in [0, MAX_CONFIGURED_TURNS + 1] {
+            spec.max_turns = max_turns;
+            assert!(headless_args(&spec, LaunchMode::Normal).is_err());
+        }
     }
 
     #[test]
     fn fixture_session_identity_and_terminal_success() {
-        let raw = r#"{"type":"end","stopReason":"EndTurn","sessionId":"sess-1","requestId":"req-1","usage":{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":3,"output_tokens":4},"total_cost_usd":0.0125}"#;
+        // Grok CLI 1.0.40's observed normal-mode terminal event (signature omitted).
+        let raw = r#"{"type":"end","stopReason":"end_turn","sessionId":"01a0e69a-9c9e-7ea3-aa94-9b160eab32f4","requestId":"d6702362-ca29-4526-9f39-8c20dfe3eae0","usage":{"input_tokens":13041,"cache_read_input_tokens":6656,"cache_creation_input_tokens":0,"output_tokens":38,"reasoning_tokens":30,"total_tokens":19735},"num_turns":1,"total_cost_usd":0.01007692}"#;
         let events = normalize_grok_line(raw);
         assert_eq!(
             events[0],
             AgentEvent::ThreadStarted {
-                thread_id: "sess-1".into()
+                thread_id: "01a0e69a-9c9e-7ea3-aa94-9b160eab32f4".into()
             }
         );
         assert_eq!(
             events[1],
             AgentEvent::TurnCompleted {
                 usage: Some(TokenUsage {
-                    input_tokens: 33,
-                    uncached_input_tokens: 10,
-                    cached_input_tokens: 20,
-                    cache_write_input_tokens: 3,
-                    output_tokens: 4,
+                    input_tokens: 19_697,
+                    uncached_input_tokens: 13_041,
+                    cached_input_tokens: 6_656,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 38,
                     ..Default::default()
                 }),
                 cost_usd: None,
             }
         );
+    }
+
+    #[test]
+    fn terminal_success_requires_the_documented_stop_reason() {
+        for stop_reason in ["EndTurn", "end_turn"] {
+            let raw = serde_json::json!({
+                "type": "end",
+                "stopReason": stop_reason,
+                "sessionId": "sess-1",
+            })
+            .to_string();
+            assert_eq!(
+                GrokProc::failure_observation(&raw),
+                FailureObservation::success(),
+                "stopReason={stop_reason}",
+            );
+            assert!(matches!(
+                normalize_grok_line(&raw).as_slice(),
+                [
+                    AgentEvent::ThreadStarted { .. },
+                    AgentEvent::TurnCompleted { .. }
+                ]
+            ));
+        }
+
+        for stop_reason in ["max_turns_reached", "cancelled", "error", "end_turn "] {
+            let raw = serde_json::json!({
+                "type": "end",
+                "stopReason": stop_reason,
+                "sessionId": "sess-1",
+            })
+            .to_string();
+            assert_eq!(
+                GrokProc::failure_observation(&raw),
+                FailureObservation::classified(
+                    FailureDisposition::NonFailover,
+                    "Grok terminal did not report the successful stopReason",
+                ),
+                "stopReason={stop_reason}",
+            );
+            assert!(
+                matches!(
+                    normalize_grok_line(&raw).as_slice(),
+                    [AgentEvent::TurnFailed { message, .. }]
+                        if message.contains("successful stopReason")
+                ),
+                "stopReason={stop_reason}"
+            );
+        }
+
+        let missing_stop_reason = r#"{"type":"end","sessionId":"sess-1"}"#;
+        assert_eq!(
+            GrokProc::failure_observation(missing_stop_reason),
+            FailureObservation::classified(
+                FailureDisposition::NonFailover,
+                "Grok terminal did not report the successful stopReason",
+            ),
+        );
+        assert!(matches!(
+            normalize_grok_line(missing_stop_reason).as_slice(),
+            [AgentEvent::TurnFailed { message, .. }] if message.contains("successful stopReason")
+        ));
     }
 
     #[test]
@@ -2423,7 +2578,7 @@ mod tests {
 
     #[test]
     fn fixture_partial_cost_does_not_hide_complete_tokens_or_invent_usd() {
-        let raw = r#"{"type":"end","sessionId":"sess-2","usage":{"input_tokens":8,"cache_read_input_tokens":4,"output_tokens":2},"total_cost_usd":0.1,"cost_is_partial":true}"#;
+        let raw = r#"{"type":"end","stopReason":"EndTurn","sessionId":"sess-2","usage":{"input_tokens":8,"cache_read_input_tokens":4,"output_tokens":2},"total_cost_usd":0.1,"cost_is_partial":true}"#;
         assert_eq!(
             normalize_grok_line(raw)[1],
             AgentEvent::TurnCompleted {
@@ -2516,6 +2671,8 @@ mod tests {
         GrokProc {
             child,
             process_group_id,
+            process_group_reaped: false,
+            killpg_calls: None,
             reader,
             diagnostics,
             failures,
@@ -2541,6 +2698,69 @@ mod tests {
         })
         .await
         .expect("process did not exit")
+    }
+
+    #[tokio::test]
+    async fn non_success_end_reasons_never_authorize_terminal_success() {
+        for (stop_reason, stderr, exit_code) in [
+            ("max_turns_reached", false, 0),
+            ("max_turns_reached", false, 7),
+            ("max_turns_reached", true, 0),
+            ("max_turns_reached", true, 7),
+            ("cancelled", false, 0),
+            ("cancelled", false, 7),
+            ("cancelled", true, 0),
+            ("cancelled", true, 7),
+        ] {
+            let raw = serde_json::json!({
+                "type": "end",
+                "stopReason": stop_reason,
+                "sessionId": "exhausted-session",
+            })
+            .to_string();
+            let stderr = if stderr {
+                "printf 'Grok diagnostic\\n' >&2;"
+            } else {
+                ""
+            };
+            let mut proc = shell_proc(&format!(
+                "printf '%s\\n' '{raw}'; {stderr} exit {exit_code}"
+            ))
+            .await;
+
+            assert_eq!(proc.next_raw_line().await.as_deref(), Some(raw.as_str()));
+            if stop_reason == "max_turns_reached" {
+                assert_eq!(
+                    proc.max_turn_exhaustion(),
+                    Some(MaxTurnsExhaustion {
+                        session_id: "exhausted-session".into(),
+                    })
+                );
+            } else {
+                assert_eq!(proc.max_turn_exhaustion(), None);
+            }
+            assert!(proc.next_raw_line().await.is_none());
+            assert_eq!(wait_status(&mut proc).await.code(), Some(exit_code));
+            assert_eq!(
+                proc.observed_pre_authoritative_failure()
+                    .unwrap()
+                    .disposition(),
+                FailureDisposition::NonFailover,
+            );
+            assert!(proc.authorized_terminal().await.is_none());
+            proc.kill_and_reap().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn max_turn_exhaustion_requires_a_valid_session_id() {
+        let mut proc = shell_proc(
+            "printf '%s\\n' '{\"type\":\"end\",\"stopReason\":\"max_turns_reached\",\"sessionId\":\" bad \"}'",
+        )
+        .await;
+        assert!(proc.next_raw_line().await.is_some());
+        assert_eq!(proc.max_turn_exhaustion(), None);
+        proc.kill_and_reap().await;
     }
 
     #[tokio::test]
@@ -2626,6 +2846,42 @@ mod tests {
         })
         .await
         .expect("Grok descendant process group was not reaped");
+    }
+
+    #[tokio::test]
+    async fn drop_kills_process_group() {
+        let mut proc = shell_proc("sleep 300 & printf 'ready\\n'; wait").await;
+        assert_eq!(proc.next_raw_line().await.as_deref(), Some("ready"));
+        let process_group_id = proc.process_group_id;
+
+        drop(proc);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if unsafe { libc::killpg(process_group_id, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Drop did not kill the Grok process group");
+    }
+
+    #[tokio::test]
+    async fn kill_and_reap_disarms_drop_kill_guard() {
+        let mut proc = shell_proc("exec sleep 300").await;
+        let calls = proc.track_killpg_calls();
+
+        proc.kill_and_reap().await;
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "Drop must not signal a process group after kill_and_reap reaped its leader"
+        );
     }
 
     fn grok_available() -> bool {

@@ -84,6 +84,10 @@ pub struct MergeResult {
     pub failure_kind: Option<MergeFailureKind>,
 }
 
+/// Bounded retries after a merge policy reports a transient pending state.
+/// Branch-sync CI uses the same retry budget after its initial full wait.
+pub const MAX_POLICY_RETRIES: u32 = 3;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChecksOutcome {
     /// All required checks passed — safe to merge.
@@ -135,11 +139,29 @@ pub enum DefaultBranchStatus {
     Unknown,
 }
 
+/// The observable PR state used by recovery paths that need to distinguish a
+/// genuinely unmerged PR from transiently unavailable merge metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeCommitStatus {
+    Merged { merge_commit_sha: Option<String> },
+    Open,
+    Closed,
+    Unknown,
+}
+
 /// Trait for executing PR merges. The default implementation posts a formal
 /// GitHub approval review (`gh pr review --approve`) then calls `gh pr merge`.
 /// Tests inject a mock via [`CommandMergeExecutor::command`].
 pub trait MergeExecutor: Send + Sync {
     fn merge(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult;
+
+    /// Daemon-internal branch syncs have no reviewer, so they must not post a
+    /// formal approval. Implementations still validate the pinned head/base
+    /// before the irreversible merge call. The default keeps lightweight test
+    /// executors source-compatible; the GitHub executor overrides it.
+    fn merge_without_approval(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult {
+        self.merge(pr, repo_dir, ctx)
+    }
 
     /// GitHub's immutable merge commit for a completed PR. The production
     /// implementation asks the PR API after merge; unavailable metadata is
@@ -147,6 +169,18 @@ pub trait MergeExecutor: Send + Sync {
     /// conservative rather than inventing a commit identity.
     fn merge_commit_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
         None
+    }
+
+    /// Resolve whether a PR has merged before attempting to recover missing
+    /// dependency provenance. Test executors that only supply a merge SHA keep
+    /// their established meaning; the GitHub executor reports the real state.
+    fn merge_commit_status(&self, pr: i64, repo_dir: &Path) -> MergeCommitStatus {
+        match self.merge_commit_sha(pr, repo_dir) {
+            Some(merge_commit_sha) => MergeCommitStatus::Merged {
+                merge_commit_sha: Some(merge_commit_sha),
+            },
+            None => MergeCommitStatus::Unknown,
+        }
     }
 
     fn wait_for_checks(
@@ -157,6 +191,20 @@ pub trait MergeExecutor: Send + Sync {
         _poll_interval_secs: u64,
     ) -> ChecksOutcome {
         ChecksOutcome::Ready
+    }
+
+    /// CI wait for a branch sync. Unlike ordinary task merges, an empty
+    /// status-check rollup never establishes readiness: the sync path has a
+    /// mandatory non-empty required-jobs gate. The production executor
+    /// overrides this while test executors can share `wait_for_checks`.
+    fn wait_for_branch_sync_checks(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        timeout_secs: u64,
+        poll_interval_secs: u64,
+    ) -> ChecksOutcome {
+        self.wait_for_checks(pr, repo_dir, timeout_secs, poll_interval_secs)
     }
 
     /// Names of checks that are still pending, used only to make a prolonged
@@ -356,6 +404,30 @@ fn checks_query_from_parsed(
     ChecksQueryResult::AllPassed
 }
 
+/// Branch synchronization is fail-closed for an empty rollup. Ordinary task
+/// merges retain their two-poll no-CI compatibility rule; this path can only
+/// advance after actual checks report green and the configured named jobs are
+/// subsequently verified.
+fn branch_sync_checks_query_outcome(query: ChecksQueryResult) -> Option<ChecksOutcome> {
+    match query {
+        ChecksQueryResult::AllPassed => Some(ChecksOutcome::Ready),
+        ChecksQueryResult::SomeFailed(failing_checks) => {
+            Some(ChecksOutcome::Failed { failing_checks })
+        }
+        ChecksQueryResult::Pending | ChecksQueryResult::NoChecksConfigured => None,
+    }
+}
+
+fn branch_sync_checks_query_from_parsed(
+    merge_state: &Option<String>,
+    checks: &Option<Vec<(String, SingleCheckStatus)>>,
+) -> ChecksQueryResult {
+    if checks.as_ref().is_some_and(Vec::is_empty) {
+        return ChecksQueryResult::NoChecksConfigured;
+    }
+    checks_query_from_parsed(merge_state, checks)
+}
+
 /// Check whether each required job in the PR's `statusCheckRollup` has conclusion
 /// SUCCESS specifically — SKIPPED and NEUTRAL do NOT satisfy a required job.
 pub fn validate_required_jobs(checks_json: &str, required_jobs: &[String]) -> RequiredJobsOutcome {
@@ -479,7 +551,9 @@ impl GhMergeExecutor {
 impl GhMergeExecutor {
     fn build_gh_cmd(&self, args: &[&str], repo_dir: &Path) -> Command {
         let mut cmd = Command::new("gh");
-        cmd.args(args);
+        cmd.args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0");
         if let Some(ref nwo) = self.gh_repo {
             cmd.args(["-R", nwo]);
         } else {
@@ -567,10 +641,37 @@ impl GhMergeExecutor {
         parse_pr_head_ref(&output.stdout)
     }
 
+    /// Build the `gh repo view` command for the repository default-branch lookup.
+    ///
+    /// `gh repo view` takes the repo *positionally* and has no `-R` flag, so it
+    /// cannot route through `build_gh_cmd` (which appends `-R <nwo>` and fails with
+    /// `unknown shorthand flag: 'R' in -R`). This replicates `build_gh_cmd`'s token +
+    /// cwd behavior, with the only difference being the slug is passed positionally.
+    fn repo_view_default_branch_cmd(&self, repo_dir: &Path) -> Command {
+        let mut cmd = Command::new("gh");
+        cmd.args(["repo", "view"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        if let Some(ref nwo) = self.gh_repo {
+            cmd.arg(nwo);
+        } else {
+            cmd.current_dir(repo_dir);
+        }
+        cmd.args(["--json", "defaultBranchRef"]);
+        if let Some(token) = self.read_token() {
+            cmd.env("GH_TOKEN", token);
+        }
+        cmd
+    }
+
     fn repository_default_branch(&self, repo_dir: &Path) -> Option<String> {
-        let mut cmd = self.build_gh_cmd(&["repo", "view", "--json", "defaultBranchRef"], repo_dir);
+        let mut cmd = self.repo_view_default_branch_cmd(repo_dir);
         let output = cmd.output().ok()?;
         if !output.status.success() {
+            eprintln!(
+                "warn: gh repo view failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
             return None;
         }
         parse_repository_default_branch(&output.stdout)
@@ -651,6 +752,30 @@ impl GhMergeExecutor {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let (merge_state, checks) = parse_checks_json(&stdout);
         checks_query_from_parsed(&merge_state, &checks)
+    }
+
+    /// Branch sync has a stricter interpretation than an ordinary task merge:
+    /// GitHub may call the PR CLEAN even while its rollup is an empty array,
+    /// but that array still cannot satisfy the mandatory named-jobs gate.
+    fn query_branch_sync_checks(&self, pr: i64, repo_dir: &Path) -> ChecksQueryResult {
+        let pr_str = pr.to_string();
+        let mut cmd = self.build_gh_cmd(
+            &[
+                "pr",
+                "view",
+                &pr_str,
+                "--json",
+                "statusCheckRollup,mergeStateStatus",
+            ],
+            repo_dir,
+        );
+        let output = match cmd.output() {
+            Ok(o) if o.status.success() => o,
+            _ => return ChecksQueryResult::Pending,
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (merge_state, checks) = parse_checks_json(&stdout);
+        branch_sync_checks_query_from_parsed(&merge_state, &checks)
     }
 
     fn is_draft(&self, pr: i64, repo_dir: &Path) -> bool {
@@ -855,6 +980,25 @@ fn parse_merge_commit_sha(json_str: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn parse_merge_commit_status(json_str: &str) -> MergeCommitStatus {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return MergeCommitStatus::Unknown;
+    };
+    match json.get("state").and_then(serde_json::Value::as_str) {
+        Some("MERGED") => MergeCommitStatus::Merged {
+            merge_commit_sha: json
+                .get("mergeCommit")
+                .and_then(|value| value.get("oid"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|sha| !sha.is_empty() && !sha.contains('\0'))
+                .map(str::to_owned),
+        },
+        Some("OPEN") => MergeCommitStatus::Open,
+        Some("CLOSED") => MergeCommitStatus::Closed,
+        _ => MergeCommitStatus::Unknown,
+    }
+}
+
 /// Parse the `--jq .isDraft` output of `gh pr view` (bare `true`/`false`).
 /// Anything that isn't exactly `true` is treated as not-draft (fail-safe:
 /// a query hiccup skips the undraft and behaves as it did before this guard).
@@ -1000,6 +1144,63 @@ impl MergeExecutor for GhMergeExecutor {
         result
     }
 
+    fn merge_without_approval(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult {
+        let pr_str = pr.to_string();
+
+        // Branch syncs have no reviewer whose verdict can authorize a formal
+        // approval, but their deterministic PR still gets the same base/head
+        // drift protection immediately before the GitHub write.
+        if let Some(rejected) = self.reject_base_drift(pr, repo_dir, &ctx.expected_base_branch) {
+            return rejected;
+        }
+        if let Some(rejected) = self.reject_head_drift(pr, repo_dir, &ctx.expected_head_sha) {
+            return rejected;
+        }
+
+        let branch_metadata = match merge_branch_metadata(
+            self.live_head_ref(pr, repo_dir),
+            self.live_base_branch(pr, repo_dir).ok(),
+            self.repository_default_branch(repo_dir),
+        ) {
+            Ok(metadata) => metadata,
+            Err(result) => return result,
+        };
+
+        // Close the metadata-query window before the irreversible merge.
+        if let Some(rejected) = self.reject_base_drift(pr, repo_dir, &ctx.expected_base_branch) {
+            return rejected;
+        }
+        if let Some(rejected) = self.reject_head_drift(pr, repo_dir, &ctx.expected_head_sha) {
+            return rejected;
+        }
+
+        let result = self.run_gh(
+            &merge_command_args(
+                &pr_str,
+                &ctx.expected_head_sha,
+                &branch_metadata.head_ref,
+                [
+                    &self.base_branch,
+                    &self.self_update_branch,
+                    &branch_metadata.pr_base_branch,
+                    &branch_metadata.default_branch,
+                ],
+            ),
+            repo_dir,
+        );
+        if !result.success && self.verify_pr_merged(pr, repo_dir) {
+            return MergeResult {
+                success: true,
+                message: format!(
+                    "merge succeeded (post-merge cleanup failed: {})",
+                    result.message,
+                ),
+                failure_kind: None,
+            };
+        }
+        result
+    }
+
     fn merge_commit_sha(&self, pr: i64, repo_dir: &Path) -> Option<String> {
         let pr = pr.to_string();
         let mut cmd = self.build_gh_cmd(&["pr", "view", &pr, "--json", "mergeCommit"], repo_dir);
@@ -1008,6 +1209,21 @@ impl MergeExecutor for GhMergeExecutor {
             return None;
         }
         parse_merge_commit_sha(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    fn merge_commit_status(&self, pr: i64, repo_dir: &Path) -> MergeCommitStatus {
+        let pr = pr.to_string();
+        let mut cmd = self.build_gh_cmd(
+            &["pr", "view", &pr, "--json", "state,mergeCommit"],
+            repo_dir,
+        );
+        let Ok(output) = cmd.output() else {
+            return MergeCommitStatus::Unknown;
+        };
+        if !output.status.success() {
+            return MergeCommitStatus::Unknown;
+        }
+        parse_merge_commit_status(&String::from_utf8_lossy(&output.stdout))
     }
 
     fn wait_for_checks(
@@ -1039,6 +1255,27 @@ impl MergeExecutor for GhMergeExecutor {
                 ChecksQueryResult::Pending => {
                     consecutive_no_checks = 0;
                 }
+            }
+            if Instant::now() + Duration::from_secs(poll_interval_secs) > deadline {
+                return ChecksOutcome::TimedOut;
+            }
+            std::thread::sleep(Duration::from_secs(poll_interval_secs));
+        }
+    }
+
+    fn wait_for_branch_sync_checks(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        timeout_secs: u64,
+        poll_interval_secs: u64,
+    ) -> ChecksOutcome {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        loop {
+            if let Some(outcome) =
+                branch_sync_checks_query_outcome(self.query_branch_sync_checks(pr, repo_dir))
+            {
+                return outcome;
             }
             if Instant::now() + Duration::from_secs(poll_interval_secs) > deadline {
                 return ChecksOutcome::TimedOut;
@@ -1265,6 +1502,8 @@ impl MergeExecutor for CommandMergeExecutor {
         let output = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(repo_dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .output()
             .ok()?;
         if !output.status.success() {
@@ -1300,6 +1539,8 @@ impl MergeExecutor for CommandMergeExecutor {
         let output = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(repo_dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .output()
             .ok()?;
         if output.status.success() {
@@ -1343,6 +1584,23 @@ mod tests {
             expected_base_branch: "main".into(),
             expected_head_sha: "abc123".into(),
         }
+    }
+
+    #[test]
+    fn branch_sync_empty_rollup_is_not_ready() {
+        let (merge_state, checks) =
+            parse_checks_json(r#"{"mergeStateStatus":"CLEAN","statusCheckRollup":[]}"#);
+        assert_eq!(
+            branch_sync_checks_query_outcome(branch_sync_checks_query_from_parsed(
+                &merge_state,
+                &checks,
+            )),
+            None
+        );
+        assert_eq!(
+            branch_sync_checks_query_outcome(ChecksQueryResult::Pending),
+            None
+        );
     }
 
     #[test]
@@ -2070,6 +2328,124 @@ mod tests {
             self_update_branch: "main".into(),
         };
         assert!(exec.read_token().is_none());
+    }
+
+    fn repo_view_argv(exec: &GhMergeExecutor, repo_dir: &Path) -> Vec<String> {
+        let cmd = exec.repo_view_default_branch_cmd(repo_dir);
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Regression: `gh repo view` takes the repo positionally and rejects `-R`
+    /// (`unknown shorthand flag: 'R' in -R`). Routing it through `build_gh_cmd`
+    /// appended `-R <nwo>`, so the lookup always failed and the fail-closed gate
+    /// parked every merge. The argv must pass the slug positionally, never via -R.
+    #[test]
+    fn repo_view_default_branch_passes_slug_positionally_never_with_r_flag() {
+        let exec = GhMergeExecutor {
+            token_file: None,
+            gh_repo: Some("owner/repo".into()),
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
+        };
+        let cmd = exec.repo_view_default_branch_cmd(Path::new("/tmp"));
+        assert_eq!(cmd.get_program().to_string_lossy(), "gh");
+
+        let argv = repo_view_argv(&exec, Path::new("/tmp"));
+        assert_eq!(
+            argv,
+            vec!["repo", "view", "owner/repo", "--json", "defaultBranchRef"],
+        );
+        assert!(
+            !argv.iter().any(|a| a == "-R"),
+            "gh repo view must not receive -R: {argv:?}"
+        );
+    }
+
+    /// With no configured slug the command falls back to running in `repo_dir`
+    /// (no positional slug), matching `build_gh_cmd`'s cwd fallback.
+    #[test]
+    fn repo_view_default_branch_falls_back_to_cwd_without_slug() {
+        let exec = GhMergeExecutor {
+            token_file: None,
+            gh_repo: None,
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
+        };
+        let repo_dir = Path::new("/tmp/some-repo");
+        let cmd = exec.repo_view_default_branch_cmd(repo_dir);
+        assert_eq!(
+            cmd.get_current_dir(),
+            Some(repo_dir),
+            "no-slug lookup must run in repo_dir",
+        );
+
+        let argv = repo_view_argv(&exec, repo_dir);
+        assert_eq!(argv, vec!["repo", "view", "--json", "defaultBranchRef"]);
+        assert!(!argv.iter().any(|a| a == "-R"));
+    }
+
+    #[test]
+    fn gh_commands_disable_git_prompts_and_optional_locks() {
+        let exec = GhMergeExecutor {
+            token_file: None,
+            gh_repo: None,
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
+        };
+        for cmd in [
+            exec.build_gh_cmd(&["pr", "view", "1"], Path::new("/tmp")),
+            exec.repo_view_default_branch_cmd(Path::new("/tmp")),
+        ] {
+            let env: std::collections::HashMap<_, _> = cmd
+                .get_envs()
+                .filter_map(|(key, value)| value.map(|value| (key, value)))
+                .collect();
+            assert_eq!(
+                env.get(std::ffi::OsStr::new("GIT_TERMINAL_PROMPT")),
+                Some(&std::ffi::OsStr::new("0"))
+            );
+            assert_eq!(
+                env.get(std::ffi::OsStr::new("GIT_OPTIONAL_LOCKS")),
+                Some(&std::ffi::OsStr::new("0"))
+            );
+        }
+    }
+
+    fn gh_available() -> bool {
+        std::process::Command::new("gh")
+            .args(["auth", "status"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Real-binary contract test: spawns the installed, authed `gh` against a
+    /// configured slug and asserts a default branch is actually resolved. This
+    /// is the boundary the parser-only tests could not see — the old `-R` argv
+    /// failed here at runtime. Skipped when `gh` is absent or unauthenticated.
+    #[test]
+    fn repo_view_default_branch_resolves_against_real_gh() {
+        if !gh_available() {
+            eprintln!("skipping: gh not available/authenticated");
+            return;
+        }
+        // A configured slug (`gh_repo = Some`) is the exact case the old `-R` argv
+        // broke: `gh repo view -R <slug>` errored, so the lookup returned None.
+        let exec = GhMergeExecutor {
+            token_file: None,
+            gh_repo: Some("cli/cli".into()),
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
+        };
+        let branch = exec.repository_default_branch(Path::new("."));
+        assert!(
+            branch.as_deref().is_some_and(|b| !b.is_empty()),
+            "gh repo view must resolve a non-empty default branch for a configured slug, got {branch:?}"
+        );
     }
 
     #[test]

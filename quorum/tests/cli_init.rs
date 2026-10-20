@@ -272,9 +272,9 @@ fn init_installs_current_embedded_recovery_skill() {
         "fresh installs must preserve repository targeting and write boundaries"
     );
     assert!(
-        skill.contains("no public successor-task creation interface")
-            && skill.contains("Do not manufacture `refs.source_task`")
-            && skill.contains("does not block this explicit path"),
+        skill.contains("Do not manufacture `refs.source_task`")
+            && skill.contains("task creation stamps that exact provenance itself")
+            && skill.contains("evidence-gated recovery operation"),
         "the skill must reject invented provenance while preserving exact-pair adoption"
     );
 }

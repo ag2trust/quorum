@@ -221,6 +221,7 @@ fn classify_claim_candidates(conn: &mut rusqlite::Connection, task_id: Option<i6
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
+            risk_flags: vec![],
         })
         .collect::<Vec<_>>();
     quorum_core::classify::store_classifications(

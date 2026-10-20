@@ -65,6 +65,23 @@ pub fn get(conn: &Connection, task_id: i64, pr_number: i64) -> Result<Option<Per
     .map_err(Into::into)
 }
 
+/// Forget a target only when it still names the stale head observed by the
+/// caller. A freshly fetched branch can advance before GitHub's PR metadata;
+/// retaining that disproven tuple would let an API outage repeatedly reuse it.
+/// The head guard preserves a newer target accepted by another reconciliation.
+pub fn delete_if_head(
+    conn: &Connection,
+    task_id: i64,
+    pr_number: i64,
+    stale_head_sha: &str,
+) -> Result<bool> {
+    Ok(conn.execute(
+        "DELETE FROM pr_targets
+         WHERE task_id=?1 AND pr_number=?2 AND head_sha=?3",
+        params![task_id, pr_number, stale_head_sha],
+    )? == 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +164,17 @@ mod tests {
         assert!(get(&c, 10, 42).unwrap().is_none());
         let got = get(&c, 10, 99).unwrap().unwrap();
         assert_eq!(got.head_ref, "branch-2");
+    }
+
+    #[test]
+    fn delete_if_head_removes_only_the_disproven_tuple() {
+        let (_d, mut c) = open_tmp();
+        upsert(&mut c, 10, 42, "branch", "stale", false).unwrap();
+
+        assert!(!delete_if_head(&c, 10, 42, "newer").unwrap());
+        assert_eq!(get(&c, 10, 42).unwrap().unwrap().head_sha, "stale");
+
+        assert!(delete_if_head(&c, 10, 42, "stale").unwrap());
+        assert!(get(&c, 10, 42).unwrap().is_none());
     }
 }

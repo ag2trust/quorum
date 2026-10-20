@@ -82,6 +82,7 @@ pub fn retire_tx(tx: &Transaction<'_>, input: &FallbackRetireInput<'_>) -> Resul
             responsibility_key: input.responsibility.responsibility_key,
             profile: input.failed_route,
             failure_disposition: Some(input.disposition),
+            failed_agent_run_id: Some(input.failed_run.agent_run_id),
             recorded_at: input.recorded_at,
         },
         input.eligible_pool,

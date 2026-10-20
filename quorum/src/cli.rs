@@ -154,6 +154,38 @@ pub enum Command {
         #[arg(long = "task-id")]
         task_id: i64,
     },
+    /// Enqueue one configured, daemon-internal branch synchronization, list
+    /// active and recent rows, or cancel one active row. A clean
+    /// synchronization remains taskless; later daemon work handles it.
+    ///
+    /// Modes:
+    ///   `--by <id> --from <src> --to <dst>` — enqueue one request.
+    ///   `--list` — JSON of active rows plus the last 10 terminal rows.
+    ///   `--cancel <id> --by <agent>` — cancel one cancellable active row.
+    ///
+    /// The modes are mutually exclusive.
+    #[command(name = "branch-sync")]
+    BranchSync {
+        /// Identity recorded as the requestor or canceller.
+        #[arg(long)]
+        by: Option<String>,
+        /// Source branch whose commits will be synchronized.
+        #[arg(long, conflicts_with_all = ["list", "cancel"])]
+        from: Option<String>,
+        /// Target branch to receive the source commits.
+        #[arg(long, conflicts_with_all = ["list", "cancel"])]
+        to: Option<String>,
+        /// List active and recent branch-sync rows as JSON.
+        #[arg(long, conflicts_with_all = ["from", "to", "cancel"])]
+        list: bool,
+        /// Cancel one active branch-sync by id. Requires `--by <agent>`.
+        #[arg(long, conflicts_with_all = ["from", "to", "list"])]
+        cancel: Option<i64>,
+        /// Target repo as owner/name (e.g. ag2trust/quorum). Routes to that
+        /// repo's DB and serve configuration instead of cwd/env.
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Post a message to the feed. Body (free text) via --body-stdin or --body-file.
     /// `--to <agent>` marks it as a direct message to that agent; omitted = broadcast.
     Post {
@@ -492,7 +524,8 @@ pub enum Command {
         /// Comma-separated tool allowlist for spawned agents (overrides built-in default).
         #[arg(long)]
         allowed_tools: Option<String>,
-        /// Directory for per-agent session logs (stream.jsonl, transcript.md, meta.json).
+        /// Directory for daemon and per-agent logs. Daemon messages append to serve.log,
+        /// rotating at 1 MiB and retaining the active file plus two prior files.
         /// Defaults to {quorum_home}/logs when omitted.
         #[arg(long)]
         log_dir: Option<String>,
@@ -553,7 +586,7 @@ pub enum Command {
     /// Performance report: model × effort aggregates over terminal tasks.
     /// Read-only, no mutations.
     Perf {
-        /// Cut dimension: `complexity` or `reviewer`.
+        /// Cut dimension: `complexity`, `reviewer`, or `risk-flag`.
         #[arg(long)]
         by: Option<String>,
         /// Include historical tasks from before the analytics rollout boundary.
@@ -562,6 +595,9 @@ pub enum Command {
         /// Emit JSON instead of a table.
         #[arg(long)]
         json: bool,
+        /// Emit the versioned read-only facts report (requires `--json`).
+        #[arg(long, requires = "json", conflicts_with = "by")]
+        facts: bool,
     },
     /// Classify tasks: assign complexity, size, readiness, readiness reason,
     /// and duplicate candidates. Primarily driven by the daemon; this command

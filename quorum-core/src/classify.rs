@@ -1,9 +1,9 @@
 //! Task classifier — authoritative complexity, execution size, readiness, and
 //! duplicate hints.  A complete classification gates worker dispatch.
 
-use crate::complexity;
 use crate::db::begin_immediate;
 use crate::error::Result;
+use crate::risk::{RiskFlag, MAX_RISK_EVIDENCE_BYTES, MAX_RISK_FLAGS};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -16,13 +16,15 @@ pub struct TaskClassification {
     pub cx_est: i64,
     pub size: String,
     /// Bounded, artifact-specific rationale for the selected execution size.
-    /// Required for every v3 verdict so a later planning iteration can correct
+    /// Required for every v4 verdict so a later planning iteration can correct
     /// the concrete breadth the classifier observed.
     pub size_reason: String,
     pub ready: bool,
     pub not_ready_reason: Option<String>,
     #[serde(default, alias = "cx_dup_of")]
     pub duplicate_of: Vec<i64>,
+    #[serde(default)]
+    pub risk_flags: Vec<RiskFlag>,
 }
 
 /// Batch response from the classifier agent.
@@ -52,6 +54,36 @@ pub struct TaskForClassification {
     pub body_char_limit: usize,
 }
 
+#[derive(Serialize)]
+struct RenderedTaskContext {
+    title: String,
+    body: Option<String>,
+    dependencies: Vec<String>,
+    recovery_notes: Vec<String>,
+}
+
+fn rendered_task_context(task: &TaskForClassification) -> RenderedTaskContext {
+    RenderedTaskContext {
+        title: truncate_for_prompt(&task.title, TITLE_CHAR_LIMIT),
+        body: task
+            .body
+            .as_deref()
+            .map(|body| truncate_for_prompt(body, task.body_char_limit)),
+        dependencies: task
+            .dependencies
+            .iter()
+            .take(DEPENDENCY_LIMIT)
+            .map(|dependency| truncate_for_prompt(dependency, DEPENDENCY_RENDER_CHAR_LIMIT))
+            .collect(),
+        recovery_notes: task
+            .recovery_notes
+            .iter()
+            .take(RECOVERY_NOTE_LIMIT)
+            .map(|note| truncate_for_prompt(note, RECOVERY_NOTE_CHAR_LIMIT))
+            .collect(),
+    }
+}
+
 fn default_body_char_limit() -> usize {
     BODY_CHAR_LIMIT
 }
@@ -71,15 +103,17 @@ pub struct ClassificationInput {
 pub fn classification_inputs(tasks: &[TaskForClassification]) -> Vec<ClassificationInput> {
     tasks
         .iter()
-        .map(|task| ClassificationInput {
-            task_id: task.id,
-            revision: task.revision,
-            // `TaskForClassification` is a struct (not a map), so serde emits
-            // a stable field order.  Keep the entire bounded prompt input,
-            // including stable dependency context and recovery notes, in the
-            // identity rather than relying on generic `updated_at`.
-            fingerprint: serde_json::to_string(task)
-                .expect("TaskForClassification always serializes"),
+        .map(|task| {
+            // The tuple has a stable serialized order. Fingerprint the exact
+            // rendered context (including truncation markers), not the DB
+            // lookahead character that only detects whether a cut occurred.
+            let rendered = rendered_task_context(task);
+            ClassificationInput {
+                task_id: task.id,
+                revision: task.revision,
+                fingerprint: serde_json::to_string(&(task.id, task.revision, rendered))
+                    .expect("rendered classifier input always serializes"),
+            }
         })
         .collect()
 }
@@ -90,7 +124,7 @@ pub const CLASSIFICATION_BATCH_LIMIT: usize = 20;
 pub const DUP_CONTEXT_LIMIT: usize = 60;
 const TITLE_CHAR_LIMIT: usize = 300;
 /// Prompt body bound for DB-sourced root tasks.
-pub const BODY_CHAR_LIMIT: usize = 2_000;
+pub const BODY_CHAR_LIMIT: usize = 4 * 1024;
 /// Per-field byte bound the daemon applies to each of a planned child's
 /// contract fields (text, list, and deliverable paths, cumulatively per
 /// field) before assembling the classifier body.
@@ -110,9 +144,18 @@ pub const DEPENDENCY_TITLE_CHAR_LIMIT: usize = 240;
 /// child keys are at most 64 bytes) followed by a bounded title.
 const DEPENDENCY_RENDER_CHAR_LIMIT: usize = DEPENDENCY_TITLE_CHAR_LIMIT + 96;
 const DEPENDENCY_LIMIT: usize = 8;
-const RECOVERY_NOTE_CHAR_LIMIT: usize = 600;
+/// Recovery notes can carry corrections to the original contract. Keep the
+/// same minimum semantic-context envelope as a root task body.
+const RECOVERY_NOTE_CHAR_LIMIT: usize = 4 * 1024;
 const RECOVERY_NOTE_LIMIT: usize = 4;
 const DUP_BODY_CHAR_LIMIT: usize = 200;
+
+/// Load one character past a prompt field's retained bound. The renderer uses
+/// that lookahead to distinguish an exact-boundary value from a truncated one
+/// without loading an unbounded DB value into memory.
+const fn with_truncation_lookahead(limit: usize) -> i64 {
+    (limit + 1) as i64
+}
 
 /// SQL counterpart of [`crate::tasks::classification_is_complete`]. Keep this
 /// predicate strict: malformed and partial v2 refs must remain classifier
@@ -155,8 +198,8 @@ pub fn unclassified_tasks(conn: &Connection) -> Result<Vec<TaskForClassification
     let tasks = stmt
         .query_map(
             params![
-                TITLE_CHAR_LIMIT as i64,
-                BODY_CHAR_LIMIT as i64,
+                with_truncation_lookahead(TITLE_CHAR_LIMIT),
+                with_truncation_lookahead(BODY_CHAR_LIMIT),
                 CLASSIFICATION_BATCH_LIMIT as i64
             ],
             |row| {
@@ -199,14 +242,15 @@ fn enrich_task(
             .query_map(
                 params![
                     deps,
-                    DEPENDENCY_TITLE_CHAR_LIMIT as i64,
+                    with_truncation_lookahead(DEPENDENCY_TITLE_CHAR_LIMIT),
                     DEPENDENCY_LIMIT as i64
                 ],
                 |r| {
+                    let title = r.get::<_, String>(1)?;
                     Ok(format!(
                         "#{} {}",
                         r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?
+                        truncate_for_prompt(&title, DEPENDENCY_TITLE_CHAR_LIMIT)
                     ))
                 },
             )?
@@ -220,7 +264,7 @@ fn enrich_task(
         .query_map(
             params![
                 task.id,
-                RECOVERY_NOTE_CHAR_LIMIT as i64,
+                with_truncation_lookahead(RECOVERY_NOTE_CHAR_LIMIT),
                 RECOVERY_NOTE_LIMIT as i64
             ],
             |r| r.get::<_, String>(0),
@@ -229,50 +273,32 @@ fn enrich_task(
     Ok(task)
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    format!("{}…", s.chars().take(max).collect::<String>())
-}
-
-/// Check whether a specific task lacks cx_est in refs.
-pub fn task_missing_cx(conn: &Connection, task_id: i64) -> Result<Option<TaskForClassification>> {
-    let query = format!(
-        "SELECT id, revision, substr(title, 1, ?2), substr(body, 1, ?3) FROM tasks
-         WHERE id = ?1
-         AND {INCOMPLETE_CLASSIFICATION_PREDICATE}"
-    );
-    conn.query_row(
-        &query,
-        params![task_id, TITLE_CHAR_LIMIT as i64, BODY_CHAR_LIMIT as i64],
-        |row| {
-            Ok(TaskForClassification {
-                id: row.get(0)?,
-                revision: row.get(1)?,
-                title: row.get(2)?,
-                body: row.get(3)?,
-                dependencies: vec![],
-                recovery_notes: vec![],
-                body_char_limit: BODY_CHAR_LIMIT,
-            })
-        },
-    )
-    .optional()
-    .map_err(Into::into)
-}
-
-/// Read the exact bounded classifier input for one task, regardless of whether
-/// it is currently eligible.  Persistence uses this inside its write
-/// transaction to reject an input that changed while a provider turn ran.
-fn classifier_input_for_task(
+/// Load the bounded classifier input for one persisted task, then add the
+/// bounded coordination context that is part of its rendered contract.  The
+/// targeted snapshot and the persistence reload must share this path so their
+/// fingerprints cover precisely the same dependency and recovery-note input.
+fn load_bounded_enriched_classifier_task(
     conn: &Connection,
     task_id: i64,
+    require_incomplete_classification: bool,
 ) -> Result<Option<TaskForClassification>> {
+    let incomplete_predicate = if require_incomplete_classification {
+        format!(" AND {INCOMPLETE_CLASSIFICATION_PREDICATE}")
+    } else {
+        String::new()
+    };
+    let query = format!(
+        "SELECT id, revision, substr(title, 1, ?2), substr(body, 1, ?3) FROM tasks \
+         WHERE id=?1{incomplete_predicate}"
+    );
     let task = conn
         .query_row(
-            "SELECT id, revision, substr(title, 1, ?2), substr(body, 1, ?3) FROM tasks WHERE id=?1",
-            params![task_id, TITLE_CHAR_LIMIT as i64, BODY_CHAR_LIMIT as i64],
+            &query,
+            params![
+                task_id,
+                with_truncation_lookahead(TITLE_CHAR_LIMIT),
+                with_truncation_lookahead(BODY_CHAR_LIMIT)
+            ],
             |row| {
                 Ok(TaskForClassification {
                     id: row.get(0)?,
@@ -289,6 +315,34 @@ fn classifier_input_for_task(
     task.map(|task| enrich_task(conn, task)).transpose()
 }
 
+/// Retain at most `max` characters and make every cut explicit. DB loaders
+/// provide a one-character lookahead, so `original exceeds` remains accurate
+/// even when the complete source length was deliberately not loaded.
+pub fn truncate_for_prompt(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    format!(
+        "{}… [TRUNCATED: retained {max} characters; original exceeds {max}]",
+        s.chars().take(max).collect::<String>()
+    )
+}
+
+/// Check whether a specific task lacks cx_est in refs.
+pub fn task_missing_cx(conn: &Connection, task_id: i64) -> Result<Option<TaskForClassification>> {
+    load_bounded_enriched_classifier_task(conn, task_id, true)
+}
+
+/// Read the exact bounded classifier input for one task, regardless of whether
+/// it is currently eligible.  Persistence uses this inside its write
+/// transaction to reject an input that changed while a provider turn ran.
+fn classifier_input_for_task(
+    conn: &Connection,
+    task_id: i64,
+) -> Result<Option<TaskForClassification>> {
+    load_bounded_enriched_classifier_task(conn, task_id, false)
+}
+
 /// All open/working tasks (for dup-detection context).
 pub fn dup_context_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>> {
     let mut stmt = conn.prepare(
@@ -300,8 +354,8 @@ pub fn dup_context_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>
     let tasks = stmt
         .query_map(
             params![
-                TITLE_CHAR_LIMIT as i64,
-                DUP_BODY_CHAR_LIMIT as i64,
+                with_truncation_lookahead(TITLE_CHAR_LIMIT),
+                with_truncation_lookahead(DUP_BODY_CHAR_LIMIT),
                 DUP_CONTEXT_LIMIT as i64
             ],
             |row| {
@@ -333,8 +387,8 @@ pub fn tasks_missing_cx_all(conn: &Connection) -> Result<Vec<TaskForClassificati
     let tasks = stmt
         .query_map(
             params![
-                TITLE_CHAR_LIMIT as i64,
-                BODY_CHAR_LIMIT as i64,
+                with_truncation_lookahead(TITLE_CHAR_LIMIT),
+                with_truncation_lookahead(BODY_CHAR_LIMIT),
                 CLASSIFICATION_BATCH_LIMIT as i64
             ],
             |row| {
@@ -491,12 +545,19 @@ fn store_classifications_tx(
                     params![result.task_id, now, note],
                 )?;
             }
-            let (review_only, continue_pr): (bool, Option<i64>) = tx.query_row(
-                "SELECT review_only, continue_pr FROM tasks WHERE id=?1",
-                params![result.task_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            if let Some(reason) = parking_reason(&sanitized, review_only, continue_pr.is_some()) {
+            let (review_only, continue_pr, task_refs): (bool, Option<i64>, Option<String>) = tx
+                .query_row(
+                    "SELECT review_only, continue_pr, refs FROM tasks WHERE id=?1",
+                    params![result.task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+            let is_branch_sync = crate::tasks::refs_have_branch_sync_ref(task_refs.as_deref());
+            if let Some(reason) = parking_reason(
+                &sanitized,
+                review_only,
+                continue_pr.is_some(),
+                is_branch_sync,
+            ) {
                 crate::tasks::park_classified_task_tx(tx, result.task_id, reason, now)?;
             } else {
                 crate::tasks::restore_classified_task_tx(tx, result.task_id, now)?;
@@ -530,6 +591,15 @@ fn sanitize(result: &TaskClassification) -> TaskClassification {
             .as_ref()
             .map(|s| s.trim().to_string()),
         duplicate_of: result.duplicate_of.clone(),
+        risk_flags: result
+            .risk_flags
+            .iter()
+            .cloned()
+            .map(|mut flag| {
+                flag.evidence = flag.evidence.trim().to_string();
+                flag
+            })
+            .collect(),
     }
 }
 
@@ -547,6 +617,20 @@ pub fn valid(result: &TaskClassification) -> bool {
                 .as_ref()
                 .is_some_and(|s| !s.trim().is_empty() && !s.contains('\0'))
         }
+        && result.risk_flags.len() <= MAX_RISK_FLAGS
+        && result.risk_flags.iter().all(|risk_flag| {
+            risk_flag.flag.is_known()
+                && !risk_flag.evidence.trim().is_empty()
+                && risk_flag.evidence.len() <= MAX_RISK_EVIDENCE_BYTES
+                && !risk_flag.evidence.contains('\0')
+        })
+        && result
+            .risk_flags
+            .iter()
+            .map(|risk_flag| risk_flag.flag)
+            .collect::<HashSet<_>>()
+            .len()
+            == result.risk_flags.len()
 }
 
 /// Validate the semantic contract for one provider response before any result
@@ -595,11 +679,13 @@ fn parking_reason(
     result: &TaskClassification,
     review_only: bool,
     continue_pr: bool,
+    branch_sync_ref: bool,
 ) -> Option<&str> {
     if !result.ready {
         return result.not_ready_reason.as_deref();
     }
-    if !review_only && !continue_pr && result.size == "XL" && result.cx_est <= 3 {
+    if !review_only && !continue_pr && !branch_sync_ref && result.size == "XL" && result.cx_est <= 3
+    {
         return Some(crate::tasks::LOW_COMPLEXITY_XL_PARK_REASON);
     }
     None
@@ -638,6 +724,7 @@ fn merge_cx_into_refs(
         serde_json::json!(result.not_ready_reason),
     );
     map.insert("cx_by".into(), serde_json::json!(version));
+    map.insert("cx_risk_flags".into(), serde_json::json!(result.risk_flags));
     map.remove("cx_flags");
     map.remove("cx_tags");
     if !result.duplicate_of.is_empty() {
@@ -680,16 +767,10 @@ pub fn build_prompt(
     tasks: &[TaskForClassification],
     dup_context: &[TaskForClassification],
 ) -> String {
-    build_prompt_with_recommendations(
-        tasks,
-        dup_context,
-        &complexity::recommendation_lines(complexity::RecommendationProvider::Claude),
-    )
+    build_prompt_with_recommendations(tasks, dup_context, "")
 }
 
-/// Build the classifier prompt with the active provider's routing guidance.
-/// Recommendations describe Quorum's operational policy only; they do not
-/// alter the classifier's required complexity-only response.
+/// Build the classifier prompt with optional routing guidance.
 pub fn build_prompt_with_recommendations(
     tasks: &[TaskForClassification],
     dup_context: &[TaskForClassification],
@@ -699,36 +780,23 @@ pub fn build_prompt_with_recommendations(
 
     prompt.push_str("\n\n## Tasks to classify\n\n");
     for t in tasks.iter().take(CLASSIFICATION_BATCH_LIMIT) {
+        let rendered = rendered_task_context(t);
         prompt.push_str(&format!("### Task #{}\n", t.id));
-        prompt.push_str(&format!(
-            "**Title:** {}\n",
-            truncate(&t.title, TITLE_CHAR_LIMIT)
-        ));
-        if let Some(body) = &t.body {
-            let truncated = truncate(body, t.body_char_limit);
-            prompt.push_str(&format!("**Body:**\n{truncated}\n"));
+        prompt.push_str(&format!("**Title:** {}\n", rendered.title));
+        if let Some(body) = rendered.body {
+            prompt.push_str(&format!("**Body:**\n{body}\n"));
         }
         prompt.push('\n');
-        if !t.dependencies.is_empty() {
+        if !rendered.dependencies.is_empty() {
             prompt.push_str(&format!(
                 "**Dependencies (scheduler-enforced assumptions):** {}\n",
-                t.dependencies
-                    .iter()
-                    .take(DEPENDENCY_LIMIT)
-                    .map(|dependency| truncate(dependency, DEPENDENCY_RENDER_CHAR_LIMIT))
-                    .collect::<Vec<_>>()
-                    .join("; ")
+                rendered.dependencies.join("; ")
             ));
         }
-        if !t.recovery_notes.is_empty() {
+        if !rendered.recovery_notes.is_empty() {
             prompt.push_str(&format!(
                 "**Recovery context:** {}\n",
-                t.recovery_notes
-                    .iter()
-                    .take(RECOVERY_NOTE_LIMIT)
-                    .map(|note| truncate(note, RECOVERY_NOTE_CHAR_LIMIT))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                rendered.recovery_notes.join("\n")
             ));
         }
     }
@@ -739,12 +807,12 @@ pub fn build_prompt_with_recommendations(
             let snippet = t
                 .body
                 .as_deref()
-                .map(|body| truncate(body, DUP_BODY_CHAR_LIMIT))
+                .map(|body| truncate_for_prompt(body, DUP_BODY_CHAR_LIMIT))
                 .unwrap_or_default();
             prompt.push_str(&format!(
                 "- #{}: {} — {snippet}\n",
                 t.id,
-                truncate(&t.title, TITLE_CHAR_LIMIT)
+                truncate_for_prompt(&t.title, TITLE_CHAR_LIMIT)
             ));
         }
     }
@@ -757,6 +825,7 @@ pub fn build_prompt_with_recommendations(
 /// Build the classifier rubric text from the shared complexity constants.
 fn classifier_rubric(recommendations: &str) -> String {
     let rubric_lines = crate::complexity::rubric_lines();
+    let risk_rubric_lines = crate::risk::rubric_lines();
     format!(
         r#"You are a task classifier for an AI agent coordination system. For each task, produce:
 
@@ -780,21 +849,24 @@ This is not a cross-vendor benchmark and does not change the required output.
 3. **size_reason**: a required, concrete rationale of at most {MAX_SIZE_REASON_BYTES} UTF-8 bytes tied to this exact task artifact. Name the implementation surfaces or responsibilities that make the selected size fit better than the adjacent sizes; do not merely restate the rubric or task title. For L, name the multiple owned seams or layers that remain one coherent outcome and explain why the artifact is broader than M. For XL, identify independently deliverable outcomes or seams that require decomposition. For S/M, identify the focused or bounded coherent seam. This rationale is durable review feedback for a later planning iteration.
 4. **ready** (boolean): true unless the intended outcome cannot be determined without an unstated product decision or open-ended investigation. Normal repository inspection, finding files, tracing implementation, and bounded engineering judgment are expected. Never reject merely because files, implementation details, or full architecture context are absent. Declared dependencies are scheduler-enforced assumptions whose required outcomes will be satisfied before execution. Use their bounded context to understand assumed outcomes, scope, complexity, and duplication, but never return ready=false merely because a dependency is currently incomplete; dependency ordering is not classifier authority. If false, provide a concrete **not_ready_reason**; if true, it must be null.
 5. **duplicate_of** (optional array): only genuine duplicates among supplied active tasks.
+6. **risk_flags** (array, default empty): bounded execution-surface and coupling signals, separate from complexity and size. Surface/coupling signals go into these flags and must NOT raise complexity. Each item is `{{"flag":"<enum>","evidence":"one task-specific sentence"}}`. Emit at most {MAX_RISK_FLAGS} unique flags; evidence must be non-empty, contain no NUL, and be at most {MAX_RISK_EVIDENCE_BYTES} UTF-8 bytes. Return `[]` when none apply.
+   Risk flags:
+{risk_rubric_lines}
 
 You are closed-book: use only this prompt, do not inspect the repository, Git history, diffs, CI, or external systems.
 
 Output format (JSON array wrapped in an object):
-{{"tasks": [{{"task_id": 1, "complexity": 4, "size": "M", "size_reason": "The artifact owns one atomic orchestration seam plus its focused replay and race tests; dependency-delivered primitives keep it bounded rather than broad.", "ready": true, "not_ready_reason": null, "duplicate_of": []}}]}}"#
+{{"tasks": [{{"task_id": 1, "complexity": 4, "size": "M", "size_reason": "The artifact owns one atomic orchestration seam plus its focused replay and race tests; dependency-delivered primitives keep it bounded rather than broad.", "ready": true, "not_ready_reason": null, "duplicate_of": [], "risk_flags": []}}]}}"#
     )
 }
 
 /// Stable classifier provenance string for `cx_by`.
 ///
 /// The model is part of the identifier so classification quality can be grouped
-/// by the model that actually produced it. `v3` adds the required bounded
-/// rationale for the size verdict to the explicit classification contract.
+/// by the model that actually produced it. `v4` adds bounded risk flags to the
+/// explicit classification contract.
 pub fn classifier_provenance(model: &str) -> String {
-    format!("{model}:v3")
+    format!("{model}:v4")
 }
 
 #[cfg(test)]
@@ -810,6 +882,7 @@ mod tests {
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
+            risk_flags: vec![],
         }
     }
 
@@ -837,8 +910,8 @@ mod tests {
 
     #[test]
     fn classifier_provenance_identifies_the_model() {
-        assert_eq!(classifier_provenance("gpt-5.6-luna"), "gpt-5.6-luna:v3");
-        assert_eq!(classifier_provenance("gpt-5.6-terra"), "gpt-5.6-terra:v3");
+        assert_eq!(classifier_provenance("gpt-5.6-luna"), "gpt-5.6-luna:v4");
+        assert_eq!(classifier_provenance("gpt-5.6-terra"), "gpt-5.6-terra:v4");
     }
 
     #[test]
@@ -883,6 +956,7 @@ mod tests {
         let resp: ClassifierResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.tasks.len(), 1);
         assert_eq!(resp.tasks[0].cx_est, 3);
+        assert!(resp.tasks[0].risk_flags.is_empty());
     }
 
     #[test]
@@ -911,19 +985,179 @@ mod tests {
         assert!(prompt.contains("Dependencies (scheduler-enforced assumptions)"));
         assert!(prompt.contains("#3 Establish prerequisite"));
         assert!(prompt.contains("#2: Other task"));
+        assert!(!prompt.contains("[TRUNCATED:"));
     }
 
     #[test]
-    fn provider_specific_prompt_contains_only_its_routing_ladder() {
-        let prompt = build_prompt_with_recommendations(
-            &[],
-            &[],
-            &crate::complexity::recommendation_lines(
-                crate::complexity::RecommendationProvider::Codex,
-            ),
+    fn prompt_truncation_marker_starts_only_beyond_the_boundary() {
+        let exact = "B".repeat(BODY_CHAR_LIMIT);
+        assert_eq!(truncate_for_prompt(&exact, BODY_CHAR_LIMIT), exact);
+
+        let oversized = format!("{exact}X");
+        let rendered = truncate_for_prompt(&oversized, BODY_CHAR_LIMIT);
+        assert!(rendered.starts_with(&exact));
+        assert!(rendered.ends_with("[TRUNCATED: retained 4096 characters; original exceeds 4096]"));
+        assert!(!rendered.ends_with('X'));
+    }
+
+    #[test]
+    fn classifier_prompt_preserves_pml_35_sized_contract_intact() {
+        let (_dir, mut conn) = open_tmp();
+        let sentinel = "EXPECTED_GRAPH_BEHAVIOR_AFTER_FORMER_2K_BOUNDARY";
+        let body = format!(
+            "{}{}{}",
+            "B".repeat(2_500),
+            sentinel,
+            "C".repeat(3_412 - 2_500 - sentinel.len())
         );
-        assert!(prompt.contains("gpt-5.6-sol / high"));
-        assert!(!prompt.contains("claude-opus-4-8"));
+        assert_eq!(body.chars().count(), 3_412);
+        let task_id = create_task(&mut conn, "Large but bounded contract", 1);
+        conn.execute(
+            "UPDATE tasks SET body=?2 WHERE id=?1",
+            params![task_id, body],
+        )
+        .unwrap();
+
+        let prompt = build_prompt(&unclassified_tasks(&conn).unwrap(), &[]);
+        assert!(prompt.contains(&body));
+        assert!(!prompt.contains("[TRUNCATED:"));
+    }
+
+    #[test]
+    fn classifier_db_paths_mark_bodies_exceeding_the_limit() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "Oversized contract", 1);
+        conn.execute(
+            "UPDATE tasks SET body=?2 WHERE id=?1",
+            params![
+                task_id,
+                format!("{}HIDDEN_SUFFIX", "B".repeat(BODY_CHAR_LIMIT))
+            ],
+        )
+        .unwrap();
+
+        let live = unclassified_tasks(&conn).unwrap();
+        let targeted = task_missing_cx(&conn, task_id).unwrap().unwrap();
+        let backfill = tasks_missing_cx_all(&conn).unwrap();
+        for task in [live[0].clone(), targeted, backfill[0].clone()] {
+            let prompt = build_prompt(&[task], &[]);
+            assert!(prompt.contains("[TRUNCATED: retained 4096 characters; original exceeds 4096]"));
+            assert!(!prompt.contains("HIDDEN_SUFFIX"));
+        }
+    }
+
+    #[test]
+    fn classifier_prompt_marks_oversized_recovery_context() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "Recovered task", 1);
+        conn.execute(
+            "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, 2, 'daemon', ?2)",
+            params![
+                task_id,
+                format!(
+                    "{}HIDDEN_RECOVERY_SUFFIX",
+                    "R".repeat(RECOVERY_NOTE_CHAR_LIMIT)
+                )
+            ],
+        )
+        .unwrap();
+
+        let prompt = build_prompt(&unclassified_tasks(&conn).unwrap(), &[]);
+        assert!(prompt.contains("[TRUNCATED: retained 4096 characters; original exceeds 4096]"));
+        assert!(!prompt.contains("HIDDEN_RECOVERY_SUFFIX"));
+    }
+
+    #[test]
+    fn targeted_snapshot_and_reload_share_bounded_recovery_context() {
+        let (_dir, mut conn) = open_tmp();
+        let dependency = create_task(&mut conn, "scheduler prerequisite", 1);
+        let task_id = create_dependent_task(
+            &mut conn,
+            "Recovered targeted task",
+            "Classify this contract with its bounded recovery context.",
+            dependency,
+            2,
+        );
+        conn.execute(
+            "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, 3, 'daemon', ?2)",
+            params![
+                task_id,
+                format!(
+                    "{}HIDDEN_TARGETED_RECOVERY_SUFFIX",
+                    "R".repeat(RECOVERY_NOTE_CHAR_LIMIT)
+                )
+            ],
+        )
+        .unwrap();
+
+        let targeted = task_missing_cx(&conn, task_id).unwrap().unwrap();
+        assert_eq!(
+            targeted.dependencies,
+            vec![format!("#{dependency} scheduler prerequisite")]
+        );
+        let targeted_prompt = build_prompt(std::slice::from_ref(&targeted), &[]);
+        assert!(targeted_prompt
+            .contains("[TRUNCATED: retained 4096 characters; original exceeds 4096]"));
+        assert!(!targeted_prompt.contains("HIDDEN_TARGETED_RECOVERY_SUFFIX"));
+
+        let snapshot = classification_inputs(std::slice::from_ref(&targeted));
+        let reloaded = classifier_input_for_task(&conn, task_id).unwrap().unwrap();
+        assert_eq!(
+            snapshot,
+            classification_inputs(std::slice::from_ref(&reloaded)),
+            "an unchanged targeted input must have the same enriched fingerprint on reload"
+        );
+        assert_eq!(
+            store_classifications_for_inputs(
+                &mut conn,
+                &[classified(task_id, 3)],
+                &snapshot,
+                "test:v2",
+                2_000_000,
+            )
+            .unwrap(),
+            1,
+            "the unchanged targeted result must survive the persistence fingerprint check"
+        );
+    }
+
+    #[test]
+    fn classifier_identity_matches_the_rendered_truncated_context() {
+        let base = TaskForClassification {
+            id: 1,
+            revision: 1,
+            title: "bounded identity".into(),
+            body: Some(format!("{}X", "B".repeat(BODY_CHAR_LIMIT))),
+            dependencies: vec![],
+            recovery_notes: vec![],
+            body_char_limit: BODY_CHAR_LIMIT,
+        };
+        let changed_only_beyond_the_rendered_bound = TaskForClassification {
+            body: Some(format!("{}Y", "B".repeat(BODY_CHAR_LIMIT))),
+            ..base.clone()
+        };
+
+        assert_eq!(
+            build_prompt(std::slice::from_ref(&base), &[]),
+            build_prompt(
+                std::slice::from_ref(&changed_only_beyond_the_rendered_bound),
+                &[]
+            )
+        );
+        assert_eq!(
+            classification_inputs(&[base]),
+            classification_inputs(&[changed_only_beyond_the_rendered_bound])
+        );
+    }
+
+    #[test]
+    fn backfill_prompt_matches_daemon_without_model_recommendations() {
+        let backfill_prompt = build_prompt(&[], &[]);
+        let daemon_prompt = build_prompt_with_recommendations(&[], &[], "");
+
+        assert_eq!(backfill_prompt, daemon_prompt);
+        assert!(!backfill_prompt.contains("claude-opus-"));
+        assert!(!backfill_prompt.contains("gpt-5.6-"));
     }
 
     #[test]
@@ -1039,7 +1273,19 @@ mod tests {
         assert_eq!(unclassified.len(), 1);
         assert_eq!(unclassified[0].id, task_id);
 
-        let results = vec![classified(task_id, 3)];
+        let mut result = classified(task_id, 3);
+        result.risk_flags = vec![
+            RiskFlag {
+                flag: crate::risk::RiskFlagName::GrammarOrParser,
+                evidence: "The task adds a delimiter parser.".into(),
+            },
+            RiskFlag {
+                flag: crate::risk::RiskFlagName::ManyConsumers,
+                evidence: "Three consumers must adopt the parsed tokens together.".into(),
+            },
+        ];
+        assert!(validate_batch(std::slice::from_ref(&result), &[task_id]).is_ok());
+        let results = vec![result];
         let stored = store_classifications(&mut conn, &results, "haiku-45:v1", 2_000_000).unwrap();
         assert_eq!(stored, 1);
 
@@ -1051,12 +1297,118 @@ mod tests {
         assert_eq!(refs["cx_est"], 3);
         assert_eq!(refs["cx_by"], "haiku-45:v1");
         assert_eq!(refs["cx_size"], "M");
+        assert_eq!(
+            refs["cx_risk_flags"],
+            serde_json::json!([
+                {"flag": "grammar_or_parser", "evidence": "The task adds a delimiter parser."},
+                {"flag": "many_consumers", "evidence": "Three consumers must adopt the parsed tokens together."},
+            ])
+        );
 
         let notes = crate::tasks::get_with_notes(&conn, task_id)
             .unwrap()
             .unwrap()
             .notes;
         assert_eq!(notes.len(), 0);
+    }
+
+    #[test]
+    fn missing_risk_flags_deserialize_empty_and_persist_empty_array() {
+        let json = r#"{"tasks":[{"task_id":1,"complexity":3,"size":"M","size_reason":"one bounded seam","ready":true,"not_ready_reason":null,"duplicate_of":[]}]}"#;
+        let response: ClassifierResponse = serde_json::from_str(json).unwrap();
+        assert!(response.tasks[0].risk_flags.is_empty());
+
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create_task(&mut conn, "Legacy classifier response", 1);
+        let mut result = response.tasks.into_iter().next().unwrap();
+        result.task_id = task_id;
+        assert_eq!(
+            store_classifications(&mut conn, &[result], "test:v4", 2_000_000).unwrap(),
+            1
+        );
+        let task = crate::tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["cx_risk_flags"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn malformed_risk_flags_reject_batch_without_persistence() {
+        let invalid_flags = vec![
+            (
+                "unknown flag",
+                vec![
+                    serde_json::from_str(
+                        r#"{"flag":"unknown_flag","evidence":"The provider chose an unknown surface signal."}"#,
+                    )
+                    .unwrap(),
+                ],
+            ),
+            (
+                "duplicate flag",
+                vec![
+                    RiskFlag {
+                        flag: crate::risk::RiskFlagName::GrammarOrParser,
+                        evidence: "The task adds syntax.".into(),
+                    },
+                    RiskFlag {
+                        flag: crate::risk::RiskFlagName::GrammarOrParser,
+                        evidence: "The task also changes parser behavior.".into(),
+                    },
+                ],
+            ),
+            (
+                "empty evidence",
+                vec![RiskFlag {
+                    flag: crate::risk::RiskFlagName::PublicContract,
+                    evidence: "".into(),
+                }],
+            ),
+            (
+                "NUL evidence",
+                vec![RiskFlag {
+                    flag: crate::risk::RiskFlagName::PublicContract,
+                    evidence: "API\0contract change".into(),
+                }],
+            ),
+            (
+                "more than seven flags",
+                (0..=MAX_RISK_FLAGS)
+                    .map(|_| RiskFlag {
+                        flag: crate::risk::RiskFlagName::GrammarOrParser,
+                        evidence: "The task changes delimiter parsing.".into(),
+                    })
+                    .collect(),
+            ),
+        ];
+
+        for (index, (case, risk_flags)) in invalid_flags.into_iter().enumerate() {
+            let (_dir, mut conn) = open_tmp();
+            let task_id = create_task(&mut conn, case, index as i64 + 1);
+            let mut result = classified(task_id, 3);
+            result.risk_flags = risk_flags;
+
+            assert!(
+                validate_batch(std::slice::from_ref(&result), &[task_id]).is_err(),
+                "{case} must reject the provider batch"
+            );
+            assert_eq!(
+                store_classifications(&mut conn, &[result], "test:v4", 2_000_000).unwrap(),
+                0,
+                "{case} must not write refs"
+            );
+            assert!(crate::tasks::get(&conn, task_id)
+                .unwrap()
+                .unwrap()
+                .refs
+                .is_none());
+            assert!(
+                unclassified_tasks(&conn)
+                    .unwrap()
+                    .iter()
+                    .any(|task| task.id == task_id),
+                "{case} must leave the task classifier-eligible"
+            );
+        }
     }
 
     #[test]
@@ -1648,8 +2000,8 @@ mod tests {
         };
         let luna_by = cx_by(luna_task);
         let terra_by = cx_by(terra_task);
-        assert_eq!(luna_by, "gpt-5.6-luna:v3");
-        assert_eq!(terra_by, "gpt-5.6-terra:v3");
+        assert_eq!(luna_by, "gpt-5.6-luna:v4");
+        assert_eq!(terra_by, "gpt-5.6-terra:v4");
         assert_ne!(luna_by, terra_by);
     }
 
@@ -1681,7 +2033,8 @@ mod tests {
         assert!(crate::tasks::classification_is_dispatchable(
             &task.refs,
             task.review_only,
-            task.continue_pr
+            task.continue_pr,
+            task.terminal_leaf,
         ));
         let active_claims: i64 = conn
             .query_row(
@@ -1934,7 +2287,8 @@ mod tests {
         assert!(crate::tasks::classification_is_dispatchable(
             &Some(refs.into()),
             false,
-            None
+            None,
+            false,
         ));
     }
 
@@ -1954,7 +2308,7 @@ mod tests {
         assert_eq!(tasks_missing_cx_all(&conn).unwrap()[0].id, task_id);
         let refs = crate::tasks::get(&conn, task_id).unwrap().unwrap().refs;
         assert!(!crate::tasks::classification_is_dispatchable(
-            &refs, false, None
+            &refs, false, None, false
         ));
     }
 
@@ -1997,13 +2351,18 @@ mod tests {
         let batch = unclassified_tasks(&conn).unwrap();
         assert_eq!(batch.len(), CLASSIFICATION_BATCH_LIMIT);
         assert!(batch.windows(2).all(|pair| pair[0].id < pair[1].id));
-        assert!(batch[0].title.chars().count() <= TITLE_CHAR_LIMIT);
-        assert!(batch[0].body.as_deref().unwrap().chars().count() <= BODY_CHAR_LIMIT);
+        assert!(batch[0].title.chars().count() <= TITLE_CHAR_LIMIT + 1);
+        assert!(batch[0].body.as_deref().unwrap().chars().count() <= BODY_CHAR_LIMIT + 1);
+        let prompt = build_prompt(std::slice::from_ref(&batch[0]), &[]);
+        assert!(prompt.contains("[TRUNCATED: retained 300 characters"));
+        assert!(prompt.contains("[TRUNCATED: retained 4096 characters"));
 
         let dup_context = dup_context_tasks(&conn).unwrap();
         assert_eq!(dup_context.len(), DUP_CONTEXT_LIMIT);
         assert!(dup_context.windows(2).all(|pair| pair[0].id < pair[1].id));
-        assert!(dup_context[0].body.as_deref().unwrap().chars().count() <= DUP_BODY_CHAR_LIMIT);
+        assert!(dup_context[0].body.as_deref().unwrap().chars().count() <= DUP_BODY_CHAR_LIMIT + 1);
+        assert!(build_prompt(&[], std::slice::from_ref(&dup_context[0]))
+            .contains("[TRUNCATED: retained 200 characters"));
     }
 
     #[test]
@@ -2017,9 +2376,7 @@ mod tests {
 
     #[test]
     fn classifier_prompt_contains_shared_rubric_descriptions() {
-        let rubric = classifier_rubric(&complexity::recommendation_lines(
-            complexity::RecommendationProvider::Claude,
-        ));
+        let rubric = classifier_rubric("");
         for (level, label, desc, _time) in &crate::complexity::RUBRIC {
             assert!(
                 rubric.contains(&format!("{level}: {label}")) && rubric.contains(*desc),
@@ -2030,9 +2387,7 @@ mod tests {
 
     #[test]
     fn classifier_prompt_calibrates_complexity_and_size_as_orthogonal_agent_dimensions() {
-        let rubric = classifier_rubric(&complexity::recommendation_lines(
-            complexity::RecommendationProvider::Claude,
-        ));
+        let rubric = classifier_rubric("");
         assert!(rubric.contains("execution surface for one managed AI coding agent"));
         assert!(rubric.contains("Do not estimate human time or translate from human project sizes"));
         assert!(rubric
@@ -2057,6 +2412,18 @@ mod tests {
         assert!(rubric.contains(
             "For XL, identify independently deliverable outcomes or seams that require decomposition"
         ));
+        assert!(rubric.contains(
+            "Surface/coupling signals go into these flags and must NOT raise complexity"
+        ));
+        assert!(rubric.contains("one task-specific sentence"));
+        assert!(rubric.contains("Return `[]` when none apply"));
+        for (flag, _) in crate::risk::RUBRIC {
+            assert!(
+                rubric.contains(crate::risk::flag_name(flag)),
+                "classifier prompt missing risk flag {}",
+                crate::risk::flag_name(flag)
+            );
+        }
     }
 
     #[test]
@@ -2088,6 +2455,7 @@ mod redesigned_tests {
             ready,
             not_ready_reason: reason.map(str::to_string),
             duplicate_of: vec![],
+            risk_flags: vec![],
         }
     }
 
@@ -2113,12 +2481,16 @@ mod redesigned_tests {
 
     #[test]
     fn policy_allows_focused_complexity_five() {
-        assert!(parking_reason(&result(5, "S", true, None), false, false).is_none());
-        assert!(parking_reason(&result(5, "M", true, None), false, false).is_none());
-        assert!(parking_reason(&result(5, "L", true, None), false, false).is_none());
-        assert!(parking_reason(&result(2, "XL", true, None), false, false).is_some());
-        assert!(parking_reason(&result(2, "XL", true, None), false, true).is_none());
-        assert!(parking_reason(&result(2, "XL", true, None), true, false).is_none());
+        assert!(parking_reason(&result(5, "S", true, None), false, false, false).is_none());
+        assert!(parking_reason(&result(5, "M", true, None), false, false, false).is_none());
+        assert!(parking_reason(&result(5, "L", true, None), false, false, false).is_none());
+        assert!(parking_reason(&result(2, "XL", true, None), false, false, false).is_some());
+        assert!(parking_reason(&result(2, "XL", true, None), false, true, false).is_none());
+        assert!(parking_reason(&result(2, "XL", true, None), true, false, false).is_none());
+        assert!(
+            parking_reason(&result(2, "XL", true, None), false, false, true).is_none(),
+            "a branch-sync judgment task skips parking like review-only/continue-pr"
+        );
     }
 
     #[test]

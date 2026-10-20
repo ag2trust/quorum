@@ -523,6 +523,7 @@ fn seed_in_review_task(home: &std::path::Path, author: &str, pr: i64) -> i64 {
             ready: true,
             not_ready_reason: None,
             duplicate_of: vec![],
+            risk_flags: vec![],
         }],
         "test:v2",
         now,

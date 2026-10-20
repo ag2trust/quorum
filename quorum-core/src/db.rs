@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 72;
+pub const SCHEMA_VERSION: i64 = 79;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1252,6 +1252,10 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
         // idempotent for re-run under the same migration transaction and matches
         // the shape SCHEMA_SQL applies to a fresh DB.
         if current < 66 {
+            // v79 later widens this index to include `failed_agent_run_id`;
+            // when migrating from a schema at or below v66 that column does
+            // not yet exist, so create the v66-shaped index first and let the
+            // v79 block below DROP+RECREATE it with the wider key.
             conn.execute_batch(
                 "CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_configured_route
                      ON agent_runs(role_assignment_id, configured_profile_id)
@@ -1333,13 +1337,223 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 [],
             )?;
         }
-        // v72 indexes the second durable FK into agent_runs. Opportunistic
+        // v72 = per-attempt decomposition-eligibility + fewest-L rank columns.
+        // Additive/observational; no backfill. `CREATE TABLE IF NOT EXISTS` in
+        // SCHEMA_SQL is a no-op for existing tables, so each column must be
+        // ALTERed in with a `column_exists` guard for idempotency.
+        for column in [
+            "eligible",
+            "oversized_count",
+            "max_oversized_cx",
+            "total_children",
+        ] {
+            if current < 72 && !column_exists(conn, "decomposition_attempts", column)? {
+                conn.execute(
+                    &format!("ALTER TABLE decomposition_attempts ADD COLUMN {column} INTEGER"),
+                    [],
+                )?;
+            }
+        }
+        if current < 72 && !column_exists(conn, "decomposition_attempts", "submission_id")? {
+            conn.execute(
+                "ALTER TABLE decomposition_attempts ADD COLUMN submission_id TEXT",
+                [],
+            )?;
+        }
+        // v73 marks generated decomposition children as terminal leaves. This is
+        // additive: historic tasks remain ordinary roots, while new materialized
+        // children opt into the one-level decomposition boundary explicitly.
+        if current < 73 && !column_exists(conn, "tasks", "terminal_leaf")? {
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN terminal_leaf INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        // v74 persists the classified proposal payload alongside each per-attempt
+        // eligibility record so the terminal-leaf best-attempt fallback can
+        // materialize a prior attempt directly without re-running the planner or
+        // classifier. Additive/observational; NULL on every historical row.
+        if current < 74 && !column_exists(conn, "decomposition_attempts", "plan_snapshot_json")? {
+            conn.execute(
+                "ALTER TABLE decomposition_attempts ADD COLUMN plan_snapshot_json TEXT
+                     CHECK(plan_snapshot_json IS NULL
+                           OR length(CAST(plan_snapshot_json AS BLOB)) <= 131072)",
+                [],
+            )?;
+        }
+        // v75 indexes the durable planner submission lookup used by the facts
+        // reader. Without a graph_id-leading index, a source with no submission
+        // could scan retained submissions for unrelated graphs before its
+        // bounded prefix/probe LIMIT applies.
+        if current < 75 {
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS planner_submissions_graph_id
+                     ON planner_submissions(graph_id)",
+            )?;
+        }
+        // v76 = durable branch synchronization rows. The table, its partial
+        // active-pair unique index, and task-reference lookup index are new
+        // schema objects, so SCHEMA_SQL creates them for fresh databases and
+        // upgrades alike. No data backfill is needed.
+        //
+        // v77 = restart-safe bounded branch-sync CI waits. These additive
+        // columns preserve the finite attempt budget, scheduled retry time,
+        // and pre-network admission boundary across daemon restarts; the
+        // partial due index keeps the scheduler's checks scan bounded.
+        if current < 77 {
+            if !column_exists(conn, "branch_syncs", "ci_attempts")? {
+                conn.execute(
+                    "ALTER TABLE branch_syncs
+                     ADD COLUMN ci_attempts INTEGER NOT NULL DEFAULT 0
+                     CHECK(ci_attempts >= 0)",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "branch_syncs", "ci_next_attempt_at")? {
+                conn.execute(
+                    "ALTER TABLE branch_syncs ADD COLUMN ci_next_attempt_at INTEGER",
+                    [],
+                )?;
+            }
+            if !column_exists(conn, "branch_syncs", "ci_wait_inflight")? {
+                conn.execute(
+                    "ALTER TABLE branch_syncs
+                     ADD COLUMN ci_wait_inflight INTEGER NOT NULL DEFAULT 0
+                     CHECK(ci_wait_inflight IN (0,1))",
+                    [],
+                )?;
+            }
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS branch_syncs_checks_due
+                     ON branch_syncs(ci_next_attempt_at, updated_at, id)
+                     WHERE active = 1 AND phase = 'checks'",
+            )?;
+        }
+        // v78 indexes the second durable FK into agent_runs. Opportunistic
         // sweep probes this column for each bounded raw run candidate, so the
-        // lookup must not scan the retained fallback-intent ledger.
-        if current < 72 {
+        // lookup must not scan the retained fallback-intent ledger. This is
+        // v78 on develop because that line had already shipped schema v77
+        // before the main hotfix was synchronized.
+        if current < 78 {
             conn.execute_batch(
                 "CREATE INDEX IF NOT EXISTS fallback_launch_intents_agent_run
                      ON fallback_launch_intents(agent_run_id)",
+            )?;
+        }
+        // v79 keys fallback launch identity to the exact failed agent_run.
+        // Before v79 the routing_attempts UNIQUE(role_assignment_id,
+        // profile_id) collapsed a second same-profile failure into a replay of
+        // the first attempt, and fallback_launch_intents.UNIQUE(responsibility
+        // _key, routing_attempt_id) returned that first generation's intent,
+        // whose stale worktree/head then failed `replay_matches`. v79 adds a
+        // nullable `failed_agent_run_id` column to both tables and widens the
+        // routing_attempts UNIQUE to include it, so a distinct failed run gets
+        // its own attempt and its own fallback launch intent. Existing rows
+        // grandfather to NULL and remain readable, immutable evidence.
+        //
+        // routing_attempts requires a table rebuild because the UNIQUE
+        // constraint is inline (an implicit index) and SQLite cannot ALTER a
+        // UNIQUE. Foreign-key enforcement is already disabled by the outer
+        // `migrate` straddle; `fallback_launch_intents.routing_attempt_id`
+        // preserves its integer values across the rename because the DROP+
+        // RENAME does not renumber rows. The `no_update` and `no_delete`
+        // triggers are recreated by SCHEMA_SQL when re-entering the migration,
+        // but SCHEMA_SQL runs before this block, so re-issue them explicitly
+        // here (their `IF NOT EXISTS` guard makes the recreation idempotent).
+        if current < 79 && !column_exists(conn, "routing_attempts", "failed_agent_run_id")? {
+            conn.pragma_update(None, "legacy_alter_table", true)?;
+            conn.execute_batch(
+                "CREATE TABLE routing_attempts_new (
+                     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                     role_assignment_id    INTEGER NOT NULL REFERENCES role_assignments(id),
+                     responsibility_key    TEXT NOT NULL,
+                     profile_id            TEXT NOT NULL,
+                     provider              TEXT NOT NULL,
+                     runner                TEXT NOT NULL,
+                     model                 TEXT NOT NULL,
+                     effort                TEXT NOT NULL,
+                     pool_key              TEXT NOT NULL,
+                     policy_generation     TEXT NOT NULL,
+                     failure_disposition   TEXT CHECK(failure_disposition IS NULL OR
+                                               failure_disposition IN (
+                                                   'provider-unavailable',
+                                                   'profile-unavailable',
+                                                   'retryable-same-route',
+                                                   'non-failover',
+                                                   'unclassified')),
+                     failed_agent_run_id   INTEGER REFERENCES agent_runs(id),
+                     recorded_at           INTEGER NOT NULL,
+                     UNIQUE(role_assignment_id, profile_id, failed_agent_run_id)
+                 );
+                 INSERT INTO routing_attempts_new(
+                     id, role_assignment_id, responsibility_key, profile_id, provider,
+                     runner, model, effort, pool_key, policy_generation,
+                     failure_disposition, failed_agent_run_id, recorded_at)
+                     SELECT id, role_assignment_id, responsibility_key, profile_id, provider,
+                            runner, model, effort, pool_key, policy_generation,
+                            failure_disposition, NULL, recorded_at
+                     FROM routing_attempts;
+                 DROP TABLE routing_attempts;
+                 ALTER TABLE routing_attempts_new RENAME TO routing_attempts;
+                 CREATE INDEX IF NOT EXISTS routing_attempts_responsibility
+                     ON routing_attempts(responsibility_key, id);
+                 CREATE TRIGGER IF NOT EXISTS routing_attempts_assignment_guard
+                 BEFORE INSERT ON routing_attempts
+                 WHEN NOT EXISTS (
+                     SELECT 1 FROM role_assignments AS assignment
+                     WHERE assignment.id=NEW.role_assignment_id
+                       AND assignment.responsibility_key=NEW.responsibility_key
+                       AND assignment.pool_key=NEW.pool_key
+                       AND assignment.policy_generation=NEW.policy_generation
+                 )
+                 BEGIN
+                     SELECT RAISE(ABORT, 'routing attempt does not match role assignment');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS routing_attempts_no_update
+                 BEFORE UPDATE ON routing_attempts
+                 BEGIN
+                     SELECT RAISE(ABORT, 'routing attempt evidence is immutable');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS routing_attempts_no_delete
+                 BEFORE DELETE ON routing_attempts
+                 BEGIN
+                     SELECT RAISE(ABORT, 'routing attempt evidence is immutable');
+                 END;",
+            )?;
+            conn.pragma_update(None, "legacy_alter_table", false)?;
+        }
+        if current < 79 && !column_exists(conn, "fallback_launch_intents", "failed_agent_run_id")? {
+            conn.execute(
+                "ALTER TABLE fallback_launch_intents
+                     ADD COLUMN failed_agent_run_id INTEGER REFERENCES agent_runs(id)",
+                [],
+            )?;
+        }
+        // The alternate agent_run is likewise keyed by the failed run it
+        // replaces. The v66 partial UNIQUE index that enforces one alternate
+        // per (assignment, profile) is dropped and replaced by one that also
+        // includes `failed_agent_run_id`, so distinct failed runs get their
+        // own alternate row while legacy (assignment, profile) reuse remains
+        // idempotent for NULL rows.
+        if current < 79 && !column_exists(conn, "agent_runs", "failed_agent_run_id")? {
+            conn.execute(
+                "ALTER TABLE agent_runs
+                     ADD COLUMN failed_agent_run_id INTEGER REFERENCES agent_runs(id)",
+                [],
+            )?;
+        }
+        if current < 79 {
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS agent_runs_configured_route;
+                 CREATE UNIQUE INDEX IF NOT EXISTS agent_runs_configured_route
+                     ON agent_runs(role_assignment_id, configured_profile_id, failed_agent_run_id)
+                     WHERE configured_profile_id IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS fallback_launch_intents_failed_agent_run
+                     ON fallback_launch_intents(failed_agent_run_id);
+                 CREATE INDEX IF NOT EXISTS routing_attempts_failed_agent_run
+                     ON routing_attempts(failed_agent_run_id);
+                 CREATE INDEX IF NOT EXISTS agent_runs_failed_agent_run
+                     ON agent_runs(failed_agent_run_id)",
             )?;
         }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
@@ -1425,6 +1639,7 @@ mod tests {
             "cursors",
             "claims",
             "tasks",
+            "branch_syncs",
             "errors",
             "events",
             "task_notes",
@@ -1470,10 +1685,284 @@ mod tests {
         }
         assert!(column_exists(&c, "run_capabilities", "agent_run_id").unwrap());
         assert!(column_exists(&c, "daemon_lock", "instance_id").unwrap());
+        assert!(column_exists(&c, "tasks", "terminal_leaf").unwrap());
+        for column in [
+            "eligible",
+            "oversized_count",
+            "max_oversized_cx",
+            "total_children",
+            "submission_id",
+            "plan_snapshot_json",
+        ] {
+            assert!(
+                column_exists(&c, "decomposition_attempts", column).unwrap(),
+                "decomposition_attempts column {column} must exist after two opens"
+            );
+        }
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    /// A v71 database (schema fixed at `PRAGMA user_version=71` before v72's
+    /// eligibility columns landed) migrates forward on open. The migration
+    /// must remain idempotent across a second open on the same file so a
+    /// mid-migration crash or a supervisor restart never re-ALTERs an already
+    /// migrated column.
+    #[test]
+    fn v71_to_v72_adds_nullable_eligibility_columns_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v71-eligibility.db");
+        // First open lands the shipped SCHEMA_VERSION; wind PRAGMA back to 71
+        // and drop the new columns so the v72 branch has to run.
+        {
+            let raw = Connection::open(&path).unwrap();
+            apply_pragmas(&raw).unwrap();
+            migrate(&raw).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE decomposition_attempts DROP COLUMN eligible;
+                 ALTER TABLE decomposition_attempts DROP COLUMN oversized_count;
+                 ALTER TABLE decomposition_attempts DROP COLUMN max_oversized_cx;
+                 ALTER TABLE decomposition_attempts DROP COLUMN total_children;
+                 ALTER TABLE decomposition_attempts DROP COLUMN submission_id;
+                 PRAGMA user_version=71;",
+            )
+            .unwrap();
+        }
+        let migrated = open(&path).unwrap();
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        for column in [
+            "eligible",
+            "oversized_count",
+            "max_oversized_cx",
+            "total_children",
+            "submission_id",
+        ] {
+            assert!(column_exists(&migrated, "decomposition_attempts", column).unwrap());
+        }
+        // Second open must not re-ALTER (idempotent).
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        for column in [
+            "eligible",
+            "oversized_count",
+            "max_oversized_cx",
+            "total_children",
+            "submission_id",
+        ] {
+            assert!(column_exists(&reopened, "decomposition_attempts", column).unwrap());
+        }
+    }
+
+    /// A v73 database (schema fixed at `PRAGMA user_version=73` before v74's
+    /// per-attempt plan snapshot column landed) migrates forward on open and
+    /// the ALTER stays idempotent across a second open on the same file.
+    #[test]
+    fn v73_to_v74_adds_nullable_plan_snapshot_column_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v73-plan-snapshot.db");
+        {
+            let raw = Connection::open(&path).unwrap();
+            apply_pragmas(&raw).unwrap();
+            migrate(&raw).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE decomposition_attempts DROP COLUMN plan_snapshot_json;
+                 PRAGMA user_version=73;",
+            )
+            .unwrap();
+        }
+        let migrated = open(&path).unwrap();
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert!(column_exists(&migrated, "decomposition_attempts", "plan_snapshot_json").unwrap());
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        assert!(column_exists(&reopened, "decomposition_attempts", "plan_snapshot_json").unwrap());
+    }
+
+    /// A v74 database predates the planner graph lookup index. Upgrade it in
+    /// place without touching the durable planner submission history, and keep
+    /// the index present on the next ordinary open too.
+    #[test]
+    fn v74_to_v75_adds_planner_submission_graph_index_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v74-planner-submission-index.db");
+        {
+            let raw = Connection::open(&path).unwrap();
+            apply_pragmas(&raw).unwrap();
+            migrate(&raw).unwrap();
+            raw.execute_batch(
+                "DROP INDEX planner_submissions_graph_id;
+                 PRAGMA user_version=74;",
+            )
+            .unwrap();
+        }
+
+        let migrated = open(&path).unwrap();
+        let index_exists: bool = migrated
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master
+                     WHERE type='index' AND name='planner_submissions_graph_id'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(index_exists);
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        assert!(reopened
+            .query_row(
+                "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type='index' AND name='planner_submissions_graph_id'
+                     )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
+    }
+
+    /// A v75 database predates branch synchronization storage. Upgrading must
+    /// create both the durable rows and the partial active-pair guard, and a
+    /// later ordinary open must be a no-op.
+    #[test]
+    fn v75_to_v76_adds_branch_syncs_table_and_index_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v75-branch-syncs.db");
+        {
+            let raw = Connection::open(&path).unwrap();
+            apply_pragmas(&raw).unwrap();
+            migrate(&raw).unwrap();
+            raw.execute_batch(
+                "DROP INDEX branch_syncs_one_active_pair;
+                 DROP TABLE branch_syncs;
+                 PRAGMA user_version=75;",
+            )
+            .unwrap();
+        }
+
+        let migrated = open(&path).unwrap();
+        for column in [
+            "id",
+            "source_branch",
+            "target_branch",
+            "source_sha",
+            "target_sha",
+            "sync_branch",
+            "merge_sha",
+            "pr",
+            "phase",
+            "ci_attempts",
+            "ci_next_attempt_at",
+            "ci_wait_inflight",
+            "task_id",
+            "active",
+            "requested_by",
+            "last_error",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(
+                column_exists(&migrated, "branch_syncs", column).unwrap(),
+                "branch_syncs column {column} missing after v75 upgrade"
+            );
+        }
+        for index in [
+            "branch_syncs_one_active_pair",
+            "branch_syncs_task_id",
+            "branch_syncs_checks_due",
+        ] {
+            assert!(migrated
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type='index' AND name=?1
+                     )",
+                    [index],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap());
+        }
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        assert!(column_exists(&reopened, "branch_syncs", "active").unwrap());
+    }
+
+    /// v76 had durable branch-sync rows but no restart-safe bounded CI wait
+    /// evidence. The upgrade must add all retry fields and its due index
+    /// without changing prior row semantics.
+    #[test]
+    fn v76_to_v77_adds_durable_branch_sync_ci_retry_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v76-branch-sync-ci-retry.db");
+        {
+            let raw = Connection::open(&path).unwrap();
+            apply_pragmas(&raw).unwrap();
+            migrate(&raw).unwrap();
+            raw.execute_batch(
+                "DROP INDEX branch_syncs_checks_due;
+                 ALTER TABLE branch_syncs DROP COLUMN ci_wait_inflight;
+                 ALTER TABLE branch_syncs DROP COLUMN ci_next_attempt_at;
+                 ALTER TABLE branch_syncs DROP COLUMN ci_attempts;
+                 PRAGMA user_version=76;",
+            )
+            .unwrap();
+        }
+
+        let migrated = open(&path).unwrap();
+        for column in ["ci_attempts", "ci_next_attempt_at", "ci_wait_inflight"] {
+            assert!(
+                column_exists(&migrated, "branch_syncs", column).unwrap(),
+                "branch_syncs column {column} missing after v76 upgrade"
+            );
+        }
+        let defaults: (i64, Option<i64>, bool) = migrated
+            .query_row(
+                "INSERT INTO branch_syncs(
+                     source_branch,target_branch,phase,requested_by,created_at,updated_at
+                 ) VALUES ('main','develop','requested','owner',1,1)
+                 RETURNING ci_attempts,ci_next_attempt_at,ci_wait_inflight",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(defaults, (0, None, false));
+        assert!(migrated
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master
+                     WHERE type='index' AND name='branch_syncs_checks_due'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
     }
 
     #[test]
@@ -1634,16 +2123,28 @@ mod tests {
             )
             .unwrap();
 
-        // A duplicate populated configured route for the same assignment is
-        // rejected by the partial UNIQUE index.
+        // Two alternates for the same (assignment, profile) authorized by
+        // distinct failed managed runs are permitted post-v79. A duplicate
+        // (assignment, profile, failed_agent_run_id) is still rejected.
         reopened
             .execute(
                 "INSERT INTO agent_runs(
                      task_id,agent_name,role,model,effort,provider,spawned_at,
                      role_assignment_id,configured_profile_id,configured_provider,
-                     configured_model,configured_effort)
+                     configured_model,configured_effort,failed_agent_run_id)
                  VALUES (7,'alt-1','worker','sol','high','codex',4,42,
-                         'sol','codex','sol','high')",
+                         'sol','codex','sol','high',1)",
+                [],
+            )
+            .unwrap();
+        reopened
+            .execute(
+                "INSERT INTO agent_runs(
+                     task_id,agent_name,role,model,effort,provider,spawned_at,
+                     role_assignment_id,configured_profile_id,configured_provider,
+                     configured_model,configured_effort,failed_agent_run_id)
+                 VALUES (7,'alt-2','worker','sol','high','codex',5,42,
+                         'sol','codex','sol','high',2)",
                 [],
             )
             .unwrap();
@@ -1651,12 +2152,15 @@ mod tests {
             "INSERT INTO agent_runs(
                  task_id,agent_name,role,model,effort,provider,spawned_at,
                  role_assignment_id,configured_profile_id,configured_provider,
-                 configured_model,configured_effort)
-             VALUES (7,'alt-2','worker','sol','high','codex',5,42,
-                     'sol','codex','sol','high')",
+                 configured_model,configured_effort,failed_agent_run_id)
+             VALUES (7,'alt-3','worker','sol','high','codex',6,42,
+                     'sol','codex','sol','high',1)",
             [],
         );
-        assert!(dup.is_err(), "duplicate configured route must fail closed");
+        assert!(
+            dup.is_err(),
+            "duplicate (assignment, profile, failed_agent_run_id) must fail closed"
+        );
     }
 
     #[test]
@@ -1859,14 +2363,14 @@ mod tests {
     }
 
     #[test]
-    fn v71_to_v72_indexes_fallback_intent_agent_run_references() {
+    fn v77_to_v78_indexes_fallback_intent_agent_run_references() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v71-fallback-agent-run-index.db");
+        let path = dir.path().join("v77-fallback-agent-run-index.db");
         {
             let conn = open(&path).unwrap();
             conn.execute_batch(
                 "DROP INDEX fallback_launch_intents_agent_run;
-                 PRAGMA user_version=71;",
+                 PRAGMA user_version=77;",
             )
             .unwrap();
         }
@@ -2058,6 +2562,59 @@ mod tests {
             })
             .collect();
         assert_eq!(branches_after_rerun, branches);
+    }
+
+    #[test]
+    fn v72_to_v73_adds_terminal_leaf_once_with_default_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v72-terminal-leaf.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                 VALUES ('legacy task','open','owner',1,1)",
+                [],
+            )
+            .unwrap();
+        }
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE tasks DROP COLUMN terminal_leaf;
+                 PRAGMA user_version=72;",
+            )
+            .unwrap();
+            assert!(!column_exists(&raw, "tasks", "terminal_leaf").unwrap());
+        }
+
+        let upgraded = open(&path).unwrap();
+        assert!(column_exists(&upgraded, "tasks", "terminal_leaf").unwrap());
+        assert_eq!(
+            upgraded
+                .query_row("SELECT terminal_leaf FROM tasks WHERE id=1", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0,
+            "migration must not reinterpret historic tasks as leaves"
+        );
+        assert_eq!(
+            upgraded
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(upgraded);
+
+        let reopened = open(&path).unwrap();
+        assert!(column_exists(&reopened, "tasks", "terminal_leaf").unwrap());
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION,
+            "the second open must be a migration no-op"
+        );
     }
 
     #[test]

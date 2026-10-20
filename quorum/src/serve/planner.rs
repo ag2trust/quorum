@@ -9,12 +9,17 @@ use super::codex_agent::{CodexProc, CodexSpec};
 use super::runner::{AgentEvent, AgentKind, CapturedOutput, RunnerFailure, RunnerProc};
 use super::session_log::{
     ProviderLifecyclePhase, SanitizedCommandKind, SanitizedCompletionOutcome, SanitizedField,
-    SanitizedProvider, SanitizedProviderFailureKind, SanitizedRejectionKind, SanitizedSessionEvent,
-    SanitizedSummaryOutcome, SanitizedTerminalStatus, SanitizedToolKind, SessionLog,
-    TurnLifecyclePhase, MAX_SANITIZED_RECORDS_PER_SESSION,
+    SanitizedPlannerFinalMessageDiagnostic, SanitizedPlannerMcpDiagnostic,
+    SanitizedPlannerMcpStatus, SanitizedPlannerPermissionDenials, SanitizedPlannerResultSubtype,
+    SanitizedPlannerStopReason, SanitizedPlannerTerminalDiagnostic, SanitizedPlannerTokenUsage,
+    SanitizedPlannerToolHistogram, SanitizedProvider, SanitizedProviderFailureKind,
+    SanitizedRejectionKind, SanitizedSessionEvent, SanitizedSummaryOutcome,
+    SanitizedTerminalStatus, SanitizedToolKind, SessionLog, TurnLifecyclePhase,
+    MAX_SANITIZED_RECORDS_PER_SESSION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -29,6 +34,7 @@ pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
 const MAX_FAILURE_SUMMARY_BYTES: usize = 2048;
 const MAX_FAILURE_REASON_BYTES: usize = 256;
 const DIAGNOSTIC_SAMPLE_LINES: usize = 2;
+const MAX_PENDING_DIAGNOSTIC_TOOL_IDS: usize = 256;
 const WRITABLE_PATH_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(1);
 pub const WORKER_WRITABILITY_GUIDANCE: &str = "Worker guidance: only the assigned worktree and repository are writable. This defense-in-depth guidance does not itself enforce that boundary.";
 const MAX_TEXT_BYTES: usize = 8 * 1024;
@@ -40,9 +46,9 @@ const MAX_REJECTION_SUMMARIES: usize = 3;
 pub(super) const MAX_REJECTION_SUMMARY_BYTES: usize =
     quorum_core::decomposition::ATTEMPT_SUMMARY_MAX_BYTES;
 // A clean terminal provider line followed by no accepted `submit_plan` emits
-// one terminal response and four closure records. Provider failures and their
+// one terminal response and five closure records. Provider failures and their
 // final outcome share this fixed reserve.
-const PLANNER_SANITIZED_CLOSURE_RESERVE: usize = 5;
+const PLANNER_SANITIZED_CLOSURE_RESERVE: usize = 6;
 
 /// Process-local admission gate for filesystem-backed write-path resolution.
 ///
@@ -168,8 +174,13 @@ pub const RESPONSE_SHAPES: &str = concat!(
 /// Build one bounded, closed-book planner turn. Retry context is deliberately
 /// limited to structured rejection summaries; provider transcripts and prior
 /// continuation identities never enter a later attempt.
-pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String]) -> String {
+pub fn build_prompt(
+    source: &PlanningSource<'_>,
+    risk_flags: &[quorum_core::risk::RiskFlag],
+    rejection_summaries: &[String],
+) -> String {
     let source_json = serde_json::to_string(source).expect("planning source serializes");
+    let risk_json = serde_json::to_string(risk_flags).expect("source risk flags serialize");
     let retry_json = serde_json::to_string(
         &rejection_summaries
             .iter()
@@ -236,7 +247,10 @@ pub fn build_prompt(source: &PlanningSource<'_>, rejection_summaries: &[String])
          `no_safe_split` BLOCKER with concrete evidence. A single-file composition child that \
          wires together primitives delivered by its sibling prerequisites is expected, not a \
          defect: its size is its own write surface, so do not split it against a stated atomic \
-         boundary merely because it composes many delivered seams.\n\nSOURCE={source_json}\n\nPRIOR_REJECTIONS={retry_json}"
+         boundary merely because it composes many delivered seams. Risks in source identifies \
+         execution-surface seams from the source classifier; split along those seams where the \
+         repository supports an independently deliverable boundary. Children are classified \
+         fresh, so do not copy source risk flags into child contracts.\n\nSOURCE={source_json}\n\nRisks in source:\n{risk_json}\n\nPRIOR_REJECTIONS={retry_json}"
     )
 }
 
@@ -714,6 +728,7 @@ pub struct PlannerSlot {
     diagnostics: PlannerDiagnostics,
     session_log: Option<SessionLog>,
     sanitized_record_count: usize,
+    attempt_diagnostic_logged: bool,
 }
 
 #[derive(Default)]
@@ -724,6 +739,14 @@ struct PlannerDiagnostics {
     end: VecDeque<String>,
     terminal_response_seen: bool,
     read_boundary_truncated: bool,
+    mcp_status: SanitizedPlannerMcpStatus,
+    submit_plan_advertised: bool,
+    tool_histogram: SanitizedPlannerToolHistogram,
+    submit_plan_error_results: u64,
+    terminal: SanitizedPlannerTerminalDiagnostic,
+    final_assistant_message: SanitizedPlannerFinalMessageDiagnostic,
+    pending_submit_plan_ids: HashSet<u64>,
+    started_codex_tool_ids: HashMap<u64, SanitizedToolKind>,
 }
 
 impl PlannerDiagnostics {
@@ -733,6 +756,14 @@ impl PlannerDiagnostics {
         *self.event_types.entry(event_type).or_default() += 1;
         self.terminal_response_seen |=
             matches!(event_type, "result" | "turn.completed" | "turn.failed");
+
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+            match provider {
+                AgentKind::Claude => self.observe_claude_event(&value),
+                AgentKind::Codex => self.observe_codex_event(&value),
+                AgentKind::Grok => self.observe_grok_event(&value),
+            }
+        }
 
         // Samples deliberately retain only a structural description. Provider
         // payload strings (including tool output and assistant text) can contain
@@ -750,6 +781,418 @@ impl PlannerDiagnostics {
     fn note_read_boundary_truncation(&mut self) {
         self.read_boundary_truncated = true;
     }
+
+    fn observe_claude_event(&mut self, value: &serde_json::Value) {
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("system")
+                if value.get("subtype").and_then(serde_json::Value::as_str) == Some("init") =>
+            {
+                self.observe_claude_init(value);
+            }
+            Some("assistant") => {
+                let Some(message) = value.get("message") else {
+                    return;
+                };
+                if let Some(text) = super::stream::assistant_text(message) {
+                    self.observe_final_message(&text);
+                }
+                if let Some(blocks) = message.get("content").and_then(serde_json::Value::as_array) {
+                    for block in blocks {
+                        if block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use")
+                        {
+                            self.observe_claude_tool_use(block);
+                        }
+                    }
+                }
+            }
+            Some("tool_use") => self.observe_claude_tool_use(value),
+            Some("user") => self.observe_claude_tool_results(
+                value
+                    .get("message")
+                    .and_then(|message| message.get("content")),
+            ),
+            Some("tool_result") => self.observe_claude_tool_result(value),
+            Some("result") => self.observe_claude_terminal(value),
+            _ => {}
+        }
+    }
+
+    fn observe_claude_init(&mut self, value: &serde_json::Value) {
+        self.mcp_status = SanitizedPlannerMcpStatus::Absent;
+        if let Some(servers) = value
+            .get("mcp_servers")
+            .and_then(serde_json::Value::as_array)
+        {
+            for server in servers {
+                if server.get("name").and_then(serde_json::Value::as_str) != Some("quorum") {
+                    continue;
+                }
+                self.mcp_status = if server.get("status").and_then(serde_json::Value::as_str)
+                    == Some("connected")
+                {
+                    SanitizedPlannerMcpStatus::Connected
+                } else {
+                    SanitizedPlannerMcpStatus::Failed
+                };
+                if matches!(self.mcp_status, SanitizedPlannerMcpStatus::Connected) {
+                    break;
+                }
+            }
+        }
+        self.submit_plan_advertised = value
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|tool| tool.as_str() == Some(super::runner::PLANNER_MCP_ALLOWED_TOOL))
+            });
+    }
+
+    fn observe_claude_tool_use(&mut self, value: &serde_json::Value) {
+        let kind = planner_tool_kind(value.get("name").and_then(serde_json::Value::as_str));
+        self.tool_histogram.increment(kind);
+        if kind == SanitizedToolKind::SubmitPlan {
+            self.remember_submit_plan_id(value.get("id").and_then(serde_json::Value::as_str));
+        }
+    }
+
+    fn observe_claude_tool_results(&mut self, content: Option<&serde_json::Value>) {
+        let Some(blocks) = content.and_then(serde_json::Value::as_array) else {
+            return;
+        };
+        for block in blocks {
+            if block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result") {
+                self.observe_claude_tool_result(block);
+            }
+        }
+    }
+
+    fn observe_claude_tool_result(&mut self, value: &serde_json::Value) {
+        let Some(id) = value
+            .get("tool_use_id")
+            .and_then(serde_json::Value::as_str)
+            .map(diagnostic_id_hash)
+        else {
+            return;
+        };
+        if self.pending_submit_plan_ids.remove(&id)
+            && value
+                .get("is_error")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        {
+            self.submit_plan_error_results = self.submit_plan_error_results.saturating_add(1);
+        }
+    }
+
+    fn observe_claude_terminal(&mut self, value: &serde_json::Value) {
+        self.terminal.stop_reason = value
+            .get("stop_reason")
+            .and_then(serde_json::Value::as_str)
+            .map(planner_stop_reason);
+        self.terminal.result_subtype = value
+            .get("subtype")
+            .and_then(serde_json::Value::as_str)
+            .map(planner_result_subtype);
+        self.terminal.turn_count = value.get("num_turns").and_then(serde_json::Value::as_u64);
+        self.terminal.error = value.get("is_error").and_then(serde_json::Value::as_bool);
+        self.terminal.duration_ms = value.get("duration_ms").and_then(serde_json::Value::as_u64);
+        self.terminal.usage = value.get("usage").and_then(planner_token_usage);
+        self.terminal.permission_denials = planner_permission_denials(
+            value
+                .get("permission_denials")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::as_slice),
+        );
+    }
+
+    fn observe_codex_event(&mut self, value: &serde_json::Value) {
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("item.started") => {
+                let Some(item) = value.get("item") else {
+                    return;
+                };
+                self.observe_started_codex_tool(item);
+            }
+            Some("item.completed") => {
+                let Some(item) = value.get("item") else {
+                    return;
+                };
+                match item.get("type").and_then(serde_json::Value::as_str) {
+                    Some("agent_message") => {
+                        if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
+                            self.observe_final_message(text);
+                        }
+                    }
+                    Some("command_execution" | "file_change" | "mcp_call") => {
+                        self.observe_completed_codex_tool(item);
+                    }
+                    _ => {}
+                }
+            }
+            Some("turn.completed") => self.observe_codex_terminal(value, false),
+            Some("turn.failed") => self.observe_codex_terminal(value, true),
+            _ => {}
+        }
+    }
+
+    fn observe_started_codex_tool(&mut self, item: &serde_json::Value) {
+        let Some(kind) = codex_tool_kind(item) else {
+            return;
+        };
+        self.tool_histogram.increment(kind);
+        if let Some(id) = item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(diagnostic_id_hash)
+        {
+            if self.started_codex_tool_ids.len() < MAX_PENDING_DIAGNOSTIC_TOOL_IDS {
+                self.started_codex_tool_ids.insert(id, kind);
+            }
+            if kind == SanitizedToolKind::SubmitPlan {
+                self.remember_submit_plan_hash(id);
+            }
+        }
+    }
+
+    fn observe_completed_codex_tool(&mut self, item: &serde_json::Value) {
+        let id = item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(diagnostic_id_hash);
+        let started_kind = id.and_then(|id| self.started_codex_tool_ids.remove(&id));
+        let Some(kind) = started_kind.or_else(|| codex_tool_kind(item)) else {
+            return;
+        };
+        if started_kind.is_none() {
+            self.tool_histogram.increment(kind);
+            if kind == SanitizedToolKind::SubmitPlan {
+                if let Some(id) = id {
+                    self.remember_submit_plan_hash(id);
+                }
+            }
+        }
+        let is_error = item.get("error").is_some_and(|error| !error.is_null())
+            || matches!(
+                item.get("status").and_then(serde_json::Value::as_str),
+                Some("failed" | "error")
+            )
+            || item
+                .get("result")
+                .and_then(|result| result.get("is_error"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+        if kind == SanitizedToolKind::SubmitPlan && is_error {
+            self.submit_plan_error_results = self.submit_plan_error_results.saturating_add(1);
+        }
+        if let Some(id) = id {
+            self.pending_submit_plan_ids.remove(&id);
+        }
+    }
+
+    fn observe_codex_terminal(&mut self, value: &serde_json::Value, failed: bool) {
+        self.terminal.stop_reason = value
+            .get("stop_reason")
+            .and_then(serde_json::Value::as_str)
+            .map(planner_stop_reason);
+        self.terminal.result_subtype = Some(if failed {
+            SanitizedPlannerResultSubtype::ExecutionError
+        } else {
+            SanitizedPlannerResultSubtype::Success
+        });
+        self.terminal.turn_count = value
+            .get("num_turns")
+            .or_else(|| value.get("turn_count"))
+            .and_then(serde_json::Value::as_u64);
+        self.terminal.error = Some(failed);
+        self.terminal.duration_ms = value.get("duration_ms").and_then(serde_json::Value::as_u64);
+        self.terminal.usage = value.get("usage").and_then(planner_token_usage);
+        self.terminal.permission_denials = planner_permission_denials(
+            value
+                .get("permission_denials")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::as_slice),
+        );
+    }
+
+    fn observe_grok_event(&mut self, value: &serde_json::Value) {
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("end") {
+            return;
+        }
+        let stop_reason = value
+            .get("stopReason")
+            .and_then(serde_json::Value::as_str)
+            .map(planner_stop_reason);
+        let max_turns = matches!(stop_reason, Some(SanitizedPlannerStopReason::MaxTurns));
+        self.terminal.stop_reason = stop_reason;
+        self.terminal.result_subtype = Some(if max_turns {
+            SanitizedPlannerResultSubtype::MaxTurns
+        } else {
+            SanitizedPlannerResultSubtype::Success
+        });
+        self.terminal.error = Some(max_turns);
+        self.terminal.usage = value.get("usage").and_then(planner_token_usage);
+    }
+
+    fn observe_final_message(&mut self, text: &str) {
+        self.final_assistant_message.bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
+        self.final_assistant_message.plan_shaped = serde_json::from_str::<serde_json::Value>(text)
+            .ok()
+            .is_some_and(|value| {
+                value.as_object().is_some_and(|object| {
+                    object.contains_key("tasks") || object.contains_key("outcome")
+                })
+            });
+    }
+
+    fn remember_submit_plan_id(&mut self, id: Option<&str>) {
+        if let Some(id) = id {
+            self.remember_submit_plan_hash(diagnostic_id_hash(id));
+        }
+    }
+
+    fn remember_submit_plan_hash(&mut self, id: u64) {
+        if self.pending_submit_plan_ids.len() < MAX_PENDING_DIAGNOSTIC_TOOL_IDS {
+            self.pending_submit_plan_ids.insert(id);
+        }
+    }
+}
+
+fn diagnostic_id_hash(id: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn planner_tool_kind(name: Option<&str>) -> SanitizedToolKind {
+    match name {
+        Some("Bash") => SanitizedToolKind::Bash,
+        Some("Read") => SanitizedToolKind::Read,
+        Some("Write") => SanitizedToolKind::Write,
+        Some("Edit") => SanitizedToolKind::Edit,
+        Some("Grep") => SanitizedToolKind::Grep,
+        Some("Glob") => SanitizedToolKind::Glob,
+        Some("Skill") => SanitizedToolKind::Skill,
+        Some("Agent") => SanitizedToolKind::Agent,
+        Some(super::runner::PLANNER_MCP_ALLOWED_TOOL) => SanitizedToolKind::SubmitPlan,
+        _ => SanitizedToolKind::Other,
+    }
+}
+
+fn sanitized_line_tool_kind(event_type: &str, raw: &str) -> SanitizedToolKind {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return SanitizedToolKind::Other;
+    };
+    match event_type {
+        "tool_use" => planner_tool_kind(value.get("name").and_then(serde_json::Value::as_str)),
+        "item.started/mcp_call" | "item.completed/mcp_call" => value
+            .get("item")
+            .map(codex_mcp_tool_kind)
+            .unwrap_or(SanitizedToolKind::Other),
+        _ => SanitizedToolKind::Other,
+    }
+}
+
+fn codex_mcp_tool_kind(item: &serde_json::Value) -> SanitizedToolKind {
+    let server = item
+        .get("server")
+        .or_else(|| item.get("server_name"))
+        .and_then(serde_json::Value::as_str);
+    let tool = item
+        .get("tool")
+        .or_else(|| item.get("tool_name"))
+        .and_then(serde_json::Value::as_str);
+    if server == Some("quorum") && tool == Some("submit_plan") {
+        SanitizedToolKind::SubmitPlan
+    } else {
+        match planner_tool_kind(tool) {
+            // Only the daemon's own MCP server can issue the authoritative
+            // planner submission tool.
+            SanitizedToolKind::SubmitPlan => SanitizedToolKind::Other,
+            kind => kind,
+        }
+    }
+}
+
+fn codex_tool_kind(item: &serde_json::Value) -> Option<SanitizedToolKind> {
+    match item.get("type").and_then(serde_json::Value::as_str) {
+        Some("command_execution") => Some(SanitizedToolKind::Bash),
+        Some("file_change") => Some(SanitizedToolKind::Edit),
+        Some("mcp_call") => Some(codex_mcp_tool_kind(item)),
+        _ => None,
+    }
+}
+
+fn planner_stop_reason(reason: &str) -> SanitizedPlannerStopReason {
+    match reason {
+        "end_turn" | "completed" => SanitizedPlannerStopReason::EndTurn,
+        "max_tokens" | "token_limit" => SanitizedPlannerStopReason::TokenLimit,
+        "max_turns" | "max_turns_reached" => SanitizedPlannerStopReason::MaxTurns,
+        "stop_sequence" => SanitizedPlannerStopReason::StopSequence,
+        "tool_use" => SanitizedPlannerStopReason::ToolUse,
+        "pause_turn" => SanitizedPlannerStopReason::PauseTurn,
+        "refusal" => SanitizedPlannerStopReason::Refusal,
+        "error" => SanitizedPlannerStopReason::Error,
+        _ => SanitizedPlannerStopReason::Other,
+    }
+}
+
+fn planner_result_subtype(subtype: &str) -> SanitizedPlannerResultSubtype {
+    match subtype {
+        "success" => SanitizedPlannerResultSubtype::Success,
+        "error_max_turns" | "max_turns" => SanitizedPlannerResultSubtype::MaxTurns,
+        "error_max_tokens" | "token_limit" => SanitizedPlannerResultSubtype::TokenLimit,
+        "error_during_execution" | "error" => SanitizedPlannerResultSubtype::ExecutionError,
+        "permission_denied" | "error_permission_denied" => {
+            SanitizedPlannerResultSubtype::PermissionDenied
+        }
+        _ => SanitizedPlannerResultSubtype::Other,
+    }
+}
+
+fn planner_token_usage(value: &serde_json::Value) -> Option<SanitizedPlannerTokenUsage> {
+    value.as_object()?;
+    Some(SanitizedPlannerTokenUsage {
+        input_tokens: value
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        cached_input_tokens: value
+            .get("cached_input_tokens")
+            .or_else(|| value.get("cache_read_input_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        cache_write_input_tokens: value
+            .get("cache_write_input_tokens")
+            .or_else(|| value.get("cache_creation_input_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        output_tokens: value
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        reasoning_output_tokens: value
+            .get("reasoning_output_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
+fn planner_permission_denials(
+    denials: Option<&[serde_json::Value]>,
+) -> SanitizedPlannerPermissionDenials {
+    let mut diagnostic = SanitizedPlannerPermissionDenials::default();
+    let Some(denials) = denials else {
+        return diagnostic;
+    };
+    for denial in denials {
+        diagnostic.count = diagnostic.count.saturating_add(1);
+        diagnostic.tools.increment(planner_tool_kind(
+            denial.get("tool_name").and_then(serde_json::Value::as_str),
+        ));
+    }
+    diagnostic
 }
 
 fn safe_event_type(provider: AgentKind, raw: &str) -> &'static str {
@@ -827,6 +1270,7 @@ impl PlannerSlot {
             started_at,
         )?);
         self.sanitized_record_count = 0;
+        self.attempt_diagnostic_logged = false;
         self.log_sanitized_events(&[
             SanitizedSessionEvent::ProviderLifecycle {
                 provider: sanitized_provider(self.proc.kind()),
@@ -880,6 +1324,36 @@ impl PlannerSlot {
         let event_type = safe_event_type(self.proc.kind(), raw);
         let details = SanitizedField::from_json_text(raw);
         let provider = sanitized_provider(self.proc.kind());
+        if event_type == "assistant" {
+            let mut events = vec![SanitizedSessionEvent::AssistantMessage {
+                details: details.clone(),
+            }];
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+                if let Some(blocks) = value
+                    .get("message")
+                    .and_then(|message| message.get("content"))
+                    .and_then(serde_json::Value::as_array)
+                {
+                    events.extend(
+                        blocks
+                            .iter()
+                            .filter(|block| {
+                                block.get("type").and_then(serde_json::Value::as_str)
+                                    == Some("tool_use")
+                            })
+                            .map(|block| SanitizedSessionEvent::ToolSummary {
+                                tool: planner_tool_kind(
+                                    block.get("name").and_then(serde_json::Value::as_str),
+                                ),
+                                outcome: SanitizedSummaryOutcome::Started,
+                                details: SanitizedField::from_json(block),
+                            }),
+                    );
+                }
+            }
+            self.log_sanitized_events(&events);
+            return;
+        }
         let event = match event_type {
             "thread.started" => SanitizedSessionEvent::ProviderLifecycle {
                 provider,
@@ -918,12 +1392,12 @@ impl PlannerSlot {
             }
             "tool_use" | "item.started/mcp_call" | "item.completed/mcp_call" => {
                 SanitizedSessionEvent::ToolSummary {
-                    tool: SanitizedToolKind::Other,
+                    tool: sanitized_line_tool_kind(event_type, raw),
                     outcome: summary_outcome(event_type),
                     details,
                 }
             }
-            "item.started/agent_message" | "item.completed/agent_message" | "assistant" => {
+            "item.started/agent_message" | "item.completed/agent_message" => {
                 SanitizedSessionEvent::AssistantMessage { details }
             }
             _ => SanitizedSessionEvent::ToolSummary {
@@ -939,10 +1413,30 @@ impl PlannerSlot {
         }
     }
 
+    fn log_attempt_diagnostic(&mut self) {
+        if self.session_log.is_none() || self.attempt_diagnostic_logged {
+            return;
+        }
+        let event = SanitizedSessionEvent::PlannerAttemptDiagnostic {
+            mcp: SanitizedPlannerMcpDiagnostic {
+                status: self.diagnostics.mcp_status,
+                submit_plan_advertised: self.diagnostics.submit_plan_advertised,
+            },
+            tool_histogram: self.diagnostics.tool_histogram,
+            submit_plan_calls: self.diagnostics.tool_histogram.submit_plan,
+            submit_plan_error_results: self.diagnostics.submit_plan_error_results,
+            terminal: Box::new(self.diagnostics.terminal),
+            final_assistant_message: self.diagnostics.final_assistant_message,
+        };
+        self.log_sanitized_closure_events(&[event]);
+        self.attempt_diagnostic_logged = true;
+    }
+
     fn log_provider_failure(&mut self, reason: &str) {
         if self.session_log.is_none() {
             return;
         }
+        self.log_attempt_diagnostic();
         self.log_sanitized_closure_events(&[SanitizedSessionEvent::ProviderFailure {
             provider: sanitized_provider(self.proc.kind()),
             kind: provider_failure_kind(reason),
@@ -954,6 +1448,7 @@ impl PlannerSlot {
         if self.session_log.is_none() {
             return;
         }
+        self.log_attempt_diagnostic();
         self.log_sanitized_closure_events(&[
             SanitizedSessionEvent::SemanticRejection {
                 kind: SanitizedRejectionKind::MissingSubmission,
@@ -1308,6 +1803,7 @@ async fn spawn_planner_with_timeout(
         diagnostics: PlannerDiagnostics::default(),
         session_log: None,
         sanitized_record_count: 0,
+        attempt_diagnostic_logged: false,
     })
 }
 
@@ -1340,6 +1836,15 @@ fn provider_failure_summary(slot: &PlannerSlot, reason: &str, byte_count_kind: &
             "stdout_lines": slot.diagnostics.lines,
             "event_types": slot.diagnostics.event_types,
             "terminal_response_seen": slot.diagnostics.terminal_response_seen,
+            "mcp": {
+                "status": slot.diagnostics.mcp_status,
+                "submit_plan_advertised": slot.diagnostics.submit_plan_advertised,
+            },
+            "tool_histogram": slot.diagnostics.tool_histogram,
+            "submit_plan_calls": slot.diagnostics.tool_histogram.submit_plan,
+            "submit_plan_error_results": slot.diagnostics.submit_plan_error_results,
+            "terminal": slot.diagnostics.terminal,
+            "final_assistant_message": slot.diagnostics.final_assistant_message,
             "samples": {
                 "beginning": beginning,
                 "end": end,
@@ -1878,7 +2383,7 @@ mod tests {
         let credential = "sk-planner-provider-payload-secret";
         let prompt = format!("credential-shaped prompt value: {credential}");
         let output = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
             serde_json::json!({"type":"thread.started","thread_id":"fixture-thread"}),
             serde_json::json!({"type":"turn.started"}),
             serde_json::json!({
@@ -1891,7 +2396,39 @@ mod tests {
             }),
             serde_json::json!({
                 "type":"item.completed",
-                "item":{"type":"mcp_call","id":"tool-1","tool_output":credential}
+                "item":{
+                    "type":"mcp_call",
+                    "id":"tool-1",
+                    "server":"quorum",
+                    "tool":"submit_plan",
+                    "arguments":{"payload":credential},
+                    "result":{"content":credential},
+                    "status":"completed"
+                }
+            }),
+            serde_json::json!({
+                "type":"item.completed",
+                "item":{
+                    "type":"mcp_call",
+                    "id":"tool-2",
+                    "server":"filesystem",
+                    "tool":"Read",
+                    "arguments":{"path":credential},
+                    "result":{"content":credential},
+                    "status":"completed"
+                }
+            }),
+            serde_json::json!({
+                "type":"item.completed",
+                "item":{
+                    "type":"mcp_call",
+                    "id":"tool-3",
+                    "server":credential,
+                    "tool":credential,
+                    "arguments":{"payload":credential},
+                    "result":{"content":credential},
+                    "status":"completed"
+                }
             }),
             serde_json::json!({
                 "type":"item.completed",
@@ -1937,7 +2474,8 @@ mod tests {
 
         let stream = std::fs::read_to_string(log_dir.join("stream.jsonl")).unwrap();
         let transcript = std::fs::read_to_string(log_dir.join("transcript.md")).unwrap();
-        for durable_surface in [&stream, &transcript, &summary] {
+        let meta = std::fs::read_to_string(log_dir.join("meta.json")).unwrap();
+        for durable_surface in [&stream, &transcript, &meta, &summary] {
             assert!(
                 !durable_surface.contains(credential),
                 "credential leaked into durable planner evidence: {durable_surface}"
@@ -1948,9 +2486,9 @@ mod tests {
             "raw provider JSON reached the sanitized stream: {stream}"
         );
 
-        let event_kinds = stream
+        let events = stream
             .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["event"].clone())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
             .collect::<Vec<_>>();
         for expected in [
             "provider_lifecycle",
@@ -1959,15 +2497,154 @@ mod tests {
             "tool_summary",
             "assistant_message",
             "terminal_response",
+            "planner_attempt_diagnostic",
             "provider_failure",
             "semantic_rejection",
             "completion",
         ] {
             assert!(
-                event_kinds.iter().any(|kind| kind == expected),
+                events.iter().any(|event| event["event"] == expected),
                 "missing sanitized {expected} event: {stream}"
             );
         }
+        assert!(events
+            .iter()
+            .any(|event| { event["event"] == "tool_summary" && event["tool"] == "submit_plan" }));
+        assert!(events
+            .iter()
+            .any(|event| { event["event"] == "tool_summary" && event["tool"] == "read" }));
+        assert!(events
+            .iter()
+            .any(|event| { event["event"] == "tool_summary" && event["tool"] == "other" }));
+
+        let diagnostic = events
+            .iter()
+            .find(|event| event["event"] == "planner_attempt_diagnostic")
+            .unwrap();
+        assert_eq!(diagnostic["mcp"]["status"], "absent");
+        assert_eq!(diagnostic["mcp"]["submit_plan_advertised"], false);
+        assert_eq!(diagnostic["tool_histogram"]["submit_plan"], 1);
+        assert_eq!(diagnostic["tool_histogram"]["read"], 1);
+        assert_eq!(diagnostic["tool_histogram"]["other"], 1);
+        assert_eq!(diagnostic["submit_plan_calls"], 1);
+        assert_eq!(diagnostic["submit_plan_error_results"], 0);
+        assert_eq!(diagnostic["terminal"]["result_subtype"], "success");
+        assert_eq!(diagnostic["terminal"]["error"], false);
+        assert_eq!(
+            diagnostic["final_assistant_message"]["bytes"],
+            credential.len()
+        );
+        assert_eq!(diagnostic["final_assistant_message"]["plan_shaped"], false);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_planner_log_allowlists_tools_and_retains_closure_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = "planner-session-payload-must-not-persist";
+        let output = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            serde_json::json!({
+                "type": "system",
+                "subtype": "init",
+                "mcp_servers": [{"name": "quorum", "status": "connected"}],
+                "tools": [super::super::runner::PLANNER_MCP_ALLOWED_TOOL],
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "tool_use", "id": "read-call", "name": "Read", "input": {"path": sentinel}},
+                    {"type": "tool_use", "id": "submit-call", "name": super::super::runner::PLANNER_MCP_ALLOWED_TOOL, "input": {"payload": sentinel}},
+                    {"type": "tool_use", "id": "unknown-call", "name": sentinel, "input": {"payload": sentinel}},
+                ]},
+            }),
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "submit-call",
+                    "is_error": true,
+                    "content": sentinel,
+                }]},
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": sentinel}]},
+            }),
+            serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "stop_reason": "end_turn",
+                "is_error": false,
+                "num_turns": 4,
+                "duration_ms": 321,
+                "usage": {"input_tokens": 20, "output_tokens": 5},
+                "permission_denials": [],
+                "result": sentinel,
+            }),
+        );
+        let mut slot = spawn_fake_claude(dir.path(), &output).await;
+        slot.start_session_log(
+            dir.path(),
+            "decomposition-planner-test",
+            42,
+            "session",
+            "frozen-base",
+            1,
+        )
+        .unwrap();
+        let log_dir = slot.log_dir().unwrap().to_path_buf();
+
+        let turn_end = poll_to_terminal(&mut slot).await;
+        assert!(matches!(
+            planner_outcome(&mut slot, turn_end, None),
+            PlannerPoll::ProviderFailed(_)
+        ));
+
+        let stream = std::fs::read_to_string(log_dir.join("stream.jsonl")).unwrap();
+        let transcript = std::fs::read_to_string(log_dir.join("transcript.md")).unwrap();
+        let meta = std::fs::read_to_string(log_dir.join("meta.json")).unwrap();
+        for durable_surface in [&stream, &transcript, &meta] {
+            assert!(
+                !durable_surface.contains(sentinel),
+                "provider payload entered a planner session log: {durable_surface}"
+            );
+        }
+
+        let events = stream
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        for expected_tool in ["read", "submit_plan", "other"] {
+            assert!(events.iter().any(|event| {
+                event["event"] == "tool_summary" && event["tool"] == expected_tool
+            }));
+        }
+        let diagnostic = events
+            .iter()
+            .find(|event| event["event"] == "planner_attempt_diagnostic")
+            .unwrap();
+        assert_eq!(diagnostic["mcp"]["status"], "connected");
+        assert_eq!(diagnostic["mcp"]["submit_plan_advertised"], true);
+        assert_eq!(diagnostic["tool_histogram"]["read"], 1);
+        assert_eq!(diagnostic["tool_histogram"]["submit_plan"], 1);
+        assert_eq!(diagnostic["tool_histogram"]["other"], 1);
+        assert_eq!(diagnostic["submit_plan_calls"], 1);
+        assert_eq!(diagnostic["submit_plan_error_results"], 1);
+        assert_eq!(diagnostic["terminal"]["stop_reason"], "end_turn");
+        assert_eq!(diagnostic["terminal"]["result_subtype"], "success");
+        assert_eq!(diagnostic["terminal"]["turn_count"], 4);
+        assert_eq!(diagnostic["terminal"]["error"], false);
+        assert_eq!(diagnostic["terminal"]["duration_ms"], 321);
+        assert_eq!(diagnostic["terminal"]["usage"]["input_tokens"], 20);
+        assert_eq!(diagnostic["terminal"]["usage"]["output_tokens"], 5);
+        assert_eq!(
+            diagnostic["final_assistant_message"]["bytes"],
+            sentinel.len()
+        );
+        assert_eq!(diagnostic["final_assistant_message"]["plan_shaped"], false);
+
         slot.kill_and_reap().await;
     }
 
@@ -2020,6 +2697,7 @@ mod tests {
         assert_eq!(events.len(), MAX_SANITIZED_RECORDS_PER_SESSION);
         for expected in [
             "terminal_response",
+            "planner_attempt_diagnostic",
             "semantic_rejection",
             "provider_failure",
             "completion",
@@ -2109,6 +2787,14 @@ mod tests {
                 .count(),
             1,
             "the reserved provider-failure record must survive the progress cap"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "planner_attempt_diagnostic")
+                .count(),
+            1,
+            "the attempt diagnostic must survive the progress cap"
         );
         let completions = events
             .iter()
@@ -2873,6 +3559,325 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn planner_failure_diagnostics_report_all_mcp_attachment_states() {
+        let cases = [
+            (
+                "connected",
+                serde_json::json!([{"name": "quorum", "status": "connected"}]),
+                serde_json::json!([super::super::runner::PLANNER_MCP_ALLOWED_TOOL]),
+                true,
+            ),
+            (
+                "failed",
+                serde_json::json!([{"name": "quorum", "status": "failed"}]),
+                serde_json::json!([]),
+                false,
+            ),
+            (
+                "absent",
+                serde_json::json!([{"name": "unrelated-server", "status": "connected"}]),
+                serde_json::json!(["Read"]),
+                false,
+            ),
+        ];
+
+        for (expected_status, mcp_servers, tools, expected_advertised) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let output = claude_stream(&[serde_json::json!({
+                "type": "system",
+                "subtype": "init",
+                "mcp_servers": mcp_servers,
+                "tools": tools,
+            })]);
+            let mut slot = spawn_fake_claude(dir.path(), &output).await;
+            let turn_end = poll_to_terminal(&mut slot).await;
+            let PlannerPoll::ProviderFailed(summary) = planner_outcome(&mut slot, turn_end, None)
+            else {
+                panic!("missing submit_plan must fail");
+            };
+            let diagnostic: serde_json::Value = serde_json::from_str(&summary).unwrap();
+            assert_eq!(
+                diagnostic["planner_diagnostic"]["mcp"]["status"],
+                expected_status
+            );
+            assert_eq!(
+                diagnostic["planner_diagnostic"]["mcp"]["submit_plan_advertised"],
+                expected_advertised
+            );
+            slot.kill_and_reap().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_failure_diagnostic_identifies_plan_shaped_final_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_message = serde_json::json!({
+            "outcome": "plan",
+            "tasks": [task("core", &[]), task("daemon", &["core"])]
+        })
+        .to_string();
+        let output = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({
+                "type": "system",
+                "subtype": "init",
+                "mcp_servers": [{"name": "quorum", "status": "connected"}],
+                "tools": [super::super::runner::PLANNER_MCP_ALLOWED_TOOL],
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": final_message}]},
+            }),
+            serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "stop_reason": "end_turn",
+                "is_error": false,
+                "num_turns": 7,
+                "duration_ms": 1234,
+                "usage": {
+                    "input_tokens": 100,
+                    "cache_read_input_tokens": 80,
+                    "cache_creation_input_tokens": 10,
+                    "output_tokens": 25,
+                },
+                "permission_denials": [],
+                "result": "",
+            }),
+        );
+        let mut slot = spawn_fake_claude(dir.path(), &output).await;
+        let turn_end = poll_to_terminal(&mut slot).await;
+        let PlannerPoll::ProviderFailed(summary) = planner_outcome(&mut slot, turn_end, None)
+        else {
+            panic!("text-only plan must fail");
+        };
+        let diagnostic: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        let planner = &diagnostic["planner_diagnostic"];
+        assert_eq!(planner["submit_plan_calls"], 0);
+        assert_eq!(planner["submit_plan_error_results"], 0);
+        assert_eq!(
+            planner["final_assistant_message"]["bytes"],
+            final_message.len()
+        );
+        assert_eq!(planner["final_assistant_message"]["plan_shaped"], true);
+        assert_eq!(planner["terminal"]["stop_reason"], "end_turn");
+        assert_eq!(planner["terminal"]["result_subtype"], "success");
+        assert_eq!(planner["terminal"]["turn_count"], 7);
+        assert_eq!(planner["terminal"]["error"], false);
+        assert_eq!(planner["terminal"]["duration_ms"], 1234);
+        assert_eq!(planner["terminal"]["usage"]["input_tokens"], 100);
+        assert_eq!(planner["terminal"]["usage"]["cached_input_tokens"], 80);
+        assert_eq!(planner["terminal"]["usage"]["cache_write_input_tokens"], 10);
+        assert_eq!(planner["terminal"]["usage"]["output_tokens"], 25);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_failure_summary_counts_rejected_submit_plan_without_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = "planner-payload-sentinel-must-not-persist";
+        let output = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            serde_json::json!({
+                "type": "system",
+                "subtype": "init",
+                "mcp_servers": [
+                    {"name": "quorum", "status": "connected"},
+                    {"name": sentinel, "status": "connected"},
+                ],
+                "tools": [super::super::runner::PLANNER_MCP_ALLOWED_TOOL, sentinel],
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "tool_use", "id": "submit-call", "name": super::super::runner::PLANNER_MCP_ALLOWED_TOOL, "input": {"payload": sentinel}},
+                    {"type": "tool_use", "id": "unknown-call", "name": sentinel, "input": {"payload": sentinel}},
+                ]},
+            }),
+            serde_json::json!({
+                "type": "user",
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "submit-call",
+                    "is_error": true,
+                    "content": sentinel,
+                }]},
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": sentinel}]},
+            }),
+            serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "is_error": false,
+                "num_turns": 3,
+                "duration_ms": 900,
+                "usage": {"input_tokens": 20, "output_tokens": 5},
+                "permission_denials": [
+                    {"tool_name": "Read", "tool_input": {"path": sentinel}},
+                    {"tool_name": sentinel, "tool_input": {"payload": sentinel}},
+                ],
+                "result": sentinel,
+            }),
+        );
+        let mut slot = spawn_fake_claude(dir.path(), &output).await;
+        let turn_end = poll_to_terminal(&mut slot).await;
+        let PlannerPoll::ProviderFailed(summary) = planner_outcome(&mut slot, turn_end, None)
+        else {
+            panic!("rejected submission must not become a plan");
+        };
+        assert!(
+            !summary.contains(sentinel),
+            "provider payload entered failure summary: {summary}"
+        );
+        let diagnostic: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        let planner = &diagnostic["planner_diagnostic"];
+        assert_eq!(planner["submit_plan_calls"], 1);
+        assert_eq!(planner["submit_plan_error_results"], 1);
+        assert_eq!(planner["tool_histogram"]["submit_plan"], 1);
+        assert_eq!(planner["tool_histogram"]["other"], 1);
+        assert_eq!(planner["terminal"]["permission_denials"]["count"], 2);
+        assert_eq!(
+            planner["terminal"]["permission_denials"]["tools"]["read"],
+            1
+        );
+        assert_eq!(
+            planner["terminal"]["permission_denials"]["tools"]["other"],
+            1
+        );
+        assert_eq!(planner["final_assistant_message"]["plan_shaped"], false);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_failure_diagnostic_maps_turn_and_token_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "result",
+                "subtype": "error_max_turns",
+                "stop_reason": "max_tokens",
+                "is_error": true,
+                "num_turns": 36,
+                "duration_ms": 4567,
+                "usage": {
+                    "input_tokens": 500,
+                    "cache_read_input_tokens": 400,
+                    "cache_creation_input_tokens": 30,
+                    "output_tokens": 75,
+                },
+                "permission_denials": [],
+            }),
+        );
+        let mut slot = spawn_fake_claude(dir.path(), &output).await;
+        let outcome = poll_to_terminal(&mut slot).await;
+        let diagnostic = failure_json(&outcome);
+        let terminal = &diagnostic["planner_diagnostic"]["terminal"];
+        assert_eq!(terminal["stop_reason"], "token_limit");
+        assert_eq!(terminal["result_subtype"], "max_turns");
+        assert_eq!(terminal["turn_count"], 36);
+        assert_eq!(terminal["error"], true);
+        assert_eq!(terminal["duration_ms"], 4567);
+        assert_eq!(terminal["usage"]["input_tokens"], 500);
+        assert_eq!(terminal["usage"]["output_tokens"], 75);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_failure_diagnostic_counts_tool_starts_before_early_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "id": "command-1",
+                    "status": "in_progress",
+                },
+            }),
+            serde_json::json!({
+                "type": "item.started",
+                "item": {
+                    "type": "file_change",
+                    "id": "file-1",
+                    "status": "in_progress",
+                },
+            }),
+        );
+        let mut slot = spawn_fake_codex(dir.path(), &output).await;
+        let outcome = poll_to_terminal(&mut slot).await;
+        let diagnostic = failure_json(&outcome);
+        let histogram = &diagnostic["planner_diagnostic"]["tool_histogram"];
+        assert_eq!(histogram["bash"], 1);
+        assert_eq!(histogram["edit"], 1);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_failure_diagnostic_counts_started_and_completed_tools_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = [
+            serde_json::json!({
+                "type": "item.started",
+                "item": {
+                    "type": "command_execution",
+                    "id": "command-1",
+                    "status": "in_progress",
+                },
+            }),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "type": "command_execution",
+                    "id": "command-1",
+                    "status": "completed",
+                },
+            }),
+            serde_json::json!({
+                "type": "item.started",
+                "item": {
+                    "type": "file_change",
+                    "id": "file-1",
+                    "status": "in_progress",
+                },
+            }),
+            serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "type": "file_change",
+                    "id": "file-1",
+                    "status": "completed",
+                },
+            }),
+            serde_json::json!({"type": "turn.completed"}),
+        ]
+        .into_iter()
+        .map(|event| event.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let mut slot = spawn_fake_codex(dir.path(), &(output + "\n")).await;
+        let turn_end = poll_to_terminal(&mut slot).await;
+        let PlannerPoll::ProviderFailed(summary) = planner_outcome(&mut slot, turn_end, None)
+        else {
+            panic!("missing submit_plan must fail");
+        };
+        let diagnostic: serde_json::Value = serde_json::from_str(&summary).unwrap();
+        let histogram = &diagnostic["planner_diagnostic"]["tool_histogram"];
+        assert_eq!(histogram["bash"], 1);
+        assert_eq!(histogram["edit"], 1);
+        slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn codex_planner_accepts_changed_unclassified_stderr_before_clean_terminal() {
         let response = serde_json::json!({
             "outcome": "plan",
@@ -3280,6 +4285,83 @@ mod tests {
             slot.kill_and_reap().await;
             assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
         }
+
+        // `try_wait` reaps the shell leader, which makes `Child::id()` return
+        // `None`. Its background child still owns the group's stdout/stderr,
+        // so teardown must use the spawn-time process-group ID rather than
+        // the reaped leader's ID.
+        let dir = tempfile::tempdir().unwrap();
+        let child_pid_path = dir.path().join("codex-child.pid");
+        let runner = executable_script(
+            dir.path(),
+            "codex",
+            &format!(
+                "sleep 30 &\nprintf '%s\\n' \"$!\" > '{}'\nexit 0",
+                child_pid_path.display()
+            ),
+        );
+        let mut slot = spawn_planner(
+            AgentKind::Codex,
+            CODEX_PLANNER_MODEL,
+            PLANNER_EFFORT,
+            dir.path(),
+            "bounded prompt",
+            false,
+            runner.to_str(),
+            None,
+        )
+        .await
+        .unwrap();
+        let child_pid = tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&child_pid_path) {
+                    if let Ok(pid) = pid.trim().parse::<libc::pid_t>() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Codex fixture did not record its child PID");
+        tokio::time::timeout(TEST_BOUNDARY_TIMEOUT, async {
+            loop {
+                if slot.proc.try_wait().unwrap().is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Codex fixture leader did not exit");
+        assert_eq!(
+            unsafe { libc::kill(child_pid, 0) },
+            0,
+            "fixture child exited early"
+        );
+
+        if tokio::time::timeout(Duration::from_secs(5), slot.kill_and_reap())
+            .await
+            .is_err()
+        {
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+            }
+            panic!("Codex teardown did not promptly kill the leader's child");
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if unsafe { libc::kill(child_pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Codex teardown left the leader's child running");
     }
 
     #[tokio::test]
@@ -3623,7 +4705,7 @@ mod tests {
             body: Some("preserve atomicity"),
             dependencies: &dependencies,
         };
-        let prompt = build_prompt(&source, &[]);
+        let prompt = build_prompt(&source, &[], &[]);
         assert!(prompt.contains("do not omit, rename, or add fields"));
         assert!(prompt.contains(r#""implementation_delta":"<new-code-or-documentation-change>""#));
         assert!(prompt.contains(r#""affected_paths":["<repo-relative-path-or-narrow-pattern>"]"#));
@@ -3667,6 +4749,29 @@ mod tests {
         assert!(prompt.contains("The daemon adds it deterministically"));
     }
 
+    #[test]
+    fn planner_prompt_includes_source_risks_for_decomposition_seams() {
+        let source = PlanningSource {
+            task_id: 7,
+            revision: 2,
+            title: "large outcome",
+            body: Some("preserve atomicity"),
+            dependencies: &[],
+        };
+        let risks = vec![quorum_core::risk::RiskFlag {
+            flag: quorum_core::risk::RiskFlagName::ManyConsumers,
+            evidence: "Several consumers must change together.".into(),
+        }];
+
+        let prompt = build_prompt(&source, &risks, &[]);
+
+        assert!(prompt.contains("Risks in source:"));
+        assert!(prompt.contains("many_consumers"));
+        assert!(prompt.contains("Several consumers must change together."));
+        assert!(prompt.contains("split along those seams"));
+        assert!(prompt.contains("Children are classified fresh"));
+    }
+
     /// The prompt must send the plan through the tool, not the transcript. The
     /// old "one JSON object" instruction is the failure mode this batch removed:
     /// conversational providers prefixed prose and lost a whole attempt.
@@ -3680,7 +4785,7 @@ mod tests {
             body: Some("preserve atomicity"),
             dependencies: &dependencies,
         };
-        let prompt = build_prompt(&source, &[]);
+        let prompt = build_prompt(&source, &[], &[]);
         assert!(!prompt.contains("Return exactly one valid JSON object"));
         assert!(!prompt.contains("Use no markdown or commentary"));
         assert!(prompt.contains(
@@ -3757,6 +4862,7 @@ mod tests {
         };
         let prompt = build_prompt(
             &source,
+            &[],
             &[
                 "cycle detected".into(),
                 "bad field".into(),

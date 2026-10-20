@@ -51,7 +51,7 @@ pub struct RoutingPolicy {
 impl RoutingPolicy {
     /// Effective Arbiter routing pool. An unset `[routing.arbiter]` block
     /// (empty map) falls back to the planner pool, so the Arbiter resolves to
-    /// the same Claude Opus 4.8 model the planner uses unless an operator
+    /// the same model profile distribution as the planner unless an operator
     /// configures an explicit override. Dormant: no runtime path resolves an
     /// Arbiter assignment yet.
     pub fn arbiter_pool(&self) -> &PercentagePool {
@@ -134,7 +134,7 @@ macro_rules! declare_serve_file_config {
         /// Deserializable TOML config for `quorum serve`. Every field is optional —
         /// missing fields fall back to built-in defaults; CLI flags override everything.
         #[derive(Debug, Default, Deserialize)]
-        #[serde(deny_unknown_fields)]
+        #[serde(default, deny_unknown_fields)]
         pub struct ServeFileConfig {
             $(
                 $(#[$meta])*
@@ -208,6 +208,9 @@ declare_serve_file_config! {
     sha_poll_interval_secs: Option<u64>,
     repo: Option<String>,
     base_branch: Option<String>,
+    /// Directed source/target branch pairs eligible for daemon branch sync.
+    /// Empty is the safe default: no pair can be enqueued until an owner opts in.
+    sync_pairs: Vec<[String; 2]>,
     self_update_branch: Option<String>,
     merge_checks_timeout_secs: Option<u64>,
     merge_checks_poll_secs: Option<u64>,
@@ -294,6 +297,7 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("sha_poll_interval_secs", ConfigKeyDisposition::Runtime),
     ("repo", ConfigKeyDisposition::Runtime),
     ("base_branch", ConfigKeyDisposition::Runtime),
+    ("sync_pairs", ConfigKeyDisposition::Runtime),
     ("self_update_branch", ConfigKeyDisposition::Runtime),
     ("merge_checks_timeout_secs", ConfigKeyDisposition::Runtime),
     ("merge_checks_poll_secs", ConfigKeyDisposition::Runtime),
@@ -600,6 +604,7 @@ pub fn load(path: &Path, explicit: bool) -> Result<ServeFileConfig> {
             })?;
             resolve_grok_adapter(cfg.grok.as_ref())?;
             validate_model_routing(&cfg)?;
+            validate_sync_pairs(&cfg.sync_pairs)?;
             resolve_resource_monitor_config(&cfg)?;
             warn_for_deprecated_keys(&s)?;
             Ok(cfg)
@@ -959,6 +964,21 @@ pub fn validate_r2_sampling(target_per_stratum: i64, steady_state_p: f64) -> Res
 pub fn validate_max_rework(max_rework: u32) -> Result<()> {
     if max_rework == 0 {
         return Err(QuorumError::Usage("max_rework must be >= 1 (got 0)".into()));
+    }
+    Ok(())
+}
+
+/// Validate the owner-configured directed branch-sync pairs. The same branch
+/// rules as task targets apply, and self-sync is never meaningful.
+pub fn validate_sync_pairs(sync_pairs: &[[String; 2]]) -> Result<()> {
+    for [from, to] in sync_pairs {
+        quorum_core::tasks::validate_target_branch(from)?;
+        quorum_core::tasks::validate_target_branch(to)?;
+        if from == to {
+            return Err(QuorumError::Usage(format!(
+                "sync_pairs entry {from:?} -> {to:?} must name two distinct branches"
+            )));
+        }
     }
     Ok(())
 }
@@ -1494,6 +1514,28 @@ pub fn task_create_base_branch(repo: &str) -> Result<String> {
     Ok(config.base_branch.unwrap_or_else(|| "main".into()))
 }
 
+/// Read the configured directed branch-sync pairs for one repository without
+/// requiring daemon-only model-routing configuration. This is the public CLI's
+/// authorization boundary for `quorum branch-sync`.
+pub fn branch_sync_pairs(repo: &str) -> Result<Vec<[String; 2]>> {
+    let path = default_config_path(repo)?;
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(QuorumError::Io(format!(
+                "cannot read serve config {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let config: ServeFileConfig = toml::from_str(&contents).map_err(|error| {
+        QuorumError::Usage(format!("bad serve config {}: {error}", path.display()))
+    })?;
+    validate_sync_pairs(&config.sync_pairs)?;
+    Ok(config.sync_pairs)
+}
+
 /// Resolve the rework ceiling that a supported non-daemon classification writer
 /// (currently `quorum classify --backfill`) must stamp when it makes a task
 /// newly dispatchable.
@@ -1788,6 +1830,15 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
 
     #[test]
     fn grok_transport_configuration_is_closed_and_validated() {
+        assert_eq!(
+            resolve_grok_adapter(None).unwrap(),
+            GrokResolvedConfig {
+                sandbox: crate::serve::grok_agent::DEFAULT_SANDBOX.into(),
+                permission_mode: crate::serve::grok_agent::DEFAULT_PERMISSION_MODE.into(),
+                max_turns: crate::serve::grok_agent::DEFAULT_MAX_TURNS,
+            }
+        );
+
         let cfg: ServeFileConfig = toml::from_str(
             "[grok]\nsandbox = \"off\"\npermission_mode = \"bypassPermissions\"\nmax_turns = 12\n",
         )
@@ -2403,6 +2454,9 @@ worktree_base = "/tmp/wt"
 
     #[test]
     fn suggested_models_accepts_every_closed_tier_at_supported_efforts() {
+        assert!(quorum_core::model_tiers::MODEL_TIERS
+            .iter()
+            .any(|tier| tier.tier == "opus-55" && tier.model_id == "claude-opus-5-5"));
         let mut selections = std::collections::HashMap::new();
         for (index, tier) in quorum_core::model_tiers::MODEL_TIERS.iter().enumerate() {
             selections.insert(
@@ -2448,7 +2502,7 @@ worktree_base = "/tmp/wt"
             assert_eq!(err.exit_code(), 2, "{model}: {err}");
             assert!(
                 err.to_string()
-                    .contains("expected Claude tier: sonnet-5|opus-46|opus-47|opus-48"),
+                    .contains("expected Claude tier: sonnet-5|opus-46|opus-47|opus-48|opus-55"),
                 "{model}: {err}"
             );
         }
@@ -2503,9 +2557,31 @@ worktree_base = "/tmp/wt"
         let cfg: ServeFileConfig = toml::from_str(crate::DEFAULT_SERVE_TOML).unwrap();
         assert!(cfg.cap.is_none());
         assert!(cfg.r2_enabled.is_none());
+        assert!(cfg.sync_pairs.is_empty());
         assert!(cfg.model_profiles.is_some());
         assert!(cfg.routing.is_some());
         validate_model_routing(&cfg).unwrap();
+    }
+
+    #[test]
+    fn sync_pairs_are_empty_by_default_and_validate_as_directed_branch_pairs() {
+        validate_sync_pairs(&ServeFileConfig::default().sync_pairs).unwrap();
+        let configured: ServeFileConfig =
+            toml::from_str("sync_pairs = [[\"main\", \"develop\"]]\n").unwrap();
+        assert_eq!(
+            configured.sync_pairs,
+            vec![["main".to_string(), "develop".to_string()]]
+        );
+        validate_sync_pairs(&configured.sync_pairs).unwrap();
+
+        for source in [
+            "sync_pairs = [[\"main\", \"main\"]]\n",
+            "sync_pairs = [[\"-not-a-branch\", \"develop\"]]\n",
+        ] {
+            let config: ServeFileConfig = toml::from_str(source).unwrap();
+            let error = validate_sync_pairs(&config.sync_pairs).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{error}");
+        }
     }
 
     #[test]

@@ -22,9 +22,40 @@ pub struct WorktreeManager {
     local_timeout: Duration,
 }
 
+#[derive(Debug)]
+struct WorktreeRegistration {
+    path: PathBuf,
+    locked_reason: Option<String>,
+}
+
+/// A GC candidate must be a direct child of the configured base. Resolve the
+/// parent rather than the candidate so a missing stale registration can still
+/// be checked without following a path outside that base.
+fn is_direct_child_of(worktree_base: &Path, path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    match (
+        std::fs::canonicalize(worktree_base),
+        std::fs::canonicalize(parent),
+    ) {
+        (Ok(base), Ok(parent)) => base == parent && path.file_name().is_some(),
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContinuationBaseMerge {
     Clean,
+    Conflicted,
+}
+
+/// The one clean-path merge outcome a branch synchronization persists. A
+/// conflict intentionally leaves the worktree and Git's merge state intact
+/// for the later judgment-required path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncMerge {
+    Clean { merge_sha: String },
     Conflicted,
 }
 
@@ -34,6 +65,19 @@ pub enum ContinuationBaseMerge {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DependencyBaseVerification {
     Verified { base_sha: String },
+    Missing { merge_commit_sha: String },
+}
+
+/// Result of verifying that an existing dependent branch already contains
+/// every done dependency's merge commit. Used at resume/replay to test
+/// dependency inclusion by ancestry instead of tip-equality with the
+/// (moving) base. `NotFound` means the branch has no local or remote head;
+/// the caller may then treat provisioning as a fresh cut from the verified
+/// base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchAncestryVerification {
+    Verified,
+    NotFound,
     Missing { merge_commit_sha: String },
 }
 
@@ -158,7 +202,9 @@ async fn run_git_with_limit(
     pipe_limit: usize,
     label: &str,
 ) -> Result<std::process::Output, String> {
-    cmd.kill_on_drop(true)
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|error| format!("{label}: {error}"))?;
@@ -260,7 +306,12 @@ async fn run_git_with_input(
 ) -> Result<std::process::Output, String> {
     tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
-        cmd.kill_on_drop(true).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = cmd.spawn().map_err(|e| format!("{label}: {e}"))?;
         let stdout = child.stdout.take().ok_or_else(|| format!("{label}: stdout unavailable"))?;
         let stderr = child.stderr.take().ok_or_else(|| format!("{label}: stderr unavailable"))?;
@@ -763,6 +814,141 @@ impl WorktreeManager {
         Ok(DependencyBaseVerification::Verified { base_sha })
     }
 
+    /// Recover a GitHub-style merge commit from the fetched target branch when
+    /// GitHub reports a PR as merged before its `mergeCommit` metadata has
+    /// propagated. This is deliberately a bounded, read-only lookup from the
+    /// caller's perspective: it refreshes only the tracking ref and never
+    /// allocates a branch or worktree.
+    pub async fn find_merged_pr_commit(
+        &self,
+        repo_dir: &Path,
+        base_branch: &str,
+        pr_number: i64,
+    ) -> Result<Option<String>, String> {
+        if pr_number <= 0 {
+            return Err("PR number must be positive".into());
+        }
+        let _guard = self.lock.lock().await;
+        let remote_ref = format!("refs/heads/{base_branch}");
+        let tracking_ref = format!("refs/remotes/origin/{base_branch}");
+        let refspec = format!("+{remote_ref}:{tracking_ref}");
+        let mut fetch = self.git_cmd(repo_dir);
+        fetch.args(["fetch", "origin", &refspec]);
+        let fetched = run_git(
+            fetch,
+            self.fetch_timeout,
+            "git fetch dependency merge lookup",
+        )
+        .await?;
+        if !fetched.status.success() {
+            return Err(format!(
+                "git fetch origin {remote_ref} failed: {}",
+                git_diagnostic(&fetched.stderr)
+            ));
+        }
+
+        let base_ref = format!("origin/{base_branch}");
+        // The GitHub-created merge subject carries the PR number as a complete
+        // token. Do not use a substring such as `#79`: it could select #799
+        // and incorrectly attest an unrelated dependency merge.
+        let marker = format!("^Merge pull request #{pr_number} from ");
+        let mut log = self.git_cmd(repo_dir);
+        log.args([
+            "log",
+            "--merges",
+            "--format=%H",
+            "--max-count=1",
+            "--extended-regexp",
+            "--grep",
+            &marker,
+            &base_ref,
+        ]);
+        let output = run_git(log, self.local_timeout, "git find dependency PR merge").await?;
+        if !output.status.success() {
+            return Err(format!(
+                "git log merge lookup failed: {}",
+                git_diagnostic(&output.stderr)
+            ));
+        }
+        let sha = git_diagnostic(&output.stdout);
+        Ok((!sha.is_empty()).then_some(sha))
+    }
+
+    /// Resolve `branch` (preferring the local ref, then `origin/<branch>`)
+    /// and verify every `merge_commits` entry is an ancestor of that head.
+    /// Base staleness is a merge-time concern, so at resume the correct test
+    /// is whether the branch itself already contains the dependency merges,
+    /// not whether its recorded provenance equals the current base tip.
+    pub async fn verify_branch_contains_commits(
+        &self,
+        repo_dir: &Path,
+        branch: &str,
+        merge_commits: &[String],
+    ) -> Result<BranchAncestryVerification, String> {
+        let _guard = self.lock.lock().await;
+        let head_sha = match self
+            .resolve_ref_unlocked(repo_dir, &format!("refs/heads/{branch}"))
+            .await?
+        {
+            Some(sha) => sha,
+            None => match self
+                .resolve_ref_unlocked(repo_dir, &format!("refs/remotes/origin/{branch}"))
+                .await?
+            {
+                Some(sha) => sha,
+                None => return Ok(BranchAncestryVerification::NotFound),
+            },
+        };
+        for merge_commit_sha in merge_commits {
+            let mut cmd = self.git_cmd(repo_dir);
+            cmd.args(["merge-base", "--is-ancestor", merge_commit_sha, &head_sha]);
+            let out = run_git(
+                cmd,
+                self.local_timeout,
+                "git verify branch dependency ancestry",
+            )
+            .await?;
+            if out.status.success() {
+                continue;
+            }
+            // Exit 1 = not an ancestor; 128 = object not in this repo (the
+            // dependency merge SHA was never fetched into the daemon clone).
+            // Either way the branch does not durably contain the dependency;
+            // the caller parks with the named commit rather than reusing it.
+            if matches!(out.status.code(), Some(1) | Some(128)) {
+                return Ok(BranchAncestryVerification::Missing {
+                    merge_commit_sha: merge_commit_sha.clone(),
+                });
+            }
+            return Err(format!(
+                "cannot verify dependency merge commit {merge_commit_sha} against {branch}@{head_sha}: {}",
+                git_diagnostic(&out.stderr)
+            ));
+        }
+        Ok(BranchAncestryVerification::Verified)
+    }
+
+    async fn resolve_ref_unlocked(
+        &self,
+        repo_dir: &Path,
+        reference: &str,
+    ) -> Result<Option<String>, String> {
+        let mut cmd = self.git_cmd(repo_dir);
+        cmd.args(["rev-parse", "--verify", reference]);
+        let out = run_git(cmd, self.local_timeout, "git rev-parse branch resolve").await?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let sha = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .to_ascii_lowercase();
+        if sha.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(sha))
+        }
+    }
+
     /// Refresh and merge the configured base into an exact continuation PR
     /// checkout. A content conflict is a prepared worker state, not a setup
     /// failure: Git leaves `MERGE_HEAD` plus the index/worktree conflicts for
@@ -799,24 +985,7 @@ impl WorktreeManager {
             return Ok(ContinuationBaseMerge::Clean);
         }
 
-        let mut merge_head = self.git_cmd(worktree_dir);
-        merge_head.args(["rev-parse", "--verify", "MERGE_HEAD"]);
-        let merge_head = run_git(
-            merge_head,
-            self.local_timeout,
-            "git verify continuation merge conflict",
-        )
-        .await?;
-        let mut conflicts = self.git_cmd(worktree_dir);
-        conflicts.args(["diff", "--name-only", "--diff-filter=U"]);
-        let conflicts = run_git(
-            conflicts,
-            self.local_timeout,
-            "git list continuation merge conflicts",
-        )
-        .await?;
-        if merge_head.status.success() && conflicts.status.success() && !conflicts.stdout.is_empty()
-        {
+        if self.is_merge_conflict_unlocked(worktree_dir).await? {
             Ok(ContinuationBaseMerge::Conflicted)
         } else {
             Err(format!(
@@ -824,6 +993,344 @@ impl WorktreeManager {
                 git_diagnostic(&merged.stderr)
             ))
         }
+    }
+
+    /// Fetch both configured sync branches and return their exact remote
+    /// commit IDs. This is the sole pinning read; callers persist the result
+    /// only after this method releases the worktree lock.
+    pub async fn fetch_sync_tips(
+        &self,
+        repo_dir: &Path,
+        source_branch: &str,
+        target_branch: &str,
+    ) -> Result<(String, String), String> {
+        let _guard = self.lock.lock().await;
+        let source_ref = format!("+refs/heads/{source_branch}:refs/remotes/origin/{source_branch}");
+        let target_ref = format!("+refs/heads/{target_branch}:refs/remotes/origin/{target_branch}");
+        let mut fetch = self.git_cmd(repo_dir);
+        fetch.args(["fetch", "origin", &source_ref, &target_ref]);
+        let fetched = run_git(fetch, self.fetch_timeout, "git fetch branch sync refs").await?;
+        if !fetched.status.success() {
+            return Err(format!(
+                "git fetch origin {source_branch} {target_branch} failed: {}",
+                git_diagnostic(&fetched.stderr)
+            ));
+        }
+
+        let source_sha = self
+            .resolve_sync_tip_unlocked(repo_dir, source_branch, source_branch, target_branch)
+            .await?;
+        let target_sha = self
+            .resolve_sync_tip_unlocked(repo_dir, target_branch, source_branch, target_branch)
+            .await?;
+        Ok((source_sha, target_sha))
+    }
+
+    async fn resolve_sync_tip_unlocked(
+        &self,
+        repo_dir: &Path,
+        branch: &str,
+        source_branch: &str,
+        target_branch: &str,
+    ) -> Result<String, String> {
+        let mut resolve = self.git_cmd(repo_dir);
+        let reference = format!("refs/remotes/origin/{branch}^{{commit}}");
+        resolve.args(["rev-parse", "--verify", &reference]);
+        let out = run_git(resolve, self.local_timeout, "git rev-parse branch sync tip").await?;
+        let sha = git_diagnostic(&out.stdout);
+        if !out.status.success() || sha.is_empty() {
+            return Err(format!(
+                "git fetch origin {source_branch} {target_branch} did not resolve origin/{branch}: {}",
+                git_diagnostic(&out.stderr)
+            ));
+        }
+        Ok(sha)
+    }
+
+    /// Check the pinned no-op condition without updating remote refs or
+    /// allocating a branch. Exit 1 from merge-base is the expected divergent
+    /// outcome; every other non-zero result is a loud Git failure.
+    pub async fn source_is_ancestor_of_target(
+        &self,
+        repo_dir: &Path,
+        source_sha: &str,
+        target_sha: &str,
+    ) -> Result<bool, String> {
+        let _guard = self.lock.lock().await;
+        let mut ancestry = self.git_cmd(repo_dir);
+        ancestry.args(["merge-base", "--is-ancestor", source_sha, target_sha]);
+        let out = run_git(
+            ancestry,
+            self.local_timeout,
+            "git merge-base branch sync no-op",
+        )
+        .await?;
+        if out.status.success() {
+            Ok(true)
+        } else if out.status.code() == Some(1) {
+            Ok(false)
+        } else {
+            Err(format!(
+                "git merge-base --is-ancestor {source_sha} {target_sha} failed: {}",
+                git_diagnostic(&out.stderr)
+            ))
+        }
+    }
+
+    /// Refresh the post-merge target branch before branch-sync completion
+    /// reads GitHub's merge-commit identity.
+    pub async fn fetch_branch_sync_target(
+        &self,
+        repo_dir: &Path,
+        target_branch: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        let mut fetch = self.git_cmd(repo_dir);
+        fetch.args(["fetch", "origin", target_branch]);
+        let fetched = run_git(fetch, self.fetch_timeout, "git fetch branch sync target").await?;
+        if !fetched.status.success() {
+            return Err(format!(
+                "git fetch origin {target_branch} failed: {}",
+                git_diagnostic(&fetched.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Prove that an immutable GitHub merge commit contains both tips pinned
+    /// by a branch synchronization. Callers fetch the target immediately
+    /// before resolving the merge commit, so this check has the remote object
+    /// graph needed for a loud verification failure rather than a guess.
+    pub async fn verify_branch_sync_merge_ancestry(
+        &self,
+        repo_dir: &Path,
+        merge_commit_sha: &str,
+        source_sha: &str,
+        target_sha: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        for (tip_name, tip_sha) in [("source", source_sha), ("target", target_sha)] {
+            let mut ancestry = self.git_cmd(repo_dir);
+            ancestry.args(["merge-base", "--is-ancestor", tip_sha, merge_commit_sha]);
+            let result = run_git(
+                ancestry,
+                self.local_timeout,
+                "git verify branch sync merge ancestry",
+            )
+            .await?;
+            if result.status.success() {
+                continue;
+            }
+            if matches!(result.status.code(), Some(1) | Some(128)) {
+                return Err(format!(
+                    "branch sync merge commit {merge_commit_sha} does not contain pinned {tip_name} tip {tip_sha}"
+                ));
+            }
+            return Err(format!(
+                "cannot verify pinned {tip_name} tip {tip_sha} against branch sync merge commit {merge_commit_sha}: {}",
+                git_diagnostic(&result.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reconstruct (or reopen) the daemon-owned sync worktree at a pinned
+    /// target and merge the pinned source. The manager lock serializes branch
+    /// creation, worktree attachment, and the merge so another daemon action
+    /// cannot observe a half-created branch.
+    pub async fn prepare_sync_merge(
+        &self,
+        repo_dir: &Path,
+        worktree_dir: &Path,
+        branch: &str,
+        source_sha: &str,
+        target_sha: &str,
+    ) -> Result<SyncMerge, String> {
+        let _guard = self.lock.lock().await;
+        self.ensure_sync_worktree_unlocked(repo_dir, worktree_dir, branch, Some(target_sha))
+            .await?;
+
+        let mut merge = self.git_cmd(worktree_dir);
+        merge.args(["merge", "--no-ff", "--no-edit", source_sha]);
+        let merged = run_git(merge, self.local_timeout, "git merge branch sync source").await?;
+        if merged.status.success() {
+            let mut head = self.git_cmd(worktree_dir);
+            head.args(["rev-parse", "HEAD"]);
+            let head = run_git(head, self.local_timeout, "git rev-parse branch sync merge").await?;
+            let merge_sha = git_diagnostic(&head.stdout);
+            if !head.status.success() || merge_sha.is_empty() {
+                return Err(format!(
+                    "git rev-parse HEAD after branch sync merge failed: {}",
+                    git_diagnostic(&head.stderr)
+                ));
+            }
+            return Ok(SyncMerge::Clean { merge_sha });
+        }
+
+        if self.is_merge_conflict_unlocked(worktree_dir).await? {
+            Ok(SyncMerge::Conflicted)
+        } else {
+            Err(format!(
+                "git merge {source_sha} failed without leaving a resolvable merge: {}",
+                git_diagnostic(&merged.stderr)
+            ))
+        }
+    }
+
+    /// Reopen a previously prepared local branch without ever recreating it.
+    /// A missing branch is stale durable state and must be failed by the
+    /// caller instead of being silently cut from another ref.
+    pub async fn open_existing_sync_worktree(
+        &self,
+        repo_dir: &Path,
+        worktree_dir: &Path,
+        branch: &str,
+    ) -> Result<(), String> {
+        let _guard = self.lock.lock().await;
+        self.ensure_sync_worktree_unlocked(repo_dir, worktree_dir, branch, None)
+            .await
+    }
+
+    /// Provision a branch-sync conflict judgment worker onto the kept sync
+    /// worktree. Unlike [`Self::provision`], this never cuts the branch from
+    /// a base ref and never re-attaches a missing worktree: a fresh checkout
+    /// of the branch would silently drop `MERGE_HEAD` and the unmerged index
+    /// the worker must resolve, so anything but the exact kept registration
+    /// fails loud.
+    pub async fn adopt_sync_worktree(
+        &self,
+        repo_dir: &Path,
+        worktree_dir: &Path,
+        branch: &str,
+    ) -> Result<PathBuf, String> {
+        let _guard = self.lock.lock().await;
+        if !self.branch_exists_unlocked(repo_dir, branch).await {
+            return Err(format!("branch sync local branch {branch} is missing"));
+        }
+        let Some(existing) = self
+            .find_worktree_for_branch_unlocked(repo_dir, branch)
+            .await
+        else {
+            return Err(format!(
+                "branch sync worktree {} for {branch} is missing; refusing to recreate it without MERGE_HEAD",
+                worktree_dir.display()
+            ));
+        };
+        let expected = std::fs::canonicalize(worktree_dir).ok();
+        let actual = std::fs::canonicalize(&existing).ok();
+        if expected.is_none() || expected != actual {
+            return Err(format!(
+                "branch collision: '{branch}' already checked out in worktree '{existing}'"
+            ));
+        }
+        Ok(worktree_dir.to_path_buf())
+    }
+
+    async fn ensure_sync_worktree_unlocked(
+        &self,
+        repo_dir: &Path,
+        worktree_dir: &Path,
+        branch: &str,
+        create_at: Option<&str>,
+    ) -> Result<(), String> {
+        let branch_exists = self.branch_exists_unlocked(repo_dir, branch).await;
+        if !branch_exists && create_at.is_none() {
+            return Err(format!("branch sync local branch {branch} is missing"));
+        }
+        if branch_exists {
+            if let Some(existing) = self
+                .find_worktree_for_branch_unlocked(repo_dir, branch)
+                .await
+            {
+                let expected = std::fs::canonicalize(worktree_dir).ok();
+                let actual = std::fs::canonicalize(&existing).ok();
+                if expected.is_some() && expected == actual {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "branch collision: '{branch}' already checked out in worktree '{existing}'"
+                ));
+            }
+            let mut add = self.git_cmd(repo_dir);
+            add.args(["worktree", "add"]);
+            add.arg(worktree_dir).arg(branch);
+            let added = run_git(
+                add,
+                self.local_timeout,
+                "git worktree add branch sync existing",
+            )
+            .await?;
+            if !added.status.success() {
+                return Err(format!(
+                    "git worktree add branch sync existing failed: {}",
+                    git_diagnostic(&added.stderr)
+                ));
+            }
+            return Ok(());
+        }
+
+        let base = create_at.expect("create_at checked above");
+        let mut add = self.git_cmd(repo_dir);
+        add.args(["worktree", "add", "-b", branch]);
+        add.arg(worktree_dir).arg(base);
+        let added = run_git(add, self.local_timeout, "git worktree add branch sync").await?;
+        if !added.status.success() {
+            return Err(format!(
+                "git worktree add branch sync failed: {}",
+                git_diagnostic(&added.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Exact conflict witness shared with continuation-base integration and
+    /// branch synchronization. Git must retain both MERGE_HEAD and at least
+    /// one unmerged path; a generic merge error never masquerades as a human
+    /// resolvable conflict.
+    async fn is_merge_conflict_unlocked(&self, worktree_dir: &Path) -> Result<bool, String> {
+        let mut merge_head = self.git_cmd(worktree_dir);
+        merge_head.args(["rev-parse", "--verify", "MERGE_HEAD"]);
+        let merge_head =
+            run_git(merge_head, self.local_timeout, "git verify merge conflict").await?;
+        let mut conflicts = self.git_cmd(worktree_dir);
+        conflicts.args(["diff", "--name-only", "--diff-filter=U"]);
+        let conflicts = run_git(conflicts, self.local_timeout, "git list merge conflicts").await?;
+        Ok(merge_head.status.success()
+            && conflicts.status.success()
+            && !conflicts.stdout.is_empty())
+    }
+
+    /// Enumerate the still-unmerged paths inside a preserved sync-conflict
+    /// worktree. Runs under the ordinary local git timeout so a hung or
+    /// oversize git call fails fast rather than stalling a daemon tick, and
+    /// treats a missing worktree as a caller-visible failure. Used by the
+    /// branch-sync conflict judgment-task intake to build the task body.
+    pub async fn sync_conflicted_files(&self, worktree_dir: &Path) -> Result<Vec<String>, String> {
+        let _guard = self.lock.lock().await;
+        if !worktree_dir.exists() {
+            return Err(format!(
+                "branch sync conflict worktree {} is missing",
+                worktree_dir.display()
+            ));
+        }
+        let mut cmd = self.git_cmd(worktree_dir);
+        cmd.args(["diff", "--name-only", "--diff-filter=U"]);
+        let output = run_git(cmd, self.local_timeout, "git list sync conflict files").await?;
+        if !output.status.success() {
+            return Err(format!(
+                "git diff --diff-filter=U failed: {}",
+                git_diagnostic(&output.stderr)
+            ));
+        }
+        let text = String::from_utf8(output.stdout).map_err(|error| {
+            format!("git diff --diff-filter=U produced non-UTF-8 output: {error}")
+        })?;
+        Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect())
     }
 
     /// Fetch a PR head via `refs/pull/<pr>/head` and provision a worktree.
@@ -1252,11 +1759,16 @@ impl WorktreeManager {
     ) -> Vec<String> {
         let _guard = self.lock.lock().await;
 
-        let mut prune_cmd = self.git_cmd(repo_dir);
-        prune_cmd.args(["worktree", "prune"]);
-        if let Err(e) = run_git(prune_cmd, self.local_timeout, "git worktree prune").await {
-            eprintln!("warn: {e}");
-        }
+        self.prune_stale_initializing_unlocked(repo_dir, worktree_base)
+            .await;
+
+        let registrations = match self.list_worktrees_unlocked(repo_dir).await {
+            Ok(registrations) => registrations,
+            Err(error) => {
+                eprintln!("warn: {error}");
+                return Vec::new();
+            }
+        };
 
         let entries = match std::fs::read_dir(worktree_base) {
             Ok(e) => e,
@@ -1266,30 +1778,163 @@ impl WorktreeManager {
         let mut removed = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    eprintln!(
+                        "warn: worktree GC cannot inspect {}: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            if !metadata.file_type().is_dir() {
                 continue;
             }
             let path_str = path.to_string_lossy().to_string();
-            if active_worktrees.iter().any(|a| *a == path_str) {
+            let canonical_path = match std::fs::canonicalize(&path) {
+                Ok(path) => path,
+                Err(error) => {
+                    eprintln!(
+                        "warn: worktree GC cannot canonicalize {}: {error}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            if !registrations.iter().any(|registration| {
+                std::fs::canonicalize(&registration.path).ok().as_ref() == Some(&canonical_path)
+            }) {
+                eprintln!(
+                    "warn: worktree GC leaving unregistered directory {}",
+                    path.display()
+                );
+                continue;
+            }
+            if active_worktrees.iter().any(|active| {
+                *active == path_str
+                    || std::fs::canonicalize(active).ok().as_ref() == Some(&canonical_path)
+            }) {
                 continue;
             }
 
             let mut rm_cmd = self.git_cmd(repo_dir);
             rm_cmd.args(["worktree", "remove", &path_str, "--force"]);
-            let git_ok = match run_git(rm_cmd, self.local_timeout, "git worktree remove").await {
-                Ok(out) if out.status.success() => true,
-                Ok(_) => false,
+            match run_git(rm_cmd, self.local_timeout, "git worktree remove").await {
+                Ok(out) if out.status.success() => removed.push(path_str),
+                Ok(out) => eprintln!(
+                    "warn: git worktree remove {} failed: {}",
+                    path.display(),
+                    git_diagnostic(&out.stderr)
+                ),
                 Err(e) => {
                     eprintln!("warn: {e}");
-                    false
                 }
-            };
-
-            if git_ok || std::fs::remove_dir_all(&path).is_ok() {
-                removed.push(path_str);
             }
         }
         removed
+    }
+
+    /// Unlock stale daemon registrations left by an interrupted worktree add,
+    /// then prune their Git metadata. Caller must arrange any cadence.
+    pub async fn prune_stale_initializing(&self, repo_dir: &Path, worktree_base: &Path) {
+        let _guard = self.lock.lock().await;
+        self.prune_stale_initializing_unlocked(repo_dir, worktree_base)
+            .await;
+    }
+
+    /// Caller MUST hold `self.lock`.
+    async fn list_worktrees_unlocked(
+        &self,
+        repo_dir: &Path,
+    ) -> Result<Vec<WorktreeRegistration>, String> {
+        let mut list = self.git_cmd(repo_dir);
+        list.args(["worktree", "list", "--porcelain"]);
+        let out = run_git(list, self.local_timeout, "git worktree list").await?;
+        if !out.status.success() {
+            return Err(format!(
+                "git worktree list failed: {}",
+                git_diagnostic(&out.stderr)
+            ));
+        }
+
+        let stdout = std::str::from_utf8(&out.stdout)
+            .map_err(|error| format!("git worktree list returned invalid UTF-8: {error}"))?;
+        let mut registrations = Vec::new();
+        let mut path = None;
+        let mut locked_reason = None;
+        for line in stdout.lines().chain(std::iter::once("")) {
+            if let Some(value) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(value));
+                locked_reason = None;
+            } else if let Some(reason) = line.strip_prefix("locked ") {
+                locked_reason = Some(reason.to_string());
+            } else if line == "locked" {
+                locked_reason = Some(String::new());
+            } else if line.is_empty() {
+                if let Some(path) = path.take() {
+                    registrations.push(WorktreeRegistration {
+                        path,
+                        locked_reason: locked_reason.take(),
+                    });
+                }
+            }
+        }
+        Ok(registrations)
+    }
+
+    /// Caller MUST hold `self.lock`.
+    async fn prune_stale_initializing_unlocked(&self, repo_dir: &Path, worktree_base: &Path) {
+        match self.list_worktrees_unlocked(repo_dir).await {
+            Ok(registrations) => {
+                for registration in registrations {
+                    if registration.locked_reason.as_deref() != Some("initializing")
+                        || !is_direct_child_of(worktree_base, &registration.path)
+                    {
+                        continue;
+                    }
+                    match std::fs::symlink_metadata(&registration.path) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            let mut unlock = self.git_cmd(repo_dir);
+                            unlock.args(["worktree", "unlock"]);
+                            unlock.arg(&registration.path);
+                            match run_git(
+                                unlock,
+                                self.local_timeout,
+                                "git worktree unlock stale initialization",
+                            )
+                            .await
+                            {
+                                Ok(out) if out.status.success() => {}
+                                Ok(out) => eprintln!(
+                                    "warn: git worktree unlock {} failed: {}",
+                                    registration.path.display(),
+                                    git_diagnostic(&out.stderr)
+                                ),
+                                Err(error) => eprintln!("warn: {error}"),
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => eprintln!(
+                            "warn: cannot inspect locked worktree {}: {error}",
+                            registration.path.display()
+                        ),
+                    }
+                }
+            }
+            Err(error) => eprintln!("warn: {error}"),
+        }
+
+        let mut prune = self.git_cmd(repo_dir);
+        prune.args(["worktree", "prune"]);
+        match run_git(prune, self.local_timeout, "git worktree prune").await {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => eprintln!(
+                "warn: git worktree prune failed: {}",
+                git_diagnostic(&out.stderr)
+            ),
+            Err(error) => eprintln!("warn: {error}"),
+        }
     }
 
     pub async fn remove(&self, repo_dir: &Path, worktree_dir: &Path) -> Result<(), String> {
@@ -1890,6 +2535,172 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
+    fn git_worktree_list(dir: &Path) -> String {
+        let output = git_output(dir, &["worktree", "list", "--porcelain"]);
+        assert!(
+            output.status.success(),
+            "git worktree list failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[tokio::test]
+    async fn branch_sync_noop_uses_pinned_ancestry_without_a_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _bare) = init_repo_with_bare_remote(tmp.path());
+        let develop = push_branch(&repo, "develop");
+        let main = git_rev_parse(&repo, "main");
+        let mgr = WorktreeManager::new();
+        let (source, target) = mgr.fetch_sync_tips(&repo, "main", "develop").await.unwrap();
+        assert_eq!(source, main);
+        assert_eq!(target, develop);
+        assert!(mgr
+            .source_is_ancestor_of_target(&repo, &source, &target)
+            .await
+            .unwrap());
+        assert!(!tmp.path().join("sync-worktree").exists());
+    }
+
+    #[tokio::test]
+    async fn branch_sync_fetch_pins_current_tips_in_a_fresh_clone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (source, bare) = init_repo_with_bare_remote(tmp.path());
+        let worker = tmp.path().join("fresh-clone");
+        assert!(StdCommand::new("git")
+            .args(["clone", &bare.to_string_lossy(), &worker.to_string_lossy()])
+            .status()
+            .unwrap()
+            .success());
+        let source_tip = push_branch(&source, "develop");
+        assert!(
+            !git_output(
+                &worker,
+                &["show-ref", "--verify", "refs/remotes/origin/develop"]
+            )
+            .status
+            .success(),
+            "the fresh clone must prove fetch creates the tracking ref"
+        );
+
+        let mgr = WorktreeManager::new();
+        let (pinned_source, pinned_target) = mgr
+            .fetch_sync_tips(&worker, "develop", "main")
+            .await
+            .unwrap();
+        assert_eq!(pinned_source, source_tip);
+        assert_eq!(pinned_target, git_rev_parse(&source, "main"));
+        assert_eq!(
+            git_rev_parse(&worker, "refs/remotes/origin/develop"),
+            source_tip,
+            "the persisted pin must come from the ref refreshed by this fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_sync_clean_merge_records_an_ancestry_preserving_merge_sha() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _bare) = init_repo_with_bare_remote(tmp.path());
+        let source_tip = push_branch(&repo, "develop");
+        let target_tip = git_rev_parse(&repo, "main");
+        let worktree = tmp.path().join("sync-worktree");
+        let mgr = WorktreeManager::new();
+        let (source, target) = mgr.fetch_sync_tips(&repo, "develop", "main").await.unwrap();
+        assert_eq!(source, source_tip);
+        assert_eq!(target, target_tip);
+        let SyncMerge::Clean { merge_sha } = mgr
+            .prepare_sync_merge(
+                &repo,
+                &worktree,
+                "sync/develop-into-main-1",
+                &source,
+                &target,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("divergent fixture must merge cleanly");
+        };
+        assert_ne!(merge_sha, source, "--no-ff must retain a merge commit");
+        for ancestor in [&source, &target] {
+            assert!(
+                git_output(
+                    &worktree,
+                    &["merge-base", "--is-ancestor", ancestor, &merge_sha]
+                )
+                .status
+                .success(),
+                "{ancestor} must be an ancestor of the recorded merge"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn branch_sync_conflict_keeps_merge_head_and_unmerged_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, _bare) = init_repo_with_bare_remote(tmp.path());
+        let repo_text = repo.to_string_lossy().to_string();
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        assert!(git_output(&repo, &["add", "shared.txt"]).status.success());
+        assert!(git_output(&repo, &["commit", "-m", "base shared file"])
+            .status
+            .success());
+        assert!(git_output(&repo, &["push", "origin", "main"])
+            .status
+            .success());
+
+        assert!(StdCommand::new("git")
+            .args(["-C", &repo_text, "checkout", "-b", "develop"])
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(repo.join("shared.txt"), "source\n").unwrap();
+        assert!(git_output(&repo, &["commit", "-am", "source change"])
+            .status
+            .success());
+        assert!(git_output(&repo, &["push", "origin", "develop"])
+            .status
+            .success());
+        assert!(StdCommand::new("git")
+            .args(["-C", &repo_text, "checkout", "main"])
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(repo.join("shared.txt"), "target\n").unwrap();
+        assert!(git_output(&repo, &["commit", "-am", "target change"])
+            .status
+            .success());
+        assert!(git_output(&repo, &["push", "origin", "main"])
+            .status
+            .success());
+
+        let mgr = WorktreeManager::new();
+        let (source, target) = mgr.fetch_sync_tips(&repo, "develop", "main").await.unwrap();
+        let worktree = tmp.path().join("sync-conflict-worktree");
+        assert_eq!(
+            mgr.prepare_sync_merge(
+                &repo,
+                &worktree,
+                "sync/develop-into-main-2",
+                &source,
+                &target,
+            )
+            .await
+            .unwrap(),
+            SyncMerge::Conflicted
+        );
+        assert!(
+            git_output(&worktree, &["rev-parse", "--verify", "MERGE_HEAD"])
+                .status
+                .success()
+        );
+        assert!(
+            !git_output(&worktree, &["diff", "--name-only", "--diff-filter=U"])
+                .stdout
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn fetch_and_provision_uses_branch_head_not_main() {
         let repo_dir = tempfile::tempdir().unwrap();
@@ -2027,7 +2838,7 @@ mod tests {
                 "--no-ff",
                 "dependency",
                 "-m",
-                "merge dependency"
+                "Merge pull request #701 from dependency"
             ])
             .status()
             .unwrap()
@@ -2055,6 +2866,218 @@ mod tests {
         )
         .status
         .success());
+        assert_eq!(
+            mgr.find_merged_pr_commit(&worker, "main", 701)
+                .await
+                .unwrap(),
+            Some(base_sha.clone()),
+            "the GitHub metadata fallback must find the PR's merge commit on the fetched base"
+        );
+        assert_eq!(
+            mgr.find_merged_pr_commit(&worker, "main", 702)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // A substring match for #701 would incorrectly select this newer
+        // #7019 merge. The fallback must preserve the exact dependency PR.
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "checkout", "-b", "dependency-prefix"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(StdCommand::new("git")
+            .args([
+                "-C",
+                &d,
+                "commit",
+                "--allow-empty",
+                "-m",
+                "dependency-prefix"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "checkout", "main"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(StdCommand::new("git")
+            .args([
+                "-C",
+                &d,
+                "merge",
+                "--no-ff",
+                "dependency-prefix",
+                "-m",
+                "Merge pull request #7019 from dependency-prefix",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let prefix_merge = git_rev_parse(&source, "HEAD");
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "push", "origin", "main"])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            mgr.find_merged_pr_commit(&worker, "main", 701)
+                .await
+                .unwrap(),
+            Some(base_sha),
+            "#701 must not match the newer #7019 merge"
+        );
+        assert_eq!(
+            mgr.find_merged_pr_commit(&worker, "main", 7019)
+                .await
+                .unwrap(),
+            Some(prefix_merge)
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_branch_contains_commits_prefers_local_head() {
+        // A resumed dependent branch is authoritative in the daemon clone
+        // (that is what `provision()` reuses). Local head must be checked
+        // before falling back to `origin/<branch>` — otherwise the ancestry
+        // test would read a stale remote view of the same branch.
+        let tmp = tempfile::tempdir().unwrap();
+        let (source, bare) = init_repo_with_bare_remote(tmp.path());
+        let worker = tmp.path().join("worker");
+        assert!(StdCommand::new("git")
+            .args(["clone", &bare.to_string_lossy(), &worker.to_string_lossy()])
+            .status()
+            .unwrap()
+            .success());
+        let dep_commit = {
+            let d = source.to_string_lossy().to_string();
+            assert!(StdCommand::new("git")
+                .args(["-C", &d, "commit", "--allow-empty", "-m", "dep"])
+                .status()
+                .unwrap()
+                .success());
+            let sha = git_rev_parse(&source, "HEAD");
+            assert!(StdCommand::new("git")
+                .args(["-C", &d, "push", "origin", "main"])
+                .status()
+                .unwrap()
+                .success());
+            sha
+        };
+        // Advance origin/main with an unrelated commit AFTER cutting the
+        // child branch, so the branch's provenance no longer equals the
+        // current base tip but ancestry to the dep is preserved.
+        let w = worker.to_string_lossy().to_string();
+        assert!(StdCommand::new("git")
+            .args(["-C", &w, "fetch", "-q", "origin"])
+            .status()
+            .unwrap()
+            .success());
+        let branch = "daemon/child-t7";
+        assert!(StdCommand::new("git")
+            .args(["-C", &w, "checkout", "-q", "-b", branch, "origin/main"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(StdCommand::new("git")
+            .args(["-C", &w, "checkout", "-q", "main"])
+            .status()
+            .unwrap()
+            .success());
+        {
+            let d = source.to_string_lossy().to_string();
+            assert!(StdCommand::new("git")
+                .args(["-C", &d, "commit", "--allow-empty", "-m", "unrelated"])
+                .status()
+                .unwrap()
+                .success());
+            assert!(StdCommand::new("git")
+                .args(["-C", &d, "push", "origin", "main"])
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        let mgr = WorktreeManager::new();
+        let outcome = mgr
+            .verify_branch_contains_commits(&worker, branch, std::slice::from_ref(&dep_commit))
+            .await
+            .unwrap();
+        assert_eq!(outcome, BranchAncestryVerification::Verified);
+    }
+
+    #[tokio::test]
+    async fn verify_branch_contains_commits_reports_missing() {
+        // A branch cut BEFORE the dependency merge cannot contain it. The
+        // helper must name the missing merge commit so the caller can park
+        // with a diagnostic that points to the exact dependency.
+        let tmp = tempfile::tempdir().unwrap();
+        let (source, bare) = init_repo_with_bare_remote(tmp.path());
+        let worker = tmp.path().join("worker");
+        assert!(StdCommand::new("git")
+            .args(["clone", &bare.to_string_lossy(), &worker.to_string_lossy()])
+            .status()
+            .unwrap()
+            .success());
+        let w = worker.to_string_lossy().to_string();
+        let branch = "daemon/stale-child-t8";
+        assert!(StdCommand::new("git")
+            .args(["-C", &w, "checkout", "-q", "-b", branch])
+            .status()
+            .unwrap()
+            .success());
+        assert!(StdCommand::new("git")
+            .args(["-C", &w, "checkout", "-q", "main"])
+            .status()
+            .unwrap()
+            .success());
+        // Introduce and push the dep merge only AFTER the stale branch is
+        // cut. The child never fetched or descended from it.
+        let d = source.to_string_lossy().to_string();
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "commit", "--allow-empty", "-m", "dep"])
+            .status()
+            .unwrap()
+            .success());
+        let dep_commit = git_rev_parse(&source, "HEAD");
+        assert!(StdCommand::new("git")
+            .args(["-C", &d, "push", "origin", "main"])
+            .status()
+            .unwrap()
+            .success());
+
+        let mgr = WorktreeManager::new();
+        let outcome = mgr
+            .verify_branch_contains_commits(&worker, branch, std::slice::from_ref(&dep_commit))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            BranchAncestryVerification::Missing {
+                merge_commit_sha: dep_commit,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_branch_contains_commits_reports_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_source, bare) = init_repo_with_bare_remote(tmp.path());
+        let worker = tmp.path().join("worker");
+        assert!(StdCommand::new("git")
+            .args(["clone", &bare.to_string_lossy(), &worker.to_string_lossy()])
+            .status()
+            .unwrap()
+            .success());
+        let mgr = WorktreeManager::new();
+        let outcome = mgr
+            .verify_branch_contains_commits(&worker, "daemon/gone-t9", &["0".repeat(40)])
+            .await
+            .unwrap();
+        assert_eq!(outcome, BranchAncestryVerification::NotFound);
     }
 
     #[tokio::test]
@@ -2349,9 +3372,81 @@ mod tests {
         assert_eq!(removed.len(), 1);
         assert!(wt1.exists(), "active worktree should NOT be removed");
         assert!(!wt2.exists(), "orphaned worktree should be removed");
+        let listed = git_worktree_list(repo_dir.path());
+        assert!(listed.contains(wt1.to_string_lossy().as_ref()));
+        assert!(!listed.contains(wt2.to_string_lossy().as_ref()));
 
         // Clean up
         mgr.remove(repo_dir.path(), &wt1).await.ok();
+    }
+
+    #[tokio::test]
+    async fn gc_leaves_unregistered_directory_under_worktree_base() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let wt_base = tempfile::tempdir().unwrap();
+        let foreign = wt_base.path().join("foreign-worktree");
+        std::fs::create_dir(&foreign).unwrap();
+        init_git_repo(&foreign);
+
+        assert!(
+            !git_worktree_list(repo_dir.path()).contains(foreign.to_string_lossy().as_ref()),
+            "fixture directory must not be registered to this repository"
+        );
+
+        let removed = WorktreeManager::new()
+            .gc_orphaned(repo_dir.path(), wt_base.path(), &[])
+            .await;
+
+        assert!(removed.is_empty());
+        assert!(foreign.exists(), "GC must leave unregistered paths alone");
+        assert!(
+            git_output(&foreign, &["rev-parse", "--is-inside-work-tree"])
+                .status
+                .success(),
+            "the foreign checkout must remain usable"
+        );
+        assert!(
+            !git_worktree_list(repo_dir.path()).contains(foreign.to_string_lossy().as_ref()),
+            "foreign path must remain absent from this repository's registration"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_unlocks_and_prunes_missing_initializing_registration() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let wt_base = tempfile::tempdir().unwrap();
+        let stale = wt_base.path().join("initializing-worktree");
+        let mgr = WorktreeManager::new();
+        mgr.provision(repo_dir.path(), "branch-initializing", &stale, "main")
+            .await
+            .unwrap();
+        assert!(git_output(
+            repo_dir.path(),
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                "initializing",
+                stale.to_string_lossy().as_ref(),
+            ],
+        )
+        .status
+        .success());
+        std::fs::remove_dir_all(&stale).unwrap();
+
+        let before = git_worktree_list(repo_dir.path());
+        assert!(before.contains(stale.to_string_lossy().as_ref()));
+        assert!(before.contains("locked initializing"));
+
+        mgr.gc_orphaned(repo_dir.path(), wt_base.path(), &[]).await;
+
+        assert!(!stale.exists());
+        assert!(
+            !git_worktree_list(repo_dir.path()).contains(stale.to_string_lossy().as_ref()),
+            "unlocked stale registration must be pruned"
+        );
     }
 
     // --- Timeout / reap tests (require Unix shims) ---
@@ -2407,6 +3502,56 @@ mod tests {
             .unwrap()
             .success();
         assert!(!alive, "timed-out git subprocess {pid:?} was not reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_git_sets_noninteractive_git_environment() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "printf '%s,%s' \"$GIT_TERMINAL_PROMPT\" \"$GIT_OPTIONAL_LOCKS\"",
+        ]);
+
+        let output = run_git(cmd, Duration::from_secs(1), "git environment")
+            .await
+            .expect("command should run");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"0,0");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_without_credentials_fails_fast_with_noninteractive_git() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let shim_dir = tempfile::tempdir().unwrap();
+        let shim = shim_dir.path().join("git-credential-prompt");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nif [ \"$GIT_TERMINAL_PROMPT\" != 0 ] || [ \"$GIT_OPTIONAL_LOCKS\" != 0 ]; then exec sleep 3600; fi\nprintf 'authentication required\\n' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // This fixture still requires a prompt failure in under two seconds,
+        // but the parallel timing suite can take longer than 300ms to start
+        // the shell shim on a loaded CI runner.
+        let (_, local_timeout) = short_timeouts();
+        let fetch_timeout = Duration::from_secs(1);
+        let mgr = WorktreeManager::with_config(shim, fetch_timeout, local_timeout);
+        let repo = tempfile::tempdir().unwrap();
+        let worktree = repo.path().join("worktree");
+
+        let started = std::time::Instant::now();
+        let error = mgr
+            .fetch_and_provision(repo.path(), "daemon/test", &worktree, "private")
+            .await
+            .expect_err("credential-less fetch must fail");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.contains("authentication required"), "{error}");
     }
 
     #[cfg(unix)]
@@ -2621,7 +3766,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn gc_orphaned_timeout_falls_through_to_fs_cleanup() {
+    async fn gc_orphaned_timeout_leaves_unregistered_directory() {
         let repo_dir = tempfile::tempdir().unwrap();
         init_git_repo(repo_dir.path());
 
@@ -2629,18 +3774,16 @@ mod tests {
         let orphan = wt_base.path().join("orphan-wt");
         std::fs::create_dir(&orphan).unwrap();
 
-        // Hanging shim — git commands timeout, but fs fallback still works
+        // Hanging shim — GC cannot prove registration, so it must leave the
+        // directory alone rather than falling back to filesystem deletion.
         let shim_dir = tempfile::tempdir().unwrap();
         let shim = create_hanging_shim(shim_dir.path());
         let (ft, lt) = short_timeouts();
         let mgr = WorktreeManager::with_config(shim, ft, lt);
 
         let removed = mgr.gc_orphaned(repo_dir.path(), wt_base.path(), &[]).await;
-        assert!(
-            removed.contains(&orphan.to_string_lossy().to_string()),
-            "orphan should be cleaned up via fs fallback"
-        );
-        assert!(!orphan.exists());
+        assert!(removed.is_empty());
+        assert!(orphan.exists());
     }
 
     #[tokio::test]
