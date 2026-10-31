@@ -399,6 +399,9 @@ This is a non-binding view of ongoing directions, not a release schedule:
   hosted Quorum service.
 - The existing loopback-only, read-only web dashboard may expand as local
   inspection needs are proven, while retaining its local, read-only posture.
+- An HTTP MCP server for outside orchestrating agents is planned in Quorum, running from
+  the container alongside `quorum web`. Its listener, authentication, and tool set are not
+  settled.
 
 ## Working on Quorum
 
