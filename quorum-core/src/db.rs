@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 81;
+pub const SCHEMA_VERSION: i64 = 82;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1567,6 +1567,9 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
         }
         // v81 = recover_refs (new CREATE TABLE IF NOT EXISTS in SCHEMA_SQL; additive,
         // so fresh DBs and upgrades alike materialize it above — no ALTER needed).
+        // v82 = planner_submission_calls, the per-call `submit_plan` ledger. Net-new
+        // table — the `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL (which runs above)
+        // handles fresh DBs and upgrades alike; no ALTER or backfill needed.
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1897,6 +1900,75 @@ mod tests {
                 |row| row.get::<_, bool>(0),
             )
             .unwrap());
+    }
+
+    /// A v81 database predates the `submit_plan` call ledger. Upgrading must
+    /// create it without touching durable planner submissions, and a later
+    /// ordinary open must preserve ledger rows.
+    #[test]
+    fn v81_to_v82_adds_planner_submission_calls_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v81-planner-submission-calls.db");
+        {
+            let raw = Connection::open(&path).unwrap();
+            apply_pragmas(&raw).unwrap();
+            migrate(&raw).unwrap();
+            raw.execute_batch(
+                "DROP TABLE planner_submission_calls;
+                 INSERT INTO planner_submissions(run_id, graph_id, response_json, rejections,
+                                                 accepted_at)
+                     VALUES ('run-seeded', 7, '{\"kind\":\"plan\"}', 2, 100);
+                 PRAGMA user_version=81;",
+            )
+            .unwrap();
+        }
+
+        let seeded = |conn: &Connection| -> (i64, String, i64, i64) {
+            conn.query_row(
+                "SELECT graph_id, response_json, rejections, accepted_at
+                 FROM planner_submissions WHERE run_id='run-seeded'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+        };
+        let expected = (7, "{\"kind\":\"plan\"}".to_string(), 2, 100);
+
+        let migrated = open(&path).unwrap();
+        assert_eq!(seeded(&migrated), expected);
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        // The table exists because this insert succeeds against its full shape.
+        migrated
+            .execute(
+                "INSERT INTO planner_submission_calls
+                     (run_id, seq, received_at, accepted, rejection_category)
+                 VALUES ('run-seeded', 1, 200, 0, 'validation')",
+                [],
+            )
+            .unwrap();
+
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        let ledger_row: (i64, i64, i64, String) = reopened
+            .query_row(
+                "SELECT seq, received_at, accepted, rejection_category
+                 FROM planner_submission_calls WHERE run_id='run-seeded'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(ledger_row, (1, 200, 0, "validation".to_string()));
+        assert_eq!(seeded(&reopened), expected);
+        assert_eq!(
+            migrate(&reopened).unwrap().migrated_from,
+            SCHEMA_VERSION,
+            "a current database re-enters migrate as a no-op"
+        );
     }
 
     /// A v75 database predates branch synchronization storage. Upgrading must
