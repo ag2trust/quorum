@@ -5120,7 +5120,12 @@ esac
         let mut adopted = false;
         while !turn.is_finished() {
             assert!(std::time::Instant::now() < deadline, "turn never finished");
-            let pgid = tracker.state().owned.values().next().map(|owned| owned.pgid);
+            let pgid = tracker
+                .state()
+                .owned
+                .values()
+                .next()
+                .map(|owned| owned.pgid);
             if let Some(pgid) = pgid {
                 adopted = true;
                 // Probe before reading the state: ownership only ever leaves
