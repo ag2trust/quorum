@@ -1190,6 +1190,20 @@ impl RunnerProc {
         }
     }
 
+    /// Failure evidence for a one-shot turn that ended without a response.
+    /// An exited process is finalized first so its buffered records count;
+    /// the captured output is returned so the caller keeps its usage. This
+    /// reaps an exited leader, so an owner that signals the numeric pgid must
+    /// retire it first.
+    pub async fn failed_turn_evidence(&mut self) -> (Option<RunnerFailure>, Vec<CapturedOutput>) {
+        let captured = if matches!(self.try_wait(), Ok(Some(_))) {
+            self.finalize_pre_authoritative_evidence().await
+        } else {
+            Vec::new()
+        };
+        (self.observed_pre_authoritative_failure(), captured)
+    }
+
     pub fn observed_planner_live_failure(&self) -> Option<RunnerFailure> {
         self.failure_tracker().observed_planner_live_failure()
     }
@@ -1334,15 +1348,20 @@ impl RunnerProc {
     }
 }
 
+/// The classified failure carried by a launch `io::Error`, if any.
+pub fn launch_failure(error: &std::io::Error) -> Option<RunnerFailure> {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<RunnerFailure>())
+        .cloned()
+}
+
 fn classify_launch_error(kind: AgentKind, error: std::io::Error) -> RunnerFailure {
     // A Claude child can exit while the first stdin write races it. Its
     // adapter has already waited for the exit and classified its bounded
     // stderr, so preserve that evidence instead of letting BrokenPipe win.
-    if let Some(failure) = error
-        .get_ref()
-        .and_then(|source| source.downcast_ref::<RunnerFailure>())
-    {
-        return failure.clone();
+    if let Some(failure) = launch_failure(&error) {
+        return failure;
     }
     let disposition = match error.kind() {
         std::io::ErrorKind::TimedOut
