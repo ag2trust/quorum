@@ -874,6 +874,84 @@ fn decide_provision(
     }
 }
 
+/// Atomically hand a fully approved, CI-ready review back to the live merge
+/// reconciler. The exact-head approval check is repeated under the same write
+/// lock as the lifecycle transition, so a concurrent status/PR/approval change
+/// is a clean no-op rather than a stale merge request.
+fn request_ready_approved_merge(
+    conn: &mut quorum_core::Connection,
+    task_id: i64,
+    pr_number: i64,
+    head_sha: &str,
+    now: i64,
+) -> Result<bool> {
+    if pr_number <= 0 || head_sha.is_empty() || head_sha.contains('\0') {
+        return Err(QuorumError::BadInput(
+            "approved merge request requires a PR and exact head SHA".into(),
+        ));
+    }
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    let eligible: bool = tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM tasks
+             WHERE id=?1 AND status='in-review' AND json_valid(refs)
+               AND json_extract(refs, '$.pr')=?2
+               AND json_extract(refs, '$.daemon_merge_retry') IS NULL
+               AND body IS NOT ?3
+         )",
+        rusqlite::params![task_id, pr_number, tasks::MERGE_BLOCKED_BODY],
+        |row| row.get(0),
+    )?;
+    if !eligible || next_needed_role(&tx, pr_number, head_sha)?.is_some() {
+        tx.commit()?;
+        return Ok(false);
+    }
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET status='merging',
+             refs=json_set(refs, '$.daemon_merge_retry', 'requested'),
+             updated_at=?4
+         WHERE id=?1 AND status='in-review' AND json_valid(refs)
+           AND json_extract(refs, '$.pr')=?2
+           AND json_extract(refs, '$.daemon_merge_retry') IS NULL
+           AND body IS NOT ?5
+           AND EXISTS(
+               SELECT 1 FROM approvals
+               WHERE pr_number=?2 AND review_role='r1'
+                 AND verdict='approved' AND blocking_count=0
+                 AND approved_head_sha=?3
+           )",
+        rusqlite::params![task_id, pr_number, head_sha, now, tasks::MERGE_BLOCKED_BODY],
+    )?;
+    if changed == 1 {
+        quorum_core::events::emit(
+            &tx,
+            "task_merging",
+            &tasks::lease_target(task_id),
+            "by daemon: exact-head approvals and pre-review CI are ready",
+            now,
+        )?;
+    }
+    tx.commit()?;
+    Ok(changed == 1)
+}
+
+async fn request_ready_approved_merge_from_db(
+    db_path: &Path,
+    task_id: i64,
+    pr_number: i64,
+    head_sha: &str,
+) -> Result<bool> {
+    let path = db_path.to_path_buf();
+    let head_sha = head_sha.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut conn = quorum_core::db::open(&path)?;
+        request_ready_approved_merge(&mut conn, task_id, pr_number, &head_sha, now_unix())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("approved merge request join: {error}")))?
+}
+
 /// Whether every review role required for `head_sha` is approved. Unlike
 /// `quorum_core::approvals::dual_approved`, this honours a durable sampled R2
 /// skip, so an R1-only approval for a sampled-out head counts as complete.
@@ -10974,7 +11052,8 @@ async fn complete_detected_merge_with_metadata(
     Ok(true)
 }
 
-/// Consume one owner retry and perform at most one formal approval/merge call.
+/// Consume one durable merge request and perform at most one formal
+/// approval/merge call.
 /// All network checks precede a final durable-authority reread; failures either
 /// invalidate only stale evidence or park the unchanged exact-SHA authority.
 async fn reconcile_merge_retries(
@@ -11284,9 +11363,7 @@ async fn reconcile_merge_retries(
             return Ok(());
         };
         complete_approved_task_merge(config, wt_mgr, task_id, pr, merge_commit_sha).await?;
-        log(&format!(
-            "PR #{pr} merged from explicit durable-approval retry"
-        ));
+        log(&format!("PR #{pr} merged from durable approval replay"));
     } else {
         match result
             .failure_kind
@@ -16874,7 +16951,7 @@ async fn tick(
     // task. External writes (sync, post, etc.) no longer auto-renew leases.
     renew_active_worker_task_leases(&db_path, workers).await;
 
-    // ── Phase 4e: Consume one explicit merge replay intent ─────────────
+    // ── Phase 4e: Consume one durable merge replay intent ──────────────
     // This runs before reviewer provisioning so invalid/missing authority can
     // return to in-review and request only its first missing role in the same
     // tick. A valid replay never allocates a reviewer or worker.
@@ -17025,13 +17102,22 @@ async fn tick(
             };
             match provision_decision {
                 // Every required role approved for this head (including a
-                // sampled R2 skip). Nothing to provision and nothing wrong —
-                // approval recovery merges it. Parking here would strand it.
+                // sampled R2 skip). Re-enter the live merge reconciler without
+                // waiting for startup approval recovery.
                 Ok(ProvisionDecision::AllApproved) => {
-                    log(&format!(
-                        "task #{task_id} PR #{pr}: all required reviews approved \
-                         — awaiting merge, not provisioning"
-                    ));
+                    if request_ready_approved_merge_from_db(&db_path, *task_id, *pr, &head_sha)
+                        .await?
+                    {
+                        log(&format!(
+                            "task #{task_id} PR #{pr}: all required reviews approved \
+                             for {head_sha} — queued daemon merge attempt"
+                        ));
+                    } else {
+                        log(&format!(
+                            "task #{task_id} PR #{pr}: approved merge eligibility changed \
+                             before the atomic handoff"
+                        ));
+                    }
                     continue;
                 }
                 Ok(ProvisionDecision::Exhausted) => {
@@ -17401,10 +17487,19 @@ async fn tick(
             match provision_decision {
                 // Success, not exhaustion — see the worker-side arm above.
                 Ok(ProvisionDecision::AllApproved) => {
-                    log(&format!(
-                        "orphan in-review task #{task_id} PR #{pr}: all required \
-                         reviews approved — awaiting merge, not provisioning"
-                    ));
+                    if request_ready_approved_merge_from_db(&db_path, *task_id, *pr, &head_sha)
+                        .await?
+                    {
+                        log(&format!(
+                            "orphan in-review task #{task_id} PR #{pr}: all required \
+                             reviews approved for {head_sha} — queued daemon merge attempt"
+                        ));
+                    } else {
+                        log(&format!(
+                            "orphan in-review task #{task_id} PR #{pr}: approved merge \
+                             eligibility changed before the atomic handoff"
+                        ));
+                    }
                     continue;
                 }
                 Ok(ProvisionDecision::Exhausted) => {
@@ -43845,6 +43940,66 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         }
     }
 
+    struct ConflictingMergeCounter {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl merge::MergeExecutor for ConflictingMergeCounter {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            merge::MergeResult {
+                success: false,
+                message: "merge must not be called for a conflict".into(),
+                failure_kind: Some(merge::MergeFailureKind::Retryable),
+            }
+        }
+
+        fn check_mergeability(&self, _pr: i64, _repo_dir: &Path) -> merge::MergeabilityState {
+            merge::MergeabilityState::Conflicting
+        }
+    }
+
+    struct FailingChecksMergeCounter {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl merge::MergeExecutor for FailingChecksMergeCounter {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            merge::MergeResult {
+                success: false,
+                message: "merge must not be called with failing CI".into(),
+                failure_kind: Some(merge::MergeFailureKind::Retryable),
+            }
+        }
+
+        fn check_mergeability(&self, _pr: i64, _repo_dir: &Path) -> merge::MergeabilityState {
+            merge::MergeabilityState::Mergeable
+        }
+
+        fn wait_for_checks(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _timeout_secs: u64,
+            _poll_interval_secs: u64,
+        ) -> merge::ChecksOutcome {
+            merge::ChecksOutcome::Failed {
+                failing_checks: vec!["flaky-test".into()],
+            }
+        }
+    }
+
     struct StaleAuthorityMergeProbe {
         calls: std::sync::atomic::AtomicUsize,
         expected_head: std::sync::Mutex<Option<String>>,
@@ -43865,6 +44020,273 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 failure_kind: Some(merge::MergeFailureKind::StaleAuthority),
             }
         }
+    }
+
+    fn prepare_ready_approved_handoff(
+        conn: &quorum_core::Connection,
+        task_id: i64,
+        rework_round: i64,
+    ) {
+        conn.execute(
+            "UPDATE tasks
+             SET status='in-review', rework_round=?2,
+                 refs=json_remove(refs, '$.daemon_merge_retry')
+             WHERE id=?1",
+            rusqlite::params![task_id, rework_round],
+        )
+        .unwrap();
+    }
+
+    fn merge_retry_test_config(
+        dir: &tempfile::TempDir,
+        live: &ResolvedReviewerPrTarget,
+        program_name: &str,
+        executor: Arc<dyn merge::MergeExecutor>,
+    ) -> ServeConfig {
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut config = pre_review_checks_config(dir.path().join("q.db"), repo);
+        config.repo = "test/repo".into();
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            program_name,
+            &open_pr_target_json(
+                &live.target.head_ref,
+                &live.target.head_sha,
+                live.target.base_ref.as_deref().unwrap(),
+            ),
+        ));
+        config.merge_executor = executor;
+        config
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fully_approved_no_commit_resubmit_merges_without_restart() {
+        let (dir, mut conn, task_id, live) = seeded_merge_retry_authority();
+        prepare_ready_approved_handoff(&conn, task_id, 1);
+        assert!(
+            request_ready_approved_merge(&mut conn, task_id, 42, &live.target.head_sha, 102,)
+                .unwrap()
+        );
+        drop(conn);
+
+        let executor = Arc::new(SuccessfulMergeCounter {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let config =
+            merge_retry_test_config(&dir, &live, "gh-no-commit-resubmit", executor.clone());
+
+        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        assert_eq!(tasks::get(&conn, task_id).unwrap().unwrap().status, "done");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_approved_handoff_conflict_enters_rework() {
+        let (dir, mut conn, task_id, live) = seeded_merge_retry_authority();
+        prepare_ready_approved_handoff(&conn, task_id, 1);
+        assert!(
+            request_ready_approved_merge(&mut conn, task_id, 42, &live.target.head_sha, 102,)
+                .unwrap()
+        );
+        drop(conn);
+
+        let executor = Arc::new(ConflictingMergeCounter {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let config = merge_retry_test_config(&dir, &live, "gh-auto-conflict", executor.clone());
+
+        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.rework_round, 2);
+        assert!(quorum_core::approvals::get_for_pr(&conn, 42)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_approved_handoff_head_move_requires_fresh_r1() {
+        let (dir, mut conn, task_id, live) = seeded_merge_retry_authority();
+        prepare_ready_approved_handoff(&conn, task_id, 1);
+        assert!(
+            request_ready_approved_merge(&mut conn, task_id, 42, &live.target.head_sha, 102,)
+                .unwrap()
+        );
+        drop(conn);
+
+        let moved_live = ResolvedReviewerPrTarget {
+            target: PrTarget {
+                head_sha: "moved-head".into(),
+                ..live.target.clone()
+            },
+            source: ReviewerPrTargetSource::Live,
+        };
+        let executor = Arc::new(PolicyBlockedMergeCounter {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let config =
+            merge_retry_test_config(&dir, &moved_live, "gh-auto-head-moved", executor.clone());
+
+        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "in-review"
+        );
+        assert_eq!(
+            next_needed_role(&conn, 42, "moved-head").unwrap(),
+            Some("r1")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_ci_failure_on_daemon_handoff_stops_at_rework_cap() {
+        let (dir, mut conn, task_id, live) = seeded_merge_retry_authority();
+        prepare_ready_approved_handoff(
+            &conn,
+            task_id,
+            i64::from(quorum_core::lifecycle::REWORK_CAP),
+        );
+        assert!(
+            request_ready_approved_merge(&mut conn, task_id, 42, &live.target.head_sha, 102,)
+                .unwrap()
+        );
+        drop(conn);
+
+        let executor = Arc::new(FailingChecksMergeCounter {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let config = merge_retry_test_config(&dir, &live, "gh-auto-ci-failed", executor.clone());
+
+        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+            .await
+            .unwrap();
+        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(tasks::MERGE_RETRY_REF).is_none());
+    }
+
+    #[test]
+    fn approved_handoff_exact_head_merge_blocked_and_lost_race_guards() {
+        let (_dir, mut conn, task_id, live) = seeded_merge_retry_authority();
+        prepare_ready_approved_handoff(&conn, task_id, 1);
+
+        assert!(!request_ready_approved_merge(&mut conn, task_id, 42, "moved-head", 102).unwrap());
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "in-review"
+        );
+
+        conn.execute(
+            "UPDATE tasks SET review_only=1, no_rework=1, body=?2 WHERE id=?1",
+            rusqlite::params![task_id, tasks::MERGE_BLOCKED_BODY],
+        )
+        .unwrap();
+        assert!(
+            !request_ready_approved_merge(&mut conn, task_id, 42, &live.target.head_sha, 103,)
+                .unwrap()
+        );
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(task.body.as_deref(), Some(tasks::MERGE_BLOCKED_BODY));
+
+        conn.execute(
+            "UPDATE tasks SET review_only=0, no_rework=0, body=NULL WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        assert!(
+            request_ready_approved_merge(&mut conn, task_id, 42, &live.target.head_sha, 104,)
+                .unwrap()
+        );
+        assert!(
+            !request_ready_approved_merge(&mut conn, task_id, 42, &live.target.head_sha, 105,)
+                .unwrap()
+        );
+        let merging_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE subject=?1 AND kind='task_merging'",
+                [tasks::lease_target(task_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(merging_events, 1);
+    }
+
+    #[tokio::test]
+    async fn pending_pre_review_ci_does_not_request_or_park_approved_handoff() {
+        let (dir, conn, task_id, _live) = seeded_merge_retry_authority();
+        prepare_ready_approved_handoff(&conn, task_id, 1);
+        drop(conn);
+
+        let executor = Arc::new(ResumeHeadPollingExecutor {
+            heads: std::sync::Mutex::new([Some("abc123".to_string())].into_iter().collect()),
+            head_calls: std::sync::atomic::AtomicUsize::new(0),
+            wait_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut config = pre_review_checks_config(dir.path().join("q.db"), dir.path().into());
+        config.merge_checks_poll_secs = 60;
+        config.merge_executor = executor.clone();
+        let mut waits = HashMap::new();
+
+        let (gate, head, _) =
+            poll_resume_reviewer_pre_review_checks(&config, &mut waits, task_id, 42)
+                .await
+                .unwrap();
+        assert_eq!(gate, PreReviewChecksGate::Waiting);
+        assert_eq!(head, "abc123");
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while executor
+            .wait_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+            && std::time::Instant::now() < deadline
+        {
+            tokio::task::yield_now().await;
+        }
+        let (gate, _, _) = poll_resume_reviewer_pre_review_checks(&config, &mut waits, task_id, 42)
+            .await
+            .unwrap();
+        assert_eq!(gate, PreReviewChecksGate::Waiting);
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(tasks::MERGE_RETRY_REF).is_none());
+        let parked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_notes WHERE task_id=?1 AND body LIKE '%park%'",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parked, 0);
     }
 
     #[cfg(unix)]
