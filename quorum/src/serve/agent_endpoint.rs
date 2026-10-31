@@ -8,7 +8,7 @@
 use quorum_core::capabilities::{LiveRunContext, LiveRunPhase};
 use quorum_core::db::begin_immediate;
 use quorum_core::error::{QuorumError, Result};
-use quorum_core::planner_submissions::{self, SubmitOutcome};
+use quorum_core::planner_submissions::{self, CallOutcome, RejectionCategory, SubmitOutcome};
 use rusqlite::{params, Transaction};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -543,15 +543,22 @@ async fn process_request_with_timeout(
     process_timeout: Duration,
 ) -> std::result::Result<Response, EndpointFailure> {
     if request.version != PROTOCOL_VERSION {
-        return Err(EndpointFailure::new(
-            "unsupported_version",
-            "unsupported protocol version",
-        ));
+        let failure = EndpointFailure::new("unsupported_version", "unsupported protocol version");
+        if matches!(request.operation, Operation::SubmitPlan { .. })
+            && capability_has_valid_shape(&request.capability)
+        {
+            return Err(record_refused_call(
+                db_path,
+                request.capability,
+                RejectionCategory::UnsupportedVersion,
+                quorum_core::clock::now(),
+                failure,
+            )
+            .await);
+        }
+        return Err(failure);
     }
-    if request.capability.is_empty()
-        || request.capability.len() > 128
-        || request.capability.contains('\0')
-    {
+    if !capability_has_valid_shape(&request.capability) {
         return Err(EndpointFailure::new(
             "unauthorized",
             "run authority rejected",
@@ -819,6 +826,11 @@ enum PreparedPlan {
 /// that gives up must treat the outcome as unknown and re-check, never as
 /// "failed, resubmit" — a corrected resubmission would receive
 /// `already_submitted` while the first plan stands.
+///
+/// Every call for an issued run lands exactly one `planner_submission_calls`
+/// row. A write-phase outcome and its row share one transaction; a refusal from
+/// the non-writing phase records its row afterwards through
+/// `record_refused_call`, so an abandoned prepare can never add a second one.
 async fn submit_plan(
     db_path: PathBuf,
     plan_validation: PlanValidation,
@@ -826,6 +838,7 @@ async fn submit_plan(
     response: serde_json::Value,
     process_timeout: Duration,
 ) -> std::result::Result<Response, EndpointFailure> {
+    let received_at = quorum_core::clock::now();
     let prepared = tokio::time::timeout(
         process_timeout,
         prepare_and_validate_plan(
@@ -836,20 +849,47 @@ async fn submit_plan(
         ),
     )
     .await
-    .map_err(|_| EndpointFailure::new("timeout", "request processing timed out"))??;
+    .unwrap_or_else(|_| {
+        Err(EndpointFailure::new(
+            "timeout",
+            "request processing timed out",
+        ))
+    });
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            let category = prepare_failure_category(failure.code);
+            return Err(
+                record_refused_call(db_path, capability, category, received_at, failure).await,
+            );
+        }
+    };
 
     match prepared {
         PreparedPlan::Invalid { graph_id, message } => {
-            in_blocking(move || record_plan_rejection(&db_path, &capability, graph_id)).await?;
+            in_write_phase(
+                db_path,
+                capability,
+                received_at,
+                move |db_path, capability| {
+                    record_plan_rejection(db_path, capability, graph_id, received_at)
+                },
+            )
+            .await?;
             Err(EndpointFailure::detailed("invalid_plan", message))
         }
         PreparedPlan::Valid {
             graph_id,
             serialized,
         } => {
-            let outcome = in_blocking(move || {
-                record_plan_acceptance(&db_path, &capability, graph_id, &serialized)
-            })
+            let outcome = in_write_phase(
+                db_path,
+                capability,
+                received_at,
+                move |db_path, capability| {
+                    record_plan_acceptance(db_path, capability, graph_id, &serialized, received_at)
+                },
+            )
             .await?;
             match outcome {
                 SubmitOutcome::Accepted => {
@@ -866,6 +906,86 @@ async fn submit_plan(
             }
         }
     }
+}
+
+/// The ledger category of a refusal from the non-writing phase. Closed over the
+/// failure code, so no message text can choose a category.
+fn prepare_failure_category(code: &str) -> RejectionCategory {
+    match code {
+        "unauthorized" => RejectionCategory::Unauthorized,
+        "already_submitted" => RejectionCategory::AlreadySubmitted,
+        "submit_budget_exhausted" => RejectionCategory::BudgetExhausted,
+        "timeout" => RejectionCategory::Timeout,
+        _ => RejectionCategory::Internal,
+    }
+}
+
+/// Run one recording step. An `internal` failure means its transaction rolled
+/// back, taking the call's ledger row with it, so the call gets one attempt at
+/// an `internal` row instead. An `unauthorized` failure already committed its row.
+async fn in_write_phase<T, F>(
+    db_path: PathBuf,
+    capability: String,
+    received_at: i64,
+    work: F,
+) -> std::result::Result<T, EndpointFailure>
+where
+    F: FnOnce(&Path, &str) -> std::result::Result<T, EndpointFailure> + Send + 'static,
+    T: Send + 'static,
+{
+    let (write_db_path, write_capability) = (db_path.clone(), capability.clone());
+    match in_blocking(move || work(&write_db_path, &write_capability)).await {
+        Err(failure) if failure.code == "internal" => Err(record_refused_call(
+            db_path,
+            capability,
+            RejectionCategory::Internal,
+            received_at,
+            failure,
+        )
+        .await),
+        result => result,
+    }
+}
+
+/// Record a call that no write-phase transaction covers, then return `failure`.
+/// If the row cannot be written the call fails as `internal`, never as the
+/// clean refusal it would otherwise have reported.
+async fn record_refused_call(
+    db_path: PathBuf,
+    capability: String,
+    category: RejectionCategory,
+    received_at: i64,
+    failure: EndpointFailure,
+) -> EndpointFailure {
+    let recorded =
+        in_blocking(move || record_call_row(&db_path, &capability, category, received_at)).await;
+    match recorded {
+        Ok(()) => failure,
+        Err(internal) => internal,
+    }
+}
+
+/// Append one refused call in its own transaction. A capability matching no
+/// issued run writes nothing: `record_call` keeps it out of the ledger.
+fn record_call_row(
+    db_path: &Path,
+    capability: &str,
+    category: RejectionCategory,
+    received_at: i64,
+) -> std::result::Result<(), EndpointFailure> {
+    let mut conn = quorum_core::db::open(db_path)
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+    let tx = begin_immediate(&mut conn)
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+    planner_submissions::record_call(
+        &tx,
+        capability,
+        CallOutcome::Rejected(category),
+        received_at,
+    )
+    .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+    tx.commit()
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))
 }
 
 /// The whole non-writing phase: the short authority read, then full plan
@@ -1099,10 +1219,14 @@ fn bounded_path_for_message(path: &str) -> String {
     format!("{}{}", &path[..end], ELLIPSIS)
 }
 
+/// Record a validation rejection and its ledger row in one transaction. The
+/// counter's own guard leaves a settled run's `rejections` alone; the call is
+/// still recorded because it was still received.
 fn record_plan_rejection(
     db_path: &Path,
     capability: &str,
     graph_id: i64,
+    received_at: i64,
 ) -> std::result::Result<(), EndpointFailure> {
     let mut conn = quorum_core::db::open(db_path)
         .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
@@ -1110,26 +1234,43 @@ fn record_plan_rejection(
         .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
     planner_submissions::record_rejection(&tx, capability, graph_id)
         .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+    record_call_in_tx(
+        &tx,
+        capability,
+        CallOutcome::Rejected(RejectionCategory::Validation),
+        received_at,
+    )?;
     tx.commit()
         .map_err(|_| EndpointFailure::new("internal", "request processing failed"))
 }
 
 /// Record an accepted plan. Authority is re-resolved inside the write
 /// transaction because validation ran outside it and the graph may have moved
-/// on; the guarded acceptance in `record_accepted` decides the outcome.
+/// on; the guarded acceptance in `record_accepted` decides the outcome, and its
+/// ledger row commits with it. An authority failure commits only its own row.
 fn record_plan_acceptance(
     db_path: &Path,
     capability: &str,
     graph_id: i64,
     serialized: &str,
+    received_at: i64,
 ) -> std::result::Result<SubmitOutcome, EndpointFailure> {
     let mut conn = quorum_core::db::open(db_path)
         .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
     let tx = begin_immediate(&mut conn)
         .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
-    let context = quorum_core::capabilities::resolve_planner_context(&tx, capability)
-        .map_err(|_| EndpointFailure::new("unauthorized", "run authority rejected"))?;
-    if context.graph_id != graph_id {
+    let authorized = quorum_core::capabilities::resolve_planner_context(&tx, capability)
+        .is_ok_and(|context| context.graph_id == graph_id);
+    if !authorized {
+        planner_submissions::record_call(
+            &tx,
+            capability,
+            CallOutcome::Rejected(RejectionCategory::Unauthorized),
+            received_at,
+        )
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+        tx.commit()
+            .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
         return Err(EndpointFailure::new(
             "unauthorized",
             "run authority rejected",
@@ -1143,9 +1284,35 @@ fn record_plan_acceptance(
         quorum_core::clock::now(),
     )
     .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+    let call = match outcome {
+        SubmitOutcome::Accepted => CallOutcome::Accepted,
+        SubmitOutcome::AlreadySubmitted => {
+            CallOutcome::Rejected(RejectionCategory::AlreadySubmitted)
+        }
+        SubmitOutcome::BudgetExhausted => CallOutcome::Rejected(RejectionCategory::BudgetExhausted),
+    };
+    record_call_in_tx(&tx, capability, call, received_at)?;
     tx.commit()
         .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
     Ok(outcome)
+}
+
+/// Append the row for an outcome being recorded in `tx`. That outcome's run was
+/// already resolved, so a missing `run_capabilities` row fails the transaction
+/// rather than letting the outcome commit without its ledger row.
+fn record_call_in_tx(
+    tx: &Transaction<'_>,
+    capability: &str,
+    outcome: CallOutcome,
+    received_at: i64,
+) -> std::result::Result<(), EndpointFailure> {
+    match planner_submissions::record_call(tx, capability, outcome, received_at) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) | Err(_) => Err(EndpointFailure::new(
+            "internal",
+            "request processing failed",
+        )),
+    }
 }
 
 fn resolve(
@@ -1165,6 +1332,12 @@ fn resolve_any_role(
         Ok(context) => Ok(context),
         Err(_) => resolve(tx, capability, "reviewer"),
     }
+}
+
+/// Run ids are daemon-minted, so a capability failing these rules cannot name
+/// an issued run.
+fn capability_has_valid_shape(capability: &str) -> bool {
+    !capability.is_empty() && capability.len() <= 128 && !capability.contains('\0')
 }
 
 fn validate_text(value: Option<&str>) -> std::result::Result<(), EndpointFailure> {
@@ -1346,16 +1519,27 @@ mod tests {
             capability: &str,
             operation: Operation,
         ) -> std::result::Result<Response, EndpointFailure> {
+            self.request(PROTOCOL_VERSION, capability, operation, PROCESS_TIMEOUT)
+                .await
+        }
+
+        async fn request(
+            &self,
+            version: u8,
+            capability: &str,
+            operation: Operation,
+            process_timeout: Duration,
+        ) -> std::result::Result<Response, EndpointFailure> {
             process_request_with_timeout(
                 self.db_path.clone(),
                 "test/repo".into(),
                 self.plan_validation.clone(),
                 Request {
-                    version: PROTOCOL_VERSION,
+                    version,
                     capability: capability.into(),
                     operation,
                 },
-                PROCESS_TIMEOUT,
+                process_timeout,
             )
             .await
         }
@@ -1379,6 +1563,63 @@ mod tests {
                 )
                 .unwrap()
         }
+
+        fn submission_count(&self) -> i64 {
+            quorum_core::db::open(&self.db_path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM planner_submissions", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        }
+
+        /// `(seq, accepted, rejection_category)` for `run_id`, in `seq` order.
+        fn ledger(&self, run_id: &str) -> Vec<(i64, i64, Option<String>)> {
+            quorum_core::db::open(&self.db_path)
+                .unwrap()
+                .prepare(
+                    "SELECT seq,accepted,rejection_category FROM planner_submission_calls
+                     WHERE run_id=?1 ORDER BY seq",
+                )
+                .unwrap()
+                .query_map([run_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        }
+
+        fn ledger_total(&self) -> i64 {
+            quorum_core::db::open(&self.db_path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM planner_submission_calls", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        }
+
+        fn execute(&self, sql: &str) {
+            quorum_core::db::open(&self.db_path)
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap();
+        }
+
+        fn revoke(&self, run_id: &str) {
+            let mut conn = quorum_core::db::open(&self.db_path).unwrap();
+            quorum_core::capabilities::revoke(&mut conn, run_id, 20).unwrap();
+        }
+    }
+
+    /// Fails every ledger insert, so no call can land a row.
+    const LEDGER_DOWN: &str = "CREATE TRIGGER ledger_down BEFORE INSERT ON planner_submission_calls
+         BEGIN SELECT RAISE(ABORT, 'ledger down'); END";
+
+    fn accepted_row(seq: i64) -> (i64, i64, Option<String>) {
+        (seq, 1, None)
+    }
+
+    fn rejected_row(seq: i64, category: &str) -> (i64, i64, Option<String>) {
+        (seq, 0, Some(category.to_string()))
     }
 
     fn plan_task(key: &str, path: &str, prerequisites: Vec<&str>) -> serde_json::Value {
@@ -1705,6 +1946,454 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, "unauthorized");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ledger_records_rejection_acceptance_and_duplicate() {
+        let fixture = PlannerFixture::new();
+        let invalid = fixture
+            .submit_plan("planner-cap", undersized_plan())
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code, "invalid_plan");
+        fixture
+            .submit_plan("planner-cap", valid_plan())
+            .await
+            .unwrap();
+        let duplicate = fixture
+            .submit_plan("planner-cap", valid_plan())
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate.code, "already_submitted");
+        assert_eq!(
+            duplicate.message,
+            "a plan was already accepted for this run"
+        );
+
+        assert_eq!(
+            fixture.ledger("planner-cap"),
+            vec![
+                rejected_row(1, "validation"),
+                accepted_row(2),
+                rejected_row(3, "already_submitted"),
+            ]
+        );
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        let summary = planner_submissions::call_summary(&conn, "planner-cap").unwrap();
+        assert_eq!((summary.total, summary.accepted), (3, 1));
+        assert_eq!(fixture.submission_row().1, 1, "only validation counts");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ledger_records_budget_exhaustion_without_spending_budget() {
+        let fixture = PlannerFixture::new();
+        let budget = planner_submissions::MAX_PLAN_SUBMIT_REJECTIONS;
+        for _ in 0..budget {
+            fixture
+                .submit_plan("planner-cap", undersized_plan())
+                .await
+                .unwrap_err();
+        }
+        let error = fixture
+            .submit_plan("planner-cap", valid_plan())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "submit_budget_exhausted");
+
+        let ledger = fixture.ledger("planner-cap");
+        assert_eq!(ledger.len() as i64, budget + 1);
+        assert_eq!(
+            ledger[ledger.len() - 1],
+            rejected_row(budget + 1, "budget_exhausted")
+        );
+        assert!(ledger[..ledger.len() - 1]
+            .iter()
+            .all(|row| row.2.as_deref() == Some("validation")));
+        assert_eq!(fixture.submission_row().1, budget);
+    }
+
+    /// The write phase reaches these outcomes only after losing a race with
+    /// another call, so drive it directly past the prepare-phase refusals.
+    #[test]
+    fn ledger_row_shares_the_write_phase_outcome() {
+        let fixture = PlannerFixture::new();
+        let accept = |plan: &str| {
+            record_plan_acceptance(&fixture.db_path, "planner-cap", 5, plan, 40).unwrap()
+        };
+        assert_eq!(accept("{\"first\":1}"), SubmitOutcome::Accepted);
+        assert_eq!(accept("{\"second\":2}"), SubmitOutcome::AlreadySubmitted);
+        assert_eq!(
+            fixture.ledger("planner-cap"),
+            vec![accepted_row(1), rejected_row(2, "already_submitted")]
+        );
+        assert_eq!(fixture.submission_row().0.as_deref(), Some("{\"first\":1}"));
+
+        let fixture = PlannerFixture::new();
+        let budget = planner_submissions::MAX_PLAN_SUBMIT_REJECTIONS;
+        for _ in 0..budget {
+            record_plan_rejection(&fixture.db_path, "planner-cap", 5, 40).unwrap();
+        }
+        assert_eq!(
+            record_plan_acceptance(&fixture.db_path, "planner-cap", 5, "{}", 41).unwrap(),
+            SubmitOutcome::BudgetExhausted
+        );
+        assert_eq!(
+            fixture.ledger("planner-cap").last(),
+            Some(&rejected_row(budget + 1, "budget_exhausted"))
+        );
+        let conn = quorum_core::db::open(&fixture.db_path).unwrap();
+        let received_at: i64 = conn
+            .query_row(
+                "SELECT MAX(received_at) FROM planner_submission_calls",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(received_at, 41, "the row keeps the call's receipt time");
+    }
+
+    /// Validation runs outside the write transaction, so a rejection can commit
+    /// behind another call's acceptance.
+    #[test]
+    fn late_rejection_is_recorded_without_touching_the_accepted_run() {
+        let fixture = PlannerFixture::new();
+        record_plan_acceptance(&fixture.db_path, "planner-cap", 5, "{\"plan\":1}", 40).unwrap();
+        record_plan_rejection(&fixture.db_path, "planner-cap", 5, 41).unwrap();
+
+        assert_eq!(
+            fixture.ledger("planner-cap"),
+            vec![accepted_row(1), rejected_row(2, "validation")]
+        );
+        assert_eq!(
+            fixture.submission_row(),
+            (Some("{\"plan\":1}".to_string()), 0)
+        );
+    }
+
+    /// An outcome may not commit without its row, even if the capability that
+    /// passed prepare is gone by the time the rejection records.
+    #[test]
+    fn outcome_without_a_ledger_row_rolls_back() {
+        let fixture = PlannerFixture::new();
+        let error = record_plan_rejection(&fixture.db_path, "never-issued", 5, 40).unwrap_err();
+        assert_eq!(error.code, "internal");
+        assert_eq!(fixture.submission_count(), 0);
+        assert_eq!(fixture.ledger_total(), 0);
+    }
+
+    /// Authority can change between prepare and record, including the graph
+    /// moving on while the capability stays live.
+    #[test]
+    fn write_phase_authority_failure_commits_only_its_ledger_row() {
+        let wrong_graph = PlannerFixture::new();
+        let error =
+            record_plan_acceptance(&wrong_graph.db_path, "planner-cap", 6, "{}", 40).unwrap_err();
+        assert_eq!(error.code, "unauthorized");
+        assert_eq!(
+            wrong_graph.ledger("planner-cap"),
+            vec![rejected_row(1, "unauthorized")]
+        );
+        assert_eq!(wrong_graph.submission_count(), 0);
+
+        let revoked = PlannerFixture::new();
+        revoked.revoke("planner-cap");
+        let error =
+            record_plan_acceptance(&revoked.db_path, "planner-cap", 5, "{}", 40).unwrap_err();
+        assert_eq!(error.code, "unauthorized");
+        assert_eq!(
+            revoked.ledger("planner-cap"),
+            vec![rejected_row(1, "unauthorized")]
+        );
+        assert_eq!(revoked.submission_count(), 0);
+
+        let unknown = PlannerFixture::new();
+        let error =
+            record_plan_acceptance(&unknown.db_path, "never-issued", 5, "{}", 40).unwrap_err();
+        assert_eq!(error.code, "unauthorized");
+        assert_eq!(unknown.ledger_total(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wrong_version_records_only_an_issued_submit_plan_capability() {
+        let fixture = PlannerFixture::new();
+        let wrong_version = PROTOCOL_VERSION + 1;
+        let submit = || Operation::SubmitPlan {
+            response: valid_plan(),
+        };
+        let refuse = |capability: String, operation: Operation| {
+            let fixture = &fixture;
+            async move {
+                let error = fixture
+                    .request(wrong_version, &capability, operation, PROCESS_TIMEOUT)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code, "unsupported_version");
+                assert_eq!(error.message, "unsupported protocol version");
+                assert!(!error.is_abnormal());
+            }
+        };
+
+        refuse("never-issued".into(), submit()).await;
+        refuse(String::new(), submit()).await;
+        refuse("x".repeat(129), submit()).await;
+        refuse("planner\0cap".into(), submit()).await;
+        refuse("planner-cap".into(), Operation::Inventory).await;
+        assert_eq!(fixture.ledger_total(), 0);
+
+        refuse("planner-cap".into(), submit()).await;
+        refuse("planner-cap".into(), submit()).await;
+        assert_eq!(
+            fixture.ledger("planner-cap"),
+            vec![
+                rejected_row(1, "unsupported_version"),
+                rejected_row(2, "unsupported_version"),
+            ]
+        );
+        assert_eq!(fixture.submission_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prepare_deadline_records_exactly_one_timeout_row() {
+        let fixture = PlannerFixture::new();
+        for capability in ["planner-cap", "never-issued"] {
+            let error = fixture
+                .request(
+                    PROTOCOL_VERSION,
+                    capability,
+                    Operation::SubmitPlan {
+                        response: valid_plan(),
+                    },
+                    Duration::ZERO,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "timeout");
+        }
+        // The abandoned prepare is still finishing; it must add nothing.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            fixture.ledger("planner-cap"),
+            vec![rejected_row(1, "timeout")]
+        );
+        assert_eq!(fixture.ledger_total(), 1);
+        assert_eq!(fixture.submission_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_authority_records_an_unauthorized_row_for_issued_runs() {
+        let fixture = PlannerFixture::new();
+        fixture.revoke("planner-cap");
+        fixture.execute(
+            "INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+             VALUES ('moved-on-cap',1,'Planner','planner',10)",
+        );
+        for capability in ["worker-cap", "planner-cap", "moved-on-cap"] {
+            let error = fixture
+                .submit_plan(capability, valid_plan())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "unauthorized", "{capability}");
+            assert_eq!(error.message, "run authority rejected");
+            assert_eq!(
+                fixture.ledger(capability),
+                vec![rejected_row(1, "unauthorized")],
+                "{capability}"
+            );
+        }
+        assert_eq!(fixture.submission_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capabilities_naming_no_issued_run_write_no_row() {
+        let fixture = PlannerFixture::new();
+        for capability in [
+            "never-issued".to_string(),
+            String::new(),
+            "x".repeat(129),
+            "planner\0cap".to_string(),
+        ] {
+            let error = fixture
+                .submit_plan(&capability, valid_plan())
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "unauthorized");
+        }
+        assert_eq!(fixture.ledger_total(), 0);
+        assert_eq!(fixture.submission_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn internal_prepare_failure_records_an_internal_row() {
+        let fixture = PlannerFixture::new();
+        fixture.execute("UPDATE tasks SET depends_on='not json' WHERE id=1");
+        let error = fixture
+            .submit_plan("planner-cap", valid_plan())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "internal");
+        assert_eq!(
+            fixture.ledger("planner-cap"),
+            vec![rejected_row(1, "internal")]
+        );
+    }
+
+    /// A failed ledger write must surface as abnormal on every path, with no
+    /// outcome left behind, rather than as the refusal the call would have got.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ledger_write_failure_is_abnormal_on_every_path() {
+        let fixture = PlannerFixture::new();
+        fixture.execute(LEDGER_DOWN);
+        let assert_internal = |result: std::result::Result<Response, EndpointFailure>| {
+            let error = result.unwrap_err();
+            assert_eq!(error.code, "internal");
+            assert_eq!(error.message, "request processing failed");
+            assert!(error.is_abnormal());
+        };
+
+        assert_internal(fixture.submit_plan("planner-cap", valid_plan()).await);
+        assert_internal(fixture.submit_plan("planner-cap", undersized_plan()).await);
+        assert_internal(fixture.submit_plan("worker-cap", valid_plan()).await);
+        assert_internal(
+            fixture
+                .request(
+                    PROTOCOL_VERSION + 1,
+                    "planner-cap",
+                    Operation::SubmitPlan {
+                        response: valid_plan(),
+                    },
+                    PROCESS_TIMEOUT,
+                )
+                .await,
+        );
+        assert_internal(
+            fixture
+                .request(
+                    PROTOCOL_VERSION,
+                    "planner-cap",
+                    Operation::SubmitPlan {
+                        response: valid_plan(),
+                    },
+                    Duration::ZERO,
+                )
+                .await,
+        );
+        let unauthorized = record_plan_acceptance(&fixture.db_path, "worker-cap", 5, "{}", 40);
+        assert_eq!(unauthorized.unwrap_err().code, "internal");
+
+        assert_eq!(fixture.ledger_total(), 0);
+        assert_eq!(fixture.submission_count(), 0, "outcomes rolled back");
+    }
+
+    /// Either half of a write-phase transaction failing discards both halves,
+    /// and the one retained record of the call is its `internal` row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rolled_back_write_phase_records_one_internal_row() {
+        for trigger in [
+            "CREATE TRIGGER ledger_refused BEFORE INSERT ON planner_submission_calls
+             WHEN NEW.rejection_category IS NOT 'internal'
+             BEGIN SELECT RAISE(ABORT, 'ledger refused'); END",
+            "CREATE TRIGGER outcome_refused BEFORE UPDATE ON planner_submissions
+             BEGIN SELECT RAISE(ABORT, 'outcome refused'); END",
+        ] {
+            for plan in [valid_plan(), undersized_plan()] {
+                let fixture = PlannerFixture::new();
+                fixture.execute(trigger);
+                let error = fixture.submit_plan("planner-cap", plan).await.unwrap_err();
+                assert_eq!(error.code, "internal");
+                assert!(error.is_abnormal());
+                assert_eq!(
+                    fixture.ledger("planner-cap"),
+                    vec![rejected_row(1, "internal")]
+                );
+                assert_eq!(fixture.submission_count(), 0, "outcome rolled back");
+            }
+        }
+    }
+
+    /// Concurrent calls race through the prepare and write phases on their own
+    /// connections. However they interleave, each lands exactly one row, `seq`
+    /// stays contiguous, and only the first accepted plan stands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_calls_each_land_exactly_one_ledger_row() {
+        const VALID_CALLS: usize = 4;
+        const INVALID_CALLS: usize = 4;
+        const ROUNDS: usize = 10;
+
+        for _ in 0..ROUNDS {
+            let fixture = Arc::new(PlannerFixture::new());
+            let mut calls = JoinSet::new();
+            for call in 0..VALID_CALLS + INVALID_CALLS {
+                let fixture = Arc::clone(&fixture);
+                calls.spawn(async move {
+                    let plan = if call < VALID_CALLS {
+                        valid_plan()
+                    } else {
+                        undersized_plan()
+                    };
+                    // The shared resolver admits one call and fails the rest
+                    // closed, so each call brings its own to reach the ledger race.
+                    let plan_validation = PlanValidation {
+                        repo_dir: fixture.plan_validation.repo_dir.clone(),
+                        path_resolver: super::super::planner::WritablePathResolver::default(),
+                    };
+                    process_request_with_timeout(
+                        fixture.db_path.clone(),
+                        "test/repo".into(),
+                        plan_validation,
+                        Request {
+                            version: PROTOCOL_VERSION,
+                            capability: "planner-cap".into(),
+                            operation: Operation::SubmitPlan { response: plan },
+                        },
+                        PROCESS_TIMEOUT,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.code)
+                });
+            }
+            let mut accepted = 0;
+            while let Some(outcome) = calls.join_next().await {
+                match outcome.unwrap() {
+                    Ok(()) => accepted += 1,
+                    Err(code) => {
+                        assert!(
+                            matches!(code, "invalid_plan" | "already_submitted"),
+                            "{code}"
+                        )
+                    }
+                }
+            }
+            assert_eq!(accepted, 1);
+
+            let ledger = fixture.ledger("planner-cap");
+            let seqs: Vec<i64> = ledger.iter().map(|row| row.0).collect();
+            assert_eq!(
+                seqs,
+                (1..=(VALID_CALLS + INVALID_CALLS) as i64).collect::<Vec<_>>()
+            );
+            assert_eq!(ledger.iter().filter(|row| row.1 == 1).count(), 1);
+            assert!(fixture.submission_row().0.is_some());
+        }
+    }
+
+    #[test]
+    fn prepare_failure_category_is_a_closed_mapping() {
+        for (code, category) in [
+            ("unauthorized", RejectionCategory::Unauthorized),
+            ("already_submitted", RejectionCategory::AlreadySubmitted),
+            (
+                "submit_budget_exhausted",
+                RejectionCategory::BudgetExhausted,
+            ),
+            ("timeout", RejectionCategory::Timeout),
+            ("internal", RejectionCategory::Internal),
+            ("invalid_plan", RejectionCategory::Internal),
+            ("unsupported_version", RejectionCategory::Internal),
+            ("anything else", RejectionCategory::Internal),
+        ] {
+            assert_eq!(prepare_failure_category(code), category, "{code}");
+        }
     }
 
     #[test]

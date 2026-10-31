@@ -2716,6 +2716,66 @@ and the capability is revoked when the attempt ends. On process exit the coordin
 was durably accepted: a submission is the outcome however the process then ended, and a turn that
 ends with none is a provider failure — printing a perfect plan as text delivers nothing.
 
+#### `planner_submissions` storage and the `submit_plan` call ledger
+
+`planner_submissions` holds one row per run that recorded an outcome: `run_id`, `graph_id`, the
+accepted `response_json`, `accepted_at`, and `rejections`. It is what the coordinator reads. Only
+a validation rejection increments `rejections`, and it does so only while no response is stored,
+so a rejection committing behind another call's acceptance leaves the count and the stored
+response unchanged. Once `rejections` reaches `MAX_PLAN_SUBMIT_REJECTIONS`, further submissions
+are refused without validating. A call refused for any other reason leaves `planner_submissions`
+unchanged.
+
+`planner_submission_calls` is the separate per-call ledger that makes a run with rejected calls
+distinguishable from a run with no calls: `run_id`, `seq`, `received_at`, `accepted`, and
+`rejection_category`. Each `submit_plan` call for an issued run writes exactly one row, with
+`accepted = 1` and no category, or `accepted = 0` and one of the fixed categories below. `seq` is
+allocated per run under `BEGIN IMMEDIATE` and starts at 1, so it is the order rows were written;
+`received_at` is the endpoint clock when it took the call, and a call that spent longer in
+validation can carry an earlier `received_at` than a lower `seq`.
+
+| Category | Call |
+|---|---|
+| `validation` | The plan failed validation (`invalid_plan`). |
+| `budget_exhausted` | The rejection budget was already spent (`submit_budget_exhausted`). |
+| `already_submitted` | A plan already stands for the run. |
+| `unauthorized` | The capability is issued but fails planner authority: wrong role, revoked, or its graph session moved on. |
+| `unsupported_version` | The request carried the wrong protocol version with a well-shaped capability. |
+| `timeout` | The read-and-validate phase passed its deadline. |
+| `internal` | The read-and-validate phase failed, or a write transaction rolled back. |
+
+The ledger holds no plan text and no validation message: the columns above are all it has, and
+the category comes from a closed mapping over the endpoint's fixed failure codes. A row is written
+in one of two ways. An outcome recorded by the write phase lands in the same transaction as
+`record_rejection` or `record_accepted`, so the outcome and its row commit or roll back together;
+when that transaction rolls back with `internal`, the call makes one attempt to write an `internal`
+row in a transaction of its own. The acceptance write re-resolves authority, and a failure there
+commits only its `unauthorized` row. A validation rejection does not re-resolve: it uses the
+authority resolved during the read-and-validate phase, so a planner revoked or moved off its graph
+while an invalid plan validates still records `validation` and can increment `rejections`, where a
+valid plan with the same timing records `unauthorized`. A refusal from the read-and-validate
+phase, including its timeout, and a version refusal write their row afterwards in their own
+transaction: that phase stays read-only, so it can be abandoned at its deadline without producing
+a second row. A ledger write that fails turns the call into the abnormal `internal` failure, never
+a clean refusal or a success. Otherwise the ledger changes nothing the client sees. Rows are diagnostic: they neither read nor write
+`rejections`, and they never cause a lifecycle transition.
+
+No row is written in exactly these cases:
+
+- Every failure before a capability is parsed: the `read_request` refusals `malformed_frame`,
+  `request_too_large`, `malformed_request`, and read `timeout`, and any call that never reaches the
+  endpoint.
+- A capability refused by the shape check (empty, over 128 bytes, or containing NUL), or one
+  matching no `run_capabilities` row, meaning unknown or never issued. A caller-supplied string
+  therefore never enters the ledger.
+- A storage or process failure that prevents the write from committing, which is reported as
+  `internal` or ends the process and is never a silent success.
+
+Operations other than `submit_plan` are out of ledger scope, including a version refusal for one.
+
+Nothing prunes either table. The rejection budget bounds validation rejections, not calls: every
+refused call still appends a ledger row, and no code path caps the rows per run.
+
 Codex planning is supported only through its hardened planner-specific boundary: the CLI runs
 read-only without coordination authority, and a bounded JSONL terminal response remains only a
 candidate until stdout reaches EOF, final diagnostics are bounded and complete, and the process
