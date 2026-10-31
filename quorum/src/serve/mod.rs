@@ -35311,6 +35311,417 @@ mod tests {
     }
 
     #[cfg(unix)]
+    const CODEX_USAGE_LIMIT_MESSAGE: &str = "You\u{2019}ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at Oct 31st, 2026 3:41 AM.";
+    #[cfg(unix)]
+    const CODEX_FAILURE_TICK_ROOT: &str = "QUORUM_TEST_CODEX_FAILURE_TICK_ROOT";
+
+    #[cfg(unix)]
+    struct CodexReviewerFailureTick {
+        db_path: PathBuf,
+        task_id: i64,
+        initial_run: i64,
+        responsibility: String,
+        reviewers: Vec<SlotState>,
+    }
+
+    /// Run one real tick over an in-review Codex reviewer whose provider
+    /// replays a failed run's stream, in a pool with one Claude alternate.
+    /// Provider-wide exclusion rules out a same-provider alternate here.
+    #[cfg(unix)]
+    fn tick_codex_reviewer_turn_failure(
+        root: PathBuf,
+        message: String,
+    ) -> CodexReviewerFailureTick {
+        std::thread::Builder::new()
+            .name("codex-reviewer-failure-tick".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(codex_reviewer_turn_failure_tick_body(&root, &message))
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    async fn codex_reviewer_turn_failure_tick_body(
+        root: &Path,
+        message: &str,
+    ) -> CodexReviewerFailureTick {
+        use std::os::unix::fs::PermissionsExt;
+
+        let worktree = root.join("reviewer-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let unused_codex = live_fallback_runner(root);
+        let head_sha = "a".repeat(40);
+        let mut config = live_fallback_test_config(
+            root.join("codex-reviewer-failure.db"),
+            root,
+            &unused_codex,
+            Arc::new(FallbackHeadExecutor(head_sha.clone())),
+        );
+        config.model_profiles.insert(
+            "b-alternate".into(),
+            crate::serve_config::ModelProfile {
+                runner: "claude".into(),
+                model: "claude-sonnet-4-6".into(),
+                effort: "high".into(),
+            },
+        );
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let observed_at = now_unix();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "codex reviewer failure",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        tasks::claim(
+            &mut conn,
+            "Author",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at - 2,
+        )
+        .unwrap()
+        .unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "Author",
+            task_id,
+            &Event::SignaledDone { pr: "77".into() },
+            observed_at - 1,
+        )
+        .unwrap();
+        tasks::reserve_reviewer_provision(
+            &mut conn,
+            task_id,
+            "codex-failure-reservation",
+            "r1",
+            observed_at,
+        )
+        .unwrap();
+        assert!(tasks::attach_reserved_reviewer(
+            &mut conn,
+            task_id,
+            "codex-failure-reservation",
+            "r1",
+            "Fallback-Reviewer",
+            3600,
+            observed_at,
+        )
+        .unwrap());
+        let responsibility = format!("reviewer:task:{task_id}:r1");
+        let (assignment, initial_run, agent_name) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "reviewer",
+            Some(77),
+            Some("r1"),
+        );
+        assert_eq!(assignment.provider, "codex");
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent_name.clone(),
+                role: "reviewer".into(),
+                task_id: Some(task_id),
+                session_id: "initial-review-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("review/pr-77".into()),
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(77),
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("review/pr-77".into()),
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let stream = root.join("failed-turn.jsonl");
+        std::fs::write(
+            &stream,
+            [
+                serde_json::json!({"type":"thread.started","thread_id":"failed-thread"}),
+                serde_json::json!({"type":"turn.started"}),
+                serde_json::json!({"type":"error","message":message}),
+                serde_json::json!({"type":"turn.failed","error":{"message":message}}),
+            ]
+            .map(|line| format!("{line}\n"))
+            .concat(),
+        )
+        .unwrap();
+        let provider = root.join("failed-codex");
+        std::fs::write(
+            &provider,
+            format!(
+                "#!/bin/sh\necho 'Reading additional input from stdin...' >&2\ncat '{}'\nexit 1\n",
+                stream.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let proc = runner::RunnerProc::launch(
+            &runner::LaunchRequest {
+                model: &assignment.model,
+                effort: &assignment.effort,
+                worktree: &worktree,
+                prompt: "exact reviewer prompt",
+                environment: &[],
+                mode: runner::LaunchMode::Normal,
+                continuation_id: None,
+            },
+            &runner::AdapterConfig {
+                executable: provider.to_str(),
+                claude_bare: false,
+                claude_allowed_tools: "",
+                codex_sandbox: "danger-full-access",
+                grok: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut slot = slot_with_process(proc);
+        slot.agent_name = agent_name.clone();
+        slot.task_id = task_id;
+        slot.session_id = "initial-review-session".into();
+        slot.model = assignment.model.clone();
+        slot.effort = assignment.effort.clone();
+        slot.worktree_path = worktree;
+        slot.branch = "review/pr-77".into();
+        slot.remote_branch = "review/pr-77".into();
+        slot.draining = true;
+        slot.pr = Some(77);
+        slot.cost_tokens = 0;
+        slot.limit_tokens = 0;
+        slot.cost_usd = 0.0;
+        slot.agent_run_id = Some(initial_run);
+        slot.cap_run_id = Some("initial-cap".into());
+        slot.reviewed_head_sha = Some(head_sha);
+        slot.pending_prompt = "exact reviewer prompt".into();
+        slot.pending_turn_kind = "review".into();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while slot.try_wait().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture provider must buffer its failed turn before the tick");
+
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named(&agent_name).unwrap();
+        let mut workers = Vec::new();
+        let mut reviewers = vec![slot];
+        let mut branch_sync_checks = branch_sync::BranchSyncChecks::default();
+        let mut pre_review_checks = HashMap::new();
+        let mut pending_reviewer_resumes = HashMap::new();
+        let mut poison_tracker = PoisonTracker::new();
+        let mut claim_skip_logs = ClaimSkipLogLimiter::new();
+        let mut graph_skip_logs = ClaimSkipLogLimiter::new();
+        let mut unrecordable = UnrecordableStrikes::new();
+        let mut reviewer_respawn_backoff = ReviewerRespawnBackoff::new();
+        let mut drain_state = DrainState::new();
+        let mut lifetime_roster = LifetimeRoster::new();
+        lifetime_roster.register(&agent_name);
+        let mut classifier_slot = None;
+        let mut decomposition_coordinator = DecompositionCoordinator::default();
+        let mut classifier_consec_errors = 0;
+        let mut classifier_backoff_until = None;
+        let mut doctor_slot = None;
+        let mut doctored_tasks = std::collections::HashSet::new();
+        let signal_count = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        tick(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+            &mut branch_sync_checks,
+            &mut pre_review_checks,
+            &mut pending_reviewer_resumes,
+            &mut poison_tracker,
+            &mut claim_skip_logs,
+            &mut graph_skip_logs,
+            &mut unrecordable,
+            &mut reviewer_respawn_backoff,
+            &mut drain_state,
+            &mut lifetime_roster,
+            &mut classifier_slot,
+            &mut decomposition_coordinator,
+            &mut classifier_consec_errors,
+            &mut classifier_backoff_until,
+            &mut doctor_slot,
+            &mut doctored_tasks,
+            &collector::CollectorTracker::default(),
+            &signal_count,
+        )
+        .await
+        .unwrap();
+        CodexReviewerFailureTick {
+            db_path: config.db_path.clone(),
+            task_id,
+            initial_run,
+            responsibility,
+            reviewers,
+        }
+    }
+
+    /// Re-executed with only the fake `claude` first on PATH: the mixed-runner
+    /// pool resolves its alternate from PATH, which a threaded test binary
+    /// must not mutate and which must never reach a real provider CLI.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess body of codex_usage_limit_tick_installs_claude_reviewer_alternate"]
+    fn codex_usage_limit_tick_child() {
+        let Some(root) = std::env::var_os(CODEX_FAILURE_TICK_ROOT) else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let mut outcome =
+            tick_codex_reviewer_turn_failure(root.clone(), CODEX_USAGE_LIMIT_MESSAGE.to_string());
+
+        assert_eq!(
+            outcome.reviewers.len(),
+            1,
+            "the reviewer slot must survive on its alternate"
+        );
+        let slot = outcome.reviewers.remove(0);
+        assert_eq!(slot.process_kind(), runner::AgentKind::Claude);
+        assert_eq!(slot.model, "claude-sonnet-4-6");
+        assert_ne!(slot.agent_run_id, Some(outcome.initial_run));
+        assert_ne!(slot.cap_run_id.as_deref(), Some("initial-cap"));
+
+        let conn = quorum_core::db::open(&outcome.db_path).unwrap();
+        let (profile, disposition, failed_run): (String, String, i64) = conn
+            .query_row(
+                "SELECT profile_id,failure_disposition,failed_agent_run_id
+                 FROM routing_attempts WHERE responsibility_key=?1",
+                [&outcome.responsibility],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(profile, "a-primary");
+        assert_eq!(disposition, "provider-unavailable");
+        assert_eq!(failed_run, outcome.initial_run);
+        assert_eq!(
+            agent_run_end_reason(&conn, outcome.initial_run).as_deref(),
+            Some("fallback-route-unavailable"),
+        );
+        assert_eq!(
+            tasks::get(&conn, outcome.task_id)
+                .unwrap()
+                .unwrap()
+                .reviewer
+                .as_deref(),
+            Some("Fallback-Reviewer"),
+        );
+        drop(conn);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert_provider_started_once(&root.join("alternate-started")).await;
+            slot.kill_and_reap().await;
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_usage_limit_tick_installs_claude_reviewer_alternate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(
+            &claude,
+            format!(
+                "#!/bin/sh\nprintf started >> '{}'\nexec sleep 30\n",
+                root.path().join("alternate-started").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(bin.clone())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "serve::tests::codex_usage_limit_tick_child",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CODEX_FAILURE_TICK_ROOT, root.path())
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child tick failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// The control for the installed alternate above: the same tick and pool
+    /// still fail an unrecognized message without trying any route.
+    #[cfg(unix)]
+    #[test]
+    fn codex_unrecognized_turn_failure_tick_stays_turn_error_unclassified() {
+        let root = tempfile::tempdir().unwrap();
+        let outcome = tick_codex_reviewer_turn_failure(
+            root.path().to_path_buf(),
+            "You\u{2019}ve hit your rate limit. Try again in 20s.".into(),
+        );
+
+        assert!(outcome.reviewers.is_empty());
+        let conn = quorum_core::db::open(&outcome.db_path).unwrap();
+        assert_eq!(
+            agent_run_end_reason(&conn, outcome.initial_run).as_deref(),
+            Some("turn-error-unclassified"),
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM routing_attempts WHERE responsibility_key=?1",
+                [&outcome.responsibility],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn restart_reaps_pid_bearing_fallback_and_replays_exact_turn_once() {
         use std::os::unix::fs::PermissionsExt;
