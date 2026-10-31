@@ -190,10 +190,12 @@ Configuration requires pools for classifier, planner, collector, workers at
 complexities 1–5, and reviewers at complexities 1–5. Every referenced profile
 must be valid for its runner, every weight must be positive, and each pool must
 total exactly 100. Classifier and collector turns fail over to another pool
-profile when a provider is unavailable, so name two providers in those pools; a
-single-provider pool alerts the owner and waits for the outage to end. The
-planner pool currently accepts Claude profiles; the complete example reflects
-that constraint.
+profile when a provider is unavailable, so name two providers in those pools. A
+single-provider pool alerts the owner and retries only within each role's
+budget. Task classification stays pending, but planning classification holds its
+graph and fails the source task after two provider failures, and a collection
+dead-letters after five attempts. The planner pool currently accepts Claude
+profiles; the complete example reflects that constraint.
 
 Weights are not independent per-call randomness. For each pool Quorum builds a
 shuffled, durable 100-slot assignment epoch containing the configured number of

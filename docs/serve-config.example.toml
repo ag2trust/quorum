@@ -36,9 +36,12 @@ model = "claude-opus-5-5"
 effort = "high"
 
 # Classifier and collector turns fail over to another pool profile when a
-# provider is unavailable, so name two providers: a single-provider pool can
-# only alert the owner and wait for the outage to end. The second provider's
-# weight is the share of normal traffic it receives.
+# provider is unavailable, so name two providers. A single-provider pool can
+# only alert the owner and retry within each role's budget: task classification
+# stays pending, planning classification holds its graph and fails the source
+# task after two provider failures, and a collection dead-letters after five
+# attempts. The second provider's weight is the share of normal traffic it
+# receives.
 [routing.classifier]
 terra = 95
 opus = 5

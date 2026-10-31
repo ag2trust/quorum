@@ -160,14 +160,14 @@ fn blocked_alert(route: &RoleRoute, failure: &RunnerFailure, subject: &str) -> (
         .map(|weighted| weighted.profile.provider.as_str())
         .collect();
     let evidence = format!("{}: {}", failure.disposition(), failure.detail());
+    let consequence = blocked_consequence(role);
     let (kind, body) = if providers.len() == 1 {
         (
             "single-provider",
             format!(
                 "{role} blocked for {subject}: routing pool `{pool_key}` names only provider \
-                 {provider}, which is unavailable ({evidence}). The work stays pending and \
-                 retries with backoff. Add a second provider to [routing.{role}] and restart \
-                 the daemon to route around this."
+                 {provider}, which is unavailable ({evidence}). {consequence} Add a second \
+                 provider to [routing.{role}] and restart the daemon to route around this."
             ),
         )
     } else {
@@ -175,8 +175,7 @@ fn blocked_alert(route: &RoleRoute, failure: &RunnerFailure, subject: &str) -> (
             "all-providers",
             format!(
                 "{role} blocked for {subject}: every provider in routing pool `{pool_key}` \
-                 ({}) is unavailable; last failure on {provider} ({evidence}). The work stays \
-                 pending and retries with backoff.",
+                 ({}) is unavailable; last failure on {provider} ({evidence}). {consequence}",
                 providers.into_iter().collect::<Vec<_>>().join(", ")
             ),
         )
@@ -186,6 +185,26 @@ fn blocked_alert(route: &RoleRoute, failure: &RunnerFailure, subject: &str) -> (
         route.pool.policy_generation
     );
     (body, refs)
+}
+
+/// What happens to blocked work under the role's own retry budget. The alert
+/// key is the role's pool, so a classifier alert raised by one task also covers
+/// planning classification, and it must state both outcomes.
+fn blocked_consequence(role: &str) -> String {
+    if role == "collector" {
+        format!(
+            "Collection retries with backoff and dead-letters after {} attempts; it then \
+             stops retrying and the job stays recorded.",
+            quorum_core::review_interpret_jobs::MAX_ATTEMPTS
+        )
+    } else {
+        format!(
+            "Task classification stays pending and retries with backoff. Planning \
+             classification does not wait: after {} provider failures its graph is held and \
+             the source task fails until an operator runs task-retry.",
+            quorum_core::decomposition::MAX_PROVIDER_FAILURES
+        )
+    }
 }
 
 /// Settle a failed turn off the async runtime. Returns the profile to run next
@@ -394,6 +413,14 @@ mod tests {
             "{alerts:?}"
         );
         assert!(alerts[0].contains("[routing.classifier]"), "{alerts:?}");
+        assert!(
+            alerts[0].contains("Task classification stays pending"),
+            "{alerts:?}"
+        );
+        assert!(
+            alerts[0].contains("after 2 provider failures its graph is held"),
+            "{alerts:?}"
+        );
     }
 
     #[test]

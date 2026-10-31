@@ -2677,10 +2677,15 @@ planner nor provider budget. A collector run on an alternate route records that 
 with a NULL `role_assignment_id`, because the assignment still names the failed route.
 
 When no eligible profile remains the role is blocked: it raises one owner alert per role, policy
-generation, and block kind (`single-provider` or `all-providers`) for each message TTL, and the
-work stays pending and visible. Exclusions are never deleted, so a blocked responsibility keeps
-probing one pool profile at a time, rotating through the pool under that role's existing retry
-pacing, and recovers once a provider returns. Failover uses the pool generation that created the
+generation, and block kind (`single-provider` or `all-providers`) for each message TTL. Blocked
+work then stays under the role's existing retry budget, so what it recovers from depends on the
+role. Task classification has no cap: the task stays pending and visible, and it recovers once a
+provider returns. Planning classification spends the decomposition provider budget: at
+`MAX_PROVIDER_FAILURES` the graph is held and the source task fails until an operator runs
+`task-retry`. Collection spends interpret-queue attempts: at `MAX_ATTEMPTS` the job dead-letters,
+stops retrying, and stays recorded. Exclusions are never deleted, so while a blocked responsibility
+is still retrying it probes one pool profile at a time, rotating through the pool under that
+role's existing retry pacing. Failover uses the pool generation that created the
 assignment, so an unfinished classifier or collector responsibility whose generation is stale
 adopts the current pool through a generation-suffixed responsibility key. This is the one
 exception to snapshot retention, and it is what lets a pool edit reach work already blocked.

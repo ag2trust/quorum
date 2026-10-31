@@ -1192,7 +1192,9 @@ impl RunnerProc {
 
     /// Failure evidence for a one-shot turn that ended without a response.
     /// An exited process is finalized first so its buffered records count;
-    /// the captured output is returned so the caller keeps its usage.
+    /// the captured output is returned so the caller keeps its usage. This
+    /// reaps an exited leader, so an owner that signals the numeric pgid must
+    /// retire it first.
     pub async fn failed_turn_evidence(&mut self) -> (Option<RunnerFailure>, Vec<CapturedOutput>) {
         let captured = if matches!(self.try_wait(), Ok(Some(_))) {
             self.finalize_pre_authoritative_evidence().await

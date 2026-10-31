@@ -1836,6 +1836,13 @@ async fn spawn_and_run_classifier(
         }
     };
 
+    // Failure evidence and `kill_and_reap` can each reap the leader, freeing
+    // the numeric pgid for reuse, so drain must stop signalling the group
+    // before the first of them starts. Output the group already wrote stays
+    // readable from the pipes after this SIGKILL.
+    if let Some(reaping) = &owned {
+        reaping.begin();
+    }
     // Reaping can drain a terminal event raced by the timeout. It remains
     // lifecycle-inert, but its usage is still durable telemetry.
     let kind = proc.kind();
@@ -1844,12 +1851,6 @@ async fn spawn_and_run_classifier(
     } else {
         (None, Vec::new())
     };
-    // The runner may reap the leader — freeing the numeric pgid for reuse —
-    // at any await inside `kill_and_reap`, so drain must stop signalling the
-    // group before that call starts, not after it returns.
-    if let Some(reaping) = &owned {
-        reaping.begin();
-    }
     captured.extend(proc.kill_and_reap().await);
     if let Some(reaping) = owned {
         reaping
@@ -1918,10 +1919,11 @@ enum Ownership {
     /// The owning task has not started reaping: the leader is unreaped, so
     /// the pgid still names this group and the tracker may signal it.
     Live,
-    /// The owning task entered `RunnerProc::kill_and_reap` (or unwound). The
-    /// tracker SIGKILLed the group at this transition; the leader may be
-    /// reaped at any moment, so only the runner's own recycle-safe kill and
-    /// Drop guard may signal from here on.
+    /// The owning task ended the turn (or unwound). The tracker SIGKILLed the
+    /// group at this transition, before failure evidence or
+    /// `RunnerProc::kill_and_reap` could reap the leader; it may be reaped at
+    /// any moment now, so only the runner's own kill and Drop guard may signal
+    /// from here on.
     Reaping,
     /// The owning task finished reaping; only the journal row remains.
     Reaped,
@@ -2093,11 +2095,12 @@ impl CollectorTracker {
         .map_err(|error| QuorumError::Io(format!("collector journal write failed: {error}")))
     }
 
-    /// Called by the owning task immediately before `kill_and_reap`, with no
-    /// await in between. Under the tracker lock — so it cannot interleave
-    /// with drain's kill pass — SIGKILL the still-owned group and retire its
-    /// pgid from every later tracker signal. Idempotent; a no-op once drain
-    /// took the entry.
+    /// Called by the owning task before any runner call that can reap the
+    /// leader — `failed_turn_evidence` or `kill_and_reap` — with no await in
+    /// between. Under the tracker lock — so it cannot interleave with drain's
+    /// kill pass — SIGKILL the still-owned group and retire its pgid from
+    /// every later tracker signal. Idempotent; a no-op once drain took the
+    /// entry.
     fn begin_reap(&self, agent: &str) {
         if let Some(owned) = self.state().owned.get_mut(agent) {
             if owned.ownership == Ownership::Live {
@@ -3763,6 +3766,8 @@ mod tests {
         assert_eq!(alerts.len(), 1, "{alerts:?}");
         assert!(alerts[0].contains("collector blocked"), "{alerts:?}");
         assert!(alerts[0].contains("[routing.collector]"), "{alerts:?}");
+        assert!(alerts[0].contains("dead-letters after 5"), "{alerts:?}");
+        assert!(!alerts[0].contains("stays pending"), "{alerts:?}");
         let conn = db::open(&db).unwrap();
         let run = review_findings::get_run(&conn, 421).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Failed);
@@ -5079,6 +5084,78 @@ esac
         run_live(&request).await.unwrap();
         assert!(tracker.state().owned.is_empty());
         assert!(rows_with_role(&db, JOURNAL_ROLE).is_empty());
+    }
+
+    /// A provider that already exited is the normal outage path. Its leader
+    /// is a zombie when the failure record arrives, and a descendant keeps the
+    /// pipes open, so failure evidence reaps the leader and would then wait on
+    /// the pipes. The tracker must never hold `Live` for a reaped leader: drain
+    /// and `begin_reap` would signal a number the kernel may have reused.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tracked_failure_evidence_never_reaps_a_live_owned_leader() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let (codex, _) = codex_over_usage_limit(dir.path());
+        let transcript = dir.path().join("codex.jsonl");
+        std::fs::write(
+            &codex,
+            format!(
+                "#!/bin/sh\n(sleep 0.2; /bin/cat '{}'; exec sleep 300) &\nexit 1\n",
+                transcript.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let tracker = CollectorTracker::default();
+        let mut request = routed_collector_request(dir.path(), &db, 516, &codex, None);
+        request.tracker = Some(tracker.clone());
+        let turn = tokio::spawn(async move { run_live(&request).await });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut adopted = false;
+        while !turn.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "turn never finished");
+            let pgid = tracker.state().owned.values().next().map(|owned| owned.pgid);
+            if let Some(pgid) = pgid {
+                adopted = true;
+                // Probe before reading the state: ownership only ever leaves
+                // `Live`, so a gone leader seen with `Live` afterwards is a
+                // real violation, never an interleaving of the hand-off. A
+                // zombie still answers this probe; only a reaped leader fails.
+                let reaped = unsafe { libc::kill(pgid, 0) } != 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+                if reaped {
+                    let still_live = tracker
+                        .state()
+                        .owned
+                        .values()
+                        .any(|owned| owned.ownership == Ownership::Live);
+                    assert!(!still_live, "leader reaped while its pgid was still Live");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(adopted, "the sampler must have seen the tracked process");
+
+        turn.await.unwrap().unwrap_err();
+        assert!(tracker.state().owned.is_empty());
+        assert!(rows_with_role(&db, JOURNAL_ROLE).is_empty());
+        let conn = db::open(&db).unwrap();
+        let attempts = quorum_core::routing_attempts::list(&conn, "collector:pr:516").unwrap();
+        assert_eq!(
+            attempts.len(),
+            1,
+            "the hand-off must keep the record that classifies the outage"
+        );
+        assert_eq!(
+            attempts[0].failure_disposition,
+            Some(super::super::runner::FailureDisposition::ProviderUnavailable)
+        );
     }
 
     // ── Shutdown-path matrix: real tick loop, live doctor + live collector ─
