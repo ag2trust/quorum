@@ -3028,7 +3028,7 @@ pub fn invalidate_recovered_sampling_authority(
 }
 
 /// Remove non-authoritative optional-role evidence without consuming the
-/// owner-authorized merge attempt.
+/// admitted durable merge attempt.
 ///
 /// The task must still own the exact `merging + attempting` boundary. Keeping
 /// that marker makes a crash after this repair conservative: startup parks the
@@ -6646,7 +6646,7 @@ pub fn retry_parked(
     Ok(Some(task))
 }
 
-/// Atomically consume at most one owner-authorized merge replay intent.
+/// Atomically consume at most one durable merge replay intent.
 ///
 /// The transition to `attempting` commits before any network call. If the
 /// daemon crashes after this point, startup parks the uncertain attempt and
@@ -6683,7 +6683,7 @@ pub fn claim_merge_retry(conn: &mut Connection, now: i64) -> Result<Option<Task>
         &tx,
         "merge_retry_started",
         &lease_target(id),
-        "owner-authorized merge replay claimed by daemon",
+        "durable merge replay claimed by daemon",
         now,
     )?;
     let mut task = tx.query_row(

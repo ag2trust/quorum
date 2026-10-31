@@ -1582,7 +1582,7 @@ The following must remain intact throughout the wait and across restarts:
 | Dependency blocking | `tasks.depends_on` | Already-done deps stay done; blocked deps stay blocked |
 | Task status = `merging` | `tasks.status` column | Restart recovery recognizes this as merge-pending |
 | Mailbox row (if still unconsumed) | `mailbox` table | Recoverable delivery signal only; durable approvals remain authoritative without it |
-| Explicit retry intent | `tasks.refs.daemon_merge_retry` | Bounds an owner retry to one daemon attempt |
+| Durable merge replay intent | `tasks.refs.daemon_merge_retry` | Bounds an owner retry or daemon-ready replay to one attempt |
 
 #### Restart reconciliation
 
@@ -1612,6 +1612,14 @@ On daemon startup, before generic crash recovery:
    only stale evidence, and return to the first missing role without stranding the marker.
 3. **Phase 5b** (orphan in-review tasks) checks for existing valid R1 approvals: if R1 is
    approved for the current PR SHA, it spawns R2 directly instead of re-running R1 (#191).
+   Once pre-review CI is ready, a task whose required roles are all approved for that exact
+   head atomically moves from `in-review` to `merging` and records
+   `daemon_merge_retry=requested`; the bounded live merge reconciler consumes that request on a
+   later tick without requiring a daemon restart. The transaction is guarded by task status, PR,
+   and exact-head approval authority, while live PR/head/target authority, mergeability, merge-time
+   CI, and the optional default-branch CI gate are revalidated outside the transaction before any
+   GitHub merge call. Pending or timed-out pre-review CI never creates the request. Review-only
+   tasks carrying `daemon:merge-blocked` retain their dedicated mergeability-retry path.
    Reviewer verdict persistence uses the task's durable author when no worker is live. When a
    repaired R1 returns and an exact task/author/head-bound R2 row was retained, that R2 is reused
    rather than provisioned again. Every persisted role remains bound to the launch-validated
@@ -1619,10 +1627,11 @@ On daemon startup, before generic crash recovery:
    stranded mailbox verdict likewise requires one unambiguous daemon-written `agent_runs`
    launch for the exact reviewer/task/PR and binds only to its immutable launch head; the current
    PR head is comparison input, never the SHA assigned to the approval.
-4. **Explicit merge replay** atomically claims at most one `requested` marker per tick. A
-   valid replay needs no live reviewer, mailbox row, or roster entry. Graceful shutdown lets
-   an admitted call settle; startup parks an uncertain `attempting` marker without a second
-   GitHub call and preserves its approvals for another explicit retry.
+4. **Durable merge replay** atomically claims at most one `requested` marker per tick, whether
+   it came from an owner retry or the ready-CI Phase 5/5b handoff. A valid replay needs no live
+   reviewer, mailbox row, or roster entry. Graceful shutdown lets an admitted call settle;
+   startup parks an uncertain `attempting` marker without a second GitHub call and preserves its
+   approvals for another explicit owner retry.
 
 A delivered respawn-per-turn worker is not an orphan while its review is pending. Its
 `awaiting-review` journal row has no PID and durably binds the agent/task, provider and exact
