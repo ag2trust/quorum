@@ -35,12 +35,18 @@ runner = "claude"
 model = "claude-opus-5-5"
 effort = "high"
 
+# Classifier and collector turns fail over to another pool profile when a
+# provider is unavailable, so name two providers: a single-provider pool can
+# only alert the owner and wait for the outage to end. The second provider's
+# weight is the share of normal traffic it receives.
 [routing.classifier]
-terra = 100
+terra = 95
+opus = 5
 [routing.planner]
 opus = 100
 [routing.collector]
-terra = 100
+terra = 95
+opus = 5
 [routing.worker.1]
 terra = 100
 [routing.worker.2]

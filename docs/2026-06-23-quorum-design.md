@@ -2662,6 +2662,30 @@ changes create a new policy generation and fresh epoch. Existing assignments ret
 profile snapshot. Allocation state is independent per repository, role, complexity pool, and
 review stage: R1 and R2 use the same reviewer eligibility pool but separate bags and positions.
 
+Classifier and collector turns fail over within their pool. Neither role holds a lease, run
+capability, or provider continuation, so a retry is a fresh turn rather than an authority
+rotation, and worker and reviewer fallback stay separate. A failed turn that the runner classifies
+`provider-unavailable` or `profile-unavailable` records one immutable `routing_attempts` row for
+the responsibility, excluding that provider or profile, and the next turn uses the
+highest-percentage eligible profile with no backoff. Each failover adds an exclusion, so automatic
+retries are bounded by the pool size per task revision, PR, or plan revision. Every other failure
+keeps the role's existing retry: the task-classifier backoff (30 seconds doubling to 300 seconds),
+the decomposition provider budget, or the collector retry queue. Task classification still
+accepts one result per task revision through its guarded store, recording the model that produced
+it. Planning classification keeps its accepted proposal across a failover and spends neither
+planner nor provider budget. A collector run on an alternate route records that route's model
+with a NULL `role_assignment_id`, because the assignment still names the failed route.
+
+When no eligible profile remains the role is blocked: it raises one owner alert per role, policy
+generation, and block kind (`single-provider` or `all-providers`) for each message TTL, and the
+work stays pending and visible. Exclusions are never deleted, so a blocked responsibility keeps
+probing one pool profile at a time, rotating through the pool under that role's existing retry
+pacing, and recovers once a provider returns. Failover uses the pool generation that created the
+assignment, so an unfinished classifier or collector responsibility whose generation is stale
+adopts the current pool through a generation-suffixed responsibility key. This is the one
+exception to snapshot retention, and it is what lets a pool edit reach work already blocked.
+Configure these pools with two providers: a single-provider pool has nowhere to fail over.
+
 Startup fails before any claim when a profile is invalid, a required pool is absent or empty,
 a profile is duplicated in a pool, a percentage is not a positive integer, a pool does not total
 100, or legacy fixed-model routing is present. Never infer runner kind from an executable
