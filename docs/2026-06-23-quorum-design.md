@@ -2749,12 +2749,15 @@ the category comes from a closed mapping over the endpoint's fixed failure codes
 in one of two ways. An outcome recorded by the write phase lands in the same transaction as
 `record_rejection` or `record_accepted`, so the outcome and its row commit or roll back together;
 when that transaction rolls back with `internal`, the call makes one attempt to write an `internal`
-row in a transaction of its own. The write phase re-resolves authority, and a failure there commits
-only its `unauthorized` row. A refusal from the read-and-validate phase, including its timeout, and
-a version refusal write their row afterwards in their own transaction: that phase stays read-only,
-so it can be abandoned at its deadline without producing a second row. A ledger write that fails turns
-the call into the abnormal `internal` failure, never a clean refusal or a success. Otherwise the
-ledger changes nothing the client sees. Rows are diagnostic: they neither read nor write
+row in a transaction of its own. The acceptance write re-resolves authority, and a failure there
+commits only its `unauthorized` row. A validation rejection does not re-resolve: it uses the
+authority resolved during the read-and-validate phase, so a planner revoked or moved off its graph
+while an invalid plan validates still records `validation` and can increment `rejections`, where a
+valid plan with the same timing records `unauthorized`. A refusal from the read-and-validate
+phase, including its timeout, and a version refusal write their row afterwards in their own
+transaction: that phase stays read-only, so it can be abandoned at its deadline without producing
+a second row. A ledger write that fails turns the call into the abnormal `internal` failure, never
+a clean refusal or a success. Otherwise the ledger changes nothing the client sees. Rows are diagnostic: they neither read nor write
 `rejections`, and they never cause a lifecycle transition.
 
 No row is written in exactly these cases:
