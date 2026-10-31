@@ -844,8 +844,13 @@ fn classify_codex_error_text(message: &str) -> Option<FailureObservation> {
             "Codex reported the selected model unavailable",
         ));
     }
-    if message.contains("429 Too Many Requests")
-        && (message.contains("insufficient_quota") || message.contains("billing_hard_limit"))
+    // ChatGPT-plan exhaustion carries no status code. Match the stable phrase
+    // only: its leading "You’ve" uses a curly apostrophe.
+    if (message.contains("429 Too Many Requests")
+        && (message.contains("insufficient_quota") || message.contains("billing_hard_limit")))
+        || message
+            .to_ascii_lowercase()
+            .contains("hit your usage limit")
     {
         return Some(FailureObservation::classified(
             FailureDisposition::ProviderUnavailable,
@@ -2038,6 +2043,99 @@ while IFS= read -r _line; do :; done
             CodexProc::failure_observation(fixture).disposition,
             Some(FailureDisposition::ProfileUnavailable)
         );
+    }
+
+    /// Captured from a failed Codex reviewer turn; note the curly apostrophe.
+    const USAGE_LIMIT_MESSAGE: &str = "You\u{2019}ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at Oct 31st, 2026 3:41 AM.";
+
+    fn usage_limit_error_line(message: &str) -> String {
+        serde_json::json!({"type":"error","message":message}).to_string()
+    }
+
+    fn usage_limit_turn_failed_line(message: &str) -> String {
+        serde_json::json!({"type":"turn.failed","error":{"message":message}}).to_string()
+    }
+
+    #[test]
+    fn codex_usage_limit_on_both_failure_records_is_provider_wide() {
+        for message in [
+            USAGE_LIMIT_MESSAGE,
+            "You've hit your usage limit.",
+            "YOU HAVE HIT YOUR USAGE LIMIT",
+        ] {
+            for line in [
+                usage_limit_error_line(message),
+                usage_limit_turn_failed_line(message),
+            ] {
+                assert_eq!(
+                    CodexProc::failure_observation(&line).disposition,
+                    Some(FailureDisposition::ProviderUnavailable),
+                    "{line}"
+                );
+            }
+        }
+
+        // Replays the failed run's record order, where the informational
+        // stderr line must not outrank the classified provider evidence.
+        let failures = FailureTracker::for_kind(AgentKind::Codex);
+        failures.observe_stderr("Reading additional input from stdin...");
+        failures.observe_stdout(r#"{"type":"thread.started","thread_id":"fixture-thread"}"#);
+        failures.observe_stdout(r#"{"type":"turn.started"}"#);
+        failures.observe_stdout(&usage_limit_error_line(USAGE_LIMIT_MESSAGE));
+        failures.observe_stdout(&usage_limit_turn_failed_line(USAGE_LIMIT_MESSAGE));
+        assert_eq!(
+            failures.observed_failure().unwrap().disposition(),
+            FailureDisposition::ProviderUnavailable
+        );
+    }
+
+    #[test]
+    fn codex_rate_limit_and_oversized_usage_limit_stay_unclassified() {
+        for message in [
+            "unexpected status 429 Too Many Requests: rate_limit_exceeded".to_string(),
+            "You\u{2019}ve hit your rate limit. Try again in 20s.".to_string(),
+            "usage limit reached".to_string(),
+            format!("{USAGE_LIMIT_MESSAGE}{}", "x".repeat(16 * 1024)),
+        ] {
+            for line in [
+                usage_limit_error_line(&message),
+                usage_limit_turn_failed_line(&message),
+            ] {
+                let observation = CodexProc::failure_observation(&line);
+                assert_eq!(observation.disposition, None, "{line}");
+                assert!(observation.unknown_failure, "{line}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_limit_text_outside_provider_failure_records_is_not_a_runner_failure() {
+        let lines = [
+            serde_json::json!({"type":"item.completed","item":{"id":"msg","type":"agent_message","text":USAGE_LIMIT_MESSAGE}}),
+            serde_json::json!({"type":"item.completed","item":{"id":"cmd","type":"command_execution","command":"cat review.md","aggregated_output":USAGE_LIMIT_MESSAGE,"exit_code":1,"status":"failed"}}),
+            serde_json::json!({"type":"item.completed","item":{"id":"err","type":"error","message":USAGE_LIMIT_MESSAGE}}),
+        ]
+        .map(|line| line.to_string());
+        for line in &lines {
+            assert_eq!(
+                CodexProc::failure_observation(line),
+                FailureObservation::inert(),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            CodexProc::stderr_failure_observation(USAGE_LIMIT_MESSAGE).disposition,
+            None
+        );
+
+        let script = format!(
+            "printf '%s\\n' '{}' '{}' '{}' '{{\"type\":\"turn.completed\"}}'",
+            lines[0], lines[1], lines[2]
+        );
+        let mut proc = shell_proc(&script).await;
+        while proc.next_raw_line().await.is_some() {}
+        let status = wait_for_exit(&mut proc).await;
+        assert!(proc.classify_pre_authoritative_exit(status).is_none());
     }
 
     #[tokio::test]
