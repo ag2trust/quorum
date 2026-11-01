@@ -171,11 +171,13 @@ model = "claude-opus-5-5"
 effort = "high"
 
 [routing.classifier]
-terra = 100
+terra = 95
+opus = 5
 [routing.planner]
 opus = 100
 [routing.collector]
-terra = 100
+terra = 95
+opus = 5
 [routing.worker.3]
 terra = 80
 opus = 20
@@ -187,8 +189,13 @@ opus = 20
 Configuration requires pools for classifier, planner, collector, workers at
 complexities 1–5, and reviewers at complexities 1–5. Every referenced profile
 must be valid for its runner, every weight must be positive, and each pool must
-total exactly 100. The planner pool currently accepts Claude profiles; the
-complete example reflects that constraint.
+total exactly 100. Classifier and collector turns fail over to another pool
+profile when a provider is unavailable, so name two providers in those pools. A
+single-provider pool alerts the owner and retries only within each role's
+budget. Task classification stays pending, but planning classification holds its
+graph and fails the source task after two provider failures, and a collection
+dead-letters after five attempts. The planner pool currently accepts Claude
+profiles; the complete example reflects that constraint.
 
 Weights are not independent per-call randomness. For each pool Quorum builds a
 shuffled, durable 100-slot assignment epoch containing the configured number of
@@ -394,6 +401,9 @@ This is a non-binding view of ongoing directions, not a release schedule:
   hosted Quorum service.
 - The existing loopback-only, read-only web dashboard may expand as local
   inspection needs are proven, while retaining its local, read-only posture.
+- An HTTP MCP server for outside orchestrating agents is planned in Quorum, running from
+  the container alongside `quorum web`. Its listener, authentication, and tool set are not
+  settled.
 
 ## Working on Quorum
 

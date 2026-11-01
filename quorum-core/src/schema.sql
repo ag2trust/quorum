@@ -506,6 +506,9 @@ CREATE TABLE IF NOT EXISTS reviewer_provision_attempts (
     head_sha        TEXT NOT NULL DEFAULT '',
     attempts        INTEGER NOT NULL DEFAULT 0,
     last_attempt_at INTEGER NOT NULL DEFAULT 0,
+    -- v83: bounded provider error from the most recent strike; NULL when that
+    -- strike had none.
+    last_provider_error TEXT,
     PRIMARY KEY (task_id, pr_number, role)
 );
 
@@ -1115,6 +1118,23 @@ CREATE TABLE IF NOT EXISTS planner_submissions (
 -- submissions for unrelated graphs.
 CREATE INDEX IF NOT EXISTS planner_submissions_graph_id
     ON planner_submissions(graph_id);
+-- v82: append-only ledger with one row per `submit_plan` call, accepted or
+-- refused. No foreign key to `planner_submissions`: a refused call may have no
+-- row there. Only fixed-vocabulary outcomes are stored; plan text, validation
+-- messages, and other provider payload strings have no column here.
+CREATE TABLE IF NOT EXISTS planner_submission_calls (
+    run_id             TEXT NOT NULL,
+    seq                INTEGER NOT NULL,
+    received_at        INTEGER NOT NULL,
+    accepted           INTEGER NOT NULL DEFAULT 0 CHECK(accepted IN (0,1)),
+    rejection_category TEXT CHECK(rejection_category IN (
+        'validation','budget_exhausted','already_submitted','unauthorized',
+        'unsupported_version','timeout','internal'
+    )),
+    PRIMARY KEY(run_id, seq),
+    CHECK((accepted = 1 AND rejection_category IS NULL)
+       OR (accepted = 0 AND rejection_category IS NOT NULL))
+);
 
 -- v61: durable storage for GitHub collaboration attempts, their agent operation outbox, and
 -- pending-review publication ownership. Runtime claiming/execution is deliberately separate.

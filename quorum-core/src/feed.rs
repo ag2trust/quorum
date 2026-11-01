@@ -108,6 +108,35 @@ pub fn post(
     Ok(PostResult { seq, expires_at })
 }
 
+/// Post an owner alert unless an unexpired one already carries `refs`.
+///
+/// The existence check and insert are one statement under the write lock, so
+/// concurrent daemon tasks reporting the same condition produce one alert per
+/// message TTL. Returns whether this call inserted the alert.
+pub fn post_owner_alert_once(
+    conn: &mut Connection,
+    author: &str,
+    body: &str,
+    refs: &str,
+    ttl: i64,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    crate::agents::touch(&tx, author, now)?;
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    let inserted = tx.execute(
+        "INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at, recipient)
+         SELECT ?1, ?2, ?3, 'alert', ?4, ?5, ?6, 'owner'
+         WHERE NOT EXISTS (
+             SELECT 1 FROM messages
+             WHERE kind='alert' AND recipient='owner' AND refs=?5 AND expires_at > ?1
+         )",
+        params![now, author, DEFAULT_TOPIC, body, refs, now + ttl],
+    )?;
+    tx.commit()?;
+    Ok(inserted == 1)
+}
+
 /// Read unexpired messages on `topic` with `seq > cursor`, oldest first, filtered by
 /// `filter`.
 ///
@@ -385,5 +414,47 @@ mod tests {
         let next = read(&mut c, "B", None, None, ReadFilter::All, 10, 100).unwrap();
         let bodies: Vec<_> = next.iter().map(|m| m.body.as_str()).collect();
         assert_eq!(bodies, ["to B"]);
+    }
+
+    #[test]
+    fn concurrent_alert_posters_leave_one_live_alert_per_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alerts.db");
+        let _ = crate::db::open(&path).unwrap();
+        for round in 0..20 {
+            let refs = format!("role-blocked:{round}");
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let inserted: usize = (0..4)
+                .map(|_| {
+                    let (path, refs, barrier) = (path.clone(), refs.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        let mut conn = crate::db::open(&path).unwrap();
+                        barrier.wait();
+                        post_owner_alert_once(
+                            &mut conn,
+                            "daemon",
+                            "blocked",
+                            &refs,
+                            DEFAULT_MESSAGE_TTL_SECS,
+                            1000,
+                        )
+                        .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|poster| usize::from(poster.join().unwrap()))
+                .sum();
+            assert_eq!(inserted, 1, "round {round}");
+        }
+    }
+
+    #[test]
+    fn an_expired_alert_does_not_suppress_a_new_one() {
+        let (_dir, mut c) = open_tmp();
+        assert!(post_owner_alert_once(&mut c, "daemon", "a", "key", 10, 100).unwrap());
+        assert!(!post_owner_alert_once(&mut c, "daemon", "a", "key", 10, 109).unwrap());
+        assert!(post_owner_alert_once(&mut c, "daemon", "a", "key", 10, 110).unwrap());
+        assert!(post_owner_alert_once(&mut c, "daemon", "a", "other", 10, 110).unwrap());
     }
 }
