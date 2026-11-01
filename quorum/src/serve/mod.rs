@@ -18003,22 +18003,18 @@ async fn tick(
     // Gate on worker count, not total in_use_count() — reviewers must
     // not consume worker capacity (F16).
     // Skip during drain — no new tasks, let existing agents finish.
-    if !drain_state.draining && !decomposition_freeze {
-        while workers.len() < config.cap {
-            if !spawn_worker(
-                config,
-                wt_mgr,
-                name_pool,
-                workers,
-                poison_tracker,
-                claim_skip_logs,
-                lifetime_roster,
-            )
-            .await?
-            {
-                break;
-            }
-        }
+    if !drain_state.draining {
+        dispatch_workers(
+            config,
+            wt_mgr,
+            name_pool,
+            workers,
+            poison_tracker,
+            claim_skip_logs,
+            lifetime_roster,
+            decomposition_freeze,
+        )
+        .await?;
     }
 
     // ── Phase 7: Task classifier ─────────────────────────────────────
@@ -24276,7 +24272,60 @@ async fn resolve_branch_sync_adoption(
     }))
 }
 
+/// Which ready tasks one worker dispatch may start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerAdmission {
+    /// Implementation-ready open tasks, then retried rework.
+    AllReady,
+    /// Retried rework only, for a decomposition freeze. No new task starts.
+    RetriedRework,
+}
+
+/// Start workers up to the cap.
+///
+/// A decomposition freeze stops new implementation, not started work. The drain
+/// counts a retried rework task, and only this dispatch can give it a worker:
+/// `reconcile_remediation_retries` needs retry feedback or a recovery marker,
+/// and the sweep leaves it alone. Skipping it under a freeze would stall the
+/// drain against itself, as `tasks::claim` and `classifier_queue` also note.
+/// The pass admits only rows the drain already counts, so it adds no started
+/// work, and the base is still captured only after those rows finish.
 #[allow(clippy::too_many_arguments)]
+async fn dispatch_workers(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    poison_tracker: &mut PoisonTracker,
+    claim_skip_logs: &mut ClaimSkipLogLimiter,
+    lifetime_roster: &mut LifetimeRoster,
+    decomposition_freeze: bool,
+) -> Result<()> {
+    let admission = if decomposition_freeze {
+        WorkerAdmission::RetriedRework
+    } else {
+        WorkerAdmission::AllReady
+    };
+    while workers.len() < config.cap {
+        if !spawn_admitted_worker(
+            config,
+            wt_mgr,
+            name_pool,
+            workers,
+            poison_tracker,
+            claim_skip_logs,
+            lifetime_roster,
+            admission,
+        )
+        .await?
+        {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 async fn spawn_worker(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -24286,13 +24335,43 @@ async fn spawn_worker(
     claim_skip_logs: &mut ClaimSkipLogLimiter,
     lifetime_roster: &mut LifetimeRoster,
 ) -> Result<bool> {
+    spawn_admitted_worker(
+        config,
+        wt_mgr,
+        name_pool,
+        workers,
+        poison_tracker,
+        claim_skip_logs,
+        lifetime_roster,
+        WorkerAdmission::AllReady,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_admitted_worker(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    poison_tracker: &mut PoisonTracker,
+    claim_skip_logs: &mut ClaimSkipLogLimiter,
+    lifetime_roster: &mut LifetimeRoster,
+    admission: WorkerAdmission,
+) -> Result<bool> {
     let db_path = config.db_path.clone();
     let p = db_path.clone();
 
     let in_flight: Vec<i64> = workers.iter().map(|w| w.task_id).collect();
     let available = tokio::task::spawn_blocking(move || -> Result<Vec<tasks::Task>> {
         let conn = quorum_core::db::open(&p)?;
-        let mut available = tasks::list_implementation_ready_open(&conn)?;
+        // Open tasks must stay out of a frozen selection, not merely lose their
+        // claim: they sort first, and a refused claim would end the pass before
+        // it reached any retried rework.
+        let mut available = match admission {
+            WorkerAdmission::AllReady => tasks::list_implementation_ready_open(&conn)?,
+            WorkerAdmission::RetriedRework => Vec::new(),
+        };
         available.extend(
             tasks::list(&conn, Some("rework"), None, None)?
                 .into_iter()
@@ -60420,6 +60499,312 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let mut slot = make_dummy_slot_async().await;
         slot.task_id = task_id;
         slot
+    }
+
+    const PROVIDER_BLOCKED_REWORK_PR: i64 = 829;
+    const PROVIDER_BLOCKED_REWORK_PROMPT: &str = "address the reviewer blocker";
+
+    /// Production dispatch state for a PR-bound rework retry: a pushed task
+    /// branch behind a live PR, a reserved allocation, `rework_round>0`, and a
+    /// provider-blocked rework turn with its continuation identity.
+    #[cfg(unix)]
+    struct BlockedReworkFixture {
+        task: i64,
+        branch: String,
+        wt_mgr: WorktreeManager,
+        names: Pool,
+        workers: Vec<SlotState>,
+        poison: PoisonTracker,
+        skips: ClaimSkipLogLimiter,
+        roster: LifetimeRoster,
+    }
+
+    #[cfg(unix)]
+    impl BlockedReworkFixture {
+        /// `harness.config` is pointed at the fixture so its ticks and
+        /// [`Self::dispatch`] use one worker-capable configuration.
+        async fn new(harness: &mut LifecycleHarness) -> Self {
+            let dir = harness._dir.path().to_path_buf();
+            let repo = harness.config.repo_dir.clone();
+            let remote = dir.join("remote.git");
+            let git = |args: &[&str]| -> String {
+                let output = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "git {args:?} failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            };
+            assert!(std::process::Command::new("git")
+                .args(["init", "--bare", "-q", "--initial-branch=main"])
+                .arg(&remote)
+                .status()
+                .unwrap()
+                .success());
+            git(&["branch", "-M", "main"]);
+            git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+            git(&["push", "-q", "origin", "main"]);
+
+            let task = harness.add_task(
+                "rework",
+                Some(&format!(
+                    r#"{{"pr":{PROVIDER_BLOCKED_REWORK_PR},"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}}"#
+                )),
+            );
+            let branch = format!("daemon/former-t{task}");
+            git(&["checkout", "-q", "-b", &branch]);
+            git(&["commit", "--allow-empty", "-qm", "reviewed delivery"]);
+            git(&["push", "-q", "-u", "origin", &branch]);
+            let head_sha = git(&["rev-parse", "HEAD"]);
+            git(&["checkout", "-q", "main"]);
+
+            {
+                let mut conn = quorum_core::db::open(&harness.db_path).unwrap();
+                conn.execute(
+                    "UPDATE tasks SET rework_round=1,author='former-worker' WHERE id=?1",
+                    [task],
+                )
+                .unwrap();
+                assert!(quorum_core::branches::record_exact_allocation(
+                    &mut conn,
+                    task,
+                    &branch,
+                    &dir.join("prior-worktree").to_string_lossy(),
+                    "former-worker",
+                    &head_sha,
+                    now_unix(),
+                )
+                .unwrap());
+            }
+            persist_runner_provider_block(
+                &harness.db_path,
+                task,
+                "quota",
+                &PendingTurn {
+                    provider: "codex".into(),
+                    model: planner::CODEX_PLANNER_MODEL.into(),
+                    effort: planner::PLANNER_EFFORT.into(),
+                    prompt: PROVIDER_BLOCKED_REWORK_PROMPT.into(),
+                    turn_kind: "rework".into(),
+                    continuation_id: Some("thread-rework".into()),
+                    requested: false,
+                },
+            )
+            .await
+            .unwrap();
+
+            harness.config.cap = 3;
+            harness.config.worktree_base = dir.join("worktrees");
+            harness.config.agent_bin = Some(
+                fake_stdin_holding_agent(&dir, "hold-worker")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            harness.config.pr_target_program = Some(fake_gh_returning(
+                &dir,
+                "gh-provider-blocked-rework",
+                &open_pr_target_json(&branch, &head_sha, "main"),
+            ));
+            Self {
+                task,
+                branch,
+                wt_mgr: WorktreeManager::new(),
+                names: Pool::new_generated(),
+                workers: Vec::new(),
+                poison: PoisonTracker::new(),
+                skips: ClaimSkipLogLimiter::new(),
+                roster: LifetimeRoster::new(),
+            }
+        }
+
+        /// Run the Phase 6 dispatch pass for one tick's freeze result.
+        async fn dispatch(&mut self, harness: &LifecycleHarness, frozen: bool) {
+            dispatch_workers(
+                &harness.config,
+                &self.wt_mgr,
+                &mut self.names,
+                &mut self.workers,
+                &mut self.poison,
+                &mut self.skips,
+                &mut self.roster,
+                frozen,
+            )
+            .await
+            .unwrap();
+        }
+
+        /// The worker took over the exact retried turn on the PR, durably.
+        fn assert_worker_attached(&self, harness: &LifecycleHarness) {
+            assert_eq!(self.workers.len(), 1, "one slot for the retried rework");
+            let worker = &self.workers[0];
+            assert_eq!(worker.task_id, self.task);
+            assert_eq!(worker.pr, Some(PROVIDER_BLOCKED_REWORK_PR));
+            assert_eq!(worker.remote_branch, self.branch);
+            assert_eq!(worker.continuation_id.as_deref(), Some("thread-rework"));
+            assert_eq!(worker.pending_prompt, PROVIDER_BLOCKED_REWORK_PROMPT);
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            let task = tasks::get(&conn, self.task).unwrap().unwrap();
+            assert_eq!(task.status, "rework");
+            assert_eq!(task.assignee.as_deref(), Some(worker.agent_name.as_str()));
+            let lease_holders: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM claims WHERE target=?1 AND holder=?2 AND active=1",
+                    rusqlite::params![tasks::lease_target(self.task), worker.agent_name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(lease_holders, 1, "the worker holds the task lease");
+        }
+
+        /// Settle the worker the way a rework delivery does: it pushes, then
+        /// its slot and journal row go away, and review completes the task.
+        async fn complete_delivery(&mut self, harness: &LifecycleHarness) {
+            let worker = self.workers.remove(0);
+            let agent = worker.agent_name.clone();
+            {
+                let mut conn = quorum_core::db::open(&harness.db_path).unwrap();
+                let pushed = tasks::apply_event(
+                    &mut conn,
+                    &agent,
+                    self.task,
+                    &Event::ReworkPushed,
+                    now_unix(),
+                )
+                .unwrap();
+                assert_eq!(pushed.task.status, "in-review");
+            }
+            cleanup_slot(
+                &harness.config,
+                &self.wt_mgr,
+                &mut self.names,
+                worker,
+                None,
+                "test_delivery",
+            )
+            .await;
+            harness.finish_task(self.task);
+        }
+    }
+
+    /// The whole outcome for a true rework: after `task-retry` lifts the hold,
+    /// the freeze returns before the worker exists, so Phase 6 must attach that
+    /// worker under the freeze or the drain waits on it forever. The open task
+    /// is listed first, and the freeze refuses its claim, so it also proves the
+    /// pass reaches the rework without starting anything new.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retried_rework_gets_a_worker_under_the_reacquired_freeze_and_planning_proceeds() {
+        let mut harness = lifecycle_harness("provider-block-rework-dispatch");
+        harness.enter_freeze_phase("draining");
+        let mut fixture = BlockedReworkFixture::new(&mut harness).await;
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(harness.freeze_row().state, "provider-backoff");
+
+        let open = harness.add_task(
+            "open",
+            Some(
+                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            ),
+        );
+        harness.expire_backoff();
+        assert!(
+            !harness.tick(&mut coordinator).await,
+            "the block still holds"
+        );
+
+        harness.retry_provider_block(fixture.task);
+        let frozen = harness.tick(&mut coordinator).await;
+        assert!(frozen);
+        assert_eq!(harness.freeze_row().state, "freeze-requested");
+
+        fixture.dispatch(&harness, frozen).await;
+        fixture.assert_worker_attached(&harness);
+        let still_open = {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            tasks::get(&conn, open).unwrap().unwrap()
+        };
+        assert_eq!(still_open.status, "open", "the freeze admits no new start");
+        assert_eq!(still_open.assignee, None);
+
+        // The attached worker is what the drain now waits for.
+        for _ in 0..2 {
+            assert!(
+                harness
+                    .tick_with_slots(&mut coordinator, &fixture.workers, &[])
+                    .await
+            );
+            let row = harness.freeze_row();
+            assert_eq!(
+                (row.state.as_str(), row.frozen_base_sha),
+                ("draining", None)
+            );
+        }
+
+        fixture.complete_delivery(&harness).await;
+        assert!(harness.tick(&mut coordinator).await);
+        let expected = repository_head_sha(&harness.config.repo_dir).await.unwrap();
+        let row = harness.freeze_row();
+        assert_eq!(row.state, "planning");
+        assert_eq!(row.frozen_base_sha, Some(expected));
+        assert_eq!((row.provider_failures, row.proposal_attempts), (1, 1));
+    }
+
+    /// The same dispatch closes a retry that lands while another started task
+    /// keeps the freeze held, where no `provider-backoff` tick ever runs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retried_rework_gets_a_worker_during_a_mixed_drain() {
+        let mut harness = lifecycle_harness("provider-block-rework-mixed");
+        harness.enter_freeze_phase("draining");
+        // No release runs here to clear the harness's bound base, and the real
+        // bind below requires the unbound `draining` graph it would meet.
+        quorum_core::db::open(&harness.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE task_decompositions SET frozen_base_sha=NULL WHERE id=?1",
+                [harness.graph],
+            )
+            .unwrap();
+        let mut fixture = BlockedReworkFixture::new(&mut harness).await;
+        let unrelated = harness.add_task("working", None);
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(harness.freeze_row().state, "draining");
+
+        harness.retry_provider_block(fixture.task);
+        let frozen = harness.tick(&mut coordinator).await;
+        assert!(frozen);
+        fixture.dispatch(&harness, frozen).await;
+        fixture.assert_worker_attached(&harness);
+
+        fixture.complete_delivery(&harness).await;
+        harness.finish_task(unrelated);
+        assert!(harness.tick(&mut coordinator).await);
+        let expected = repository_head_sha(&harness.config.repo_dir).await.unwrap();
+        let row = harness.freeze_row();
+        assert_eq!(row.state, "planning");
+        assert_eq!(row.frozen_base_sha, Some(expected));
+    }
+
+    /// A frozen pass is for work the drain is already waiting on. Rework with
+    /// no retry stays with its own recovery path and gets no worker here.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn frozen_dispatch_leaves_rework_without_a_retry_unclaimed() {
+        let mut harness = lifecycle_harness("provider-block-no-retry");
+        harness.enter_freeze_phase("draining");
+        let mut fixture = BlockedReworkFixture::new(&mut harness).await;
+        fixture.dispatch(&harness, true).await;
+        assert!(fixture.workers.is_empty(), "still provider-blocked");
+        let conn = quorum_core::db::open(&harness.db_path).unwrap();
+        let task = tasks::get(&conn, fixture.task).unwrap().unwrap();
+        assert_eq!((task.status.as_str(), task.assignee), ("rework", None));
     }
 
     /// The owner-visible defect: a repository draining behind nothing but
