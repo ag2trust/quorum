@@ -1620,6 +1620,11 @@ On daemon startup, before generic crash recovery:
    CI, and the optional default-branch CI gate are revalidated outside the transaction before any
    GitHub merge call. Pending or timed-out pre-review CI never creates the request. Review-only
    tasks carrying `daemon:merge-blocked` retain their dedicated mergeability-retry path.
+   A graceful drain that observes the committed `merging + requested` pair tears down an idle
+   retained worker without changing either field, so restart can claim the replay instead of
+   stranding its marker on an `in-review` task. A decomposition freeze counts `merging` among
+   started non-terminal work; it cannot capture its frozen base while an orphan handoff still
+   awaits Phase 4e reconciliation.
    Reviewer verdict persistence uses the task's durable author when no worker is live. When a
    repaired R1 returns and an exact task/author/head-bound R2 row was retained, that R2 is reused
    rather than provisioned again. Every persisted role remains bound to the launch-validated
@@ -1631,7 +1636,10 @@ On daemon startup, before generic crash recovery:
    it came from an owner retry or the ready-CI Phase 5/5b handoff. A valid replay needs no live
    reviewer, mailbox row, or roster entry. Graceful shutdown lets an admitted call settle;
    startup parks an uncertain `attempting` marker without a second GitHub call and preserves its
-   approvals for another explicit owner retry.
+   approvals for another explicit owner retry. If a worker-fixable replay enters `rework` while
+   the original sticky or dormant worker slot is retained, Phase 4e reacquires that worker's
+   remediation lease, validates the live PR baseline, and feeds the durable feedback immediately;
+   the retained slot cannot suppress both that feed and replacement-worker provisioning.
 
 A delivered respawn-per-turn worker is not an orphan while its review is pending. Its
 `awaiting-review` journal row has no PID and durably binds the agent/task, provider and exact

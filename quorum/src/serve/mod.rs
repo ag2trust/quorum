@@ -11258,7 +11258,7 @@ async fn rework_explicit_merge_retry(
     pr: i64,
     reviewer: &str,
     reason: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let task = {
         let p = config.db_path.clone();
         tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
@@ -11277,23 +11277,23 @@ async fn rework_explicit_merge_retry(
         )
         .await?;
         set_task_body(&config.db_path, task_id, tasks::MERGE_BLOCKED_BODY).await;
-        return Ok(());
+        return Ok(false);
     }
     let effective_base =
         effective_task_base_branch(&config.db_path, task_id, &config.base_branch).await?;
     let feedback = merge_base_remediation_message(reason, &effective_base);
     let p = config.db_path.clone();
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let transition = tokio::task::spawn_blocking(move || -> Result<tasks::TransitionResult> {
         let mut conn = quorum_core::db::open(&p)?;
-        tasks::rework_approved_merge(&mut conn, task_id, pr, &feedback, now_unix())?;
-        Ok(())
+        tasks::rework_approved_merge(&mut conn, task_id, pr, &feedback, now_unix())
     })
     .await
     .map_err(|error| QuorumError::Io(format!("merge retry rework join: {error}")))??;
     log(&format!(
-        "task #{task_id} merge replay assigned actionable rework by {reviewer}"
+        "task #{task_id} merge replay entered {} by {reviewer}",
+        transition.task.status
     ));
-    Ok(())
+    Ok(true)
 }
 
 /// Read GitHub's immutable merge commit outside any database transaction.
@@ -11367,9 +11367,9 @@ async fn reconcile_merge_retries(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     draining: bool,
-) -> Result<()> {
+) -> Result<Option<i64>> {
     if draining {
-        return Ok(());
+        return Ok(None);
     }
     let task = {
         let p = config.db_path.clone();
@@ -11380,7 +11380,7 @@ async fn reconcile_merge_retries(
         .await
         .map_err(|error| QuorumError::Io(format!("merge retry claim join: {error}")))??
     };
-    let Some(task) = task else { return Ok(()) };
+    let Some(task) = task else { return Ok(None) };
     let task_id = task.id;
     let Some(pr) = tasks::extract_pr_number(&task.refs) else {
         invalidate_explicit_merge_retry(
@@ -11393,7 +11393,7 @@ async fn reconcile_merge_retries(
             ),
         )
         .await?;
-        return Ok(());
+        return Ok(None);
     };
 
     let resolve_live = || async {
@@ -11423,7 +11423,7 @@ async fn reconcile_merge_retries(
                 "merging",
             )
             .await?;
-            return Ok(());
+            return Ok(None);
         }
     };
     let Some(effective_base) = task_target_branch(&config.db_path, task_id).await? else {
@@ -11439,7 +11439,7 @@ async fn reconcile_merge_retries(
             ),
         )
         .await?;
-        return Ok(());
+        return Ok(None);
     };
     if let Err(reason) =
         validate_reviewer_pr_target(&live, pr, &live.target.head_sha, &effective_base)
@@ -11451,12 +11451,12 @@ async fn reconcile_merge_retries(
             InvalidMergeRetryAuthority::return_to_review(vec!["r1", "r2"], reason),
         )
         .await?;
-        return Ok(());
+        return Ok(None);
     }
     let Some(authority) =
         reconcile_merge_retry_authority(&config.db_path, task_id, pr, &live).await?
     else {
-        return Ok(());
+        return Ok(None);
     };
 
     let mergeability = {
@@ -11471,13 +11471,13 @@ async fn reconcile_merge_retries(
             let Some(merge_commit_sha) =
                 required_merged_commit_sha(config, task_id, pr, "merging").await?
             else {
-                return Ok(());
+                return Ok(None);
             };
             complete_approved_task_merge(config, wt_mgr, task_id, pr, merge_commit_sha).await?;
-            return Ok(());
+            return Ok(None);
         }
         merge::MergeabilityState::Conflicting => {
-            rework_explicit_merge_retry(
+            let transitioned = rework_explicit_merge_retry(
                 config,
                 task_id,
                 pr,
@@ -11485,7 +11485,7 @@ async fn reconcile_merge_retries(
                 &format!("PR #{pr} conflicts with its target branch"),
             )
             .await?;
-            return Ok(());
+            return Ok(transitioned.then_some(task_id));
         }
         merge::MergeabilityState::Closed => {
             invalidate_explicit_merge_retry(
@@ -11498,7 +11498,7 @@ async fn reconcile_merge_retries(
                 ),
             )
             .await?;
-            return Ok(());
+            return Ok(None);
         }
         merge::MergeabilityState::Mergeable => {}
     }
@@ -11528,7 +11528,7 @@ async fn reconcile_merge_retries(
     match checks {
         merge::ChecksOutcome::Ready => {}
         merge::ChecksOutcome::Failed { failing_checks } => {
-            rework_explicit_merge_retry(
+            let transitioned = rework_explicit_merge_retry(
                 config,
                 task_id,
                 pr,
@@ -11536,7 +11536,7 @@ async fn reconcile_merge_retries(
                 &format!("PR #{pr} CI failed: {}", failing_checks.join(", ")),
             )
             .await?;
-            return Ok(());
+            return Ok(transitioned.then_some(task_id));
         }
         merge::ChecksOutcome::TimedOut | merge::ChecksOutcome::Pending { .. } => {
             require_park_task(
@@ -11546,7 +11546,7 @@ async fn reconcile_merge_retries(
                 "merging",
             )
             .await?;
-            return Ok(());
+            return Ok(None);
         }
     }
 
@@ -11567,7 +11567,7 @@ async fn reconcile_merge_retries(
                 "merging",
             )
             .await?;
-            return Ok(());
+            return Ok(None);
         }
     }
 
@@ -11583,7 +11583,7 @@ async fn reconcile_merge_retries(
                 "merging",
             )
             .await?;
-            return Ok(());
+            return Ok(None);
         }
     };
     if let Err(reason) =
@@ -11596,12 +11596,12 @@ async fn reconcile_merge_retries(
             InvalidMergeRetryAuthority::return_to_review(vec!["r1", "r2"], reason),
         )
         .await?;
-        return Ok(());
+        return Ok(None);
     }
     let Some(final_authority) =
         reconcile_merge_retry_authority(&config.db_path, task_id, pr, &live).await?
     else {
-        return Ok(());
+        return Ok(None);
     };
 
     let final_mergeability = {
@@ -11619,13 +11619,13 @@ async fn reconcile_merge_retries(
             let Some(merge_commit_sha) =
                 required_merged_commit_sha(config, task_id, pr, "merging").await?
             else {
-                return Ok(());
+                return Ok(None);
             };
             complete_approved_task_merge(config, wt_mgr, task_id, pr, merge_commit_sha).await?;
-            return Ok(());
+            return Ok(None);
         }
         merge::MergeabilityState::Conflicting => {
-            rework_explicit_merge_retry(
+            let transitioned = rework_explicit_merge_retry(
                 config,
                 task_id,
                 pr,
@@ -11633,7 +11633,7 @@ async fn reconcile_merge_retries(
                 &format!("PR #{pr} conflicts with its target branch"),
             )
             .await?;
-            return Ok(());
+            return Ok(transitioned.then_some(task_id));
         }
         merge::MergeabilityState::Closed => {
             invalidate_explicit_merge_retry(
@@ -11646,7 +11646,7 @@ async fn reconcile_merge_retries(
                 ),
             )
             .await?;
-            return Ok(());
+            return Ok(None);
         }
     }
 
@@ -11667,10 +11667,11 @@ async fn reconcile_merge_retries(
         let Some(merge_commit_sha) =
             required_merged_commit_sha(config, task_id, pr, "merging").await?
         else {
-            return Ok(());
+            return Ok(None);
         };
         complete_approved_task_merge(config, wt_mgr, task_id, pr, merge_commit_sha).await?;
         log(&format!("PR #{pr} merged from durable approval replay"));
+        Ok(None)
     } else {
         match result
             .failure_kind
@@ -11684,6 +11685,7 @@ async fn reconcile_merge_retries(
                     "merging",
                 )
                 .await?;
+                Ok(None)
             }
             merge::MergeFailureKind::StaleAuthority => {
                 invalidate_explicit_merge_retry(
@@ -11699,9 +11701,10 @@ async fn reconcile_merge_retries(
                     ),
                 )
                 .await?;
+                Ok(None)
             }
             merge::MergeFailureKind::Retryable => {
-                rework_explicit_merge_retry(
+                let transitioned = rework_explicit_merge_retry(
                     config,
                     task_id,
                     pr,
@@ -11709,9 +11712,142 @@ async fn reconcile_merge_retries(
                     &format!("Merge of PR #{pr} failed: {}", result.message),
                 )
                 .await?;
+                Ok(transitioned.then_some(task_id))
             }
         }
     }
+}
+
+/// Resume one retained worker after the durable merge replay moved its task
+/// into actionable rework. Phase 4e runs after the ordinary mailbox paths, so
+/// a sticky/dormant worker cannot rely on those paths to receive this turn;
+/// leaving the slot idle also prevents the later remediation reconciler from
+/// allocating a replacement. The durable retry marker and feedback select the
+/// exact task, and the established sticky-remediation lease/baseline boundary
+/// is crossed before any provider launch.
+async fn resume_retained_merge_replay_rework(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    task_id: i64,
+) -> Result<()> {
+    let Some(worker_index) = workers
+        .iter()
+        .position(|worker| worker.task_id == task_id && !worker.draining)
+    else {
+        return Ok(());
+    };
+
+    let db_path = config.db_path.clone();
+    let task = tokio::task::spawn_blocking(move || -> Result<Option<tasks::Task>> {
+        let conn = quorum_core::db::open(&db_path)?;
+        tasks::get(&conn, task_id)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("retained merge rework lookup join: {error}")))??;
+    let Some(task) = task else {
+        return Ok(());
+    };
+    if !daemon_rework_retry_requested(task.refs.as_deref()) {
+        return Ok(());
+    }
+
+    if task.status != "rework" {
+        let worker = workers.remove(worker_index);
+        cleanup_slot(
+            config,
+            wt_mgr,
+            name_pool,
+            worker,
+            None,
+            terminal_rework_slot_reason(&task),
+        )
+        .await;
+        return Ok(());
+    }
+
+    let Some(pr) = tasks::extract_pr_number(&task.refs) else {
+        let worker = workers.remove(worker_index);
+        fail_worker_assignment_settled(
+            &config.db_path,
+            &worker.agent_name,
+            worker.task_id,
+            "merge replay rework lost its PR binding",
+        )
+        .await;
+        cleanup_slot(config, wt_mgr, name_pool, worker, None, "agent_failed").await;
+        return Ok(());
+    };
+    let Some(feedback) = remediation_retry_feedback(task.refs.as_deref()) else {
+        return Ok(());
+    };
+    if !install_sticky_remediation_lease_and_baseline(
+        config,
+        workers[worker_index].agent_name.clone(),
+        task.id,
+        pr,
+        &feedback,
+    )
+    .await?
+    {
+        let worker = workers.remove(worker_index);
+        cleanup_slot(
+            config,
+            wt_mgr,
+            name_pool,
+            worker,
+            None,
+            "remediation_lease_unavailable",
+        )
+        .await;
+        return Ok(());
+    }
+
+    let prompt = reviewer::build_rework_prompt(
+        &workers[worker_index].agent_name,
+        task.id,
+        pr,
+        &feedback,
+        workers[worker_index].cost_usd,
+        config.limits.max_task_cost_usd,
+        &load_task_risk_flags_for_prompt(&config.db_path, task.id).await?,
+        &load_worker_task_context(&config.db_path, task.id).await?,
+    );
+    if let Err(error) = feed_worker_turn(&mut workers[worker_index], &prompt, config).await {
+        log(&format!(
+            "merge replay rework feed failed for task #{}: {error}; preserving durable remediation intent",
+            task.id
+        ));
+        if !handle_dormant_worker_feed_failure(
+            config,
+            wt_mgr,
+            name_pool,
+            workers,
+            worker_index,
+            &error,
+        )
+        .await
+        {
+            fail_worker_after_rework_feed_failure(
+                config,
+                wt_mgr,
+                name_pool,
+                workers,
+                worker_index,
+                &error,
+            )
+            .await;
+        }
+        return Ok(());
+    }
+
+    let worker = &mut workers[worker_index];
+    begin_sticky_worker_rework(worker, &config.db_path).await?;
+    log(&format!(
+        "worker {} rework #{} started from durable merge replay",
+        worker.agent_name, worker.rework_count
+    ));
     Ok(())
 }
 
@@ -17270,7 +17406,10 @@ async fn tick(
     // This runs before reviewer provisioning so invalid/missing authority can
     // return to in-review and request only its first missing role in the same
     // tick. A valid replay never allocates a reviewer or worker.
-    reconcile_merge_retries(config, wt_mgr, drain_state.draining).await?;
+    let replay_rework_task = reconcile_merge_retries(config, wt_mgr, drain_state.draining).await?;
+    if let Some(task_id) = replay_rework_task {
+        resume_retained_merge_replay_rework(config, wt_mgr, name_pool, workers, task_id).await?;
+    }
 
     // ── Phase 4f: GitHub REQUEST_CHANGES outbox for review-only closes ──
     // `task-create --review-only` tasks close as `done` in the lifecycle
@@ -20794,7 +20933,8 @@ fn slot_is_graceful_drain_candidate(slot: &SlotState) -> bool {
 /// - A worker whose task is already in review is cleaned up without a
 ///   lifecycle mutation. An unconditional `AgentFailed` there releases the
 ///   review lease and clears `tasks.reviewer`, which orphans the reviewer's
-///   verdict. A worker whose task is mid-merge keeps the explicit
+///   verdict. A worker whose task is mid-merge keeps an admitted durable merge
+///   replay in `merging`; an unmarked merge keeps the established explicit
 ///   `AgentFailed` reset to in-review. Every other worker classifies its exit
 ///   through the exact-run disposition: an unconsumed matching Done row
 ///   retains the slot so Phase 2 delivers it on a later tick; only a run that
@@ -20824,8 +20964,8 @@ async fn drain_idle_agents(
         log(&format!(
             "DRAIN: tearing down idle worker {agent_name} (task #{task_id})"
         ));
-        match task_status_for_drain(db_path, task_id).await.as_deref() {
-            Some("in-review") => {
+        match task_state_for_drain(db_path, task_id).await {
+            Some(ref state) if state.status == "in-review" => {
                 // The worker no longer owns this phase. `InReview + AgentFailed`
                 // releases the task lease and clears `tasks.reviewer`, which
                 // orphans a verdict the reviewer has already made durable.
@@ -20836,7 +20976,19 @@ async fn drain_idle_agents(
                 cleanup_slot(config, wt_mgr, name_pool, w, None, "drain").await;
                 continue;
             }
-            Some("merging") => {
+            Some(ref state) if state.status == "merging" && state.merge_retry_marked => {
+                // Phase 4e deliberately does not claim a replay while draining.
+                // Preserve both halves of the already-committed handoff so the
+                // next daemon can claim it; resetting only the status would
+                // strand the marker in an ineligible in-review row forever.
+                log(&format!(
+                    "DRAIN: worker {agent_name} task #{task_id} has a durable merge replay — preserving merging for restart"
+                ));
+                let w = workers.remove(i);
+                cleanup_slot(config, wt_mgr, name_pool, w, None, "drain").await;
+                continue;
+            }
+            Some(ref state) if state.status == "merging" => {
                 // A task mid-merge is reset to in-review so approval recovery
                 // merges it from durable state after restart. The exact-run
                 // worker disposition below deliberately never transitions a
@@ -21017,15 +21169,35 @@ async fn drain_idle_agents(
     }
 }
 
-/// Best-effort status read that routes drain teardown. `None` (read failure
-/// or missing task) falls through to the atomic exact-run disposition, which
-/// performs its own authoritative classification.
-async fn task_status_for_drain(db_path: &Path, task_id: i64) -> Option<String> {
+/// Best-effort lifecycle/merge-intent read that routes drain teardown. Both
+/// fields come from one SQLite snapshot so drain never separates a committed
+/// `merging + daemon_merge_retry` handoff. `None` (read failure or missing
+/// task) falls through to the atomic exact-run disposition, which performs its
+/// own authoritative classification.
+struct DrainTaskState {
+    status: String,
+    merge_retry_marked: bool,
+}
+
+async fn task_state_for_drain(db_path: &Path, task_id: i64) -> Option<DrainTaskState> {
     let p = db_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let conn = quorum_core::db::open(&p).ok()?;
         let task = tasks::get(&conn, task_id).ok()??;
-        Some(task.status)
+        let merge_retry_marked = task
+            .refs
+            .as_deref()
+            .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+            .and_then(|refs| {
+                refs.get(tasks::MERGE_RETRY_REF)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .is_some_and(|marker| marker == "requested" || marker == "attempting");
+        Some(DrainTaskState {
+            status: task.status,
+            merge_retry_marked,
+        })
     })
     .await
     .ok()
@@ -40322,6 +40494,86 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn retained_dormant_worker_resumes_merge_replay_rework_without_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dormant-merge-replay.db");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (program, args_path, _, _) = fake_codex_resume_program(dir.path());
+        let (slot, _old_run_id, _old_capability) =
+            dormant_codex_rework_fixture(&db_path, &worktree, Some("thread-exact"), "thread-exact");
+        let task_id = slot.task_id;
+        let feedback = "Resolve the replay conflict against main.";
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks
+                 SET status='merging',
+                     refs=json_set(
+                         json_remove(refs, '$.daemon_rework_retry_requested'),
+                         '$.daemon_merge_retry', 'attempting'
+                     )
+                 WHERE id=?1",
+                [task_id],
+            )
+            .unwrap();
+            let transition =
+                tasks::rework_approved_merge(&mut conn, task_id, 443, feedback, now_unix())
+                    .unwrap();
+            assert_eq!(transition.task.status, "rework");
+        }
+
+        let mut config = dormant_codex_test_config(
+            db_path.clone(),
+            worktree,
+            Some(program.to_string_lossy().into_owned()),
+        );
+        config.repo = "test/repo".into();
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-dormant-merge-replay",
+            &open_pr_target_json("daemon/dormant-t1", "head-443", "main"),
+        ));
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("Dormant").unwrap();
+        let mut workers = vec![slot];
+
+        resume_retained_merge_replay_rework(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            task_id,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(workers.len(), 1);
+        assert!(workers[0].draining);
+        assert_eq!(workers[0].rework_count, 1);
+        assert!(matches!(workers[0].proc, SlotProcess::Running(_)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !args_path.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let args = std::fs::read_to_string(&args_path).expect("dormant turn launched");
+        assert!(args.contains(feedback));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let claim_holder: String = conn
+            .query_row(
+                "SELECT holder FROM claims WHERE target=?1 AND active=1",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claim_holder, "Dormant");
+        drop(conn);
+        workers.remove(0).kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn dormant_codex_rework_records_each_agent_run_without_prior_buckets() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("dormant-rework-usage.db");
@@ -53835,6 +54087,59 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let task = tasks::get(&conn, fx.task_id).unwrap().unwrap();
         assert_eq!(task.status, "in-review");
         assert_eq!(task_event_count(&conn, fx.task_id, "task_in_review"), 2);
+    }
+
+    /// A Phase 5/5b handoff commits `merging` and its replay marker together.
+    /// If drain begins before Phase 4e can claim it, teardown must preserve
+    /// that pair so the next daemon can consume the request.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_preserves_requested_merge_replay_for_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("drain-requested-merge-replay.db");
+        let worker_wt = dir.path().join("worker-wt");
+        let reviewer_wt = dir.path().join("reviewer-wt");
+        std::fs::create_dir_all(&worker_wt).unwrap();
+        let fx = seed_drain_verdict_fixture(&db_path, &reviewer_wt, None, None, None);
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks
+                 SET status='merging',
+                     refs=json_set(refs, '$.daemon_merge_retry', 'requested')
+                 WHERE id=?1",
+                [fx.task_id],
+            )
+            .unwrap();
+        }
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut workers = vec![
+            drain_test_slot(DRAIN_AUTHOR, fx.task_id, worker_wt, DRAIN_AUTHOR_CAP, None).await,
+        ];
+        let mut reviewers: Vec<SlotState> = Vec::new();
+
+        drain_idle_agents(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+        )
+        .await;
+        assert!(workers.is_empty());
+
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, fx.task_id).unwrap().unwrap();
+        assert_eq!(task.status, "merging");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[tasks::MERGE_RETRY_REF], "requested");
+        assert_eq!(task_event_count(&conn, fx.task_id, "task_in_review"), 1);
+        let claimed = tasks::claim_merge_retry(&mut conn, now_unix())
+            .unwrap()
+            .expect("restart can claim the preserved replay");
+        assert_eq!(claimed.id, fx.task_id);
     }
 
     /// Negative path: an idle worker that still owns a `working` task and has
