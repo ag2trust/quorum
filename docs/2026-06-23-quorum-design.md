@@ -1622,9 +1622,11 @@ On daemon startup, before generic crash recovery:
    tasks carrying `daemon:merge-blocked` retain their dedicated mergeability-retry path.
    A graceful drain that observes the committed `merging + requested` pair tears down an idle
    retained worker without changing either field, so restart can claim the replay instead of
-   stranding its marker on an `in-review` task. A decomposition freeze counts `merging` among
-   started non-terminal work; it cannot capture its frozen base while an orphan handoff still
-   awaits Phase 4e reconciliation.
+   stranding its marker on an `in-review` task. Killing that worker demotes the task and removes
+   an unconsumed `requested` marker in one transaction, so the retained approvals can queue a new
+   handoff. A decomposition freeze counts `merging` among started non-terminal work, in both the
+   tick gate and the atomic frozen-base bind; it cannot capture its frozen base while an orphan
+   handoff still awaits Phase 4e reconciliation.
    Reviewer verdict persistence uses the task's durable author when no worker is live. When a
    repaired R1 returns and an exact task/author/head-bound R2 row was retained, that R2 is reused
    rather than provisioned again. Every persisted role remains bound to the launch-validated
@@ -1638,8 +1640,9 @@ On daemon startup, before generic crash recovery:
    startup parks an uncertain `attempting` marker without a second GitHub call and preserves its
    approvals for another explicit owner retry. If a worker-fixable replay enters `rework` while
    the original sticky or dormant worker slot is retained, Phase 4e reacquires that worker's
-   remediation lease, validates the live PR baseline, and feeds the durable feedback immediately;
-   the retained slot cannot suppress both that feed and replacement-worker provisioning.
+   remediation lease, validates the live PR baseline, and feeds the durable feedback immediately.
+   If that handoff fails abnormally, the idle slot is released for durable remediation; the
+   retained slot cannot suppress both that feed and replacement-worker provisioning.
 
 A delivered respawn-per-turn worker is not an orphan while its review is pending. Its
 `awaiting-review` journal row has no PID and durably binds the agent/task, provider and exact

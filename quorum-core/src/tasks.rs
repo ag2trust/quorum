@@ -5021,7 +5021,20 @@ pub fn fail_worker_assignment(
         },
         now,
         true,
-        |_| Ok(()),
+        |tx| {
+            // `Merging + AgentFailed` returns to `in-review`, where an
+            // unconsumed replay request is unclaimable and also blocks the
+            // ready-approved handoff. Approvals survive, so dropping the
+            // request lets Phase 5/5b queue a fresh one. An `attempting`
+            // marker stays: that attempt's outcome is uncertain.
+            tx.execute(
+                "UPDATE tasks SET refs=json_remove(refs, '$.daemon_merge_retry')
+                 WHERE id=?1 AND status='in-review' AND json_valid(refs)
+                   AND json_extract(refs, '$.daemon_merge_retry')='requested'",
+                params![id],
+            )?;
+            Ok(())
+        },
     )
     .map(|transition| WorkerFailureOutcome::Applied(Box::new(transition)))
 }
@@ -7423,6 +7436,58 @@ mod tests {
         assert_eq!(transition.task.status, "open");
         assert_eq!(transition.task.recovery_attempts, 1);
         assert_eq!(get(&conn, task_id).unwrap().unwrap(), transition.task);
+    }
+
+    /// `quorum kill` reaches a retained worker through this path. Demoting a
+    /// queued replay must not strand its marker on an `in-review` task.
+    #[test]
+    fn fail_worker_assignment_clears_requested_merge_replay_on_demotion() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 1_000,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks
+             SET status='merging', refs='{\"pr\":7,\"daemon_merge_retry\":\"requested\"}'
+             WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+
+        let outcome =
+            fail_worker_assignment(&mut conn, "worker", task_id, "killed", 1_001).unwrap();
+
+        let WorkerFailureOutcome::Applied(transition) = outcome else {
+            panic!("a merging task must apply AgentFailed");
+        };
+        assert_eq!(transition.task.status, "in-review");
+        let task = get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(MERGE_RETRY_REF).is_none());
+        assert_eq!(refs["pr"], 7);
+    }
+
+    #[test]
+    fn fail_worker_assignment_keeps_uncertain_merge_attempt_marker() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 1_000,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks
+             SET status='merging', refs='{\"pr\":7,\"daemon_merge_retry\":\"attempting\"}'
+             WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+
+        fail_worker_assignment(&mut conn, "worker", task_id, "killed", 1_001).unwrap();
+
+        let task = get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[MERGE_RETRY_REF], MERGE_RETRY_ATTEMPTING);
     }
 
     #[test]

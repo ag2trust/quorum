@@ -9043,10 +9043,11 @@ async fn tick_decomposition(
         let conn = quorum_core::db::open(&config.db_path)?;
         count_drain_blocking_journal_rows(&conn)?
     };
-    // Every task that had already started (working/in-review/rework) must reach
-    // a terminal state before we capture the frozen base. The planning source
-    // itself sits in 'planning' — exclude it. Live-process counts alone miss
-    // the `in-review` gap between worker teardown and reviewer attach.
+    // Every task that had already started (working/in-review/rework/merging)
+    // must reach a terminal state before we capture the frozen base. The
+    // planning source itself sits in 'planning' — exclude it. Live-process
+    // counts alone miss the `in-review` gap between worker teardown and
+    // reviewer attach, and the slotless `merging` gap before Phase 4e.
     let started_non_terminal = {
         let conn = quorum_core::db::open(&config.db_path)?;
         quorum_core::tasks::count_started_non_terminal_excluding(&conn, snapshot.source_task_id)?
@@ -11725,7 +11726,46 @@ async fn reconcile_merge_retries(
 /// allocating a replacement. The durable retry marker and feedback select the
 /// exact task, and the established sticky-remediation lease/baseline boundary
 /// is crossed before any provider launch.
+///
+/// This handoff fires once, on the transition, so a tick error cannot simply
+/// be retried. An abnormal failure releases the idle slot instead, leaving the
+/// durable remediation intent for the replacement-worker reconciler.
 async fn resume_retained_merge_replay_rework(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    task_id: i64,
+) {
+    let Err(error) =
+        feed_retained_merge_replay_rework(config, wt_mgr, name_pool, workers, task_id).await
+    else {
+        return;
+    };
+    log(&format!(
+        "merge replay rework handoff failed for task #{task_id}: {error}; \
+         releasing any idle retained slot for durable remediation"
+    ));
+    let Some(worker_index) = workers
+        .iter()
+        .position(|worker| worker.task_id == task_id && !worker.draining)
+    else {
+        return;
+    };
+    let worker = workers.remove(worker_index);
+    release_sticky_remediation_lease(&config.db_path, &worker.agent_name, task_id).await;
+    cleanup_slot(
+        config,
+        wt_mgr,
+        name_pool,
+        worker,
+        None,
+        "remediation_lease_unavailable",
+    )
+    .await;
+}
+
+async fn feed_retained_merge_replay_rework(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
@@ -17408,7 +17448,7 @@ async fn tick(
     // tick. A valid replay never allocates a reviewer or worker.
     let replay_rework_task = reconcile_merge_retries(config, wt_mgr, drain_state.draining).await?;
     if let Some(task_id) = replay_rework_task {
-        resume_retained_merge_replay_rework(config, wt_mgr, name_pool, workers, task_id).await?;
+        resume_retained_merge_replay_rework(config, wt_mgr, name_pool, workers, task_id).await;
     }
 
     // ── Phase 4f: GitHub REQUEST_CHANGES outbox for review-only closes ──
@@ -40499,7 +40539,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let db_path = dir.path().join("dormant-merge-replay.db");
         let worktree = dir.path().join("worktree");
         std::fs::create_dir_all(&worktree).unwrap();
-        let (program, args_path, _, _) = fake_codex_resume_program(dir.path());
+        let (program, args_path, _, cwd_path) = fake_codex_resume_program(dir.path());
         let (slot, _old_run_id, _old_capability) =
             dormant_codex_rework_fixture(&db_path, &worktree, Some("thread-exact"), "thread-exact");
         let task_id = slot.task_id;
@@ -40546,15 +40586,17 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &mut workers,
             task_id,
         )
-        .await
-        .unwrap();
+        .await;
 
         assert_eq!(workers.len(), 1);
         assert!(workers[0].draining);
         assert_eq!(workers[0].rework_count, 1);
         assert!(matches!(workers[0].proc, SlotProcess::Running(_)));
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while !args_path.exists() && std::time::Instant::now() < deadline {
+        // The script writes cwd last, so its presence means args are complete.
+        for _ in 0..1000 {
+            if cwd_path.exists() {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let args = std::fs::read_to_string(&args_path).expect("dormant turn launched");
@@ -40570,6 +40612,148 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(claim_holder, "Dormant");
         drop(conn);
         workers.remove(0).kill_and_reap().await;
+    }
+
+    /// The resume fires once, so an abnormal failure must not leave an idle
+    /// slot suppressing the replacement-worker reconciler.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn merge_replay_rework_abnormal_failure_releases_slot_for_durable_remediation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dormant-merge-replay-abnormal.db");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (program, args_path, _, _) = fake_codex_resume_program(dir.path());
+        let (slot, _old_run_id, _old_capability) =
+            dormant_codex_rework_fixture(&db_path, &worktree, Some("thread-exact"), "thread-exact");
+        let task_id = slot.task_id;
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks
+                 SET status='merging',
+                     refs=json_set(
+                         json_remove(refs, '$.daemon_rework_retry_requested'),
+                         '$.daemon_merge_retry', 'attempting'
+                     )
+                 WHERE id=?1",
+                [task_id],
+            )
+            .unwrap();
+            tasks::rework_approved_merge(&mut conn, task_id, 443, "Fix it.", now_unix()).unwrap();
+            // Fail the guarded baseline write after the lease is installed.
+            conn.execute_batch(
+                "CREATE TRIGGER fail_baseline_insert BEFORE INSERT ON pr_targets
+                 BEGIN SELECT RAISE(ABORT, 'injected baseline failure'); END;
+                 CREATE TRIGGER fail_baseline_update BEFORE UPDATE ON pr_targets
+                 BEGIN SELECT RAISE(ABORT, 'injected baseline failure'); END;",
+            )
+            .unwrap();
+        }
+
+        let mut config = dormant_codex_test_config(
+            db_path.clone(),
+            worktree,
+            Some(program.to_string_lossy().into_owned()),
+        );
+        config.repo = "test/repo".into();
+        config.pr_target_program = Some(fake_gh_returning(
+            dir.path(),
+            "gh-dormant-merge-replay-abnormal",
+            &open_pr_target_json("daemon/dormant-t1", "head-443", "main"),
+        ));
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("Dormant").unwrap();
+        let mut workers = vec![slot];
+
+        resume_retained_merge_replay_rework(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            task_id,
+        )
+        .await;
+
+        assert!(workers.is_empty());
+        assert!(!args_path.exists());
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(
+            remediation_retry_feedback(task.refs.as_deref()).as_deref(),
+            Some("Fix it.")
+        );
+        let active_claims: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM claims WHERE target=?1 AND active=1",
+                [format!("task#{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_claims, 0);
+    }
+
+    /// A replay that exhausts the rework cap lands in `failed`, so the
+    /// retained worker has no further turn and its slot is released.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn merge_replay_past_rework_cap_releases_retained_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("dormant-merge-replay-cap.db");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (program, args_path, _, _) = fake_codex_resume_program(dir.path());
+        let (slot, _old_run_id, _old_capability) =
+            dormant_codex_rework_fixture(&db_path, &worktree, Some("thread-exact"), "thread-exact");
+        let task_id = slot.task_id;
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks
+                 SET status='merging', rework_round=1000,
+                     refs=json_set(
+                         json_remove(refs, '$.daemon_rework_retry_requested'),
+                         '$.daemon_merge_retry', 'attempting'
+                     )
+                 WHERE id=?1",
+                [task_id],
+            )
+            .unwrap();
+            let transition =
+                tasks::rework_approved_merge(&mut conn, task_id, 443, "Fix it.", now_unix())
+                    .unwrap();
+            assert_eq!(transition.task.status, "failed");
+        }
+
+        let mut config = dormant_codex_test_config(
+            db_path.clone(),
+            worktree,
+            Some(program.to_string_lossy().into_owned()),
+        );
+        config.repo = "test/repo".into();
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("Dormant").unwrap();
+        let mut workers = vec![slot];
+
+        resume_retained_merge_replay_rework(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            task_id,
+        )
+        .await;
+
+        assert!(workers.is_empty());
+        assert!(!args_path.exists());
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "failed"
+        );
     }
 
     #[cfg(unix)]
@@ -44743,9 +44927,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         });
         let config = merge_retry_test_config(&dir, &live, "gh-auto-conflict", executor.clone());
 
-        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
-            .await
-            .unwrap();
+        // The returned id is what hands a retained worker its rework turn.
+        assert_eq!(
+            reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+                .await
+                .unwrap(),
+            Some(task_id)
+        );
 
         assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         let conn = quorum_core::db::open(&config.db_path).unwrap();
@@ -44817,12 +45005,18 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         });
         let config = merge_retry_test_config(&dir, &live, "gh-auto-ci-failed", executor.clone());
 
-        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
-            .await
-            .unwrap();
-        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
-            .await
-            .unwrap();
+        assert_eq!(
+            reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+                .await
+                .unwrap(),
+            Some(task_id)
+        );
+        assert_eq!(
+            reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+                .await
+                .unwrap(),
+            None
+        );
 
         assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         let conn = quorum_core::db::open(&config.db_path).unwrap();

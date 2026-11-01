@@ -862,17 +862,18 @@ pub fn bind_frozen_base_and_enter_planning(
     // Bind must recheck drain quiescence atomically: the daemon tick's
     // pre-check reads task status outside this transaction, and a supported
     // operator retry (see `tasks::retry_parked`) can restore a parked task to
-    // `rework`/`in-review` between that read and this update. Refuse the bind
-    // if any started-but-not-terminal task exists other than the planning
-    // source itself, so the drain-to-planning handoff never captures a base
-    // while a merge, remediation, or review is still in flight.
+    // `rework`/`in-review`/`merging` between that read and this update. Refuse
+    // the bind if any started-but-not-terminal task exists other than the
+    // planning source itself, so the drain-to-planning handoff never captures a
+    // base while a merge, remediation, or review is still in flight. This set
+    // must match `tasks::count_started_non_terminal_excluding`.
     let changed = tx.execute(
         "UPDATE task_decompositions SET state='planning',frozen_base_sha=?2,updated_at=?3
          WHERE id=?1 AND state='draining' AND freeze_active=1 AND active=0
            AND frozen_base_sha IS NULL
            AND NOT EXISTS (
                SELECT 1 FROM tasks t
-               WHERE t.status IN ('working','in-review','rework')
+               WHERE t.status IN ('working','in-review','rework','merging')
                  AND t.id != (SELECT g.source_task_id
                               FROM task_decompositions g WHERE g.id=?1)
            )",
@@ -4922,9 +4923,14 @@ mod tests {
         conn.execute("UPDATE tasks SET status='rework' WHERE id=2", [])
             .unwrap();
         assert!(!bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 6).unwrap());
+
+        // A retry can restore `merging` too; its approved PR has not landed yet.
+        conn.execute("UPDATE tasks SET status='merging' WHERE id=2", [])
+            .unwrap();
+        assert!(!bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 7).unwrap());
         conn.execute("UPDATE tasks SET status='done' WHERE id=2", [])
             .unwrap();
-        assert!(bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 7).unwrap());
+        assert!(bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 8).unwrap());
     }
 
     #[test]
