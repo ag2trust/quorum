@@ -891,6 +891,112 @@ exit 0
     drop(handle);
 }
 
+/// A terminal provider error is durable strike evidence, so the exhausted park
+/// reason remains actionable even though the daemon only decides to park on a
+/// later tick after the failed reviewer has been reaped.
+#[test]
+fn provider_failure_budget_park_names_durable_error_and_is_retryable() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "Worker";
+    let task_id = seed_in_review_task(home.path(), author, 42);
+    create_author_branch(repo_dir.path(), author, task_id);
+    record_closed_run(home.path(), task_id, author, "worker");
+    let names = write_named_pool(home.path(), &["Reviewer".into()]);
+
+    let provider_error = "simulated reviewer provider outage";
+    let failing_reviewer = home.path().join("failing-reviewer.sh");
+    std::fs::write(
+        &failing_reviewer,
+        format!(
+            "#!/bin/sh\nIFS= read -r _line\nprintf '{{\"type\":\"result\",\"result\":\"{provider_error}\",\"is_error\":true}}\\n'\nexit 1\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&failing_reviewer, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut handle = ServeHandle::start_with_agent_bin_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+        &failing_reviewer,
+        &[("QUORUM_TEST_REVIEWER_RESPAWN_BACKOFF_MS", "250")],
+    );
+    assert!(
+        handle.wait_for("orphan in-review task #1 PR #42: provision exhausted", 90),
+        "provider failures did not exhaust and park: {:?}",
+        handle.lines
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    handle.drain_pending_lines();
+
+    let parked = get_task(home.path(), task_id);
+    assert_eq!(parked.status, "failed", "task was not parked");
+    let reason = parked.refs.unwrap_or_default();
+    assert!(
+        reason.contains("reviewer provision exhausted for orphan PR #42"),
+        "park reason lost its exhausted prefix: {reason}"
+    );
+    assert!(
+        reason.contains("after 3 attempts at head "),
+        "park reason omitted the durable attempt count and head: {reason}"
+    );
+    assert!(
+        reason.contains(provider_error),
+        "park reason omitted the durable provider error: {reason}"
+    );
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    let notification: String = conn
+        .query_row(
+            "SELECT body FROM messages WHERE recipient='owner' ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        notification.contains(provider_error),
+        "park notification omitted the durable provider error: {notification}"
+    );
+    drop(conn);
+    drop(handle);
+
+    let retry = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .args([
+            "task-retry",
+            "--task-id",
+            &task_id.to_string(),
+            "--by",
+            author,
+        ])
+        .status()
+        .unwrap();
+    assert!(
+        retry.success(),
+        "parked provider failure task was not retryable"
+    );
+    assert_eq!(
+        get_task(home.path(), task_id).status,
+        "in-review",
+        "task-retry did not restore the parked review state"
+    );
+}
+
 /// If the durable strike cannot be written, the durable budget can never be
 /// reached — but an unrecordable strike is a DB fault, not a lifecycle verdict.
 /// The daemon must stay loud and keep going (a transient write-lock holder must

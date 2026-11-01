@@ -904,6 +904,42 @@ fn decide_provision(
     }
 }
 
+/// Return the park and notification reasons for an exhausted reviewer
+/// provision decision. A lifetime run-cap has no per-head provider diagnostic,
+/// and an ordinary strike deliberately clears one, so both retain their
+/// established generic messages. Provider failures, however, are durable with
+/// the strike count and must remain actionable after a daemon restart.
+async fn exhausted_reviewer_provision_reasons(
+    db_path: &Path,
+    task_id: i64,
+    pr_number: i64,
+    head_sha: &str,
+    generic_park_reason: String,
+    generic_notification_reason: String,
+    specific_reason_prefix: String,
+) -> Result<(String, String)> {
+    let path = db_path.to_path_buf();
+    let head = head_sha.to_string();
+    let provider_error = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        let conn = quorum_core::db::open(&path)?;
+        if is_reviewer_cap_exceeded(&conn, task_id)? {
+            return Ok(None);
+        }
+        quorum_core::provision_attempts::exhausted_provider_error(&conn, task_id, pr_number, &head)
+    })
+    .await
+    .map_err(|e| QuorumError::Io(format!("exhausted reviewer reason join: {e}")))??;
+
+    let Some(provider_error) = provider_error else {
+        return Ok((generic_park_reason, generic_notification_reason));
+    };
+    let reason = format!(
+        "{specific_reason_prefix} after {MAX_REVIEWER_PROVISION_STRIKES} attempts at head \
+         {head_sha}: provider error: {provider_error}"
+    );
+    Ok((reason.clone(), reason))
+}
+
 /// Whether every review role required for `head_sha` is approved. Unlike
 /// `quorum_core::approvals::dual_approved`, this honours a durable sampled R2
 /// skip, so an R1-only approval for a sampled-out head counts as complete.
@@ -17259,7 +17295,7 @@ async fn tick(
             .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))??;
             needs_reviewer_from_workers.retain(|(_, task_id, _)| reviewable.contains(task_id));
         }
-        let mut parked_workers: Vec<usize> = Vec::new();
+        let mut parked_workers: Vec<(usize, String, String)> = Vec::new();
         let mut repo_mismatch_workers: Vec<(usize, String)> = Vec::new();
         let mut pr_closed_workers: Vec<usize> = Vec::new();
         let mut failed_pre_review_checks: Vec<(i64, i64, String, Vec<String>)> = Vec::new();
@@ -17349,11 +17385,24 @@ async fn tick(
                     continue;
                 }
                 Ok(ProvisionDecision::Exhausted) => {
+                    let (park_reason, notification_reason) = exhausted_reviewer_provision_reasons(
+                        &db_path,
+                        *task_id,
+                        *pr,
+                        &head_sha,
+                        format!(
+                            "reviewer provision exhausted for PR #{pr} after \
+                             {MAX_REVIEWER_PROVISION_STRIKES} attempts"
+                        ),
+                        "reviewer provision exhausted".to_string(),
+                        format!("reviewer provision exhausted for PR #{pr}"),
+                    )
+                    .await?;
                     log(&format!(
                         "reviewer provision exhausted for task #{task_id} PR #{pr} \
                          — parking worker"
                     ));
-                    parked_workers.push(*wi);
+                    parked_workers.push((*wi, park_reason, notification_reason));
                     continue;
                 }
                 Ok(ProvisionDecision::Needed(role_str)) => {
@@ -17481,28 +17530,13 @@ async fn tick(
             .await;
             cleanup_slot(config, wt_mgr, name_pool, w, None, "parked").await;
         }
-        for &wi in parked_workers.iter().rev() {
+        for (wi, park_reason, notification_reason) in parked_workers.into_iter().rev() {
             let w = workers.remove(wi);
             let pr_label =
                 w.pr.map(|n| format!("#{n}"))
                     .unwrap_or_else(|| "unknown".to_string());
-            park_task(
-                &db_path,
-                w.task_id,
-                &format!(
-                    "reviewer provision exhausted for PR {pr_label} after \
-                     {MAX_REVIEWER_PROVISION_STRIKES} attempts"
-                ),
-                "in-review",
-            )
-            .await;
-            notify_provision_failure(
-                &db_path,
-                w.task_id,
-                "reviewer provision exhausted",
-                &pr_label,
-            )
-            .await;
+            park_task(&db_path, w.task_id, &park_reason, "in-review").await;
+            notify_provision_failure(&db_path, w.task_id, &notification_reason, &pr_label).await;
             cleanup_slot(config, wt_mgr, name_pool, w, None, "parked").await;
         }
         for (task_id, pr, head_sha, failing_checks) in failed_pre_review_checks {
@@ -17722,21 +17756,25 @@ async fn tick(
                     continue;
                 }
                 Ok(ProvisionDecision::Exhausted) => {
+                    let (park_reason, notification_reason) = exhausted_reviewer_provision_reasons(
+                        &db_path,
+                        *task_id,
+                        *pr,
+                        &head_sha,
+                        format!("reviewer provision exhausted for orphan PR #{pr}"),
+                        "reviewer provision exhausted (orphan in-review)".to_string(),
+                        format!("reviewer provision exhausted for orphan PR #{pr}"),
+                    )
+                    .await?;
                     log(&format!(
                         "orphan in-review task #{task_id} PR #{pr}: \
                          provision exhausted — parking"
                     ));
-                    park_task(
-                        &db_path,
-                        *task_id,
-                        &format!("reviewer provision exhausted for orphan PR #{pr}"),
-                        "in-review",
-                    )
-                    .await;
+                    park_task(&db_path, *task_id, &park_reason, "in-review").await;
                     notify_provision_failure(
                         &db_path,
                         *task_id,
-                        "reviewer provision exhausted (orphan in-review)",
+                        &notification_reason,
                         &format!("#{pr}"),
                     )
                     .await;
