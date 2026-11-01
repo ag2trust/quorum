@@ -2902,6 +2902,8 @@ fn awaiting_reviewer_reason(
             "classification pending".to_string()
         }));
     }
+    // Same count the daemon uses. The no-work exclusion lives only in
+    // `total_reviewer_runs`.
     let total = crate::provision_attempts::total_reviewer_runs(conn, task_id)?;
     if total >= crate::provision_attempts::MAX_TOTAL_REVIEWER_RUNS {
         return Ok(Some(format!(

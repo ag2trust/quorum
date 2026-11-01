@@ -175,9 +175,17 @@ pub fn clear_for_task(conn: &mut Connection, task_id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Lifetime cap on reviewer runs per task; at the cap the daemon parks the task
+/// Lifetime cap on reviewer runs per task. At the cap the daemon parks the task
 /// instead of spawning another reviewer.
+///
+/// [`total_reviewer_runs`] is the count. A `turn-error-unclassified` run that
+/// ended within [`REVIEWER_NO_WORK_MAX_SECS`] with a recorded PR and head does
+/// not consume it; the per-head strike bound covers those runs.
 pub const MAX_TOTAL_REVIEWER_RUNS: i64 = 12;
+/// Maximum `ended_at - spawned_at` span, in unix seconds, of a reviewer run
+/// treated as having ended before review work. `agent_runs.spawned_at` and
+/// `ended_at` are both unix seconds.
+pub const REVIEWER_NO_WORK_MAX_SECS: i64 = 60;
 /// Consecutive reviewer provision failures at one head SHA before the daemon stops retrying.
 pub const MAX_REVIEWER_PROVISION_STRIKES: u32 = 3;
 
@@ -191,11 +199,29 @@ pub fn max_attempts_for_task(conn: &Connection, task_id: i64) -> Result<i64> {
     )?)
 }
 
-/// Count total reviewer agent_runs for a task.
+/// Reviewer runs that consume [`MAX_TOTAL_REVIEWER_RUNS`] for `task_id`.
+///
+/// Excludes a run only when it durably ended before review work: `end_reason`
+/// is `turn-error-unclassified`, `ended_at` is set, `ended_at - spawned_at` is
+/// at most [`REVIEWER_NO_WORK_MAX_SECS`], and both `review_pr` and
+/// `review_head_sha` are set. `fail_reviewer_if_owner` lets a racing verdict
+/// win, so this close cannot hold a verdict, and the head requirement keeps
+/// the exemption on runs the per-head strike bound can cover. `end_reason IS`
+/// is null-safe, so a missing reason still counts. Completed reviews, every
+/// other end reason, live runs, slower unclassified closes, and rows missing
+/// either launch column (including historical ones) still count.
 pub fn total_reviewer_runs(conn: &Connection, task_id: i64) -> Result<i64> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM agent_runs WHERE task_id = ?1 AND role = 'reviewer'",
-        params![task_id],
+        "SELECT COUNT(*) FROM agent_runs \
+         WHERE task_id = ?1 AND role = 'reviewer' \
+           AND NOT ( \
+             end_reason IS 'turn-error-unclassified' \
+             AND ended_at IS NOT NULL \
+             AND ended_at - spawned_at <= ?2 \
+             AND review_pr IS NOT NULL \
+             AND review_head_sha IS NOT NULL \
+           )",
+        params![task_id, REVIEWER_NO_WORK_MAX_SECS],
         |r| r.get(0),
     )?;
     Ok(count)
@@ -446,5 +472,199 @@ mod tests {
         let hostile = "'; DROP TABLE reviewer_provision_attempts; --";
         record_provider_failure(&mut c, 10, 42, "r1", "sha1", hostile).unwrap();
         assert_eq!(stored_error(&c, 10, 42, "r1").as_deref(), Some(hostile));
+    }
+
+    struct ReviewerRunKind {
+        label: &'static str,
+        role: &'static str,
+        /// `None` leaves `ended_at` NULL. Otherwise `spawned_at + ended_offset`.
+        ended_offset: Option<i64>,
+        end_reason: Option<&'static str>,
+        review_pr: Option<i64>,
+        review_head: Option<&'static str>,
+        counts: bool,
+    }
+
+    fn insert_reviewer_run(
+        conn: &Connection,
+        task_id: i64,
+        name: &str,
+        spawned_at: i64,
+        kind: &ReviewerRunKind,
+    ) {
+        let ended_at = kind.ended_offset.map(|offset| spawned_at + offset);
+        conn.execute(
+            "INSERT INTO agent_runs
+                (task_id, agent_name, role, model, effort, spawned_at, ended_at, end_reason,
+                 review_pr, review_head_sha)
+             VALUES (?1, ?2, ?3, 'm', 'e', ?4, ?5, ?6, ?7, ?8)",
+            params![
+                task_id,
+                name,
+                kind.role,
+                spawned_at,
+                ended_at,
+                kind.end_reason,
+                kind.review_pr,
+                kind.review_head,
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn total_reviewer_runs_excludes_only_short_unclassified_work_with_a_head() {
+        let (_d, c) = open_tmp();
+        let spawned = 1_700_000_000_i64;
+        let head = "0123456789abcdef0123456789abcdef01234567";
+        let unclassified = Some("turn-error-unclassified");
+        let kinds = [
+            ReviewerRunKind {
+                label: "instant unclassified with head",
+                role: "reviewer",
+                ended_offset: Some(0),
+                end_reason: unclassified,
+                review_pr: Some(4),
+                review_head: Some(head),
+                counts: false,
+            },
+            ReviewerRunKind {
+                label: "unclassified at the no-work threshold",
+                role: "reviewer",
+                ended_offset: Some(REVIEWER_NO_WORK_MAX_SECS),
+                end_reason: unclassified,
+                review_pr: Some(4),
+                review_head: Some(head),
+                counts: false,
+            },
+            ReviewerRunKind {
+                label: "unclassified one second past the threshold",
+                role: "reviewer",
+                ended_offset: Some(REVIEWER_NO_WORK_MAX_SECS + 1),
+                end_reason: unclassified,
+                review_pr: Some(4),
+                review_head: Some(head),
+                counts: true,
+            },
+            ReviewerRunKind {
+                label: "completed review",
+                role: "reviewer",
+                ended_offset: Some(1),
+                end_reason: Some("completed"),
+                review_pr: Some(4),
+                review_head: Some(head),
+                counts: true,
+            },
+            ReviewerRunKind {
+                label: "other end reason",
+                role: "reviewer",
+                ended_offset: Some(0),
+                end_reason: Some("continuation-unavailable"),
+                review_pr: Some(4),
+                review_head: Some(head),
+                counts: true,
+            },
+            ReviewerRunKind {
+                label: "live run with null ended_at",
+                role: "reviewer",
+                ended_offset: None,
+                end_reason: None,
+                review_pr: Some(4),
+                review_head: Some(head),
+                counts: true,
+            },
+            ReviewerRunKind {
+                label: "unclassified reason but still live",
+                role: "reviewer",
+                ended_offset: None,
+                end_reason: unclassified,
+                review_pr: Some(4),
+                review_head: Some(head),
+                counts: true,
+            },
+            ReviewerRunKind {
+                label: "short unclassified missing review_pr",
+                role: "reviewer",
+                ended_offset: Some(0),
+                end_reason: unclassified,
+                review_pr: None,
+                review_head: Some(head),
+                counts: true,
+            },
+            ReviewerRunKind {
+                label: "short unclassified missing review_head_sha",
+                role: "reviewer",
+                ended_offset: Some(0),
+                end_reason: unclassified,
+                review_pr: Some(4),
+                review_head: None,
+                counts: true,
+            },
+            ReviewerRunKind {
+                label: "historical unclassified row missing both launch columns",
+                role: "reviewer",
+                ended_offset: Some(0),
+                end_reason: unclassified,
+                review_pr: None,
+                review_head: None,
+                counts: true,
+            },
+            ReviewerRunKind {
+                label: "ended row with a null end_reason",
+                role: "reviewer",
+                ended_offset: Some(0),
+                end_reason: None,
+                review_pr: Some(4),
+                review_head: Some(head),
+                counts: true,
+            },
+            ReviewerRunKind {
+                label: "worker run",
+                role: "worker",
+                ended_offset: Some(0),
+                end_reason: unclassified,
+                review_pr: Some(4),
+                review_head: Some(head),
+                counts: false,
+            },
+        ];
+
+        let mixed_task = 100_i64;
+        let mut expected_mixed = 0_i64;
+        for (index, kind) in kinds.iter().enumerate() {
+            let task_id = (index as i64) + 1;
+            insert_reviewer_run(&c, task_id, kind.label, spawned, kind);
+            assert_eq!(
+                total_reviewer_runs(&c, task_id).unwrap(),
+                i64::from(kind.counts),
+                "{}",
+                kind.label
+            );
+            insert_reviewer_run(&c, mixed_task, &format!("mixed-{index}"), spawned, kind);
+            if kind.counts {
+                expected_mixed += 1;
+            }
+        }
+
+        assert_eq!(total_reviewer_runs(&c, mixed_task).unwrap(), expected_mixed);
+        let exempt = ReviewerRunKind {
+            label: "burst",
+            role: "reviewer",
+            ended_offset: Some(0),
+            end_reason: unclassified,
+            review_pr: Some(4),
+            review_head: Some(head),
+            counts: false,
+        };
+        for n in 0..40 {
+            insert_reviewer_run(&c, mixed_task, &format!("burst-{n}"), spawned, &exempt);
+        }
+        assert_eq!(
+            total_reviewer_runs(&c, mixed_task).unwrap(),
+            expected_mixed,
+            "a burst of instant provider failures must not consume the lifetime cap"
+        );
+        assert!(expected_mixed < MAX_TOTAL_REVIEWER_RUNS);
+        assert_eq!(total_reviewer_runs(&c, 999).unwrap(), 0);
     }
 }
