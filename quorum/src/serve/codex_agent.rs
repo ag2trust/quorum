@@ -1525,6 +1525,35 @@ printf '{"quorum_agent":"%s","quorum_home":"%s","quorum_repo":"%s","quorum_run_i
         .expect("real Codex did not launch the configured MCP child")
     }
 
+    fn rollout_is_written(dir: &std::path::Path, thread_id: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                return rollout_is_written(&path, thread_id);
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.contains(thread_id)
+                && name.ends_with(".jsonl")
+                && entry.metadata().is_ok_and(|meta| meta.len() > 0)
+        })
+    }
+
+    /// Codex issues the thread ID before it persists the rollout, and resume
+    /// refuses a thread with no rollout. Wait before killing the fresh process.
+    async fn wait_for_rollout(codex_home: &std::path::Path, thread_id: &str) {
+        let sessions = codex_home.join("sessions");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !rollout_is_written(&sessions, thread_id) {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("real Codex did not persist the fresh thread rollout")
+    }
+
     /// Codex 0.148 clears an MCP child's environment before copying its
     /// defaults and the names in `env_vars`. Exercise that real provider
     /// boundary for a fresh provider-issued thread and its exact resume.
@@ -1588,6 +1617,7 @@ while IFS= read -r request; do :; done
                 other => panic!("fresh Codex did not issue a thread identity: {other:?}"),
             };
         wait_for_mcp_launches(&capture, 1).await;
+        wait_for_rollout(&codex_home, &thread_id).await;
         let _ = fresh.kill_and_reap().await;
 
         let resumed = CodexProc::spawn_resume(
