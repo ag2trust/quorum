@@ -19312,18 +19312,28 @@ async fn finalize_dormant_worker_turn(
             )));
         }
         let run_id = match assignment {
-            Some(ref assignment) => quorum_core::agent_runs::insert_worker_with_assignment(
-                &tx,
-                task_id,
-                &agent,
-                &assignment.responsibility_key,
-                &model,
-                &effort,
-                &provider,
-                &provider,
-                Some(assignment.id),
-                now,
-            )?,
+            Some(ref assignment) => {
+                let run_id = quorum_core::agent_runs::insert_worker_with_assignment(
+                    &tx,
+                    task_id,
+                    &agent,
+                    &assignment.responsibility_key,
+                    &model,
+                    &effort,
+                    &provider,
+                    &provider,
+                    Some(assignment.id),
+                    now,
+                )?;
+                quorum_core::capabilities::bind_worker_run_tx(
+                    &tx,
+                    &cap_run_id,
+                    run_id,
+                    task_id,
+                    &agent,
+                )?;
+                run_id
+            }
             None => quorum_core::agent_runs::insert(
                 &tx, task_id, &agent, "worker", &model, &effort, &provider, now,
             )?,
@@ -40466,6 +40476,440 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 "{label}: capability rotated before validation"
             );
         }
+    }
+
+    #[cfg(unix)]
+    const DORMANT_WORKER_FAILURE_TICK_ROOT: &str = "QUORUM_TEST_DORMANT_WORKER_FAILURE_TICK_ROOT";
+
+    /// A pool whose primary is the dormant fixture's exact Codex route and
+    /// whose only eligible alternate is on another provider.
+    #[cfg(unix)]
+    fn dormant_worker_fallback_config(
+        db_path: PathBuf,
+        root: &Path,
+        codex_program: &Path,
+    ) -> ServeConfig {
+        let mut config = live_fallback_test_config(
+            db_path,
+            root,
+            codex_program,
+            Arc::new(FallbackHeadExecutor("a".repeat(40))),
+        );
+        config.model_profiles.insert(
+            "a-primary".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.6-terra".into(),
+                effort: "high".into(),
+            },
+        );
+        config.model_profiles.insert(
+            "b-alternate".into(),
+            crate::serve_config::ModelProfile {
+                runner: "claude".into(),
+                model: "claude-sonnet-4-6".into(),
+                effort: "high".into(),
+            },
+        );
+        config
+    }
+
+    /// Re-home the dormant fixture onto a routed worker's layout: the completed
+    /// run names its immutable assignment and its capability is bound to it.
+    /// The turn under test still gets its binding from production finalize.
+    #[cfg(unix)]
+    fn assign_dormant_worker_run(
+        config: &ServeConfig,
+        task_id: i64,
+        completed_run: i64,
+        completed_capability: &str,
+    ) -> String {
+        let pool = configured_routing_pool(config, "worker", Some(3), None).unwrap();
+        let primary = &pool.profiles[0].profile;
+        let responsibility = worker_responsibility_key(task_id, 1);
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO role_assignments(
+                 responsibility_key,task_id,role,complexity,profile_id,provider,runner,
+                 model,effort,pool_key,policy_generation,created_at)
+             VALUES (?1,?2,'worker','3',?3,?4,?5,?6,?7,?8,?9,1)",
+            rusqlite::params![
+                responsibility,
+                task_id,
+                primary.id,
+                primary.provider,
+                primary.runner,
+                primary.model,
+                primary.effort,
+                pool.pool_key,
+                pool.policy_generation,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE agent_runs SET role_assignment_id=?2 WHERE id=?1",
+            rusqlite::params![completed_run, conn.last_insert_rowid()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE run_capabilities SET agent_run_id=?2 WHERE run_id=?1",
+            rusqlite::params![completed_capability, completed_run],
+        )
+        .unwrap();
+        responsibility
+    }
+
+    #[cfg(unix)]
+    async fn dormant_worker_usage_limit_tick_body(root: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let worktree = root.join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let stream = root.join("failed-turn.jsonl");
+        std::fs::write(
+            &stream,
+            [
+                serde_json::json!({"type":"thread.started","thread_id":"thread-exact"}),
+                serde_json::json!({"type":"turn.started"}),
+                serde_json::json!({"type":"error","message":CODEX_USAGE_LIMIT_MESSAGE}),
+                serde_json::json!({"type":"turn.failed","error":{"message":CODEX_USAGE_LIMIT_MESSAGE}}),
+            ]
+            .map(|line| format!("{line}\n"))
+            .concat(),
+        )
+        .unwrap();
+        let provider = root.join("failed-codex");
+        std::fs::write(
+            &provider,
+            format!(
+                "#!/bin/sh\necho 'Reading additional input from stdin...' >&2\ncat '{}'\nexit 1\n",
+                stream.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config =
+            dormant_worker_fallback_config(root.join("dormant-worker.db"), root, &provider);
+        let (mut slot, completed_run, completed_capability) = dormant_codex_rework_fixture(
+            &config.db_path,
+            &worktree,
+            Some("thread-exact"),
+            "thread-exact",
+        );
+        let task_id = slot.task_id;
+        let responsibility =
+            assign_dormant_worker_run(&config, task_id, completed_run, &completed_capability);
+        assert!(install_live_worker_remediation_lease(
+            &config,
+            slot.agent_name.clone(),
+            task_id,
+            443,
+            "exact reviewer finding",
+        )
+        .await
+        .unwrap());
+
+        let prompt = "Fix the exact reviewer finding and retain PR #443.";
+        feed_worker_turn(&mut slot, prompt, &config).await.unwrap();
+        slot.draining = true;
+        let dormant_run = slot.agent_run_id.unwrap();
+        let dormant_capability = slot.cap_run_id.clone().unwrap();
+        assert_ne!(dormant_run, completed_run);
+        assert_ne!(dormant_capability, completed_capability);
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT agent_run_id FROM run_capabilities WHERE run_id=?1",
+                [&dormant_capability],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap(),
+            Some(dormant_run),
+            "dormant finalize must bind the replacement capability to its run"
+        );
+        drop(conn);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while slot.try_wait().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture provider must buffer its failed turn before the tick");
+
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("Dormant").unwrap();
+        let mut workers = vec![slot];
+        let mut reviewers = Vec::new();
+        let mut branch_sync_checks = branch_sync::BranchSyncChecks::default();
+        let mut pre_review_checks = HashMap::new();
+        let mut pending_reviewer_resumes = HashMap::new();
+        let mut poison_tracker = PoisonTracker::new();
+        let mut claim_skip_logs = ClaimSkipLogLimiter::new();
+        let mut graph_skip_logs = ClaimSkipLogLimiter::new();
+        let mut unrecordable = UnrecordableStrikes::new();
+        let mut reviewer_respawn_backoff = ReviewerRespawnBackoff::new();
+        let mut drain_state = DrainState::new();
+        let mut lifetime_roster = LifetimeRoster::new();
+        lifetime_roster.register("Dormant");
+        let mut classifier_slot = None;
+        let mut decomposition_coordinator = DecompositionCoordinator::default();
+        let mut classifier_consec_errors = 0;
+        let mut classifier_backoff_until = None;
+        let mut doctor_slot = None;
+        let mut doctored_tasks = std::collections::HashSet::new();
+        let signal_count = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        tick(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+            &mut branch_sync_checks,
+            &mut pre_review_checks,
+            &mut pending_reviewer_resumes,
+            &mut poison_tracker,
+            &mut claim_skip_logs,
+            &mut graph_skip_logs,
+            &mut unrecordable,
+            &mut reviewer_respawn_backoff,
+            &mut drain_state,
+            &mut lifetime_roster,
+            &mut classifier_slot,
+            &mut decomposition_coordinator,
+            &mut classifier_consec_errors,
+            &mut classifier_backoff_until,
+            &mut doctor_slot,
+            &mut doctored_tasks,
+            &collector::CollectorTracker::default(),
+            &signal_count,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            workers.len(),
+            1,
+            "the worker slot must survive on its alternate"
+        );
+        let slot = workers.remove(0);
+        assert_eq!(slot.process_kind(), runner::AgentKind::Claude);
+        assert_eq!(slot.model, "claude-sonnet-4-6");
+        assert_eq!(slot.pending_prompt, prompt);
+        assert_eq!(slot.pending_turn_kind, "rework");
+        let alternate_run = slot.agent_run_id.unwrap();
+        let alternate_capability = slot.cap_run_id.clone().unwrap();
+        assert_ne!(alternate_run, dormant_run);
+        assert_ne!(alternate_capability, dormant_capability);
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let (profile, disposition, failed_run): (String, String, i64) = conn
+            .query_row(
+                "SELECT profile_id,failure_disposition,failed_agent_run_id
+                 FROM routing_attempts WHERE responsibility_key=?1",
+                [&responsibility],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(profile, "a-primary");
+        assert_eq!(disposition, "provider-unavailable");
+        assert_eq!(failed_run, dormant_run);
+        assert_eq!(
+            agent_run_end_reason(&conn, dormant_run).as_deref(),
+            Some("fallback-route-unavailable"),
+        );
+        let (intent_run, intent_capability, intent_failed_run, intent_turn): (
+            i64,
+            String,
+            i64,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT agent_run_id,capability_run_id,failed_agent_run_id,pending_turn_json
+                 FROM fallback_launch_intents WHERE responsibility_key=?1",
+                [&responsibility],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(intent_run, alternate_run);
+        assert_eq!(intent_capability, alternate_capability);
+        assert_eq!(intent_failed_run, dormant_run);
+        let intent_turn: serde_json::Value = serde_json::from_str(&intent_turn).unwrap();
+        assert_eq!(intent_turn["prompt"], prompt);
+        assert_eq!(intent_turn["provider"], "claude");
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.assignee.as_deref(), Some("Dormant"));
+        drop(conn);
+
+        assert_provider_started_once(&root.join("alternate-started")).await;
+        slot.kill_and_reap().await;
+    }
+
+    /// Re-executed with only the fake `claude` first on PATH, like the reviewer
+    /// tick: the mixed-runner pool resolves its alternate from PATH, which a
+    /// threaded test binary must not mutate.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "subprocess body of dormant_worker_usage_limit_tick_installs_claude_alternate"]
+    fn dormant_worker_usage_limit_tick_child() {
+        let Some(root) = std::env::var_os(DORMANT_WORKER_FAILURE_TICK_ROOT) else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        std::thread::Builder::new()
+            .name("dormant-worker-failure-tick".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(dormant_worker_usage_limit_tick_body(&root));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dormant_worker_usage_limit_tick_installs_claude_alternate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(
+            &claude,
+            format!(
+                "#!/bin/sh\nprintf started >> '{}'\nexec sleep 30\n",
+                root.path().join("alternate-started").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths(
+            std::iter::once(bin.clone())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "serve::tests::dormant_worker_usage_limit_tick_child",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(DORMANT_WORKER_FAILURE_TICK_ROOT, root.path())
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child tick failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// A refused bind must not leave a worker running under a run it cannot
+    /// retire: the run insert rolls back, the launched provider is reaped, and
+    /// the replacement capability is revoked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dormant_worker_capability_bind_failure_rolls_back_run_and_reaps_provider() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let survived = root.path().join("provider-survived");
+        let provider = root.path().join("slow-codex");
+        std::fs::write(
+            &provider,
+            format!(
+                "#!/bin/sh\nsleep 0.2\nprintf survived > '{}'\nexec sleep 30\n",
+                survived.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = dormant_worker_fallback_config(
+            root.path().join("dormant-bind-failure.db"),
+            root.path(),
+            &provider,
+        );
+        let (mut slot, completed_run, completed_capability) = dormant_codex_rework_fixture(
+            &config.db_path,
+            &worktree,
+            Some("thread-exact"),
+            "thread-exact",
+        );
+        let task_id = slot.task_id;
+        assign_dormant_worker_run(&config, task_id, completed_run, &completed_capability);
+        assert!(install_live_worker_remediation_lease(
+            &config,
+            slot.agent_name.clone(),
+            task_id,
+            443,
+            "exact reviewer finding",
+        )
+        .await
+        .unwrap());
+        quorum_core::db::open(&config.db_path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER refuse_dormant_capability_bind
+                 BEFORE UPDATE OF agent_run_id ON run_capabilities
+                 BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+
+        let error = feed_worker_turn(&mut slot, "exact reworked turn", &config)
+            .await
+            .expect_err("an unbound dormant run must not be installed");
+        assert!(
+            error
+                .to_string()
+                .contains("worker capability could not bind its immutable run"),
+            "{error}"
+        );
+        assert!(matches!(slot.proc, SlotProcess::Dormant { .. }));
+        assert_eq!(slot.agent_run_id, Some(completed_run));
+        assert_eq!(
+            slot.cap_run_id.as_deref(),
+            Some(completed_capability.as_str())
+        );
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        assert_eq!(
+            quorum_core::agent_runs::runs_for_task(&conn, task_id)
+                .unwrap()
+                .len(),
+            1,
+            "a failed bind must roll back the run insert"
+        );
+        let active_capabilities: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM run_capabilities WHERE task_id=?1 AND revoked_at IS NULL",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            active_capabilities, 0,
+            "the replacement capability must be revoked"
+        );
+        drop(conn);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !survived.exists(),
+            "the launched provider must be killed and reaped"
+        );
     }
 
     #[tokio::test]
