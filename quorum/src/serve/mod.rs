@@ -16046,7 +16046,7 @@ async fn tick(
     order_reviewer_teardowns(&mut reviewer_fallback_teardowns);
     for (i, end_reason) in reviewer_fallback_teardowns.into_iter().rev() {
         let dead = reviewers.remove(i);
-        strike_reviewer_unclassified_teardown(
+        let close_reason = strike_reviewer_unclassified_teardown(
             config,
             unrecordable,
             reviewer_respawn_backoff,
@@ -16054,7 +16054,7 @@ async fn tick(
             &dead,
         )
         .await;
-        teardown_reviewer(config, wt_mgr, name_pool, dead, end_reason).await;
+        teardown_reviewer(config, wt_mgr, name_pool, dead, close_reason).await;
     }
 
     // ── Phase 3-idle: Kill idle reviewers (same logic as workers) ──────
@@ -22182,21 +22182,33 @@ async fn record_reviewer_strike(
     Ok(strikes)
 }
 
+/// `agent_runs.end_reason` when an unclassified reviewer close could not record
+/// its per-head strike. Distinct from `turn-error-unclassified`, so the run
+/// still counts toward `MAX_TOTAL_REVIEWER_RUNS` after restart.
+const REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON: &str =
+    "turn-error-unclassified-strike-unrecorded";
+
 /// Burn one per-head strike for an unclassified terminal reviewer turn before
 /// teardown closes the exact agent run. First-turn failures can precede the
 /// slot's in-memory PR/head fields, so recover either missing value from the
-/// immutable launch evidence persisted on that run. A short close with that
-/// PR and head stays out of `MAX_TOTAL_REVIEWER_RUNS`; this strike is the
-/// durable bound that still applies across restarts.
+/// immutable launch evidence persisted on that run.
+///
+/// Returns the end reason teardown must persist. A successful strike keeps
+/// `turn-error-unclassified`, whose short closes stay out of
+/// `MAX_TOTAL_REVIEWER_RUNS` because this strike is the durable bound across
+/// restarts. A failed strike write returns
+/// [`REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON`] so that close still
+/// counts toward the lifetime cap; the in-memory backstop does not survive a
+/// restart.
 async fn strike_reviewer_unclassified_teardown(
     config: &ServeConfig,
     unrecordable: &mut UnrecordableStrikes,
     respawn_backoff: &mut ReviewerRespawnBackoff,
-    end_reason: &str,
+    end_reason: &'static str,
     dead: &SlotState,
-) {
+) -> &'static str {
     if end_reason != "turn-error-unclassified" {
-        return;
+        return end_reason;
     }
 
     let role = if dead.r2_origin { "r2" } else { "r1" };
@@ -22208,7 +22220,7 @@ async fn strike_reviewer_unclassified_teardown(
                 "reviewer {} ended turn-error-unclassified for task #{} without slot PR/head or an agent run id; cannot record a durable strike",
                 dead.agent_name, dead.task_id,
             ));
-            return;
+            return end_reason;
         };
         let p = config.db_path.clone();
         let task_id = dead.task_id;
@@ -22237,21 +22249,21 @@ async fn strike_reviewer_unclassified_teardown(
                     "reviewer {} ended turn-error-unclassified for task #{} but exact agent run #{run_id} has no durable reviewer launch; cannot record a strike",
                     dead.agent_name, dead.task_id,
                 ));
-                return;
+                return end_reason;
             }
             Ok(Err(error)) => {
                 log(&format!(
-                    "reviewer {} ended turn-error-unclassified for task #{} but durable launch lookup for agent run #{run_id} failed: {error}; cannot record a strike",
+                    "reviewer {} ended turn-error-unclassified for task #{} but durable launch lookup for agent run #{run_id} failed: {error}; closing as {REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON} so the lifetime cap still counts this run",
                     dead.agent_name, dead.task_id,
                 ));
-                return;
+                return REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON;
             }
             Err(error) => {
                 log(&format!(
-                    "reviewer {} ended turn-error-unclassified for task #{} but durable launch lookup for agent run #{run_id} could not join: {error}; cannot record a strike",
+                    "reviewer {} ended turn-error-unclassified for task #{} but durable launch lookup for agent run #{run_id} could not join: {error}; closing as {REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON} so the lifetime cap still counts this run",
                     dead.agent_name, dead.task_id,
                 ));
-                return;
+                return REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON;
             }
         }
     }
@@ -22261,7 +22273,7 @@ async fn strike_reviewer_unclassified_teardown(
             "reviewer {} ended turn-error-unclassified for task #{} but neither slot nor durable agent run supplied a complete PR/head; cannot record a strike",
             dead.agent_name, dead.task_id,
         ));
-        return;
+        return end_reason;
     };
     let provider_error = dead
         .last_error_text
@@ -22269,7 +22281,9 @@ async fn strike_reviewer_unclassified_teardown(
         .unwrap_or("reviewer turn ended with an unclassified error");
     // An unrecordable strike is already loud and counted by the common
     // in-memory backstop; still pause so this failure cannot respawn per tick.
-    let strikes = record_reviewer_provider_failure_strike(
+    // The backstop resets on restart, so a failed write must not close under
+    // the exempt `turn-error-unclassified` reason.
+    match record_reviewer_provider_failure_strike(
         config,
         unrecordable,
         dead.task_id,
@@ -22279,15 +22293,30 @@ async fn strike_reviewer_unclassified_teardown(
         provider_error,
     )
     .await
-    .unwrap_or(1);
-    let delay = respawn_backoff.record(dead.task_id, pr, strikes, std::time::Instant::now());
-    log(&format!(
-        "reviewer {} ended turn-error-unclassified for task #{} PR #{pr} head {head_sha}: recorded a {role_label} provider-failure strike and deferring the next provision by {:.1}s",
-        dead.agent_name,
-        dead.task_id,
-        delay.as_secs_f64(),
-        role_label = role.to_uppercase(),
-    ));
+    {
+        Ok(strikes) => {
+            let delay =
+                respawn_backoff.record(dead.task_id, pr, strikes, std::time::Instant::now());
+            log(&format!(
+                "reviewer {} ended turn-error-unclassified for task #{} PR #{pr} head {head_sha}: recorded a {role_label} provider-failure strike and deferring the next provision by {:.1}s",
+                dead.agent_name,
+                dead.task_id,
+                delay.as_secs_f64(),
+                role_label = role.to_uppercase(),
+            ));
+            end_reason
+        }
+        Err(error) => {
+            let delay = respawn_backoff.record(dead.task_id, pr, 1, std::time::Instant::now());
+            log(&format!(
+                "reviewer {} ended turn-error-unclassified for task #{} PR #{pr} head {head_sha}: durable provider-failure strike was not recorded ({error}); closing as {REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON} so the lifetime cap still counts this run, deferring the next provision by {:.1}s",
+                dead.agent_name,
+                dead.task_id,
+                delay.as_secs_f64(),
+            ));
+            REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON
+        }
+    }
 }
 
 /// A reviewer process that exited while it still owned the review and had
@@ -45995,6 +46024,150 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             decide_provision(&conn, task_id, 77, &head_sha).unwrap(),
             ProvisionDecision::Exhausted,
             "durable strikes alone bound respawns after a daemon restart",
+        );
+    }
+
+    /// A failed strike write must not exempt the following close. After restart
+    /// the in-memory backstop is gone, attempts stay at zero, and the lifetime
+    /// cap is what bounds the next provision.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrecorded_unclassified_strike_stays_on_the_lifetime_cap_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("unrecorded-strike.db");
+        let (config, task_id, run_id, agent) = seed_reviewer_fallback_failure_fixture(&db_path);
+        let head_sha = "a".repeat(40);
+        let spawned = now_unix();
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE agent_runs SET spawned_at=?1 WHERE id=?2",
+                rusqlite::params![spawned, run_id],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "CREATE TRIGGER block_reviewer_provision_strikes
+                 BEFORE INSERT ON reviewer_provision_attempts
+                 BEGIN
+                   SELECT RAISE(ABORT, 'strike write blocked');
+                 END;",
+            )
+            .unwrap();
+        }
+        let mut dead = failed_reviewer_fallback_test_slot(task_id, run_id, agent);
+        dead.pr = None;
+        dead.reviewed_head_sha = None;
+        dead.last_error_text = Some("provider first turn exploded".into());
+        let mut unrecordable = UnrecordableStrikes::new();
+        let mut backoff = ReviewerRespawnBackoff::new();
+
+        let close_reason = strike_reviewer_unclassified_teardown(
+            &config,
+            &mut unrecordable,
+            &mut backoff,
+            "turn-error-unclassified",
+            &dead,
+        )
+        .await;
+        assert_eq!(
+            close_reason,
+            REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON
+        );
+        close_agent_run(&db_path, Some(run_id), close_reason).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            quorum_core::provision_attempts::get_attempts(&conn, task_id, 77, "r1", &head_sha)
+                .unwrap(),
+            0,
+            "the blocked strike write must not become a durable attempt",
+        );
+        let closed: (i64, i64, String, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT spawned_at, ended_at, end_reason, review_pr, review_head_sha
+                 FROM agent_runs WHERE id=?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(closed.1 - closed.0 <= quorum_core::provision_attempts::REVIEWER_NO_WORK_MAX_SECS);
+        assert_eq!(closed.2, REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON);
+        assert_eq!(closed.3, Some(77));
+        assert_eq!(closed.4.as_deref(), Some(head_sha.as_str()));
+        assert_eq!(
+            quorum_core::provision_attempts::total_reviewer_runs(&conn, task_id).unwrap(),
+            1,
+            "the short close still counts because its reason is not exempt",
+        );
+
+        let mut restarted_backoff = ReviewerRespawnBackoff::new();
+        assert!(
+            !restarted_backoff.blocks(task_id, 77, std::time::Instant::now()),
+            "restart drops the in-memory pause",
+        );
+        assert_eq!(
+            decide_provision(&conn, task_id, 77, &head_sha).unwrap(),
+            ProvisionDecision::Needed("r1"),
+            "one counted close does not exhaust the lifetime cap",
+        );
+
+        for n in 0..11 {
+            conn.execute(
+                "INSERT INTO agent_runs
+                    (task_id, agent_name, role, model, effort, spawned_at, ended_at, end_reason,
+                     review_pr, review_head_sha)
+                 VALUES (?1, ?2, 'reviewer', 'm', 'e', ?3, ?3, 'turn-error-unclassified', 77, ?4)",
+                rusqlite::params![task_id, format!("exempt-{n}"), spawned, head_sha],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            quorum_core::provision_attempts::total_reviewer_runs(&conn, task_id).unwrap(),
+            1,
+            "short unclassified closes with a recorded strike shape stay exempt",
+        );
+        assert_eq!(
+            decide_provision(&conn, task_id, 77, &head_sha).unwrap(),
+            ProvisionDecision::Needed("r1"),
+        );
+
+        for n in 0..(MAX_TOTAL_REVIEWER_RUNS - 1) {
+            conn.execute(
+                "INSERT INTO agent_runs
+                    (task_id, agent_name, role, model, effort, spawned_at, ended_at, end_reason,
+                     review_pr, review_head_sha)
+                 VALUES (?1, ?2, 'reviewer', 'm', 'e', ?3, ?3, ?4, 77, ?5)",
+                rusqlite::params![
+                    task_id,
+                    format!("unstriked-{n}"),
+                    spawned,
+                    REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON,
+                    head_sha,
+                ],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            quorum_core::provision_attempts::get_attempts(&conn, task_id, 77, "r1", &head_sha)
+                .unwrap(),
+            0,
+        );
+        assert_eq!(
+            quorum_core::provision_attempts::total_reviewer_runs(&conn, task_id).unwrap(),
+            MAX_TOTAL_REVIEWER_RUNS,
+        );
+        assert_eq!(
+            decide_provision(&conn, task_id, 77, &head_sha).unwrap(),
+            ProvisionDecision::Exhausted,
+            "repeated strike-failed closes still exhaust the lifetime cap after restart",
         );
     }
 
