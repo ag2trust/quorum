@@ -1003,7 +1003,7 @@ pub fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<b
 pub fn count_started_non_terminal_excluding(conn: &Connection, exclude_id: i64) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT count(*) FROM tasks
-         WHERE status IN ('working','in-review','rework')
+         WHERE status IN ('working','in-review','rework','merging')
            AND id != ?1",
         params![exclude_id],
         |r| r.get(0),
@@ -17427,18 +17427,26 @@ mod tests {
             )
             .unwrap();
         }
+        c.execute(
+            "UPDATE tasks SET refs=json_set(
+                 COALESCE(refs, '{}'), '$.daemon_merge_retry', 'requested'
+             ) WHERE id=?1",
+            params![merging],
+        )
+        .unwrap();
 
-        // working+in-review+rework block; source, open, merging, and terminals do not.
-        assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 3);
+        // Every started non-terminal phase blocks, including an orphan marked
+        // merge handoff; source, open, and terminals do not.
+        assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 4);
 
         // Excluding an actual started task drops its count.
         assert_eq!(
             count_started_non_terminal_excluding(&c, in_review).unwrap(),
-            2
+            3
         );
 
         // Move the last blocker to done → predicate releases (returns 0).
-        for id in [working, rework] {
+        for id in [working, rework, merging] {
             c.execute("UPDATE tasks SET status='done' WHERE id=?1", params![id])
                 .unwrap();
         }
