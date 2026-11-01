@@ -1322,7 +1322,9 @@ pub fn reacquire_freeze(conn: &mut Connection, graph_id: i64, now: i64) -> Resul
 ///
 /// Only [`crate::runner_state::provider_block`] classifies a task as blocked:
 /// a parked task, one blocked for any other reason, or one whose refs do not
-/// parse is absent here and so keeps holding the drain.
+/// parse is absent here and so keeps holding the drain. So is a `merging` task:
+/// it is started work that needs no provider turn to finish, so its PR must
+/// land or fall back before the freeze can move.
 pub fn provider_blocked_started_task_ids(
     conn: &Connection,
     source_task_id: i64,
@@ -11176,6 +11178,38 @@ mod tests {
                 .unwrap();
         }
 
+        assert!(release_freeze_for_provider_block(&mut conn, graph, &[], 50).unwrap());
+    }
+
+    /// An approved handoff stays in `merging` until Phase 4e consumes it, so it
+    /// holds the release exactly as it holds the frozen-base bind, even when
+    /// its refs still carry a provider block from an earlier turn.
+    #[test]
+    fn provider_block_release_refuses_while_a_merge_handoff_holds_the_drain() {
+        let (_dir, mut conn) = file_setup();
+        let graph = frozen_graph(&mut conn, "draining");
+        insert_task(&conn, "rework", Some(BLOCKED_REFS));
+
+        let merging = insert_task(
+            &conn,
+            "merging",
+            Some(r#"{"pr":7,"daemon_merge_retry":"requested"}"#),
+        );
+        assert_release_refused(&mut conn, graph, &[]);
+
+        let blocked_refs: serde_json::Value = serde_json::from_str(BLOCKED_REFS).unwrap();
+        conn.execute(
+            "UPDATE tasks SET refs=?2 WHERE id=?1",
+            params![merging, blocked_refs.to_string()],
+        )
+        .unwrap();
+        assert!(!provider_blocked_started_task_ids(&conn, 1)
+            .unwrap()
+            .contains(&merging));
+        assert_release_refused(&mut conn, graph, &[]);
+
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [merging])
+            .unwrap();
         assert!(release_freeze_for_provider_block(&mut conn, graph, &[], 50).unwrap());
     }
 
