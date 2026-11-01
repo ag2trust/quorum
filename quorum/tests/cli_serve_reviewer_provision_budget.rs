@@ -248,6 +248,13 @@ fi
             self.lines.push(line);
         }
     }
+
+    fn extract_agent_name(&self, prefix: &str) -> Option<String> {
+        self.lines.iter().find_map(|line| {
+            let rest = line.split(prefix).nth(1)?;
+            Some(rest.split_whitespace().next().unwrap_or("").to_string())
+        })
+    }
 }
 
 fn db_path(home: &std::path::Path) -> std::path::PathBuf {
@@ -331,6 +338,68 @@ fn record_closed_run(home: &std::path::Path, task_id: i64, agent: &str, role: &s
     )
     .unwrap();
     quorum_core::agent_runs::close(&conn, run_id, 101, "test teardown").unwrap();
+}
+
+fn task_retry(home: &std::path::Path, task_id: i64, by: &str) -> std::process::Output {
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
+        .args(["task-retry", "--task-id", &task_id.to_string(), "--by", by])
+        .output()
+        .unwrap()
+}
+
+fn provision_attempts_total(home: &std::path::Path, task_id: i64) -> i64 {
+    quorum_core::db::open(&db_path(home))
+        .unwrap()
+        .query_row(
+            "SELECT COALESCE(SUM(attempts), 0) FROM reviewer_provision_attempts WHERE task_id=?1",
+            rusqlite::params![task_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// Submit a reviewer verdict through the live daemon endpoint, the same path a
+/// managed reviewer uses.
+fn submit_approval(home: &std::path::Path, agent: &str, pr: i64) {
+    let db = db_path(home);
+    let run_id =
+        quorum_core::capabilities::active_for_agent(&quorum_core::db::open(&db).unwrap(), agent)
+            .unwrap()
+            .expect("live reviewer capability")
+            .run_id;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&db, &mut hasher);
+    let endpoint = std::env::temp_dir()
+        .join(format!(
+            "quorum-agent-{:016x}",
+            std::hash::Hasher::finish(&hasher)
+        ))
+        .join("endpoint.sock");
+    let out = Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home)
+        .env("QUORUM_REPO", "test/repo")
+        .env("QUORUM_AGENT_ENDPOINT", endpoint)
+        .env("QUORUM_RUN_ID", run_id)
+        .args([
+            "done",
+            "--agent",
+            agent,
+            "--pr",
+            &pr.to_string(),
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "verdict failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// A generated child whose graph is no longer the current active plan can never
@@ -894,6 +963,10 @@ exit 0
 /// A terminal provider error is durable strike evidence, so the exhausted park
 /// reason remains actionable even though the daemon only decides to park on a
 /// later tick after the failed reviewer has been reaped.
+///
+/// Each owner retry then grants exactly one bounded budget: a provider that is
+/// still failing parks again at the same bound, and a healthy one completes the
+/// review on the restored task.
 #[test]
 fn provider_failure_budget_park_names_durable_error_and_is_retryable() {
     let home = tempfile::tempdir().unwrap();
@@ -908,11 +981,12 @@ fn provider_failure_budget_park_names_durable_error_and_is_retryable() {
         .status()
         .unwrap();
 
-    let author = "Worker";
+    // The gh shim resolves this author's branch, which a healthy review needs.
+    let author = "OrigWorker";
     let task_id = seed_in_review_task(home.path(), author, 42);
     create_author_branch(repo_dir.path(), author, task_id);
     record_closed_run(home.path(), task_id, author, "worker");
-    let names = write_named_pool(home.path(), &["Reviewer".into()]);
+    let names = write_named_pool(home.path(), &["Reviewer".into(), "SecondReviewer".into()]);
 
     let provider_error = "simulated reviewer provider outage";
     let failing_reviewer = home.path().join("failing-reviewer.sh");
@@ -973,27 +1047,206 @@ fn provider_failure_budget_park_names_durable_error_and_is_retryable() {
     );
     drop(conn);
     drop(handle);
+    assert_eq!(provision_attempts_total(home.path(), task_id), 3);
 
-    let retry = Command::new(cargo_bin("quorum"))
-        .env("QUORUM_HOME", home.path())
-        .env("QUORUM_REPO", "test/repo")
-        .args([
-            "task-retry",
-            "--task-id",
-            &task_id.to_string(),
-            "--by",
-            author,
-        ])
-        .status()
-        .unwrap();
+    let retry = task_retry(home.path(), task_id, "Owner");
     assert!(
-        retry.success(),
-        "parked provider failure task was not retryable"
+        retry.status.success(),
+        "parked provider failure task was not retryable: {retry:?}"
     );
     assert_eq!(
         get_task(home.path(), task_id).status,
         "in-review",
         "task-retry did not restore the parked review state"
+    );
+    assert_eq!(
+        provision_attempts_total(home.path(), task_id),
+        0,
+        "task-retry must clear provider-failure strikes with the restore"
+    );
+
+    // Still failing: the retry bought one more bounded budget, not a loop.
+    // SIGKILL leaves the daemon lock Held, so each restart clears the row.
+    common::clear_daemon_lock(&db_path(home.path()));
+    let mut still_failing = ServeHandle::start_with_agent_bin_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+        &failing_reviewer,
+        &[("QUORUM_TEST_REVIEWER_RESPAWN_BACKOFF_MS", "250")],
+    );
+    assert!(
+        still_failing.wait_for("orphan in-review task #1 PR #42: provision exhausted", 90),
+        "a still-failing provider did not park again: {:?}",
+        still_failing.lines
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    still_failing.drain_pending_lines();
+    let respawns = still_failing
+        .lines
+        .iter()
+        .filter(|line| line.contains("spawning reviewer"))
+        .count();
+    assert_eq!(
+        respawns, 3,
+        "each owner retry grants exactly one strike budget: {:?}",
+        still_failing.lines
+    );
+    assert_eq!(get_task(home.path(), task_id).status, "failed");
+    assert_eq!(provision_attempts_total(home.path(), task_id), 3);
+    drop(still_failing);
+
+    // Provider healthy again: the restored task completes its review.
+    assert!(task_retry(home.path(), task_id, "Owner").status.success());
+    common::clear_daemon_lock(&db_path(home.path()));
+    let mut healthy = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+    );
+    assert!(
+        healthy.wait_for("spawning reviewer", 30),
+        "no reviewer provisioned after retry: {:?}",
+        healthy.lines
+    );
+    let r1 = healthy.extract_agent_name("spawning reviewer ").unwrap();
+    assert!(
+        healthy.wait_for("result", 15),
+        "R1 produced no result: {:?}",
+        healthy.lines
+    );
+    submit_approval(home.path(), &r1, 42);
+    assert!(
+        healthy.wait_for("R2: pre-merge reviewer", 30),
+        "R2 was not provisioned after R1 approval: {:?}",
+        healthy.lines
+    );
+    let r2 = healthy
+        .extract_agent_name("R2: pre-merge reviewer ")
+        .unwrap();
+    assert!(
+        healthy.wait_for("result", 15),
+        "R2 produced no result: {:?}",
+        healthy.lines
+    );
+    submit_approval(home.path(), &r2, 42);
+    assert!(
+        healthy.wait_for("PR #42 merged — firing MergeSucceeded", 30),
+        "reviewed task did not merge: {:?}",
+        healthy.lines
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while get_task(home.path(), task_id).status != "done" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "merge success did not complete the task: {:?}",
+            healthy.lines
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `task-retry` on a truly cap-exhausted task is a loud clean negative. Before
+/// this refusal it reported success, and the next provision pass decided
+/// `Exhausted` and parked the task again. The park, its refs, and the audit log
+/// stay untouched, and an active decomposition freeze keeps its own exit code.
+#[test]
+fn task_retry_refuses_cap_exhausted_task_with_reason() {
+    let home = tempfile::tempdir().unwrap();
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let task_id = seed_in_review_task(home.path(), "OrigWorker", 42);
+    let cap = quorum_core::provision_attempts::MAX_TOTAL_REVIEWER_RUNS;
+    for n in 0..cap {
+        record_closed_run(home.path(), task_id, &format!("Spent{n}"), "reviewer");
+    }
+    {
+        let mut conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+        quorum_core::tasks::park(
+            &mut conn,
+            task_id,
+            "reviewer provision exhausted for orphan PR #42",
+            "in-review",
+            5000,
+        )
+        .unwrap()
+        .expect("task parked");
+    }
+    let parked_refs = get_task(home.path(), task_id).refs;
+
+    let refused = task_retry(home.path(), task_id, "Owner");
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "cap refusal must be a clean negative: {refused:?}"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(payload["ok"], serde_json::json!(false));
+    assert_eq!(payload["outcome"], "task-retry-rejected");
+    let reason = payload["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.starts_with(&format!("reviewer run cap exhausted ({cap}/{cap})")),
+        "payload must name the cap: {payload}"
+    );
+
+    let task = get_task(home.path(), task_id);
+    assert_eq!(task.status, "failed", "task must stay parked");
+    assert_eq!(
+        task.refs, parked_refs,
+        "a refused retry must not touch refs"
+    );
+    let mut conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    let audit_count = |conn: &quorum_core::Connection, sql: &str| -> i64 {
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    };
+    assert_eq!(
+        audit_count(&conn, "SELECT COUNT(*) FROM events WHERE kind='task_retry'"),
+        0,
+        "a refused retry must not emit task_retry"
+    );
+    assert_eq!(
+        audit_count(&conn, "SELECT COUNT(*) FROM errors"),
+        0,
+        "an expected refusal must not log an error"
+    );
+
+    let source = quorum_core::tasks::create(
+        &mut conn,
+        "test",
+        "graph source",
+        None,
+        0,
+        None,
+        None,
+        None,
+        None,
+        5000,
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+             planned_source_revision,created_at,updated_at)
+         VALUES (?1,'draining',0,1,1,1000,1000)",
+        [source],
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(
+        task_retry(home.path(), task_id, "Owner").status.code(),
+        Some(2),
+        "a decomposition freeze must keep its usage refusal at the cap"
     );
 }
 

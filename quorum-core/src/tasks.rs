@@ -6240,19 +6240,58 @@ pub fn cancelled_dep_ids(conn: &Connection, id: i64) -> Result<Vec<i64>> {
     Ok(ids)
 }
 
+/// Why the lifetime reviewer-run cap forbids resuming parked task `id`, or
+/// `None` when the cap is not what decides this retry.
+///
+/// Both reviewer-cap park sites resume to `in-review`, where the next provision
+/// pass would re-park a task at the cap, so restoring one reports success for
+/// nothing. Parks that [`retry_parked`] settles before this gate (a merged
+/// publication, a classifier policy park, or any park under a decomposition
+/// freeze) return `None` so their outcomes stay unchanged. Side-effect free:
+/// the CLI uses it to name the reason and `retry_parked` to enforce it.
+pub fn reviewer_cap_retry_refusal(conn: &Connection, id: i64) -> Result<Option<String>> {
+    let cap_decides: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM tasks
+             WHERE id=?1 AND status='failed' AND json_valid(refs)
+               AND json_extract(refs, '$.daemon_parked')=1
+               AND json_extract(refs, '$.daemon_resume_status')='in-review'
+               AND COALESCE(json_extract(refs, '$.classifier_policy_parked'), 0)<>1
+               AND COALESCE(json_extract(refs, '$.daemon_publication_failure_kind'), '')<>?2
+         ) AND NOT EXISTS(SELECT 1 FROM task_decompositions WHERE freeze_active=1)",
+        params![id, PUBLICATION_FAILURE_KIND_PR_MERGED],
+        |row| row.get(0),
+    )?;
+    if !cap_decides {
+        return Ok(None);
+    }
+    let total = crate::provision_attempts::total_reviewer_runs(conn, id)?;
+    let cap = crate::provision_attempts::MAX_TOTAL_REVIEWER_RUNS;
+    Ok((total >= cap).then(|| {
+        format!(
+            "reviewer run cap exhausted ({total}/{cap}); task-retry does not renew this cap — \
+             inspect the review history and close or rescope the task"
+        )
+    }))
+}
+
 /// Explicitly resume the same task after an automatic park. PR, branch,
 /// dependency, approval, author, and rework context remain untouched.
 ///
 /// `reset_recovery_budget`: true for an explicit owner `task-retry` (fresh
-/// budget); false for daemon-initiated auto-retries, whose respawns must
-/// stay bounded by the recovery budget spent at park time.
+/// budget, including one more reviewer strike budget for each provider failure
+/// recorded against this task); false for daemon-initiated auto-retries, whose
+/// respawns must stay bounded by the budget spent at park time. Neither resets
+/// the lifetime reviewer-run count.
 ///
 /// Refuses to restore when `depends_on` contains a cancelled task — that
 /// dependency is terminal-terminal, so the sweep would just re-park the
 /// dependent on the next tick while the operator sees a "restored" outcome
 /// and no signal that disposition (dep edit or close) is required. Callers
 /// see `Ok(None)`; [`cancelled_dep_ids`] surfaces the specific ids so the
-/// CLI can name them in the exit-1 payload.
+/// CLI can name them in the exit-1 payload. A task the lifetime reviewer-run
+/// cap would immediately re-park is refused the same way, with
+/// [`reviewer_cap_retry_refusal`] supplying the reason.
 pub fn retry_parked(
     conn: &mut Connection,
     id: i64,
@@ -6392,6 +6431,12 @@ pub fn retry_parked(
         task.ready = compute_ready(&tx, &task.depends_on)?;
         tx.commit()?;
         return Ok(Some(task));
+    }
+    // Checked under the write lock: the cap is not an owner-renewable budget,
+    // so a restore here would only be re-parked by the next provision pass.
+    if reviewer_cap_retry_refusal(&tx, id)?.is_some() {
+        tx.commit()?;
+        return Ok(None);
     }
     if !matches!(
         resume_status.as_str(),
@@ -6571,6 +6616,16 @@ pub fn retry_parked(
     if updated == 0 {
         tx.commit()?;
         return Ok(None);
+    }
+    // Provider-failure strikes say nothing about this PR head, so an owner
+    // retry grants them one fresh bounded budget. Strikes without a provider
+    // error keep their row, and the daemon's own retries never extend the bound.
+    if reset_recovery_budget {
+        tx.execute(
+            "DELETE FROM reviewer_provision_attempts
+             WHERE task_id=?1 AND last_provider_error IS NOT NULL",
+            params![id],
+        )?;
     }
     if reset_publication {
         tx.execute("DELETE FROM task_branches WHERE task_id=?1", params![id])?;
@@ -17511,6 +17566,265 @@ mod tests {
             })
             .unwrap();
         assert_eq!(status, "failed");
+    }
+
+    fn park_for_retry(c: &mut Connection, resume_status: &str) -> i64 {
+        let id = create(c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed',refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_reason', 'test park',
+                 'daemon_resume_status', ?2
+             ) WHERE id=?1",
+            params![id, resume_status],
+        )
+        .unwrap();
+        id
+    }
+
+    fn add_reviewer_runs(c: &Connection, task_id: i64, count: i64) {
+        for n in 0..count {
+            crate::agent_runs::insert(
+                c,
+                task_id,
+                &format!("rev-{task_id}-{n}"),
+                "reviewer",
+                "model",
+                "high",
+                "claude",
+                100 + n,
+            )
+            .unwrap();
+        }
+    }
+
+    fn task_retry_events(c: &Connection, id: i64) -> i64 {
+        c.query_row(
+            "SELECT COUNT(*) FROM events WHERE kind='task_retry' AND subject=?1",
+            params![lease_target(id)],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn strike_rows(c: &Connection, task_id: i64) -> Vec<String> {
+        let mut stmt = c
+            .prepare(
+                "SELECT role FROM reviewer_provision_attempts
+                 WHERE task_id=?1 ORDER BY role",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(params![task_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        rows
+    }
+
+    /// The lifetime cap is not owner-renewable: a restore would be re-parked by
+    /// the next provision pass, so retry refuses inside the transaction and
+    /// leaves the park, its strikes, and the audit log exactly as they were.
+    #[test]
+    fn retry_parked_refuses_a_reviewer_cap_exhausted_review_park() {
+        use crate::provision_attempts::{self, MAX_TOTAL_REVIEWER_RUNS};
+        let (_d, mut c) = open_tmp();
+        let id = park_for_retry(&mut c, "in-review");
+        provision_attempts::record_provider_failure(&mut c, id, 42, "r1", "sha", "boom").unwrap();
+        add_reviewer_runs(&c, id, MAX_TOTAL_REVIEWER_RUNS - 1);
+
+        assert_eq!(reviewer_cap_retry_refusal(&c, id).unwrap(), None);
+        add_reviewer_runs(&c, id, 1);
+        let reason = reviewer_cap_retry_refusal(&c, id)
+            .unwrap()
+            .expect("the cap decides this park");
+        assert!(
+            reason.starts_with(&format!(
+                "reviewer run cap exhausted ({MAX_TOTAL_REVIEWER_RUNS}/{MAX_TOTAL_REVIEWER_RUNS})"
+            )),
+            "unexpected reason: {reason}"
+        );
+
+        for reset_recovery_budget in [true, false] {
+            let out = retry_parked(&mut c, id, "operator", reset_recovery_budget, 1001).unwrap();
+            assert!(out.is_none(), "cap-exhausted retry must be refused");
+        }
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        let refs: serde_json::Value =
+            serde_json::from_str(task.refs.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(refs["daemon_parked"], serde_json::json!(true));
+        assert_eq!(refs["daemon_resume_status"], "in-review");
+        assert!(
+            refs.get(POISON_RETRY_GENERATION_REF).is_none(),
+            "a refused retry must not advance the retry generation: {refs}"
+        );
+        assert_eq!(task_retry_events(&c, id), 0);
+        assert_eq!(strike_rows(&c, id), vec!["r1".to_string()]);
+    }
+
+    /// The refusal counts exactly what the daemon counts: instant provider
+    /// failures that did no review work leave a provider park retryable.
+    #[test]
+    fn retry_parked_cap_refusal_uses_the_lifetime_run_definition() {
+        use crate::provision_attempts::MAX_TOTAL_REVIEWER_RUNS;
+        let (_d, mut c) = open_tmp();
+        let id = park_for_retry(&mut c, "in-review");
+        add_reviewer_runs(&c, id, MAX_TOTAL_REVIEWER_RUNS);
+        c.execute(
+            "UPDATE agent_runs SET end_reason='turn-error-unclassified',
+                 ended_at=spawned_at+1, review_pr=42, review_head_sha='sha'
+             WHERE task_id=?1",
+            params![id],
+        )
+        .unwrap();
+        assert_eq!(reviewer_cap_retry_refusal(&c, id).unwrap(), None);
+        let restored = retry_parked(&mut c, id, "operator", true, 1001)
+            .unwrap()
+            .expect("no-work runs do not consume the cap");
+        assert_eq!(restored.status, "in-review");
+    }
+
+    /// Only the review stage the cap park sites resume is refused; a parked
+    /// worker at the cap still has real work to do before the next review.
+    #[test]
+    fn retry_parked_cap_refusal_ignores_other_resume_stages_and_unparked_tasks() {
+        use crate::provision_attempts::MAX_TOTAL_REVIEWER_RUNS;
+        let (_d, mut c) = open_tmp();
+        for (resume, restored) in [("open", "open"), ("working", "open"), ("rework", "rework")] {
+            let id = park_for_retry(&mut c, resume);
+            add_reviewer_runs(&c, id, MAX_TOTAL_REVIEWER_RUNS);
+            assert_eq!(reviewer_cap_retry_refusal(&c, id).unwrap(), None);
+            let task = retry_parked(&mut c, id, "operator", true, 1001)
+                .unwrap()
+                .expect("non-review park restores at the cap");
+            assert_eq!(task.status, restored);
+        }
+        let unparked = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        add_reviewer_runs(&c, unparked, MAX_TOTAL_REVIEWER_RUNS);
+        assert_eq!(reviewer_cap_retry_refusal(&c, unparked).unwrap(), None);
+    }
+
+    /// The existing refusals keep their own outcomes for a task that is also at
+    /// the cap: the predicate stays silent, so the CLI cannot mask them.
+    #[test]
+    fn retry_parked_earlier_refusals_win_over_the_reviewer_cap() {
+        use crate::provision_attempts::MAX_TOTAL_REVIEWER_RUNS;
+        let (_d, mut c) = open_tmp();
+
+        let merged = park_for_retry(&mut c, "in-review");
+        add_reviewer_runs(&c, merged, MAX_TOTAL_REVIEWER_RUNS);
+        c.execute(
+            "UPDATE tasks SET refs=json_set(refs,'$.daemon_publication_failure_kind',?2)
+             WHERE id=?1",
+            params![merged, PUBLICATION_FAILURE_KIND_PR_MERGED],
+        )
+        .unwrap();
+        assert_eq!(reviewer_cap_retry_refusal(&c, merged).unwrap(), None);
+        assert!(retry_parked(&mut c, merged, "operator", true, 1001)
+            .unwrap()
+            .is_none());
+
+        let policy = park_for_retry(&mut c, "in-review");
+        add_reviewer_runs(&c, policy, MAX_TOTAL_REVIEWER_RUNS);
+        c.execute(
+            "UPDATE tasks SET refs=json_set(refs,'$.classifier_policy_parked',json('true'))
+             WHERE id=?1",
+            params![policy],
+        )
+        .unwrap();
+        assert_eq!(reviewer_cap_retry_refusal(&c, policy).unwrap(), None);
+        let reclassified = retry_parked(&mut c, policy, "operator", true, 1001)
+            .unwrap()
+            .expect("a policy park is reclassified, not restored");
+        assert_eq!(reclassified.status, "failed");
+        assert_eq!(task_retry_events(&c, policy), 1);
+
+        let frozen = park_for_retry(&mut c, "in-review");
+        add_reviewer_runs(&c, frozen, MAX_TOTAL_REVIEWER_RUNS);
+        assert!(reviewer_cap_retry_refusal(&c, frozen).unwrap().is_some());
+        let source = create(&mut c, "boss", "src", None, 0, None, None, None, None, 1000).unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+             VALUES (?1,'draining',0,1,1,1000,1000)",
+            params![source],
+        )
+        .unwrap();
+        assert_eq!(reviewer_cap_retry_refusal(&c, frozen).unwrap(), None);
+        assert!(matches!(
+            retry_parked(&mut c, frozen, "operator", true, 1002),
+            Err(QuorumError::Usage(_))
+        ));
+    }
+
+    /// An owner retry deletes this task's provider-failure strikes in the
+    /// restoring transaction and nothing else: generic strikes and other tasks
+    /// keep their rows.
+    #[test]
+    fn retry_parked_owner_retry_clears_only_this_tasks_provider_strikes() {
+        use crate::provision_attempts::{self, MAX_REVIEWER_PROVISION_STRIKES};
+        let (_d, mut c) = open_tmp();
+        let id = park_for_retry(&mut c, "in-review");
+        let other = park_for_retry(&mut c, "in-review");
+        for _ in 0..MAX_REVIEWER_PROVISION_STRIKES {
+            provision_attempts::record_provider_failure(&mut c, id, 42, "r1", "sha", "boom")
+                .unwrap();
+        }
+        provision_attempts::record_attempt(&mut c, id, 42, "r2", "sha").unwrap();
+        provision_attempts::record_provider_failure(&mut c, other, 43, "r1", "sha", "boom")
+            .unwrap();
+
+        let restored = retry_parked(&mut c, id, "operator", true, 1001)
+            .unwrap()
+            .expect("provider park restores");
+        assert_eq!(restored.status, "in-review");
+        assert_eq!(task_retry_events(&c, id), 1);
+        assert_eq!(strike_rows(&c, id), vec!["r2".to_string()]);
+        assert_eq!(
+            provision_attempts::get_attempts(&c, id, 42, "r1", "sha").unwrap(),
+            0
+        );
+        assert_eq!(strike_rows(&c, other), vec!["r1".to_string()]);
+    }
+
+    /// A daemon-initiated retry must not be able to extend the strike bound.
+    #[test]
+    fn retry_parked_daemon_retry_keeps_provider_strikes() {
+        use crate::provision_attempts::{self, MAX_REVIEWER_PROVISION_STRIKES};
+        let (_d, mut c) = open_tmp();
+        let id = park_for_retry(&mut c, "in-review");
+        for _ in 0..MAX_REVIEWER_PROVISION_STRIKES {
+            provision_attempts::record_provider_failure(&mut c, id, 42, "r1", "sha", "boom")
+                .unwrap();
+        }
+        let restored = retry_parked(&mut c, id, "daemon", false, 1001)
+            .unwrap()
+            .expect("daemon retry restores");
+        assert_eq!(restored.status, "in-review");
+        assert_eq!(
+            provision_attempts::get_attempts(&c, id, 42, "r1", "sha").unwrap(),
+            i64::from(MAX_REVIEWER_PROVISION_STRIKES)
+        );
+    }
+
+    /// A policy park stays `failed`, so no strike budget is granted for it.
+    #[test]
+    fn retry_parked_policy_branch_keeps_provider_strikes() {
+        use crate::provision_attempts;
+        let (_d, mut c) = open_tmp();
+        let id = park_for_retry(&mut c, "in-review");
+        c.execute(
+            "UPDATE tasks SET refs=json_set(refs,'$.classifier_policy_parked',json('true'))
+             WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        provision_attempts::record_provider_failure(&mut c, id, 42, "r1", "sha", "boom").unwrap();
+        retry_parked(&mut c, id, "operator", true, 1001)
+            .unwrap()
+            .expect("policy retry reclassifies");
+        assert_eq!(strike_rows(&c, id), vec!["r1".to_string()]);
     }
 
     /// Task #473: a parked task whose depends_on contains a cancelled id

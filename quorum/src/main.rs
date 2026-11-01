@@ -1424,6 +1424,14 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 }));
                 return Ok(1);
             }
+            if let Some(reason) = quorum_core::tasks::reviewer_cap_retry_refusal(&conn, task_id)? {
+                output::emit(&serde_json::json!({
+                    "ok": false,
+                    "outcome": "task-retry-rejected",
+                    "reason": reason,
+                }));
+                return Ok(1);
+            }
             let retried =
                 match quorum_core::tasks::retry_parked(&mut conn, task_id, &by, true, now)? {
                     some @ Some(_) => some,
