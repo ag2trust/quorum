@@ -506,6 +506,9 @@ CREATE TABLE IF NOT EXISTS reviewer_provision_attempts (
     head_sha        TEXT NOT NULL DEFAULT '',
     attempts        INTEGER NOT NULL DEFAULT 0,
     last_attempt_at INTEGER NOT NULL DEFAULT 0,
+    -- v83: bounded provider error from the most recent strike; NULL when that
+    -- strike had none.
+    last_provider_error TEXT,
     PRIMARY KEY (task_id, pr_number, role)
 );
 

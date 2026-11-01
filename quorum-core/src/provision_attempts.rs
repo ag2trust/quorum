@@ -5,20 +5,66 @@
 //! per-instance, allowing unbounded retries after restarts.
 //!
 //! A new head SHA resets the budget (the prior failures were for a different diff).
+//!
+//! A strike may carry the provider error that caused it. The stored error always
+//! describes the most recent strike, so it survives a restart alongside the count.
 
 use crate::clock;
 use crate::db::begin_immediate;
 use crate::error::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 
+/// Byte bound on a stored provider error.
+pub const MAX_PROVIDER_ERROR_BYTES: usize = 512;
+
 /// Record a provision attempt. Returns the new cumulative count.
 /// If `head_sha` differs from the stored SHA, the counter resets to 1.
+/// Clears any stored provider error: this strike has none.
 pub fn record_attempt(
     conn: &mut Connection,
     task_id: i64,
     pr_number: i64,
     role: &str,
     head_sha: &str,
+) -> Result<i64> {
+    record_strike(conn, task_id, pr_number, role, head_sha, None)
+}
+
+/// Record a provision attempt caused by a provider failure, storing the bounded
+/// `error` in the same transaction as the strike. Counter semantics match
+/// [`record_attempt`]. Returns the new cumulative count.
+pub fn record_provider_failure(
+    conn: &mut Connection,
+    task_id: i64,
+    pr_number: i64,
+    role: &str,
+    head_sha: &str,
+    error: &str,
+) -> Result<i64> {
+    let error = bound_provider_error(error);
+    record_strike(conn, task_id, pr_number, role, head_sha, Some(&error))
+}
+
+/// Remove embedded NUL and cap at [`MAX_PROVIDER_ERROR_BYTES`], cutting only
+/// between characters.
+fn bound_provider_error(error: &str) -> String {
+    let mut bounded = String::with_capacity(error.len().min(MAX_PROVIDER_ERROR_BYTES));
+    for ch in error.chars().filter(|ch| *ch != '\0') {
+        if bounded.len() + ch.len_utf8() > MAX_PROVIDER_ERROR_BYTES {
+            break;
+        }
+        bounded.push(ch);
+    }
+    bounded
+}
+
+fn record_strike(
+    conn: &mut Connection,
+    task_id: i64,
+    pr_number: i64,
+    role: &str,
+    head_sha: &str,
+    provider_error: Option<&str>,
 ) -> Result<i64> {
     let now = clock::now();
     let tx = begin_immediate(conn)?;
@@ -39,13 +85,23 @@ pub fn record_attempt(
 
     tx.execute(
         "INSERT INTO reviewer_provision_attempts
-            (task_id, pr_number, role, head_sha, attempts, last_attempt_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            (task_id, pr_number, role, head_sha, attempts, last_attempt_at,
+             last_provider_error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(task_id, pr_number, role) DO UPDATE SET
              head_sha = excluded.head_sha,
              attempts = excluded.attempts,
-             last_attempt_at = excluded.last_attempt_at",
-        params![task_id, pr_number, role, head_sha, new_count, now],
+             last_attempt_at = excluded.last_attempt_at,
+             last_provider_error = excluded.last_provider_error",
+        params![
+            task_id,
+            pr_number,
+            role,
+            head_sha,
+            new_count,
+            now,
+            provider_error
+        ],
     )?;
     tx.commit()?;
     Ok(new_count)
@@ -72,6 +128,28 @@ pub fn get_attempts(
         Some((count, stored_sha)) if stored_sha == head_sha => Ok(count),
         _ => Ok(0),
     }
+}
+
+/// Stored provider error for a (task, PR) whose provision budget is exhausted at
+/// `head_sha`. `None` when no role has reached [`MAX_REVIEWER_PROVISION_STRIKES`]
+/// at that head, or its most recent strike carried no provider error. If several
+/// roles qualify, the most recently struck one wins.
+pub fn exhausted_provider_error(
+    conn: &Connection,
+    task_id: i64,
+    pr_number: i64,
+    head_sha: &str,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT last_provider_error FROM reviewer_provision_attempts \
+             WHERE task_id = ?1 AND pr_number = ?2 AND head_sha = ?3 \
+               AND attempts >= ?4 AND last_provider_error IS NOT NULL \
+             ORDER BY last_attempt_at DESC, role ASC LIMIT 1",
+            params![task_id, pr_number, head_sha, MAX_REVIEWER_PROVISION_STRIKES],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 /// Clear provision attempts for a specific (task, PR, role).
@@ -202,5 +280,171 @@ mod tests {
     fn missing_record_returns_zero() {
         let (_d, c) = open_tmp();
         assert_eq!(get_attempts(&c, 999, 888, "r1", "anything").unwrap(), 0);
+    }
+
+    /// Raw column read: unlike the helper, this sees errors below the strike cap.
+    fn stored_error(c: &Connection, task_id: i64, pr: i64, role: &str) -> Option<String> {
+        c.query_row(
+            "SELECT last_provider_error FROM reviewer_provision_attempts \
+             WHERE task_id = ?1 AND pr_number = ?2 AND role = ?3",
+            params![task_id, pr, role],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn provider_failure_shares_the_attempt_counter() {
+        let (_d, mut c) = open_tmp();
+        assert_eq!(record_attempt(&mut c, 10, 42, "r1", "sha1").unwrap(), 1);
+        assert_eq!(
+            record_provider_failure(&mut c, 10, 42, "r1", "sha1", "boom").unwrap(),
+            2
+        );
+        assert_eq!(get_attempts(&c, 10, 42, "r1", "sha1").unwrap(), 2);
+        assert_eq!(stored_error(&c, 10, 42, "r1").as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn new_head_resets_count_and_clears_prior_error() {
+        let (_d, mut c) = open_tmp();
+        record_provider_failure(&mut c, 10, 42, "r1", "sha1", "old").unwrap();
+        record_provider_failure(&mut c, 10, 42, "r1", "sha1", "old").unwrap();
+
+        assert_eq!(record_attempt(&mut c, 10, 42, "r1", "sha2").unwrap(), 1);
+        assert_eq!(stored_error(&c, 10, 42, "r1"), None);
+
+        record_provider_failure(&mut c, 10, 42, "r1", "sha2", "two").unwrap();
+        assert_eq!(
+            record_provider_failure(&mut c, 10, 42, "r1", "sha3", "three").unwrap(),
+            1
+        );
+        assert_eq!(stored_error(&c, 10, 42, "r1").as_deref(), Some("three"));
+    }
+
+    #[test]
+    fn plain_strike_clears_provider_error_at_the_same_head() {
+        let (_d, mut c) = open_tmp();
+        for _ in 0..MAX_REVIEWER_PROVISION_STRIKES {
+            record_provider_failure(&mut c, 10, 42, "r1", "sha1", "boom").unwrap();
+        }
+        assert_eq!(
+            exhausted_provider_error(&c, 10, 42, "sha1").unwrap(),
+            Some("boom".to_string())
+        );
+
+        record_attempt(&mut c, 10, 42, "r1", "sha1").unwrap();
+        assert_eq!(
+            get_attempts(&c, 10, 42, "r1", "sha1").unwrap(),
+            i64::from(MAX_REVIEWER_PROVISION_STRIKES) + 1
+        );
+        assert_eq!(stored_error(&c, 10, 42, "r1"), None);
+        assert_eq!(exhausted_provider_error(&c, 10, 42, "sha1").unwrap(), None);
+    }
+
+    #[test]
+    fn exhausted_error_requires_matching_head_and_the_strike_cap() {
+        let (_d, mut c) = open_tmp();
+        for _ in 1..MAX_REVIEWER_PROVISION_STRIKES {
+            record_provider_failure(&mut c, 10, 42, "r1", "sha1", "boom").unwrap();
+        }
+        assert!(stored_error(&c, 10, 42, "r1").is_some());
+        assert_eq!(
+            exhausted_provider_error(&c, 10, 42, "sha1").unwrap(),
+            None,
+            "one strike below the cap stays hidden"
+        );
+
+        record_provider_failure(&mut c, 10, 42, "r1", "sha1", "boom").unwrap();
+        assert_eq!(
+            exhausted_provider_error(&c, 10, 42, "sha1").unwrap(),
+            Some("boom".to_string())
+        );
+        assert_eq!(exhausted_provider_error(&c, 10, 42, "other").unwrap(), None);
+        assert_eq!(exhausted_provider_error(&c, 10, 99, "sha1").unwrap(), None);
+        assert_eq!(exhausted_provider_error(&c, 11, 42, "sha1").unwrap(), None);
+    }
+
+    #[test]
+    fn exhausted_error_finds_any_role_and_prefers_the_latest_strike() {
+        let (_d, mut c) = open_tmp();
+        for _ in 0..MAX_REVIEWER_PROVISION_STRIKES {
+            record_attempt(&mut c, 10, 42, "r1", "sha1").unwrap();
+            record_provider_failure(&mut c, 10, 42, "r2", "sha1", "r2-error").unwrap();
+        }
+        assert_eq!(
+            exhausted_provider_error(&c, 10, 42, "sha1").unwrap(),
+            Some("r2-error".to_string()),
+            "an exhausted role without an error must not mask one that has it"
+        );
+
+        for _ in 0..MAX_REVIEWER_PROVISION_STRIKES {
+            record_provider_failure(&mut c, 10, 42, "r1", "sha1", "r1-error").unwrap();
+        }
+        c.execute(
+            "UPDATE reviewer_provision_attempts SET last_attempt_at = \
+             CASE role WHEN 'r1' THEN 100 ELSE 200 END",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            exhausted_provider_error(&c, 10, 42, "sha1").unwrap(),
+            Some("r2-error".to_string())
+        );
+        c.execute(
+            "UPDATE reviewer_provision_attempts SET last_attempt_at = 300 WHERE role = 'r1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            exhausted_provider_error(&c, 10, 42, "sha1").unwrap(),
+            Some("r1-error".to_string())
+        );
+    }
+
+    #[test]
+    fn stored_error_truncates_on_a_utf8_boundary() {
+        let (_d, mut c) = open_tmp();
+        // A 4-byte scalar straddling the limit must be dropped whole.
+        let error = format!("{}{}tail", "a".repeat(MAX_PROVIDER_ERROR_BYTES - 1), '😀');
+        record_provider_failure(&mut c, 10, 42, "r1", "sha1", &error).unwrap();
+        assert_eq!(
+            stored_error(&c, 10, 42, "r1").unwrap(),
+            "a".repeat(MAX_PROVIDER_ERROR_BYTES - 1)
+        );
+
+        let exact = "é".repeat(MAX_PROVIDER_ERROR_BYTES / 2);
+        record_provider_failure(&mut c, 10, 42, "r1", "sha1", &exact).unwrap();
+        assert_eq!(stored_error(&c, 10, 42, "r1").unwrap(), exact);
+
+        let oversized = "x".repeat(MAX_PROVIDER_ERROR_BYTES * 4);
+        record_provider_failure(&mut c, 10, 42, "r1", "sha1", &oversized).unwrap();
+        assert_eq!(
+            stored_error(&c, 10, 42, "r1").unwrap().len(),
+            MAX_PROVIDER_ERROR_BYTES
+        );
+    }
+
+    #[test]
+    fn stored_error_strips_nul_and_binds_sql_text() {
+        let (_d, mut c) = open_tmp();
+        record_provider_failure(&mut c, 10, 42, "r1", "sha1", "a\0b\0").unwrap();
+        let hex: String = c
+            .query_row(
+                "SELECT hex(last_provider_error) FROM reviewer_provision_attempts",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hex, "6162", "no NUL may reach the stored bytes");
+
+        // Stripping happens before the bound, so NUL never consumes the budget.
+        let padded = format!("{}{}", "\0".repeat(MAX_PROVIDER_ERROR_BYTES), "kept");
+        record_provider_failure(&mut c, 10, 42, "r1", "sha1", &padded).unwrap();
+        assert_eq!(stored_error(&c, 10, 42, "r1").as_deref(), Some("kept"));
+
+        let hostile = "'; DROP TABLE reviewer_provision_attempts; --";
+        record_provider_failure(&mut c, 10, 42, "r1", "sha1", hostile).unwrap();
+        assert_eq!(stored_error(&c, 10, 42, "r1").as_deref(), Some(hostile));
     }
 }
