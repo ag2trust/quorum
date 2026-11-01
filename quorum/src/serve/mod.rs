@@ -3870,8 +3870,9 @@ fn resolve_reviewer_recovery(
         // and leaving it open would make every orphan scan re-select it and
         // fail again with no strike or backoff. End it durably (guarded so a
         // concurrent close wins) and let the caller provision a fresh
-        // reviewer; total reviewer runs stay bounded by
-        // `MAX_TOTAL_REVIEWER_RUNS`, which counts this ended run.
+        // reviewer. This `continuation-unavailable` close still counts toward
+        // `MAX_TOTAL_REVIEWER_RUNS`. Only a short `turn-error-unclassified`
+        // run with a recorded PR and head is exempt from that cap.
         let ended_at = now_unix();
         let tx = quorum_core::db::begin_immediate(&mut conn)?;
         let ended = tx.execute(
@@ -22184,7 +22185,9 @@ async fn record_reviewer_strike(
 /// Burn one per-head strike for an unclassified terminal reviewer turn before
 /// teardown closes the exact agent run. First-turn failures can precede the
 /// slot's in-memory PR/head fields, so recover either missing value from the
-/// immutable launch evidence persisted on that run.
+/// immutable launch evidence persisted on that run. A short close with that
+/// PR and head stays out of `MAX_TOTAL_REVIEWER_RUNS`; this strike is the
+/// durable bound that still applies across restarts.
 async fn strike_reviewer_unclassified_teardown(
     config: &ServeConfig,
     unrecordable: &mut UnrecordableStrikes,
@@ -22296,7 +22299,8 @@ async fn strike_reviewer_unclassified_teardown(
 /// `quorum submit` (e.g. a resumed thread deciding "no new review is due")
 /// records nothing in `reviewer_provision_attempts`, so the 3-strike per-head
 /// cap never fires and the daemon re-provisions every tick until the lifetime
-/// `MAX_TOTAL_REVIEWER_RUNS` cap parks the task.
+/// `MAX_TOTAL_REVIEWER_RUNS` cap parks the task. This no-verdict exit still
+/// counts toward that cap.
 async fn strike_reviewer_no_verdict_exit(
     config: &ServeConfig,
     unrecordable: &mut UnrecordableStrikes,
@@ -45675,6 +45679,172 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(
             is_reviewer_cap_exceeded(&conn, 1).unwrap(),
             "should be exceeded at {MAX_TOTAL_REVIEWER_RUNS} runs"
+        );
+    }
+
+    /// Status and `decide_provision` share `total_reviewer_runs` on one mixed
+    /// fixture: counted reviews plus a burst of short unclassified failures,
+    /// once just under the cap and once at it.
+    #[test]
+    fn status_and_daemon_agree_on_reviewer_cap_with_no_work_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("q.db")).unwrap();
+        let classified = r#""cx_est":2,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null"#;
+        let head = "0123456789abcdef0123456789abcdef01234567";
+        let spawned = 1_700_000_000_i64;
+        let no_work = quorum_core::provision_attempts::REVIEWER_NO_WORK_MAX_SECS;
+        // Completed rows fill whatever the cap does not already cover with the
+        // slow, historical, and live runs seeded below.
+        const FIXED_COUNTED: i64 = 3;
+        const _: () = assert!(MAX_TOTAL_REVIEWER_RUNS > FIXED_COUNTED);
+
+        let (below_id, at_id) = {
+            let mut mk = |title: &str, pr: i64| {
+                let id = tasks::create(
+                    &mut conn,
+                    "owner",
+                    title,
+                    None,
+                    0,
+                    None,
+                    Some(&format!(r#"{{"pr":{pr},{classified}}}"#)),
+                    None,
+                    None,
+                    100,
+                )
+                .unwrap();
+                conn.execute("UPDATE tasks SET status='in-review' WHERE id=?1", [id])
+                    .unwrap();
+                id
+            };
+            (mk("below cap", 61), mk("at cap", 62))
+        };
+
+        let insert = |conn: &quorum_core::Connection,
+                      task_id: i64,
+                      name: &str,
+                      ended_at: Option<i64>,
+                      end_reason: Option<&str>,
+                      review_pr: Option<i64>,
+                      review_head: Option<&str>| {
+            conn.execute(
+                "INSERT INTO agent_runs
+                    (task_id, agent_name, role, model, effort, spawned_at, ended_at, end_reason,
+                     review_pr, review_head_sha)
+                 VALUES (?1, ?2, 'reviewer', 'm', 'e', ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    task_id,
+                    name,
+                    spawned,
+                    ended_at,
+                    end_reason,
+                    review_pr,
+                    review_head
+                ],
+            )
+            .unwrap();
+        };
+        let seed = |conn: &quorum_core::Connection, task_id: i64, pr: i64, completed: i64| {
+            for n in 0..completed {
+                insert(
+                    conn,
+                    task_id,
+                    &format!("completed-{task_id}-{n}"),
+                    Some(spawned + 5),
+                    Some("completed"),
+                    Some(pr),
+                    Some(head),
+                );
+            }
+            insert(
+                conn,
+                task_id,
+                &format!("slow-{task_id}"),
+                Some(spawned + no_work + 1),
+                Some("turn-error-unclassified"),
+                Some(pr),
+                Some(head),
+            );
+            insert(
+                conn,
+                task_id,
+                &format!("historical-{task_id}"),
+                Some(spawned),
+                Some("turn-error-unclassified"),
+                None,
+                None,
+            );
+            insert(
+                conn,
+                task_id,
+                &format!("live-{task_id}"),
+                None,
+                None,
+                Some(pr),
+                Some(head),
+            );
+            for n in 0..8 {
+                insert(
+                    conn,
+                    task_id,
+                    &format!("no-work-{task_id}-{n}"),
+                    Some(spawned),
+                    Some("turn-error-unclassified"),
+                    Some(pr),
+                    Some(head),
+                );
+            }
+        };
+        seed(
+            &conn,
+            below_id,
+            61,
+            MAX_TOTAL_REVIEWER_RUNS - FIXED_COUNTED - 1,
+        );
+        seed(&conn, at_id, 62, MAX_TOTAL_REVIEWER_RUNS - FIXED_COUNTED);
+
+        let raw = |conn: &quorum_core::Connection, task_id: i64| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE task_id=?1 AND role='reviewer'",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let reason_for = |conn: &quorum_core::Connection, task_id: i64| -> Option<String> {
+            quorum_core::stats::stats(conn, 200, 60)
+                .unwrap()
+                .reviewing
+                .into_iter()
+                .find(|task| task.id == task_id)
+                .and_then(|task| task.reason)
+        };
+
+        let below_total =
+            quorum_core::provision_attempts::total_reviewer_runs(&conn, below_id).unwrap();
+        let at_total = quorum_core::provision_attempts::total_reviewer_runs(&conn, at_id).unwrap();
+        assert_eq!(below_total, MAX_TOTAL_REVIEWER_RUNS - 1);
+        assert_eq!(at_total, MAX_TOTAL_REVIEWER_RUNS);
+        assert!(raw(&conn, below_id) > MAX_TOTAL_REVIEWER_RUNS);
+        assert!(raw(&conn, at_id) > at_total);
+
+        assert!(!is_reviewer_cap_exceeded(&conn, below_id).unwrap());
+        assert_eq!(
+            decide_provision(&conn, below_id, 61, "head-61").unwrap(),
+            ProvisionDecision::Needed("r1")
+        );
+        assert_eq!(reason_for(&conn, below_id), None);
+
+        assert!(is_reviewer_cap_exceeded(&conn, at_id).unwrap());
+        assert_eq!(
+            decide_provision(&conn, at_id, 62, "head-62").unwrap(),
+            ProvisionDecision::Exhausted
+        );
+        let at_reason =
+            format!("reviewer run cap exhausted ({at_total}/{MAX_TOTAL_REVIEWER_RUNS})");
+        assert_eq!(
+            reason_for(&conn, at_id).as_deref(),
+            Some(at_reason.as_str())
         );
     }
 
