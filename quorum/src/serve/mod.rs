@@ -60501,6 +60501,28 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         slot
     }
 
+    /// `tick` needs more stack than a default test thread provides, and the
+    /// fixture's worker process must stay on one runtime across ticks.
+    #[cfg(unix)]
+    fn run_on_tick_stack<Body>(name: &str, body: fn() -> Body)
+    where
+        Body: std::future::Future<Output = ()> + 'static,
+    {
+        std::thread::Builder::new()
+            .name(name.into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(body());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     const PROVIDER_BLOCKED_REWORK_PR: i64 = 829;
     const PROVIDER_BLOCKED_REWORK_PROMPT: &str = "address the reviewer blocker";
 
@@ -60622,17 +60644,51 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             }
         }
 
-        /// Run the Phase 6 dispatch pass for one tick's freeze result.
-        async fn dispatch(&mut self, harness: &LifecycleHarness, frozen: bool) {
-            dispatch_workers(
+        /// Run one whole production tick, so `tick_decomposition`'s freeze result
+        /// reaches the real Phase 6 gate instead of a value the test passes in.
+        async fn production_tick(
+            &mut self,
+            harness: &LifecycleHarness,
+            coordinator: &mut DecompositionCoordinator,
+        ) {
+            let mut reviewers = Vec::new();
+            let mut branch_sync_checks = branch_sync::BranchSyncChecks::default();
+            let mut pre_review_checks = HashMap::new();
+            let mut pending_reviewer_resumes = HashMap::new();
+            let mut graph_skip_logs = ClaimSkipLogLimiter::new();
+            let mut unrecordable = UnrecordableStrikes::new();
+            let mut reviewer_respawn_backoff = ReviewerRespawnBackoff::new();
+            let mut drain_state = DrainState::new();
+            let mut classifier_slot = None;
+            let mut classifier_consec_errors = 0;
+            let mut classifier_backoff_until = None;
+            let mut doctor_slot = None;
+            let mut doctored_tasks = std::collections::HashSet::new();
+            let signal_count = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+            tick(
                 &harness.config,
                 &self.wt_mgr,
                 &mut self.names,
                 &mut self.workers,
+                &mut reviewers,
+                &mut branch_sync_checks,
+                &mut pre_review_checks,
+                &mut pending_reviewer_resumes,
                 &mut self.poison,
                 &mut self.skips,
+                &mut graph_skip_logs,
+                &mut unrecordable,
+                &mut reviewer_respawn_backoff,
+                &mut drain_state,
                 &mut self.roster,
-                frozen,
+                &mut classifier_slot,
+                coordinator,
+                &mut classifier_consec_errors,
+                &mut classifier_backoff_until,
+                &mut doctor_slot,
+                &mut doctored_tasks,
+                &collector::CollectorTracker::default(),
+                &signal_count,
             )
             .await
             .unwrap();
@@ -60694,117 +60750,121 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     /// The whole outcome for a true rework: after `task-retry` lifts the hold,
     /// the freeze returns before the worker exists, so Phase 6 must attach that
     /// worker under the freeze or the drain waits on it forever. The open task
-    /// is listed first, and the freeze refuses its claim, so it also proves the
-    /// pass reaches the rework without starting anything new.
+    /// would sort first and be refused, so it also proves the pass reaches the
+    /// rework without starting anything new.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn retried_rework_gets_a_worker_under_the_reacquired_freeze_and_planning_proceeds() {
-        let mut harness = lifecycle_harness("provider-block-rework-dispatch");
-        harness.enter_freeze_phase("draining");
-        let mut fixture = BlockedReworkFixture::new(&mut harness).await;
-        let mut coordinator = DecompositionCoordinator::default();
-        assert!(harness.tick(&mut coordinator).await);
-        assert_eq!(harness.freeze_row().state, "provider-backoff");
+    #[test]
+    fn retried_rework_gets_a_worker_under_the_reacquired_freeze_and_planning_proceeds() {
+        run_on_tick_stack("retried-rework-", || async {
+            let mut harness = lifecycle_harness("provider-block-rework-dispatch");
+            harness.enter_freeze_phase("draining");
+            let mut fixture = BlockedReworkFixture::new(&mut harness).await;
+            let mut coordinator = DecompositionCoordinator::default();
+            assert!(harness.tick(&mut coordinator).await);
+            assert_eq!(harness.freeze_row().state, "provider-backoff");
 
-        let open = harness.add_task(
-            "open",
-            Some(
-                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
-            ),
-        );
-        harness.expire_backoff();
-        assert!(
-            !harness.tick(&mut coordinator).await,
-            "the block still holds"
-        );
-
-        harness.retry_provider_block(fixture.task);
-        let frozen = harness.tick(&mut coordinator).await;
-        assert!(frozen);
-        assert_eq!(harness.freeze_row().state, "freeze-requested");
-
-        fixture.dispatch(&harness, frozen).await;
-        fixture.assert_worker_attached(&harness);
-        let still_open = {
-            let conn = quorum_core::db::open(&harness.db_path).unwrap();
-            tasks::get(&conn, open).unwrap().unwrap()
-        };
-        assert_eq!(still_open.status, "open", "the freeze admits no new start");
-        assert_eq!(still_open.assignee, None);
-
-        // The attached worker is what the drain now waits for.
-        for _ in 0..2 {
+            let open = harness.add_task(
+                "open",
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+            );
+            harness.expire_backoff();
             assert!(
-                harness
-                    .tick_with_slots(&mut coordinator, &fixture.workers, &[])
-                    .await
+                !harness.tick(&mut coordinator).await,
+                "the block still holds"
             );
-            let row = harness.freeze_row();
-            assert_eq!(
-                (row.state.as_str(), row.frozen_base_sha),
-                ("draining", None)
-            );
-        }
 
-        fixture.complete_delivery(&harness).await;
-        assert!(harness.tick(&mut coordinator).await);
-        let expected = repository_head_sha(&harness.config.repo_dir).await.unwrap();
-        let row = harness.freeze_row();
-        assert_eq!(row.state, "planning");
-        assert_eq!(row.frozen_base_sha, Some(expected));
-        assert_eq!((row.provider_failures, row.proposal_attempts), (1, 1));
+            harness.retry_provider_block(fixture.task);
+            fixture.production_tick(&harness, &mut coordinator).await;
+            assert_eq!(harness.freeze_row().state, "freeze-requested");
+            fixture.assert_worker_attached(&harness);
+            let still_open = {
+                let conn = quorum_core::db::open(&harness.db_path).unwrap();
+                tasks::get(&conn, open).unwrap().unwrap()
+            };
+            assert_eq!(still_open.status, "open", "the freeze admits no new start");
+            assert_eq!(still_open.assignee, None);
+
+            // The attached worker is what the drain now waits for.
+            for _ in 0..2 {
+                assert!(
+                    harness
+                        .tick_with_slots(&mut coordinator, &fixture.workers, &[])
+                        .await
+                );
+                let row = harness.freeze_row();
+                assert_eq!(
+                    (row.state.as_str(), row.frozen_base_sha),
+                    ("draining", None)
+                );
+            }
+
+            fixture.complete_delivery(&harness).await;
+            assert!(harness.tick(&mut coordinator).await);
+            let expected = repository_head_sha(&harness.config.repo_dir).await.unwrap();
+            let row = harness.freeze_row();
+            assert_eq!(row.state, "planning");
+            assert_eq!(row.frozen_base_sha, Some(expected));
+            assert_eq!((row.provider_failures, row.proposal_attempts), (1, 1));
+        });
     }
 
     /// The same dispatch closes a retry that lands while another started task
     /// keeps the freeze held, where no `provider-backoff` tick ever runs.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn retried_rework_gets_a_worker_during_a_mixed_drain() {
-        let mut harness = lifecycle_harness("provider-block-rework-mixed");
-        harness.enter_freeze_phase("draining");
-        // No release runs here to clear the harness's bound base, and the real
-        // bind below requires the unbound `draining` graph it would meet.
-        quorum_core::db::open(&harness.db_path)
-            .unwrap()
-            .execute(
-                "UPDATE task_decompositions SET frozen_base_sha=NULL WHERE id=?1",
-                [harness.graph],
-            )
-            .unwrap();
-        let mut fixture = BlockedReworkFixture::new(&mut harness).await;
-        let unrelated = harness.add_task("working", None);
-        let mut coordinator = DecompositionCoordinator::default();
-        assert!(harness.tick(&mut coordinator).await);
-        assert_eq!(harness.freeze_row().state, "draining");
+    #[test]
+    fn retried_rework_gets_a_worker_during_a_mixed_drain() {
+        run_on_tick_stack("retried-rework-", || async {
+            let mut harness = lifecycle_harness("provider-block-rework-mixed");
+            harness.enter_freeze_phase("draining");
+            // No release runs here to clear the harness's bound base, and the real
+            // bind below requires the unbound `draining` graph it would meet.
+            quorum_core::db::open(&harness.db_path)
+                .unwrap()
+                .execute(
+                    "UPDATE task_decompositions SET frozen_base_sha=NULL WHERE id=?1",
+                    [harness.graph],
+                )
+                .unwrap();
+            let mut fixture = BlockedReworkFixture::new(&mut harness).await;
+            let unrelated = harness.add_task("working", None);
+            let mut coordinator = DecompositionCoordinator::default();
+            assert!(harness.tick(&mut coordinator).await);
+            assert_eq!(harness.freeze_row().state, "draining");
 
-        harness.retry_provider_block(fixture.task);
-        let frozen = harness.tick(&mut coordinator).await;
-        assert!(frozen);
-        fixture.dispatch(&harness, frozen).await;
-        fixture.assert_worker_attached(&harness);
+            harness.retry_provider_block(fixture.task);
+            fixture.production_tick(&harness, &mut coordinator).await;
+            assert_eq!(harness.freeze_row().state, "draining");
+            fixture.assert_worker_attached(&harness);
 
-        fixture.complete_delivery(&harness).await;
-        harness.finish_task(unrelated);
-        assert!(harness.tick(&mut coordinator).await);
-        let expected = repository_head_sha(&harness.config.repo_dir).await.unwrap();
-        let row = harness.freeze_row();
-        assert_eq!(row.state, "planning");
-        assert_eq!(row.frozen_base_sha, Some(expected));
+            fixture.complete_delivery(&harness).await;
+            harness.finish_task(unrelated);
+            assert!(harness.tick(&mut coordinator).await);
+            let expected = repository_head_sha(&harness.config.repo_dir).await.unwrap();
+            let row = harness.freeze_row();
+            assert_eq!(row.state, "planning");
+            assert_eq!(row.frozen_base_sha, Some(expected));
+        });
     }
 
     /// A frozen pass is for work the drain is already waiting on. Rework with
     /// no retry stays with its own recovery path and gets no worker here.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn frozen_dispatch_leaves_rework_without_a_retry_unclaimed() {
-        let mut harness = lifecycle_harness("provider-block-no-retry");
-        harness.enter_freeze_phase("draining");
-        let mut fixture = BlockedReworkFixture::new(&mut harness).await;
-        fixture.dispatch(&harness, true).await;
-        assert!(fixture.workers.is_empty(), "still provider-blocked");
-        let conn = quorum_core::db::open(&harness.db_path).unwrap();
-        let task = tasks::get(&conn, fixture.task).unwrap().unwrap();
-        assert_eq!((task.status.as_str(), task.assignee), ("rework", None));
+    #[test]
+    fn frozen_dispatch_leaves_rework_without_a_retry_unclaimed() {
+        run_on_tick_stack("frozen-dispatch", || async {
+            let mut harness = lifecycle_harness("provider-block-no-retry");
+            harness.enter_freeze_phase("draining");
+            let mut fixture = BlockedReworkFixture::new(&mut harness).await;
+            let mut coordinator = DecompositionCoordinator::default();
+            fixture.production_tick(&harness, &mut coordinator).await;
+            assert_eq!(harness.freeze_row().state, "provider-backoff");
+            assert!(fixture.workers.is_empty(), "still provider-blocked");
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            let task = tasks::get(&conn, fixture.task).unwrap().unwrap();
+            assert_eq!((task.status.as_str(), task.assignee), ("rework", None));
+        });
     }
 
     /// The owner-visible defect: a repository draining behind nothing but
