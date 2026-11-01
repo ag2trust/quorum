@@ -45716,6 +45716,100 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
     }
 
+    #[tokio::test]
+    async fn exhausted_reviewer_reasons_keep_generic_text_for_cap_and_ordinary_strikes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let generic_park = format!(
+            "reviewer provision exhausted for PR #42 after \
+             {MAX_REVIEWER_PROVISION_STRIKES} attempts"
+        );
+        let generic_notification = "reviewer provision exhausted".to_string();
+        let specific_prefix = "reviewer provision exhausted for PR #42".to_string();
+
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            // An ordinary final strike deliberately clears an earlier provider
+            // diagnostic, so its exhausted reason must remain byte-for-byte
+            // compatible with the pre-diagnostic text.
+            for _ in 1..MAX_REVIEWER_PROVISION_STRIKES {
+                quorum_core::provision_attempts::record_provider_failure(
+                    &mut conn,
+                    2,
+                    42,
+                    "r1",
+                    "ordinary-head",
+                    "older provider failure",
+                )
+                .unwrap();
+            }
+            quorum_core::provision_attempts::record_attempt(
+                &mut conn,
+                2,
+                42,
+                "r1",
+                "ordinary-head",
+            )
+            .unwrap();
+
+            // Even with a current provider diagnostic, the lifetime cap has
+            // priority and keeps its established generic park/notification.
+            for _ in 0..MAX_REVIEWER_PROVISION_STRIKES {
+                quorum_core::provision_attempts::record_provider_failure(
+                    &mut conn,
+                    1,
+                    42,
+                    "r1",
+                    "cap-head",
+                    "provider failure hidden by lifetime cap",
+                )
+                .unwrap();
+            }
+            for i in 0..MAX_TOTAL_REVIEWER_RUNS {
+                quorum_core::agent_runs::insert(
+                    &conn,
+                    1,
+                    &format!("rev-{i}"),
+                    "reviewer",
+                    "model",
+                    "high",
+                    "claude",
+                    100 + i,
+                )
+                .unwrap();
+            }
+        }
+
+        let ordinary = exhausted_reviewer_provision_reasons(
+            &db_path,
+            2,
+            42,
+            "ordinary-head",
+            generic_park.clone(),
+            generic_notification.clone(),
+            specific_prefix.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ordinary,
+            (generic_park.clone(), generic_notification.clone())
+        );
+
+        let capped = exhausted_reviewer_provision_reasons(
+            &db_path,
+            1,
+            42,
+            "cap-head",
+            generic_park.clone(),
+            generic_notification.clone(),
+            specific_prefix,
+        )
+        .await
+        .unwrap();
+        assert_eq!(capped, (generic_park, generic_notification));
+    }
+
     /// Three no-verdict exits for one head exhaust the per-head budget, so the
     /// orphan-PR loop parks on `Exhausted` instead of spawning a fourth
     /// reviewer and waiting for the 12-run lifetime cap.
