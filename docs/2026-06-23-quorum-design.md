@@ -435,7 +435,8 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
 - `quorum task-retry --task-id <n> --by <operator>` → operator retry for a task
   durably parked after an automatic bounded failure. General daemon parks restore
   their recorded lifecycle stage as specified in § Explicit cancellation and durable
-  parking. A parked merge restores `merging` with one durable daemon-owned replay intent;
+  parking, which also defines the exit-1 refusal for a task at the lifetime reviewer-run
+  cap. A parked merge restores `merging` with one durable daemon-owned replay intent;
   the daemon revalidates the exact persisted PR target, base, head, required role approvals,
   sampled-R2 decision, and CI before making at most one approval/merge call. Invalid or
   incomplete authority returns to `in-review` for the first missing role. A missing or
@@ -1182,6 +1183,31 @@ the cancelled dep(s) in the JSON payload; the operator resolves it by editing
 automatic cancellation cascade is added. This explicit gate prevents hot
 respawn/provision loops: daemon ticks cannot retry a parked task until the operator
 requests it.
+
+Reviewer provision exhaustion has two durable bounds, and `task-retry` treats them
+differently:
+
+- **Per-head strikes.** `reviewer_provision_attempts` parks a role after
+  `MAX_REVIEWER_PROVISION_STRIKES` (3) strikes at one head; a new head resets the count. A
+  strike caused by a provider failure stores the bounded error in `last_provider_error`, and
+  the park reason names it. That failure says nothing about the head, so an owner `task-retry`
+  deletes this task's strike rows with a non-NULL `last_provider_error` in the transaction
+  that restores the task, and the next provision pass allocates a reviewer. A provider that is
+  still failing backs off and parks again at the same bound, so each owner retry grants one
+  bounded budget. Strike rows with no provider error are kept, so a generic strike park behaves
+  as before. A daemon-initiated retry (`reset_recovery_budget=false`) deletes nothing and
+  cannot extend the bound.
+- **Lifetime cap.** `MAX_TOTAL_REVIEWER_RUNS` (12) counts every reviewer run of a task except a
+  `turn-error-unclassified` run that durably ended within `REVIEWER_NO_WORK_MAX_SECS` (60)
+  with its PR and head recorded. Those runs did no review work and the per-head bound already
+  covers them. The cap is not an owner-renewable budget: nothing resets the count. Both cap
+  park sites resume to `in-review`, so `retry_parked` refuses inside its transaction when that
+  resume status meets a count at the cap. The refusal is a clean negative (exit 1, no `errors`
+  row) with JSON naming the cap; the task stays parked and no `task_retry` event or strike
+  deletion is written. `reviewer_cap_retry_refusal` is the one side-effect-free predicate
+  behind both the enforcement and the CLI reason. It is silent for the earlier merged-publication,
+  policy-park, and decomposition-freeze outcomes, so those keep their existing results, and for
+  other resume stages, which still have worker or merge work before any next review.
 
 Daemon startup also reconciles bounded batches of legacy/corrupt terminal rows carrying
 runnable remediation retry markers. `failed` parks retain their reason and explicit
