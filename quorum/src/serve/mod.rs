@@ -31,6 +31,7 @@ pub mod rereview_builder;
 pub mod review_cycle_context;
 pub mod review_ledger;
 pub mod reviewer;
+pub mod role_failover;
 pub mod runner;
 pub mod session_log;
 pub mod stream;
@@ -461,13 +462,42 @@ fn assign_role(
     quorum_core::role_assignments::assign_or_get(&mut conn, &request, &pool, now_unix())
 }
 
-fn assign_classifier_batch(
+/// Assign a classifier or collector responsibility and resolve the route for
+/// its next turn. Unlike a worker or reviewer turn, nothing about these roles
+/// outlives a turn, so unfinished work adopts the current routing policy: a
+/// pool edited to route around an outage must reach work assigned before the
+/// edit. The derived key keeps the earlier assignment's evidence immutable.
+fn assign_role_route(
+    config: &ServeConfig,
+    request: quorum_core::role_assignments::AssignmentRequest,
+    probe: u32,
+) -> Result<role_failover::RoleRoute> {
+    let pool = configured_routing_pool(config, &request.role, None, None)?;
+    let mut conn = quorum_core::db::open(&config.db_path)?;
+    let now = now_unix();
+    let mut assignment =
+        quorum_core::role_assignments::assign_or_get(&mut conn, &request, &pool, now)?;
+    if !assignment.matches_pool_generation(&pool) {
+        let current = quorum_core::role_assignments::AssignmentRequest {
+            responsibility_key: format!(
+                "{}:policy:{}",
+                request.responsibility_key, pool.policy_generation
+            ),
+            ..request
+        };
+        assignment = quorum_core::role_assignments::assign_or_get(&mut conn, &current, &pool, now)?;
+    }
+    role_failover::resolve(&conn, assignment, pool, probe)
+}
+
+fn assign_classifier_route(
     config: &ServeConfig,
     tasks: &[quorum_core::classify::TaskForClassification],
     decomposition: Option<DecompositionClassifierResponsibility>,
-) -> Result<quorum_core::role_assignments::RoleAssignment> {
+    probe: u32,
+) -> Result<role_failover::RoleRoute> {
     let request = classifier_assignment_request(tasks, decomposition)?;
-    assign_role(config, request, None)
+    assign_role_route(config, request, probe)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2552,55 +2582,79 @@ fn spawn_post_merge_collector(
     pr_num: i64,
     task_id: i64,
 ) {
-    let assignment = match assign_role(
+    // ServeConfig::repo is the "owner/name" slug this daemon manages — pass it
+    // explicitly so `gh api` targets the right repo when the daemon's cwd is a
+    // worktree or unrelated dir.
+    let repo = (!config.repo.is_empty()).then(|| config.repo.clone());
+    match routed_collector_request(config, pr_num, task_id, repo, 0) {
+        Ok(request) => collectors.spawn_detached(request),
+        Err(error) => log(&format!(
+            "collector routing failed for PR #{pr_num}: {error}"
+        )),
+    }
+}
+
+/// Build one collector turn on its resolved route, carrying what the detached
+/// run needs to move to another eligible profile on its own.
+fn routed_collector_request(
+    config: &ServeConfig,
+    pr_num: i64,
+    task_id: i64,
+    repo: Option<String>,
+    probe: u32,
+) -> Result<collector::CollectionRequest> {
+    let responsibility_key = format!("collector:pr:{pr_num}");
+    let route = assign_role_route(
         config,
         quorum_core::role_assignments::AssignmentRequest {
-            responsibility_key: format!("collector:pr:{pr_num}"),
+            responsibility_key: responsibility_key.clone(),
             task_id: Some(task_id),
             pr_number: Some(pr_num),
             role: "collector".into(),
             review_stage: None,
             complexity: None,
         },
-        None,
-    ) {
-        Ok(assignment) => assignment,
-        Err(error) => {
-            log(&format!(
-                "collector routing failed for PR #{pr_num}: {error}"
-            ));
-            return;
-        }
+        probe,
+    )?;
+    let provider_bin = |model: &str| {
+        resolve_provider(model)
+            .ok()
+            .and_then(|kind| agent_bin_for_kind(config, kind))
+            .map(str::to_owned)
     };
-    let collector_agent_bin = resolve_provider(&assignment.model)
-        .ok()
-        .and_then(|kind| agent_bin_for_kind(config, kind))
-        .map(str::to_owned);
+    let agent_bins = route
+        .pool
+        .profiles
+        .iter()
+        .map(|weighted| {
+            (
+                weighted.profile.id.clone(),
+                provider_bin(&weighted.profile.model),
+            )
+        })
+        .collect();
+    let profile = route.profile.clone();
     let mut request = collector::CollectionRequest::new(
         pr_num,
         Some(task_id),
-        // ServeConfig::repo is the "owner/name" slug this daemon manages —
-        // pass it explicitly so `gh api` targets the right repo when the
-        // daemon's cwd is a worktree or unrelated dir.
-        if config.repo.is_empty() {
-            None
-        } else {
-            Some(config.repo.clone())
-        },
+        repo,
         config.db_path.clone(),
         config.repo_dir.clone(),
-        collector_agent_bin,
+        provider_bin(&profile.model),
         config.bare_agent,
     )
     .with_collector(
-        assignment.provider.clone(),
-        assignment.runner.clone(),
-        assignment.model.clone(),
-        assignment.effort.clone(),
+        profile.provider,
+        profile.runner,
+        profile.model,
+        profile.effort,
         config.codex_sandbox.clone(),
     );
-    request.role_assignment_id = Some(assignment.id);
-    collectors.spawn_detached(request);
+    request.role_assignment_id = route
+        .links_assignment(&responsibility_key)
+        .then_some(route.assignment.id);
+    request.routing = Some(collector::CollectorRouting { route, agent_bins });
+    Ok(request)
 }
 
 /// Build the daemon-authored branch name for an orphan in-review task.
@@ -5812,6 +5866,8 @@ struct DecompositionCoordinator {
     /// holds unrevoked `submit_plan` authority.
     planner_run_id: Option<String>,
     classifier_slot: Option<classifier::ClassifierSlot>,
+    /// Rotates the classifier route while every pool profile is excluded.
+    classifier_route_probe: u32,
     /// The classifier batch durably accepted for `proposal`. Present only once
     /// the graph has reached `validating`; materialization consumes exactly
     /// this batch, so the Arbiter never reviews one classification while the
@@ -8667,10 +8723,15 @@ async fn tick_decomposition(
             })
         });
         if let Some(outcome) = terminal {
+            let failure = match outcome {
+                classifier::ClassifierResult::Error(_) => slot.failure_evidence().await,
+                classifier::ClassifierResult::Done(_) => None,
+            };
             let slot = coordinator
                 .classifier_slot
                 .take()
                 .expect("classifier slot exists");
+            let route = slot.route.clone();
             let expected = slot.pending_task_ids.clone();
             let source_task_ids: Vec<i64> = coordinator
                 .classifier_source_task_id
@@ -8684,16 +8745,29 @@ async fn tick_decomposition(
             delete_decomposition_process(config, graph_id, "classifier").await?;
             match outcome {
                 classifier::ClassifierResult::Error(summary) => {
-                    record_decomposition_attempt(
-                        config,
-                        graph_id,
-                        "provider",
-                        "classifier-provider",
-                        &summary,
+                    // A failover keeps the accepted proposal in `preclassifying`:
+                    // an unavailable route says nothing about the plan, so the
+                    // alternate classifies it below without spending a planner
+                    // retry or a provider failure.
+                    if !classifier_fails_over(
+                        &config.db_path,
+                        route.as_ref(),
+                        failure.as_ref(),
+                        &format!("decomposition graph {graph_id}"),
                     )
-                    .await?;
-                    coordinator.proposal = None;
-                    coordinator.classifications = None;
+                    .await
+                    {
+                        record_decomposition_attempt(
+                            config,
+                            graph_id,
+                            "provider",
+                            "classifier-provider",
+                            &summary,
+                        )
+                        .await?;
+                        coordinator.proposal = None;
+                        coordinator.classifications = None;
+                    }
                 }
                 classifier::ClassifierResult::Done(text) => {
                     // The batch must both parse and admit every proposed child
@@ -9222,7 +9296,7 @@ async fn tick_decomposition(
         }
         let source_titles = planned_source_dependency_titles(&config.db_path, proposal).await?;
         let tasks = proposed_classifier_tasks(proposal, &source_titles);
-        let classifier_assignment = assign_classifier_batch(
+        let route = assign_classifier_route(
             config,
             &tasks,
             Some(DecompositionClassifierResponsibility {
@@ -9230,21 +9304,24 @@ async fn tick_decomposition(
                 source_task_id: snapshot.source_task_id,
                 plan_revision: snapshot.plan_revision,
             }),
+            coordinator.classifier_route_probe,
         )?;
-        let classifier_kind = resolve_provider(&classifier_assignment.model)?;
+        coordinator.classifier_route_probe = coordinator.classifier_route_probe.wrapping_add(1);
+        let classifier_kind = resolve_provider(&route.profile.model)?;
         match classifier::spawn_classifier_configured(
             &tasks,
             &[],
             agent_bin_for_kind(config, classifier_kind),
             config.bare_agent,
-            &classifier_assignment.model,
-            &classifier_assignment.effort,
+            &route.profile.model,
+            &route.profile.effort,
             &config.codex_sandbox,
             "",
         )
         .await
         {
-            Ok(slot) => {
+            Ok(mut slot) => {
+                slot.route = Some(route);
                 let session_id = agent::new_session_id();
                 if let Err(error) = journal_decomposition_process(
                     config,
@@ -9272,14 +9349,23 @@ async fn tick_decomposition(
                 coordinator.classifier_slot = Some(slot);
             }
             Err(error) => {
-                record_decomposition_attempt(
-                    config,
-                    snapshot.graph_id,
-                    "provider",
-                    "classifier-spawn",
-                    &error.to_string(),
+                if !classifier_fails_over(
+                    &config.db_path,
+                    Some(&route),
+                    runner::launch_failure(&error).as_ref(),
+                    &format!("decomposition graph {}", snapshot.graph_id),
                 )
-                .await?
+                .await
+                {
+                    record_decomposition_attempt(
+                        config,
+                        snapshot.graph_id,
+                        "provider",
+                        "classifier-spawn",
+                        &error.to_string(),
+                    )
+                    .await?
+                }
             }
         }
     }
@@ -9370,6 +9456,196 @@ async fn persist_classifier_error(db_path: &Path, detail: &str) {
     .await;
 }
 
+fn classifier_subject(task_ids: &[i64]) -> String {
+    task_ids
+        .iter()
+        .map(|id| format!("task #{id}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Drain the in-flight classifier and start the next one. `provider_bin` is the
+/// executable override for a provider, separated so a test can drive a route
+/// across providers without changing the process PATH.
+async fn tick_classifier(
+    config: &ServeConfig,
+    classifier_slot: &mut Option<classifier::ClassifierSlot>,
+    classifier_consec_errors: &mut u32,
+    classifier_backoff_until: &mut Option<std::time::Instant>,
+    draining: bool,
+    decomposition_freeze: bool,
+    provider_bin: &(dyn Fn(runner::AgentKind) -> Option<String> + Sync),
+) -> Result<()> {
+    let db_path = config.db_path.clone();
+    // 7a: Drain events from in-flight classifier.
+    let classifier_terminal = if let Some(slot) = classifier_slot.as_mut() {
+        let exited = matches!(slot.proc.try_wait(), Ok(Some(_)));
+        if let Some(result) = classifier::drain_classifier_events(slot).await {
+            Some(result)
+        } else if exited {
+            Some(if slot.response_text.is_empty() {
+                classifier::ClassifierResult::Error("classifier exited without a response".into())
+            } else {
+                classifier::ClassifierResult::Done(std::mem::take(&mut slot.response_text))
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(result) = classifier_terminal {
+        // Failure evidence is read while the slot still owns the process.
+        let failure = match (&result, classifier_slot.as_mut()) {
+            (classifier::ClassifierResult::Error(_), Some(slot)) => slot.failure_evidence().await,
+            _ => None,
+        };
+        // A Claude Result event ends the turn but not its persistent process.
+        // Consume the slot, kill the process group, and reap the child before
+        // dropping the TempDir or performing result/error handling.
+        let slot = classifier_slot
+            .take()
+            .expect("terminal classifier result requires an active slot");
+        let route = slot.route.clone();
+        let pending_task_ids = slot.pending_task_ids.clone();
+        let pending_inputs = slot.pending_inputs.clone();
+        let classifier_model = slot.model.clone();
+        reap_classifier_with_usage(&db_path, slot, None).await;
+
+        match result {
+            classifier::ClassifierResult::Done(text) => {
+                match store_classifier_response(
+                    &db_path,
+                    &text,
+                    &pending_task_ids,
+                    &pending_inputs,
+                    &classifier_model,
+                    config.max_rework,
+                )
+                .await
+                {
+                    Ok(stored) => {
+                        log(&format!("classifier: stored {stored} classification(s)"));
+                        *classifier_consec_errors = 0;
+                        *classifier_backoff_until = None;
+                    }
+                    Err(error) => {
+                        record_classifier_failure(
+                            &db_path,
+                            &error,
+                            classifier_consec_errors,
+                            classifier_backoff_until,
+                        )
+                        .await;
+                    }
+                }
+            }
+            classifier::ClassifierResult::Error(error) => {
+                if classifier::is_auth_error(&error) {
+                    log(&format!(
+                        "classifier: {error} — if using subscription auth, \
+                         ensure no_bare_agent = true (the default)"
+                    ));
+                } else {
+                    log(&format!("classifier: {error}"));
+                }
+                let subject = classifier_subject(&pending_task_ids);
+                if !classifier_fails_over(&db_path, route.as_ref(), failure.as_ref(), &subject)
+                    .await
+                {
+                    record_classifier_failure(
+                        &db_path,
+                        &error,
+                        classifier_consec_errors,
+                        classifier_backoff_until,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    // 7b: Spawn classifier if idle and there are unclassified tasks.
+    // Skip if in backoff from consecutive errors.
+    if let Some(until) = *classifier_backoff_until {
+        if std::time::Instant::now() < until {
+            // Still in backoff — skip spawn this tick.
+        } else {
+            *classifier_backoff_until = None;
+        }
+    }
+    // A decomposition freeze does not stop the classifier outright: already
+    // started work (notably a review-only task, created `in-review` and
+    // unclassified) must classify before its reviewer can dispatch, and the
+    // freeze's own drain waits for that work to finish. `classifier_queue`
+    // narrows the freeze-time queue to that started set.
+    if classifier_slot.is_none() && !draining && classifier_backoff_until.is_none() {
+        let p = db_path.clone();
+        let unclassified = tokio::task::spawn_blocking(move || -> Result<(Vec<quorum_core::classify::TaskForClassification>, Vec<quorum_core::classify::TaskForClassification>)> {
+            let conn = quorum_core::db::open(&p)?;
+            classifier_queue(&conn, decomposition_freeze)
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
+
+        if let Ok((tasks, dup_context)) = unclassified {
+            // A classifier assignment belongs to one exact task revision. This
+            // keeps retry identity stable even as the unclassified queue changes.
+            let tasks = tasks.into_iter().take(1).collect::<Vec<_>>();
+            if !tasks.is_empty() {
+                // Consecutive errors advance the probe, so a blocked head task
+                // reaches every provider in the pool under its own backoff.
+                let route =
+                    assign_classifier_route(config, &tasks, None, *classifier_consec_errors)?;
+                let classifier_kind = resolve_provider(&route.profile.model)?;
+                match classifier::spawn_classifier_configured(
+                    &tasks,
+                    &dup_context,
+                    provider_bin(classifier_kind).as_deref(),
+                    config.bare_agent,
+                    &route.profile.model,
+                    &route.profile.effort,
+                    &config.codex_sandbox,
+                    "",
+                )
+                .await
+                {
+                    Ok(mut slot) => {
+                        log(&format!(
+                            "classifier: spawned for {} task(s) on profile {}",
+                            tasks.len(),
+                            route.profile.id
+                        ));
+                        slot.route = Some(route);
+                        *classifier_slot = Some(slot);
+                    }
+                    Err(e) => {
+                        let subject = classifier_subject(&[tasks[0].id]);
+                        let failure = runner::launch_failure(&e);
+                        if !classifier_fails_over(
+                            &db_path,
+                            Some(&route),
+                            failure.as_ref(),
+                            &subject,
+                        )
+                        .await
+                        {
+                            record_classifier_failure(
+                                &db_path,
+                                &format!("classifier spawn failed: {e}"),
+                                classifier_consec_errors,
+                                classifier_backoff_until,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn record_classifier_failure(
     db_path: &Path,
     detail: &str,
@@ -9389,6 +9665,36 @@ async fn record_classifier_failure(
         "classifier: backoff {delay}s after {} consecutive error(s)",
         *consecutive_errors
     ));
+}
+
+/// Settle a failed classifier turn against its route. True means another pool
+/// profile is eligible and the caller should retry on it without backoff: the
+/// next spawn resolves that route from the evidence just recorded.
+async fn classifier_fails_over(
+    db_path: &Path,
+    route: Option<&role_failover::RoleRoute>,
+    failure: Option<&runner::RunnerFailure>,
+    subject: &str,
+) -> bool {
+    let Some(route) = route else {
+        return false;
+    };
+    match role_failover::settle(db_path, route, failure, subject).await {
+        role_failover::RouteFailure::Alternate(alternate) => {
+            log(&format!(
+                "classifier: {} unavailable for {subject}; retrying on profile {}",
+                route.profile.id, alternate.id
+            ));
+            true
+        }
+        role_failover::RouteFailure::Blocked => {
+            log(&format!(
+                "classifier: blocked for {subject}: no eligible route remains"
+            ));
+            false
+        }
+        role_failover::RouteFailure::NotFailover => false,
+    }
 }
 
 async fn store_classifier_response(
@@ -17706,142 +18012,16 @@ async fn tick(
     }
 
     // ── Phase 7: Task classifier ─────────────────────────────────────
-    // 7a: Drain events from in-flight classifier.
-    let classifier_terminal = if let Some(slot) = classifier_slot.as_mut() {
-        let exited = matches!(slot.proc.try_wait(), Ok(Some(_)));
-        if let Some(result) = classifier::drain_classifier_events(slot).await {
-            Some(result)
-        } else if exited {
-            Some(if slot.response_text.is_empty() {
-                classifier::ClassifierResult::Error("classifier exited without a response".into())
-            } else {
-                classifier::ClassifierResult::Done(std::mem::take(&mut slot.response_text))
-            })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    if let Some(result) = classifier_terminal {
-        // A Claude Result event ends the turn but not its persistent process.
-        // Consume the slot, kill the process group, and reap the child before
-        // dropping the TempDir or performing result/error handling.
-        let slot = classifier_slot
-            .take()
-            .expect("terminal classifier result requires an active slot");
-        let pending_task_ids = slot.pending_task_ids.clone();
-        let pending_inputs = slot.pending_inputs.clone();
-        let classifier_model = slot.model.clone();
-        reap_classifier_with_usage(&db_path, slot, None).await;
-
-        match result {
-            classifier::ClassifierResult::Done(text) => {
-                match store_classifier_response(
-                    &db_path,
-                    &text,
-                    &pending_task_ids,
-                    &pending_inputs,
-                    &classifier_model,
-                    config.max_rework,
-                )
-                .await
-                {
-                    Ok(stored) => {
-                        log(&format!("classifier: stored {stored} classification(s)"));
-                        *classifier_consec_errors = 0;
-                        *classifier_backoff_until = None;
-                    }
-                    Err(error) => {
-                        record_classifier_failure(
-                            &db_path,
-                            &error,
-                            classifier_consec_errors,
-                            classifier_backoff_until,
-                        )
-                        .await;
-                    }
-                }
-            }
-            classifier::ClassifierResult::Error(error) => {
-                if classifier::is_auth_error(&error) {
-                    log(&format!(
-                        "classifier: {error} — if using subscription auth, \
-                         ensure no_bare_agent = true (the default)"
-                    ));
-                } else {
-                    log(&format!("classifier: {error}"));
-                }
-                record_classifier_failure(
-                    &db_path,
-                    &error,
-                    classifier_consec_errors,
-                    classifier_backoff_until,
-                )
-                .await;
-            }
-        }
-    }
-
-    // 7b: Spawn classifier if idle and there are unclassified tasks.
-    // Skip if in backoff from consecutive errors.
-    if let Some(until) = *classifier_backoff_until {
-        if std::time::Instant::now() < until {
-            // Still in backoff — skip spawn this tick.
-        } else {
-            *classifier_backoff_until = None;
-        }
-    }
-    // A decomposition freeze does not stop the classifier outright: already
-    // started work (notably a review-only task, created `in-review` and
-    // unclassified) must classify before its reviewer can dispatch, and the
-    // freeze's own drain waits for that work to finish. `classifier_queue`
-    // narrows the freeze-time queue to that started set.
-    if classifier_slot.is_none() && !drain_state.draining && classifier_backoff_until.is_none() {
-        let p = db_path.clone();
-        let unclassified = tokio::task::spawn_blocking(move || -> Result<(Vec<quorum_core::classify::TaskForClassification>, Vec<quorum_core::classify::TaskForClassification>)> {
-            let conn = quorum_core::db::open(&p)?;
-            classifier_queue(&conn, decomposition_freeze)
-        })
-        .await
-        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
-
-        if let Ok((tasks, dup_context)) = unclassified {
-            // A classifier assignment belongs to one exact task revision. This
-            // keeps retry identity stable even as the unclassified queue changes.
-            let tasks = tasks.into_iter().take(1).collect::<Vec<_>>();
-            if !tasks.is_empty() {
-                let classifier_assignment = assign_classifier_batch(config, &tasks, None)?;
-                let classifier_kind = resolve_provider(&classifier_assignment.model)?;
-                match classifier::spawn_classifier_configured(
-                    &tasks,
-                    &dup_context,
-                    agent_bin_for_kind(config, classifier_kind),
-                    config.bare_agent,
-                    &classifier_assignment.model,
-                    &classifier_assignment.effort,
-                    &config.codex_sandbox,
-                    "",
-                )
-                .await
-                {
-                    Ok(slot) => {
-                        log(&format!("classifier: spawned for {} task(s)", tasks.len()));
-                        *classifier_slot = Some(slot);
-                    }
-                    Err(e) => {
-                        record_classifier_failure(
-                            &db_path,
-                            &format!("classifier spawn failed: {e}"),
-                            classifier_consec_errors,
-                            classifier_backoff_until,
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-    }
+    tick_classifier(
+        config,
+        classifier_slot,
+        classifier_consec_errors,
+        classifier_backoff_until,
+        drain_state.draining,
+        decomposition_freeze,
+        &|kind| agent_bin_for_kind(config, kind).map(str::to_owned),
+    )
+    .await?;
 
     // ── Phase 7.5: Post-merge collector retry queue (#127) ─────────────
     // Complements #125's fire-and-forget `spawn_post_merge_collector`. Every
@@ -17933,43 +18113,17 @@ async fn tick(
             // on both success and failure, so the next tick's converge step
             // catches successes and the mark_error above blocks re-picking
             // until the backoff window elapses.
-            let assignment = assign_role(
+            let repo = job
+                .repo
+                .clone()
+                .or_else(|| (!config.repo.is_empty()).then(|| config.repo.clone()));
+            let request = routed_collector_request(
                 config,
-                quorum_core::role_assignments::AssignmentRequest {
-                    responsibility_key: format!("collector:pr:{}", job.pr_number),
-                    task_id: Some(job.task_id),
-                    pr_number: Some(job.pr_number),
-                    role: "collector".into(),
-                    review_stage: None,
-                    complexity: None,
-                },
-                None,
-            )?;
-            let collector_agent_bin =
-                agent_bin_for_kind(config, resolve_provider(&assignment.model)?).map(str::to_owned);
-            let mut request = collector::CollectionRequest::new(
                 job.pr_number,
-                Some(job.task_id),
-                job.repo.clone().or_else(|| {
-                    if config.repo.is_empty() {
-                        None
-                    } else {
-                        Some(config.repo.clone())
-                    }
-                }),
-                config.db_path.clone(),
-                config.repo_dir.clone(),
-                collector_agent_bin,
-                config.bare_agent,
-            )
-            .with_collector(
-                assignment.provider.clone(),
-                assignment.runner.clone(),
-                assignment.model.clone(),
-                assignment.effort.clone(),
-                config.codex_sandbox.clone(),
-            );
-            request.role_assignment_id = Some(assignment.id);
+                job.task_id,
+                repo,
+                u32::try_from(job.attempts).unwrap_or_default(),
+            )?;
             collectors.spawn_detached(request);
         }
     }
@@ -57789,6 +57943,487 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     /// runs in an empty isolation directory. The graph starts in `planning`
     /// bound to the repository's real HEAD so frozen views can be built.
     #[cfg(unix)]
+    /// Classifier provider failover, driven through `tick_classifier` against
+    /// provider executables that speak each runner's real protocol.
+    #[cfg(unix)]
+    struct ClassifierRouteFixture {
+        _dir: tempfile::TempDir,
+        config: ServeConfig,
+        task_id: i64,
+        codex: PathBuf,
+        claude: PathBuf,
+        codex_runs: PathBuf,
+        claude_runs: PathBuf,
+    }
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct ClassifierRouteState {
+        slot: Option<classifier::ClassifierSlot>,
+        errors: u32,
+        backoff: Option<std::time::Instant>,
+    }
+
+    #[cfg(unix)]
+    fn write_provider_script(path: &Path, runs: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\nprintf x >> '{}'\n{body}", runs.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    impl ClassifierRouteFixture {
+        fn new(pool: &[(&str, u8)]) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("classifier-route.db");
+            let task_id = {
+                let mut conn = quorum_core::db::open(&db_path).unwrap();
+                tasks::create(
+                    &mut conn,
+                    "owner",
+                    "classify across an outage",
+                    Some("a task that needs classification"),
+                    1,
+                    None,
+                    None,
+                    None,
+                    None,
+                    1,
+                )
+                .unwrap()
+            };
+            let mut config = pre_review_checks_config(db_path, dir.path().to_path_buf());
+            config.model_profiles = std::collections::BTreeMap::from([
+                (
+                    "terra".to_string(),
+                    crate::serve_config::ModelProfile {
+                        runner: "codex".into(),
+                        model: "gpt-5.6-terra".into(),
+                        effort: "high".into(),
+                    },
+                ),
+                (
+                    "haiku".to_string(),
+                    crate::serve_config::ModelProfile {
+                        runner: "claude".into(),
+                        model: classifier::CLASSIFIER_MODEL.into(),
+                        effort: classifier::CLASSIFIER_EFFORT.into(),
+                    },
+                ),
+            ]);
+            config.routing.classifier = pool
+                .iter()
+                .map(|(profile, percent)| (profile.to_string(), *percent))
+                .collect();
+            let fixture = Self {
+                codex: dir.path().join("codex"),
+                claude: dir.path().join("claude"),
+                codex_runs: dir.path().join("codex-runs"),
+                claude_runs: dir.path().join("claude-runs"),
+                _dir: dir,
+                config,
+                task_id,
+            };
+            // The bag order decides the first route; pin it to Codex so each
+            // test exercises the outage the role was reported against.
+            let assignment = {
+                let pool =
+                    configured_routing_pool(&fixture.config, "classifier", None, None).unwrap();
+                let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+                quorum_core::role_assignments::assign_or_get_with_seed(
+                    &mut conn,
+                    &fixture.assignment_request(),
+                    &pool,
+                    7,
+                    1,
+                )
+                .unwrap()
+            };
+            assert_eq!(assignment.provider, "codex");
+            fixture
+        }
+
+        fn responsibility(&self) -> String {
+            format!("classifier:task:{}:revision:1", self.task_id)
+        }
+
+        fn assignment_request(&self) -> quorum_core::role_assignments::AssignmentRequest {
+            quorum_core::role_assignments::AssignmentRequest {
+                responsibility_key: self.responsibility(),
+                task_id: Some(self.task_id),
+                pr_number: None,
+                role: "classifier".into(),
+                review_stage: None,
+                complexity: None,
+            }
+        }
+
+        fn codex_is_over_its_usage_limit(&self) {
+            let transcript = self._dir.path().join("codex-limit.jsonl");
+            let message = "You have hit your usage limit";
+            std::fs::write(
+                &transcript,
+                format!(
+                    "{}\n{}\n",
+                    serde_json::json!({"type":"error","message":message}),
+                    serde_json::json!({"type":"turn.failed","error":{"message":message}}),
+                ),
+            )
+            .unwrap();
+            write_provider_script(
+                &self.codex,
+                &self.codex_runs,
+                &format!("/bin/cat '{}'\nexit 1\n", transcript.display()),
+            );
+        }
+
+        fn codex_exits_without_evidence(&self) {
+            write_provider_script(&self.codex, &self.codex_runs, "exit 1\n");
+        }
+
+        fn claude_answers(&self) {
+            let tasks = serde_json::json!({"tasks":[{
+                "task_id": self.task_id,
+                "complexity": 2,
+                "size": "S",
+                "size_reason": "one focused change",
+                "ready": true,
+                "not_ready_reason": null,
+            }]});
+            let transcript = self._dir.path().join("claude-answer.jsonl");
+            std::fs::write(
+                &transcript,
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "type":"result","is_error":false,"result":tasks.to_string()
+                    })
+                ),
+            )
+            .unwrap();
+            write_provider_script(
+                &self.claude,
+                &self.claude_runs,
+                &format!(
+                    "while IFS= read -r _turn; do /bin/cat '{}'; done\n",
+                    transcript.display()
+                ),
+            );
+        }
+
+        fn claude_has_no_credit(&self) {
+            let transcript = self._dir.path().join("claude-credit.jsonl");
+            std::fs::write(
+                &transcript,
+                format!(
+                    "{}\n{}\n",
+                    serde_json::json!({
+                        "type":"assistant","error":"credit_balance_too_low",
+                        "message":{"content":[]}
+                    }),
+                    serde_json::json!({
+                        "type":"result","is_error":true,"result":"Credit balance is too low"
+                    }),
+                ),
+            )
+            .unwrap();
+            write_provider_script(
+                &self.claude,
+                &self.claude_runs,
+                &format!(
+                    "IFS= read -r _turn\n/bin/cat '{}'\nexit 1\n",
+                    transcript.display()
+                ),
+            );
+        }
+
+        async fn tick(&self, state: &mut ClassifierRouteState) {
+            let (codex, claude) = (self.codex.clone(), self.claude.clone());
+            tick_classifier(
+                &self.config,
+                &mut state.slot,
+                &mut state.errors,
+                &mut state.backoff,
+                false,
+                false,
+                &move |kind| match kind {
+                    runner::AgentKind::Codex => Some(codex.to_string_lossy().into_owned()),
+                    runner::AgentKind::Claude => Some(claude.to_string_lossy().into_owned()),
+                    runner::AgentKind::Grok => None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn tick_until(
+            &self,
+            state: &mut ClassifierRouteState,
+            done: impl Fn(&ClassifierRouteState) -> bool,
+        ) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !done(state) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "classifier did not reach the expected state"
+                );
+                self.tick(state).await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        fn unclassified(&self) -> usize {
+            let conn = quorum_core::db::open(&self.config.db_path).unwrap();
+            quorum_core::classify::unclassified_tasks(&conn)
+                .unwrap()
+                .len()
+        }
+
+        fn attempts(&self) -> Vec<(String, Option<String>)> {
+            let conn = quorum_core::db::open(&self.config.db_path).unwrap();
+            quorum_core::routing_attempts::list(&conn, &self.responsibility())
+                .unwrap()
+                .into_iter()
+                .map(|attempt| {
+                    (
+                        attempt.profile.id,
+                        attempt.failure_disposition.map(|d| d.to_string()),
+                    )
+                })
+                .collect()
+        }
+
+        fn alerts(&self) -> Vec<String> {
+            route_alerts(&self.config.db_path)
+        }
+
+        fn classifier_errors(&self) -> i64 {
+            let conn = quorum_core::db::open(&self.config.db_path).unwrap();
+            conn.query_row(
+                "SELECT count(*) FROM errors WHERE source='classifier'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        }
+
+        fn runs(path: &Path) -> usize {
+            std::fs::read(path).map_or(0, |runs| runs.len())
+        }
+    }
+
+    fn route_alerts(db_path: &Path) -> Vec<String> {
+        let conn = quorum_core::db::open(db_path).unwrap();
+        let mut statement = conn
+            .prepare("SELECT body FROM messages WHERE kind='alert' AND recipient='owner'")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn classifier_provider_outage_moves_to_the_second_profile_and_classifies() {
+        let fixture = ClassifierRouteFixture::new(&[("terra", 99), ("haiku", 1)]);
+        fixture.codex_is_over_its_usage_limit();
+        fixture.claude_answers();
+        let mut state = ClassifierRouteState::default();
+
+        fixture
+            .tick_until(&mut state, |state| {
+                state.slot.is_none() && ClassifierRouteFixture::runs(&fixture.claude_runs) > 0
+            })
+            .await;
+
+        assert_eq!(fixture.unclassified(), 0, "the alternate must classify");
+        assert_eq!(
+            fixture.attempts(),
+            vec![(
+                "terra".to_string(),
+                Some("provider-unavailable".to_string())
+            )]
+        );
+        assert_eq!(ClassifierRouteFixture::runs(&fixture.codex_runs), 1);
+        assert_eq!(ClassifierRouteFixture::runs(&fixture.claude_runs), 1);
+        assert_eq!(state.errors, 0, "a failover is not a classifier error");
+        assert!(state.backoff.is_none(), "a failover must not wait");
+        assert!(fixture.alerts().is_empty(), "{:?}", fixture.alerts());
+
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let task = tasks::get(&conn, fixture.task_id).unwrap().unwrap();
+        let refs = task.refs.unwrap_or_default();
+        assert!(
+            refs.contains(&quorum_core::classify::classifier_provenance(
+                classifier::CLASSIFIER_MODEL
+            )),
+            "the accepted result must name the route that produced it: {refs}"
+        );
+
+        // One accepted result: the settled task is not classified again.
+        for _ in 0..3 {
+            fixture.tick(&mut state).await;
+        }
+        assert!(state.slot.is_none());
+        assert_eq!(ClassifierRouteFixture::runs(&fixture.claude_runs), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn single_provider_pool_alerts_once_and_keeps_retrying_on_backoff_only() {
+        let fixture = ClassifierRouteFixture::new(&[("terra", 100)]);
+        fixture.codex_is_over_its_usage_limit();
+        let mut state = ClassifierRouteState::default();
+
+        fixture
+            .tick_until(&mut state, |state| state.errors == 1)
+            .await;
+
+        let alerts = fixture.alerts();
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert!(
+            alerts[0].contains("names only provider codex"),
+            "{alerts:?}"
+        );
+        assert!(alerts[0].contains("[routing.classifier]"), "{alerts:?}");
+        assert_eq!(fixture.unclassified(), 1, "the task must remain pending");
+        assert_eq!(fixture.classifier_errors(), 1, "the failure stays visible");
+
+        // No tight loop: nothing spawns while the backoff stands.
+        assert!(state.backoff.is_some());
+        for _ in 0..20 {
+            fixture.tick(&mut state).await;
+        }
+        assert!(state.slot.is_none());
+        assert_eq!(ClassifierRouteFixture::runs(&fixture.codex_runs), 1);
+
+        // An elapsed backoff probes again, so the task recovers when the
+        // outage ends, and the repeat adds neither evidence nor an alert.
+        state.backoff = Some(std::time::Instant::now());
+        fixture
+            .tick_until(&mut state, |state| state.errors == 2)
+            .await;
+        assert_eq!(ClassifierRouteFixture::runs(&fixture.codex_runs), 2);
+        assert_eq!(fixture.attempts().len(), 1);
+        assert_eq!(fixture.alerts().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn both_providers_unavailable_stays_bounded_and_unclassified() {
+        let fixture = ClassifierRouteFixture::new(&[("terra", 99), ("haiku", 1)]);
+        fixture.codex_is_over_its_usage_limit();
+        fixture.claude_has_no_credit();
+        let mut state = ClassifierRouteState::default();
+
+        fixture
+            .tick_until(&mut state, |state| state.errors == 1)
+            .await;
+
+        assert_eq!(
+            fixture.attempts(),
+            vec![
+                (
+                    "terra".to_string(),
+                    Some("provider-unavailable".to_string())
+                ),
+                (
+                    "haiku".to_string(),
+                    Some("provider-unavailable".to_string())
+                ),
+            ]
+        );
+        assert_eq!(fixture.unclassified(), 1);
+        assert_eq!(fixture.classifier_errors(), 1);
+        let alerts = fixture.alerts();
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert!(alerts[0].contains("every provider"), "{alerts:?}");
+
+        assert!(state.backoff.is_some());
+        for _ in 0..20 {
+            fixture.tick(&mut state).await;
+        }
+        assert!(state.slot.is_none());
+        assert_eq!(ClassifierRouteFixture::runs(&fixture.codex_runs), 1);
+        assert_eq!(ClassifierRouteFixture::runs(&fixture.claude_runs), 1);
+
+        // A later probe rotates, so the provider that recovers first is reached.
+        state.backoff = Some(std::time::Instant::now());
+        fixture.claude_answers();
+        fixture
+            .tick_until(&mut state, |_| fixture.unclassified() == 0)
+            .await;
+        assert_eq!(ClassifierRouteFixture::runs(&fixture.codex_runs), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn classifier_failure_without_availability_evidence_does_not_fail_over() {
+        let fixture = ClassifierRouteFixture::new(&[("terra", 99), ("haiku", 1)]);
+        fixture.codex_exits_without_evidence();
+        fixture.claude_answers();
+        let mut state = ClassifierRouteState::default();
+
+        fixture
+            .tick_until(&mut state, |state| state.errors == 1)
+            .await;
+
+        assert!(fixture.attempts().is_empty());
+        assert_eq!(ClassifierRouteFixture::runs(&fixture.claude_runs), 0);
+        assert!(state.backoff.is_some());
+        assert_eq!(fixture.unclassified(), 1);
+        assert!(fixture.alerts().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pool_edit_reroutes_unfinished_work_assigned_under_the_old_policy() {
+        let mut fixture = ClassifierRouteFixture::new(&[("terra", 100)]);
+        let request = fixture.assignment_request();
+        let original = assign_role_route(&fixture.config, request.clone(), 0).unwrap();
+        assert_eq!(
+            original.assignment.responsibility_key,
+            fixture.responsibility()
+        );
+        let replayed = assign_role_route(&fixture.config, request.clone(), 0).unwrap();
+        assert_eq!(
+            replayed, original,
+            "an unchanged policy keeps its assignment"
+        );
+
+        fixture.config.routing.classifier =
+            std::collections::BTreeMap::from([("terra".to_string(), 99), ("haiku".to_string(), 1)]);
+        let current = assign_role_route(&fixture.config, request.clone(), 0).unwrap();
+
+        assert_ne!(current.assignment.id, original.assignment.id);
+        assert!(current.assignment.matches_pool_generation(&current.pool));
+        assert!(!current.links_assignment(&fixture.responsibility()));
+
+        // Evidence now lands on the current generation, which the alert's
+        // remedy depends on; the old pool could never name an alternate.
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProviderUnavailable,
+            "usage limit",
+            std::io::ErrorKind::Other,
+        );
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let outcome =
+            role_failover::record_failure(&mut conn, &current, &failure, "task", 2).unwrap();
+        assert!(
+            matches!(outcome, role_failover::RouteFailure::Alternate(_)),
+            "{outcome:?}"
+        );
+        let retried = assign_role_route(&fixture.config, request, 0).unwrap();
+        assert_eq!(retried.assignment.id, current.assignment.id);
+        assert_ne!(retried.profile.provider, current.profile.provider);
+    }
+
     struct LifecycleHarness {
         _dir: tempfile::TempDir,
         db_path: PathBuf,
@@ -58214,6 +58849,154 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     /// A classifier rejection returns the proposal to the planner retry path
     /// from `preclassifying`: the Arbiter is never assigned, journalled, or
     /// spawned for that proposal, and no verdict row exists.
+    #[cfg(unix)]
+    impl LifecycleHarness {
+        /// Make the classifier fail on `model` with a Codex record that names
+        /// that route unavailable, leaving every other provider turn intact.
+        fn classifier_model_fails(&mut self, model: &str, message: &str) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let failure = self._dir.path().join("classifier-failure.jsonl");
+            std::fs::write(
+                &failure,
+                format!(
+                    "{}\n",
+                    serde_json::json!({"type":"turn.failed","error":{"message":message}})
+                ),
+            )
+            .unwrap();
+            let wrapper = self._dir.path().join("codex-wrapper");
+            let original = self.config.agent_bin.clone().unwrap();
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\n\
+                     case \"$*\" in *mcp_servers.quorum*) exec '{original}' \"$@\" ;; esac\n\
+                     case \"$*\" in *{model}*) /bin/cat '{}'; exit 1 ;; esac\n\
+                     exec '{original}' \"$@\"\n",
+                    failure.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            self.config.agent_bin = Some(wrapper.to_string_lossy().into_owned());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planning_classifier_outage_keeps_the_proposal_and_uses_the_alternate() {
+        let mut harness = lifecycle_harness("classifier-failover");
+        let failing_model = "gpt-5.6-terra";
+        harness.config.model_profiles.insert(
+            "failing".to_string(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: failing_model.into(),
+                effort: planner::PLANNER_EFFORT.into(),
+            },
+        );
+        harness.config.routing.classifier = std::collections::BTreeMap::from([
+            ("failing".to_string(), 99),
+            ("test".to_string(), 1),
+        ]);
+        harness.classifier_model_fails(
+            failing_model,
+            "The model gpt-5.6-terra does not exist or you do not have access to it.",
+        );
+        harness.accept_proposal(5);
+        let responsibility = {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            let plan_revision: i64 = conn
+                .query_row(
+                    "SELECT plan_revision FROM task_decompositions WHERE id=?1",
+                    [harness.graph],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            format!(
+                "classifier:decomposition:graph:{}:source:{}:plan-revision:{plan_revision}",
+                harness.graph, harness.source
+            )
+        };
+        let assignment = {
+            let pool = configured_routing_pool(&harness.config, "classifier", None, None).unwrap();
+            let mut conn = quorum_core::db::open(&harness.db_path).unwrap();
+            quorum_core::role_assignments::assign_or_get_with_seed(
+                &mut conn,
+                &quorum_core::role_assignments::AssignmentRequest {
+                    responsibility_key: responsibility.clone(),
+                    task_id: Some(harness.source),
+                    pr_number: None,
+                    role: "classifier".into(),
+                    review_stage: None,
+                    complexity: None,
+                },
+                &pool,
+                7,
+                1,
+            )
+            .unwrap()
+        };
+        assert_eq!(assignment.profile_id, "failing");
+
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        harness
+            .tick_until(&mut coordinator, |c| c.classifications.is_some())
+            .await;
+
+        assert_eq!(
+            arbiter_gate_state(&harness.db_path, harness.graph).0,
+            "validating",
+            "the alternate must carry the same proposal to the Arbiter"
+        );
+        assert!(
+            arbiter_gate_attempts(&harness.db_path, harness.graph).is_empty(),
+            "an unavailable route must not spend a planning budget"
+        );
+        let conn = quorum_core::db::open(&harness.db_path).unwrap();
+        let attempts = quorum_core::routing_attempts::list(&conn, &responsibility).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].profile.id, "failing");
+        assert_eq!(
+            attempts[0].failure_disposition,
+            Some(runner::FailureDisposition::ProfileUnavailable)
+        );
+        drop(conn);
+        harness.settle(&mut coordinator).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocked_planning_classifier_alerts_and_spends_the_existing_provider_budget() {
+        let mut harness = lifecycle_harness("classifier-blocked");
+        harness.classifier_model_fails(
+            planner::CODEX_PLANNER_MODEL,
+            "You have hit your usage limit",
+        );
+        harness.accept_proposal(5);
+
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        assert!(coordinator.classifier_slot.is_some());
+        harness
+            .tick_until(&mut coordinator, |c| c.classifier_slot.is_none())
+            .await;
+
+        assert_eq!(
+            arbiter_gate_attempts(&harness.db_path, harness.graph),
+            vec![("provider".to_string(), "classifier-provider".to_string())]
+        );
+        let alerts = route_alerts(&harness.db_path);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert!(
+            alerts[0].contains("names only provider codex"),
+            "{alerts:?}"
+        );
+        harness.settle(&mut coordinator).await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn classifier_rejection_replans_without_ever_spawning_an_arbiter() {
@@ -59220,6 +60003,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             planner_source_task_id: None,
             planner_run_id: None,
             classifier_slot: Some(classifier_slot),
+            classifier_route_probe: 0,
             classifications: None,
             arbiter_slot: None,
             arbiter_source_task_id: None,

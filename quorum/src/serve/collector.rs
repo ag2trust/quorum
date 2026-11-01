@@ -19,7 +19,10 @@
 use super::classifier::{
     CLASSIFIER_EFFORT, CLASSIFIER_MODEL, MAX_CLASSIFIER_RESPONSE_BYTES, MAX_CLASSIFIER_STDOUT_BYTES,
 };
-use super::runner::{AdapterConfig, AgentEvent, AgentKind, LaunchMode, LaunchRequest, RunnerProc};
+use super::role_failover::{settle, RouteFailure};
+use super::runner::{
+    AdapterConfig, AgentEvent, AgentKind, LaunchMode, LaunchRequest, RunnerFailure, RunnerProc,
+};
 use quorum_core::clock;
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::review_findings::{
@@ -31,10 +34,11 @@ use quorum_core::review_followups::{
     ScopeRelationship, TechnicalImpact, VerificationExpectations, MAX_FOLLOWUP_ARTIFACTS,
     MAX_FOLLOWUP_EVIDENCE_IDS, MAX_FOLLOWUP_TEXT_BYTES,
 };
+use quorum_core::role_assignments::ModelProfile;
 use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -953,6 +957,17 @@ pub struct CollectionRequest {
     /// [`CollectorTracker::spawn_detached`]; the one-shot CLI path runs the
     /// classifier inline and owns its process directly.
     pub tracker: Option<CollectorTracker>,
+    /// Provider failover state for a daemon run. `None` keeps the request on
+    /// its one configured route, as the one-shot CLI path does.
+    pub routing: Option<CollectorRouting>,
+}
+
+/// The route a daemon collection is running and the executable override for
+/// each profile it may move to.
+#[derive(Debug, Clone)]
+pub struct CollectorRouting {
+    pub route: super::role_failover::RoleRoute,
+    pub agent_bins: HashMap<String, Option<String>>,
 }
 
 impl CollectionRequest {
@@ -985,6 +1000,7 @@ impl CollectionRequest {
             codex_sandbox: "danger-full-access".to_string(),
             env_vars: vec![],
             tracker: None,
+            routing: None,
         }
     }
 
@@ -1003,6 +1019,23 @@ impl CollectionRequest {
         self.codex_sandbox = codex_sandbox.into();
         self
     }
+
+    /// Move this run onto `profile`. The role assignment still names the
+    /// failed route and the evidence guard matches it exactly, so the run's
+    /// model column carries the alternate without an assignment link; the
+    /// `routing_attempts` row records why the route changed.
+    fn adopt_route(&mut self, profile: ModelProfile) {
+        let Some(routing) = self.routing.as_mut() else {
+            return;
+        };
+        self.agent_bin = routing.agent_bins.get(&profile.id).cloned().flatten();
+        self.collector_provider = profile.provider.clone();
+        self.collector_runner = profile.runner.clone();
+        self.collector_model = profile.model.clone();
+        self.collector_effort = profile.effort.clone();
+        self.role_assignment_id = None;
+        routing.route.profile = profile;
+    }
 }
 
 /// Result summary returned to the caller (the daemon logs it; the CLI prints it).
@@ -1018,7 +1051,10 @@ pub struct CollectionOutcome {
 
 struct ClassifierTurnOutcome {
     response: Result<String>,
-    usage: super::runner::TokenUsage,
+    /// `None` when no provider turn ran, so there is no telemetry to record.
+    usage: Option<super::runner::TokenUsage>,
+    /// Runner evidence for a failed turn; the input to provider failover.
+    failure: Option<RunnerFailure>,
 }
 
 /// Full pipeline: fetch inputs, spawn classifier, parse + store. On any failure
@@ -1048,18 +1084,14 @@ pub async fn run_collection_with_inputs(
     inputs: CollectorInputs,
     attempted_at: i64,
 ) -> Result<CollectionOutcome> {
+    // A failover changes the route for the rest of this run, including any
+    // repair turn, and every run record below must name the route that ran.
+    let mut routed_request = request.clone();
+    let request = &mut routed_request;
+
     // 2) Spawn classifier + await bounded turn.
     let collector_prompt = review_findings::build_collector_prompt(&inputs);
-    let turn = match spawn_and_run_classifier(request, &collector_prompt).await {
-        Ok(turn) => turn,
-        Err(e) => {
-            let err_text = format!("collector classifier failed: {e}");
-            record_failure(request, &err_text, attempted_at).await;
-            return Err(QuorumError::Io(err_text));
-        }
-    };
-    record_token_usage(request, turn.usage).await;
-    let response_text = match turn.response {
+    let response_text = match run_routed_turn(request, &collector_prompt).await {
         Ok(response) => response,
         Err(e) => {
             let err_text = format!("collector classifier failed: {e}");
@@ -1081,16 +1113,7 @@ pub async fn run_collection_with_inputs(
         Err(primary_error) => {
             let repair_prompt =
                 build_repair_prompt(&collector_prompt, &response_text, &primary_error);
-            let repair_turn = match spawn_and_run_classifier(request, &repair_prompt).await {
-                Ok(turn) => turn,
-                Err(error) => {
-                    let err_text = format!("collector repair classifier failed: {error}");
-                    record_failure(request, &err_text, attempted_at).await;
-                    return Err(QuorumError::Io(err_text));
-                }
-            };
-            record_token_usage(request, repair_turn.usage).await;
-            let repair_response = match repair_turn.response {
+            let repair_response = match run_routed_turn(request, &repair_prompt).await {
                 Ok(response) => response,
                 Err(error) => {
                     let err_text = format!("collector repair classifier failed: {error}");
@@ -1195,6 +1218,44 @@ pub async fn run_collection_with_inputs(
             let err_text = format!("collector db-write join failed: {e}");
             record_failure(request, &err_text, attempted_at).await;
             Err(QuorumError::Io(err_text))
+        }
+    }
+}
+
+/// Run one bounded collector turn, moving to another eligible pool profile
+/// when the provider is unavailable. Each move adds an exclusion, so the loop
+/// runs at most once per pool profile; usage is attributed to the route that
+/// spent it.
+async fn run_routed_turn(request: &mut CollectionRequest, prompt: &str) -> Result<String> {
+    loop {
+        let turn = spawn_and_run_classifier(request, prompt).await;
+        if let Some(usage) = turn.usage {
+            record_token_usage(request, usage).await;
+        }
+        let error = match turn.response {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
+        let Some(routing) = request.routing.as_ref() else {
+            return Err(error);
+        };
+        let subject = format!("PR #{}", request.pr_number);
+        match settle(
+            &request.db_path,
+            &routing.route,
+            turn.failure.as_ref(),
+            &subject,
+        )
+        .await
+        {
+            RouteFailure::Alternate(alternate) => {
+                eprintln!(
+                    "quorum serve: collector {} unavailable for {subject}; retrying on profile {}",
+                    routing.route.profile.id, alternate.id
+                );
+                request.adopt_route(alternate);
+            }
+            RouteFailure::Blocked | RouteFailure::NotFailover => return Err(error),
         }
     }
 }
@@ -1615,8 +1676,8 @@ async fn run_gh_raw(
 async fn spawn_and_run_classifier(
     request: &CollectionRequest,
     prompt: &str,
-) -> Result<ClassifierTurnOutcome> {
-    let mut proc = RunnerProc::launch(
+) -> ClassifierTurnOutcome {
+    let launched = RunnerProc::launch(
         &LaunchRequest {
             model: &request.collector_model,
             effort: &request.collector_effort,
@@ -1634,8 +1695,17 @@ async fn spawn_and_run_classifier(
             grok: Default::default(),
         },
     )
-    .await
-    .map_err(|e| QuorumError::Io(format!("spawn classifier: {e}")))?;
+    .await;
+    let mut proc = match launched {
+        Ok(proc) => proc,
+        Err(failure) => {
+            return ClassifierTurnOutcome {
+                response: Err(QuorumError::Io(format!("spawn classifier: {failure}"))),
+                usage: None,
+                failure: Some(failure),
+            };
+        }
+    };
 
     // Daemon-owned runs register the process group and journal it before the
     // turn starts, so every daemon exit path and restart recovery can kill it.
@@ -1649,7 +1719,11 @@ async fn spawn_and_run_classifier(
                 reaping.begin();
                 let _ = proc.kill_and_reap().await;
                 tracker.release(&request.db_path, &reaping.agent).await;
-                return Err(error);
+                return ClassifierTurnOutcome {
+                    response: Err(error),
+                    usage: None,
+                    failure: None,
+                };
             }
             Some(reaping)
         }
@@ -1762,28 +1836,31 @@ async fn spawn_and_run_classifier(
         }
     };
 
-    // Reaping can drain a terminal event raced by the timeout. It remains
-    // lifecycle-inert, but its usage is still durable telemetry.
-    let kind = proc.kind();
-    // The runner may reap the leader — freeing the numeric pgid for reuse —
-    // at any await inside `kill_and_reap`, so drain must stop signalling the
-    // group before that call starts, not after it returns.
+    // Failure evidence and `kill_and_reap` can each reap the leader, freeing
+    // the numeric pgid for reuse, so drain must stop signalling the group
+    // before the first of them starts. Output the group already wrote stays
+    // readable from the pipes after this SIGKILL.
     if let Some(reaping) = &owned {
         reaping.begin();
     }
-    let terminal = proc.kill_and_reap().await;
+    // Reaping can drain a terminal event raced by the timeout. It remains
+    // lifecycle-inert, but its usage is still durable telemetry.
+    let kind = proc.kind();
+    let (failure, mut captured) = if outcome.is_err() {
+        proc.failed_turn_evidence().await
+    } else {
+        (None, Vec::new())
+    };
+    captured.extend(proc.kill_and_reap().await);
     if let Some(reaping) = owned {
         reaping
             .tracker
             .release(&request.db_path, &reaping.agent)
             .await;
     }
-    Ok(finalize_classifier_turn(
-        kind,
-        terminal,
-        outcome,
-        usage_total,
-    ))
+    let mut turn = finalize_classifier_turn(kind, captured, outcome, usage_total);
+    turn.failure = failure;
+    turn
 }
 
 fn finalize_classifier_turn(
@@ -1808,7 +1885,11 @@ fn finalize_classifier_turn(
             }
         }
     }
-    ClassifierTurnOutcome { response, usage }
+    ClassifierTurnOutcome {
+        response,
+        usage: Some(usage),
+        failure: None,
+    }
 }
 
 /// Journal role for a daemon-owned collector classifier process. Restart
@@ -1838,10 +1919,11 @@ enum Ownership {
     /// The owning task has not started reaping: the leader is unreaped, so
     /// the pgid still names this group and the tracker may signal it.
     Live,
-    /// The owning task entered `RunnerProc::kill_and_reap` (or unwound). The
-    /// tracker SIGKILLed the group at this transition; the leader may be
-    /// reaped at any moment, so only the runner's own recycle-safe kill and
-    /// Drop guard may signal from here on.
+    /// The owning task ended the turn (or unwound). The tracker SIGKILLed the
+    /// group at this transition, before failure evidence or
+    /// `RunnerProc::kill_and_reap` could reap the leader; it may be reaped at
+    /// any moment now, so only the runner's own kill and Drop guard may signal
+    /// from here on.
     Reaping,
     /// The owning task finished reaping; only the journal row remains.
     Reaped,
@@ -2013,11 +2095,12 @@ impl CollectorTracker {
         .map_err(|error| QuorumError::Io(format!("collector journal write failed: {error}")))
     }
 
-    /// Called by the owning task immediately before `kill_and_reap`, with no
-    /// await in between. Under the tracker lock — so it cannot interleave
-    /// with drain's kill pass — SIGKILL the still-owned group and retire its
-    /// pgid from every later tracker signal. Idempotent; a no-op once drain
-    /// took the entry.
+    /// Called by the owning task before any runner call that can reap the
+    /// leader — `failed_turn_evidence` or `kill_and_reap` — with no await in
+    /// between. Under the tracker lock — so it cannot interleave with drain's
+    /// kill pass — SIGKILL the still-owned group and retire its pgid from
+    /// every later tracker signal. Idempotent; a no-op once drain took the
+    /// entry.
     fn begin_reap(&self, agent: &str) {
         if let Some(owned) = self.state().owned.get_mut(agent) {
             if owned.ownership == Ownership::Live {
@@ -2296,14 +2379,14 @@ mod tests {
         ));
         assert_eq!(
             outcome.usage,
-            super::super::runner::TokenUsage {
+            Some(super::super::runner::TokenUsage {
                 input_tokens: 100,
                 uncached_input_tokens: 20,
                 cached_input_tokens: 80,
                 cache_write_input_tokens: 10,
                 output_tokens: 5,
                 reasoning_tokens: 0,
-            },
+            }),
             "terminal usage raced by the timeout must survive final reap"
         );
     }
@@ -3456,11 +3539,285 @@ mod tests {
             codex_sandbox: "danger-full-access".to_string(),
             env_vars,
             tracker: None,
+            routing: None,
         }
     }
 
     async fn run_live(request: &CollectionRequest) -> Result<CollectionOutcome> {
         run_collection_with_inputs(request, synthetic_inputs(request.pr_number), 1000).await
+    }
+
+    /// A collection request whose primary route is a Codex profile and whose
+    /// optional alternate is the Claude-protocol fake agent.
+    #[cfg(unix)]
+    fn routed_collector_request(
+        dir: &std::path::Path,
+        db: &std::path::Path,
+        pr: i64,
+        codex_bin: &std::path::Path,
+        claude_bin: Option<&std::path::Path>,
+    ) -> CollectionRequest {
+        use quorum_core::role_assignments::{AssignmentRequest, ValidatedPool, WeightedProfile};
+
+        let codex = ModelProfile {
+            id: "terra".into(),
+            provider: "codex".into(),
+            runner: "codex".into(),
+            model: "gpt-5.6-terra".into(),
+            effort: "high".into(),
+        };
+        let claude = ModelProfile {
+            id: "haiku".into(),
+            provider: "claude".into(),
+            runner: "claude".into(),
+            model: CLASSIFIER_MODEL.into(),
+            effort: CLASSIFIER_EFFORT.into(),
+        };
+        let mut agent_bins = HashMap::from([(
+            codex.id.clone(),
+            Some(codex_bin.to_string_lossy().into_owned()),
+        )]);
+        let mut profiles = vec![WeightedProfile {
+            profile: codex.clone(),
+            percent: if claude_bin.is_some() { 99 } else { 100 },
+        }];
+        if let Some(bin) = claude_bin {
+            agent_bins.insert(claude.id.clone(), Some(bin.to_string_lossy().into_owned()));
+            profiles.push(WeightedProfile {
+                profile: claude,
+                percent: 1,
+            });
+        }
+        let pool = ValidatedPool {
+            pool_key: "collector".into(),
+            policy_generation: "generation-1".into(),
+            profiles,
+        };
+        let assignment = {
+            let mut conn = db::open(db).unwrap();
+            quorum_core::role_assignments::assign_or_get_with_seed(
+                &mut conn,
+                &AssignmentRequest {
+                    responsibility_key: format!("collector:pr:{pr}"),
+                    task_id: None,
+                    pr_number: Some(pr),
+                    role: "collector".into(),
+                    review_stage: None,
+                    complexity: None,
+                },
+                &pool,
+                7,
+                1,
+            )
+            .unwrap()
+        };
+        assert_eq!(assignment.provider, "codex");
+        let mut request = CollectionRequest::new(
+            pr,
+            None,
+            None,
+            db.to_path_buf(),
+            dir.to_path_buf(),
+            agent_bins[&codex.id].clone(),
+            true,
+        )
+        .with_collector(
+            codex.provider.clone(),
+            codex.runner.clone(),
+            codex.model.clone(),
+            codex.effort.clone(),
+            "danger-full-access",
+        );
+        request.role_assignment_id = Some(assignment.id);
+        request.routing = Some(CollectorRouting {
+            route: super::super::role_failover::RoleRoute {
+                assignment,
+                pool,
+                profile: codex,
+            },
+            agent_bins,
+        });
+        request
+    }
+
+    #[cfg(unix)]
+    fn write_collector_provider(
+        dir: &std::path::Path,
+        name: &str,
+        lines: &[serde_json::Value],
+        read_turn: bool,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let transcript = dir.join(format!("{name}.jsonl"));
+        let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        std::fs::write(&transcript, body).unwrap();
+        let runs = dir.join(format!("{name}-runs"));
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf x >> '{}'\n{}/bin/cat '{}'\nexit 1\n",
+                runs.display(),
+                if read_turn {
+                    "IFS= read -r _turn\n"
+                } else {
+                    ""
+                },
+                transcript.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (path, runs)
+    }
+
+    #[cfg(unix)]
+    fn codex_over_usage_limit(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let message = "You have hit your usage limit";
+        write_collector_provider(
+            dir,
+            "codex",
+            &[
+                serde_json::json!({"type":"error","message":message}),
+                serde_json::json!({"type":"turn.failed","error":{"message":message}}),
+            ],
+            false,
+        )
+    }
+
+    fn collector_alerts(db: &std::path::Path) -> Vec<String> {
+        let conn = db::open(db).unwrap();
+        let mut statement = conn
+            .prepare("SELECT body FROM messages WHERE kind='alert' AND recipient='owner'")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collector_provider_outage_moves_to_the_second_profile_and_collects() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let (codex, codex_runs) = codex_over_usage_limit(dir.path());
+        let (claude, claude_runs) = write_collector_provider(
+            dir.path(),
+            "claude",
+            &[serde_json::json!({
+                "type":"result",
+                "is_error":false,
+                "result":response(vec![finding("blocking", 101)], vec![]),
+            })],
+            true,
+        );
+        let request = routed_collector_request(dir.path(), &db, 420, &codex, Some(&claude));
+
+        let outcome = run_live(&request).await.unwrap();
+
+        assert_eq!(outcome.status, RunStatus::Success);
+        assert_eq!(outcome.findings_count, 1);
+        assert_eq!(std::fs::read(&codex_runs).unwrap().len(), 1);
+        assert_eq!(std::fs::read(&claude_runs).unwrap().len(), 1);
+        let conn = db::open(&db).unwrap();
+        let run = review_findings::get_run(&conn, 420).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Success);
+        assert_eq!(
+            run.collector_model, CLASSIFIER_MODEL,
+            "the run row must name the route that produced it"
+        );
+        assert_eq!(
+            run.role_assignment_id, None,
+            "the assignment names the failed route"
+        );
+        let attempts = quorum_core::routing_attempts::list(&conn, "collector:pr:420").unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].profile.id, "terra");
+        assert_eq!(
+            attempts[0].failure_disposition,
+            Some(super::super::runner::FailureDisposition::ProviderUnavailable)
+        );
+        assert!(collector_alerts(&db).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collector_single_provider_pool_alerts_once_and_records_a_failed_run() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let (codex, codex_runs) = codex_over_usage_limit(dir.path());
+        let request = routed_collector_request(dir.path(), &db, 421, &codex, None);
+
+        for attempt in 1..=2 {
+            let error = run_live(&request).await.unwrap_err();
+            assert!(error.to_string().contains("collector classifier failed"));
+            assert_eq!(
+                std::fs::read(&codex_runs).unwrap().len(),
+                attempt,
+                "each collection runs the only route exactly once"
+            );
+        }
+
+        let alerts = collector_alerts(&db);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert!(alerts[0].contains("collector blocked"), "{alerts:?}");
+        assert!(alerts[0].contains("[routing.collector]"), "{alerts:?}");
+        assert!(alerts[0].contains("dead-letters after 5"), "{alerts:?}");
+        assert!(!alerts[0].contains("stays pending"), "{alerts:?}");
+        let conn = db::open(&db).unwrap();
+        let run = review_findings::get_run(&conn, 421).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.collector_model, "gpt-5.6-terra");
+        assert_eq!(
+            run.role_assignment_id, request.role_assignment_id,
+            "a failure on the assigned route keeps its assignment link"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collector_with_both_providers_unavailable_runs_each_route_once() {
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let (codex, codex_runs) = codex_over_usage_limit(dir.path());
+        let (claude, claude_runs) = write_collector_provider(
+            dir.path(),
+            "claude",
+            &[
+                serde_json::json!({
+                    "type":"assistant","error":"credit_balance_too_low",
+                    "message":{"content":[]}
+                }),
+                serde_json::json!({
+                    "type":"result","is_error":true,"result":"Credit balance is too low"
+                }),
+            ],
+            true,
+        );
+        let request = routed_collector_request(dir.path(), &db, 422, &codex, Some(&claude));
+
+        run_live(&request).await.unwrap_err();
+
+        assert_eq!(std::fs::read(&codex_runs).unwrap().len(), 1);
+        assert_eq!(std::fs::read(&claude_runs).unwrap().len(), 1);
+        let conn = db::open(&db).unwrap();
+        let run = review_findings::get_run(&conn, 422).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.collector_model, CLASSIFIER_MODEL);
+        assert_eq!(
+            quorum_core::routing_attempts::list(&conn, "collector:pr:422")
+                .unwrap()
+                .len(),
+            2
+        );
+        let alerts = collector_alerts(&db);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert!(alerts[0].contains("every provider"), "{alerts:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3902,6 +4259,7 @@ mod tests {
             codex_sandbox: "danger-full-access".to_string(),
             env_vars: vec![],
             tracker: None,
+            routing: None,
         };
         let result = run_collection(&retry).await;
 
@@ -4726,6 +5084,83 @@ esac
         run_live(&request).await.unwrap();
         assert!(tracker.state().owned.is_empty());
         assert!(rows_with_role(&db, JOURNAL_ROLE).is_empty());
+    }
+
+    /// A provider that already exited is the normal outage path. Its leader
+    /// is a zombie when the failure record arrives, and a descendant keeps the
+    /// pipes open, so failure evidence reaps the leader and would then wait on
+    /// the pipes. The tracker must never hold `Live` for a reaped leader: drain
+    /// and `begin_reap` would signal a number the kernel may have reused.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tracked_failure_evidence_never_reaps_a_live_owned_leader() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = setup_git_dir();
+        let db = dir.path().join("q.db");
+        let _ = db::open(&db).unwrap();
+        let (codex, _) = codex_over_usage_limit(dir.path());
+        let transcript = dir.path().join("codex.jsonl");
+        std::fs::write(
+            &codex,
+            format!(
+                "#!/bin/sh\n(sleep 0.2; /bin/cat '{}'; exec sleep 300) &\nexit 1\n",
+                transcript.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let tracker = CollectorTracker::default();
+        let mut request = routed_collector_request(dir.path(), &db, 516, &codex, None);
+        request.tracker = Some(tracker.clone());
+        let turn = tokio::spawn(async move { run_live(&request).await });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut adopted = false;
+        while !turn.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "turn never finished");
+            let pgid = tracker
+                .state()
+                .owned
+                .values()
+                .next()
+                .map(|owned| owned.pgid);
+            if let Some(pgid) = pgid {
+                adopted = true;
+                // Probe before reading the state: ownership only ever leaves
+                // `Live`, so a gone leader seen with `Live` afterwards is a
+                // real violation, never an interleaving of the hand-off. A
+                // zombie still answers this probe; only a reaped leader fails.
+                let reaped = unsafe { libc::kill(pgid, 0) } != 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+                if reaped {
+                    let still_live = tracker
+                        .state()
+                        .owned
+                        .values()
+                        .any(|owned| owned.ownership == Ownership::Live);
+                    assert!(!still_live, "leader reaped while its pgid was still Live");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(adopted, "the sampler must have seen the tracked process");
+
+        turn.await.unwrap().unwrap_err();
+        assert!(tracker.state().owned.is_empty());
+        assert!(rows_with_role(&db, JOURNAL_ROLE).is_empty());
+        let conn = db::open(&db).unwrap();
+        let attempts = quorum_core::routing_attempts::list(&conn, "collector:pr:516").unwrap();
+        assert_eq!(
+            attempts.len(),
+            1,
+            "the hand-off must keep the record that classifies the outage"
+        );
+        assert_eq!(
+            attempts[0].failure_disposition,
+            Some(super::super::runner::FailureDisposition::ProviderUnavailable)
+        );
     }
 
     // ── Shutdown-path matrix: real tick loop, live doctor + live collector ─
