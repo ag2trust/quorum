@@ -16045,6 +16045,14 @@ async fn tick(
     order_reviewer_teardowns(&mut reviewer_fallback_teardowns);
     for (i, end_reason) in reviewer_fallback_teardowns.into_iter().rev() {
         let dead = reviewers.remove(i);
+        strike_reviewer_unclassified_teardown(
+            config,
+            unrecordable,
+            reviewer_respawn_backoff,
+            end_reason,
+            &dead,
+        )
+        .await;
         teardown_reviewer(config, wt_mgr, name_pool, dead, end_reason).await;
     }
 
@@ -22057,13 +22065,57 @@ async fn record_reviewer_provision_strike(
     role: &str,
     head_sha: &str,
 ) -> Result<i64> {
+    record_reviewer_strike(config, unrecordable, task_id, pr, role, head_sha, None).await
+}
+
+/// Record a provider-caused reviewer strike while preserving its bounded
+/// diagnostic on the same durable row as the attempt count.
+async fn record_reviewer_provider_failure_strike(
+    config: &ServeConfig,
+    unrecordable: &mut UnrecordableStrikes,
+    task_id: i64,
+    pr: i64,
+    role: &str,
+    head_sha: &str,
+    provider_error: &str,
+) -> Result<i64> {
+    record_reviewer_strike(
+        config,
+        unrecordable,
+        task_id,
+        pr,
+        role,
+        head_sha,
+        Some(provider_error),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_reviewer_strike(
+    config: &ServeConfig,
+    unrecordable: &mut UnrecordableStrikes,
+    task_id: i64,
+    pr: i64,
+    role: &str,
+    head_sha: &str,
+    provider_error: Option<&str>,
+) -> Result<i64> {
     let role_str = role.to_string();
     let sha = head_sha.to_string();
+    let provider_error = provider_error.map(str::to_string);
     let recorded = {
         let p = config.db_path.clone();
         match tokio::task::spawn_blocking(move || -> Result<i64> {
             let mut conn = quorum_core::db::open(&p)?;
-            quorum_core::provision_attempts::record_attempt(&mut conn, task_id, pr, &role_str, &sha)
+            match provider_error {
+                Some(error) => quorum_core::provision_attempts::record_provider_failure(
+                    &mut conn, task_id, pr, &role_str, &sha, &error,
+                ),
+                None => quorum_core::provision_attempts::record_attempt(
+                    &mut conn, task_id, pr, &role_str, &sha,
+                ),
+            }
         })
         .await
         {
@@ -22127,6 +22179,112 @@ async fn record_reviewer_provision_strike(
         ));
     }
     Ok(strikes)
+}
+
+/// Burn one per-head strike for an unclassified terminal reviewer turn before
+/// teardown closes the exact agent run. First-turn failures can precede the
+/// slot's in-memory PR/head fields, so recover either missing value from the
+/// immutable launch evidence persisted on that run.
+async fn strike_reviewer_unclassified_teardown(
+    config: &ServeConfig,
+    unrecordable: &mut UnrecordableStrikes,
+    respawn_backoff: &mut ReviewerRespawnBackoff,
+    end_reason: &str,
+    dead: &SlotState,
+) {
+    if end_reason != "turn-error-unclassified" {
+        return;
+    }
+
+    let role = if dead.r2_origin { "r2" } else { "r1" };
+    let mut pr = dead.pr;
+    let mut head_sha = dead.reviewed_head_sha.clone();
+    if pr.is_none() || head_sha.is_none() {
+        let Some(run_id) = dead.agent_run_id else {
+            log(&format!(
+                "reviewer {} ended turn-error-unclassified for task #{} without slot PR/head or an agent run id; cannot record a durable strike",
+                dead.agent_name, dead.task_id,
+            ));
+            return;
+        };
+        let p = config.db_path.clone();
+        let task_id = dead.task_id;
+        let agent_name = dead.agent_name.clone();
+        let launch = tokio::task::spawn_blocking(
+            move || -> Result<Option<(Option<i64>, Option<String>)>> {
+                let conn = quorum_core::db::open(&p)?;
+                Ok(conn
+                    .query_row(
+                        "SELECT review_pr,review_head_sha FROM agent_runs \
+                     WHERE id=?1 AND task_id=?2 AND agent_name=?3 AND role='reviewer'",
+                        rusqlite::params![run_id, task_id, agent_name],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?)
+            },
+        )
+        .await;
+        match launch {
+            Ok(Ok(Some((run_pr, run_head_sha)))) => {
+                pr = pr.or(run_pr);
+                head_sha = head_sha.or(run_head_sha);
+            }
+            Ok(Ok(None)) => {
+                log(&format!(
+                    "reviewer {} ended turn-error-unclassified for task #{} but exact agent run #{run_id} has no durable reviewer launch; cannot record a strike",
+                    dead.agent_name, dead.task_id,
+                ));
+                return;
+            }
+            Ok(Err(error)) => {
+                log(&format!(
+                    "reviewer {} ended turn-error-unclassified for task #{} but durable launch lookup for agent run #{run_id} failed: {error}; cannot record a strike",
+                    dead.agent_name, dead.task_id,
+                ));
+                return;
+            }
+            Err(error) => {
+                log(&format!(
+                    "reviewer {} ended turn-error-unclassified for task #{} but durable launch lookup for agent run #{run_id} could not join: {error}; cannot record a strike",
+                    dead.agent_name, dead.task_id,
+                ));
+                return;
+            }
+        }
+    }
+
+    let (Some(pr), Some(head_sha)) = (pr, head_sha) else {
+        log(&format!(
+            "reviewer {} ended turn-error-unclassified for task #{} but neither slot nor durable agent run supplied a complete PR/head; cannot record a strike",
+            dead.agent_name, dead.task_id,
+        ));
+        return;
+    };
+    let provider_error = dead
+        .last_error_text
+        .as_deref()
+        .unwrap_or("reviewer turn ended with an unclassified error");
+    // An unrecordable strike is already loud and counted by the common
+    // in-memory backstop; still pause so this failure cannot respawn per tick.
+    let strikes = record_reviewer_provider_failure_strike(
+        config,
+        unrecordable,
+        dead.task_id,
+        pr,
+        role,
+        &head_sha,
+        provider_error,
+    )
+    .await
+    .unwrap_or(1);
+    let delay = respawn_backoff.record(dead.task_id, pr, strikes, std::time::Instant::now());
+    log(&format!(
+        "reviewer {} ended turn-error-unclassified for task #{} PR #{pr} head {head_sha}: recorded a {role_label} provider-failure strike and deferring the next provision by {:.1}s",
+        dead.agent_name,
+        dead.task_id,
+        delay.as_secs_f64(),
+        role_label = role.to_uppercase(),
+    ));
 }
 
 /// A reviewer process that exited while it still owned the review and had
@@ -35475,6 +35633,7 @@ mod tests {
         task_id: i64,
         initial_run: i64,
         responsibility: String,
+        backoff_armed: bool,
         reviewers: Vec<SlotState>,
     }
 
@@ -35611,6 +35770,21 @@ mod tests {
             },
         )
         .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER require_unclassified_strike_before_run_close
+             BEFORE UPDATE OF ended_at ON agent_runs
+             WHEN NEW.end_reason='turn-error-unclassified'
+               AND NOT EXISTS (
+                 SELECT 1 FROM reviewer_provision_attempts
+                 WHERE task_id=NEW.task_id AND pr_number=NEW.review_pr
+                   AND role=CASE WHEN NEW.sub_role='r2' THEN 'r2' ELSE 'r1' END
+                   AND head_sha=NEW.review_head_sha AND attempts > 0
+               )
+             BEGIN
+               SELECT RAISE(ABORT, 'unclassified reviewer run closed before durable strike');
+             END;",
+        )
+        .unwrap();
         drop(conn);
 
         let stream = root.join("failed-turn.jsonl");
@@ -35733,11 +35907,13 @@ mod tests {
         )
         .await
         .unwrap();
+        let backoff_armed = reviewer_respawn_backoff.blocks(task_id, 77, std::time::Instant::now());
         CodexReviewerFailureTick {
             db_path: config.db_path.clone(),
             task_id,
             initial_run,
             responsibility,
+            backoff_armed,
             reviewers,
         }
     }
@@ -35859,10 +36035,36 @@ mod tests {
         );
 
         assert!(outcome.reviewers.is_empty());
+        assert!(
+            outcome.backoff_armed,
+            "the same tick must arm the reviewer respawn pause"
+        );
         let conn = quorum_core::db::open(&outcome.db_path).unwrap();
         assert_eq!(
             agent_run_end_reason(&conn, outcome.initial_run).as_deref(),
             Some("turn-error-unclassified"),
+        );
+        assert_eq!(
+            quorum_core::provision_attempts::get_attempts(
+                &conn,
+                outcome.task_id,
+                77,
+                "r1",
+                &"a".repeat(40),
+            )
+            .unwrap(),
+            1,
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT last_provider_error FROM reviewer_provision_attempts
+                 WHERE task_id=?1 AND pr_number=77 AND role='r1'",
+                [outcome.task_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .as_deref(),
+            Some("You’ve hit your rate limit. Try again in 20s."),
         );
         assert_eq!(
             conn.query_row(
@@ -45558,6 +45760,121 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             ProvisionDecision::Needed("r1"),
             "a new head clears the per-head strikes"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unclassified_reviewer_turn_strikes_backoffs_and_exhausts_from_durable_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("unclassified-strikes.db");
+        let (config, task_id, run_id, agent) = seed_reviewer_fallback_failure_fixture(&db_path);
+        let mut dead = failed_reviewer_fallback_test_slot(task_id, run_id, agent);
+        dead.pr = None;
+        dead.reviewed_head_sha = None;
+        dead.last_error_text = Some("provider first turn exploded".into());
+        let head_sha = "a".repeat(40);
+        let mut unrecordable = UnrecordableStrikes::new();
+        let mut backoff = ReviewerRespawnBackoff::new();
+
+        for strike in 1..=MAX_REVIEWER_PROVISION_STRIKES as i64 {
+            strike_reviewer_unclassified_teardown(
+                &config,
+                &mut unrecordable,
+                &mut backoff,
+                "turn-error-unclassified",
+                &dead,
+            )
+            .await;
+
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            assert_eq!(
+                quorum_core::provision_attempts::get_attempts(&conn, task_id, 77, "r1", &head_sha,)
+                    .unwrap(),
+                strike,
+                "the first-turn slot must recover its PR/head from agent_runs",
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT last_provider_error FROM reviewer_provision_attempts
+                     WHERE task_id=?1 AND pr_number=77 AND role='r1'",
+                    [task_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+                .as_deref(),
+                Some("provider first turn exploded"),
+            );
+            drop(conn);
+            assert!(
+                backoff.blocks(task_id, 77, std::time::Instant::now()),
+                "strike {strike} must pause the next orphan provision pass",
+            );
+        }
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            decide_provision(&conn, task_id, 77, &head_sha).unwrap(),
+            ProvisionDecision::Exhausted,
+        );
+        let mut fresh_backoff = ReviewerRespawnBackoff::new();
+        assert!(
+            !fresh_backoff.blocks(task_id, 77, std::time::Instant::now()),
+            "in-memory backoff is intentionally empty after restart",
+        );
+        assert_eq!(
+            decide_provision(&conn, task_id, 77, &head_sha).unwrap(),
+            ProvisionDecision::Exhausted,
+            "durable strikes alone bound respawns after a daemon restart",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ownership_transferred_unclassified_teardown_records_no_strike_or_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("unclassified-verdict-race.db");
+        let (config, task_id, run_id, agent) = seed_reviewer_fallback_failure_fixture(&db_path);
+        let dead = failed_reviewer_fallback_test_slot(task_id, run_id, agent.clone());
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::apply_event(
+                &mut conn,
+                &agent,
+                task_id,
+                &Event::VerdictChanges,
+                now_unix(),
+            )
+            .unwrap();
+        }
+        let end_reason = fail_reviewer_for_unclassified_turn(&db_path, &dead)
+            .await
+            .expect("the processed racing verdict transferred ownership");
+        assert_eq!(end_reason, "ownership_transferred");
+
+        let mut unrecordable = UnrecordableStrikes::new();
+        let mut backoff = ReviewerRespawnBackoff::new();
+        strike_reviewer_unclassified_teardown(
+            &config,
+            &mut unrecordable,
+            &mut backoff,
+            end_reason,
+            &dead,
+        )
+        .await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            quorum_core::provision_attempts::get_attempts(
+                &conn,
+                task_id,
+                77,
+                "r1",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap(),
+            0,
+        );
+        assert!(!backoff.blocks(task_id, 77, std::time::Instant::now()));
     }
 
     #[test]
