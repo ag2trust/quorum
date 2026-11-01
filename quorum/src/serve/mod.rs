@@ -8490,6 +8490,15 @@ fn planned_children(
         .collect()
 }
 
+/// Task ids with a live worker or reviewer slot in this coordinator tick.
+fn live_slot_task_ids(workers: &[SlotState], reviewers: &[SlotState]) -> Vec<i64> {
+    workers
+        .iter()
+        .chain(reviewers)
+        .map(|slot| slot.task_id)
+        .collect()
+}
+
 /// Advance at most one durable decomposition coordinator. Returns whether the
 /// repository planning freeze is active after this tick.
 async fn tick_decomposition(
@@ -8976,6 +8985,25 @@ async fn tick_decomposition(
 
     if snapshot.state == "provider-backoff" {
         if now_unix() - snapshot.updated_at >= DECOMPOSITION_PROVIDER_BACKOFF_SECS {
+            // A freeze reacquired over an idle provider-blocked task could only
+            // drain until the next release, so hold here without touching the
+            // graph: the backoff window is far shorter than a provider block.
+            let live_task_ids = live_slot_task_ids(workers, reviewers);
+            let path = config.db_path.clone();
+            let source_task_id = snapshot.source_task_id;
+            let idle_blocked = tokio::task::spawn_blocking(move || -> Result<bool> {
+                let conn = quorum_core::db::open(&path)?;
+                let blocked = quorum_core::decomposition::provider_blocked_started_task_ids(
+                    &conn,
+                    source_task_id,
+                )?;
+                Ok(blocked.iter().any(|id| !live_task_ids.contains(id)))
+            })
+            .await
+            .map_err(|error| QuorumError::Io(format!("provider block query join: {error}")))??;
+            if idle_blocked {
+                return Ok(false);
+            }
             // A provider failure released this graph's freeze and cleared its
             // SHA. The cached archive can no longer be reused, and its
             // durable recovery marker must not count as in-flight work while
@@ -9009,6 +9037,36 @@ async fn tick_decomposition(
         let conn = quorum_core::db::open(&config.db_path)?;
         quorum_core::tasks::count_started_non_terminal_excluding(&conn, snapshot.source_task_id)?
     };
+    // Tasks waiting on `task-retry` cannot finish by themselves, so a drain
+    // held only by them would freeze the repository indefinitely. They stay in
+    // the count above: the frozen base is captured only after a real drain.
+    if matches!(snapshot.state.as_str(), "freeze-requested" | "draining")
+        && started_non_terminal > 0
+    {
+        let live_task_ids = live_slot_task_ids(workers, reviewers);
+        let path = config.db_path.clone();
+        let graph_id = snapshot.graph_id;
+        let released = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let mut conn = quorum_core::db::open(&path)?;
+            quorum_core::decomposition::release_freeze_for_provider_block(
+                &mut conn,
+                graph_id,
+                &live_task_ids,
+                now_unix(),
+            )
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("provider block release join: {error}")))??;
+        if released {
+            log(&format!(
+                "graph {graph_id}: released the planning freeze; only provider-blocked \
+                 tasks are holding the drain"
+            ));
+            // The freeze was held when this tick began, so its remaining
+            // phases stay frozen; the next tick reports the release.
+            return Ok(true);
+        }
+    }
     if snapshot.state == "freeze-requested" {
         let path = config.db_path.clone();
         let graph_id = snapshot.graph_id;
@@ -60199,6 +60257,424 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             )
             .unwrap();
         assert_eq!(state, ("planning".into(), true, Some(expected_sha)));
+    }
+
+    /// Durable freeze facts a provider-block release must change or preserve.
+    #[derive(Debug, PartialEq)]
+    struct FreezeRow {
+        state: String,
+        freeze_active: bool,
+        frozen_base_sha: Option<String>,
+        provider_failures: i64,
+        proposal_attempts: i64,
+        updated_at: i64,
+    }
+
+    #[cfg(unix)]
+    impl LifecycleHarness {
+        /// Return the graph to a pre-bind freeze phase with visible budgets and
+        /// a backdated `updated_at`.
+        fn enter_freeze_phase(&self, phase: &str) {
+            let conn = quorum_core::db::open(&self.db_path).unwrap();
+            conn.execute(
+                "UPDATE task_decompositions
+                 SET state=?2,provider_failures=1,proposal_attempts=1,updated_at=5
+                 WHERE id=?1",
+                rusqlite::params![self.graph, phase],
+            )
+            .unwrap();
+        }
+
+        fn add_task(&self, status: &str, refs: Option<&str>) -> i64 {
+            let mut conn = quorum_core::db::open(&self.db_path).unwrap();
+            let task = tasks::create(
+                &mut conn,
+                "owner",
+                "other work",
+                None,
+                1,
+                None,
+                None,
+                None,
+                None,
+                6,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status=?2,refs=?3 WHERE id=?1",
+                rusqlite::params![task, status, refs],
+            )
+            .unwrap();
+            task
+        }
+
+        async fn add_provider_blocked_task(&self, status: &str) -> i64 {
+            let task = self.add_task(status, None);
+            persist_runner_provider_block(&self.db_path, task, "quota", &dead_codex_retry())
+                .await
+                .unwrap();
+            task
+        }
+
+        fn retry_provider_block(&self, task: i64) {
+            let mut conn = quorum_core::db::open(&self.db_path).unwrap();
+            assert!(
+                tasks::retry_provider_blocked(&mut conn, task, "operator", now_unix())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        fn finish_task(&self, task: i64) {
+            let conn = quorum_core::db::open(&self.db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='done',assignee=NULL WHERE id=?1",
+                [task],
+            )
+            .unwrap();
+        }
+
+        /// Move a released graph past its backoff window.
+        fn expire_backoff(&self) {
+            let conn = quorum_core::db::open(&self.db_path).unwrap();
+            conn.execute(
+                "UPDATE task_decompositions SET updated_at=5 WHERE id=?1",
+                [self.graph],
+            )
+            .unwrap();
+        }
+
+        fn freeze_row(&self) -> FreezeRow {
+            let conn = quorum_core::db::open(&self.db_path).unwrap();
+            conn.query_row(
+                "SELECT state,freeze_active,frozen_base_sha,provider_failures,
+                        proposal_attempts,updated_at
+                 FROM task_decompositions WHERE id=?1",
+                [self.graph],
+                |row| {
+                    Ok(FreezeRow {
+                        state: row.get(0)?,
+                        freeze_active: row.get(1)?,
+                        frozen_base_sha: row.get(2)?,
+                        provider_failures: row.get(3)?,
+                        proposal_attempts: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .unwrap()
+        }
+
+        fn claim_task(&self, task: i64) -> Option<tasks::Task> {
+            let mut conn = quorum_core::db::open(&self.db_path).unwrap();
+            tasks::claim(&mut conn, "next", Some(task), &[], 60, now_unix()).unwrap()
+        }
+
+        fn classifier_queue_ids(&self, frozen: bool) -> Vec<i64> {
+            let conn = quorum_core::db::open(&self.db_path).unwrap();
+            classifier_queue(&conn, frozen)
+                .unwrap()
+                .0
+                .iter()
+                .map(|task| task.id)
+                .collect()
+        }
+
+        async fn tick_with_slots(
+            &self,
+            coordinator: &mut DecompositionCoordinator,
+            workers: &[SlotState],
+            reviewers: &[SlotState],
+        ) -> bool {
+            tick_decomposition(
+                &self.config,
+                coordinator,
+                workers,
+                reviewers,
+                DecompositionLiveWork::default(),
+            )
+            .await
+            .unwrap()
+        }
+
+        /// Walk a reacquired graph through a real drain into `planning`.
+        async fn assert_real_drain_reaches_planning(
+            &self,
+            coordinator: &mut DecompositionCoordinator,
+        ) {
+            assert_eq!(self.freeze_row().state, "freeze-requested");
+            assert!(self.freeze_row().freeze_active);
+            assert!(self.tick(coordinator).await);
+            assert_eq!(self.freeze_row().state, "draining");
+            assert!(self.tick(coordinator).await);
+            let expected = repository_head_sha(&self.config.repo_dir).await.unwrap();
+            let row = self.freeze_row();
+            assert_eq!(row.state, "planning");
+            assert_eq!(row.frozen_base_sha, Some(expected));
+        }
+    }
+
+    /// A slot holding `task_id`, for live-worker and live-reviewer negatives.
+    #[cfg(unix)]
+    async fn live_slot_for(task_id: i64) -> SlotState {
+        let mut slot = make_dummy_slot_async().await;
+        slot.task_id = task_id;
+        slot
+    }
+
+    /// The owner-visible defect: a repository draining behind nothing but
+    /// provider-blocked work must unfreeze, from either pre-bind phase, without
+    /// spending a planning budget.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_provider_block_releases_freeze_and_reopens_dispatch() {
+        for phase in ["freeze-requested", "draining"] {
+            let harness = lifecycle_harness("provider-block-release");
+            harness.enter_freeze_phase(phase);
+            harness.add_provider_blocked_task("rework").await;
+            let unclassified = harness.add_task("open", None);
+            let classified = harness.add_task(
+                "open",
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+            );
+            assert!(!harness.classifier_queue_ids(true).contains(&unclassified));
+            assert!(harness.claim_task(classified).is_none(), "{phase} freezes");
+
+            let mut coordinator = DecompositionCoordinator::default();
+            assert!(harness.tick(&mut coordinator).await, "{phase}");
+            let row = harness.freeze_row();
+            assert_eq!(row.state, "provider-backoff", "{phase}");
+            assert!(!row.freeze_active, "{phase}");
+            assert_eq!(row.frozen_base_sha, None, "{phase}");
+            assert_eq!((row.provider_failures, row.proposal_attempts), (1, 1));
+            let attempts: i64 = quorum_core::db::open(&harness.db_path)
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM decomposition_attempts WHERE graph_id=?1",
+                    [harness.graph],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(attempts, 0, "a release is a wait, not an attempt");
+
+            let frozen = harness.tick(&mut coordinator).await;
+            assert!(!frozen, "the next tick reports the repository unfrozen");
+            assert!(harness.classifier_queue_ids(frozen).contains(&unclassified));
+            assert_eq!(harness.claim_task(classified).unwrap().id, classified);
+        }
+    }
+
+    /// DECOMPOSITION_PROVIDER_BACKOFF_SECS is 5, so without the guard the
+    /// freeze would flap on every expiry. Unrelated started work must not hide
+    /// the block, and the waiting tick must not touch the graph.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_block_holds_reacquire_until_retry_then_a_real_drain_plans() {
+        let harness = lifecycle_harness("provider-block-hold");
+        harness.enter_freeze_phase("draining");
+        let blocked = harness.add_provider_blocked_task("rework").await;
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        let unrelated = harness.add_task("working", None);
+
+        harness.expire_backoff();
+        let held = harness.freeze_row();
+        assert_eq!(held.state, "provider-backoff");
+        for _ in 0..3 {
+            assert!(!harness.tick(&mut coordinator).await);
+            assert_eq!(harness.freeze_row(), held);
+        }
+
+        harness.retry_provider_block(blocked);
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(harness.freeze_row().state, "freeze-requested");
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(harness.freeze_row().state, "draining");
+
+        // Started work still holds the drain, so the base is not captured yet.
+        assert!(harness.tick(&mut coordinator).await);
+        let row = harness.freeze_row();
+        assert_eq!(
+            (row.state.as_str(), row.frozen_base_sha),
+            ("draining", None)
+        );
+
+        harness.finish_task(blocked);
+        harness.finish_task(unrelated);
+        assert!(harness.tick(&mut coordinator).await);
+        let expected = repository_head_sha(&harness.config.repo_dir).await.unwrap();
+        let row = harness.freeze_row();
+        assert_eq!(row.state, "planning");
+        assert_eq!(row.frozen_base_sha, Some(expected));
+        assert_eq!((row.provider_failures, row.proposal_attempts), (1, 1));
+    }
+
+    /// The guard belongs to the state, not to this release: an ordinary planner
+    /// provider failure waits too, keeps its cached view while waiting, and
+    /// then runs the existing cleanup exactly once the block clears.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_provider_failure_backoff_also_waits_for_provider_block() {
+        let harness = lifecycle_harness("provider-failure-block-hold");
+        let snapshot = {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            load_planning_snapshot(&conn).unwrap().unwrap()
+        };
+        let mut coordinator = DecompositionCoordinator::default();
+        let view = retain_cached_frozen_planner_view(&harness.config, &mut coordinator, &snapshot)
+            .await
+            .unwrap();
+        let blocked = harness.add_provider_blocked_task("rework").await;
+        {
+            let mut conn = quorum_core::db::open(&harness.db_path).unwrap();
+            assert!(quorum_core::decomposition::record_attempt(
+                &mut conn,
+                harness.graph,
+                "provider",
+                "planner-provider",
+                "bounded provider failure",
+                5,
+            )
+            .unwrap()
+            .is_some());
+        }
+        let held = harness.freeze_row();
+        assert_eq!(held.state, "provider-backoff");
+
+        assert!(!harness.tick(&mut coordinator).await);
+        assert_eq!(harness.freeze_row(), held);
+        assert!(view.exists());
+
+        harness.retry_provider_block(blocked);
+        harness.finish_task(blocked);
+        assert!(harness.tick(&mut coordinator).await);
+        assert!(coordinator.frozen_view.is_none());
+        assert!(!view.exists());
+        harness
+            .assert_real_drain_reaches_planning(&mut coordinator)
+            .await;
+    }
+
+    /// A provider-blocked task whose slot is still live may yet land work, so
+    /// it holds the drain like any other started task, and a slot on either
+    /// role counts. Once the last slot leaves, the same graph releases.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_blocked_task_with_live_slot_keeps_holding_the_drain() {
+        let harness = lifecycle_harness("provider-block-live-slot");
+        harness.enter_freeze_phase("draining");
+        let blocked = harness.add_provider_blocked_task("rework").await;
+        let held = harness.freeze_row();
+        let slots = [live_slot_for(blocked).await];
+        let mut coordinator = DecompositionCoordinator::default();
+
+        assert!(harness.tick_with_slots(&mut coordinator, &slots, &[]).await);
+        assert_eq!(harness.freeze_row(), held);
+        assert!(harness.tick_with_slots(&mut coordinator, &[], &slots).await);
+        assert_eq!(harness.freeze_row(), held);
+
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(harness.freeze_row().state, "provider-backoff");
+    }
+
+    /// Only an idle provider block is a reason to stay out of the freeze: a
+    /// blocked task that still has a slot does not hold a reacquire.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_backoff_reacquires_over_a_blocked_task_with_a_live_slot() {
+        let harness = lifecycle_harness("provider-block-live-slot-backoff");
+        harness.enter_freeze_phase("provider-backoff");
+        {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            conn.execute(
+                "UPDATE task_decompositions SET freeze_active=0,frozen_base_sha=NULL WHERE id=?1",
+                [harness.graph],
+            )
+            .unwrap();
+        }
+        let blocked = harness.add_provider_blocked_task("rework").await;
+        let slots = [live_slot_for(blocked).await];
+        let mut coordinator = DecompositionCoordinator::default();
+
+        assert!(harness.tick_with_slots(&mut coordinator, &[], &slots).await);
+        let row = harness.freeze_row();
+        assert_eq!(row.state, "freeze-requested");
+        assert!(row.freeze_active);
+    }
+
+    /// Ordinary rework, a parked task, and a mix with one provider block can
+    /// all still finish or need another owner, so each keeps today's drain.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_holders_other_than_provider_blocks_do_not_release_the_freeze() {
+        for (name, status, refs, with_block) in [
+            ("ordinary-rework", "rework", None, false),
+            (
+                "parked",
+                "working",
+                Some(r#"{"daemon_parked":true,"daemon_parked_reason":"held"}"#),
+                false,
+            ),
+            ("mixed", "rework", None, true),
+        ] {
+            let harness = lifecycle_harness(name);
+            harness.enter_freeze_phase("draining");
+            harness.add_task(status, refs);
+            if with_block {
+                harness.add_provider_blocked_task("rework").await;
+            }
+            let held = harness.freeze_row();
+            let mut coordinator = DecompositionCoordinator::default();
+            for _ in 0..2 {
+                assert!(harness.tick(&mut coordinator).await, "{name}");
+                assert_eq!(harness.freeze_row(), held, "{name}");
+            }
+        }
+
+        let harness = lifecycle_harness("freeze-requested-holder");
+        harness.enter_freeze_phase("freeze-requested");
+        harness.add_task("rework", None);
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        let row = harness.freeze_row();
+        assert_eq!(row.state, "draining", "the ordinary advance is unchanged");
+        assert!(row.freeze_active);
+    }
+
+    /// The released state is fully durable: a restarted coordinator with empty
+    /// slots neither refreezes nor forgets the wait.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn released_provider_block_survives_restart_until_it_clears() {
+        let harness = lifecycle_harness("provider-block-restart");
+        harness.enter_freeze_phase("draining");
+        let blocked = harness.add_provider_blocked_task("rework").await;
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        drop(coordinator);
+
+        harness.expire_backoff();
+        let held = harness.freeze_row();
+        let mut coordinator = DecompositionCoordinator::default();
+        let startup_state = reconcile_decomposition_startup(&harness.config, &mut coordinator)
+            .await
+            .unwrap();
+        assert_eq!(startup_state, StartupDecompositionState::None);
+        assert!(!startup_state.defers_lifecycle_recovery());
+        assert_eq!(coordinator.graph_id, Some(harness.graph));
+        for _ in 0..2 {
+            assert!(!harness.tick(&mut coordinator).await);
+            assert_eq!(harness.freeze_row(), held);
+        }
+
+        harness.retry_provider_block(blocked);
+        harness.finish_task(blocked);
+        assert!(harness.tick(&mut coordinator).await);
+        harness
+            .assert_real_drain_reaches_planning(&mut coordinator)
+            .await;
     }
 
     /// When the selected aggregate switches from graph A (now in provider
