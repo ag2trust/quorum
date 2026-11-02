@@ -1003,7 +1003,7 @@ pub fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<b
 pub fn count_started_non_terminal_excluding(conn: &Connection, exclude_id: i64) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT count(*) FROM tasks
-         WHERE status IN ('working','in-review','rework')
+         WHERE status IN ('working','in-review','rework','merging')
            AND id != ?1",
         params![exclude_id],
         |r| r.get(0),
@@ -3028,7 +3028,7 @@ pub fn invalidate_recovered_sampling_authority(
 }
 
 /// Remove non-authoritative optional-role evidence without consuming the
-/// owner-authorized merge attempt.
+/// admitted durable merge attempt.
 ///
 /// The task must still own the exact `merging + attempting` boundary. Keeping
 /// that marker makes a crash after this repair conservative: startup parks the
@@ -5021,7 +5021,20 @@ pub fn fail_worker_assignment(
         },
         now,
         true,
-        |_| Ok(()),
+        |tx| {
+            // `Merging + AgentFailed` returns to `in-review`, where an
+            // unconsumed replay request is unclaimable and also blocks the
+            // ready-approved handoff. Approvals survive, so dropping the
+            // request lets Phase 5/5b queue a fresh one. An `attempting`
+            // marker stays: that attempt's outcome is uncertain.
+            tx.execute(
+                "UPDATE tasks SET refs=json_remove(refs, '$.daemon_merge_retry')
+                 WHERE id=?1 AND status='in-review' AND json_valid(refs)
+                   AND json_extract(refs, '$.daemon_merge_retry')='requested'",
+                params![id],
+            )?;
+            Ok(())
+        },
     )
     .map(|transition| WorkerFailureOutcome::Applied(Box::new(transition)))
 }
@@ -6701,7 +6714,7 @@ pub fn retry_parked(
     Ok(Some(task))
 }
 
-/// Atomically consume at most one owner-authorized merge replay intent.
+/// Atomically consume at most one durable merge replay intent.
 ///
 /// The transition to `attempting` commits before any network call. If the
 /// daemon crashes after this point, startup parks the uncertain attempt and
@@ -6738,7 +6751,7 @@ pub fn claim_merge_retry(conn: &mut Connection, now: i64) -> Result<Option<Task>
         &tx,
         "merge_retry_started",
         &lease_target(id),
-        "owner-authorized merge replay claimed by daemon",
+        "durable merge replay claimed by daemon",
         now,
     )?;
     let mut task = tx.query_row(
@@ -7478,6 +7491,58 @@ mod tests {
         assert_eq!(transition.task.status, "open");
         assert_eq!(transition.task.recovery_attempts, 1);
         assert_eq!(get(&conn, task_id).unwrap().unwrap(), transition.task);
+    }
+
+    /// `quorum kill` reaches a retained worker through this path. Demoting a
+    /// queued replay must not strand its marker on an `in-review` task.
+    #[test]
+    fn fail_worker_assignment_clears_requested_merge_replay_on_demotion() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 1_000,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks
+             SET status='merging', refs='{\"pr\":7,\"daemon_merge_retry\":\"requested\"}'
+             WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+
+        let outcome =
+            fail_worker_assignment(&mut conn, "worker", task_id, "killed", 1_001).unwrap();
+
+        let WorkerFailureOutcome::Applied(transition) = outcome else {
+            panic!("a merging task must apply AgentFailed");
+        };
+        assert_eq!(transition.task.status, "in-review");
+        let task = get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(MERGE_RETRY_REF).is_none());
+        assert_eq!(refs["pr"], 7);
+    }
+
+    #[test]
+    fn fail_worker_assignment_keeps_uncertain_merge_attempt_marker() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 1_000,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks
+             SET status='merging', refs='{\"pr\":7,\"daemon_merge_retry\":\"attempting\"}'
+             WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+
+        fail_worker_assignment(&mut conn, "worker", task_id, "killed", 1_001).unwrap();
+
+        let task = get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[MERGE_RETRY_REF], MERGE_RETRY_ATTEMPTING);
     }
 
     #[test]
@@ -17482,18 +17547,26 @@ mod tests {
             )
             .unwrap();
         }
+        c.execute(
+            "UPDATE tasks SET refs=json_set(
+                 COALESCE(refs, '{}'), '$.daemon_merge_retry', 'requested'
+             ) WHERE id=?1",
+            params![merging],
+        )
+        .unwrap();
 
-        // working+in-review+rework block; source, open, merging, and terminals do not.
-        assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 3);
+        // Every started non-terminal phase blocks, including an orphan marked
+        // merge handoff; source, open, and terminals do not.
+        assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 4);
 
         // Excluding an actual started task drops its count.
         assert_eq!(
             count_started_non_terminal_excluding(&c, in_review).unwrap(),
-            2
+            3
         );
 
         // Move the last blocker to done → predicate releases (returns 0).
-        for id in [working, rework] {
+        for id in [working, rework, merging] {
             c.execute("UPDATE tasks SET status='done' WHERE id=?1", params![id])
                 .unwrap();
         }

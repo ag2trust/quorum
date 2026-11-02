@@ -710,7 +710,7 @@ fn policy_blocked_merge_parks_task_no_rework() {
     )
     .unwrap();
     assert!(
-        retry_handle.wait_for("PR #1 merged from explicit durable-approval retry", 15),
+        retry_handle.wait_for("PR #1 merged from durable approval replay", 15),
         "retried task never reached a second merge attempt: {:?}",
         retry_handle.lines
     );

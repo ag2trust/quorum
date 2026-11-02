@@ -862,17 +862,18 @@ pub fn bind_frozen_base_and_enter_planning(
     // Bind must recheck drain quiescence atomically: the daemon tick's
     // pre-check reads task status outside this transaction, and a supported
     // operator retry (see `tasks::retry_parked`) can restore a parked task to
-    // `rework`/`in-review` between that read and this update. Refuse the bind
-    // if any started-but-not-terminal task exists other than the planning
-    // source itself, so the drain-to-planning handoff never captures a base
-    // while a merge, remediation, or review is still in flight.
+    // `rework`/`in-review`/`merging` between that read and this update. Refuse
+    // the bind if any started-but-not-terminal task exists other than the
+    // planning source itself, so the drain-to-planning handoff never captures a
+    // base while a merge, remediation, or review is still in flight. This set
+    // must match `tasks::count_started_non_terminal_excluding`.
     let changed = tx.execute(
         "UPDATE task_decompositions SET state='planning',frozen_base_sha=?2,updated_at=?3
          WHERE id=?1 AND state='draining' AND freeze_active=1 AND active=0
            AND frozen_base_sha IS NULL
            AND NOT EXISTS (
                SELECT 1 FROM tasks t
-               WHERE t.status IN ('working','in-review','rework')
+               WHERE t.status IN ('working','in-review','rework','merging')
                  AND t.id != (SELECT g.source_task_id
                               FROM task_decompositions g WHERE g.id=?1)
            )",
@@ -1321,7 +1322,9 @@ pub fn reacquire_freeze(conn: &mut Connection, graph_id: i64, now: i64) -> Resul
 ///
 /// Only [`crate::runner_state::provider_block`] classifies a task as blocked:
 /// a parked task, one blocked for any other reason, or one whose refs do not
-/// parse is absent here and so keeps holding the drain.
+/// parse is absent here and so keeps holding the drain. So is a `merging` task:
+/// it is started work that needs no provider turn to finish, so its PR must
+/// land or fall back before the freeze can move.
 pub fn provider_blocked_started_task_ids(
     conn: &Connection,
     source_task_id: i64,
@@ -5000,9 +5003,14 @@ mod tests {
         conn.execute("UPDATE tasks SET status='rework' WHERE id=2", [])
             .unwrap();
         assert!(!bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 6).unwrap());
+
+        // A retry can restore `merging` too; its approved PR has not landed yet.
+        conn.execute("UPDATE tasks SET status='merging' WHERE id=2", [])
+            .unwrap();
+        assert!(!bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 7).unwrap());
         conn.execute("UPDATE tasks SET status='done' WHERE id=2", [])
             .unwrap();
-        assert!(bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 7).unwrap());
+        assert!(bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 8).unwrap());
     }
 
     #[test]
@@ -11170,6 +11178,38 @@ mod tests {
                 .unwrap();
         }
 
+        assert!(release_freeze_for_provider_block(&mut conn, graph, &[], 50).unwrap());
+    }
+
+    /// An approved handoff stays in `merging` until Phase 4e consumes it, so it
+    /// holds the release exactly as it holds the frozen-base bind, even when
+    /// its refs still carry a provider block from an earlier turn.
+    #[test]
+    fn provider_block_release_refuses_while_a_merge_handoff_holds_the_drain() {
+        let (_dir, mut conn) = file_setup();
+        let graph = frozen_graph(&mut conn, "draining");
+        insert_task(&conn, "rework", Some(BLOCKED_REFS));
+
+        let merging = insert_task(
+            &conn,
+            "merging",
+            Some(r#"{"pr":7,"daemon_merge_retry":"requested"}"#),
+        );
+        assert_release_refused(&mut conn, graph, &[]);
+
+        let blocked_refs: serde_json::Value = serde_json::from_str(BLOCKED_REFS).unwrap();
+        conn.execute(
+            "UPDATE tasks SET refs=?2 WHERE id=?1",
+            params![merging, blocked_refs.to_string()],
+        )
+        .unwrap();
+        assert!(!provider_blocked_started_task_ids(&conn, 1)
+            .unwrap()
+            .contains(&merging));
+        assert_release_refused(&mut conn, graph, &[]);
+
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [merging])
+            .unwrap();
         assert!(release_freeze_for_provider_block(&mut conn, graph, &[], 50).unwrap());
     }
 

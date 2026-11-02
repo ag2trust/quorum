@@ -3825,13 +3825,15 @@ mod tests {
         let r1 = mgr
             .provision(tmp.path(), "b1", &tmp.path().join("wt1"), "main")
             .await;
-        assert!(r1.unwrap_err().contains("timed out"));
+        let e1 = r1.unwrap_err();
+        assert!(e1.contains("timed out"), "first provision: {e1}");
 
         // Second call also times out — proves mutex was released after first timeout
         let r2 = mgr
             .provision(tmp.path(), "b2", &tmp.path().join("wt2"), "main")
             .await;
-        assert!(r2.unwrap_err().contains("timed out"));
+        let e2 = r2.unwrap_err();
+        assert!(e2.contains("timed out"), "second provision: {e2}");
     }
 
     #[cfg(unix)]
