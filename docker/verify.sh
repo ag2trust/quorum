@@ -14,6 +14,7 @@ printf 'verify: image architecture linux/amd64\n'
 
 "$(dirname "$0")/smoke.sh" "$image"
 "$(dirname "$0")/supervise.sh" "$image"
+"$(dirname "$0")/replace.sh" "$image"
 
 if docker build \
   --platform linux/amd64 \
