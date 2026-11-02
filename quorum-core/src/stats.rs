@@ -269,12 +269,18 @@ pub struct ReviewingTask {
     pub pr: Option<i64>,
     /// The in-flight reviewer agent, if the daemon currently has one for this task.
     pub reviewer: Option<String>,
-    /// `reviewing`, `awaiting reviewer`, or `merging`.
+    /// `reviewing`, `awaiting reviewer`, `approved, merge pending`, or `merging`.
+    ///
+    /// `approved, merge pending` means no reviewer is live and every required role (R1,
+    /// plus R2 unless durably skipped) is approved with zero blockers for the task's
+    /// durably recorded PR head; the daemon still owns the merge (and any CI wait).
     pub state: String,
     /// Why an `awaiting reviewer` task has no live reviewer, when that is derivable from
     /// durable DB state alone (classification pending, reviewer cap exhausted, provisioning
-    /// strikes exhausted). Absent means the cause is not visible to a read-only status
-    /// process (for example live CI state, which only the daemon queries from GitHub).
+    /// strikes exhausted, or an approval whose current head is not durably known). For
+    /// `approved, merge pending` it names the approved head. Absent means the cause is not
+    /// visible to a read-only status process (for example live CI state, which only the
+    /// daemon queries from GitHub).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -2909,10 +2915,27 @@ fn reviewing_tasks(
         } else if reviewer.is_some() {
             ("reviewing".to_string(), None)
         } else {
-            (
-                "awaiting reviewer".to_string(),
-                awaiting_reviewer_reason(conn, id, refs.as_deref(), freeze_active)?,
-            )
+            match review_approval_view(conn, id, extract_pr_from_refs(refs.as_deref()))? {
+                ApprovalView::Approved(head) => (
+                    APPROVED_MERGE_PENDING.to_string(),
+                    Some(format!(
+                        "all required reviews approved at head {}",
+                        short_sha(&head)
+                    )),
+                ),
+                view => {
+                    let reason =
+                        awaiting_reviewer_reason(conn, id, refs.as_deref(), freeze_active)?
+                            .or_else(|| {
+                                (view == ApprovalView::HeadUnknown).then(|| {
+                                    "approval recorded but the current PR head is not \
+                                     durably known"
+                                        .to_string()
+                                })
+                            });
+                    ("awaiting reviewer".to_string(), reason)
+                }
+            }
         };
         out.push(ReviewingTask {
             id,
@@ -2924,6 +2947,67 @@ fn reviewing_tasks(
         });
     }
     Ok(out)
+}
+
+/// `ReviewingTask.state` for an in-review task whose required review roles are all
+/// approved (zero blockers) for its durably recorded head, awaiting the daemon's merge.
+pub const APPROVED_MERGE_PENDING: &str = "approved, merge pending";
+
+#[derive(Debug, PartialEq, Eq)]
+enum ApprovalView {
+    /// Every required role is approved for this durably recorded head.
+    Approved(String),
+    /// An approval bound to this task exists, but no durable current head does.
+    HeadUnknown,
+    /// Not fully approved for the recorded head (or nothing recorded).
+    NotApproved,
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
+/// The task's current PR head as last durably recorded by the daemon: the persisted
+/// PR target (refreshed on reviewer launch and rework publication), else the newest
+/// reviewer run launched against this PR. Never consults GitHub.
+fn durable_review_head(conn: &Connection, task_id: i64, pr: i64) -> Result<Option<String>> {
+    if let Some(target) = crate::pr_targets::get(conn, task_id, pr)? {
+        if !target.head_sha.is_empty() {
+            return Ok(Some(target.head_sha));
+        }
+    }
+    Ok(conn
+        .query_row(
+            "SELECT review_head_sha FROM agent_runs
+             WHERE task_id=?1 AND role='reviewer' AND review_pr=?2
+               AND review_head_sha IS NOT NULL AND review_head_sha <> ''
+             ORDER BY spawned_at DESC, id DESC LIMIT 1",
+            params![task_id, pr],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
+/// Read-only approval view for an in-review task, using the same predicate the daemon
+/// uses to gate merge ([`crate::approvals::all_required_roles_approved`]). Approvals
+/// must be bound to this task; a stale-head approval never counts.
+fn review_approval_view(conn: &Connection, task_id: i64, pr: Option<i64>) -> Result<ApprovalView> {
+    let Some(pr) = pr else {
+        return Ok(ApprovalView::NotApproved);
+    };
+    let bound_r1 = crate::approvals::get(conn, pr, "r1")?
+        .is_some_and(|a| a.task_id == task_id && a.verdict == "approved" && a.blocking_count == 0);
+    if !bound_r1 {
+        return Ok(ApprovalView::NotApproved);
+    }
+    let Some(head) = durable_review_head(conn, task_id, pr)? else {
+        return Ok(ApprovalView::HeadUnknown);
+    };
+    if crate::approvals::all_required_roles_approved(conn, pr, &head)? {
+        Ok(ApprovalView::Approved(head))
+    } else {
+        Ok(ApprovalView::NotApproved)
+    }
 }
 
 /// True when the refs carry the complete classification the reviewer claim requires
@@ -6352,6 +6436,139 @@ mod tests {
             "classification pending (a decomposition freeze is active)"
         );
         assert!(reason(unknown).is_null());
+    }
+
+    #[test]
+    fn approved_in_review_task_reports_merge_pending_only_for_recorded_head() {
+        let (_d, mut c) = open_tmp();
+        let classified = r#""cx_est":2,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null"#;
+        let mut mk = |title: &str, status: &str, pr: i64| {
+            let id = crate::tasks::create(&mut c, "A", title, None, 0, None, None, None, None, 100)
+                .unwrap();
+            c.execute(
+                "UPDATE tasks SET status=?1, refs=?2 WHERE id=?3",
+                params![status, format!(r#"{{"pr":{pr},{classified}}}"#), id],
+            )
+            .unwrap();
+            id
+        };
+        let both = mk("both approved", "in-review", 11);
+        let skipped = mk("r2 durably skipped", "in-review", 12);
+        let r2_missing = mk("r2 missing", "in-review", 13);
+        let stale = mk("stale head", "in-review", 14);
+        let unknown = mk("head unknown", "in-review", 15);
+        let run_head = mk("reviewer-run head", "in-review", 16);
+        let live = mk("live reviewer", "in-review", 17);
+        let merging = mk("merging", "merging", 18);
+        let wrong_task = mk("approval bound to another task", "in-review", 19);
+
+        let approve = |c: &mut Connection, task_id: i64, pr: i64, role: &str, head: &str| {
+            crate::approvals::record(
+                c,
+                &crate::approvals::Approval {
+                    pr_number: pr,
+                    review_role: role.into(),
+                    task_id,
+                    author: "W".into(),
+                    reviewer: format!("Rev-{role}"),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: head.into(),
+                },
+            )
+            .unwrap();
+        };
+        let target = |c: &mut Connection, task_id: i64, pr: i64, head: &str| {
+            crate::pr_targets::upsert(c, task_id, pr, "daemon/x", head, false).unwrap();
+        };
+        for (id, pr) in [(both, 11), (live, 17), (merging, 18)] {
+            approve(&mut c, id, pr, "r1", "head-a");
+            approve(&mut c, id, pr, "r2", "head-a");
+            target(&mut c, id, pr, "head-a");
+        }
+        approve(&mut c, skipped, 12, "r1", "head-a");
+        crate::review_audits::record_r2_requirement(&mut c, skipped, 12, "head-a", false).unwrap();
+        target(&mut c, skipped, 12, "head-a");
+        approve(&mut c, r2_missing, 13, "r1", "head-a");
+        crate::review_audits::record_r2_requirement(&mut c, r2_missing, 13, "head-a", true)
+            .unwrap();
+        target(&mut c, r2_missing, 13, "head-a");
+        approve(&mut c, stale, 14, "r1", "head-old");
+        approve(&mut c, stale, 14, "r2", "head-old");
+        target(&mut c, stale, 14, "head-new");
+        approve(&mut c, unknown, 15, "r1", "head-a");
+        approve(&mut c, unknown, 15, "r2", "head-a");
+        approve(&mut c, run_head, 16, "r1", "head-r");
+        approve(&mut c, run_head, 16, "r2", "head-r");
+        c.execute(
+            "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,spawned_at,review_pr,review_head_sha)
+             VALUES (?1,'R2x','reviewer','m','e',150,16,'head-r')",
+            params![run_head],
+        )
+        .unwrap();
+        approve(&mut c, both, 19, "r1", "head-a");
+        approve(&mut c, both, 19, "r2", "head-a");
+        target(&mut c, wrong_task, 19, "head-a");
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "R1".into(),
+                role: "reviewer".into(),
+                task_id: Some(live),
+                session_id: "reviewer-session".into(),
+                worktree: None,
+                branch: None,
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(17),
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+
+        let json = serde_json::to_value(stats(&c, 200, 60).unwrap()).unwrap();
+        let row = |id: i64| {
+            json["reviewing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        for id in [both, skipped, run_head] {
+            assert_eq!(row(id)["state"], "approved, merge pending", "task #{id}");
+        }
+        assert_eq!(
+            row(both)["reason"],
+            "all required reviews approved at head head-a"
+        );
+        assert_eq!(
+            row(run_head)["reason"],
+            "all required reviews approved at head head-r"
+        );
+        for id in [r2_missing, stale, wrong_task] {
+            assert_eq!(row(id)["state"], "awaiting reviewer", "task #{id}");
+            assert!(
+                row(id).get("reason").is_none(),
+                "task #{id}: reason unchanged"
+            );
+        }
+        assert_eq!(row(unknown)["state"], "awaiting reviewer");
+        assert_eq!(
+            row(unknown)["reason"],
+            "approval recorded but the current PR head is not durably known"
+        );
+        assert_eq!(row(live)["state"], "reviewing");
+        assert_eq!(row(merging)["state"], "merging");
+        assert!(row(merging).get("reason").is_none());
     }
 
     #[test]

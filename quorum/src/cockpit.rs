@@ -1594,6 +1594,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reviewing_section_renders_approved_merge_pending_state() {
+        let mut s = default_stats();
+        s.reviewing.push(ReviewingTask {
+            id: 12,
+            title: "approved".into(),
+            pr: Some(402),
+            reviewer: None,
+            state: quorum_core::stats::APPROVED_MERGE_PENDING.into(),
+            reason: Some("all required reviews approved at head abc123".into()),
+        });
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output
+                .contains("approved, merge pending — all required reviews approved at head abc123"),
+            "{output}"
+        );
+        assert!(!output.contains("awaiting reviewer"), "{output}");
+    }
+
     // ── #177: MERGE WAIT section ────────────────────────────────────
 
     #[test]
