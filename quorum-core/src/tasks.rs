@@ -656,6 +656,49 @@ macro_rules! branch_sync_ref_present_sql {
 }
 pub const BRANCH_SYNC_REF_PRESENT_SQL: &str = branch_sync_ref_present_sql!();
 
+/// Planner-routing eligibility over a `tasks` row aliased `t`.
+///
+/// This is the cx-ready route — `L` at complexity 5, `XL` at complexity 4 or
+/// 5, and flagged `L` at complexity 4 — plus the per-task exclusions:
+/// review-only, terminal leaf, continuation, a branch-sync ref, and an
+/// existing decomposition or graph membership. `id` is qualified because the
+/// membership subqueries shadow it; the other `refs` checks stay unqualified
+/// and resolve to that same aliased row. The repository-wide one-active-graph
+/// exclusion is not part of this predicate. `planning_candidate` keeps that
+/// clause, and status uses this predicate only to explain a queued task that
+/// the clause is holding.
+///
+/// A branch-sync judgment task bypasses planning exactly like continuation
+/// and review-only work. Selecting it would let routed planning reject it
+/// every tick while an ordinary decomposable candidate waits behind it.
+macro_rules! planner_eligibility_sql {
+    () => {
+        concat!(
+            "(json_valid(t.refs) AND json_extract(t.refs,'$.cx_ready')=1",
+            " AND (",
+            "(json_extract(t.refs,'$.cx_size')='L' AND json_extract(t.refs,'$.cx_est')=5)",
+            " OR (json_extract(t.refs,'$.cx_size')='XL' AND json_extract(t.refs,'$.cx_est') IN (4,5))",
+            " OR (json_extract(t.refs,'$.cx_size')='L'",
+            " AND json_extract(t.refs,'$.cx_est')=4",
+            " AND COALESCE(json_array_length(t.refs, '$.cx_risk_flags'), 0) >= 1)",
+            ")",
+            " AND t.review_only=0",
+            " AND t.terminal_leaf=0",
+            " AND t.continue_pr IS NULL",
+            " AND NOT ",
+            branch_sync_ref_present_sql!(),
+            " AND NOT EXISTS (SELECT 1 FROM task_decompositions planner_source",
+            " WHERE planner_source.source_task_id=t.id)",
+            " AND NOT EXISTS (SELECT 1 FROM task_graph_members planner_member",
+            " WHERE planner_member.task_id=t.id))"
+        )
+    };
+}
+
+/// See [`planner_eligibility_sql`]. Planner selection and the status hold
+/// reason both interpolate this fragment so the route cannot drift.
+pub const PLANNER_ELIGIBILITY_PREDICATE: &str = planner_eligibility_sql!();
+
 // SQL counterpart of the implementation branch in
 // `classification_is_dispatchable`. Callers that need implementation work
 // additionally require `review_only=0`; continuation tasks, tasks bound to a

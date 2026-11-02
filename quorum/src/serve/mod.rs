@@ -6428,38 +6428,20 @@ async fn reconcile_decomposition_startup(
 
 fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>> {
     use rusqlite::OptionalExtension;
-    // The `refs.branch_sync` exclusion matches the core planner/decomposition
-    // guards in `begin_planning`/`begin_routed_planning` and the direct
-    // dispatch clause: a branch-sync judgment task bypasses planning exactly
-    // like continuation and review-only work. Selecting it here would let
-    // `begin_routed_planning` reject it every tick while ordinary
-    // decomposable candidates starve behind it.
-    let branch_sync_ref_present =
-        quorum_core::tasks::BRANCH_SYNC_REF_PRESENT_SQL.replace("refs", "t.refs");
+    // Route and per-task exclusions come from the shared predicate. The
+    // one-active-graph rule stays here: status names that graph instead of
+    // folding the exclusion into eligibility.
+    let eligible = quorum_core::tasks::PLANNER_ELIGIBILITY_PREDICATE;
     let dep_satisfied = quorum_core::tasks::DEP_SATISFIED_PREDICATE;
     Ok(conn
         .query_row(
             &format!(
                 "SELECT t.id,t.revision FROM tasks t
-         WHERE t.status='open' AND t.assignee IS NULL AND t.review_only=0
-           AND t.terminal_leaf=0
+         WHERE t.status='open' AND t.assignee IS NULL
            AND NOT EXISTS (SELECT 1 FROM task_decompositions repository_graph
                            WHERE repository_graph.state IN ('active','blocked')
                               OR repository_graph.active=1)
-           AND json_valid(t.refs) AND json_extract(t.refs,'$.cx_ready')=1
-           AND (
-                (json_extract(t.refs,'$.cx_size')='L'
-                 AND json_extract(t.refs,'$.cx_est')=5)
-             OR (json_extract(t.refs,'$.cx_size')='XL'
-                 AND json_extract(t.refs,'$.cx_est') IN (4,5))
-             OR (json_extract(t.refs,'$.cx_size')='L'
-                 AND json_extract(t.refs,'$.cx_est')=4
-                 AND COALESCE(json_array_length(t.refs, '$.cx_risk_flags'), 0) >= 1)
-           )
-           AND t.continue_pr IS NULL
-           AND NOT {branch_sync_ref_present}
-           AND NOT EXISTS (SELECT 1 FROM task_decompositions d WHERE d.source_task_id=t.id)
-           AND NOT EXISTS (SELECT 1 FROM task_graph_members m WHERE m.task_id=t.id)
+           AND {eligible}
            AND (t.depends_on IS NULL OR NOT EXISTS (
                SELECT 1 FROM json_each(t.depends_on) dep
                WHERE NOT EXISTS (SELECT 1 FROM tasks d

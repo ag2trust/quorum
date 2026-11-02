@@ -448,6 +448,13 @@ fn render_queue(queue: &[QueueTask], sty: &Style, w: &mut dyn Write, width: usiz
             pr_str,
         );
         let _ = writeln!(w, "      {}", truncate(&q.title, width.saturating_sub(6)));
+        if let Some(reason) = q.hold_reason.as_deref() {
+            let _ = writeln!(
+                w,
+                "      {}",
+                sty.dim(&truncate(reason, width.saturating_sub(6)))
+            );
+        }
     }
 }
 
@@ -1163,6 +1170,7 @@ mod tests {
             tier_eff: "opus47·md".into(),
             priority: 10,
             pr: None,
+            hold_reason: None,
         });
         s.blocked.push(BlockedTask {
             id: 3,
@@ -1204,6 +1212,30 @@ mod tests {
                 .all(|line| !line.contains("gpt-5.6-terra") || !line.contains("c2")),
             "complexity leaked into model: {output}"
         );
+    }
+
+    #[test]
+    fn queue_renders_planner_hold_reason() {
+        let mut s = default_stats();
+        s.queue_tasks.push(QueueTask {
+            id: 80,
+            title: "decompose the router".into(),
+            provider: Some("pending".into()),
+            model: Some("pending".into()),
+            effort: Some("pending".into()),
+            tier_eff: "—".into(),
+            priority: 1,
+            pr: None,
+            hold_reason: Some("waiting for graph #74 (source #697) before planning".into()),
+        });
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("waiting for graph #74 (source #697) before planning"),
+            "{output}"
+        );
+        assert!(output.contains("decompose the router"), "{output}");
     }
 
     #[test]
@@ -1509,6 +1541,7 @@ mod tests {
             tier_eff: "pending".into(),
             priority: 0,
             pr: None,
+            hold_reason: None,
         });
         let sty = Style::plain();
         let mut buf = Vec::new();

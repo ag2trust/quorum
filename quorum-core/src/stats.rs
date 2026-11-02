@@ -254,6 +254,11 @@ pub struct QueueTask {
     pub tier_eff: String,
     pub priority: i64,
     pub pr: Option<i64>,
+    /// Why a planner-routed queued task is waiting on another graph, e.g.
+    /// `waiting for graph #74 (source #697) before planning`. Absent for
+    /// non-planner tasks and when no active or blocked graph holds planning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold_reason: Option<String>,
 }
 
 /// A task in the post-submit review or merge band, shown in REVIEWING.
@@ -2787,9 +2792,60 @@ fn queue_tasks(conn: &Connection) -> Result<Vec<QueueTask>> {
             tier_eff: tier_eff_label(labels.as_deref()),
             priority,
             pr: extract_pr_from_refs(refs.as_deref()),
+            hold_reason: None,
         });
     }
+    apply_planner_hold_reasons(conn, &mut result)?;
     Ok(result)
+}
+
+/// The graph that withholds planner selection: `state` active or blocked, or
+/// the `active=1` scheduling slot. At most one row has `active=1`; a blocked
+/// row with `active=0` can match too, so the read picks one deterministically
+/// and prefers the scheduling slot.
+fn planner_holding_graph(conn: &Connection) -> Result<Option<(i64, i64)>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, source_task_id FROM task_decompositions
+             WHERE state IN ('active','blocked') OR active=1
+             ORDER BY active DESC, id ASC
+             LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+fn planner_eligible_task_ids(conn: &Connection) -> Result<std::collections::HashSet<i64>> {
+    let sql = format!(
+        "SELECT t.id FROM tasks t WHERE {}",
+        crate::tasks::PLANNER_ELIGIBILITY_PREDICATE
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let ids = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(ids)
+}
+
+/// One holding-graph read per status snapshot. Only queued tasks that match
+/// the shared planner-eligibility predicate get a reason.
+fn apply_planner_hold_reasons(conn: &Connection, queue: &mut [QueueTask]) -> Result<()> {
+    if queue.is_empty() {
+        return Ok(());
+    }
+    let Some((graph_id, source_task_id)) = planner_holding_graph(conn)? else {
+        return Ok(());
+    };
+    let eligible = planner_eligible_task_ids(conn)?;
+    let reason =
+        format!("waiting for graph #{graph_id} (source #{source_task_id}) before planning");
+    for task in queue.iter_mut() {
+        if eligible.contains(&task.id) {
+            task.hold_reason = Some(reason.clone());
+        }
+    }
+    Ok(())
 }
 
 fn extract_pr_from_refs(refs_json: Option<&str>) -> Option<i64> {
@@ -4324,6 +4380,127 @@ mod tests {
             .collect();
         // Only the ready task counts.
         assert_eq!(by_tier.get("tier:opus-46"), Some(&1));
+    }
+
+    fn classified_open(c: &mut Connection, title: &str, refs: &str) -> i64 {
+        crate::tasks::create(c, "boss", title, None, 0, None, Some(refs), None, None, 100).unwrap()
+    }
+
+    fn insert_holding_graph(
+        c: &Connection,
+        graph_id: i64,
+        source_task_id: i64,
+        state: &str,
+        active: i64,
+    ) {
+        c.execute(
+            "INSERT INTO task_decompositions(
+                 id, source_task_id, state, active, freeze_active,
+                 planned_source_revision, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 0, 1, 1, 1)",
+            params![graph_id, source_task_id, state, active],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn queue_names_holding_graph_for_planner_routed_task() {
+        let (_d, mut c) = open_tmp();
+        c.execute(
+            "INSERT INTO tasks(id, title, status, priority, created_by, created_at, updated_at)
+             VALUES (697, 'graph source', 'decomposed', 0, 'boss', 100, 100)",
+            [],
+        )
+        .unwrap();
+        let planner = classified_open(
+            &mut c,
+            "plan me",
+            r#"{"cx_est":5,"cx_size":"L","cx_ready":true}"#,
+        );
+        let flagged = classified_open(
+            &mut c,
+            "flagged large",
+            r#"{"cx_est":4,"cx_size":"L","cx_ready":true,"cx_risk_flags":[{"flag":"many_consumers","evidence":"several consumers"}]}"#,
+        );
+        let medium = classified_open(
+            &mut c,
+            "dispatch me",
+            r#"{"cx_est":3,"cx_size":"M","cx_ready":true}"#,
+        );
+        let plain_large = classified_open(
+            &mut c,
+            "plain large",
+            r#"{"cx_est":4,"cx_size":"L","cx_ready":true,"cx_risk_flags":[]}"#,
+        );
+        insert_holding_graph(&c, 74, 697, "active", 1);
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let reason = "waiting for graph #74 (source #697) before planning";
+        for id in [planner, flagged] {
+            let task = s.queue_tasks.iter().find(|task| task.id == id).unwrap();
+            assert_eq!(task.hold_reason.as_deref(), Some(reason));
+            let json = serde_json::to_value(task).unwrap();
+            assert_eq!(json["hold_reason"], serde_json::json!(reason));
+            assert_eq!(json["id"], id);
+            assert!(json.get("title").is_some());
+            assert!(json.get("provider").is_some());
+        }
+        for id in [medium, plain_large] {
+            let task = s.queue_tasks.iter().find(|task| task.id == id).unwrap();
+            assert!(
+                task.hold_reason.is_none(),
+                "non-planner task {id} gained a hold"
+            );
+            let json = serde_json::to_value(task).unwrap();
+            assert!(json.get("hold_reason").is_none(), "{json}");
+        }
+    }
+
+    #[test]
+    fn queue_omits_hold_reason_without_holding_graph() {
+        let (_d, mut c) = open_tmp();
+        let planner = classified_open(
+            &mut c,
+            "plan me",
+            r#"{"cx_est":5,"cx_size":"L","cx_ready":true}"#,
+        );
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let task = s
+            .queue_tasks
+            .iter()
+            .find(|task| task.id == planner)
+            .unwrap();
+        assert!(task.hold_reason.is_none());
+        let json = serde_json::to_value(task).unwrap();
+        assert!(json.get("hold_reason").is_none(), "{json}");
+    }
+
+    #[test]
+    fn queue_names_blocked_graph_that_is_not_the_active_slot() {
+        let (_d, mut c) = open_tmp();
+        c.execute(
+            "INSERT INTO tasks(id, title, status, priority, created_by, created_at, updated_at)
+             VALUES (697, 'graph source', 'decomposed', 0, 'boss', 100, 100)",
+            [],
+        )
+        .unwrap();
+        let planner = classified_open(
+            &mut c,
+            "plan me",
+            r#"{"cx_est":5,"cx_size":"L","cx_ready":true}"#,
+        );
+        insert_holding_graph(&c, 74, 697, "blocked", 0);
+
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let task = s
+            .queue_tasks
+            .iter()
+            .find(|task| task.id == planner)
+            .unwrap();
+        assert_eq!(
+            task.hold_reason.as_deref(),
+            Some("waiting for graph #74 (source #697) before planning")
+        );
     }
 
     #[test]
