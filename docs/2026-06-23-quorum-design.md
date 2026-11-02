@@ -2923,10 +2923,16 @@ self-attestation nor redesigns the worker filesystem sandbox.
 
 Semantic proposal rejections and provider/protocol failures have independent caps of three per
 unchanged source revision. Semantic retries keep the repository freeze. Provider failure releases
-the freeze during backoff, and retry drains again. Full prompts and transcripts are not persisted;
-only bounded structured attempts, the accepted closed proposal and its accepted classification
-needed to resume preclassification or validation, and final reasons are durable. Restart inspection never consumes a semantic
-proposal attempt.
+the freeze during backoff, and retry drains again. Separately, a `freeze-requested` or `draining`
+graph whose started non-terminal tasks other than the source are all provider-blocked, with no such
+task holding a live slot, releases through `provider-backoff` with `freeze_active=0` and its frozen
+SHA cleared. That release is a wait rather than a planning failure: it records no attempt and
+increments neither `provider_failures` nor `proposal_attempts`. When backoff expires, reacquisition
+waits while an idle provider-blocked task remains; the same guard applies when an ordinary provider
+failure put the graph into backoff. Full prompts and transcripts are not persisted; only bounded
+structured attempts, the accepted closed proposal and its accepted classification needed to resume
+preclassification or validation, and final reasons are durable. Restart inspection never consumes a
+semantic proposal attempt.
 
 Exhausting either three-attempt planning budget holds the graph and fails the source; it never
 retries automatically. `task-retry` may explicitly resume that same aggregate only while a single
@@ -2960,9 +2966,15 @@ planning freeze acquisition excludes live reservations. The daemon releases the 
 after reviewer attachment or complete failed-provision cleanup. Because the freeze drain waits for
 every already-started task, the ordinary classifier keeps running under a freeze for exactly that
 started set (`working`, `in-review`, `rework` — e.g. a review-only task created during the freeze,
-whose reviewer cannot dispatch unclassified); `open` tasks wait for the freeze to clear. The drain
-counts only journal rows with live work behind them, never a cached frozen-view marker, and the
-coordinator settles a previous graph's cached view, marker, and proposal whenever the selected
+whose reviewer cannot dispatch unclassified); `open` tasks wait for the freeze to clear. A
+provider-blocked task remains in the started non-terminal drain count, so the frozen base is captured
+only after a real drain with zero started non-terminal tasks other than the source. Other blocked or
+parked tasks, as well as provider-blocked tasks that still hold a live slot, keep holding the drain.
+There is no automatic provider retry;
+progress requires an operator `task-retry`. After a provider-blocked release, status names the
+blocking task in decomposition reasons and reports it as an expected wait rather than a drain stall.
+The drain counts only journal rows with live work behind them, never a cached frozen-view marker, and
+the coordinator settles a previous graph's cached view, marker, and proposal whenever the selected
 aggregate changes.
 
 One `BEGIN IMMEDIATE` transaction creates the entire graph: every generated task with
