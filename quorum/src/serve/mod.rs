@@ -1018,15 +1018,14 @@ async fn exhausted_reviewer_provision_reasons(
     Ok((reason.clone(), reason))
 }
 
-/// Whether every review role required for `head_sha` is approved. Unlike
-/// `quorum_core::approvals::dual_approved`, this honours a durable sampled R2
-/// skip, so an R1-only approval for a sampled-out head counts as complete.
+/// Whether every review role required for `head_sha` is approved. Delegates to
+/// the shared quorum-core predicate that read-only status also uses.
 fn all_required_roles_approved(
     conn: &quorum_core::Connection,
     pr_number: i64,
     head_sha: &str,
 ) -> Result<bool> {
-    Ok(next_needed_role(conn, pr_number, head_sha)?.is_none())
+    quorum_core::approvals::all_required_roles_approved(conn, pr_number, head_sha)
 }
 
 /// Determine the next review role needed for a PR, checking durable approvals.
@@ -1036,31 +1035,7 @@ fn next_needed_role(
     pr_number: i64,
     head_sha: &str,
 ) -> Result<Option<&'static str>> {
-    let r1 = quorum_core::approvals::get(conn, pr_number, "r1")?;
-    let Some(r1) = r1.filter(|a| {
-        a.verdict == "approved"
-            && a.blocking_count == 0
-            && !a.approved_head_sha.is_empty()
-            && a.approved_head_sha == head_sha
-    }) else {
-        return Ok(Some("r1"));
-    };
-
-    if !r2_required_for_head(conn, r1.task_id, pr_number, head_sha) {
-        return Ok(None);
-    }
-
-    match quorum_core::approvals::get(conn, pr_number, "r2")? {
-        Some(a)
-            if a.verdict == "approved"
-                && a.blocking_count == 0
-                && !a.approved_head_sha.is_empty()
-                && a.approved_head_sha == head_sha =>
-        {
-            Ok(None)
-        }
-        _ => Ok(Some("r2")),
-    }
+    quorum_core::approvals::next_needed_role(conn, pr_number, head_sha)
 }
 
 /// Exact durable role authority for an orphan/reconstructed review path. The
@@ -1225,33 +1200,16 @@ fn consume_graph_blocker_signal(
 /// Whether an R2 was required for this PR head when R1 approved. Decisions are
 /// retained in a daemon-owned table by PR and head SHA so a later rework head
 /// cannot change the requirement if an earlier head is force-pushed back.
-/// Missing or unreadable state fails closed to mandatory R2.
+/// Missing or unreadable state fails closed to mandatory R2. Delegates to the
+/// shared quorum-core predicate used by merge gating and status.
+#[cfg(test)]
 fn r2_required_for_head(
     conn: &quorum_core::Connection,
     task_id: i64,
     pr_number: i64,
     head_sha: &str,
 ) -> bool {
-    // A head's durable decision is immutable, including after a force-push
-    // returns the PR to that head.  The exhausted-budget skip may establish a
-    // decision only for a previously unseen head; it must never weaken one
-    // already recorded as required.
-    match quorum_core::review_audits::r2_requirement(conn, task_id, pr_number, head_sha) {
-        Ok(Some(required)) => return required,
-        // Missing state is the only case where the cap may establish a new
-        // R2 skip. An unreadable or task-mismatched decision fails closed.
-        Ok(None) => {}
-        Err(_) => return true,
-    }
-    if matches!(
-        tasks::get(conn, task_id),
-        Ok(Some(task))
-            if task.rework_round >= i64::from(task.effective_rework_cap())
-    ) {
-        return false;
-    }
-    // Missing, unreadable, or task-mismatched state fails closed to R2.
-    true
+    quorum_core::approvals::r2_required_for_head(conn, task_id, pr_number, head_sha)
 }
 
 struct R2SamplingPolicy {

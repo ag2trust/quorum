@@ -138,6 +138,75 @@ pub fn dual_approved(conn: &Connection, pr_number: i64) -> Result<Option<String>
     }
 }
 
+/// True when `approval` is a zero-blocker approval bound to exactly `head_sha`.
+fn approves_head(approval: &Approval, head_sha: &str) -> bool {
+    approval.verdict == "approved"
+        && approval.blocking_count == 0
+        && !approval.approved_head_sha.is_empty()
+        && approval.approved_head_sha == head_sha
+}
+
+/// Whether R2 is required for `head_sha`, from durable state only.
+///
+/// A head's durable decision is immutable, including after a force-push
+/// returns the PR to that head. The exhausted-rework-budget skip may establish
+/// a decision only for a previously unseen head; it never weakens one already
+/// recorded as required. Unreadable or task-mismatched state fails closed to R2.
+pub fn r2_required_for_head(
+    conn: &Connection,
+    task_id: i64,
+    pr_number: i64,
+    head_sha: &str,
+) -> bool {
+    match crate::review_audits::r2_requirement(conn, task_id, pr_number, head_sha) {
+        Ok(Some(required)) => return required,
+        // Missing state is the only case where the cap may establish a new
+        // R2 skip. An unreadable or task-mismatched decision fails closed.
+        Ok(None) => {}
+        Err(_) => return true,
+    }
+    if matches!(
+        crate::tasks::get(conn, task_id),
+        Ok(Some(task))
+            if task.rework_round >= i64::from(task.effective_rework_cap())
+    ) {
+        return false;
+    }
+    true
+}
+
+/// The next review role still needed for `head_sha` on `pr_number`, or `None`
+/// when every required role (R1, plus R2 unless durably skipped) is approved
+/// with zero blockers for that exact head. This is the single predicate shared
+/// by daemon merge gating and read-only status so the two cannot drift.
+pub fn next_needed_role(
+    conn: &Connection,
+    pr_number: i64,
+    head_sha: &str,
+) -> Result<Option<&'static str>> {
+    let Some(r1) = get(conn, pr_number, "r1")?.filter(|a| approves_head(a, head_sha)) else {
+        return Ok(Some("r1"));
+    };
+    if !r2_required_for_head(conn, r1.task_id, pr_number, head_sha) {
+        return Ok(None);
+    }
+    match get(conn, pr_number, "r2")? {
+        Some(a) if approves_head(&a, head_sha) => Ok(None),
+        _ => Ok(Some("r2")),
+    }
+}
+
+/// Whether every review role required for `head_sha` is approved. Unlike
+/// [`dual_approved`], this honours a durable sampled R2 skip, so an R1-only
+/// approval for a sampled-out head counts as complete.
+pub fn all_required_roles_approved(
+    conn: &Connection,
+    pr_number: i64,
+    head_sha: &str,
+) -> Result<bool> {
+    Ok(next_needed_role(conn, pr_number, head_sha)?.is_none())
+}
+
 /// True if any durable approval exists for the given task (any role).
 pub fn has_for_task(conn: &Connection, task_id: i64) -> Result<bool> {
     let count: i64 = conn.query_row(
