@@ -710,6 +710,13 @@ full idle window to react to the completion. Because activity can only be record
 while the slot is still under the busy ceiling, a persistent worker is reaped at most
 about `max_busy_idle_secs + max_idle_secs` after its last daemon-fed turn. At most 8
 self-continued turns are tolerated per daemon-fed turn.
+A reviewer that already recorded its verdict and waits for its sticky re-review — task in
+`rework` (worker rework or CI remediation), in `merging` (merge failure resumes the
+reviewer), or `in-review` with the CI-gated `ResumeReviewer` still pending — is not an
+idle zombie: the reviewer between-turn watchdog applies `max_busy_idle_secs` instead of
+`max_idle_secs`. Past the busy ceiling it is reaped with a log line naming the sticky wait,
+and the fresh-reviewer path reviews the reworked head. Reviewer slots do not count
+against `cap`, so a waiting reviewer never blocks worker dispatch.
 `max_task_wall_secs` is also checked between turns while the provider is acting on its
 own. A `result` for a
 turn the daemon did not feed never completes or fails a daemon turn, but its usage and
