@@ -35919,6 +35919,7 @@ mod tests {
             turn_started_at: now,
             last_event_at: now,
             turn_ended_at: None,
+            last_provider_activity_at: None,
             agent_state: None,
             session_log: None,
             live_stats: LiveStats::new(),
