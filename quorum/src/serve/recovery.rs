@@ -716,6 +716,7 @@ fn reconstruct_dormant_slots(
             turn_started_at: now,
             last_event_at: now,
             turn_ended_at: Some(now),
+            last_provider_activity_at: None,
             agent_state: recovery.entry.agent_state.clone(),
             session_log: None,
             live_stats: LiveStats::new(),

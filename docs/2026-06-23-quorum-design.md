@@ -700,10 +700,16 @@ both the in-turn and the between-turn idle watchdog use `max_busy_idle_secs` (de
 A persistent Claude child keeps running after its turn's `result` (background tasks
 complete; the CLI may self-continue). The daemon keeps reading its stdout between turns,
 with a bounded per-tick drain, to update liveness and outstanding-work tracking.
-The between-turn idle clock stays anchored on the end of the last daemon-fed turn.
-Outstanding work, or a self-continued turn still in progress, only selects the busy
-ceiling, so a persistent worker is reaped at most `max_busy_idle_secs` after its last
-daemon-fed turn. At most 8 self-continued turns are tolerated per daemon-fed turn.
+While work is outstanding or a self-continued turn is in progress, the between-turn idle
+clock is anchored on the end of the last daemon-fed turn and the busy ceiling applies, so
+self-continuation never extends it. Otherwise the plain `max_idle_secs` ceiling is
+measured from the latest provider activity: the later of the fed-turn end, a
+self-continued turn end, or outstanding work dropping to zero. Plain liveness lines do
+not count as activity. A worker whose background task finishes late therefore gets the
+full idle window to react to the completion. Because activity can only be recorded
+while the slot is still under the busy ceiling, a persistent worker is reaped at most
+about `max_busy_idle_secs + max_idle_secs` after its last daemon-fed turn. At most 8
+self-continued turns are tolerated per daemon-fed turn.
 `max_task_wall_secs` is also checked between turns while the provider is acting on its
 own. A `result` for a
 turn the daemon did not feed never completes or fails a daemon turn, but its usage and
