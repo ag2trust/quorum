@@ -29711,6 +29711,67 @@ async fn revalidate_remediation_claim_for_spawn(
 /// The worker gets the existing PR, branch, blocking findings, and task body.
 /// Separates a clean lost guarded claim from an actual provisioning failure so
 /// lifecycle races can never flow into the park/notification path.
+/// Durable identity of one launched remediation worker process.
+struct RemediationRunEvidence<'a> {
+    task_id: i64,
+    agent: &'a str,
+    model: &'a str,
+    effort: &'a str,
+    provider: &'a str,
+    capability_run_id: &'a str,
+    spawned_at: i64,
+}
+
+/// Persist a launched remediation worker's run row.
+///
+/// An assignment-backed run can reach provider fallback, whose retirement
+/// (`attributed_retirement_target_tx`) proves the failed route through
+/// `run_capabilities.agent_run_id`. The run insert and capability binding
+/// therefore commit in one `BEGIN IMMEDIATE` transaction, exactly as initial
+/// worker spawns do; an unbound remediation capability makes every later
+/// fallback retirement fail closed. An assignment-free run cannot reach
+/// fallback, so it records only the run row.
+fn persist_remediation_worker_run(
+    conn: &mut quorum_core::Connection,
+    assignment: Option<&quorum_core::role_assignments::RoleAssignment>,
+    run: &RemediationRunEvidence<'_>,
+) -> Result<i64> {
+    let Some(assignment) = assignment else {
+        return quorum_core::agent_runs::insert(
+            conn,
+            run.task_id,
+            run.agent,
+            "worker",
+            run.model,
+            run.effort,
+            run.provider,
+            run.spawned_at,
+        );
+    };
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    let run_id = quorum_core::agent_runs::insert_worker_with_assignment(
+        &tx,
+        run.task_id,
+        run.agent,
+        &assignment.responsibility_key,
+        run.model,
+        run.effort,
+        run.provider,
+        run.provider,
+        Some(assignment.id),
+        run.spawned_at,
+    )?;
+    quorum_core::capabilities::bind_worker_run_tx(
+        &tx,
+        run.capability_run_id,
+        run_id,
+        run.task_id,
+        run.agent,
+    )?;
+    tx.commit()?;
+    Ok(run_id)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_remediation_worker(
     config: &ServeConfig,
@@ -30524,31 +30585,19 @@ async fn spawn_remediation_worker(
                 let spawned_at = session_started_at;
                 tokio::task::spawn_blocking(move || -> Result<i64> {
                     let mut conn = quorum_core::db::open(&p)?;
-                    match worker_assignment {
-                        Some(assignment) => {
-                            let tx = quorum_core::db::begin_immediate(&mut conn)?;
-                            let run_id = quorum_core::agent_runs::insert_worker_with_assignment(
-                                &tx,
-                                tid,
-                                &name,
-                                &assignment.responsibility_key,
-                                &m,
-                                &e,
-                                &prov,
-                                &prov,
-                                Some(assignment.id),
-                                spawned_at,
-                            )?;
-                            quorum_core::capabilities::bind_worker_run_tx(
-                                &tx, &cap, run_id, tid, &name,
-                            )?;
-                            tx.commit()?;
-                            Ok(run_id)
-                        }
-                        None => quorum_core::agent_runs::insert(
-                            &conn, tid, &name, "worker", &m, &e, &prov, spawned_at,
-                        ),
-                    }
+                    persist_remediation_worker_run(
+                        &mut conn,
+                        worker_assignment.as_ref(),
+                        &RemediationRunEvidence {
+                            task_id: tid,
+                            agent: &name,
+                            model: &m,
+                            effort: &e,
+                            provider: &prov,
+                            capability_run_id: &cap,
+                            spawned_at,
+                        },
+                    )
                 })
                 .await
                 .map_err(|error| format!("run binding join failed: {error}"))
@@ -35755,6 +35804,406 @@ mod tests {
         assert_eq!(evidence, (2, 2, 1, 1));
         drop(conn);
         let _ = slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    fn remediation_fallback_slot(
+        agent_name: &str,
+        task_id: i64,
+        worktree: &Path,
+        model: &str,
+        effort: &str,
+        agent_run_id: i64,
+        cap_run_id: &str,
+    ) -> SlotState {
+        let now = std::time::Instant::now();
+        SlotState {
+            agent_name: agent_name.into(),
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "remediation-session".into(),
+            model: model.into(),
+            effort: effort.into(),
+            worktree_path: worktree.to_path_buf(),
+            branch: format!("daemon/{agent_name}-remediation"),
+            remote_branch: "daemon/fallback-worker".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: Some(77),
+            rework_count: 1,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            fallback_install_error_count: 0,
+            last_error_text: None,
+            agent_run_id: Some(agent_run_id),
+            cap_run_id: Some(cap_run_id.into()),
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: Some("original-thread".into()),
+            pending_prompt: "exact remediation prompt".into(),
+            pending_turn_kind: "rework".into(),
+        }
+    }
+
+    /// Reproduces task #790 on boostmyagents: the initial worker failed over
+    /// from its assigned route, a changes verdict sent the task to rework, and
+    /// the remediation worker resumed the original (already failed) route.
+    /// Returns the remediation slot after its first route failed.
+    #[cfg(unix)]
+    async fn seed_remediation_after_initial_failover(
+        config: &ServeConfig,
+        worktree: &Path,
+    ) -> (i64, String, SlotState) {
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "remediation fallback after initial failover",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let observed_at = now_unix();
+        quorum_core::tasks::claim(
+            &mut conn,
+            "Fallback-Worker",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        let responsibility = worker_responsibility_key(task_id, 1);
+        let (assignment, initial_run, agent_name) = seed_live_fallback_assignment(
+            config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "worker",
+            None,
+            None,
+        );
+        let journal_entry = |agent: &str| JournalEntry {
+            agent: agent.into(),
+            role: "worker".into(),
+            task_id: Some(task_id),
+            session_id: "initial-session".into(),
+            worktree: Some(worktree.to_string_lossy().into_owned()),
+            branch: Some("daemon/fallback-worker".into()),
+            phase: "working".into(),
+            cost_tokens: 0,
+            agent_state: None,
+            cost_usd: 0.0,
+            log_dir: None,
+            pid: None,
+            pr: None,
+            rework_count: 0,
+            provider: Some("codex".into()),
+            continuation_id: None,
+            local_branch: Some("daemon/fallback-worker".into()),
+        };
+        journal::upsert(&mut conn, &journal_entry(&agent_name)).unwrap();
+        let mut initial = remediation_fallback_slot(
+            &agent_name,
+            task_id,
+            worktree,
+            &assignment.model,
+            &assignment.effort,
+            initial_run,
+            "initial-cap",
+        );
+        initial.pr = None;
+        initial.rework_count = 0;
+        initial.continuation_id = None;
+        initial.pending_turn_kind = "initial".into();
+        let currency = load_worker_fallback_currency(&conn, &initial, observed_at).unwrap();
+        drop(conn);
+
+        // Step 1: the initial worker's assigned route fails and falls over.
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "assigned profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+        assert_eq!(
+            activate_worker_fallback(config, &mut initial, &failure, &currency)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Activated
+        );
+        assert_ne!(initial.model, assignment.model);
+        let alternate_run = initial.agent_run_id.unwrap();
+        let _ = initial.kill_and_reap().await;
+
+        // Step 2: the alternate submitted, review requested changes, and the
+        // worker slot was torn down — the task waits in rework, unclaimed.
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        quorum_core::agent_runs::close(&conn, alternate_run, now_unix(), "completed").unwrap();
+        quorum_core::capabilities::revoke_all_for_agent(&mut conn, &agent_name, now_unix())
+            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='rework', assignee=NULL WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE claims SET active=0 WHERE target=?1",
+            [format!("task#{task_id}")],
+        )
+        .unwrap();
+        journal::delete(&mut conn, &agent_name).unwrap();
+
+        // Step 3: spawn_remediation_worker's durable evidence, in its order:
+        // claim, capability, original-layout recovery, bound run row.
+        let remediator = "Anvil-Remediator".to_string();
+        quorum_core::tasks::claim_remediation_rework_with_feedback(
+            &mut conn,
+            &remediator,
+            task_id,
+            3600,
+            now_unix(),
+            Some("fix the blocker"),
+        )
+        .unwrap()
+        .unwrap();
+        let cap_run_id = "remediation-cap";
+        quorum_core::capabilities::issue(
+            &mut conn,
+            cap_run_id,
+            task_id,
+            &remediator,
+            "worker",
+            now_unix(),
+        )
+        .unwrap();
+        let original = quorum_core::agent_runs::first_worker(&conn, task_id)
+            .unwrap()
+            .unwrap();
+        let layout = recover_original_remediation_layout(&conn, task_id, original).unwrap();
+        let layout_assignment = layout.assignment.clone().unwrap();
+        assert_eq!(layout_assignment.id, assignment.id);
+        let provider = layout.kind.to_string();
+        let remediation_run = persist_remediation_worker_run(
+            &mut conn,
+            Some(&layout_assignment),
+            &RemediationRunEvidence {
+                task_id,
+                agent: &remediator,
+                model: &layout.model,
+                effort: &layout.effort,
+                provider: &provider,
+                capability_run_id: cap_run_id,
+                spawned_at: now_unix(),
+            },
+        )
+        .unwrap();
+        // The retirement guard proves the failed route through this binding.
+        assert_eq!(
+            conn.query_row(
+                "SELECT agent_run_id FROM run_capabilities WHERE run_id=?1",
+                [cap_run_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap(),
+            Some(remediation_run)
+        );
+        let mut remediation_journal = journal_entry(&remediator);
+        remediation_journal.pr = Some(77);
+        remediation_journal.rework_count = 1;
+        journal::upsert(&mut conn, &remediation_journal).unwrap();
+        drop(conn);
+
+        let slot = remediation_fallback_slot(
+            &remediator,
+            task_id,
+            worktree,
+            &layout.model,
+            &layout.effort,
+            remediation_run,
+            cap_run_id,
+        );
+        (task_id, responsibility, slot)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remediation_worker_falls_over_after_initial_worker_failover() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let runner_program = live_fallback_runner(root.path());
+        let mut config = live_fallback_test_config(
+            root.path().join("remediation-fallback.db"),
+            root.path(),
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        config.model_profiles.insert(
+            "c-tertiary".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.5".into(),
+                effort: "medium".into(),
+            },
+        );
+        for pool in config.routing.worker.values_mut() {
+            pool.insert("a-primary".into(), 34);
+            pool.insert("b-alternate".into(), 33);
+            pool.insert("c-tertiary".into(), 33);
+        }
+        let (task_id, responsibility, mut slot) =
+            seed_remediation_after_initial_failover(&config, &worktree).await;
+        let assigned_model = slot.model.clone();
+        let observed_at = now_unix();
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
+        drop(conn);
+
+        // Step 4: the remediation run's (original) route fails again.
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "assigned profile unavailable again",
+            std::io::ErrorKind::Other,
+        );
+        assert_eq!(
+            activate_worker_fallback(&config, &mut slot, &failure, &currency)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Activated
+        );
+        assert_ne!(slot.model, assigned_model);
+        assert_eq!(slot.agent_name, "Anvil-Remediator");
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let (active_runs, active_caps, holder): (i64, i64, String) = conn
+            .query_row(
+                "SELECT
+                     (SELECT count(*) FROM agent_runs WHERE task_id=?1 AND ended_at IS NULL),
+                     (SELECT count(*) FROM run_capabilities WHERE task_id=?1 AND revoked_at IS NULL),
+                     (SELECT holder FROM claims WHERE target='task#' || ?1 AND active=1)",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((active_runs, active_caps), (1, 1));
+        assert_eq!(holder, "Anvil-Remediator");
+        assert_eq!(
+            quorum_core::routing_attempts::list(&conn, &responsibility)
+                .unwrap()
+                .len(),
+            2
+        );
+        drop(conn);
+        let _ = slot.kill_and_reap().await;
+    }
+
+    /// With no eligible alternate left, the remediation worker's failure must
+    /// settle into the explicit provider-blocked state with a durable note:
+    /// no run or capability stays live, and `task-retry` releases the lease.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remediation_worker_without_eligible_alternate_is_provider_blocked_with_note() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let runner_program = live_fallback_runner(root.path());
+        let config = live_fallback_test_config(
+            root.path().join("remediation-no-alternate.db"),
+            root.path(),
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        let (task_id, _responsibility, mut slot) =
+            seed_remediation_after_initial_failover(&config, &worktree).await;
+        let observed_at = now_unix();
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
+        drop(conn);
+
+        // Every configured route is codex: a provider-wide outage leaves
+        // nothing eligible.
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProviderUnavailable,
+            "Codex reported account quota unavailable",
+            std::io::ErrorKind::Other,
+        );
+        assert_eq!(
+            activate_worker_fallback(&config, &mut slot, &failure, &currency)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Settled
+        );
+
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let (active_runs, active_caps): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                     (SELECT count(*) FROM agent_runs WHERE task_id=?1 AND ended_at IS NULL),
+                     (SELECT count(*) FROM run_capabilities WHERE task_id=?1 AND revoked_at IS NULL)",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((active_runs, active_caps), (0, 0));
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            runner_state::provider_block(&refs).unwrap().provider,
+            "codex"
+        );
+        let notes: Vec<String> = conn
+            .prepare("SELECT body FROM task_notes WHERE task_id=?1 AND agent='daemon'")
+            .unwrap()
+            .query_map([task_id], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            notes
+                .iter()
+                .filter(|body| body.starts_with("provider-blocked: worker Anvil-Remediator"))
+                .count(),
+            1,
+            "provider block must leave exactly one owner-visible note: {notes:?}"
+        );
+
+        // The block is the existing owner-recoverable state: task-retry
+        // releases the held lease so a fresh worker can be dispatched.
+        assert!(
+            tasks::retry_provider_blocked(&mut conn, task_id, "owner", now_unix())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM claims WHERE target=?1 AND active=1",
+                [format!("task#{task_id}")],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[cfg(unix)]
