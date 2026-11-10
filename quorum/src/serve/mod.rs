@@ -16356,27 +16356,28 @@ async fn tick(
         .or(config.limits.idle_timeout_secs)
         .unwrap_or(900);
     let busy_idle_timeout = max_busy_idle_secs(&config.limits);
-    let mut idle_reviewers: Vec<(usize, u64, u64)> = Vec::new();
-    for (i, r) in reviewers.iter().enumerate() {
-        if r.draining || slot_has_pending_watchdog_outcome(r) {
-            continue;
-        }
-        if let Some((idle, limit)) = between_turn_idle(r, idle_timeout, busy_idle_timeout) {
-            if idle > limit {
-                log(&format!(
-                    "WATCHDOG: reviewer {} idle {idle}s (limit {limit}s) — killing zombie",
-                    r.agent_name
-                ));
-                idle_reviewers.push((i, idle, limit));
-            }
-        }
-    }
-    for &(i, idle, limit) in idle_reviewers.iter().rev() {
+    let idle_reviewers = idle_reviewer_reap_candidates(
+        &db_path,
+        reviewers,
+        pending_reviewer_resumes,
+        idle_timeout,
+        busy_idle_timeout,
+    )
+    .await;
+    for &(i, idle, limit, awaiting_rereview) in idle_reviewers.iter().rev() {
+        let reason = if awaiting_rereview {
+            format!(
+                "reviewer idle {idle}s awaiting sticky re-review (busy ceiling {limit}s) — \
+                 zombie reaped; a fresh reviewer reviews the reworked head"
+            )
+        } else {
+            format!("reviewer idle {idle}s between turns (limit {limit}s) — zombie reaped")
+        };
         let mutation = fail_reviewer_if_owner(
             &db_path,
             &reviewers[i].agent_name,
             reviewers[i].task_id,
-            &format!("reviewer idle {idle}s between turns (limit {limit}s) — zombie reaped"),
+            &reason,
         )
         .await;
         if mutation.is_none() {
@@ -20808,6 +20809,113 @@ fn slot_is_idle_zombie_candidate(
     }
     between_turn_idle(slot, idle_timeout_secs, busy_idle_secs)
         .is_some_and(|(idle, limit)| idle > limit)
+}
+
+/// The reviewer has already recorded its verdict and waits on daemon-owned
+/// work before its sticky re-review: worker rework or CI remediation
+/// (`rework`), the merge gate (`merging`, whose failure resumes the reviewer),
+/// or the CI-gated resume of a reworked head (`pending_reviewer_resumes`).
+fn reviewer_awaits_sticky_rereview(task_status: Option<&str>, resume_pending: bool) -> bool {
+    resume_pending || matches!(task_status, Some("rework" | "merging"))
+}
+
+/// Between-turn idle bound for a reviewer slot. A reviewer awaiting its
+/// sticky re-review is not an idle zombie: the plain ceiling would reap it
+/// while rework plus CI routinely outlasts it, replacing the original R1 with
+/// a fresh reviewer. The wait is still bounded by the finite busy ceiling
+/// (and by the rework cap across rounds), after which the fresh-reviewer
+/// fallback applies.
+fn reviewer_between_turn_idle(
+    slot: &SlotState,
+    idle_secs: u64,
+    busy_idle_secs: u64,
+    awaiting_rereview: bool,
+) -> Option<(u64, u64)> {
+    let (idle, limit) = between_turn_idle(slot, idle_secs, busy_idle_secs)?;
+    let limit = if awaiting_rereview {
+        limit.max(busy_idle_secs)
+    } else {
+        limit
+    };
+    Some((idle, limit))
+}
+
+/// Reviewer slots past their between-turn idle bound:
+/// `(index, idle_secs, limit_secs, awaiting_rereview)`. Task status is read
+/// only for slots already past the plain ceiling, one short connection each.
+/// An unreadable status keeps the plain ceiling (the pre-existing behavior).
+async fn idle_reviewer_reap_candidates(
+    db_path: &Path,
+    reviewers: &[SlotState],
+    pending_reviewer_resumes: &HashMap<i64, i64>,
+    idle_timeout_secs: u64,
+    busy_idle_secs: u64,
+) -> Vec<(usize, u64, u64, bool)> {
+    let mut candidates = Vec::new();
+    for (i, r) in reviewers.iter().enumerate() {
+        if r.draining || slot_has_pending_watchdog_outcome(r) {
+            continue;
+        }
+        let Some((idle, limit)) = between_turn_idle(r, idle_timeout_secs, busy_idle_secs) else {
+            continue;
+        };
+        if idle <= limit {
+            continue;
+        }
+        let resume_pending = pending_reviewer_resumes.contains_key(&r.task_id);
+        let task_status = if resume_pending {
+            None
+        } else {
+            let p = db_path.to_path_buf();
+            let task_id = r.task_id;
+            match tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+                let conn = quorum_core::db::open(&p)?;
+                Ok(tasks::get(&conn, task_id)?.map(|task| task.status))
+            })
+            .await
+            {
+                Ok(Ok(status)) => status,
+                Ok(Err(error)) => {
+                    log(&format!(
+                        "reviewer {} idle status lookup failed for task #{task_id}: {error}",
+                        r.agent_name
+                    ));
+                    None
+                }
+                Err(error) => {
+                    log(&format!(
+                        "reviewer {} idle status lookup join failed for task #{task_id}: {error}",
+                        r.agent_name
+                    ));
+                    None
+                }
+            }
+        };
+        let awaiting = reviewer_awaits_sticky_rereview(task_status.as_deref(), resume_pending);
+        let Some((idle, limit)) =
+            reviewer_between_turn_idle(r, idle_timeout_secs, busy_idle_secs, awaiting)
+        else {
+            continue;
+        };
+        if idle <= limit {
+            continue;
+        }
+        if awaiting {
+            log(&format!(
+                "WATCHDOG: reviewer {} idle {idle}s awaiting sticky re-review on task #{} \
+                 exceeded the busy ceiling ({limit}s) — reaping; the fresh-reviewer path \
+                 reviews the reworked head",
+                r.agent_name, r.task_id
+            ));
+        } else {
+            log(&format!(
+                "WATCHDOG: reviewer {} idle {idle}s (limit {limit}s) — killing zombie",
+                r.agent_name
+            ));
+        }
+        candidates.push((i, idle, limit, awaiting));
+    }
+    candidates
 }
 
 /// A terminal watchdog breach classified as OutcomePending preserves mailbox
@@ -35889,6 +35997,7 @@ mod tests {
             turn_started_at: now,
             last_event_at: now,
             turn_ended_at: None,
+            last_provider_activity_at: None,
             agent_state: None,
             session_log: None,
             live_stats: LiveStats::new(),
@@ -45999,6 +46108,167 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         slot.draining = false;
         slot.error_turn_count = 1;
         assert!(!slot_is_idle_zombie_candidate(&slot, 300, 3600));
+    }
+
+    fn seed_reviewed_task(db_path: &Path, reviewer: &str, status: &str) -> i64 {
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "sticky re-review",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now_unix(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status=?2, reviewer=?3, rework_round=1 WHERE id=?1",
+            rusqlite::params![task_id, status, reviewer],
+        )
+        .unwrap();
+        task_id
+    }
+
+    fn set_task_status(db_path: &Path, task_id: i64, status: &str) {
+        let conn = quorum_core::db::open(db_path).unwrap();
+        conn.execute(
+            "UPDATE tasks SET status=?2 WHERE id=?1",
+            rusqlite::params![task_id, status],
+        )
+        .unwrap();
+    }
+
+    fn backdate_turn_end(slot: &mut SlotState, secs: u64) {
+        slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(secs));
+        slot.last_provider_activity_at = None;
+    }
+
+    /// Owner decision 2026-11-09: the original R1 performs the re-review. A
+    /// live Claude reviewer that submitted `changes` must outlast the plain
+    /// idle ceiling while the worker remediates and the reworked head's
+    /// pre-review CI runs, so `resume_reviewer_after_ci` still finds the same
+    /// slot (it skips the feed when no reviewer slot exists for the task).
+    #[tokio::test]
+    async fn sticky_reviewer_survives_idle_ceiling_through_rework_and_ci() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sticky-rereview.db");
+        let mut reviewer = make_dummy_slot_async().await;
+        assert_eq!(reviewer.process_kind(), runner::AgentKind::Claude);
+        let agent = reviewer.agent_name.clone();
+        let session = reviewer.session_id.clone();
+        let task_id = seed_reviewed_task(&db_path, &agent, "rework");
+        reviewer.task_id = task_id;
+        reviewer.draining = false;
+        backdate_turn_end(&mut reviewer, 901);
+        let mut reviewers = vec![reviewer];
+        let mut pending_resumes = HashMap::new();
+
+        // Worker remediating past max_idle_secs.
+        assert!(
+            idle_reviewer_reap_candidates(&db_path, &reviewers, &pending_resumes, 900, 3600)
+                .await
+                .is_empty(),
+            "a reviewer awaiting rework must not be reaped at the plain idle ceiling"
+        );
+
+        // Merge-gate CI wait (an approved reviewer resumes on merge failure).
+        set_task_status(&db_path, task_id, "merging");
+        assert!(
+            idle_reviewer_reap_candidates(&db_path, &reviewers, &pending_resumes, 900, 3600)
+                .await
+                .is_empty(),
+            "a reviewer awaiting the merge gate must not be reaped at the plain idle ceiling"
+        );
+
+        // Rework pushed: in-review with the CI-gated resume pending.
+        set_task_status(&db_path, task_id, "in-review");
+        pending_resumes.insert(task_id, 77);
+        backdate_turn_end(&mut reviewers[0], 1800);
+        assert!(
+            idle_reviewer_reap_candidates(&db_path, &reviewers, &pending_resumes, 900, 3600)
+                .await
+                .is_empty(),
+            "a reviewer awaiting pre-review CI for its re-review must not be reaped"
+        );
+
+        // CI ready: the same slot is present for the re-review feed.
+        let resumed = reviewers
+            .iter()
+            .find(|r| r.task_id == task_id)
+            .expect("ResumeReviewer must find the original reviewer slot");
+        assert_eq!(resumed.agent_name, agent);
+        assert_eq!(resumed.session_id, session);
+        reviewers.remove(0).kill_and_reap().await;
+    }
+
+    /// Negative paths: the wait is bounded by the busy ceiling, after which
+    /// the reviewer is reaped and the fresh-reviewer path runs; a reviewer
+    /// that owes a verdict keeps the plain ceiling.
+    #[tokio::test]
+    async fn sticky_reviewer_wait_is_bounded_by_busy_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sticky-rereview-bound.db");
+        let mut reviewer = make_dummy_slot_async().await;
+        let agent = reviewer.agent_name.clone();
+        let task_id = seed_reviewed_task(&db_path, &agent, "rework");
+        reviewer.task_id = task_id;
+        reviewer.draining = false;
+        backdate_turn_end(&mut reviewer, 3601);
+        let mut reviewers = vec![reviewer];
+        let mut pending_resumes = HashMap::new();
+
+        let reaped =
+            idle_reviewer_reap_candidates(&db_path, &reviewers, &pending_resumes, 900, 3600).await;
+        assert_eq!(reaped.len(), 1);
+        let (index, idle, limit, awaiting) = reaped[0];
+        assert_eq!(index, 0);
+        assert!(idle > 3600);
+        assert_eq!(limit, 3600, "the busy ceiling bounds the re-review wait");
+        assert!(awaiting, "the reap records that it ended a sticky wait");
+
+        pending_resumes.insert(task_id, 77);
+        set_task_status(&db_path, task_id, "in-review");
+        let reaped =
+            idle_reviewer_reap_candidates(&db_path, &reviewers, &pending_resumes, 900, 3600).await;
+        assert_eq!(reaped.len(), 1, "a CI-pending wait is bounded too");
+        assert!(reaped[0].3);
+
+        // A reviewer that owes its verdict (in-review, no pending resume)
+        // remains an idle zombie at the plain ceiling.
+        pending_resumes.clear();
+        backdate_turn_end(&mut reviewers[0], 901);
+        let reaped =
+            idle_reviewer_reap_candidates(&db_path, &reviewers, &pending_resumes, 900, 3600).await;
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].2, 900);
+        assert!(!reaped[0].3);
+
+        // The reap releases review ownership through the existing guarded
+        // failure, so Phase 5 provisions a fresh reviewer.
+        assert_eq!(
+            fail_reviewer_if_owner(&db_path, &agent, task_id, "idle reap").await,
+            Some(true)
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert!(task.reviewer.is_none());
+        drop(conn);
+        reviewers.remove(0).kill_and_reap().await;
+    }
+
+    #[test]
+    fn reviewer_rereview_wait_states() {
+        assert!(reviewer_awaits_sticky_rereview(Some("rework"), false));
+        assert!(reviewer_awaits_sticky_rereview(Some("merging"), false));
+        assert!(reviewer_awaits_sticky_rereview(Some("in-review"), true));
+        assert!(!reviewer_awaits_sticky_rereview(Some("in-review"), false));
+        assert!(!reviewer_awaits_sticky_rereview(Some("done"), false));
+        assert!(!reviewer_awaits_sticky_rereview(None, false));
     }
 
     #[test]
