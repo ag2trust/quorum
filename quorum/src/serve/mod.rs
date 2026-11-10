@@ -4821,6 +4821,11 @@ pub(crate) struct SlotState {
     /// Set when `draining` flips to false (turn completed). Used by the idle
     /// watchdog to detect zombies sitting between turns indefinitely.
     turn_ended_at: Option<std::time::Instant>,
+    /// Latest provider activity between daemon turns: a self-continued turn
+    /// ended, or outstanding tool/background work went to zero. The plain
+    /// between-turn idle ceiling is measured from the later of this and
+    /// `turn_ended_at`; the busy ceiling ignores it.
+    last_provider_activity_at: Option<std::time::Instant>,
     agent_state: Option<String>,
     session_log: Option<session_log::SessionLog>,
     live_stats: LiveStats,
@@ -16351,34 +16356,27 @@ async fn tick(
         .or(config.limits.idle_timeout_secs)
         .unwrap_or(900);
     let busy_idle_timeout = max_busy_idle_secs(&config.limits);
-    let mut idle_reviewers: Vec<(usize, u64)> = Vec::new();
+    let mut idle_reviewers: Vec<(usize, u64, u64)> = Vec::new();
     for (i, r) in reviewers.iter().enumerate() {
         if r.draining || slot_has_pending_watchdog_outcome(r) {
             continue;
         }
-        let limit = between_turn_idle_limit(r, idle_timeout, busy_idle_timeout);
-        if let Some(ended) = r.turn_ended_at {
-            if ended.elapsed().as_secs() > limit {
+        if let Some((idle, limit)) = between_turn_idle(r, idle_timeout, busy_idle_timeout) {
+            if idle > limit {
                 log(&format!(
-                    "WATCHDOG: reviewer {} idle {}s (limit {}s) — killing zombie",
-                    r.agent_name,
-                    ended.elapsed().as_secs(),
-                    limit
+                    "WATCHDOG: reviewer {} idle {idle}s (limit {limit}s) — killing zombie",
+                    r.agent_name
                 ));
-                idle_reviewers.push((i, limit));
+                idle_reviewers.push((i, idle, limit));
             }
         }
     }
-    for &(i, limit) in idle_reviewers.iter().rev() {
+    for &(i, idle, limit) in idle_reviewers.iter().rev() {
         let mutation = fail_reviewer_if_owner(
             &db_path,
             &reviewers[i].agent_name,
             reviewers[i].task_id,
-            &format!(
-                "reviewer idle {}s between turns (limit {}s) — zombie reaped",
-                reviewers[i].turn_ended_at.unwrap().elapsed().as_secs(),
-                limit
-            ),
+            &format!("reviewer idle {idle}s between turns (limit {limit}s) — zombie reaped"),
         )
         .await;
         if mutation.is_none() {
@@ -16499,20 +16497,19 @@ async fn tick(
     // Phase-aware: workers whose task is already in-review or merging are
     // legitimately idle (awaiting review/merge) — release gracefully without
     // firing AgentFailed (#176).
-    let mut idle_workers: Vec<usize> = Vec::new();
+    let mut idle_workers: Vec<(usize, u64, u64)> = Vec::new();
     for (i, w) in workers.iter().enumerate() {
-        if slot_is_idle_zombie_candidate(w, idle_timeout, max_busy_idle_secs(&config.limits)) {
-            idle_workers.push(i);
+        if !slot_is_idle_zombie_candidate(w, idle_timeout, max_busy_idle_secs(&config.limits)) {
+            continue;
+        }
+        if let Some((idle_secs, idle_limit)) =
+            between_turn_idle(w, idle_timeout, max_busy_idle_secs(&config.limits))
+        {
+            idle_workers.push((i, idle_secs, idle_limit));
         }
     }
-    for &i in idle_workers.iter().rev() {
+    for &(i, idle_secs, idle_limit) in idle_workers.iter().rev() {
         let task_id = workers[i].task_id;
-        let idle_secs = workers[i].turn_ended_at.unwrap().elapsed().as_secs();
-        let idle_limit = between_turn_idle_limit(
-            &workers[i],
-            idle_timeout,
-            max_busy_idle_secs(&config.limits),
-        );
 
         // Look up current task status to distinguish legitimate waits from zombies.
         let p = db_path.clone();
@@ -18981,10 +18978,12 @@ async fn observe_between_turn_output(
             break;
         };
         observed += 1;
+        let was_busy = slot.has_outstanding_provider_work();
         let Ok(proc) = slot.live_process_mut() else {
             break;
         };
         let events = proc.normalize_stream_line(&raw_line);
+        note_provider_activity(slot, was_busy, &events);
         if let Some(ref mut sl) = slot.session_log {
             sl.log_raw_and_normalized(&raw_line, &events);
         }
@@ -19001,10 +19000,11 @@ async fn observe_between_turn_output(
             }
             // Refresh liveness first so budget checks below never mistake a
             // long between-turn wait for an idle breach.
-            // `turn_ended_at` is deliberately NOT re-anchored: the between-turn
-            // bound is measured from the last daemon-fed turn, so provider
-            // self-continuation can only select the busy ceiling, never extend
-            // it (see `between_turn_idle_limit`).
+            // `turn_ended_at` is deliberately NOT re-anchored, and plain
+            // liveness never refreshes `last_provider_activity_at`: only a
+            // self-continued turn end or outstanding work clearing does (see
+            // `between_turn_idle`), so the busy ceiling stays measured from
+            // the last daemon-fed turn.
             slot.last_event_at = std::time::Instant::now();
             slot.live_stats.record_event();
             match event {
@@ -19106,15 +19106,46 @@ async fn clear_worker_reaction_before_feed(slot: &mut SlotState, db_path: &Path)
 /// re-arming background work and continuing on its own.
 const MAX_UNFED_TURNS_PER_FED_TURN: u32 = 8;
 
-/// Between-turn idle ceiling, measured from the last daemon-fed turn end.
+/// Between-turn idle measurement: `(idle_secs, limit_secs)`, or `None` while
+/// a daemon turn is in flight.
+///
 /// Outstanding work, or a self-continued provider turn in progress, selects
-/// the busy ceiling; nothing extends past it.
-fn between_turn_idle_limit(slot: &SlotState, idle_secs: u64, busy_idle_secs: u64) -> u64 {
+/// the busy ceiling measured from the last daemon-fed turn end, so
+/// self-continuation never extends it. Otherwise the plain ceiling is
+/// measured from the latest provider activity: the fed-turn end, a
+/// self-continued turn end, or outstanding work clearing. A worker whose
+/// background task finishes late therefore gets the full idle window to react
+/// to the completion; `MAX_UNFED_TURNS_PER_FED_TURN`, the busy ceiling, and
+/// `max_task_wall_secs` still bound a provider that keeps itself busy.
+fn between_turn_idle(slot: &SlotState, idle_secs: u64, busy_idle_secs: u64) -> Option<(u64, u64)> {
+    let fed_turn_ended = slot.turn_ended_at?;
     let provider_active = matches!(
         &slot.proc,
         SlotProcess::Running(proc) if proc.has_outstanding_work() || proc.unfed_turn_open()
     );
-    effective_idle_secs(idle_secs, busy_idle_secs, provider_active)
+    let anchor = if provider_active {
+        fed_turn_ended
+    } else {
+        slot.last_provider_activity_at
+            .map_or(fed_turn_ended, |activity| activity.max(fed_turn_ended))
+    };
+    Some((
+        anchor.elapsed().as_secs(),
+        effective_idle_secs(idle_secs, busy_idle_secs, provider_active),
+    ))
+}
+
+/// Refresh `last_provider_activity_at` after one normalized stdout line: a
+/// self-continued turn ended, or outstanding tool/background work went from
+/// non-zero to zero. Other lines are liveness only and never re-anchor the
+/// between-turn idle bound.
+fn note_provider_activity(slot: &mut SlotState, was_busy: bool, events: &[runner::AgentEvent]) {
+    let unfed_turn_ended = events
+        .iter()
+        .any(|event| matches!(event, runner::AgentEvent::UnfedTurnUsage { .. }));
+    if unfed_turn_ended || (was_busy && !slot.has_outstanding_provider_work()) {
+        slot.last_provider_activity_at = Some(std::time::Instant::now());
+    }
 }
 
 /// The provider is acting without a daemon turn: a self-continued turn has
@@ -19248,6 +19279,7 @@ async fn feed_worker_turn(
             slot.last_terminal_cost_usd = None;
             slot.live_stats = LiveStats::new();
             slot.turn_ended_at = None;
+            slot.last_provider_activity_at = None;
         }
 
         // A launched turn is not recoverably installed until its exact PID is
@@ -20774,9 +20806,8 @@ fn slot_is_idle_zombie_candidate(
     if matches!(slot.proc, SlotProcess::Dormant { .. }) {
         return false;
     }
-    let limit = between_turn_idle_limit(slot, idle_timeout_secs, busy_idle_secs);
-    slot.turn_ended_at
-        .is_some_and(|t| t.elapsed().as_secs() > limit)
+    between_turn_idle(slot, idle_timeout_secs, busy_idle_secs)
+        .is_some_and(|(idle, limit)| idle > limit)
 }
 
 /// A terminal watchdog breach classified as OutcomePending preserves mailbox
@@ -21820,6 +21851,7 @@ async fn drain_events(
             DrainedLine::Raw(raw_line) => {
                 let kind = slot.process_kind();
                 raw_drain_budget_exhausted = line_index + 1 == MAX_STREAM_LINES_PER_TICK;
+                let was_busy = slot.has_outstanding_provider_work();
                 let events = slot
                     .live_process_mut()
                     .map_err(|error| {
@@ -21828,6 +21860,7 @@ async fn drain_events(
                         ))
                     })?
                     .normalize_stream_line(&raw_line);
+                note_provider_activity(slot, was_busy, &events);
                 if let Some(ref mut sl) = slot.session_log {
                     if kind == runner::AgentKind::Grok {
                         sl.log_grok_raw_and_normalized(&raw_line, &events);
@@ -23800,6 +23833,7 @@ async fn provision_reviewer_reserved(
                 turn_started_at: now_instant,
                 last_event_at: now_instant,
                 turn_ended_at: None,
+                last_provider_activity_at: None,
                 agent_state: None,
                 session_log: reviewer_session_log,
                 live_stats: LiveStats::new(),
@@ -23866,6 +23900,7 @@ async fn provision_reviewer_reserved(
                 turn_started_at: now_instant,
                 last_event_at: now_instant,
                 turn_ended_at: None,
+                last_provider_activity_at: None,
                 agent_state: None,
                 session_log: reviewer_session_log,
                 live_stats: LiveStats::new(),
@@ -25750,6 +25785,7 @@ async fn spawn_admitted_worker(
                 turn_started_at: now_instant,
                 last_event_at: now_instant,
                 turn_ended_at: None,
+                last_provider_activity_at: None,
                 agent_state: None,
                 session_log: worker_session_log,
                 live_stats: LiveStats::new(),
@@ -25803,6 +25839,7 @@ async fn spawn_admitted_worker(
                 turn_started_at: now_instant,
                 last_event_at: now_instant,
                 turn_ended_at: None,
+                last_provider_activity_at: None,
                 agent_state: None,
                 session_log: worker_session_log,
                 live_stats: LiveStats::new(),
@@ -27277,6 +27314,7 @@ async fn activate_reviewer_fallback(
     slot.turn_started_at = instant;
     slot.last_event_at = instant;
     slot.turn_ended_at = None;
+    slot.last_provider_activity_at = None;
     log(&format!(
         "reviewer {} fell back to provider {} model {} for task #{} PR #{}",
         slot.agent_name, alternate_kind, slot.model, slot.task_id, pr
@@ -27861,6 +27899,7 @@ async fn activate_worker_fallback(
     slot.turn_started_at = instant;
     slot.last_event_at = instant;
     slot.turn_ended_at = None;
+    slot.last_provider_activity_at = None;
     slot.session_log = new_session_log;
     log(&format!(
         "worker {} fell back to provider {} model {} for task #{}",
@@ -28012,6 +28051,7 @@ async fn resume_pending_fallbacks(
             turn_started_at: now_instant,
             last_event_at: now_instant,
             turn_ended_at: None,
+            last_provider_activity_at: None,
             agent_state: entry.agent_state.clone(),
             session_log,
             live_stats: LiveStats::new(),
@@ -30600,6 +30640,7 @@ async fn spawn_remediation_worker(
                 turn_started_at: now_instant,
                 last_event_at: now_instant,
                 turn_ended_at: None,
+                last_provider_activity_at: None,
                 agent_state: None,
                 session_log: worker_session_log,
                 live_stats: LiveStats::new(),
@@ -34226,6 +34267,7 @@ mod tests {
             turn_started_at: now,
             last_event_at: now,
             turn_ended_at: None,
+            last_provider_activity_at: None,
             agent_state: None,
             session_log: None,
             live_stats: LiveStats::new(),
@@ -34899,6 +34941,7 @@ mod tests {
             turn_started_at: now,
             last_event_at: now,
             turn_ended_at: Some(now),
+            last_provider_activity_at: None,
             agent_state: None,
             session_log: None,
             live_stats: LiveStats::new(),
@@ -35325,6 +35368,7 @@ mod tests {
             turn_started_at: now,
             last_event_at: now,
             turn_ended_at: None,
+            last_provider_activity_at: None,
             agent_state: None,
             session_log: None,
             live_stats: LiveStats::new(),
@@ -35513,6 +35557,7 @@ mod tests {
             turn_started_at: now,
             last_event_at: now,
             turn_ended_at: None,
+            last_provider_activity_at: None,
             agent_state: None,
             session_log: None,
             live_stats: LiveStats::new(),
@@ -35705,6 +35750,7 @@ mod tests {
             turn_started_at: now,
             last_event_at: now,
             turn_ended_at: None,
+            last_provider_activity_at: None,
             agent_state: None,
             session_log: None,
             live_stats: LiveStats::new(),
@@ -35975,6 +36021,7 @@ mod tests {
             turn_started_at: now,
             last_event_at: now,
             turn_ended_at: None,
+            last_provider_activity_at: None,
             agent_state: None,
             session_log: None,
             live_stats: LiveStats::new(),
@@ -37363,6 +37410,7 @@ mod tests {
             turn_started_at: now,
             last_event_at: now,
             turn_ended_at: None,
+            last_provider_activity_at: None,
             agent_state: None,
             session_log: None,
             live_stats: LiveStats::new(),
@@ -38074,7 +38122,8 @@ mod tests {
         );
         slot.kill_and_reap().await;
 
-        // Closed self-continuations with nothing outstanding: plain ceiling.
+        // Closed self-continuations with nothing outstanding: plain ceiling,
+        // measured from the last self-continued turn end.
         let mut slot = replay_fed_turn_then_between_turns(
             dir.path(),
             &fed_then_unfed_turns(3, false),
@@ -38082,6 +38131,12 @@ mod tests {
         )
         .await;
         slot.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(1000));
+        assert!(
+            !slot_is_idle_zombie_candidate(&slot, 900, 3600),
+            "a just-ended self-continued turn restarts the idle window"
+        );
+        slot.last_provider_activity_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(901));
         assert!(slot_is_idle_zombie_candidate(&slot, 900, 3600));
         slot.kill_and_reap().await;
     }
@@ -38240,6 +38295,74 @@ mod tests {
         idle.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(1000));
         assert!(slot_is_idle_zombie_candidate(&idle, 900, 3600));
         idle.kill_and_reap().await;
+    }
+
+    /// boostmyagents #841: the fed turn ends with a background task running;
+    /// it finishes more than `max_idle_secs` later. The worker must get the
+    /// full idle window to react to the completion, not be reaped at once.
+    #[tokio::test]
+    async fn background_completion_after_idle_limit_restarts_idle_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let lines: Vec<&str> = CLAUDE_BETWEEN_TURNS_FIXTURE.lines().collect();
+        let fed_end = lines
+            .iter()
+            .position(|line| line.contains(r#""stop_reason":"end_turn""#))
+            .unwrap();
+        let fed_turn = &lines[..=fed_end];
+        // task_updated completed, task_notification, background_tasks_changed [].
+        let completion = &lines[fed_end + 1..fed_end + 4];
+        assert!(completion[0].contains(r#""subtype":"task_updated""#));
+        assert!(completion[2].contains(r#""subtype":"background_tasks_changed","tasks":[]"#));
+        let completion_path = dir.path().join("completion.jsonl");
+        std::fs::write(&completion_path, format!("{}\n", completion.join("\n"))).unwrap();
+        let gate = dir.path().join("go");
+        let then = format!(
+            "while [ ! -f '{}' ]; do sleep 0.02; done; cat '{}'; sleep 5",
+            gate.display(),
+            completion_path.display()
+        );
+        let mut slot = claude_replay_slot(dir.path(), fed_turn, &then);
+        run_turn_then_observe_between_turns(&mut slot, dir.path()).await;
+        assert!(slot.has_outstanding_provider_work());
+
+        // More than max_idle_secs pass while the background task runs.
+        let stale = std::time::Instant::now() - std::time::Duration::from_secs(1071);
+        slot.turn_ended_at = Some(stale);
+        slot.last_provider_activity_at = slot.last_provider_activity_at.map(|_| stale);
+        assert!(!slot_is_idle_zombie_candidate(&slot, 900, 3600));
+
+        std::fs::write(&gate, "").unwrap();
+        for _ in 0..200 {
+            assert!(actionable_slot_breach(
+                &mut slot,
+                dir.path(),
+                "worker",
+                &CostLimits::default()
+            )
+            .await
+            .unwrap()
+            .is_none());
+            if !slot.has_outstanding_provider_work() {
+                break;
+            }
+        }
+        assert!(
+            !slot.has_outstanding_provider_work(),
+            "completion must clear outstanding work"
+        );
+        assert!(
+            !slot_is_idle_zombie_candidate(&slot, 900, 3600),
+            "work clearing restarts the idle window"
+        );
+        // Still idle after the plain window with no further activity: reaped.
+        let cleared = slot
+            .last_provider_activity_at
+            .expect("work clearing is activity");
+        slot.last_provider_activity_at = Some(cleared - std::time::Duration::from_secs(899));
+        assert!(!slot_is_idle_zombie_candidate(&slot, 900, 3600));
+        slot.last_provider_activity_at = Some(cleared - std::time::Duration::from_secs(901));
+        assert!(slot_is_idle_zombie_candidate(&slot, 900, 3600));
+        slot.kill_and_reap().await;
     }
 
     #[tokio::test]
@@ -41121,6 +41244,7 @@ printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-session-te
                 turn_started_at: now_instant,
                 last_event_at: now_instant,
                 turn_ended_at: Some(now_instant),
+                last_provider_activity_at: None,
                 agent_state: None,
                 session_log: None,
                 live_stats: LiveStats::new(),
@@ -43170,6 +43294,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             turn_started_at: now,
             last_event_at: now,
             turn_ended_at: None,
+            last_provider_activity_at: None,
             agent_state: None,
             session_log: None,
             live_stats: LiveStats::new(),
@@ -55070,6 +55195,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             turn_started_at: now,
             last_event_at: now,
             turn_ended_at: Some(now),
+            last_provider_activity_at: None,
             agent_state: None,
             session_log: None,
             live_stats: LiveStats::new(),
