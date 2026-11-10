@@ -132,6 +132,10 @@ primary = 100
 ## Rework ceiling: max changes-to-rework rounds before a task fails. Stamped
 ## onto each task at adoption; unset keeps the compiled default (7).
 # max_rework = 7
+
+## Decomposition: children of one graph that may be working at once. Unset
+## defaults to cap; must be >= 1; values above cap are bounded by cap.
+# max_graph_children_working = 4
 ";
 
 fn run() -> Result<i32> {
@@ -1026,19 +1030,19 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             bind,
             log_dir,
         } => {
-            let configured_log_dir = if log_dir.is_none() {
-                let repo = paths::resolve_repo()?;
-                let serve_config_path = serve_config::default_config_path(&repo)?;
-                serve_config::load(&serve_config_path, false)?.log_dir
-            } else {
-                None
-            };
+            // The Ready band must apply the daemon's effective per-graph
+            // working-children limit, so serve config is always resolved.
+            let repo = paths::resolve_repo()?;
+            let serve_config_path = serve_config::default_config_path(&repo)?;
+            let file_cfg = serve_config::load(&serve_config_path, false)?;
+            let graph_children_limit = serve_config::file_graph_children_working_limit(&file_cfg)?;
             web::serve(
                 paths::db_path()?,
-                resolve_web_log_dir(log_dir, configured_log_dir, paths::home_dir()?),
+                resolve_web_log_dir(log_dir, file_cfg.log_dir, paths::home_dir()?),
                 &bind,
                 port,
                 load_cfg()?.online_window_secs,
+                graph_children_limit,
             )?;
             Ok(0)
         }
@@ -1647,7 +1651,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     "serve requires --worktree-base (or worktree_base in config file)".into(),
                 ));
             }
-            let r_cap = resolve_val(cap, file_cfg.cap, 4);
+            let r_cap = resolve_val(cap, file_cfg.cap, serve_config::DEFAULT_CAP);
             let r_names = resolve_opt_str(names_file.as_deref(), file_cfg.names_file.as_deref());
             let r_agent_bin = resolve_opt_str(agent_bin.as_deref(), file_cfg.agent_bin.as_deref());
             let r_merge_token = resolve_opt_str(
@@ -1765,6 +1769,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 .max_rework
                 .unwrap_or(quorum_core::lifecycle::REWORK_CAP);
             serve_config::validate_max_rework(r_max_rework)?;
+            let r_max_graph_children_working = serve_config::resolve_max_graph_children_working(
+                file_cfg.max_graph_children_working,
+                r_cap.value,
+            )?;
 
             let model_profiles = file_cfg.model_profiles.clone().ok_or_else(|| {
                 QuorumError::Usage("serve config requires [model_profiles]".into())
@@ -1906,6 +1914,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 r2_target_per_stratum: r_r2_target_per_stratum,
                 r2_steady_state_p: r_r2_steady_state_p,
                 max_rework: r_max_rework,
+                max_graph_children_working: Some(r_max_graph_children_working),
             };
             Ok(serve::run_serve(config)?)
         }

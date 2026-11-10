@@ -10946,6 +10946,213 @@ mod tests {
         }
     }
 
+    fn working_children(conn: &Connection, ids: &[i64]) -> usize {
+        ids.iter()
+            .filter(|id| {
+                conn.query_row(
+                    "SELECT status='working' FROM tasks WHERE id=?1",
+                    [id],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap()
+            })
+            .count()
+    }
+
+    fn independent_graph(conn: &mut Connection, children: usize) -> Vec<i64> {
+        let graph = begin(conn);
+        let keys: Vec<String> = (0..children).map(|i| format!("c{i}")).collect();
+        let planned: Vec<PlannedChild> = keys.iter().map(|key| child(key, &[])).collect();
+        materialize_graph(conn, graph, 1, &planned, 4)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn graph_children_limit_four_lets_four_independent_children_start() {
+        let mut conn = setup();
+        let ids = independent_graph(&mut conn, 4);
+        for (index, now) in (5..9).enumerate() {
+            assert_eq!(
+                crate::tasks::list_implementation_ready_open_with_graph_limit(&conn, 4)
+                    .unwrap()
+                    .len(),
+                4 - index,
+                "every unclaimed child stays listed below the limit"
+            );
+            let claimed = crate::tasks::claim_with_graph_limit(
+                &mut conn,
+                &format!("w{index}"),
+                None,
+                &[],
+                60,
+                now,
+                4,
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("claim {} must win under limit 4", index + 1));
+            assert!(ids.contains(&claimed.id));
+        }
+        assert_eq!(working_children(&conn, &ids), 4);
+        // The legacy entry points keep the historical limit of two.
+        let mut legacy = setup();
+        let legacy_ids = independent_graph(&mut legacy, 4);
+        for (index, id) in legacy_ids.iter().enumerate() {
+            let won = crate::tasks::claim(&mut legacy, "w", Some(*id), &[], 60, 5)
+                .unwrap()
+                .is_some();
+            assert_eq!(won, index < 2, "legacy claim {index}");
+        }
+    }
+
+    #[test]
+    fn bounded_dashboard_projection_binds_the_supplied_graph_limit() {
+        let mut conn = setup();
+        let ids = independent_graph(&mut conn, 4);
+        for (index, now) in (5..7).enumerate() {
+            crate::tasks::claim_with_graph_limit(
+                &mut conn,
+                &format!("w{index}"),
+                None,
+                &[],
+                60,
+                now,
+                4,
+            )
+            .unwrap()
+            .unwrap();
+        }
+        let listed = |conn: &Connection, graph_limit| {
+            crate::tasks::list_implementation_ready_open_limited(conn, 20, graph_limit)
+                .unwrap()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>()
+        };
+        let dispatchable = crate::tasks::list_implementation_ready_open_with_graph_limit(&conn, 4)
+            .unwrap()
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        assert_eq!(dispatchable.len(), 2);
+        assert!(dispatchable.iter().all(|id| ids.contains(id)));
+        // With two children working, the dashboard agrees with dispatch at
+        // limit 4 and hides the remaining children at limit 2.
+        assert_eq!(listed(&conn, 4), dispatchable);
+        assert!(listed(&conn, 2).is_empty());
+        for bad in [0, -1] {
+            assert!(matches!(
+                crate::tasks::list_implementation_ready_open_limited(&conn, 20, bad),
+                Err(crate::error::QuorumError::Usage(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn graph_children_limit_one_serialises_children() {
+        let mut conn = setup();
+        let ids = independent_graph(&mut conn, 3);
+        crate::tasks::claim_with_graph_limit(&mut conn, "w1", Some(ids[0]), &[], 60, 5, 1)
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::tasks::list_implementation_ready_open_with_graph_limit(&conn, 1)
+                .unwrap()
+                .is_empty(),
+            "listing must agree with the claim predicate"
+        );
+        assert!(
+            crate::tasks::claim_with_graph_limit(&mut conn, "w2", Some(ids[1]), &[], 60, 6, 1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::tasks::claim_with_graph_limit(&mut conn, "w2", None, &["x"], 60, 6, 1)
+                .unwrap()
+                .is_none()
+        );
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
+            .unwrap();
+        let next = crate::tasks::claim_with_graph_limit(&mut conn, "w2", None, &[], 60, 7, 1)
+            .unwrap()
+            .expect("a finished child frees the single slot");
+        assert!(ids[1..].contains(&next.id));
+        assert_eq!(working_children(&conn, &ids), 1);
+    }
+
+    #[test]
+    fn graph_children_limit_below_one_is_usage_error() {
+        let mut conn = setup();
+        let ids = independent_graph(&mut conn, 2);
+        for bad in [0, -1] {
+            assert!(matches!(
+                crate::tasks::claim_with_graph_limit(&mut conn, "w", Some(ids[0]), &[], 60, 5, bad),
+                Err(crate::error::QuorumError::Usage(_))
+            ));
+            assert!(matches!(
+                crate::tasks::list_implementation_ready_open_with_graph_limit(&conn, bad),
+                Err(crate::error::QuorumError::Usage(_))
+            ));
+        }
+        assert_eq!(working_children(&conn, &ids), 0);
+    }
+
+    #[test]
+    fn real_file_concurrent_child_claims_never_exceed_configured_limit() {
+        use std::sync::{Arc, Barrier};
+
+        const CHILDREN: usize = 6;
+        for limit in [1_i64, 3, 6] {
+            for round in 0..15 {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("quorum.db");
+                let mut conn = crate::db::open(&path).unwrap();
+                conn.execute(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES ('large','open','owner',1,1)",
+                    [],
+                )
+                .unwrap();
+                let ids = independent_graph(&mut conn, CHILDREN);
+                drop(conn);
+
+                // Twice as many claimers as children: half target a specific
+                // child, half use the selector path.
+                let barrier = Arc::new(Barrier::new(CHILDREN * 2));
+                let handles: Vec<_> = (0..CHILDREN * 2)
+                    .map(|index| {
+                        let path = path.clone();
+                        let barrier = Arc::clone(&barrier);
+                        let target = (index < CHILDREN).then(|| ids[index]);
+                        std::thread::spawn(move || {
+                            let mut conn = crate::db::open(&path).unwrap();
+                            barrier.wait();
+                            crate::tasks::claim_with_graph_limit(
+                                &mut conn,
+                                &format!("w{index}"),
+                                target,
+                                &[],
+                                60,
+                                10 + round,
+                                limit,
+                            )
+                            .unwrap()
+                            .is_some()
+                        })
+                    })
+                    .collect();
+                let winners = handles
+                    .into_iter()
+                    .map(|handle| usize::from(handle.join().unwrap()))
+                    .sum::<usize>();
+                let conn = crate::db::open(&path).unwrap();
+                let working = working_children(&conn, &ids);
+                assert_eq!(winners, limit as usize, "limit {limit} round {round}");
+                assert_eq!(working, limit as usize, "limit {limit} round {round}");
+            }
+        }
+    }
+
     /// Task #473 blocker 1: graph member cancellation must refresh the
     /// durable park refs of parked dependents. Ordinary `tasks::update`
     /// wires convergence; `cancel_graph_in_tx` is a separate cancellation

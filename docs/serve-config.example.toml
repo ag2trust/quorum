@@ -17,6 +17,10 @@ log_dir       = "/home/user/.quorum/serve/quorum/logs"
 
 # ── agent spawn and model routing ─────────────────────────────────────
 cap = 4
+# Children of one decomposition graph that may be working at once. Unset
+# defaults to cap; must be >= 1 (0 or negative is bad config, exit 2); values
+# above cap are effectively bounded by cap.
+# max_graph_children_working = 4
 # names_file = "/home/user/.quorum/serve/names.txt"
 # agent_bin  = "claude"
 

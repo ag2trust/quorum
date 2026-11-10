@@ -934,7 +934,7 @@ fn sentinel_gone_terminates_serve_and_children() {
 #[test]
 fn stable_graph_rejection_is_filtered_without_skip_or_spawn() {
     // A graph member whose sibling has failed is deterministically rejected by
-    // GRAPH_IMPLEMENTATION_READY_CLAUSE. Selection shares that predicate, so
+    // graph_implementation_ready_clause!. Selection shares that predicate, so
     // repeated ticks must not attempt claims or emit race-skip/spawn logs.
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();

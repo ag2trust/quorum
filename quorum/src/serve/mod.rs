@@ -4490,6 +4490,10 @@ pub struct ServeConfig {
     /// Maximum rework rounds before a task fails. Stamped onto each task at
     /// adoption; unset in config falls back to `lifecycle::REWORK_CAP`.
     pub max_rework: u32,
+    /// Validated `max_graph_children_working`: how many children of one
+    /// decomposition graph may be `working` at once. `None` means the worker
+    /// `cap`; values above `cap` are effectively bounded by `cap`.
+    pub max_graph_children_working: Option<usize>,
     /// Codex sandbox mode (default: "danger-full-access").
     pub codex_sandbox: String,
     /// Validated Grok adapter settings used by every managed worker launch.
@@ -4497,6 +4501,15 @@ pub struct ServeConfig {
     /// Test-only override for the `gh` binary used by live PR target
     /// resolution. None → look up "gh" on PATH.
     pub pr_target_program: Option<PathBuf>,
+}
+
+impl ServeConfig {
+    /// Per-graph working-children limit bound by both the dispatch listing
+    /// and the authoritative claim, so the two always agree.
+    pub fn graph_children_working_limit(&self) -> i64 {
+        let limit = self.max_graph_children_working.unwrap_or(self.cap).max(1);
+        i64::try_from(limit).unwrap_or(i64::MAX)
+    }
 }
 
 /// Supervisor handoff: a daemon which has drained for a self-update exits 75.
@@ -24753,13 +24766,16 @@ async fn spawn_admitted_worker(
     let p = db_path.clone();
 
     let in_flight: Vec<i64> = workers.iter().map(|w| w.task_id).collect();
+    let graph_children_limit = config.graph_children_working_limit();
     let available = tokio::task::spawn_blocking(move || -> Result<Vec<tasks::Task>> {
         let conn = quorum_core::db::open(&p)?;
         // Open tasks must stay out of a frozen selection, not merely lose their
         // claim: they sort first, and a refused claim would end the pass before
         // it reached any retried rework.
         let mut available = match admission {
-            WorkerAdmission::AllReady => tasks::list_implementation_ready_open(&conn)?,
+            WorkerAdmission::AllReady => {
+                tasks::list_implementation_ready_open_with_graph_limit(&conn, graph_children_limit)?
+            }
             WorkerAdmission::RetriedRework => Vec::new(),
         };
         available.extend(
@@ -24887,13 +24903,14 @@ async fn spawn_admitted_worker(
                 now,
             )
         } else {
-            tasks::claim(
+            tasks::claim_with_graph_limit(
                 &mut conn,
                 &claim_agent,
                 Some(claim_task_id),
                 &[],
                 tasks::DEFAULT_LEASE_TTL_SECS,
                 now,
+                graph_children_limit,
             )
         }
     })
@@ -31513,6 +31530,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn graph_children_working_limit_defaults_to_cap() {
+        let mut config = pre_review_checks_config(PathBuf::from("db"), PathBuf::from("repo"));
+        config.cap = 4;
+        assert_eq!(config.graph_children_working_limit(), 4);
+        config.max_graph_children_working = Some(1);
+        assert_eq!(config.graph_children_working_limit(), 1);
+        config.max_graph_children_working = Some(6);
+        assert_eq!(config.graph_children_working_limit(), 6);
+    }
+
     fn pre_review_checks_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
         let profile = crate::serve_config::ModelProfile {
             runner: "codex".into(),
@@ -31564,6 +31592,7 @@ mod tests {
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
             max_rework: quorum_core::lifecycle::REWORK_CAP,
+            max_graph_children_working: None,
             codex_sandbox: "danger-full-access".into(),
             grok: Default::default(),
             pr_target_program: None,
@@ -34609,6 +34638,7 @@ mod tests {
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
             max_rework: quorum_core::lifecycle::REWORK_CAP,
+            max_graph_children_working: None,
             codex_sandbox: "danger-full-access".into(),
             grok: Default::default(),
             pr_target_program: None,
@@ -43644,6 +43674,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             r2_target_per_stratum: 0,
             r2_steady_state_p: 0.0,
             max_rework: quorum_core::lifecycle::REWORK_CAP,
+            max_graph_children_working: None,
             codex_sandbox: "danger-full-access".into(),
             grok: Default::default(),
             pr_target_program: None,
