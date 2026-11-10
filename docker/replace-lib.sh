@@ -217,6 +217,39 @@ replace_wait_stopped() {
   return 1
 }
 
+# Bounded wait until a `quorum serve` process exists in $1. `docker top` runs
+# outside the container, so the probe creates no process in its PID namespace;
+# an in-container probe racing startup would shift the numeric PID serve gets.
+replace_wait_serve_started() {
+  tries=0
+  while [ "$tries" -lt 40 ]; do
+    docker top "$1" 2>/dev/null | grep -q 'quorum serve' && return 0
+    running=$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || echo false)
+    [ "$running" = true ] || return 1
+    tries=$((tries + 1))
+    sleep 1
+  done
+  return 1
+}
+
+# Abrupt stop: SIGKILL to the container init makes the kernel kill every
+# process in its PID namespace, so no shutdown path, lock release, or SQLite
+# close/checkpoint runs. Requires exit 137, then removes the container.
+replace_kill_abrupt() {
+  docker kill -s KILL "$1" >/dev/null || replace_fail "cannot SIGKILL $1"
+  replace_wait_stopped "$1" || replace_fail "$1 did not stop after SIGKILL"
+  replace_assert_eq 137 "$(docker inspect -f '{{.State.ExitCode}}' "$1")" \
+    "$1 SIGKILL exit"
+  docker rm "$1" >/dev/null
+}
+
+# PRAGMA integrity_check over the DB (plus WAL) copy recorded in snapshot $1.
+replace_assert_integrity() {
+  integrity=$(sqlite3 "$1/db/quorum.db" 'PRAGMA integrity_check') \
+    || replace_fail "integrity_check could not open $1/db/quorum.db"
+  replace_assert_eq ok "$integrity" "PRAGMA integrity_check of $1"
+}
+
 # Clean SIGTERM stop with exit 0, then removal.
 replace_stop_remove() {
   docker stop -t 20 "$1" >/dev/null
@@ -363,6 +396,10 @@ replace_snapshot() {
     } >/out/manifest
     db=/data/quorum/repos/$REPLACE_SLUG/quorum.db
     mkdir /out/db
+    # WAL/SHM presence and size at snapshot time (diagnostic, not compared).
+    for file in "$db-wal" "$db-shm"; do
+      [ ! -e "$file" ] || printf "%s %s\n" "${file##*/}" "$(wc -c <"$file")"
+    done >/out/db-files
     for file in "$db" "$db-wal"; do
       [ ! -e "$file" ] || cp "$file" /out/db/
     done
