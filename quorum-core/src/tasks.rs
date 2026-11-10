@@ -5259,14 +5259,41 @@ pub fn dispose_dead_turn_runner(
             block.provider, pending_turn.provider
         )));
     }
+    let newly_blocked = runner_state::provider_block(&refs).as_ref() != Some(block);
     runner_state::set_provider_block(&mut refs, block, pending_turn);
     tx.execute(
         "UPDATE tasks SET refs=?2, updated_at=?3 WHERE id=?1",
         params![id, refs.to_string(), now],
     )?;
+    // A provider block deliberately retains the worker lease until an owner
+    // `task-retry`, so no daemon dispatch will touch the task again. Record
+    // that hold durably and visibly; a replay of the same block adds nothing.
+    if newly_blocked {
+        add_note_tx(
+            &tx,
+            "daemon",
+            id,
+            &provider_block_note(agent, id, block),
+            now,
+        )?;
+    }
     consume_pending_worker_reactions_tx(&tx, agent, id, now)?;
     tx.commit()?;
     Ok(DeadTurnRunnerDisposition::ProviderBlocked)
+}
+
+/// Bounded owner-facing note for a worker provider block.
+fn provider_block_note(agent: &str, id: i64, block: &ProviderBlock) -> String {
+    const MAX_REASON_CHARS: usize = 500;
+    let mut reason: String = block.reason.chars().take(MAX_REASON_CHARS).collect();
+    if block.reason.chars().count() > MAX_REASON_CHARS {
+        reason.push('…');
+    }
+    format!(
+        "provider-blocked: worker {agent} stopped on provider {} ({reason}); \
+         no agent will run and the lease stays held until `quorum task-retry {id}`",
+        block.provider
+    )
 }
 
 /// The worker's latest explicit reaction for this task. Phase 2 projects
@@ -9321,6 +9348,29 @@ mod tests {
             runner_state::provider_block(&refs).unwrap().reason,
             "process exited"
         );
+        let notes = notes_for(&c, id).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].agent, "daemon");
+        assert!(notes[0].body.starts_with("provider-blocked: worker worker"));
+        assert!(notes[0].body.contains(&format!("quorum task-retry {id}")));
+
+        // Replaying the identical block is idempotent: no duplicate note.
+        assert_eq!(
+            dispose_dead_turn_runner(
+                &mut c,
+                id,
+                "worker",
+                &ProviderBlock {
+                    provider: "codex".into(),
+                    reason: "process exited".into(),
+                },
+                &dead_turn_retry(),
+                1002,
+            )
+            .unwrap(),
+            DeadTurnRunnerDisposition::ProviderBlocked
+        );
+        assert_eq!(notes_for(&c, id).unwrap().len(), 1);
     }
 
     #[test]
