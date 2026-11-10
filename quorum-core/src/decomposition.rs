@@ -11006,6 +11006,49 @@ mod tests {
     }
 
     #[test]
+    fn bounded_dashboard_projection_binds_the_supplied_graph_limit() {
+        let mut conn = setup();
+        let ids = independent_graph(&mut conn, 4);
+        for (index, now) in (5..7).enumerate() {
+            crate::tasks::claim_with_graph_limit(
+                &mut conn,
+                &format!("w{index}"),
+                None,
+                &[],
+                60,
+                now,
+                4,
+            )
+            .unwrap()
+            .unwrap();
+        }
+        let listed = |conn: &Connection, graph_limit| {
+            crate::tasks::list_implementation_ready_open_limited(conn, 20, graph_limit)
+                .unwrap()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>()
+        };
+        let dispatchable = crate::tasks::list_implementation_ready_open_with_graph_limit(&conn, 4)
+            .unwrap()
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        assert_eq!(dispatchable.len(), 2);
+        assert!(dispatchable.iter().all(|id| ids.contains(id)));
+        // With two children working, the dashboard agrees with dispatch at
+        // limit 4 and hides the remaining children at limit 2.
+        assert_eq!(listed(&conn, 4), dispatchable);
+        assert!(listed(&conn, 2).is_empty());
+        for bad in [0, -1] {
+            assert!(matches!(
+                crate::tasks::list_implementation_ready_open_limited(&conn, 20, bad),
+                Err(crate::error::QuorumError::Usage(_))
+            ));
+        }
+    }
+
+    #[test]
     fn graph_children_limit_one_serialises_children() {
         let mut conn = setup();
         let ids = independent_graph(&mut conn, 3);

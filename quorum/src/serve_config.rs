@@ -987,6 +987,21 @@ pub fn resolve_max_graph_children_working(configured: Option<i64>, cap: usize) -
     }
 }
 
+/// Worker `cap` used when neither `--cap` nor the serve config sets one.
+pub const DEFAULT_CAP: usize = 4;
+
+/// Effective per-graph working-children limit as resolved from a serve config
+/// file alone, for read-only consumers (`quorum web`) that must agree with the
+/// daemon's dispatch predicate. A `--cap` passed only on the `serve` command
+/// line is not visible here.
+pub fn file_graph_children_working_limit(cfg: &ServeFileConfig) -> Result<i64> {
+    let limit = resolve_max_graph_children_working(
+        cfg.max_graph_children_working,
+        cfg.cap.unwrap_or(DEFAULT_CAP),
+    )?;
+    Ok(i64::try_from(limit).unwrap_or(i64::MAX))
+}
+
 /// Validate the owner-configured directed branch-sync pairs. The same branch
 /// rules as task targets apply, and self-sync is never meaningful.
 pub fn validate_sync_pairs(sync_pairs: &[[String; 2]]) -> Result<()> {
@@ -2659,6 +2674,29 @@ worktree_base = "/tmp/wt"
         assert_eq!(err.exit_code(), 2, "{err}");
         validate_max_rework(1).unwrap();
         validate_max_rework(10).unwrap();
+    }
+
+    #[test]
+    fn file_graph_children_working_limit_matches_daemon_resolution() {
+        let parse = |src: &str| toml::from_str::<ServeFileConfig>(src).unwrap();
+        // Absent cap and key → the daemon's default cap, not the legacy 2.
+        assert_eq!(
+            file_graph_children_working_limit(&parse("")).unwrap(),
+            DEFAULT_CAP as i64
+        );
+        assert_eq!(
+            file_graph_children_working_limit(&parse("cap = 6\n")).unwrap(),
+            6
+        );
+        assert_eq!(
+            file_graph_children_working_limit(&parse("cap = 6\nmax_graph_children_working = 1\n"))
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            file_graph_children_working_limit(&parse("max_graph_children_working = 0\n")),
+            Err(QuorumError::Usage(_))
+        ));
     }
 
     #[test]

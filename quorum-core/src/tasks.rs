@@ -7348,15 +7348,20 @@ pub fn list_implementation_ready_open_with_graph_limit(
 /// uses the unbounded candidate projection above because it must continue past
 /// temporarily inadmissible candidates when selecting work.
 ///
-/// Read-only pollers have no serve config, so this projection applies
-/// [`DEFAULT_GRAPH_CHILDREN_WORKING_LIMIT`]; a daemon configured with a larger
-/// `max_graph_children_working` may dispatch graph children it omits.
-pub fn list_implementation_ready_open_limited(conn: &Connection, limit: i64) -> Result<Vec<Task>> {
+/// `graph_children_limit` must be the daemon's effective per-graph
+/// working-children limit (resolved from `max_graph_children_working`, default
+/// worker `cap`) so the projection agrees with dispatch.
+pub fn list_implementation_ready_open_limited(
+    conn: &Connection,
+    limit: i64,
+    graph_children_limit: i64,
+) -> Result<Vec<Task>> {
     if limit < 0 {
         return Err(QuorumError::Usage(
             "implementation-ready task limit must not be negative".into(),
         ));
     }
+    validate_graph_children_working_limit(graph_children_limit)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLS} FROM tasks
          WHERE status='open'
@@ -7377,10 +7382,7 @@ pub fn list_implementation_ready_open_limited(conn: &Connection, limit: i64) -> 
         graph_ready = graph_implementation_ready_clause!("?2"),
     ))?;
     let mut tasks: Vec<Task> = stmt
-        .query_map(
-            params![limit, DEFAULT_GRAPH_CHILDREN_WORKING_LIMIT],
-            row_to_task,
-        )?
+        .query_map(params![limit, graph_children_limit], row_to_task)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for task in &mut tasks {
         task.ready = true;
@@ -16116,7 +16118,9 @@ mod tests {
             );
         }
 
-        let listed = list_implementation_ready_open_limited(&conn, 20).unwrap();
+        let listed =
+            list_implementation_ready_open_limited(&conn, 20, DEFAULT_GRAPH_CHILDREN_WORKING_LIMIT)
+                .unwrap();
         assert_eq!(listed.len(), 20);
         assert_eq!(
             listed.iter().map(|task| task.id).collect::<Vec<_>>(),
@@ -16125,7 +16129,7 @@ mod tests {
         assert!(listed.iter().all(|task| task.ready));
         assert!(listed.iter().all(|task| task.id != ids[0]));
         assert!(matches!(
-            list_implementation_ready_open_limited(&conn, -1),
+            list_implementation_ready_open_limited(&conn, -1, DEFAULT_GRAPH_CHILDREN_WORKING_LIMIT),
             Err(QuorumError::Usage(_))
         ));
     }
@@ -16173,11 +16177,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            list_implementation_ready_open_limited(&conn, DASHBOARD_LIMIT)
-                .unwrap()
-                .into_iter()
-                .map(|task| task.id)
-                .collect::<Vec<_>>(),
+            list_implementation_ready_open_limited(
+                &conn,
+                DASHBOARD_LIMIT,
+                DEFAULT_GRAPH_CHILDREN_WORKING_LIMIT
+            )
+            .unwrap()
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<Vec<_>>(),
             [dispatchable],
         );
     }
