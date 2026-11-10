@@ -202,7 +202,7 @@ printf 'replace-abrupt: %s abrupt replacements passed; serve pids %s; stale-hold
 # PID, and every attempt must be rejected.
 HOLDER=$CURRENT
 HOLDER_PID=$PID
-CONTENDER_TRIES=8
+CONTENDER_TRIES=20
 serve_start() {
   docker exec "$HOLDER" sh -c "cut -d' ' -f22 /proc/$HOLDER_PID/stat" \
     || replace_fail "cannot read holder serve start time"
