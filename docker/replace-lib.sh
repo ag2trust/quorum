@@ -466,6 +466,36 @@ replace_comparator_selftest() {
   rm -rf "$probe"
 }
 
+# Write a byte-level listing of the entire host tree to host file $1: every
+# path with its type, owner, and mode, plus size and sha256 for regular files
+# and the target for symlinks. Two equal listings mean nothing was created,
+# removed, re-owned, or rewritten (directory mtimes deliberately excluded).
+# Files under quorum/logs are listed without size or hash because startup may
+# append to them; replace_snapshot with a reference checks they only grow.
+replace_tree_state() {
+  replace_root_sh '
+    cd /data
+    find . -mindepth 1 | LC_ALL=C sort | while IFS= read -r path; do
+      meta=$(stat -c "%F %u:%g %a" "$path" | tr " " _)
+      if [ -L "$path" ]; then
+        printf "%s %s -> %s\n" "$meta" "$path" "$(readlink "$path")"
+      elif [ -f "$path" ] && [ "${path#./quorum/logs/}" != "$path" ]; then
+        printf "%s append-only %s\n" "$meta" "$path"
+      elif [ -f "$path" ]; then
+        printf "%s %s %s %s\n" "$meta" "$(wc -c <"$path")" \
+          "$(sha256sum <"$path" | cut -d" " -f1)" "$path"
+      else
+        printf "%s %s\n" "$meta" "$path"
+      fi
+    done
+  ' >"$1" || replace_fail "tree state listing into $1 failed"
+  grep -q ' \./quorum/repos/' "$1" || replace_fail "tree state $1 is vacuous"
+}
+
+replace_assert_tree_equal() {
+  diff -u "$1" "$2" >&2 || replace_fail "$3"
+}
+
 # Deliberately alter one recorded artifact between containers (comparator
 # demonstration; the suite must then fail). Classes: repo config db log
 # worktree.
