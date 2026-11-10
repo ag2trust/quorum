@@ -579,8 +579,15 @@ pub(crate) const RETRYABLE_DAEMON_PARK_CHILD_SQL: &str = retryable_daemon_park_s
 // predicate is used both by daemon-side candidate selection and by the
 // authoritative claim transaction so the two paths cannot drift. Only a
 // hard-failed sibling withholds dispatch; a retryable daemon park does not.
-const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = concat!(
-    "(NOT EXISTS (
+//
+// `$limit` is the SQL placeholder (for example `"?4"`) bound to the per-graph
+// working-children limit. Each caller binds the same validated value so the
+// listing and the claim agree; the placeholder differs only because each
+// statement numbers its parameters independently.
+macro_rules! graph_implementation_ready_clause {
+    ($limit:literal) => {
+        concat!(
+            "(NOT EXISTS (
     SELECT 1 FROM task_graph_members own_member
     WHERE own_member.task_id=tasks.id
 ) OR EXISTS (
@@ -597,17 +604,36 @@ const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = concat!(
           WHERE sibling_member.graph_id=own_member.graph_id
             AND sibling_member.active=1 AND sibling.status='failed'
             AND NOT ",
-    retryable_daemon_park_sql!("sibling"),
-    "
+            retryable_daemon_park_sql!("sibling"),
+            "
       )
-      AND 2 > (
+      AND ",
+            $limit,
+            " > (
           SELECT COUNT(*) FROM task_graph_members sibling_member
           JOIN tasks sibling ON sibling.id=sibling_member.task_id
           WHERE sibling_member.graph_id=own_member.graph_id
             AND sibling_member.active=1 AND sibling.status='working'
       )
 ))"
-);
+        )
+    };
+}
+
+/// Per-graph working-children limit applied by the legacy [`claim`] and
+/// [`list_implementation_ready_open`] entry points. The daemon passes its
+/// configured `max_graph_children_working` (default: worker `cap`) through the
+/// `*_with_graph_limit` variants instead.
+pub const DEFAULT_GRAPH_CHILDREN_WORKING_LIMIT: i64 = 2;
+
+fn validate_graph_children_working_limit(limit: i64) -> Result<()> {
+    if limit < 1 {
+        return Err(QuorumError::Usage(format!(
+            "graph working-children limit must be >= 1 (got {limit})"
+        )));
+    }
+    Ok(())
+}
 
 /// SQL shape for the only flagged root route that requires decomposition.
 /// Missing flags are intentionally equivalent to an empty array.
@@ -1835,6 +1861,32 @@ pub fn claim(
     ttl: i64,
     now: i64,
 ) -> Result<Option<Task>> {
+    claim_with_graph_limit(
+        conn,
+        agent,
+        task_id,
+        match_labels,
+        ttl,
+        now,
+        DEFAULT_GRAPH_CHILDREN_WORKING_LIMIT,
+    )
+}
+
+/// [`claim`] with an explicit per-graph working-children limit: an open
+/// generated child is claimable only while fewer than `graph_children_limit`
+/// active siblings of its graph are `working`. The count is evaluated inside
+/// the claim's `BEGIN IMMEDIATE` transaction, so racing claimers serialise on
+/// the write lock and cannot exceed the limit.
+pub fn claim_with_graph_limit(
+    conn: &mut Connection,
+    agent: &str,
+    task_id: Option<i64>,
+    match_labels: &[&str],
+    ttl: i64,
+    now: i64,
+    graph_children_limit: i64,
+) -> Result<Option<Task>> {
+    validate_graph_children_working_limit(graph_children_limit)?;
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
@@ -1887,13 +1939,14 @@ pub fn claim(
                        AND (
                          (status='open' AND {NO_PLANNING_FREEZE_CLAUSE}
                             AND {DEP_READY_CLAUSE}
-                            AND {GRAPH_IMPLEMENTATION_READY_CLAUSE})
+                            AND {graph_ready})
                          OR (status='in-review' AND reviewer IS NULL \
                              AND (author IS NULL OR author != ?1))
                      )
-                     RETURNING {COLS}"
+                     RETURNING {COLS}",
+                    graph_ready = graph_implementation_ready_clause!("?4"),
                 ),
-                params![agent, now, id],
+                params![agent, now, id, graph_children_limit],
                 row_to_task,
             )
             .optional()?,
@@ -1912,10 +1965,11 @@ pub fn claim(
                    AND (
                     (status='open' AND {NO_PLANNING_FREEZE_CLAUSE}
                        AND {DEP_READY_CLAUSE}
-                       AND {GRAPH_IMPLEMENTATION_READY_CLAUSE})
+                       AND {graph_ready})
                     OR (status='in-review' AND reviewer IS NULL \
                         AND (author IS NULL OR author != ?1))
-                )"
+                )",
+                graph_ready = graph_implementation_ready_clause!("?3"),
             );
             if !match_labels.is_empty() {
                 use std::fmt::Write as _;
@@ -1924,7 +1978,7 @@ pub fn claim(
                     if i > 0 {
                         selector.push_str(" AND ");
                     }
-                    let _ = write!(selector, "labels LIKE ?{}", i + 3);
+                    let _ = write!(selector, "labels LIKE ?{}", i + 4);
                 }
                 selector.push(')');
             }
@@ -1948,7 +2002,7 @@ pub fn claim(
             );
             let label_pats: Vec<String> =
                 match_labels.iter().map(|l| format!("%\"{l}\"%")).collect();
-            let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&agent, &now];
+            let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&agent, &now, &graph_children_limit];
             for p in &label_pats {
                 bind.push(p);
             }
@@ -7259,15 +7313,26 @@ pub fn list(
 /// predicates authoritatively; this read prevents stable graph holds from
 /// becoming a repeated select/claim-reject loop.
 pub fn list_implementation_ready_open(conn: &Connection) -> Result<Vec<Task>> {
+    list_implementation_ready_open_with_graph_limit(conn, DEFAULT_GRAPH_CHILDREN_WORKING_LIMIT)
+}
+
+/// [`list_implementation_ready_open`] with the same explicit per-graph
+/// working-children limit the caller passes to [`claim_with_graph_limit`].
+pub fn list_implementation_ready_open_with_graph_limit(
+    conn: &Connection,
+    graph_children_limit: i64,
+) -> Result<Vec<Task>> {
+    validate_graph_children_working_limit(graph_children_limit)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLS} FROM tasks
          WHERE status='open'
            AND {DEP_READY_CLAUSE}
-           AND {GRAPH_IMPLEMENTATION_READY_CLAUSE}
-         ORDER BY priority DESC, id ASC"
+           AND {graph_ready}
+         ORDER BY priority DESC, id ASC",
+        graph_ready = graph_implementation_ready_clause!("?1"),
     ))?;
     let mut tasks: Vec<Task> = stmt
-        .query_map([], row_to_task)?
+        .query_map(params![graph_children_limit], row_to_task)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for task in &mut tasks {
         task.ready = true;
@@ -7282,6 +7347,10 @@ pub fn list_implementation_ready_open(conn: &Connection) -> Result<Vec<Task>> {
 /// task before applying its display bound. The daemon scheduler intentionally
 /// uses the unbounded candidate projection above because it must continue past
 /// temporarily inadmissible candidates when selecting work.
+///
+/// Read-only pollers have no serve config, so this projection applies
+/// [`DEFAULT_GRAPH_CHILDREN_WORKING_LIMIT`]; a daemon configured with a larger
+/// `max_graph_children_working` may dispatch graph children it omits.
 pub fn list_implementation_ready_open_limited(conn: &Connection, limit: i64) -> Result<Vec<Task>> {
     if limit < 0 {
         return Err(QuorumError::Usage(
@@ -7292,7 +7361,7 @@ pub fn list_implementation_ready_open_limited(conn: &Connection, limit: i64) -> 
         "SELECT {COLS} FROM tasks
          WHERE status='open'
            AND {DEP_READY_CLAUSE}
-           AND {GRAPH_IMPLEMENTATION_READY_CLAUSE}
+           AND {graph_ready}
            AND review_only=0
            AND CASE WHEN json_valid(refs) THEN
                json_type(refs, '$.cx_est')='integer'
@@ -7304,10 +7373,14 @@ pub fn list_implementation_ready_open_limited(conn: &Connection, limit: i64) -> 
                AND json_type(refs, '$.cx_not_ready_reason')='null'
            ELSE 0 END
          ORDER BY priority DESC, id ASC
-         LIMIT ?1"
+         LIMIT ?1",
+        graph_ready = graph_implementation_ready_clause!("?2"),
     ))?;
     let mut tasks: Vec<Task> = stmt
-        .query_map(params![limit], row_to_task)?
+        .query_map(
+            params![limit, DEFAULT_GRAPH_CHILDREN_WORKING_LIMIT],
+            row_to_task,
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for task in &mut tasks {
         task.ready = true;

@@ -3010,7 +3010,9 @@ Generated tasks retain ordinary independent implementation, review, rework, and 
 As terminal leaves, they dispatch directly regardless of the root size-dispatch policy and cannot
 be selected as decomposition sources. Their atomic claim additionally requires an active
 decomposed source, done prerequisites, no hard-failed sibling or graph blocker, and fewer than
-two active implementation siblings. Eligible graph children sort before unrelated new work, but
+`max_graph_children_working` working implementation siblings. That serve-config key defaults to
+the worker `cap`, must be `>= 1` (otherwise bad config, exit 2), and is effectively bounded by
+`cap`; the dispatch listing and the claim transaction bind the same value. Eligible graph children sort before unrelated new work, but
 reserve no idle capacity and never interrupt active unrelated work. Active siblings may finish
 after another child hard-fails; no later child may start.
 

@@ -234,6 +234,9 @@ declare_serve_file_config! {
     /// Maximum rework rounds before a task fails. Stamped onto each task at
     /// adoption, immutable thereafter; unset falls back to the compiled default.
     max_rework: Option<u32>,
+    /// Children of one decomposition graph that may be `working` at once.
+    /// Unset defaults to `cap`; values above `cap` are bounded by `cap`.
+    max_graph_children_working: Option<i64>,
     /// Runner-specific Codex configuration.
     codex: Option<CodexFileConfig>,
     /// Grok adapter configuration for managed worker roles.
@@ -319,6 +322,7 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("r2_target_per_stratum", ConfigKeyDisposition::Runtime),
     ("r2_steady_state_p", ConfigKeyDisposition::Runtime),
     ("max_rework", ConfigKeyDisposition::Runtime),
+    ("max_graph_children_working", ConfigKeyDisposition::Runtime),
     ("codex", ConfigKeyDisposition::Runtime),
     ("grok", ConfigKeyDisposition::Runtime),
     #[cfg(test)]
@@ -968,6 +972,19 @@ pub fn validate_max_rework(max_rework: u32) -> Result<()> {
         return Err(QuorumError::Usage("max_rework must be >= 1 (got 0)".into()));
     }
     Ok(())
+}
+
+/// Resolve the per-graph working-children limit. Unset defaults to the worker
+/// `cap`; zero or negative values are bad config. Values above `cap` are kept
+/// as configured: the worker cap already bounds concurrent claims.
+pub fn resolve_max_graph_children_working(configured: Option<i64>, cap: usize) -> Result<usize> {
+    match configured {
+        None => Ok(cap.max(1)),
+        Some(limit) if limit < 1 => Err(QuorumError::Usage(format!(
+            "max_graph_children_working must be >= 1 (got {limit})"
+        ))),
+        Some(limit) => Ok(usize::try_from(limit).unwrap_or(usize::MAX)),
+    }
 }
 
 /// Validate the owner-configured directed branch-sync pairs. The same branch
@@ -2642,6 +2659,35 @@ worktree_base = "/tmp/wt"
         assert_eq!(err.exit_code(), 2, "{err}");
         validate_max_rework(1).unwrap();
         validate_max_rework(10).unwrap();
+    }
+
+    #[test]
+    fn max_graph_children_working_defaults_to_cap_and_rejects_non_positive() {
+        let parse = |toml: &str| -> Option<i64> {
+            toml::from_str::<ServeFileConfig>(toml)
+                .unwrap()
+                .max_graph_children_working
+        };
+        // Absent key → worker cap.
+        assert_eq!(resolve_max_graph_children_working(parse(""), 4).unwrap(), 4);
+        assert_eq!(resolve_max_graph_children_working(parse(""), 7).unwrap(), 7);
+        // Explicit values, including above cap, are kept.
+        let one = parse("max_graph_children_working = 1\n");
+        assert_eq!(resolve_max_graph_children_working(one, 4).unwrap(), 1);
+        let above = parse("max_graph_children_working = 9\n");
+        assert_eq!(resolve_max_graph_children_working(above, 4).unwrap(), 9);
+        // Zero and negative are bad config → exit 2.
+        for bad in [
+            "max_graph_children_working = 0\n",
+            "max_graph_children_working = -3\n",
+        ] {
+            let err = resolve_max_graph_children_working(parse(bad), 4).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{err}");
+            assert!(
+                err.to_string().contains("max_graph_children_working"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

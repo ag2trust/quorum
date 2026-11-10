@@ -132,6 +132,10 @@ primary = 100
 ## Rework ceiling: max changes-to-rework rounds before a task fails. Stamped
 ## onto each task at adoption; unset keeps the compiled default (7).
 # max_rework = 7
+
+## Decomposition: children of one graph that may be working at once. Unset
+## defaults to cap; must be >= 1; values above cap are bounded by cap.
+# max_graph_children_working = 4
 ";
 
 fn run() -> Result<i32> {
@@ -1765,6 +1769,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 .max_rework
                 .unwrap_or(quorum_core::lifecycle::REWORK_CAP);
             serve_config::validate_max_rework(r_max_rework)?;
+            let r_max_graph_children_working = serve_config::resolve_max_graph_children_working(
+                file_cfg.max_graph_children_working,
+                r_cap.value,
+            )?;
 
             let model_profiles = file_cfg.model_profiles.clone().ok_or_else(|| {
                 QuorumError::Usage("serve config requires [model_profiles]".into())
@@ -1906,6 +1914,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 r2_target_per_stratum: r_r2_target_per_stratum,
                 r2_steady_state_p: r_r2_steady_state_p,
                 max_rework: r_max_rework,
+                max_graph_children_working: Some(r_max_graph_children_working),
             };
             Ok(serve::run_serve(config)?)
         }

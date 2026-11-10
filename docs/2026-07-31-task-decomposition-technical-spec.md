@@ -447,7 +447,8 @@ Inside the atomic claim transaction, a generated child additionally requires:
 - source status `decomposed` and graph state `active`;
 - no failed sibling and no graph blocker;
 - every ordinary dependency done;
-- fewer than two working implementation siblings.
+- fewer than `max_graph_children_working` working implementation siblings (serve config;
+  defaults to `cap`, must be `>= 1`).
 
 Already active children keep authority after a sibling fails and may finish. Later claims fail
 cleanly. Eligible graph children sort before unrelated open work, then retain normal priority/ID

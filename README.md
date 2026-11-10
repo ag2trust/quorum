@@ -211,7 +211,9 @@ session. Even with no rework, it can spend tokens on the intake classifier, an
 optional planner and classifiers for proposed children, implementation, R1, R2,
 the post-merge collector, and qualifying follow-up planning when activated.
 Provider retries and an optional doctor turn can add further calls. A decomposed
-parent can also produce several child implementation and review paths.
+parent can also produce several child implementation and review paths. At most
+`max_graph_children_working` children of one graph implement at once; the key
+defaults to `cap`, must be at least 1, and is effectively bounded by `cap`.
 
 Set token, USD, and wall-clock ceilings in the
 [serve configuration](docs/serve-config.example.toml); the exact flags are also
