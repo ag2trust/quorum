@@ -4,6 +4,7 @@ set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ENTRY=$HERE/entrypoint.sh
+HEALTH=$HERE/health.sh
 BASE_PATH=$PATH
 REAL_GIT=$(command -v git)
 FAILS=0
@@ -14,6 +15,17 @@ setup() {
   "$REAL_GIT" -C "$WORK/repo" init -q
   cp "$HERE/serve-codex.toml" "$WORK/serve-codex.toml"
 
+  if ! PATH=$BASE_PATH command -v timeout >/dev/null 2>&1; then
+    # Host-only shim where GNU timeout is absent; the image ships coreutils.
+    cat >"$WORK/bin/timeout" <<'EOF'
+#!/bin/sh
+[ "${1:-}" = -k ] && shift 2
+shift
+exec "$@"
+EOF
+    chmod +x "$WORK/bin/timeout"
+  fi
+
   cat >"$WORK/bin/git" <<EOF
 #!/bin/sh
 if [ "\${1:-}" = -C ]; then exec "$REAL_GIT" "\$@"; fi
@@ -21,7 +33,7 @@ if [ "\${1:-}" = ls-remote ]; then
   if [ "\${FAKE_HTTP_READY:-1}" = 1 ]; then
     printf "fatal: repository 'http://127.0.0.1:%s/' not found\\n" "\${FAKE_WEB_PORT:-8080}" >&2
   else
-    printf "fatal: unable to access Web\\n" >&2
+    printf "fatal: unable to access '/secret/http-diagnostic'\\n" >&2
   fi
   exit 128
 fi
@@ -36,6 +48,10 @@ case "$command" in
   init)
     printf 'init %s\n' "$PWD" >>"${FAKE_CALLS:?}"
     sleep "${FAKE_INIT_SLEEP:-0}"
+    if [ "${FAKE_INIT_CODE:-0}" = 0 ]; then
+      db_dir="$QUORUM_HOME/repos/$(printf '%s' "$QUORUM_REPO" | sed 's#/#__#')"
+      mkdir -p "$db_dir" && : >>"$db_dir/quorum.db"
+    fi
     exit "${FAKE_INIT_CODE:-0}"
     ;;
   serve)
@@ -59,11 +75,16 @@ case "$command" in
     exit "${FAKE_WEB_CODE:-0}"
     ;;
   status)
-    if [ "${FAKE_READY:-1}" = 1 ]; then
-      printf '{"daemon":{"Alive":{"pid":42}}}\n'
-    else
-      printf '{"daemon":"None"}\n'
-    fi
+    printf 'status\n' >>"${FAKE_CALLS:?}"
+    case "${FAKE_READY:-1}" in
+      1) daemon='{"Alive":{"pid":42,"heartbeat_age_secs":1}}' ;;
+      stale) daemon='{"Stale":{"pid":42,"heartbeat_age_secs":99,"pid_dead":true}}' ;;
+      *) daemon='"None"' ;;
+    esac
+    # Message bodies that spoof liveness and carry a private path must never
+    # satisfy readiness or reach probe output.
+    printf '{"agents_total":0,"recent_messages":[{"body":"Alive"},{"body":"/secret/status-path,\\"daemon\\":{\\"Alive\\":{"}],"daemon":%s,"resources":null}\n' "$daemon"
+    exit "${FAKE_STATUS_CODE:-0}"
     ;;
 esac
 EOF
@@ -76,6 +97,8 @@ EOF
   QUORUM_WORKTREE_BASE="$WORK/wt"
   QUORUM_LOG_DIR="$WORK/logs"
   QUORUM_SERVE_TEMPLATE="$WORK/serve-codex.toml"
+  QUORUM_HEALTH_PROBE="$HEALTH"
+  QUORUM_RUN_DIR="$WORK/run"
   QUORUM_READY_TRIES=3
   QUORUM_SHUTDOWN_TRIES=1
   FAKE_CALLS="$WORK/calls"
@@ -83,9 +106,10 @@ EOF
   export PATH QUORUM_REPO QUORUM_HOME QUORUM_REPO_DIR QUORUM_WORKTREE_BASE
   export QUORUM_LOG_DIR QUORUM_SERVE_TEMPLATE QUORUM_READY_TRIES
   export QUORUM_SHUTDOWN_TRIES FAKE_CALLS FAKE_DESCENDANT_PID
+  export QUORUM_HEALTH_PROBE QUORUM_RUN_DIR
   unset FAKE_INIT_CODE FAKE_INIT_SLEEP FAKE_SERVE_CODE FAKE_SERVE_SLEEP
   unset FAKE_SERVE_IGNORE_TERM FAKE_WEB_CODE FAKE_WEB_SLEEP FAKE_READY
-  unset FAKE_HTTP_READY
+  unset FAKE_HTTP_READY FAKE_STATUS_CODE
   unset QUORUM_SERVE_CONFIG QUORUM_SELF_UPDATE_DRAIN QUORUM_WEB_PORT
 }
 
@@ -245,6 +269,121 @@ for expected in 3 75; do
   check "serve exit $expected" "$expected" "$?"
   teardown
 done
+
+# Steady state: the supervisor records itself and both direct children, the
+# out-of-band probe reports ready, and shutdown removes the record.
+setup
+FAKE_SERVE_SLEEP=30 FAKE_WEB_SLEEP=30 sh "$ENTRY" >/dev/null 2>&1 & entry_pid=$!
+probe_out= probe_tries=0
+while [ "$probe_tries" -lt 30 ]; do
+  probe_out=$(sh "$HEALTH" readiness 2>&1) && break
+  probe_tries=$((probe_tries + 1))
+  sleep 0.1
+done
+check 'steady-state readiness probe' 'health: ready' "$probe_out"
+check 'steady-state liveness probe' 'health: live' "$(sh "$HEALTH" liveness 2>&1)"
+check 'record names supervisor' "supervisor=$entry_pid" \
+  "$(grep '^supervisor=' "$QUORUM_RUN_DIR/supervisor.pids" 2>/dev/null)"
+check 'record names repository' 'repo=acme/widget' \
+  "$(grep '^repo=' "$QUORUM_RUN_DIR/supervisor.pids" 2>/dev/null)"
+kill -TERM "$entry_pid"
+wait "$entry_pid" 2>/dev/null
+check 'shutdown removes runtime record' no \
+  "$(test -e "$QUORUM_RUN_DIR/supervisor.pids" && echo yes || echo no)"
+check 'probe after shutdown' 'health: not-ready check=runtime' \
+  "$(sh "$HEALTH" readiness 2>&1)"
+teardown
+
+# A record left by an earlier start is cleared before init runs.
+setup
+mkdir -p "$QUORUM_RUN_DIR"
+printf 'supervisor=%s\nserve=%s\nweb=%s\nrepo=acme/widget\n' $$ $$ $$ \
+  >"$QUORUM_RUN_DIR/supervisor.pids"
+FAKE_INIT_CODE=3 sh "$ENTRY" >/dev/null 2>&1
+check 'stale runtime record cleared' no \
+  "$(test -e "$QUORUM_RUN_DIR/supervisor.pids" && echo yes || echo no)"
+teardown
+
+# Probe contract against a synthetic record of live processes. Each failure
+# exits 1 and prints only its fixed check name.
+probe_case() {
+  probe_label=$1 probe_expected=$2
+  shift 2
+  probe_out=$(env "$@" sh "$HEALTH" readiness 2>&1)
+  probe_code=$?
+  check "$probe_label output" "$probe_expected" "$probe_out"
+  if [ "$probe_expected" = 'health: ready' ]; then
+    check "$probe_label exit" 0 "$probe_code"
+  else
+    check "$probe_label exit" 1 "$probe_code"
+  fi
+}
+
+setup
+sleep 60 & live_a=$!
+sleep 60 & live_b=$!
+sh -c 'exit 0' & dead=$!
+wait "$dead"
+mkdir -p "$QUORUM_RUN_DIR" "$QUORUM_HOME/repos/acme__widget"
+: >"$QUORUM_HOME/repos/acme__widget/quorum.db"
+record() {
+  printf 'supervisor=%s\nserve=%s\nweb=%s\nrepo=%s\n' "$1" "$2" "$3" "$4" \
+    >"$QUORUM_RUN_DIR/supervisor.pids"
+}
+record "$live_a" "$live_b" "$live_a" acme/widget
+
+: >"$FAKE_CALLS"
+probe_case 'ready' 'health: ready'
+check 'one status read per probe' 1 "$(grep -c '^status$' "$FAKE_CALLS")"
+check 'usage exit' 2 "$(sh "$HEALTH" bogus >/dev/null 2>&1; echo $?)"
+check 'usage output' 'health: usage' "$(sh "$HEALTH" bogus 2>&1)"
+
+probe_case 'missing daemon authority' 'health: not-ready check=authority' FAKE_READY=0
+probe_case 'stale daemon authority' 'health: not-ready check=authority' FAKE_READY=stale
+probe_case 'status exit 3' 'health: not-ready check=db' FAKE_STATUS_CODE=3
+probe_case 'Web HTTP failure' 'health: not-ready check=http' FAKE_HTTP_READY=0
+probe_case 'invalid identity' 'health: not-ready check=config' QUORUM_REPO=bad
+probe_case 'missing runtime record' 'health: not-ready check=runtime' \
+  QUORUM_RUN_DIR="$WORK/absent"
+
+# A different repository is refused by the record, and when the record names
+# it, the missing selected DB is refused before status could create it.
+probe_case 'wrong repository' 'health: not-ready check=repo' QUORUM_REPO=acme/other
+record "$live_a" "$live_b" "$live_a" acme/other
+: >"$FAKE_CALLS"
+probe_case 'wrong repository DB' 'health: not-ready check=db' QUORUM_REPO=acme/other
+check 'wrong repository DB not created' no \
+  "$(test -e "$QUORUM_HOME/repos/acme__other" && echo yes || echo no)"
+check 'wrong repository runs no status' 0 "$(grep -c '^status$' "$FAKE_CALLS")"
+record "$live_a" "$live_b" "$live_a" acme/widget
+
+mv "$QUORUM_HOME/repos/acme__widget/quorum.db" "$WORK/db.off"
+probe_case 'missing DB' 'health: not-ready check=db'
+mv "$WORK/db.off" "$QUORUM_HOME/repos/acme__widget/quorum.db"
+
+for required in "$QUORUM_WORKTREE_BASE" "$QUORUM_LOG_DIR" "$QUORUM_REPO_DIR"; do
+  mv "$required" "$WORK/path.off"
+  probe_case "missing path $(basename "$required")" 'health: not-ready check=paths'
+  mv "$WORK/path.off" "$required"
+done
+if [ "$(id -u)" -ne 0 ]; then
+  chmod 000 "$QUORUM_WORKTREE_BASE"
+  probe_case 'inaccessible path' 'health: not-ready check=paths'
+  chmod 755 "$QUORUM_WORKTREE_BASE"
+fi
+
+record "$live_a" "$dead" "$live_b" acme/widget
+probe_case 'dead serve' 'health: not-ready check=serve'
+check 'liveness dead serve' 'health: not-live check=serve' "$(sh "$HEALTH" liveness 2>&1)"
+record "$live_a" "$live_b" "$dead" acme/widget
+probe_case 'dead Web' 'health: not-ready check=web'
+record "$dead" "$live_a" "$live_b" acme/widget
+probe_case 'dead supervisor' 'health: not-ready check=supervisor'
+printf 'supervisor=%s\nbogus=1\n' "$live_a" >"$QUORUM_RUN_DIR/supervisor.pids"
+probe_case 'malformed runtime record' 'health: not-ready check=runtime'
+kill "$live_a" "$live_b" 2>/dev/null
+wait "$live_a" "$live_b" 2>/dev/null
+teardown
 
 printf '%s\n' '---'
 if [ "$FAILS" -eq 0 ]; then

@@ -31,6 +31,9 @@ READY_TRIES=${QUORUM_READY_TRIES:-30}
 SHUTDOWN_TRIES=${QUORUM_SHUTDOWN_TRIES:-5}
 SERVE_CONFIG=${QUORUM_SERVE_CONFIG:-$QUORUM_HOME/serve/${REPO_OWNER}__${REPO_NAME}.toml}
 SERVE_TEMPLATE=${QUORUM_SERVE_TEMPLATE:-/usr/share/quorum/serve-codex.toml}
+HEALTH_PROBE=${QUORUM_HEALTH_PROBE:-/usr/local/bin/quorum-health}
+RUN_DIR=${QUORUM_RUN_DIR:-/run/quorum}
+RUNTIME_FILE=$RUN_DIR/supervisor.pids
 export QUORUM_HOME
 
 positive_integer() {
@@ -50,6 +53,12 @@ git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
 CONFIG_DIR=$(dirname "$SERVE_CONFIG")
 mkdir -p "$CONFIG_DIR" "$QUORUM_HOME/init" "$WORKTREE_BASE" "$LOG_DIR" \
   || fail 'cannot prepare writable state below /data' 3
+
+# The health probe trusts only PIDs recorded by this supervisor instance after
+# both children started. Clear any record left by an earlier container start.
+mkdir -p "$RUN_DIR" && rm -f "$RUNTIME_FILE" \
+  || fail 'cannot prepare the runtime health record' 3
+trap 'rm -f "$RUNTIME_FILE"' EXIT
 
 # Install public Codex-only routing only for a fresh repository identity. An
 # operator-created configuration at the normal per-repo path is never changed.
@@ -185,23 +194,25 @@ web_exit() {
   exit 1
 }
 
-web_http_ready() {
-  # git is already a pinned runtime dependency. Its smart-HTTP probe reports
-  # this error only after receiving a real non-Git HTTP response from Web.
-  web_response=$(timeout 2 git ls-remote "http://127.0.0.1:$WEB_PORT/" 2>&1 || true)
-  case "$web_response" in
-    "fatal: repository 'http://127.0.0.1:$WEB_PORT/' not found") return 0 ;;
-    *) return 1 ;;
-  esac
-}
+# Record the supervisor and both direct children atomically for the probe.
+runtime_candidate=$RUNTIME_FILE.candidate.$$
+if ! printf 'supervisor=%s\nserve=%s\nweb=%s\nrepo=%s\n' \
+    "$$" "$SERVE" "$WEB" "$QUORUM_REPO" >"$runtime_candidate" \
+  || ! mv -f "$runtime_candidate" "$RUNTIME_FILE"; then
+  rm -f "$runtime_candidate"
+  printf 'entrypoint: cannot record the runtime health record\n' >&2
+  stop_and_wait "$SERVE" "$SERVE_TREE" >/dev/null 2>&1 || true
+  stop_and_wait "$WEB" "$WEB_TREE" >/dev/null 2>&1 || true
+  exit 3
+fi
 
 i=0
 while [ "$i" -lt "$READY_TRIES" ]; do
   [ "$SHUTTING_DOWN" -eq 1 ] && serve_exit
   alive "$SERVE" || serve_exit
   alive "$WEB" || web_exit
-  if quorum status --json 2>/dev/null | grep -q '"Alive"' \
-    && web_http_ready; then
+  # Startup readiness is the same bounded probe Docker's HEALTHCHECK runs.
+  if sh "$HEALTH_PROBE" readiness >/dev/null 2>&1; then
     break
   fi
   i=$((i + 1))
