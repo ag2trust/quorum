@@ -49,15 +49,73 @@ routing file at `/data/quorum/serve/<owner>__<name>.toml`; every managed role
 selects the bundled Codex CLI. An existing file at that path is never
 overwritten. Set `QUORUM_SERVE_CONFIG` to use another persistent file.
 
-Readiness requires all three facts at once: both supervised children are live,
-`quorum status --json` reports live daemon authority, and Web returns a real
-HTTP response on `127.0.0.1`. Web always binds loopback; publishing the port
-does not make it remotely reachable. Remote access requires a separately
-secured proxy sharing the container's network namespace.
+Startup readiness and the Docker `HEALTHCHECK` use the same probe (see
+"Health probe" below). Web always binds loopback; the image declares no
+`EXPOSE`, and publishing the port does not make it remotely reachable. Remote
+access requires a separately secured proxy sharing the container's network
+namespace.
 
 The daemon identity lock rejects another container serving the same repository
 database, including containers whose isolated PID namespaces give both daemon
 processes the same numeric PID. Stop the active container before replacement.
+
+## Health probe
+
+`/usr/local/bin/quorum-health` (source `docker/health.sh`) is a read-only
+POSIX-sh probe with two modes:
+
+- **`liveness`** — the supervisor (`entrypoint.sh` under `tini`) and both
+  required children, `quorum serve` and `quorum web`, are live (present and
+  not zombies). The supervisor records its own PID, both child PIDs, and
+  `QUORUM_REPO` in `/run/quorum/supervisor.pids` after starting both
+  children; it deletes any earlier record before `quorum init` and removes
+  the record on exit. A missing or malformed record is never live, and a
+  `QUORUM_REPO` different from the recorded one fails.
+- **`readiness`** (the default, run by `HEALTHCHECK`) — liveness, then each of
+  these in order:
+  1. `/data/quorum`, the repository checkout (with its `.git`), the worktree
+     base, and the log directory exist and are readable, writable, and
+     searchable by the runtime UID.
+  2. The selected repository's database already exists, and one short-lived
+     `quorum status --json` read of it exits 0. The probe checks the file
+     first so it never creates a database for a wrong identity. That read
+     opens and closes its own connection and holds no transaction between
+     probes. A newer schema (`SchemaTooNew`), an unreadable database, or any
+     other nonzero exit fails. The supervisor runs `quorum init` with the
+     same binary before it writes the PID record, so the read finds a current
+     schema and applies no migration. It never repairs lifecycle state or
+     writes rows.
+  3. The status reports the top-level daemon liveness as `Alive`. `None`
+     (no authority) and `Stale` both fail.
+  4. Web returns a real HTTP response on `127.0.0.1:$QUORUM_WEB_PORT`. The
+     probe uses the pinned runtime `git` smart-HTTP client, which reports
+     `repository ... not found` only after it receives a non-Git HTTP
+     response. Neither process presence nor log lines count as a response.
+
+Each invocation prints exactly one line and nothing on stderr:
+
+| Output | Exit |
+|---|---|
+| `health: live` / `health: ready` | 0 |
+| `health: not-live check=<name>` / `health: not-ready check=<name>` | 1 |
+| `health: usage` (unknown mode or extra argument) | 2 |
+
+`<name>` is one of `config` (invalid `QUORUM_REPO` or `QUORUM_WEB_PORT`),
+`runtime`, `supervisor`, `serve`, `web`, `repo`, `paths`, `db`, `authority`,
+or `http`. Raw status JSON and HTTP client output are never printed. Status
+JSON is streamed through a filter that splits fields at commas and keeps a
+64-byte prefix of each, so only two short counters reach the shell. The
+HTTP diagnostic is captured up to 512 bytes and compared to one fixed string.
+
+Bounds: one attempt per invocation, with no internal retries. The status
+read has a 5s timeout and the HTTP request a 2s timeout. Each timeout sends
+KILL 1s later, so a probe takes about 9s at worst. The probe reads at most 8
+lines of the PID record. The image's
+`HEALTHCHECK --interval=30s --timeout=15s --start-period=120s --retries=3`
+runs `quorum-health readiness`. `docker exec <container> quorum-health
+liveness` runs the other mode by hand. A replaced command, for example
+`quorum --help`, reports unhealthy because it starts no supervisor. Pass
+`--no-healthcheck` for such one-off runs if that matters.
 
 ## Lifecycle and overrides
 
@@ -80,7 +138,9 @@ docker run --rm quorum:local quorum --help
 
 Runtime path and timing overrides are `QUORUM_REPO_DIR`,
 `QUORUM_WORKTREE_BASE`, `QUORUM_LOG_DIR`, `QUORUM_WEB_PORT`,
-`QUORUM_READY_TRIES`, and `QUORUM_SHUTDOWN_TRIES`. The image contains no
+`QUORUM_READY_TRIES`, and `QUORUM_SHUTDOWN_TRIES`; `QUORUM_RUN_DIR` and
+`QUORUM_HEALTH_PROBE` relocate the PID record and probe for host-side
+contract tests (`docker/entrypoint_test.sh`). The image contains no
 credentials, tenancy, billing, gateway, or provisioning behavior; inject
 provider and GitHub credentials at runtime.
 
