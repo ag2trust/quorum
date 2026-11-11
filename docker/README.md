@@ -169,19 +169,23 @@ The entrypoint installs a per-repo serve config at
 path yet; an existing file — including one hand-edited by an operator after
 the first start — is never regenerated, reset, or overwritten by any later
 start or replacement. `docker/replace.sh` verifies this directly: it appends
-an operator edit to the effective config before replacing the container and
-asserts the edit, and the full config byte-for-byte including its checksum,
-are still present after the replacement starts and after it is stopped.
+an operator edit to the effective config before replacing the container.
+While the replacement container is live, it asserts only that the serve
+process's `--config` argument still points at the same config path. The
+full config byte-for-byte, including its checksum, is compared once — after
+the replacement container is stopped — against the config recorded before
+replacement, and the operator edit is asserted present in that recorded
+config.
 
 ### One container per repository
 
-The daemon identity lock allows only one live authority per repository
-database. Starting a second container against the same `/data` tree and
-`QUORUM_REPO` while the first is live fails authority acquisition, even when
-both containers' isolated PID namespaces happen to assign their `quorum
-serve` processes the same numeric PID (`docker/replace-abrupt.sh`, case (b)
-above). Always stop the existing container before starting a replacement
-over the same tree and identity.
+Starting a second container against the same `/data` tree and `QUORUM_REPO`
+while the first is live fails authority acquisition — see "Exactly one
+container may serve a given repository identity's database at a time"
+above — even when both containers' isolated PID namespaces happen to
+assign their `quorum serve` processes the same numeric PID
+(`docker/replace-abrupt.sh`, case (b) above). Always stop the existing
+container before starting a replacement over the same tree and identity.
 
 A different `QUORUM_REPO` value is a separate identity with its own
 on-disk namespace under the same `/data` mount: `docker/replace-negative.sh`
@@ -230,8 +234,10 @@ is refused outright (exit 3, logged as `db schema version N is newer than
 this binary (M)`) rather than read or migrated backward; the refused
 database is left byte-for-byte untouched. Rolling an image back after it has
 run a newer binary against a `/data` tree therefore requires either keeping
-the newer image, or discarding the state created under it — there is no
-in-place conversion back to an older schema.
+the newer image, or discarding the state created under it so the older
+image performs an ordinary fresh init — a direct corollary of that refusal
+and of ordinary fresh-init behavior, not a separately tested guarantee —
+since there is no in-place conversion back to an older schema.
 
 ### Scope of these guarantees
 
