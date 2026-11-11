@@ -241,10 +241,12 @@ since there is no in-place conversion back to an older schema.
 
 ### Scope of these guarantees
 
-Every guarantee above is backed by an assertion in `replace.sh`,
-`replace-abrupt.sh`, or `replace-negative.sh`, not inferred. These suites
-prove on-disk state survival, daemon-lock authority handover, config
-preservation, and fail-closed behavior at the container and filesystem
-level. They do not prove that an in-flight provider (agent) turn in progress
-at the moment of replacement resumes — only that the durable rows, worktree
-contents, and config bytes a resumed turn would depend on survive intact.
+Every guarantee above, except the fresh-init-after-discard corollary in
+"Rollback limitations" noted as such there, is backed by an assertion in
+`replace.sh`, `replace-abrupt.sh`, or `replace-negative.sh`, not inferred.
+These suites prove on-disk state survival, daemon-lock authority handover,
+config preservation, and fail-closed behavior at the container and
+filesystem level. They do not prove that an in-flight provider (agent) turn
+in progress at the moment of replacement resumes — only that the durable
+rows, worktree contents, and config bytes a resumed turn would depend on
+survive intact.
