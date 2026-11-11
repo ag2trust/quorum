@@ -1378,6 +1378,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let capture = root.path().join("mcp-child-environment.log");
         let fake_quorum = root.path().join("quorum");
+        // Publish the capture with rename: the poll below treats existence as
+        // completion, so a truncating `>` redirect would expose partial lines.
         std::fs::write(
             &fake_quorum,
             format!(
@@ -1392,8 +1394,8 @@ mod tests {
                    printf 'github=%s\\n' \"$GITHUB_TOKEN\"\n\\
                    printf 'quorum_home=%s\\n' \"$QUORUM_HOME\"\n\\
                    printf 'gh_config=%s\\n' \"$GH_CONFIG_DIR\"\n\\
-                 }} > '{}'\n",
-                capture.display()
+                 }} > '{capture}.partial' && mv '{capture}.partial' '{capture}'\n",
+                capture = capture.display()
             ),
         )
         .unwrap();
