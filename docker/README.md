@@ -83,3 +83,140 @@ Runtime path and timing overrides are `QUORUM_REPO_DIR`,
 `QUORUM_READY_TRIES`, and `QUORUM_SHUTDOWN_TRIES`. The image contains no
 credentials, tenancy, billing, gateway, or provisioning behavior; inject
 provider and GitHub credentials at runtime.
+
+## Container replacement
+
+Exactly one container may serve a given repository identity's database at a
+time; replacing the container that holds authority is the normal way to
+redeploy, update environment or mount settings, or recover from a crash.
+`docker/replace.sh`, `docker/replace-abrupt.sh`, and `docker/replace-negative.sh`
+(run through `docker/verify.sh IMAGE`, or individually with
+`docker/<script>.sh IMAGE`) are the verified suites behind every guarantee
+below.
+
+### Clean replacement
+
+Stop and remove the running container, then start a replacement from the
+same image, the same `QUORUM_REPO`, and the same `/data` host mount:
+
+```sh
+docker stop quorum-prod && docker rm quorum-prod
+docker run -d --name quorum-prod \
+  -e QUORUM_REPO=owner/name \
+  -v /host/quorum-data:/data \
+  quorum:local
+```
+
+`docker/replace.sh` seeds rows and an operator edit to the serve config
+through a live container, stops and removes it, then starts a second
+container over the same tree and asserts: the repository, every DB row, the
+exact config bytes (including the operator edit), recorded log bytes, and
+the worktree root are all unchanged; the replacement serves from the same
+image and `QUORUM_REPO`/mount shape; exactly one live daemon authority
+exists after the restart; and Web in the second container reads the
+replacement daemon's own database. This proves on-disk state survival and
+authority handover only — it does not prove that an in-flight provider turn
+resumes.
+
+### Abrupt replacement and stale daemon-lock takeover
+
+A container can also disappear without a clean shutdown (host crash, `kill
+-9`, OOM). `docker/replace-abrupt.sh` repeatedly `SIGKILL`s a live container
+under concurrent write load and starts a replacement on the same tree once
+the daemon-lock staleness window has elapsed, asserting each time that:
+every row committed before the kill survives; the crash-image database (and
+its WAL, when the kill lands mid-transaction) passes `PRAGMA
+integrity_check`; the replacement takes over the stale `daemon_lock` row
+within a fixed bound (32s stale wait + startup, bounded at 75s total) without
+anything else editing that row first; and every other recorded artifact,
+including the exact config checksum, still matches the baseline. A
+replacement may reuse the stale holder's exact numeric PID — this is
+expected inside a container's isolated PID namespace and does not indicate a
+second live authority.
+
+With a final replacement live, the suite also starts a second real container
+on the same tree whose `quorum serve` process is made to share the
+holder's numeric PID; that contender still fails authority acquisition
+(exit 2, logging that another daemon with that PID already holds the DB)
+and the original holder remains the sole live authority, confirmed by its
+unchanged process start time and a refreshed heartbeat. Equal-PID contention
+is therefore rejected on something other than the raw PID.
+
+Operationally: after an abrupt container death, start the replacement with
+the same image, `QUORUM_REPO`, and mount; a replacement started too soon
+(inside the stale window, while the old holder could conceivably still be
+alive) is refused, not merged, and a replacement started once the window has
+passed takes over the DB's existing `daemon_lock` row rather than needing
+any manual lock cleanup.
+
+### Serve-config preservation
+
+The entrypoint installs a per-repo serve config at
+`/data/quorum/serve/<owner>__<name>.toml` only when no file exists at that
+path yet; an existing file — including one hand-edited by an operator after
+the first start — is never regenerated, reset, or overwritten by any later
+start or replacement. `docker/replace.sh` verifies this directly: it appends
+an operator edit to the effective config before replacing the container and
+asserts the edit, and the full config byte-for-byte including its checksum,
+are still present after the replacement starts and after it is stopped.
+
+### One container per repository
+
+The daemon identity lock allows only one live authority per repository
+database. Starting a second container against the same `/data` tree and
+`QUORUM_REPO` while the first is live fails authority acquisition, even when
+both containers' isolated PID namespaces happen to assign their `quorum
+serve` processes the same numeric PID (`docker/replace-abrupt.sh`, case (b)
+above). Always stop the existing container before starting a replacement
+over the same tree and identity.
+
+A different `QUORUM_REPO` value is a separate identity and is safe to run
+concurrently over the same `/data` mount: `docker/replace-negative.sh`
+starts a container with a second `owner/name` against the same host tree and
+asserts it serves from its own namespace
+(`/data/quorum/repos/<owner>__<name>/quorum.db` and
+`/data/quorum/serve/<owner>__<name>.toml`), while the original identity's DB
+and config stay byte-identical throughout and after.
+
+### Fail-closed behavior
+
+`docker/replace-negative.sh` breaks one precondition at a time and asserts
+the container exits non-zero for the documented reason, leaves no container
+serving the tree, and leaves the host tree byte-for-byte unchanged — no
+`daemon_lock` row is taken and no fresh state is created over existing data:
+
+- An unwritable mount — a read-only `/data`, a writable `/data` with a
+  read-only `/data/quorum`, or a tree owned by a different numeric
+  UID/GID — fails closed (`is not a valid git checkout` or `unable to open
+  database file`, exit 1 or 3 depending on which check is reached first).
+- A missing `/data/repos/project/.git`, a corrupted repository `HEAD`, or a
+  corrupt SQLite header all fail closed (exit 1 or 3) with a message naming
+  the broken precondition.
+- A database with `PRAGMA user_version` above what the image's `quorum`
+  binary supports is refused with exit 3 before any lock is taken or any
+  persistent PRAGMA is applied — both through the entrypoint's `quorum init`
+  and through `quorum serve` invoked directly.
+
+After each negative case, restoring the broken precondition and starting
+again reproduces the original accepted state exactly.
+
+### Rollback limitations
+
+There is no supported downgrade path. A database already migrated to a
+newer `PRAGMA user_version` than an older image's `quorum` binary supports
+is refused outright (exit 3, logged as `db schema version N is newer than
+this binary (M)`) rather than read or migrated backward; the refused
+database is left byte-for-byte untouched. Rolling an image back after it has
+run a newer binary against a `/data` tree therefore requires either keeping
+the newer image, or discarding the state created under it — there is no
+in-place conversion back to an older schema.
+
+### Scope of these guarantees
+
+Every guarantee above is backed by an assertion in `replace.sh`,
+`replace-abrupt.sh`, or `replace-negative.sh`, not inferred. These suites
+prove on-disk state survival, daemon-lock authority handover, config
+preservation, and fail-closed behavior at the container and filesystem
+level. They do not prove that an in-flight provider (agent) turn in progress
+at the moment of replacement resumes — only that the durable rows, worktree
+contents, and config bytes a resumed turn would depend on survive intact.
