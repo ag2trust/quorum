@@ -53,11 +53,41 @@ Startup readiness and the Docker `HEALTHCHECK` use the same probe (see
 "Health probe" below). Web always binds loopback; the image declares no
 `EXPOSE`, and publishing the port does not make it remotely reachable. Remote
 access requires a separately secured proxy sharing the container's network
-namespace.
+namespace (see "Reaching Web from a sidecar" below).
 
 The daemon identity lock rejects another container serving the same repository
 database, including containers whose isolated PID namespaces give both daemon
 processes the same numeric PID. Stop the active container before replacement.
+
+## Reaching Web from a sidecar
+
+`quorum web` listens only on `127.0.0.1:$QUORUM_WEB_PORT` inside the container
+and rejects non-loopback binds such as `--bind 0.0.0.0`. The only way to reach
+it is to run a process in the same network namespace, where that loopback
+address is shared:
+
+```sh
+docker run --rm --network container:<quorum-container> <helper-image> \
+  <client> http://127.0.0.1:8080/
+```
+
+Kubernetes-style pods give the same result: containers in one pod share a
+network namespace, so a sidecar there reaches Web on `127.0.0.1`.
+
+The image publishes no port and declares no `EXPOSE`. Even with `-p`, Docker
+forwards traffic to the container's bridge address, where nothing listens.
+Peers on the same bridge network cannot connect to the Quorum container's IP on
+the Web port either.
+
+Quorum ships no proxy. Any component that relays Web beyond the shared
+namespace is supplied and secured by the operator, runs outside Quorum, and is
+outside the guarantees in this document.
+
+`docker/network-verify.sh <image>` (run by `verify.sh`) checks this with real
+containers. A `--network container:` helper gets an HTTP response from loopback
+Web. A peer on the same user-defined bridge, a wrong port, and a stopped Web
+all fail within bounded timeouts. `quorum web --bind 0.0.0.0` exits nonzero.
+The image and container show no exposed or published ports.
 
 ## Health probe
 
