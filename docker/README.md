@@ -107,16 +107,16 @@ docker run -d --name quorum-prod \
   quorum:local
 ```
 
-`docker/replace.sh` seeds rows and an operator edit to the serve config
-through a live container, stops and removes it, then starts a second
-container over the same tree and asserts: the repository, every DB row, the
-exact config bytes (including the operator edit), recorded log bytes, and
-the worktree root are all unchanged; the replacement serves from the same
-image and `QUORUM_REPO`/mount shape; exactly one live daemon authority
-exists after the restart; and Web in the second container reads the
-replacement daemon's own database. This proves on-disk state survival and
-authority handover only — it does not prove that an in-flight provider turn
-resumes.
+`docker/replace.sh` seeds rows through a live container, stops and removes
+it, applies an operator edit to the serve config through a one-off root
+container against the stopped tree, then starts a second container over
+the same tree and asserts: the repository, every DB row, the exact config
+bytes (including the operator edit), recorded log bytes, and the worktree
+root are all unchanged; the replacement serves from the same image and
+`QUORUM_REPO`/mount shape; exactly one live daemon authority exists after
+the restart; and Web in the second container reads the replacement
+daemon's own database. This proves on-disk state survival and authority
+handover only — it does not prove that an in-flight provider turn resumes.
 
 ### Abrupt replacement and stale daemon-lock takeover
 
@@ -172,13 +172,17 @@ serve` processes the same numeric PID (`docker/replace-abrupt.sh`, case (b)
 above). Always stop the existing container before starting a replacement
 over the same tree and identity.
 
-A different `QUORUM_REPO` value is a separate identity and is safe to run
-concurrently over the same `/data` mount: `docker/replace-negative.sh`
-starts a container with a second `owner/name` against the same host tree and
+A different `QUORUM_REPO` value is a separate identity with its own
+on-disk namespace under the same `/data` mount: `docker/replace-negative.sh`
+starts a container with a second `owner/name` — while the original
+identity's container is not running — against the same host tree, and
 asserts it serves from its own namespace
 (`/data/quorum/repos/<owner>__<name>/quorum.db` and
-`/data/quorum/serve/<owner>__<name>.toml`), while the original identity's DB
-and config stay byte-identical throughout and after.
+`/data/quorum/serve/<owner>__<name>.toml`), while the original identity's
+DB and config stay byte-identical throughout and after. This proves
+on-disk namespace isolation between identities, not the safety of running
+both identities' containers at the same time; the suite never starts them
+concurrently, so this doc makes no claim about that case.
 
 ### Fail-closed behavior
 
