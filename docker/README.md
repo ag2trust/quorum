@@ -126,17 +126,20 @@ handover only — it does not prove that an in-flight provider turn resumes.
 
 A container can also disappear without a clean shutdown (host crash, `kill
 -9`, OOM). `docker/replace-abrupt.sh` repeatedly `SIGKILL`s a live container
-under concurrent write load and starts a replacement on the same tree once
-the daemon-lock staleness window has elapsed, asserting each time that:
-every row committed before the kill survives; the crash-image database (and
-its WAL, when the kill lands mid-transaction) passes `PRAGMA
-integrity_check`; the replacement takes over the stale `daemon_lock` row
-within a fixed bound (32s stale wait + startup, bounded at 75s total) without
-anything else editing that row first; and every other recorded artifact,
-including the exact config checksum, still matches the baseline. A
-replacement may reuse the stale holder's exact numeric PID — this is
-expected inside a container's isolated PID namespace and does not indicate a
-second live authority.
+while a separate, continuously-running write load executes in the
+background, and starts a replacement on the same tree once the daemon-lock
+staleness window has elapsed, asserting each time that: every row
+synchronously committed through the CLI before that background load started
+survives — the background load's own rows are never asserted as committed
+(the suite's own comment: they exist only to keep a WAL/SHM open so a kill
+can land mid-transaction); the crash-image database (and its WAL, when the
+kill lands mid-transaction) passes `PRAGMA integrity_check`; the replacement
+takes over the stale `daemon_lock` row within a fixed bound (32s stale wait
++ startup, bounded at 75s total) without anything else editing that row
+first; and every other recorded artifact, including the exact config
+checksum, still matches the baseline. A replacement may reuse the stale
+holder's exact numeric PID — this is expected inside a container's isolated
+PID namespace and does not indicate a second live authority.
 
 With a final replacement live, the suite also starts a bounded sequence of
 real contender containers on the same tree, each in its own isolated PID
