@@ -16,7 +16,9 @@
 # (b) With the final replacement live and authoritative, a second real
 # container (default entrypoint) on the same tree must fail authority
 # acquisition although its serve process has the same numeric PID as the
-# holder's; the holder must remain the sole live authority.
+# holder's; the holder must remain the sole live authority. When no
+# contender reaches the holder's PID, the holder is replaced by one more fully
+# verified abrupt kill and takeover (bounded holder rounds).
 #
 # This proves on-disk state survival and lock authority only; it does not
 # prove that an in-flight provider turn resumes.
@@ -158,13 +160,16 @@ printf 'replace-abrupt: baseline recorded %s artifacts; config sha256 %s\n' \
 
 PIDS=$PID
 REUSES=0
-k=1
-while :; do
+
+# Replacement $1 after the previous abrupt kill: wait out the stale window,
+# start it to authority within the takeover bound, and require every row
+# committed through iteration $1 - 1.
+replace_after_kill() {
   STALE_PID=$PID
   now=$(date +%s)
   remaining=$((KILL_TS + STALE_WAIT - now))
   [ "$remaining" -le 0 ] || sleep "$remaining"
-  replace_name "r$k"
+  replace_name "r$1"
   CURRENT=$REPLACE_NAME
   start_authority "$CURRENT"
   elapsed=$(($(date +%s) - KILL_TS))
@@ -173,16 +178,27 @@ while :; do
   PID=$(replace_serve_pids "$CURRENT")
   PIDS="$PIDS $PID"
   [ "$PID" != "$STALE_PID" ] || REUSES=$((REUSES + 1))
-  assert_rows_live "$CURRENT" $((k - 1))
-  printf 'replace-abrupt: replacement %s/%s: stale holder pid %s -> serve pid %s; authority %ss after kill\n' \
-    "$k" "$ITERATIONS" "$STALE_PID" "$PID" "$elapsed"
-  [ "$k" -lt "$ITERATIONS" ] || break
-  seed_rows "$CURRENT" "$k"
-  SNAP=$REPLACE_WORK/kill-$k
+  assert_rows_live "$CURRENT" $(($1 - 1))
+  printf 'replace-abrupt: replacement %s: stale holder pid %s -> serve pid %s; authority %ss after kill\n' \
+    "$1" "$STALE_PID" "$PID" "$elapsed"
+}
+
+# Commit iteration $1 rows through the live replacement, then kill it under
+# write load and verify the crash image against the baseline.
+kill_current() {
+  seed_rows "$CURRENT" "$1"
+  SNAP=$REPLACE_WORK/kill-$1
   replace_status_snapshot "$CURRENT" "$SNAP"
   start_write_load "$CURRENT"
-  kill_and_record "$CURRENT" "$SNAP" "$PID" "$k"
+  kill_and_record "$CURRENT" "$SNAP" "$PID" "$1"
   replace_assert_unchanged "$BASE" "$SNAP"
+}
+
+k=1
+while :; do
+  replace_after_kill "$k"
+  [ "$k" -lt "$ITERATIONS" ] || break
+  kill_current "$k"
   k=$((k + 1))
 done
 
@@ -197,17 +213,18 @@ printf 'replace-abrupt: %s abrupt replacements passed; serve pids %s; stale-hold
 # contender's PATH records its own PID and execs the real binary in place, so
 # the recorded PID is the contender's serve process. Contenders are never
 # exec'd into, so nothing perturbs their PID sequence. Container start varies
-# the serve PID by a small run-to-run offset, so equality is not assumed:
-# bounded attempts run until one contender's serve has the holder's numeric
-# PID, and every attempt must be rejected.
-HOLDER=$CURRENT
-HOLDER_PID=$PID
-CONTENDER_TRIES=20
+# the serve PID by a small run-to-run offset on both sides, so equality is not
+# assumed: bounded attempts run until one contender's serve has the holder's
+# numeric PID, and every attempt must be rejected. A holder whose PID no
+# contender reaches (CI observed holder 14 against 20 contenders at 13) is
+# replaced by one more fully verified abrupt kill and takeover, bounded by
+# HOLDER_TRIES.
+HOLDER_TRIES=4
+CONTENDER_TRIES=8
 serve_start() {
   docker exec "$HOLDER" sh -c "cut -d' ' -f22 /proc/$HOLDER_PID/stat" \
     || replace_fail "cannot read holder serve start time"
 }
-HOLDER_START=$(serve_start)
 PROBE=$REPLACE_WORK/pid-probe
 cat >"$PROBE" <<'SH'
 #!/bin/sh
@@ -215,35 +232,48 @@ cat >"$PROBE" <<'SH'
 exec /usr/local/bin/quorum "$@"
 SH
 chmod 0555 "$PROBE"
-CONTENDER_PIDS=
 EQUAL=0
-attempt=1
-while [ "$attempt" -le "$CONTENDER_TRIES" ]; do
-  replace_name "contender$attempt"
-  CONTENDER=$REPLACE_NAME
-  replace_run_default "$CONTENDER" \
-    -e PATH=/opt/pid-probe:/opt/codex/bin:/usr/local/bin:/usr/bin:/bin \
-    -v "$PROBE:/opt/pid-probe/quorum:ro"
-  replace_wait_stopped "$CONTENDER" 60 || replace_fail "$CONTENDER did not exit"
-  CONTENDER_LOG=$(docker logs "$CONTENDER" 2>&1)
-  CONTENDER_PID=$(printf '%s\n' "$CONTENDER_LOG" \
-    | sed -n 's/^pid-probe: quorum serve pid \([0-9][0-9]*\)$/\1/p')
-  [ -n "$CONTENDER_PID" ] || replace_fail "$CONTENDER never started serve"
-  replace_assert_eq 2 "$(docker inspect -f '{{.State.ExitCode}}' "$CONTENDER")" \
-    "$CONTENDER authority rejection exit"
-  printf '%s\n' "$CONTENDER_LOG" \
-    | grep -qF "another daemon (pid $HOLDER_PID) is already serving this DB" \
-    || replace_fail "$CONTENDER rejection did not name the live holder"
-  docker rm "$CONTENDER" >/dev/null
-  CONTENDER_PIDS="$CONTENDER_PIDS $CONTENDER_PID"
-  if [ "$CONTENDER_PID" = "$HOLDER_PID" ]; then
-    EQUAL=1
-    break
-  fi
-  attempt=$((attempt + 1))
+round=1
+while :; do
+  HOLDER=$CURRENT
+  HOLDER_PID=$PID
+  HOLDER_START=$(serve_start)
+  CONTENDER_PIDS=
+  attempt=1
+  while [ "$attempt" -le "$CONTENDER_TRIES" ]; do
+    replace_name "contender$round-$attempt"
+    CONTENDER=$REPLACE_NAME
+    replace_run_default "$CONTENDER" \
+      -e PATH=/opt/pid-probe:/opt/codex/bin:/usr/local/bin:/usr/bin:/bin \
+      -v "$PROBE:/opt/pid-probe/quorum:ro"
+    replace_wait_stopped "$CONTENDER" 60 || replace_fail "$CONTENDER did not exit"
+    CONTENDER_LOG=$(docker logs "$CONTENDER" 2>&1)
+    CONTENDER_PID=$(printf '%s\n' "$CONTENDER_LOG" \
+      | sed -n 's/^pid-probe: quorum serve pid \([0-9][0-9]*\)$/\1/p')
+    [ -n "$CONTENDER_PID" ] || replace_fail "$CONTENDER never started serve"
+    replace_assert_eq 2 "$(docker inspect -f '{{.State.ExitCode}}' "$CONTENDER")" \
+      "$CONTENDER authority rejection exit"
+    printf '%s\n' "$CONTENDER_LOG" \
+      | grep -qF "another daemon (pid $HOLDER_PID) is already serving this DB" \
+      || replace_fail "$CONTENDER rejection did not name the live holder"
+    docker rm "$CONTENDER" >/dev/null
+    CONTENDER_PIDS="$CONTENDER_PIDS $CONTENDER_PID"
+    if [ "$CONTENDER_PID" = "$HOLDER_PID" ]; then
+      EQUAL=1
+      break
+    fi
+    attempt=$((attempt + 1))
+  done
+  [ "$EQUAL" = 0 ] || break
+  printf 'replace-abrupt: holder round %s: no contender serve had holder pid %s:%s; replacing the holder\n' \
+    "$round" "$HOLDER_PID" "$CONTENDER_PIDS"
+  [ "$round" -lt "$HOLDER_TRIES" ] || replace_fail \
+    "no contender serve matched a holder pid in $HOLDER_TRIES holder rounds"
+  kill_current "$k"
+  k=$((k + 1))
+  replace_after_kill "$k"
+  round=$((round + 1))
 done
-[ "$EQUAL" = 1 ] || replace_fail \
-  "no contender serve had holder pid $HOLDER_PID in $CONTENDER_TRIES attempts:$CONTENDER_PIDS"
 # Past one 10s heartbeat: a stolen lock would make the holder's guarded
 # refresh match zero rows and exit, so the same serve process (same start
 # time) with a heartbeat refreshed after the contender exited is the authority.
@@ -254,8 +284,8 @@ age=$(docker exec "$HOLDER" quorum status --json \
   | sed -n 's/.*"Alive":{[^}]*"heartbeat_age_secs":\([0-9][0-9]*\).*/\1/p')
 [ -n "$age" ] && [ "$age" -le 11 ] \
   || replace_fail "holder heartbeat not refreshed after contention (age ${age:-none})"
-printf 'replace-abrupt: contender serve pids%s all exited 2 against holder serve pid %s (equal on attempt %s); holder remains sole authority\n' \
-  "$CONTENDER_PIDS" "$HOLDER_PID" "$attempt"
+printf 'replace-abrupt: contender serve pids%s all exited 2 against holder serve pid %s (equal on holder round %s attempt %s); holder remains sole authority\n' \
+  "$CONTENDER_PIDS" "$HOLDER_PID" "$round" "$attempt"
 
 # Clean stop of the holder releases its lock; the final artifacts still equal
 # the baseline and every committed row survives.
@@ -265,10 +295,10 @@ replace_stop_remove "$HOLDER"
 replace_snapshot "$FINAL" "$BASE"
 replace_assert_unchanged "$BASE" "$FINAL"
 replace_assert_integrity "$FINAL"
-assert_rows_in_copy "$FINAL" $((ITERATIONS - 1))
+assert_rows_in_copy "$FINAL" $((k - 1))
 replace_assert_eq 0 \
   "$(sqlite3 "$FINAL/db/quorum.db" 'SELECT count(*) FROM daemon_lock')" \
   'daemon_lock rows after clean holder stop'
 printf 'replace-abrupt: final artifacts, config (sha256 %s), and %s committed rows unchanged\n' \
-  "$(sed -n 's/^config sha256 //p' "$FINAL/manifest")" "$((ITERATIONS * 3))"
+  "$(sed -n 's/^config sha256 //p' "$FINAL/manifest")" "$((k * 3))"
 printf 'replace-abrupt: abrupt replacement and equal-PID contention passed\n'
