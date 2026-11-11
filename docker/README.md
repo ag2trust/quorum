@@ -210,11 +210,22 @@ serving the tree, and leaves the host tree byte-for-byte unchanged — no
   read-only `/data/quorum` — fails closed with `unable to open database
   file` (exit 3).
 - A tree owned by a different numeric UID/GID (not a read-only mount, but
-  root-owned so UID/GID `10001:10001` cannot read it) is refused as
-  foreign-owned with `is not a valid git checkout` (exit 1).
-- A missing `/data/repos/project/.git`, a corrupted repository `HEAD`, or a
-  corrupt SQLite header all fail closed (exit 1 or 3) with a message naming
-  the broken precondition.
+  root-owned, which trips git's dubious-ownership safety check rather than
+  a POSIX read-permission denial — Docker Desktop host bind mounts do not
+  enforce owner/mode bits) is refused as foreign-owned with `is not a valid
+  git checkout` (exit 1).
+- A missing `/data/repos/project/.git` fails closed with its own distinct
+  message naming that precondition: `is not a git checkout (.git is
+  missing)` (exit 1).
+- A corrupted repository `HEAD` fails closed with the *same* `is not a
+  valid git checkout` message as the foreign-ownership case above (exit 1):
+  the entrypoint reaches both through the identical `git rev-parse
+  --is-inside-work-tree` check, so that message alone does not let an
+  operator tell a corrupted checkout apart from a foreign-owned one;
+  distinguishing the two requires inspecting tree ownership or `HEAD`
+  directly, not the container's logged message.
+- A corrupt SQLite header fails closed with its own distinct message,
+  `file is not a database` (exit 3).
 - A database with `PRAGMA user_version` above what the image's `quorum`
   binary supports is refused with exit 3 before any lock is taken or any
   persistent PRAGMA is applied — both through the entrypoint's `quorum init`
