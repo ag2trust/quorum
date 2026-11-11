@@ -26,6 +26,7 @@ HEALTHY_DEADLINE_SECS=150   # image HEALTHCHECK: 30s interval, 120s start period
 UNHEALTHY_DEADLINE_SECS=60  # fake container: 2s interval, 2 retries
 STALE_DEADLINE_SECS=60      # serve heartbeat goes stale after 30s
 RECOVER_DEADLINE_SECS=30
+FREEZE_ATTEMPTS=3          # serve freezes tried for the authority negative
 SETUP_DEADLINE_SECS=60
 PROBE_EXEC_TIMEOUT_SECS=30  # outer bound on one probe (probe worst case ~9s)
 REPEATED_PROBES=20
@@ -364,28 +365,50 @@ docker rm -f "$OTHER" >/dev/null
 printf 'health-verify: wrong-repository authority negative passed\n'
 
 # Missing daemon authority: freeze the real serve child. It stays a live,
-# non-zombie PID, so only the heartbeat-based authority check can fail.
-signal_child "$PRIMARY" STOP serve
-start=$(date +%s)
-while :; do
-  probe_capture readiness "$PRIMARY"
-  [ "$PROBE_RC $PROBE_OUT" = '1 health: not-ready check=authority' ] && break
-  [ "$PROBE_RC $PROBE_OUT" = '0 health: ready' ] \
-    || fail "stopped-serve probe gave unexpected exit $PROBE_RC '$PROBE_OUT'"
-  [ "$(elapsed_since "$start")" -lt "$STALE_DEADLINE_SECS" ] \
-    || fail "stopped serve never lost authority within ${STALE_DEADLINE_SECS}s"
-  sleep 3
-done
-printf 'health-verify: stopped serve reported check=authority after %ss\n' \
-  "$(elapsed_since "$start")"
-signal_child "$PRIMARY" CONT serve
-start=$(date +%s)
-while :; do
-  probe_capture readiness "$PRIMARY"
-  [ "$PROBE_RC $PROBE_OUT" = '0 health: ready' ] && break
-  [ "$(elapsed_since "$start")" -lt "$RECOVER_DEADLINE_SECS" ] \
+# non-zombie PID, so only the heartbeat-based authority check can fail. A
+# freeze that lands while serve holds the SQLite write lock instead makes the
+# bounded status read fail (check=db, still not ready); that attempt is
+# resumed and the freeze retried, so authority itself must be observed.
+wait_primary_ready() {
+  wr_start=$(date +%s)
+  while :; do
+    probe_capture readiness "$PRIMARY"
+    [ "$PROBE_RC $PROBE_OUT" = '0 health: ready' ] && return 0
+    [ "$(elapsed_since "$wr_start")" -lt "$RECOVER_DEADLINE_SECS" ] || return 1
+    sleep 2
+  done
+}
+freeze_attempt=0 authority_seen=0
+while [ "$authority_seen" = 0 ]; do
+  freeze_attempt=$((freeze_attempt + 1))
+  [ "$freeze_attempt" -le "$FREEZE_ATTEMPTS" ] \
+    || fail "stopped serve never reported check=authority in $FREEZE_ATTEMPTS freezes"
+  signal_child "$PRIMARY" STOP serve
+  start=$(date +%s)
+  while :; do
+    probe_capture readiness "$PRIMARY"
+    case "$PROBE_RC $PROBE_OUT" in
+      '1 health: not-ready check=authority')
+        authority_seen=1
+        printf 'health-verify: stopped serve reported check=authority after %ss (freeze %s)\n' \
+          "$(elapsed_since "$start")" "$freeze_attempt"
+        break
+        ;;
+      '1 health: not-ready check=db')
+        printf 'health-verify: freeze %s held the DB write lock (check=db); retrying\n' \
+          "$freeze_attempt"
+        break
+        ;;
+      '0 health: ready') ;;
+      *) fail "stopped-serve probe gave unexpected exit $PROBE_RC '$PROBE_OUT'" ;;
+    esac
+    [ "$(elapsed_since "$start")" -lt "$STALE_DEADLINE_SECS" ] \
+      || fail "stopped serve never lost authority within ${STALE_DEADLINE_SECS}s"
+    sleep 3
+  done
+  signal_child "$PRIMARY" CONT serve
+  wait_primary_ready \
     || fail "resumed serve not ready within ${RECOVER_DEADLINE_SECS}s"
-  sleep 2
 done
 wait_health "$PRIMARY" healthy "$HEALTHY_DEADLINE_SECS" \
   || fail 'primary not Docker-healthy after negatives'
