@@ -143,11 +143,13 @@ unchanged process start time and a refreshed heartbeat. Equal-PID contention
 is therefore rejected on something other than the raw PID.
 
 Operationally: after an abrupt container death, start the replacement with
-the same image, `QUORUM_REPO`, and mount; a replacement started too soon
-(inside the stale window, while the old holder could conceivably still be
-alive) is refused, not merged, and a replacement started once the window has
-passed takes over the DB's existing `daemon_lock` row rather than needing
-any manual lock cleanup.
+the same image, `QUORUM_REPO`, and mount once the stale window has passed;
+`docker/replace-abrupt.sh` only ever starts the replacement after waiting
+out that window, so it takes over the DB's existing `daemon_lock` row
+within the bound above rather than needing any manual lock cleanup. Whether
+a replacement started before the window elapses is refused is not covered
+by this suite — that path is exercised only by a Rust unit test in
+`quorum-core/src/daemon_lock.rs`, outside this doc's scope.
 
 ### Serve-config preservation
 
@@ -185,10 +187,12 @@ the container exits non-zero for the documented reason, leaves no container
 serving the tree, and leaves the host tree byte-for-byte unchanged — no
 `daemon_lock` row is taken and no fresh state is created over existing data:
 
-- An unwritable mount — a read-only `/data`, a writable `/data` with a
-  read-only `/data/quorum`, or a tree owned by a different numeric
-  UID/GID — fails closed (`is not a valid git checkout` or `unable to open
-  database file`, exit 1 or 3 depending on which check is reached first).
+- An unwritable mount — a read-only `/data`, or a writable `/data` with a
+  read-only `/data/quorum` — fails closed with `unable to open database
+  file` (exit 3).
+- A tree owned by a different numeric UID/GID (not a read-only mount, but
+  root-owned so UID/GID `10001:10001` cannot read it) is refused as
+  foreign-owned with `is not a valid git checkout` (exit 1).
 - A missing `/data/repos/project/.git`, a corrupted repository `HEAD`, or a
   corrupt SQLite header all fail closed (exit 1 or 3) with a message naming
   the broken precondition.
