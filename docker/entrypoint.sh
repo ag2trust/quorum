@@ -219,7 +219,8 @@ while [ "$i" -lt "$READY_TRIES" ]; do
   sleep 1
 done
 if [ "$i" -ge "$READY_TRIES" ]; then
-  printf 'entrypoint: daemon and Web not ready after %ss\n' "$READY_TRIES" >&2
+  printf 'entrypoint: daemon and Web not ready after %s readiness probes\n' \
+    "$READY_TRIES" >&2
   stop_and_wait "$SERVE" "$SERVE_TREE" >/dev/null 2>&1 || true
   stop_and_wait "$WEB" "$WEB_TREE" >/dev/null 2>&1 || true
   exit 1

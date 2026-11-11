@@ -299,9 +299,13 @@ setup
 mkdir -p "$QUORUM_RUN_DIR"
 printf 'supervisor=%s\nserve=%s\nweb=%s\nrepo=acme/widget\n' $$ $$ $$ \
   >"$QUORUM_RUN_DIR/supervisor.pids"
-FAKE_INIT_CODE=3 sh "$ENTRY" >/dev/null 2>&1
-check 'stale runtime record cleared' no \
+# Observe while init is still running, before the EXIT cleanup could mask it.
+FAKE_INIT_SLEEP=30 sh "$ENTRY" >/dev/null 2>&1 & entry_pid=$!
+wait_for_call '^init '
+check 'stale runtime record cleared before init' no \
   "$(test -e "$QUORUM_RUN_DIR/supervisor.pids" && echo yes || echo no)"
+kill -TERM "$entry_pid"
+wait "$entry_pid" 2>/dev/null
 teardown
 
 # Probe contract against a synthetic record of live processes. Each failure
