@@ -110,9 +110,13 @@ docker run -d --name quorum-prod \
 `docker/replace.sh` seeds rows through a live container, stops and removes
 it, applies an operator edit to the serve config through a one-off root
 container against the stopped tree, then starts a second container over
-the same tree and asserts: the repository, every DB row, the exact config
-bytes (including the operator edit), recorded log bytes, and the worktree
-root are all unchanged; the replacement serves from the same image and
+the same tree and asserts: the repository, a fixed set of representative
+rows seeded by the test (a specific task, a task note, all `pinned` rows,
+all `control` rows, and the messages for one topic) plus the aggregate
+counts in the status projection, the exact config bytes (including the
+operator edit), recorded log bytes, and the worktree root are all
+unchanged — there is no full-table or full-database diff anywhere in the
+suite; the replacement serves from the same image and
 `QUORUM_REPO`/mount shape; exactly one live daemon authority exists after
 the restart; and Web in the second container reads the replacement
 daemon's own database. This proves on-disk state survival and authority
@@ -134,13 +138,20 @@ replacement may reuse the stale holder's exact numeric PID — this is
 expected inside a container's isolated PID namespace and does not indicate a
 second live authority.
 
-With a final replacement live, the suite also starts a second real container
-on the same tree whose `quorum serve` process is made to share the
-holder's numeric PID; that contender still fails authority acquisition
-(exit 2, logging that another daemon with that PID already holds the DB)
-and the original holder remains the sole live authority, confirmed by its
-unchanged process start time and a refreshed heartbeat. Equal-PID contention
-is therefore rejected on something other than the raw PID.
+With a final replacement live, the suite also starts a bounded sequence of
+real contender containers on the same tree, each in its own isolated PID
+namespace, until one contender's `quorum serve` process happens to land on
+the exact same numeric PID as the live holder's (CONTENDER_TRIES per
+holder; if none match, the holder itself is killed and replaced for another
+round, up to HOLDER_TRIES, after which the suite fails outright rather than
+passing without ever observing a collision). Every contender in the
+sequence — including the one that lands on the holder's PID — fails
+authority acquisition (exit 2, logging that another daemon with that PID
+already holds the DB), and the original holder remains the sole live
+authority throughout, confirmed by its unchanged process start time and a
+refreshed heartbeat. A passing run therefore did observe genuine equal-PID
+contention and is accurate evidence that it is rejected on something other
+than the raw PID.
 
 Operationally: after an abrupt container death, start the replacement with
 the same image, `QUORUM_REPO`, and mount once the stale window has passed;
@@ -205,8 +216,11 @@ serving the tree, and leaves the host tree byte-for-byte unchanged — no
   persistent PRAGMA is applied — both through the entrypoint's `quorum init`
   and through `quorum serve` invoked directly.
 
-After each negative case, restoring the broken precondition and starting
-again reproduces the original accepted state exactly.
+After each negative case, restoring the broken precondition reproduces the
+accepted tree byte-for-byte; starting a real container again to confirm it
+resumes as the sole authority with every recorded artifact, DB row, and the
+exact config checksum intact happens once, for the original identity, at
+the end of the suite.
 
 ### Rollback limitations
 
