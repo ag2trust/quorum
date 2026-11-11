@@ -17,6 +17,7 @@ printf 'verify: image architecture linux/amd64\n'
 "$(dirname "$0")/replace.sh" "$image"
 "$(dirname "$0")/replace-abrupt.sh" "$image"
 "$(dirname "$0")/replace-negative.sh" "$image"
+"$(dirname "$0")/health-verify.sh" "$image"
 
 if docker build \
   --platform linux/amd64 \
