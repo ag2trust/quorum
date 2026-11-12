@@ -2524,18 +2524,33 @@ mod tests {
     /// benches, and its newer build-dir layout no longer places unit-test
     /// executables beside the bins, so `assert_cmd::cargo::cargo_bin` cannot
     /// find them here. Walk up from this test executable to the artifact
-    /// directory instead (`target/<profile>` in both layouts).
+    /// directory instead (`target/<profile>` in both layouts), never past the
+    /// target directory root that Cargo marks with `CACHEDIR.TAG`.
+    ///
+    /// A filtered unit-test run (`cargo test --bin quorum`) does not build the
+    /// bins, so they may be missing or stale; `cargo test --workspace` and
+    /// `cargo build --bins` build them.
     fn package_bin(name: &str) -> std::path::PathBuf {
         if let Some(path) = std::env::var_os(format!("CARGO_BIN_EXE_{name}")) {
             return path.into();
         }
         let exe = std::env::current_exe().expect("resolve the test executable");
         let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
-        exe.ancestors()
-            .skip(1)
-            .map(|dir| dir.join(&file))
-            .find(|candidate| candidate.is_file())
-            .unwrap_or_else(|| panic!("no `{file}` bin above test executable {}", exe.display()))
+        for dir in exe.ancestors().skip(1) {
+            let candidate = dir.join(&file);
+            if candidate.is_file() {
+                return candidate;
+            }
+            if dir.join("CACHEDIR.TAG").is_file() {
+                break;
+            }
+        }
+        panic!(
+            "no `{file}` bin in the target directory above test executable {}; \
+             a filtered unit-test run does not build the package's bins, so run \
+             `cargo test --workspace` or `cargo build --bins` first",
+            exe.display()
+        )
     }
 
     fn setup_git_dir() -> tempfile::TempDir {
