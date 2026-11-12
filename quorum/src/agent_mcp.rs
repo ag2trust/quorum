@@ -54,6 +54,23 @@ const HTTP_MCP_PATH: &str = "/mcp";
 /// `MAX_FRAME_BYTES`; the allowance covers the JSON-RPC envelope and string
 /// escaping around the largest payload the endpoint would accept.
 const MAX_HTTP_BODY_BYTES: usize = 4 * MAX_FRAME_BYTES;
+/// Open HTTP connections served at once. HTTP/1.1 carries one request per
+/// connection at a time, so this is also the bound on concurrent requests.
+/// Further connections wait in the kernel's listen backlog. It is kept well
+/// under the daemon endpoint's 32 connection slots so this listener cannot
+/// starve the CLI path that shares them.
+const MAX_HTTP_CONNECTIONS: usize = 8;
+/// Endpoint exchanges in flight at once, counted separately from connections
+/// because a blocking exchange outlives a client that hung up on it.
+const MAX_ENDPOINT_EXCHANGES: usize = MAX_HTTP_CONNECTIONS;
+/// A connection must deliver a complete request head within this bound,
+/// whether it is new or idle between requests.
+const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// One request, from its head to the start of its response, including
+/// reading its body and waiting for the daemon endpoint.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// After SIGINT/SIGTERM, open connections get this long to finish.
+const HTTP_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 /// Where a request's run capability comes from.
 #[derive(Debug, Clone)]
@@ -73,6 +90,9 @@ struct QuorumServer {
     // actually returned there instead of taking an asynchronous watcher
     // baseline, which could miss a transition before its first poll.
     advertised_phase: Arc<Mutex<Option<RunPhase>>>,
+    /// HTTP only: bounds concurrent endpoint exchanges across all requests.
+    /// stdio serves one client and keeps its exchanges unbounded as before.
+    endpoint_slots: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -665,6 +685,16 @@ impl QuorumServer {
         }
     }
 
+    /// Wait for one of the bounded endpoint exchange slots. The permit is
+    /// owned so blocking work can carry it until that work really ends.
+    async fn endpoint_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match &self.endpoint_slots {
+            // The semaphore is never closed, so acquisition cannot fail.
+            Some(slots) => Arc::clone(slots).acquire_owned().await.ok(),
+            None => None,
+        }
+    }
+
     fn is_http(&self) -> bool {
         matches!(self.authority, Authority::Bearer)
     }
@@ -737,6 +767,7 @@ impl QuorumServer {
             return Err(EndpointFailure::Unavailable);
         }
         let exchange = async {
+            let _slot = self.endpoint_slot().await;
             let mut stream = UnixStream::connect(&self.endpoint).await?;
             stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
             stream.write_all(&body).await?;
@@ -806,7 +837,9 @@ impl QuorumServer {
             );
         };
         let endpoint = self.endpoint.clone();
+        let slot = self.endpoint_slot().await;
         match tokio::task::spawn_blocking(move || {
+            let _slot = slot;
             crate::agent_client::submit_plan(&endpoint, &capability, &response)
         })
         .await
@@ -958,7 +991,12 @@ impl QuorumServer {
         F: FnOnce(&Path) -> Result<SignalOutcome> + Send + 'static,
     {
         let endpoint = self.endpoint.clone();
-        match tokio::task::spawn_blocking(move || send(&endpoint)).await {
+        let slot = self.endpoint_slot().await;
+        let sent = tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            send(&endpoint)
+        });
+        match sent.await {
             Ok(Ok(SignalOutcome::Accepted(id))) => {
                 let mut result = Map::new();
                 result.insert("ok".into(), Value::Bool(true));
@@ -1234,6 +1272,7 @@ fn run_stdio() -> Result<()> {
         authority: Authority::Run(capability.clone()),
         repository,
         advertised_phase: Arc::default(),
+        endpoint_slots: None,
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1273,6 +1312,9 @@ fn run_http(addr: SocketAddr) -> Result<()> {
         authority: Authority::Bearer,
         repository,
         advertised_phase: Arc::default(),
+        endpoint_slots: Some(Arc::new(tokio::sync::Semaphore::new(
+            MAX_ENDPOINT_EXCHANGES,
+        ))),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1297,27 +1339,113 @@ fn run_http(addr: SocketAddr) -> Result<()> {
             .with_sse_keep_alive(None)
             .with_max_request_body_bytes(MAX_HTTP_BODY_BYTES);
         let cancel = config.cancellation_token.clone();
-        let service = StreamableHttpService::new(
-            move || Ok(server.clone()),
-            Arc::new(NeverSessionManager::default()),
-            config,
-        );
         let app = axum::Router::new()
-            .route_service(HTTP_MCP_PATH, service)
-            .layer(axum::middleware::from_fn(require_bearer));
+            .route(
+                HTTP_MCP_PATH,
+                axum::routing::any(move |request: axum::extract::Request| {
+                    // A fresh rmcp service per request. rmcp caches one tool
+                    // schema entry per distinct `tools/call` name for the
+                    // life of a service and never evicts, so a shared service
+                    // would let any caller grow memory without bound. Nothing
+                    // else in a stateless service outlives a request.
+                    let service = StreamableHttpService::new(
+                        {
+                            let server = server.clone();
+                            move || Ok(server.clone())
+                        },
+                        Arc::new(NeverSessionManager::default()),
+                        config.clone(),
+                    );
+                    async move { service.handle(request).await }
+                }),
+            )
+            .layer(axum::middleware::from_fn(bound_request));
         // The one line a launcher needs to learn a port-0 bind.
         eprintln!("quorum agent-mcp listening on http://{local}{HTTP_MCP_PATH}");
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                tokio::select! {
-                    _ = sigint.recv() => {}
-                    _ = sigterm.recv() => {}
+
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_CONNECTIONS));
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                // Signals first, then reaping, so finished connections never
+                // accumulate behind a steady stream of new ones.
+                biased;
+                _ = sigint.recv() => break,
+                _ = sigterm.recv() => break,
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
+                accepted = accept_with_slot(&listener, &slots) => {
+                    if let Some((stream, slot)) = accepted {
+                        connections.spawn(serve_http_connection(
+                            stream,
+                            app.clone(),
+                            shutdown.subscribe(),
+                            slot,
+                        ));
+                    }
                 }
-                cancel.cancel();
-            })
-            .await
-            .map_err(|_| QuorumError::Io("agent MCP service failed".into()))
+            }
+        }
+        // Signals only start shutdown. Stop accepting, tell rmcp and every
+        // connection to finish, and wait a bounded time. A connection still
+        // open after that (a half-sent request, a stalled peer) is dropped:
+        // an endpoint exchange already in flight is one atomic daemon
+        // operation whose outcome the daemon alone decides.
+        drop(listener);
+        cancel.cancel();
+        let _ = shutdown.send(true);
+        let _ = tokio::time::timeout(HTTP_SHUTDOWN_DRAIN, async {
+            while connections.join_next().await.is_some() {}
+        })
+        .await;
+        connections.shutdown().await;
+        Ok(())
     })
+}
+
+/// Accept one connection, but only once a connection slot is free, so the
+/// excess waits in the kernel's bounded listen backlog rather than in memory.
+/// Cancel-safe: a dropped call releases its slot and leaves the backlog alone.
+async fn accept_with_slot(
+    listener: &tokio::net::TcpListener,
+    slots: &Arc<tokio::sync::Semaphore>,
+) -> Option<(tokio::net::TcpStream, tokio::sync::OwnedSemaphorePermit)> {
+    // The semaphore is never closed, so acquisition cannot fail.
+    let slot = Arc::clone(slots).acquire_owned().await.ok()?;
+    match listener.accept().await {
+        Ok((stream, _)) => Some((stream, slot)),
+        Err(_) => {
+            // Usually transient (the peer reset, or descriptors ran out).
+            // Pause so a persistent failure cannot spin this loop.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            None
+        }
+    }
+}
+
+/// Serve one HTTP/1.1 connection until it closes, its request head times
+/// out, or shutdown is signalled. `_slot` is held for the connection's life.
+async fn serve_http_connection(
+    stream: tokio::net::TcpStream,
+    app: axum::Router,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+) {
+    let connection = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HTTP_HEADER_READ_TIMEOUT)
+        .serve_connection(
+            hyper_util::rt::TokioIo::new(stream),
+            hyper_util::service::TowerToHyperService::new(app),
+        );
+    tokio::pin!(connection);
+    tokio::select! {
+        _ = connection.as_mut() => {}
+        _ = shutdown.changed() => {
+            connection.as_mut().graceful_shutdown();
+            let _ = connection.await;
+        }
+    }
 }
 
 fn validate_loopback(addr: SocketAddr) -> Result<()> {
@@ -1353,8 +1481,10 @@ fn bearer_capability(headers: &HeaderMap) -> Option<&str> {
     Some(capability)
 }
 
-/// Refuse a request without a well-formed bearer before it reaches MCP.
-async fn require_bearer(
+/// Refuse a request without a well-formed bearer before it reaches MCP, and
+/// bound how long an admitted one may take to produce its response. The bound
+/// covers reading the body, which rmcp does inside the service.
+async fn bound_request(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -1366,7 +1496,17 @@ async fn require_bearer(
         )
             .into_response();
     }
-    next.run(request).await
+    match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, next.run(request)).await {
+        Ok(response) => response,
+        // Dropping the request future cancels its handler. A signal already
+        // sent to the daemon is not undone, so its outcome is unknown.
+        Err(_) => (
+            StatusCode::REQUEST_TIMEOUT,
+            [(header::CONNECTION, "close")],
+            "Request Timeout",
+        )
+            .into_response(),
+    }
 }
 
 fn required_env(name: &str, max_bytes: usize) -> Result<String> {
@@ -1391,6 +1531,7 @@ mod tests {
             authority: Authority::Run("run-capability".into()),
             repository: "owner/repository".into(),
             advertised_phase: Arc::default(),
+            endpoint_slots: None,
         };
 
         // This models the client caching its initial list before the task

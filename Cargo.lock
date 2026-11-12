@@ -917,6 +917,8 @@ dependencies = [
  "axum",
  "clap",
  "directories",
+ "hyper",
+ "hyper-util",
  "libc",
  "predicates",
  "quorum-core",

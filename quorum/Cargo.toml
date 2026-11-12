@@ -20,6 +20,8 @@ toml = "0.8"
 directories = "5"
 tokio = { version = "1", features = ["rt-multi-thread", "process", "macros", "io-util", "time", "signal", "sync", "net"] }
 axum = "0.7"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 tempfile = "3"
