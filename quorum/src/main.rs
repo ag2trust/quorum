@@ -184,7 +184,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Sweep => "sweep",
         cli::Command::Message { .. } => "message",
         cli::Command::React { .. } => "react",
-        cli::Command::AgentMcp => "agent-mcp",
+        cli::Command::AgentMcp { .. } => "agent-mcp",
         cli::Command::Submit { .. } => "submit",
         cli::Command::ReviewDraft { .. } => "review-draft",
         cli::Command::Serve { .. } => "serve",
@@ -1230,8 +1230,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
             Ok(0)
         }
-        cli::Command::AgentMcp => {
-            agent_mcp::run()?;
+        cli::Command::AgentMcp { listen } => {
+            agent_mcp::run(listen)?;
             Ok(0)
         }
         cli::Command::Submit {

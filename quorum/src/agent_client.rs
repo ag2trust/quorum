@@ -28,9 +28,14 @@ struct Request<'a> {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation<'a> {
     AppendNote {
-        task_id: i64,
-        agent: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent: Option<&'a str>,
         note: &'a str,
+    },
+    AlertOwner {
+        body: &'a str,
     },
     Submit {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,6 +76,7 @@ enum ResponseResult {
     TaskNote { note_id: i64 },
     Mailbox { mailbox_id: i64 },
     PlanAccepted { graph_id: i64 },
+    Message { seq: i64 },
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,11 +171,95 @@ pub fn append_note(request: AppendNote<'_>) -> Result<i64> {
     note_id(exchange(
         request.capability,
         Operation::AppendNote {
-            task_id: request.task_id,
-            agent: request.agent,
+            task_id: Some(request.task_id),
+            agent: Some(request.agent),
             note: request.note,
         },
     )?)
+}
+
+/// Outcome of one signalling operation sent to an explicit endpoint.
+///
+/// Like [`SubmitPlanOutcome`], a daemon rejection is a value so the caller can
+/// relay the endpoint's own code and message. `Accepted` carries the id of the
+/// row the daemon wrote: a mailbox id, a task-note id, or a feed `seq`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignalOutcome {
+    Accepted(i64),
+    Rejected { code: String, message: String },
+}
+
+/// [`submit`] against an explicit endpoint, returning a rejection as a value.
+pub fn submit_at(endpoint: &Path, request: Submit<'_>) -> Result<SignalOutcome> {
+    signal_at(
+        endpoint,
+        request.capability,
+        Operation::Submit {
+            summary: request.summary,
+            verdict: request.verdict,
+            feedback: request.feedback,
+            feedback_json: request.feedback_json,
+            blocking: request.blocking,
+        },
+        mailbox_id,
+    )
+}
+
+/// [`react`] against an explicit endpoint, returning a rejection as a value.
+pub fn react_at(
+    endpoint: &Path,
+    capability: &str,
+    state: &str,
+    reason: Option<&str>,
+) -> Result<SignalOutcome> {
+    signal_at(
+        endpoint,
+        capability,
+        Operation::React { state, reason },
+        mailbox_id,
+    )
+}
+
+/// Append a progress note to the capability's own task as its own agent. No
+/// identity fields are sent: the daemon derives both from the capability.
+pub fn append_note_at(endpoint: &Path, capability: &str, note: &str) -> Result<SignalOutcome> {
+    signal_at(
+        endpoint,
+        capability,
+        Operation::AppendNote {
+            task_id: None,
+            agent: None,
+            note,
+        },
+        note_id,
+    )
+}
+
+/// Post a critical feed message to the owner through a `reviewer` capability.
+pub fn alert_owner_at(endpoint: &Path, capability: &str, body: &str) -> Result<SignalOutcome> {
+    signal_at(
+        endpoint,
+        capability,
+        Operation::AlertOwner { body },
+        message_seq,
+    )
+}
+
+/// `accepted` names the one result variant the operation may answer with, so
+/// a mismatched success is a malformed response rather than a mislabelled id.
+fn signal_at(
+    endpoint: &Path,
+    capability: &str,
+    operation: Operation<'_>,
+    accepted: fn(ResponseResult) -> Result<i64>,
+) -> Result<SignalOutcome> {
+    match exchange_at(endpoint, capability, operation)? {
+        Ok(result) => accepted(result).map(SignalOutcome::Accepted),
+        Err(error) => Ok(SignalOutcome::Rejected {
+            code: error.code,
+            message: error.message,
+        }),
+    }
 }
 
 fn exchange(capability: &str, operation: Operation<'_>) -> Result<ResponseResult> {
@@ -254,6 +344,15 @@ fn mailbox_id(result: ResponseResult) -> Result<i64> {
 fn note_id(result: ResponseResult) -> Result<i64> {
     match result {
         ResponseResult::TaskNote { note_id } if note_id > 0 => Ok(note_id),
+        _ => Err(QuorumError::Io(
+            "agent endpoint returned malformed response".into(),
+        )),
+    }
+}
+
+fn message_seq(result: ResponseResult) -> Result<i64> {
+    match result {
+        ResponseResult::Message { seq } if seq > 0 => Ok(seq),
         _ => Err(QuorumError::Io(
             "agent endpoint returned malformed response".into(),
         )),

@@ -398,9 +398,16 @@ pub enum Command {
         #[arg(long = "run-id")]
         run_id: Option<String>,
     },
-    /// Run the credentialless, tools-only managed-agent MCP server over stdio.
+    /// Run the credentialless, tools-only managed-agent MCP server over stdio,
+    /// or over loopback Streamable HTTP with `--listen`.
     #[command(name = "agent-mcp")]
-    AgentMcp,
+    AgentMcp {
+        /// Serve Streamable HTTP MCP at `http://<addr>/mcp` instead of stdio.
+        /// Loopback addresses only; plain HTTP. Each request carries its run
+        /// capability as `Authorization: Bearer <run id>`.
+        #[arg(long, value_name = "SOCKETADDR")]
+        listen: Option<std::net::SocketAddr>,
+    },
     /// Signal task completion (worker) or emit a review verdict (reviewer).
     /// The daemon endpoint writes the mailbox row after deriving authority from
     /// the run capability; CLI task, PR, and identity flags are compatibility inputs.

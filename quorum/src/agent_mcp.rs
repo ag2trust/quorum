@@ -4,8 +4,16 @@
 //! known tool call is authorized by the daemon endpoint using only the injected
 //! run capability. Tool arguments deliberately stop at this shell until the
 //! durable operation slices implement their closed endpoint schemas.
+//!
+//! Two transports share this shell. Over stdio it serves the one run whose
+//! capability was injected into its environment. With `--listen` it serves
+//! loopback Streamable HTTP statelessly: every request names its own run with
+//! an `Authorization: Bearer <run id>` header, nothing about a run is kept
+//! between requests, and the signalling tools below are advertised.
 
-use crate::agent_client::SubmitPlanOutcome;
+use crate::agent_client::{SignalOutcome, SubmitPlanOutcome};
+use axum::http::{header, request::Parts, HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use quorum_core::error::{QuorumError, Result};
 use rmcp::{
     model::{
@@ -15,12 +23,16 @@ use rmcp::{
         ServerInfo, Tool, ToolAnnotations,
     },
     service::{Peer, RequestContext},
+    transport::streamable_http_server::{
+        session::never::NeverSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    },
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::future::Future;
-use std::path::PathBuf;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -36,11 +48,26 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const PHASE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_CAPABILITY_BYTES: usize = 128;
 const MAX_ENV_BYTES: usize = 4096;
+/// The only path the HTTP transport serves.
+const HTTP_MCP_PATH: &str = "/mcp";
+/// Bound on one HTTP request body. An endpoint request is at most
+/// `MAX_FRAME_BYTES`; the allowance covers the JSON-RPC envelope and string
+/// escaping around the largest payload the endpoint would accept.
+const MAX_HTTP_BODY_BYTES: usize = 4 * MAX_FRAME_BYTES;
+
+/// Where a request's run capability comes from.
+#[derive(Debug, Clone)]
+enum Authority {
+    /// stdio: the one capability injected into this process's environment.
+    Run(String),
+    /// HTTP: the bearer token of each request. Nothing is stored.
+    Bearer,
+}
 
 #[derive(Debug, Clone)]
 struct QuorumServer {
     endpoint: PathBuf,
-    capability: String,
+    authority: Authority,
     repository: String,
     // `tools/list` is the only inventory a client can cache. Track the phase
     // actually returned there instead of taking an asynchronous watcher
@@ -276,6 +303,226 @@ fn json_result(value: Value, is_error: bool) -> CallToolResult {
     }
 }
 
+const SUBMIT_WORK: &str = "submit_work";
+const SUBMIT_REVIEW: &str = "submit_review";
+const REACT: &str = "react";
+const TASK_NOTE: &str = "task_note";
+const ALERT_OWNER: &str = "alert_owner";
+
+/// Shared by every signalling tool description. The endpoint appends one row
+/// per accepted call and deduplicates nothing, so a retry is never free.
+const SIGNAL_RETRY: &str = "Not idempotent: every accepted call records another row, so call it \
+     once. A rejection ({\"code\",\"message\"}) recorded nothing and may be corrected and \
+     repeated. After `transport` the outcome is unknown and a repeat may record a duplicate.";
+
+/// The signalling tools advertised over HTTP for a run phase. Like
+/// `submit_plan` they are not `ProtocolOperation`s; the daemon endpoint
+/// re-derives authority from the capability on every call.
+fn signal_tools(phase: RunPhase) -> Vec<Tool> {
+    match phase {
+        RunPhase::Planner => Vec::new(),
+        RunPhase::InitialWorker | RunPhase::ReworkWorker => {
+            vec![submit_work_tool(), react_tool(), task_note_tool()]
+        }
+        RunPhase::Reviewer => vec![submit_review_tool(), task_note_tool(), alert_owner_tool()],
+    }
+}
+
+fn signal_tool(
+    name: &'static str,
+    description: String,
+    properties: Value,
+    required: &[&str],
+) -> Tool {
+    Tool::new(name, description, github_schema(properties, required)).with_annotations(
+        ToolAnnotations::new()
+            .read_only(false)
+            .destructive(false)
+            .idempotent(false)
+            // The daemon endpoint is the only world these tools touch.
+            .open_world(false),
+    )
+}
+
+fn submit_work_tool() -> Tool {
+    signal_tool(
+        SUBMIT_WORK,
+        format!(
+            "Signal that this worker run's delivery (initial or rework) is complete, with an \
+             optional summary. The daemon alone decides what happens next. Success is \
+             {{\"ok\":true,\"mailbox_id\":N}}. {SIGNAL_RETRY}"
+        ),
+        json!({"summary": bounded_string(1, 32768)}),
+        &[],
+    )
+}
+
+fn submit_review_tool() -> Tool {
+    signal_tool(
+        SUBMIT_REVIEW,
+        format!(
+            "Submit this reviewer run's verdict. `approved` requires `blocking: 0` and takes no \
+             feedback. `changes` requires `blocking` >= 1 and non-empty `feedback`. \
+             `graph-blocker` takes only `feedback_json` (the graph-blocker feedback object). \
+             The daemon re-validates and alone acts on the verdict. Success is \
+             {{\"ok\":true,\"mailbox_id\":N}}. {SIGNAL_RETRY}"
+        ),
+        json!({
+            "verdict": {"type":"string","enum":["approved","changes","graph-blocker"]},
+            "blocking": {"type":"integer","minimum":0},
+            "feedback": bounded_string(1, 32768),
+            "feedback_json": {"type":"object"}
+        }),
+        &["verdict"],
+    )
+}
+
+fn react_tool() -> Tool {
+    signal_tool(
+        REACT,
+        format!(
+            "Signal a worker run's state to the daemon: `blocked`, `failed`, `needs-info`, or \
+             `note`. `blocked` and `needs-info` require a non-empty `reason` stating the blocker \
+             or the full question. Success is {{\"ok\":true,\"mailbox_id\":N}}. {SIGNAL_RETRY}"
+        ),
+        json!({
+            "state": {"type":"string","enum":["blocked","failed","needs-info","note"]},
+            "reason": bounded_string(1, quorum_core::tasks::REACT_REASON_MAX_BYTES)
+        }),
+        &["state"],
+    )
+}
+
+fn task_note_tool() -> Tool {
+    signal_tool(
+        TASK_NOTE,
+        format!(
+            "Append a progress note to this run's own task, authored as this run's agent. \
+             Success is {{\"ok\":true,\"note_id\":N}}. {SIGNAL_RETRY}"
+        ),
+        json!({"note": bounded_string(1, 32768)}),
+        &["note"],
+    )
+}
+
+fn alert_owner_tool() -> Tool {
+    signal_tool(
+        ALERT_OWNER,
+        format!(
+            "Post a critical feed message addressed to the owner, authored as this reviewer \
+             run's agent. It changes no task state. Success is {{\"ok\":true,\"seq\":N}}. \
+             {SIGNAL_RETRY}"
+        ),
+        json!({
+            "body": bounded_string(1, crate::serve::agent_endpoint::MAX_OWNER_ALERT_BYTES)
+        }),
+        &["body"],
+    )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubmitWorkArguments {
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubmitReviewArguments {
+    verdict: String,
+    #[serde(default)]
+    blocking: Option<u32>,
+    #[serde(default)]
+    feedback: Option<String>,
+    #[serde(default)]
+    feedback_json: Option<Map<String, Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReactArguments {
+    state: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskNoteArguments {
+    note: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AlertOwnerArguments {
+    body: String,
+}
+
+fn invalid_arguments(message: impl Into<String>) -> CallToolResult {
+    json_result(
+        json!({"code": "invalid_arguments", "message": message.into()}),
+        true,
+    )
+}
+
+/// Decode a signalling tool's arguments against its closed shape. Absent
+/// arguments are an empty object; an unknown or mistyped field is refused here
+/// and never reaches the endpoint.
+fn signal_arguments<T: serde::de::DeserializeOwned>(
+    tool: &str,
+    arguments: Option<Map<String, Value>>,
+) -> std::result::Result<T, CallToolResult> {
+    serde_json::from_value(Value::Object(arguments.unwrap_or_default()))
+        .map_err(|error| invalid_arguments(format!("invalid {tool} arguments: {error}")))
+}
+
+/// The client-side checks `quorum submit` applies to a reviewer verdict. On
+/// success, returns the serialized graph-blocker feedback when there is one.
+fn validate_review(
+    arguments: &SubmitReviewArguments,
+) -> std::result::Result<Option<String>, String> {
+    let verdict = arguments.verdict.as_str();
+    if !matches!(verdict, "approved" | "changes" | "graph-blocker") {
+        return Err("verdict must be 'approved', 'changes', or 'graph-blocker'".into());
+    }
+    if verdict == "graph-blocker" {
+        if arguments.blocking.is_some() || arguments.feedback.is_some() {
+            return Err(
+                "graph-blocker uses only feedback_json, not ordinary review feedback or blocking"
+                    .into(),
+            );
+        }
+        let Some(feedback_json) = arguments.feedback_json.as_ref() else {
+            return Err("verdict graph-blocker requires feedback_json".into());
+        };
+        let raw = Value::Object(feedback_json.clone()).to_string();
+        // The shared validator words its errors for the CLI flag.
+        crate::graph_blocker::parse_feedback(&raw)
+            .map_err(|error| error.replace("--feedback-json", "feedback_json"))?;
+        return Ok(Some(raw));
+    }
+    if arguments.feedback_json.is_some() {
+        return Err("feedback_json requires verdict graph-blocker".into());
+    }
+    if arguments.feedback.is_some() && verdict != "changes" {
+        return Err("feedback requires verdict changes".into());
+    }
+    // The shared validator decides; its own text names CLI flags, so the
+    // refusal restates the rule in this tool's terms instead.
+    crate::verdict::validate(
+        Some(verdict),
+        arguments.blocking,
+        arguments.feedback.as_deref(),
+        true,
+    )
+    .map_err(|_| {
+        "approved requires blocking 0; changes requires blocking >= 1 and non-empty feedback"
+            .to_string()
+    })?;
+    Ok(None)
+}
+
 fn bounded_string(min: usize, max: usize) -> Value {
     json!({"type":"string","minLength":min,"maxLength":max})
 }
@@ -398,9 +645,33 @@ enum EndpointFailure {
 }
 
 impl QuorumServer {
-    async fn inventory(&self) -> std::result::Result<Inventory, McpError> {
+    /// The run capability authorizing one request.
+    ///
+    /// Over HTTP it is read from that request's own `Authorization` header on
+    /// every call and never retained, so two runs sharing one listener cannot
+    /// observe or borrow each other's authority.
+    fn capability(
+        &self,
+        context: &RequestContext<RoleServer>,
+    ) -> std::result::Result<String, McpError> {
+        match &self.authority {
+            Authority::Run(capability) => Ok(capability.clone()),
+            Authority::Bearer => context
+                .extensions
+                .get::<Parts>()
+                .and_then(|parts| bearer_capability(&parts.headers))
+                .map(str::to_owned)
+                .ok_or_else(|| McpError::invalid_request("run authority rejected", None)),
+        }
+    }
+
+    fn is_http(&self) -> bool {
+        matches!(self.authority, Authority::Bearer)
+    }
+
+    async fn inventory(&self, capability: &str) -> std::result::Result<Inventory, McpError> {
         let response = self
-            .exchange(EndpointOperation::Inventory)
+            .exchange(capability, EndpointOperation::Inventory)
             .await
             .map_err(inventory_error)?;
         let EndpointResult::Inventory {
@@ -453,11 +724,12 @@ impl QuorumServer {
 
     async fn exchange(
         &self,
+        capability: &str,
         operation: EndpointOperation,
     ) -> std::result::Result<EndpointResult, EndpointFailure> {
         let request = EndpointRequest {
             version: PROTOCOL_VERSION,
-            capability: &self.capability,
+            capability,
             operation,
         };
         let body = serde_json::to_vec(&request).map_err(|_| EndpointFailure::Unavailable)?;
@@ -514,7 +786,11 @@ impl QuorumServer {
     /// before it connects, so nothing was submitted and repeating the identical
     /// call cannot succeed. That case is reported as `request_too_large` — the
     /// one failure whose remedy is a smaller plan rather than a retry.
-    async fn submit_plan(&self, arguments: Option<Map<String, Value>>) -> CallToolResult {
+    async fn submit_plan(
+        &self,
+        capability: String,
+        arguments: Option<Map<String, Value>>,
+    ) -> CallToolResult {
         let Some(response) = arguments
             .as_ref()
             .and_then(|arguments| arguments.get("response"))
@@ -530,7 +806,6 @@ impl QuorumServer {
             );
         };
         let endpoint = self.endpoint.clone();
-        let capability = self.capability.clone();
         match tokio::task::spawn_blocking(move || {
             crate::agent_client::submit_plan(&endpoint, &capability, &response)
         })
@@ -556,6 +831,155 @@ impl QuorumServer {
                     "code": "transport",
                     "message": "the agent endpoint did not answer; call submit_plan again to \
                                 learn whether the plan was accepted"
+                }),
+                true,
+            ),
+        }
+    }
+
+    /// Route one HTTP signalling tool, or `None` when `name` is not one.
+    ///
+    /// Arguments are checked against the tool's closed shape and the same
+    /// rules the CLI applies; the daemon endpoint then re-validates and is the
+    /// only authority on whether this run may send the signal at all.
+    async fn call_signal(
+        &self,
+        name: &str,
+        capability: String,
+        arguments: Option<Map<String, Value>>,
+    ) -> Option<CallToolResult> {
+        Some(match name {
+            SUBMIT_WORK => {
+                let arguments: SubmitWorkArguments = match signal_arguments(name, arguments) {
+                    Ok(arguments) => arguments,
+                    Err(refusal) => return Some(refusal),
+                };
+                self.signal("mailbox_id", move |endpoint| {
+                    crate::agent_client::submit_at(
+                        endpoint,
+                        crate::agent_client::Submit {
+                            capability: &capability,
+                            summary: arguments.summary.as_deref(),
+                            verdict: None,
+                            feedback: None,
+                            feedback_json: None,
+                            blocking: None,
+                        },
+                    )
+                })
+                .await
+            }
+            SUBMIT_REVIEW => {
+                let arguments: SubmitReviewArguments = match signal_arguments(name, arguments) {
+                    Ok(arguments) => arguments,
+                    Err(refusal) => return Some(refusal),
+                };
+                let feedback_json = match validate_review(&arguments) {
+                    Ok(feedback_json) => feedback_json,
+                    Err(message) => return Some(invalid_arguments(message)),
+                };
+                self.signal("mailbox_id", move |endpoint| {
+                    crate::agent_client::submit_at(
+                        endpoint,
+                        crate::agent_client::Submit {
+                            capability: &capability,
+                            summary: None,
+                            verdict: Some(&arguments.verdict),
+                            feedback: arguments.feedback.as_deref(),
+                            feedback_json: feedback_json.as_deref(),
+                            blocking: arguments.blocking,
+                        },
+                    )
+                })
+                .await
+            }
+            REACT => {
+                let arguments: ReactArguments = match signal_arguments(name, arguments) {
+                    Ok(arguments) => arguments,
+                    Err(refusal) => return Some(refusal),
+                };
+                if !matches!(
+                    arguments.state.as_str(),
+                    "blocked" | "failed" | "needs-info" | "note"
+                ) {
+                    return Some(invalid_arguments(
+                        "state must be 'blocked', 'failed', 'needs-info', or 'note'",
+                    ));
+                }
+                let Ok(reason) = quorum_core::tasks::validate_react_reason(
+                    &arguments.state,
+                    arguments.reason.as_deref(),
+                ) else {
+                    return Some(invalid_arguments(format!(
+                        "blocked and needs-info require a non-empty reason; a reason is at \
+                         most {} bytes with no NUL",
+                        quorum_core::tasks::REACT_REASON_MAX_BYTES
+                    )));
+                };
+                self.signal("mailbox_id", move |endpoint| {
+                    crate::agent_client::react_at(
+                        endpoint,
+                        &capability,
+                        &arguments.state,
+                        reason.as_deref(),
+                    )
+                })
+                .await
+            }
+            TASK_NOTE => {
+                let arguments: TaskNoteArguments = match signal_arguments(name, arguments) {
+                    Ok(arguments) => arguments,
+                    Err(refusal) => return Some(refusal),
+                };
+                self.signal("note_id", move |endpoint| {
+                    crate::agent_client::append_note_at(endpoint, &capability, &arguments.note)
+                })
+                .await
+            }
+            ALERT_OWNER => {
+                let arguments: AlertOwnerArguments = match signal_arguments(name, arguments) {
+                    Ok(arguments) => arguments,
+                    Err(refusal) => return Some(refusal),
+                };
+                self.signal("seq", move |endpoint| {
+                    crate::agent_client::alert_owner_at(endpoint, &capability, &arguments.body)
+                })
+                .await
+            }
+            _ => return None,
+        })
+    }
+
+    /// Send one signalling operation and shape its result. `id_key` names the
+    /// row the daemon wrote. A daemon rejection is relayed verbatim; a request
+    /// too large for one endpoint frame never left this process.
+    async fn signal<F>(&self, id_key: &'static str, send: F) -> CallToolResult
+    where
+        F: FnOnce(&Path) -> Result<SignalOutcome> + Send + 'static,
+    {
+        let endpoint = self.endpoint.clone();
+        match tokio::task::spawn_blocking(move || send(&endpoint)).await {
+            Ok(Ok(SignalOutcome::Accepted(id))) => {
+                let mut result = Map::new();
+                result.insert("ok".into(), Value::Bool(true));
+                result.insert(id_key.into(), Value::from(id));
+                json_result(Value::Object(result), false)
+            }
+            Ok(Ok(SignalOutcome::Rejected { code, message })) => {
+                json_result(json!({"code": code, "message": message}), true)
+            }
+            Ok(Err(QuorumError::Usage(_))) => json_result(
+                json!({
+                    "code": "request_too_large",
+                    "message": "the arguments do not fit one endpoint request; send less text"
+                }),
+                true,
+            ),
+            Ok(Err(_)) | Err(_) => json_result(
+                json!({
+                    "code": "transport",
+                    "message": "the agent endpoint did not answer; whether the signal was \
+                                recorded is unknown"
                 }),
                 true,
             ),
@@ -645,12 +1069,15 @@ fn tool_error(code: &str) -> CallToolResult {
 
 impl ServerHandler for QuorumServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_tool_list_changed()
-                .build(),
-        )
+        let tools = ServerCapabilities::builder().enable_tools();
+        // A stateless HTTP request has no channel for a later notification,
+        // so that transport must not promise `tools/list_changed`.
+        let capabilities = if self.is_http() {
+            tools.build()
+        } else {
+            tools.enable_tool_list_changed().build()
+        };
+        ServerInfo::new(capabilities)
             .with_server_info(Implementation::new("quorum", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Only tools authorized for this exact managed run are exposed. Workers may write only the assigned worktree and repository.",
@@ -660,18 +1087,26 @@ impl ServerHandler for QuorumServer {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, McpError> {
-        let inventory = self.inventory().await?;
-        self.record_advertised_phase(inventory.phase);
-        let planner = inventory.phase == RunPhase::Planner;
+        let capability = self.capability(&context)?;
+        let inventory = self.inventory(&capability).await?;
+        let phase = inventory.phase;
+        // The advertised phase is per-run state, which only the single-run
+        // stdio transport keeps.
+        if !self.is_http() {
+            self.record_advertised_phase(phase);
+        }
         let mut tools: Vec<Tool> = inventory
             .operations
             .into_iter()
             .map(ProtocolOperation::tool)
             .collect();
-        if planner {
+        if phase == RunPhase::Planner {
             tools.push(submit_plan_tool());
+        }
+        if self.is_http() {
+            tools.extend(signal_tools(phase));
         }
         // MCP 2026-07-28 requires `ttlMs` and `cacheScope` on list results;
         // rmcp leaves both unset, and Claude Code then rejects the whole
@@ -685,15 +1120,28 @@ impl ServerHandler for QuorumServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, McpError> {
-        if request.name == SUBMIT_PLAN && self.planner_tool_advertised() {
-            return Ok(self.submit_plan(request.arguments).await.into());
+        let capability = self.capability(&context)?;
+        if self.is_http() {
+            // No per-run state exists to consult here: the daemon endpoint
+            // authorizes each of these calls from the capability alone.
+            if request.name == SUBMIT_PLAN {
+                return Ok(self.submit_plan(capability, request.arguments).await.into());
+            }
+            if let Some(result) = self
+                .call_signal(&request.name, capability.clone(), request.arguments.clone())
+                .await
+            {
+                return Ok(result.into());
+            }
+        } else if request.name == SUBMIT_PLAN && self.planner_tool_advertised() {
+            return Ok(self.submit_plan(capability, request.arguments).await.into());
         }
         let operation = ProtocolOperation::from_name(&request.name)
             .ok_or_else(|| McpError::new(ErrorCode::METHOD_NOT_FOUND, "unknown tool", None))?;
         match self
-            .exchange(EndpointOperation::Protocol { operation })
+            .exchange(&capability, EndpointOperation::Protocol { operation })
             .await
         {
             Ok(_) => Err(McpError::internal_error(
@@ -748,14 +1196,14 @@ impl ServerHandler for QuorumServer {
 /// Keep a persistent provider's cached MCP tool list aligned with the
 /// daemon-derived phase. The endpoint remains the authority for every call;
 /// this only tells clients to rediscover the changed inventory.
-async fn notify_phase_changes(server: QuorumServer, peer: Peer<RoleServer>) {
+async fn notify_phase_changes(server: QuorumServer, capability: String, peer: Peer<RoleServer>) {
     let mut interval = tokio::time::interval(PHASE_POLL_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval.tick().await;
 
     loop {
         interval.tick().await;
-        let Ok(inventory) = server.inventory().await else {
+        let Ok(inventory) = server.inventory(&capability).await else {
             continue;
         };
         if server.phase_changed_since_advertisement(inventory.phase) {
@@ -767,7 +1215,14 @@ async fn notify_phase_changes(server: QuorumServer, peer: Peer<RoleServer>) {
     }
 }
 
-pub fn run() -> Result<()> {
+pub fn run(listen: Option<SocketAddr>) -> Result<()> {
+    match listen {
+        Some(addr) => run_http(addr),
+        None => run_stdio(),
+    }
+}
+
+fn run_stdio() -> Result<()> {
     let endpoint = required_env("QUORUM_AGENT_ENDPOINT", MAX_ENV_BYTES)?;
     let capability = required_env("QUORUM_RUN_ID", MAX_CAPABILITY_BYTES)?;
     let repository = required_env("QUORUM_REPO", 255)?;
@@ -776,7 +1231,7 @@ pub fn run() -> Result<()> {
     let _agent = required_env("QUORUM_AGENT", 128)?;
     let server = QuorumServer {
         endpoint: PathBuf::from(endpoint),
-        capability,
+        authority: Authority::Run(capability.clone()),
         repository,
         advertised_phase: Arc::default(),
     };
@@ -790,7 +1245,11 @@ pub fn run() -> Result<()> {
             .serve(rmcp::transport::stdio())
             .await
             .map_err(|_| QuorumError::Io("agent MCP initialization failed".into()))?;
-        let watcher = tokio::spawn(notify_phase_changes(server, service.peer().clone()));
+        let watcher = tokio::spawn(notify_phase_changes(
+            server,
+            capability,
+            service.peer().clone(),
+        ));
         let result = service
             .waiting()
             .await
@@ -799,6 +1258,115 @@ pub fn run() -> Result<()> {
         watcher.abort();
         result
     })
+}
+
+/// Serve Streamable HTTP MCP on a loopback address until SIGINT or SIGTERM.
+///
+/// The listener holds no run: it needs only the daemon endpoint locator and
+/// the repository identity, and deliberately never reads `QUORUM_RUN_ID`.
+fn run_http(addr: SocketAddr) -> Result<()> {
+    validate_loopback(addr)?;
+    let endpoint = required_env("QUORUM_AGENT_ENDPOINT", MAX_ENV_BYTES)?;
+    let repository = required_env("QUORUM_REPO", 255)?;
+    let server = QuorumServer {
+        endpoint: PathBuf::from(endpoint),
+        authority: Authority::Bearer,
+        repository,
+        advertised_phase: Arc::default(),
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| QuorumError::Io("failed to start agent MCP runtime".into()))?;
+    runtime.block_on(async move {
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .map_err(|e| QuorumError::Io(format!("failed to register SIGINT handler: {e}")))?;
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|e| QuorumError::Io(format!("failed to register SIGTERM handler: {e}")))?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| QuorumError::Io(format!("failed to bind agent MCP listener: {e}")))?;
+        let local = listener
+            .local_addr()
+            .map_err(|e| QuorumError::Io(format!("failed to bind agent MCP listener: {e}")))?;
+        // Stateless: no sessions, no server-initiated stream, one JSON body
+        // per request. The default allowed hosts are the loopback names.
+        let config = StreamableHttpServerConfig::default()
+            .with_legacy_session_mode(false)
+            .with_json_response(true)
+            .with_sse_keep_alive(None)
+            .with_max_request_body_bytes(MAX_HTTP_BODY_BYTES);
+        let cancel = config.cancellation_token.clone();
+        let service = StreamableHttpService::new(
+            move || Ok(server.clone()),
+            Arc::new(NeverSessionManager::default()),
+            config,
+        );
+        let app = axum::Router::new()
+            .route_service(HTTP_MCP_PATH, service)
+            .layer(axum::middleware::from_fn(require_bearer));
+        // The one line a launcher needs to learn a port-0 bind.
+        eprintln!("quorum agent-mcp listening on http://{local}{HTTP_MCP_PATH}");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                tokio::select! {
+                    _ = sigint.recv() => {}
+                    _ = sigterm.recv() => {}
+                }
+                cancel.cancel();
+            })
+            .await
+            .map_err(|_| QuorumError::Io("agent MCP service failed".into()))
+    })
+}
+
+fn validate_loopback(addr: SocketAddr) -> Result<()> {
+    if addr.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(QuorumError::Usage(
+        "agent-mcp --listen is loopback-only; it serves plain HTTP authorized by run capability"
+            .into(),
+    ))
+}
+
+/// The run capability carried by exactly one well-formed
+/// `Authorization: Bearer <run id>` header, or `None`. The shape rules are the
+/// endpoint's own plus no whitespace, so a malformed credential is refused
+/// here without being forwarded, stored, or echoed.
+fn bearer_capability(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let (scheme, capability) = value.to_str().ok()?.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer")
+        || capability.is_empty()
+        || capability.len() > MAX_CAPABILITY_BYTES
+        || capability
+            .chars()
+            .any(|character| character == '\0' || character.is_whitespace())
+    {
+        return None;
+    }
+    Some(capability)
+}
+
+/// Refuse a request without a well-formed bearer before it reaches MCP.
+async fn require_bearer(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if bearer_capability(request.headers()).is_none() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            "Unauthorized",
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 fn required_env(name: &str, max_bytes: usize) -> Result<String> {
@@ -820,7 +1388,7 @@ mod tests {
     fn delayed_watcher_snapshot_detects_change_after_tools_list() {
         let server = QuorumServer {
             endpoint: PathBuf::from("/tmp/agent-endpoint"),
-            capability: "run-capability".into(),
+            authority: Authority::Run("run-capability".into()),
             repository: "owner/repository".into(),
             advertised_phase: Arc::default(),
         };
