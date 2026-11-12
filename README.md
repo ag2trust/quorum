@@ -426,11 +426,16 @@ This is a non-binding view of ongoing directions, not a release schedule:
   a loopback host), `QUORUM_INFERENCE_ALLOWED_MODELS` and `QUORUM_INFERENCE_ALLOWED_BETAS`
   (comma-separated; unset allows any model and no `anthropic-beta` value),
   `QUORUM_INFERENCE_RUN_TOKEN_CAP` (input plus output tokens per run, then 429), and
-  `QUORUM_INFERENCE_UPSTREAM_TIMEOUT_SECS` (default 300). Token counts are kept in the
-  forwarder's memory, so they outlive a daemon restart and reset when the forwarder
-  restarts; the cap is checked when a request arrives, so a request already in flight can
-  overshoot it. Nothing starts the forwarder automatically, and its logs carry metadata
-  only.
+  `QUORUM_INFERENCE_UPSTREAM_TIMEOUT_SECS` (default 300). Every `/v1/messages` request
+  must state `max_tokens`. With a cap set, a request is admitted only if the run's
+  remaining allowance covers `max_tokens` plus an input estimate of one token per two
+  body bytes; that amount is held while the request is in flight, so concurrent requests
+  cannot pass the cap together, and is replaced by the upstream's reported usage when the
+  response completes. A response that ends without final usage (the caller hung up, the
+  stream broke, the upstream went silent after the request was sent) is charged the whole
+  hold. Token counts are kept in the forwarder's memory, so they outlive a daemon restart
+  and reset when the forwarder restarts. Nothing starts the forwarder automatically, and
+  its logs carry metadata only.
 
 ## Working on Quorum
 

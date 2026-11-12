@@ -198,6 +198,17 @@ fn serve_upstream(
             thread::sleep(Duration::from_secs(20));
         }
         "model-slow" => thread::sleep(Duration::from_secs(20)),
+        "model-held" => {
+            // Stay in flight until the test lets this request finish.
+            let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(20));
+            respond(
+                &mut stream,
+                "200 OK",
+                &json!({"id": "msg_1", "type": "message", "role": "assistant",
+                        "content": [{"type": "text", "text": COMPLETION}],
+                        "usage": {"input_tokens": 10, "output_tokens": 5}}),
+            );
+        }
         "model-refused-key" => respond(
             &mut stream,
             "401 Unauthorized",
@@ -475,6 +486,16 @@ fn message(model: &str) -> Value {
     })
 }
 
+/// What the forwarder holds against a run while this request is in flight:
+/// one input token per two body bytes, plus the request's `max_tokens`.
+fn hold(body: &Value) -> u64 {
+    (body.to_string().len() as u64).div_ceil(2) + body["max_tokens"].as_u64().unwrap()
+}
+
+fn cap_env(cap: u64) -> String {
+    cap.to_string()
+}
+
 fn post(addr: SocketAddr, run: &str, body: &Value) -> Reply {
     send(
         addr,
@@ -734,6 +755,8 @@ fn requests_outside_the_policy_get_400_and_nothing_is_forwarded() {
         ),
         (message("model-other"), "model model-other is not allowed"),
         (with("model", json!(null)), "model must be"),
+        (with("max_tokens", json!(null)), "max_tokens must be"),
+        (with("max_tokens", json!(2_000_000)), "max_tokens must be"),
         (json!([message("model-json")]), "must be a JSON object"),
     ] {
         let reply = post(addr, "run-a", &body);
@@ -796,12 +819,16 @@ fn requests_outside_the_policy_get_400_and_nothing_is_forwarded() {
 fn a_run_over_its_token_cap_gets_429_until_the_forwarder_restarts() {
     let endpoint = FakeEndpoint::start(&["run-a", "run-b"]);
     let upstream = FakeUpstream::start();
-    let env = [("QUORUM_INFERENCE_RUN_TOKEN_CAP", "40")];
+    // The run will use 15 tokens whole, then 30 streamed (7 + 3 input, 20
+    // output). The cap is one token short of covering a further request's
+    // hold on top of those 45.
+    let cap = cap_env(45 + hold(&message("model-json")) - 1);
+    let env = [("QUORUM_INFERENCE_RUN_TOKEN_CAP", cap.as_str())];
     let forwarder = Forwarder::start(&endpoint.path, &upstream.url(), &env);
     let addr = forwarder.addr;
 
-    // 15 tokens whole, then 30 streamed (7 + 3 input, 20 output): 45 >= 40.
-    // The request that crosses the cap completes; the next is refused.
+    // Each request is admitted because its hold fits, and is then charged
+    // only what the upstream reports: holds are reconciled, not kept.
     assert_eq!(post(addr, "run-a", &message("model-json")).status, 200);
     // Token counting is free upstream and is not charged here.
     for _ in 0..3 {
@@ -866,10 +893,11 @@ fn a_run_over_its_token_cap_gets_429_until_the_forwarder_restarts() {
 fn a_streamed_response_is_passed_through_as_it_arrives_and_is_counted() {
     let endpoint = FakeEndpoint::start(&["run-a"]);
     let upstream = FakeUpstream::start();
+    let cap = cap_env(30 + hold(&message("model-json")) - 1);
     let forwarder = Forwarder::start(
         &endpoint.path,
         &upstream.url(),
-        &[("QUORUM_INFERENCE_RUN_TOKEN_CAP", "30")],
+        &[("QUORUM_INFERENCE_RUN_TOKEN_CAP", &cap)],
     );
     let addr = forwarder.addr;
     let mut body = message("model-gated-stream");
@@ -914,7 +942,8 @@ fn a_streamed_response_is_passed_through_as_it_arrives_and_is_counted() {
     }
     assert!(!received.contains(UPSTREAM_KEY));
 
-    // Streamed usage (10 input + 20 output) reached the cap of 30.
+    // The stream's closing usage (10 input + 20 output) replaced its hold,
+    // leaving one token too few for another request.
     assert_eq!(post(addr, "run-a", &message("model-json")).status, 429);
     let logs = forwarder.stop();
     assert!(
@@ -929,9 +958,14 @@ fn a_streamed_response_is_passed_through_as_it_arrives_and_is_counted() {
 fn upstream_failures_are_bounded_and_never_expose_the_credential() {
     let endpoint = FakeEndpoint::start(&["run-a"]);
     let upstream = FakeUpstream::start();
+    // Room for the two requests below whose outcome stays unknown, each
+    // charged its hold, and one token short of a request after them.
+    let slow_hold = hold(&message("model-slow"));
+    let stalled_hold = 10 + 64;
+    let cap = cap_env(slow_hold + stalled_hold + hold(&message("model-json")) - 1);
     let env = [
         ("QUORUM_INFERENCE_UPSTREAM_TIMEOUT_SECS", "1"),
-        ("QUORUM_INFERENCE_RUN_TOKEN_CAP", "10"),
+        ("QUORUM_INFERENCE_RUN_TOKEN_CAP", cap.as_str()),
     ];
     let forwarder = Forwarder::start(&endpoint.path, &upstream.url(), &env);
     let addr = forwarder.addr;
@@ -962,8 +996,9 @@ fn upstream_failures_are_bounded_and_never_expose_the_credential() {
     assert_eq!(reply.status, 529);
     assert_eq!(reply.json()["error"]["type"], "overloaded_error");
 
-    // A stream that stalls is ended with an error event at the bound, and
-    // the usage it had already reported (10 input, 1 output) is kept.
+    // A stream that stalls is ended with an error event at the bound. It
+    // never reported closing usage, so it is charged its reported input (10)
+    // plus its whole max_tokens (64).
     let started = Instant::now();
     let reply = post(addr, "run-a", &message("model-stalled-stream"));
     assert_eq!(reply.status, 200);
@@ -980,7 +1015,22 @@ fn upstream_failures_are_bounded_and_never_expose_the_credential() {
         started.elapsed()
     );
     assert_eq!(post(addr, "run-a", &message("model-json")).status, 429);
-    forwarder.stop();
+    let logs = forwarder.stop();
+    // The request the upstream never answered was sent, so its hold is kept;
+    // the upstream's error responses cost nothing.
+    let total = |model: &str| {
+        let line = logs
+            .iter()
+            .find(|line| line.contains(&format!("model={model} ")))
+            .unwrap_or_else(|| panic!("no log line for {model}: {logs:?}"));
+        line.rsplit_once("run_total_tokens=").unwrap().1.to_string()
+    };
+    assert_eq!(total("model-slow"), slow_hold.to_string());
+    assert_eq!(total("model-overloaded"), slow_hold.to_string());
+    assert_eq!(
+        total("model-stalled-stream"),
+        (slow_hold + stalled_hold).to_string()
+    );
 
     // No upstream listening at all: a clean 502.
     let closed = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1000,6 +1050,115 @@ fn upstream_failures_are_bounded_and_never_expose_the_credential() {
     assert_eq!(reply.status, 503, "{}", reply.body);
     assert_eq!(upstream.seen().len(), forwarded);
     forwarder.stop();
+}
+
+#[test]
+fn a_stream_the_caller_abandons_is_charged_its_whole_hold() {
+    let endpoint = FakeEndpoint::start(&["run-a"]);
+    let upstream = FakeUpstream::start();
+    let mut body = message("model-gated-stream");
+    body["stream"] = json!(true);
+    // The upstream reports 10 input tokens before the caller leaves and
+    // would report 20 output tokens at the end. Charging only what was seen
+    // (11) would leave room for another request; charging the reported input
+    // plus the whole max_tokens (74) leaves one token too few.
+    let abandoned = 10 + 64;
+    let cap = cap_env((abandoned + hold(&message("model-json")) - 1).max(hold(&body)));
+    let forwarder = Forwarder::start(
+        &endpoint.path,
+        &upstream.url(),
+        &[("QUORUM_INFERENCE_RUN_TOKEN_CAP", &cap)],
+    );
+    let addr = forwarder.addr;
+    let body = body.to_string();
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "POST /v1/messages HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         x-api-key: run-a\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut received = String::new();
+    let mut buffer = [0_u8; 4096];
+    while !received.contains("message_start") {
+        let read = stream.read(&mut buffer).unwrap();
+        assert!(read > 0, "stream closed early: {received:?}");
+        received.push_str(std::str::from_utf8(&buffer[..read]).unwrap());
+    }
+    // Hang up before any closing usage, then let the upstream finish.
+    drop(stream);
+    upstream.release.send(()).unwrap();
+    thread::sleep(Duration::from_millis(1500));
+
+    assert_eq!(post(addr, "run-a", &message("model-json")).status, 429);
+    assert_eq!(upstream.seen().len(), 1);
+    let logs = forwarder.stop();
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("model=model-gated-stream")
+                && line.ends_with(&format!("run_total_tokens={abandoned}"))),
+        "{logs:?}"
+    );
+}
+
+#[test]
+fn concurrent_requests_cannot_together_exceed_the_cap() {
+    let endpoint = FakeEndpoint::start(&["run-a"]);
+    let upstream = FakeUpstream::start();
+    let body = message("model-held");
+    // Room for exactly two requests in flight.
+    let cap = cap_env(2 * hold(&body));
+    let forwarder = Forwarder::start(
+        &endpoint.path,
+        &upstream.url(),
+        &[("QUORUM_INFERENCE_RUN_TOKEN_CAP", &cap)],
+    );
+    let addr = forwarder.addr;
+
+    // Eight requests at once, none of which the upstream answers yet.
+    let (sender, results) = mpsc::channel();
+    for _ in 0..8 {
+        let sender = sender.clone();
+        let body = body.clone();
+        thread::spawn(move || {
+            let _ = sender.send(post(addr, "run-a", &body).status);
+        });
+    }
+    // Six are refused while the two admitted ones are still in flight and
+    // have reported no usage at all.
+    for _ in 0..6 {
+        let status = results.recv_timeout(Duration::from_secs(15)).unwrap();
+        assert_eq!(status, 429);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while upstream.seen().len() < 2 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(results.recv_timeout(Duration::from_millis(300)).is_err());
+    assert_eq!(upstream.seen().len(), 2);
+
+    for _ in 0..2 {
+        upstream.release.send(()).unwrap();
+    }
+    for _ in 0..2 {
+        let status = results.recv_timeout(Duration::from_secs(15)).unwrap();
+        assert_eq!(status, 200);
+    }
+    // Both holds were reconciled to the 15 tokens each request really used,
+    // so the run can go on: 30 used, and another request's hold fits.
+    assert_eq!(post(addr, "run-a", &message("model-json")).status, 200);
+    assert_eq!(upstream.seen().len(), 3);
+    let logs = forwarder.stop();
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("model=model-json") && line.ends_with("run_total_tokens=45")),
+        "{logs:?}"
+    );
 }
 
 /// A raw request on its own connection; `None` when the server closed or
@@ -1330,10 +1489,12 @@ fn run_authority_comes_from_the_real_daemon_endpoint() {
     let (daemon, db) = Daemon::start(root.path());
     install_runs(&db);
     let upstream = FakeUpstream::start();
+    // Two 15-token requests fit; a third request's hold does not.
+    let cap = cap_env(30 + hold(&message("model-json")) - 1);
     let forwarder = Forwarder::start(
         &endpoint_path(&db),
         &upstream.url(),
-        &[("QUORUM_INFERENCE_RUN_TOKEN_CAP", "20")],
+        &[("QUORUM_INFERENCE_RUN_TOKEN_CAP", &cap)],
     );
     let addr = forwarder.addr;
 

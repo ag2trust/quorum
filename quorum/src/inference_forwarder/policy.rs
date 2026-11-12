@@ -23,10 +23,16 @@ pub(super) struct Policy {
     pub(super) allowed_betas: Vec<String>,
 }
 
+/// Largest `max_tokens` a request may ask for. It bounds what one request
+/// can reserve from a run's allowance.
+const MAX_OUTPUT_TOKENS: u64 = 1_000_000;
+
 /// The parts of an admitted request the forwarder needs afterwards.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Admitted {
     pub(super) model: String,
+    /// The request's output ceiling; `None` only where it was not required.
+    pub(super) max_tokens: Option<u64>,
 }
 
 /// Printable, bounded form of a caller-supplied identifier for an error
@@ -50,8 +56,10 @@ pub(super) fn printable(value: &str) -> String {
 }
 
 impl Policy {
-    /// Admit or refuse one parsed request body.
-    pub(super) fn admit(&self, body: &Value) -> Result<Admitted, String> {
+    /// Admit or refuse one parsed request body. A request that generates
+    /// output must state a bounded `max_tokens`: it is what the run's token
+    /// allowance is held against while the request is in flight.
+    pub(super) fn admit(&self, body: &Value, generates: bool) -> Result<Admitted, String> {
         let body = body
             .as_object()
             .ok_or_else(|| "request body must be a JSON object".to_string())?;
@@ -60,6 +68,15 @@ impl Policy {
             _ => return Err("model must be a non-empty string".into()),
         };
         self.check_model(&model)?;
+        let max_tokens = match body.get("max_tokens").map(Value::as_u64) {
+            Some(Some(max_tokens)) if max_tokens <= MAX_OUTPUT_TOKENS => Some(max_tokens),
+            None if !generates => None,
+            _ => {
+                return Err(format!(
+                    "max_tokens must be an integer from 0 to {MAX_OUTPUT_TOKENS}"
+                ))
+            }
+        };
         for field in ["mcp_servers", "container"] {
             if body.contains_key(field) {
                 return Err(format!("{field} is not available through this forwarder"));
@@ -81,7 +98,7 @@ impl Policy {
             }
             Some(_) => return Err("messages must be an array".into()),
         }
-        Ok(Admitted { model })
+        Ok(Admitted { model, max_tokens })
     }
 
     fn check_model(&self, model: &str) -> Result<(), String> {
@@ -242,19 +259,19 @@ mod tests {
     }
 
     fn refused(body: &Value) -> String {
-        Policy::default().admit(body).unwrap_err()
+        Policy::default().admit(body, true).unwrap_err()
     }
 
     #[test]
     fn plain_requests_and_custom_tools_are_admitted() {
         let policy = Policy::default();
-        assert_eq!(policy.admit(&base()).unwrap().model, "model-a");
+        assert_eq!(policy.admit(&base(), true).unwrap().model, "model-a");
         let tools = json!([
             {"name": "read", "description": "d", "input_schema": {"type": "object"},
              "cache_control": {"type": "ephemeral"}},
             {"type": "custom", "name": "write", "input_schema": {"type": "object"}}
         ]);
-        policy.admit(&with("tools", tools)).unwrap();
+        policy.admit(&with("tools", tools), true).unwrap();
         // Inline sources, tool results, and cache breakpoints are ordinary.
         let messages = json!([
             {"role": "user", "content": [
@@ -272,9 +289,12 @@ mod tests {
                 {"type": "tool_result", "tool_use_id": "t1", "content": [{"type": "text", "text": "ok"}]}
             ]}
         ]);
-        policy.admit(&with("messages", messages)).unwrap();
+        policy.admit(&with("messages", messages), true).unwrap();
         policy
-            .admit(&with("system", json!([{"type": "text", "text": "s"}])))
+            .admit(
+                &with("system", json!([{"type": "text", "text": "s"}])),
+                true,
+            )
             .unwrap();
     }
 
@@ -362,21 +382,52 @@ mod tests {
             allowed_models: Some(vec!["model-a".into()]),
             ..Policy::default()
         };
-        policy.admit(&base()).unwrap();
+        policy.admit(&base(), true).unwrap();
         let message = policy
-            .admit(&with("model", json!("model-b\n\"x")))
+            .admit(&with("model", json!("model-b\n\"x")), true)
             .unwrap_err();
         assert_eq!(message, "model model-b??x is not allowed by this forwarder");
         policy
-            .admit(&with("fallbacks", json!([{"model": "model-a"}])))
+            .admit(&with("fallbacks", json!([{"model": "model-a"}])), true)
             .unwrap();
         for fallbacks in [json!([{"model": "model-b"}]), json!("default"), json!([{}])] {
-            policy.admit(&with("fallbacks", fallbacks)).unwrap_err();
+            policy
+                .admit(&with("fallbacks", fallbacks), true)
+                .unwrap_err();
         }
         // Without a model allowlist, fallbacks are the upstream's business.
         Policy::default()
-            .admit(&with("fallbacks", json!("default")))
+            .admit(&with("fallbacks", json!("default")), true)
             .unwrap();
+    }
+
+    #[test]
+    fn generating_requests_must_state_a_bounded_max_tokens() {
+        let policy = Policy::default();
+        assert_eq!(policy.admit(&base(), true).unwrap().max_tokens, Some(16));
+        for max_tokens in [0, MAX_OUTPUT_TOKENS] {
+            let admitted = policy.admit(&with("max_tokens", json!(max_tokens)), true);
+            assert_eq!(admitted.unwrap().max_tokens, Some(max_tokens));
+        }
+        let mut missing = base();
+        missing.as_object_mut().unwrap().remove("max_tokens");
+        for body in [
+            missing.clone(),
+            with("max_tokens", json!(MAX_OUTPUT_TOKENS + 1)),
+            with("max_tokens", json!(u64::MAX)),
+            with("max_tokens", json!(-1)),
+            with("max_tokens", json!(1.5)),
+            with("max_tokens", json!("16")),
+            with("max_tokens", json!(null)),
+        ] {
+            let message = policy.admit(&body, true).unwrap_err();
+            assert!(message.starts_with("max_tokens must be"), "{message}");
+        }
+        // Token counting generates nothing and takes no max_tokens.
+        assert_eq!(policy.admit(&missing, false).unwrap().max_tokens, None);
+        policy
+            .admit(&with("max_tokens", json!("16")), false)
+            .unwrap_err();
     }
 
     #[test]

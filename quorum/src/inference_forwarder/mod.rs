@@ -33,7 +33,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 use tokio_rustls::rustls;
-use usage::{Admission, Counts, Ledger, Meter};
+use usage::{Admission, Counts, Ledger, Meter, Reservation};
 
 const PROTOCOL_VERSION: u8 = 1;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -185,7 +185,7 @@ struct Forwarder {
     credential: HeaderValue,
     policy: Policy,
     upstream_timeout: Duration,
-    ledger: Ledger,
+    ledger: Arc<Ledger>,
     endpoint_slots: tokio::sync::Semaphore,
     tls: Option<tokio_rustls::TlsConnector>,
 }
@@ -577,7 +577,7 @@ async fn handle(forwarder: Arc<Forwarder>, request: Request<Body>) -> Response {
         return invalid(&log, "request body must be valid JSON");
     };
     drop(bytes);
-    let admitted = match forwarder.policy.admit(&value) {
+    let admitted = match forwarder.policy.admit(&value, route == Route::Messages) {
         Ok(admitted) => admitted,
         Err(message) => return invalid(&log, &message),
     };
@@ -615,31 +615,88 @@ async fn handle(forwarder: Arc<Forwarder>, request: Request<Body>) -> Response {
         return invalid(&log, "request body must be valid JSON");
     };
     drop(value);
+
+    // Hold the most this request could cost before anything is sent. Token
+    // counting generates nothing and is not charged.
+    let charge = match (route, admitted.max_tokens) {
+        (Route::Messages, Some(max_tokens)) => {
+            let hold = usage::estimated_input_tokens(outbound.len()).saturating_add(max_tokens);
+            match forwarder.ledger.reserve(capability, hold) {
+                Some(reservation) => Some(Charge {
+                    reservation,
+                    max_tokens,
+                }),
+                None => {
+                    return log.refuse(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "rate_limit_error",
+                        "this run's remaining token allowance cannot cover this request's \
+                         max_tokens plus its estimated input",
+                    )
+                }
+            }
+        }
+        _ => None,
+    };
     let response = match forwarder
         .send(route, outbound, api_version, betas.as_deref())
         .await
     {
         Ok(response) => response,
         Err(failure) => {
-            let (status, message) = match failure {
-                UpstreamFailure::Unreachable => {
-                    (StatusCode::BAD_GATEWAY, "upstream could not be reached")
-                }
+            let (status, message, sent) = match failure {
+                UpstreamFailure::Unreachable => (
+                    StatusCode::BAD_GATEWAY,
+                    "upstream could not be reached",
+                    false,
+                ),
+                UpstreamFailure::ConnectTimedOut => (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "upstream could not be reached in time",
+                    false,
+                ),
+                UpstreamFailure::Lost => (
+                    StatusCode::BAD_GATEWAY,
+                    "upstream closed without answering",
+                    true,
+                ),
                 UpstreamFailure::TimedOut => (
                     StatusCode::GATEWAY_TIMEOUT,
                     "upstream did not answer in time",
+                    true,
                 ),
             };
-            log.emit(status.as_u16(), Counts::default(), None);
+            // A request that was sent may still be served and billed, so its
+            // hold is charged; one that never left costs nothing.
+            let run_total = charge.map(|charge| {
+                if sent {
+                    charge.reservation.keep()
+                } else {
+                    charge.reservation.release()
+                }
+            });
+            log.emit(status.as_u16(), Counts::default(), run_total);
             return error_response(status, "api_error", message, true);
         }
     };
-    forwarder.relay(response, capability, log).await
+    forwarder.relay(response, charge, log).await
+}
+
+/// The hold one generating request has on its run's allowance.
+struct Charge {
+    reservation: Reservation,
+    max_tokens: u64,
 }
 
 #[derive(Debug)]
 enum UpstreamFailure {
+    /// No connection was made; nothing was sent.
     Unreachable,
+    /// Connecting took too long; nothing was sent.
+    ConnectTimedOut,
+    /// The request was sent and the connection ended without a response.
+    Lost,
+    /// The request was sent and no response head arrived in time.
     TimedOut,
 }
 
@@ -690,7 +747,7 @@ impl Forwarder {
         };
         let connection = tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, connect)
             .await
-            .map_err(|_| UpstreamFailure::TimedOut)??;
+            .map_err(|_| UpstreamFailure::ConnectTimedOut)??;
         let exchange = async {
             match connection {
                 Connection::Plain(stream) => exchange(stream, request).await,
@@ -702,17 +759,16 @@ impl Forwarder {
             .map_err(|_| UpstreamFailure::TimedOut)?
     }
 
-    /// Turn the upstream's response into the caller's, counting its usage
-    /// against the run.
+    /// Turn the upstream's response into the caller's, reconciling the
+    /// request's hold with the usage the upstream reports.
     async fn relay(
-        self: Arc<Self>,
+        &self,
         response: hyper::Response<Incoming>,
-        capability: &str,
+        charge: Option<Charge>,
         log: RequestLog,
     ) -> Response {
         let (parts, body) = response.into_parts();
         let status = parts.status;
-        let counted = log.route == Route::Messages && status.is_success();
         let content_type = parts.headers.get(header::CONTENT_TYPE).cloned();
         let is_event_stream = content_type
             .as_ref()
@@ -730,33 +786,47 @@ impl Forwarder {
             }
         }
 
-        if counted && is_event_stream {
-            relayed
-                .headers_mut()
-                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-            *relayed.body_mut() = Body::new(MeteredStream {
-                inner: Some(body),
-                idle: Box::pin(tokio::time::sleep(self.upstream_timeout)),
-                deadline: Box::pin(tokio::time::sleep(MAX_STREAM_DURATION)),
-                idle_timeout: self.upstream_timeout,
-                meter: Meter::default(),
-                run_total: None,
-                forwarder: Arc::clone(&self),
-                capability: capability.to_string(),
-                log,
-            });
-            return relayed;
-        }
+        // An error status means the upstream did no billable work.
+        let mut run_total = None;
+        let charge = match charge {
+            Some(charge) if !status.is_success() => {
+                run_total = Some(charge.reservation.release());
+                None
+            }
+            charge => charge,
+        };
+        let charge = match charge {
+            Some(charge) if is_event_stream => {
+                relayed
+                    .headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+                *relayed.body_mut() = Body::new(MeteredStream {
+                    inner: Some(body),
+                    idle: Box::pin(tokio::time::sleep(self.upstream_timeout)),
+                    deadline: Box::pin(tokio::time::sleep(MAX_STREAM_DURATION)),
+                    idle_timeout: self.upstream_timeout,
+                    meter: Meter::default(),
+                    charge: Some(charge),
+                    log,
+                });
+                return relayed;
+            }
+            charge => charge,
+        };
 
+        // From here a dropped `charge` keeps its whole hold, which is right
+        // for every way a successful response can fail to report its usage.
         let read = tokio::time::timeout(
             self.upstream_timeout,
             read_limited(body, MAX_BUFFERED_RESPONSE_BYTES),
         )
         .await;
+        let keep =
+            |charge: Option<Charge>| charge.map(|charge| charge.reservation.keep()).or(run_total);
         let bytes = match read {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(_)) => {
-                log.emit(502, Counts::default(), None);
+                log.emit(502, Counts::default(), keep(charge));
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
@@ -765,7 +835,7 @@ impl Forwarder {
                 );
             }
             Err(_) => {
-                log.emit(504, Counts::default(), None);
+                log.emit(504, Counts::default(), keep(charge));
                 return error_response(
                     StatusCode::GATEWAY_TIMEOUT,
                     "api_error",
@@ -780,7 +850,7 @@ impl Forwarder {
         if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
             || usage::contains(&bytes, self.credential.as_bytes())
         {
-            log.emit(502, Counts::default(), None);
+            log.emit(502, Counts::default(), keep(charge));
             return refusal(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
@@ -788,14 +858,21 @@ impl Forwarder {
             );
         }
         let mut meter = Meter::default();
-        let mut run_total = None;
-        if counted {
-            let reported = serde_json::from_slice::<Value>(&bytes)
+        let settled = charge.map(|charge| {
+            if let Some(usage) = serde_json::from_slice::<Value>(&bytes)
                 .ok()
-                .and_then(|value| value.get("usage").map(|usage| meter.observe(usage)));
-            run_total = Some(self.ledger.charge(capability, reported.unwrap_or(0)));
-        }
-        log.emit(status.as_u16(), meter.counts(), run_total);
+                .as_ref()
+                .and_then(|value| value.get("usage"))
+            {
+                meter.observe_final(usage);
+            }
+            if meter.final_seen() {
+                charge.reservation.settle(meter.counts().total())
+            } else {
+                charge.reservation.keep()
+            }
+        });
+        log.emit(status.as_u16(), meter.counts(), settled.or(run_total));
         *relayed.body_mut() = Body::from(bytes);
         relayed
     }
@@ -824,7 +901,7 @@ where
     sender
         .send_request(request)
         .await
-        .map_err(|_| UpstreamFailure::Unreachable)
+        .map_err(|_| UpstreamFailure::Lost)
 }
 
 /// A streamed upstream response passed through chunk by chunk as it arrives,
@@ -836,9 +913,8 @@ struct MeteredStream {
     deadline: Pin<Box<tokio::time::Sleep>>,
     idle_timeout: Duration,
     meter: Meter,
-    run_total: Option<u64>,
-    forwarder: Arc<Forwarder>,
-    capability: String,
+    /// Held until the stream is dropped, however it ends.
+    charge: Option<Charge>,
     log: RequestLog,
 }
 
@@ -869,9 +945,17 @@ impl HttpBody for MeteredStream {
                     cx.waker().wake_by_ref();
                     return Poll::Pending;
                 };
-                let reported = this.meter.feed_events(&data);
-                if reported > 0 {
-                    this.run_total = Some(this.forwarder.ledger.charge(&this.capability, reported));
+                if this.meter.feed_events(&data) && this.meter.input_known() {
+                    // The real input replaces its estimate; output is still
+                    // held at its ceiling until the closing usage arrives.
+                    if let Some(charge) = this.charge.as_mut() {
+                        let counts = this.meter.counts();
+                        charge.reservation.hold(
+                            counts
+                                .input_total()
+                                .saturating_add(counts.output_total().max(charge.max_tokens)),
+                        );
+                    }
                 }
                 this.idle
                     .as_mut()
@@ -898,7 +982,16 @@ impl HttpBody for MeteredStream {
 impl Drop for MeteredStream {
     fn drop(&mut self) {
         // Runs whether the stream completed, failed, or the caller hung up.
-        self.log.emit(200, self.meter.counts(), self.run_total);
+        // Only a stream that delivered its closing usage is charged what it
+        // used; any other ending is charged the hold.
+        let run_total = self.charge.take().map(|charge| {
+            if self.meter.final_seen() {
+                charge.reservation.settle(self.meter.counts().total())
+            } else {
+                charge.reservation.keep()
+            }
+        });
+        self.log.emit(200, self.meter.counts(), run_total);
     }
 }
 
@@ -997,7 +1090,7 @@ impl Forwarder {
                 allowed_betas: list_env("QUORUM_INFERENCE_ALLOWED_BETAS")?.unwrap_or_default(),
             },
             upstream_timeout: Duration::from_secs(timeout),
-            ledger: Ledger::new(cap, MAX_TRACKED_RUNS),
+            ledger: Arc::new(Ledger::new(cap, MAX_TRACKED_RUNS)),
             endpoint_slots: tokio::sync::Semaphore::new(MAX_ENDPOINT_EXCHANGES),
             tls,
         })
