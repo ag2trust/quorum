@@ -90,7 +90,10 @@ ordinary shell commands. Managed PR collaboration additionally uses a credential
 process; persistent providers retain that MCP process across their stdin-fed turns. It writes
 bounded, run-authorized GitHub operation requests through a narrow local daemon endpoint, and the
 daemon alone writes SQLite and performs the remote operation. The MCP process never receives the
-Quorum database, GitHub credentials, or lifecycle authority.
+Quorum database, GitHub credentials, or lifecycle authority. An operator may instead run the
+same adapter with `--listen` as a loopback-only Streamable HTTP server authorized per request by
+the run capability; nothing launches it automatically (see the GitHub collaboration MCP
+technical spec).
 
 For contained runs, the same local endpoint carries the existing run-scoped `submit` and `react`
 signals and the closed established public-command family, so those commands need neither a

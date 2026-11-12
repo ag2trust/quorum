@@ -149,7 +149,9 @@ from a cached old turn from being reinterpreted under a new attempt that happens
 live capability. Public CLI requests are not attempt-scoped and use the compatibility path below.
 
 The initial endpoint is a local framed-JSON IPC channel, implemented as an owner-only Unix-domain
-socket on supported runtimes. It does not listen on TCP. Each bounded request carries the run
+socket on supported runtimes. The daemon endpoint itself does not listen on TCP; the separate
+`quorum agent-mcp --listen` adapter described below is the only TCP listener, and it is a client
+of this socket. Each bounded request carries the run
 capability and one closed operation; responses use closed bounded schemas. The daemon exposes
 the existing `submit`/`react` signals, the role-scoped MCP operations, and the established public
 CLI compatibility family through this channel—no SQL, daemon filesystem path, arbitrary command,
@@ -186,6 +188,26 @@ child retains this same MCP process and connection across its stdin-fed turns; p
 respawn per turn receive a new process. The endpoint is not a Repository Service or arbitrary
 database channel. Stdout is protocol-only; bounded diagnostics go to stderr and never include
 request bodies, responses, or capabilities.
+
+`quorum agent-mcp --listen <SOCKETADDR>` runs the same adapter as a separate Streamable HTTP
+server at `/mcp` instead of stdio. It is not part of the daemon and nothing launches it
+automatically: an operator starts it with `QUORUM_AGENT_ENDPOINT` and `QUORUM_REPO`, and it
+reaches the daemon only through the endpoint socket. Its limits are:
+
+- Loopback addresses only, plain HTTP. A non-loopback address is a usage error.
+- The run capability is the `Authorization: Bearer <run id>` header of each request. A missing or
+  malformed header is answered `401` before MCP runs. The capability is read per request, never
+  stored, and the daemon endpoint authorizes every call from it exactly as it does over stdio.
+- Stateless: no sessions, no server-initiated stream, and therefore no
+  `notifications/tools/list_changed`. A client learns a phase change by listing tools again.
+- In addition to the stdio inventory it advertises signalling tools by run phase: `submit_work`,
+  `react`, and `task_note` to a worker; `submit_review`, `task_note`, and `alert_owner` to a
+  reviewer. They proxy the endpoint's `Submit`, `React`, `AppendNote`, and `AlertOwner` operations.
+  `AlertOwner` writes one critical feed message to the owner as the reviewer capability's agent.
+  None is idempotent: each accepted call writes another row.
+- The role-scoped GitHub operations remain unimplemented on this transport as on stdio.
+- Worker and reviewer prompts still instruct the shell commands, and managed launches still
+  inject the stdio server; this transport changes neither.
 
 The logical MCP server name is `quorum`, yielding client-visible names such as
 `mcp__quorum__pull_request_read`. The daemon injects only this per-run server into ordinary worker
