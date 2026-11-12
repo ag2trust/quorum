@@ -88,7 +88,9 @@ Move `.githooks/pre-push`'s checks into required CI jobs, and add the floor-git 
 - `cargo fmt --check`;
 - the job running the hostile suites on the floor git.
 
-Nothing else may land before this, because slice 2 removes the hook from daemon pushes.
+Nothing else may land before this, because slice 2 removes the hook from daemon pushes. The
+owner confirmed this order on 2026-11-12; the hotfix, starting with the base-branch check, is
+being prepared as a separate PR to `main`.
 
 Verification: CI rejects a PR with `fmt` drift and a PR branched from a feature branch.
 
@@ -103,7 +105,9 @@ Add `quorum_core::git::{LocalGit, TransportGit}`, the spec's two profiles:
 - SHA and ref validators;
 - startup checks for the empty directories and the git floor, applied wherever the constructors
   run;
-- the `inherit` URL-rewrite check.
+- the `inherit` URL-rewrite check;
+- an attribute-source override that sets `GIT_ATTR_SOURCE=<ours>` and is used only by
+  `merge-tree` (slice 14). Every other local-profile command uses the empty tree.
 
 Additive; nothing calls it yet.
 
@@ -124,8 +128,11 @@ Tests:
 - **URL rewriting:** `plant_operator`'s `insteadOf` makes `--get-url` differ, so startup fails
   with exit 2. `pushInsteadOf` is detected by the config check.
 - **`--end-of-options`:** a ref argument `--upload-pack=…` is passed as data, not as an option.
-- **Version gate:** a fake `git` reporting `2.42` makes clone-mode startup fail with exit 2, and
-  makes linked mode log a warning.
+- **Attribute source:** the exact env of a `merge-tree` call has `GIT_ATTR_SOURCE=<ours>`, and
+  every other command's has the empty tree.
+- **Version gate:** a fake `git` reporting `2.42` makes clone-mode startup fail with exit 2 and
+  an error naming `2.42` and the floor `2.43`. In linked mode it logs a warning naming `2.42`
+  and startup continues. A fake `git` reporting `2.43.0` passes in both modes.
 
 ## 2. Early linked-mode hardening
 
@@ -152,8 +159,12 @@ Tests:
   - the tripwire has no `pre-push`, `reference-transaction`, or `preflight.sh` entry.
 - **Startup GC:** GC of a worktree with planted `.gitattributes`, `filter.t.clean`, and
   `info/attributes` fires no filter. The directory is retired, not deleted.
-- **LFS:** a repository with `filter=lfs` in `.gitattributes` parks the publication with
-  `lfs-unsupported`, and nothing is pushed.
+- **LFS:** each of these parks the publication with `lfs-unsupported`, and nothing is pushed:
+  - a repository with `filter=lfs` in `.gitattributes`;
+  - a delivered tree with an LFS pointer file and no `filter=lfs` attribute.
+
+  A file that mentions the pointer header line but not as its first line, or is over 1 KiB, does
+  not park.
 - **Existing tests:** all linked-mode publication and cleanup tests stay green.
 
 ## 3. Untrusted-file reader and symlink-safe removal
@@ -456,41 +467,64 @@ Tests (real `quorum serve` with `--incomplete-clone-mode`, a `file://` remote, a
   the reason. This is the park test moved here from the publication slice.
 - **Push rejection:** a remote `pre-receive` rejection parks through the existing
   push-rejection path.
-- **LFS:** an LFS base parks with `lfs-unsupported`.
+- **LFS:** an LFS base parks with `lfs-unsupported`, and so does a delivery that adds a pointer
+  file without an attribute.
 - **Rework:** the second run reuses the workspace, and its push is a fast-forward.
 
 ## 13. Read-only roles and planning in clone mode
 
-Implement:
+Read-only roles get no `.git` (owner decision, 2026-11-12). Implement:
 
-- reviewer, review-only, and continuation-reviewer seeding at `refs/quorum/pr/<n>`, with the
-  read-only mount mode passed to the launcher;
+- `Workspace::export_tree(sha)`: `archive` of the frozen commit from the private repository,
+  extracted in staging with the planner view's bounded extraction and handed over with the
+  no-replace rename;
+- reviewer, review-only, and continuation-reviewer workspaces as the exported tree of the
+  verified PR head (`refs/quorum/pr/<n>`), with the read-only mount mode and the inputs
+  directory passed to the launcher, and no export declaration;
+- `PrivateRepo::review_materials`, written into the inputs directory, with `<base>` and `<head>`
+  chosen per review kind;
 - a durable seeded head SHA in the reviewer journal, replacing R17, with the fail-safe fallback
   for legacy journals;
-- the planner frozen view and frozen-base capture from the private repository (M25, M26);
-- `PrivateRepo::review_materials`;
+- the planner frozen view as the exported tree of the frozen SHA, and frozen-base capture from
+  the private repository (M25, M26);
 - `QUORUM_REPO` kept for restricted spawns, and `GH_REPO` set in run environments.
+
+These materials are the input to the separate read-only role prompt work. Until it lands,
+today's read-only prompts, which name `git` commands, do not work in clone mode; that is
+acceptable behind `--incomplete-clone-mode`, and slice 17 waits for it.
 
 Tests:
 
-- **Reviewer verdict recovery:** a reviewer workspace whose `HEAD` was moved, or whose `.git` is
-  a symlink, does not change the recovered SHA, and no git runs in it. A legacy journal row
-  without a seeded SHA yields no recovered verdict and a fresh review.
+- **No `.git`:** for each read-only role (planner, reviewer, review-only, continuation
+  reviewer), the workspace contains no `.git` directory or file, no refs, and no objects. Its
+  files equal `ls-tree -r` of the frozen commit, with symlinks kept as symlinks. A tree with
+  `export-ignore` and `export-subst` attributes is exported verbatim.
+- **No export for read-only roles:** the launcher receives no export declaration, and the
+  export command is never spawned, as the local launcher's test hook records. A read-only run
+  that runs `git init` and commits in its workspace leaves no bundle in its outbox, and nothing
+  is imported or pushed.
+- **Reviewer verdict recovery:** a run that creates a `.git` in its read-only workspace, as a
+  directory or as a symlink naming another commit, does not change the recovered SHA, and no
+  git runs in it. A legacy journal row without a seeded SHA yields no recovered verdict and a
+  fresh review.
 - **Planner view:** the view follows the frozen SHA even when `repo_dir`'s `HEAD` moves, and a
   planted `repo_dir` config has no effect.
-- **Restricted spawn:** a planner spawn in a clone workspace with no remote resolves the
+- **Restricted spawn:** a planner spawn in an exported-tree workspace with no `.git` resolves the
   repository through `QUORUM_REPO`.
 - **Review materials:**
   - outputs match `git diff` and `git log` on a fixture;
   - a `diff=t` attribute plus a global textconv tripwire does not fire;
   - an oversized diff is truncated, with a `TRUNCATED` trailer listing the omitted paths;
-  - `remerge.patch` is present for a daemon-made merge.
+  - `remerge.patch` is present for a daemon-made merge;
+  - a branch-sync CI-fix review's materials cover exactly the range from the recorded merge to
+    the gated head.
 
 ## 14. Continuation and branch synchronization via `merge-tree`
 
 Replace R5–R8 in clone mode:
 
-- `merge-tree --write-tree` in the private repository;
+- `merge-tree --write-tree` in the private repository, with `GIT_ATTR_SOURCE=<ours>` (owner
+  decision, 2026-11-12: built-in merge attributes are honored, custom drivers stay impossible);
 - `commit-tree` for clean merges;
 - conflicted paths from `--name-only` output;
 - conflict seeding with `<ours>` and `<theirs>` both as starts and excludes;
@@ -503,6 +537,12 @@ Tests:
   exports and imports. A delivery that resolves by dropping `<theirs>` is rejected with
   `merge-not-completed`.
 - **Hostile merge configuration:** `merge=t` plus a global driver tripwire does not fire.
+- **`merge=union`:** a file marked `merge=union` in `<ours>`'s `.gitattributes`, edited at the
+  same place on both sides, merges cleanly into the union of both edits.
+- **Custom driver without configuration:** a file marked `merge=evil` in `<ours>`, with no
+  `merge.evil.driver` anywhere and a `.gitconfig` in the tree defining one, executes nothing (the
+  tripwire stays empty). Git falls back to its text merge: an overlapping edit is listed as a
+  conflict, and a non-overlapping edit merges cleanly.
 - **`--ff` semantics:** when the base is an ancestor of the head, no merge commit is made.
 
 ## 15. Recovery, reconciliation, and replay in clone mode
@@ -560,6 +600,12 @@ Tests:
 
 ## 17. Default flip
 
+Before this slice:
+
+- the separate read-only role prompt work has landed, since read-only workspaces have no `.git`;
+- the container image ships a current git release instead of the distribution's 2.39
+  (`Dockerfile:32`), which is below the floor.
+
 Set the `workspace_mode` default to `clone`, and remove `--incomplete-clone-mode`. Update
 `README.md`, `docs/serve-config.example.toml`, and the workspace and lifecycle sections of
 `docs/2026-06-23-quorum-design.md`.
@@ -569,6 +615,8 @@ Tests:
 - A local operator with no new keys starts in clone mode, with `remote_url` derived and logged,
   and completes the slice 12 happy path.
 - The full clone suite passes on the floor git and on a current git.
+- The container image's smoke test asserts that its git is at least the floor and that clone
+  mode starts.
 
 ## 18. Remove the linked-worktree mode
 
