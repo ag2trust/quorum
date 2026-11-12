@@ -174,10 +174,6 @@ fn serve_upstream(
             body.len()
         );
     };
-    if request_line.contains("/count_tokens") {
-        respond(&mut stream, "200 OK", &json!({"input_tokens": 42}));
-        return;
-    }
     match body["model"].as_str().unwrap_or("") {
         "model-gated-stream" => {
             let _ = stream.write_all(STREAM_HEAD.as_bytes());
@@ -199,6 +195,29 @@ fn serve_upstream(
             thread::sleep(Duration::from_secs(20));
         }
         "model-slow" => thread::sleep(Duration::from_secs(20)),
+        // The upstream compacted the conversation, then answered: the
+        // top-level counts cover the answer only, the steps are itemized.
+        "model-compacting" => respond(
+            &mut stream,
+            "200 OK",
+            &json!({"id": "msg_1", "type": "message", "role": "assistant",
+                    "content": [{"type": "compaction", "content": "summary"},
+                                {"type": "text", "text": COMPLETION}],
+                    "usage": {"input_tokens": 30, "output_tokens": 5, "iterations": [
+                        {"type": "compaction", "input_tokens": 400, "output_tokens": 60},
+                        {"type": "message", "input_tokens": 30, "output_tokens": 5}]}}),
+        ),
+        "model-flood-stream" => {
+            // Far more than the socket buffers of a peer that is not reading.
+            let _ = stream.write_all(STREAM_HEAD.as_bytes());
+            write_chunk(&mut stream, &stream_start());
+            let padding = format!(": {}\n\n", "p".repeat(64 * 1024));
+            for _ in 0..2048 {
+                if write!(stream, "{:x}\r\n{padding}\r\n", padding.len()).is_err() {
+                    return;
+                }
+            }
+        }
         "model-held" => {
             // Stay in flight until the test lets this request finish, then
             // bill it as the densest text possible: one input token per
@@ -322,6 +341,10 @@ fn forwarder_command(endpoint: &Path, upstream: &str, env: &[(&str, &str)]) -> C
         .env_remove("QUORUM_INFERENCE_ALLOWED_BETAS")
         .env_remove("QUORUM_INFERENCE_RUN_TOKEN_CAP")
         .env_remove("QUORUM_INFERENCE_UPSTREAM_TIMEOUT_SECS")
+        .env_remove("QUORUM_INFERENCE_CLIENT_STALL_TIMEOUT_SECS")
+        .env_remove("QUORUM_INFERENCE_AUTH_RECHECK_SECS")
+        .env_remove("QUORUM_INFERENCE_RUN_MAX_IN_FLIGHT")
+        .env_remove("QUORUM_INFERENCE_ALLOW_COMPACTION")
         .env_remove("QUORUM_RUN_ID")
         .env_remove("QUORUM_AGENT")
         .env_remove("QUORUM_HOME")
@@ -545,16 +568,15 @@ fn forwards_with_the_upstream_credential_in_place_of_the_run_capability() {
     assert_eq!(reply.header("request-id").as_deref(), Some("req_1"));
     assert_eq!(reply.header("x-upstream-account"), None);
 
-    // Authorization: Bearer is accepted too, and count_tokens is mirrored.
+    // Authorization: Bearer is accepted too.
     let reply = send(
         addr,
         "POST",
-        "/v1/messages/count_tokens",
+        "/v1/messages",
         &[("Authorization", "Bearer run-a")],
         &message("model-json").to_string(),
     );
     assert_eq!(reply.status, 200, "{}", reply.body);
-    assert_eq!(reply.json()["input_tokens"], 42);
 
     // A duplicated key is forwarded once, with the value that was checked.
     let duplicated = concat!(
@@ -576,11 +598,9 @@ fn forwards_with_the_upstream_credential_in_place_of_the_run_capability() {
     assert_eq!(seen[0].body, message("model-json"));
     assert_eq!(seen[0].header("anthropic-beta"), ["beta-b"]);
     assert_eq!(seen[0].header("anthropic-version"), ["2023-06-01"]);
-    assert_eq!(
-        seen[1].request_line,
-        "POST /v1/messages/count_tokens HTTP/1.1"
-    );
+    assert_eq!(seen[1].request_line, "POST /v1/messages HTTP/1.1");
     assert_eq!(seen[1].header("anthropic-version"), ["2023-06-01"]);
+    assert!(seen[1].header("anthropic-beta").is_empty());
     assert!(
         !seen[2].raw_body.contains("web_search"),
         "{}",
@@ -598,7 +618,7 @@ fn forwards_with_the_upstream_credential_in_place_of_the_run_capability() {
     let logs = forwarder.stop();
     let line = logs
         .iter()
-        .find(|line| line.contains("route=messages"))
+        .find(|line| line.contains("model=model-json"))
         .unwrap_or_else(|| panic!("no request log line: {logs:?}"));
     for field in [
         "task=7",
@@ -633,12 +653,10 @@ fn requests_without_a_live_run_capability_get_401_and_nothing_is_forwarded() {
         &[("x-api-key", "run a")],
     ];
     for headers in cases {
-        for path in ["/v1/messages", "/v1/messages/count_tokens"] {
-            let reply = send(addr, "POST", path, headers, &body);
-            assert_eq!(reply.status, 401, "{headers:?}: {}", reply.body);
-            assert_eq!(reply.json()["error"]["type"], "authentication_error");
-            assert_eq!(reply.header("x-should-retry").as_deref(), Some("false"));
-        }
+        let reply = send(addr, "POST", "/v1/messages", headers, &body);
+        assert_eq!(reply.status, 401, "{headers:?}: {}", reply.body);
+        assert_eq!(reply.json()["error"]["type"], "authentication_error");
+        assert_eq!(reply.header("x-should-retry").as_deref(), Some("false"));
     }
     assert!(upstream.seen().is_empty());
 
@@ -663,6 +681,7 @@ fn only_the_messages_routes_exist() {
         ("DELETE", "/v1/messages"),
         ("POST", "/v1/messages/"),
         ("POST", "/v1/messages/batches"),
+        ("POST", "/v1/messages/count_tokens"),
         ("POST", "/v1/complete"),
         ("POST", "/v1/files"),
         ("GET", "/v1/models"),
@@ -754,27 +773,89 @@ fn requests_outside_the_policy_get_400_and_nothing_is_forwarded() {
                 "mcp_servers",
                 json!([{"type": "url", "url": "https://mcp.example", "name": "m"}]),
             ),
-            "mcp_servers is not available",
+            "request field mcp_servers is not available",
         ),
         (
             with("container", json!("container_1")),
-            "container is not available",
+            "request field container is not available",
         ),
         (
             with("messages", url_image),
-            "image content is not available",
+            "content block type image is not available",
         ),
         (
             with("messages", file_document),
-            "document content is not available",
+            "content block type document is not available",
         ),
         (
             with("messages", inline_document),
-            "document content is not available",
+            "content block type document is not available",
         ),
         (
             with("messages", inline_image),
-            "image content is not available",
+            "content block type image is not available",
+        ),
+        (
+            with("some_future_field", json!({"enabled": true})),
+            "request field some_future_field is not available",
+        ),
+        (
+            with("fallbacks", json!([{"model": "model-other"}])),
+            "request field fallbacks is not available",
+        ),
+        // Compaction is off unless the operator enables it.
+        (
+            with(
+                "context_management",
+                json!({"edits": [{"type": "compact_20260112"}]}),
+            ),
+            "request field context_management is not available",
+        ),
+        (
+            with(
+                "messages",
+                json!([{"role": "assistant", "content": [
+                    {"type": "compaction", "content": "summary"}]}]),
+            ),
+            "content block type compaction is not available",
+        ),
+        (
+            with(
+                "messages",
+                json!([{"role": "user", "content": [{"type": "some_future_block"}]}]),
+            ),
+            "content block type some_future_block is not available",
+        ),
+        (
+            with(
+                "messages",
+                json!([{"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t", "content": [
+                        {"type": "search_result", "title": "t", "content": []}]}]}]),
+            ),
+            "content block type search_result is not available",
+        ),
+        // Object-valued content is walked like any other.
+        (
+            with(
+                "messages",
+                json!([{"role": "user", "content":
+                    {"type": "server_tool_use", "id": "s", "name": "web_search"}}]),
+            ),
+            "content block type server_tool_use is not available",
+        ),
+        (
+            with(
+                "messages",
+                json!([{"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t", "content":
+                        {"type": "image", "source": {"type": "url", "url": "http://x"}}}]}]),
+            ),
+            "tool_result content must be",
+        ),
+        (
+            with("system", json!([{"type": "document", "title": "t"}])),
+            "content block type document is not available",
         ),
         (message("model-other"), "model model-other is not allowed"),
         (with("model", json!(null)), "model must be"),
@@ -800,17 +881,15 @@ fn requests_outside_the_policy_get_400_and_nothing_is_forwarded() {
 
     // Betas outside the allowlist refuse the request, however they arrive.
     for betas in ["code-execution-2025-08-25", "beta-a,mcp-client-2025-11-20"] {
-        for path in ["/v1/messages", "/v1/messages/count_tokens"] {
-            let reply = send(
-                addr,
-                "POST",
-                path,
-                &[("x-api-key", "run-a"), ("anthropic-beta", betas)],
-                &message("model-json").to_string(),
-            );
-            assert_eq!(reply.status, 400, "{betas}: {}", reply.body);
-            assert!(reply.error_message().contains("is not allowed"));
-        }
+        let reply = send(
+            addr,
+            "POST",
+            "/v1/messages",
+            &[("x-api-key", "run-a"), ("anthropic-beta", betas)],
+            &message("model-json").to_string(),
+        );
+        assert_eq!(reply.status, 400, "{betas}: {}", reply.body);
+        assert!(reply.error_message().contains("is not allowed"));
     }
     let reply = send(
         addr,
@@ -853,17 +932,6 @@ fn a_run_over_its_token_cap_gets_429_until_the_forwarder_restarts() {
     // Each request is admitted because its hold fits, and is then charged
     // only what the upstream reports: holds are reconciled, not kept.
     assert_eq!(post(addr, "run-a", &message("model-json")).status, 200);
-    // Token counting is free upstream and is not charged here.
-    for _ in 0..3 {
-        let reply = send(
-            addr,
-            "POST",
-            "/v1/messages/count_tokens",
-            &[("x-api-key", "run-a")],
-            &message("model-json").to_string(),
-        );
-        assert_eq!(reply.status, 200);
-    }
     // An upstream error reports no usage and costs the run nothing.
     assert_eq!(
         post(addr, "run-a", &message("model-overloaded")).status,
@@ -1138,13 +1206,17 @@ fn concurrent_requests_with_dense_bodies_cannot_together_exceed_the_cap() {
     let mut body = message("model-held");
     body["messages"][0]["content"] = json!("7 9 4 1 ".repeat(512));
     let billed = body.to_string().len() as u64 + 64;
-    // Room for exactly two requests in flight.
+    // Token room for exactly two requests in flight; the separate in-flight
+    // limit is raised out of the way.
     let cap_tokens = 2 * hold(&body);
     let cap = cap_env(cap_tokens);
     let forwarder = Forwarder::start(
         &endpoint.path,
         &upstream.url(),
-        &[("QUORUM_INFERENCE_RUN_TOKEN_CAP", &cap)],
+        &[
+            ("QUORUM_INFERENCE_RUN_TOKEN_CAP", &cap),
+            ("QUORUM_INFERENCE_RUN_MAX_IN_FLIGHT", "8"),
+        ],
     );
     let addr = forwarder.addr;
 
@@ -1228,6 +1300,242 @@ fn holds_are_released_on_completion_so_a_run_is_not_starved() {
     );
 }
 
+#[test]
+fn compaction_is_admitted_only_when_enabled_and_its_usage_is_charged() {
+    let endpoint = FakeEndpoint::start(&["run-a"]);
+    let upstream = FakeUpstream::start();
+    let forwarder = Forwarder::start(
+        &endpoint.path,
+        &upstream.url(),
+        &[
+            ("QUORUM_INFERENCE_ALLOW_COMPACTION", "1"),
+            ("QUORUM_INFERENCE_ALLOWED_BETAS", "compact-2026-01-12"),
+        ],
+    );
+    let addr = forwarder.addr;
+    let compacting = |model: &str, edits: Value| {
+        let mut body = message(model);
+        body["context_management"] = json!({ "edits": edits });
+        body["messages"] = json!([
+            {"role": "user", "content": PROMPT},
+            {"role": "assistant", "content": [
+                {"type": "compaction", "content": "summary"},
+                {"type": "text", "text": "earlier answer"}]},
+            {"role": "user", "content": PROMPT}
+        ]);
+        body
+    };
+    let headers = [
+        ("x-api-key", "run-a"),
+        ("anthropic-beta", "compact-2026-01-12"),
+    ];
+
+    // Enabling compaction admits compaction edits and nothing else.
+    for edits in [
+        json!([{"type": "clear_tool_uses_20250919"}]),
+        json!([{"type": "compact_20260112"}, {"type": "clear_thinking_20251015"}]),
+    ] {
+        let body = compacting("model-compacting", edits).to_string();
+        let reply = send(addr, "POST", "/v1/messages", &headers, &body);
+        assert_eq!(reply.status, 400, "{}", reply.body);
+        assert!(reply.error_message().starts_with("context edit clear_"));
+    }
+    let mut other = compacting("model-compacting", json!([{"type": "compact_20260112"}]));
+    other["mcp_servers"] = json!([]);
+    let reply = send(addr, "POST", "/v1/messages", &headers, &other.to_string());
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(upstream.seen().is_empty());
+
+    // The upstream bills a compaction step (400 + 60) outside the top-level
+    // counts (30 + 5). The run is charged every itemized step: 495.
+    let body = compacting("model-compacting", json!([{"type": "compact_20260112"}]));
+    let reply = send(addr, "POST", "/v1/messages", &headers, &body.to_string());
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(upstream.seen()[0].body, body);
+    assert_eq!(
+        upstream.seen()[0].header("anthropic-beta"),
+        ["compact-2026-01-12"]
+    );
+
+    // A streamed response that does not itemize its steps cannot show
+    // whether a compaction ran, so it is charged its whole hold: twice the
+    // input bound, plus max_tokens.
+    let mut streamed = compacting("model-stream", json!([{"type": "compact_20260112"}]));
+    streamed["stream"] = json!(true);
+    let reply = send(
+        addr,
+        "POST",
+        "/v1/messages",
+        &headers,
+        &streamed.to_string(),
+    );
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let streamed_hold = 2 * (streamed.to_string().len() as u64 + 1024) + 64;
+
+    let logs = forwarder.stop();
+    let total = |model: &str| {
+        let line = logs
+            .iter()
+            .find(|line| line.contains(&format!("model={model} status=200")))
+            .unwrap_or_else(|| panic!("no log line for {model}: {logs:?}"));
+        line.rsplit_once("run_total_tokens=").unwrap().1.to_string()
+    };
+    assert_eq!(total("model-compacting"), "495");
+    assert_eq!(total("model-stream"), (495 + streamed_hold).to_string());
+}
+
+#[test]
+fn a_run_past_its_in_flight_limit_gets_429_and_other_runs_are_unaffected() {
+    let endpoint = FakeEndpoint::start(&["run-a", "run-b"]);
+    let upstream = FakeUpstream::start();
+    // The default limit: two requests in flight per run.
+    let forwarder = Forwarder::start(&endpoint.path, &upstream.url(), &[]);
+    let addr = forwarder.addr;
+
+    let (sender, results) = mpsc::channel();
+    for _ in 0..2 {
+        let sender = sender.clone();
+        thread::spawn(move || {
+            let _ = sender.send(post(addr, "run-a", &message("model-held")).status);
+        });
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while upstream.seen().len() < 2 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(upstream.seen().len(), 2);
+
+    // A third request from the same run is refused before its body is read.
+    for _ in 0..3 {
+        let reply = post(addr, "run-a", &message("model-json"));
+        assert_eq!(reply.status, 429, "{}", reply.body);
+        assert!(reply.error_message().contains("in flight"));
+    }
+    assert_eq!(upstream.seen().len(), 2);
+    // Another run still has both of its own slots.
+    assert_eq!(post(addr, "run-b", &message("model-json")).status, 200);
+
+    // Finishing one request frees one slot.
+    upstream.release.send(()).unwrap();
+    assert_eq!(results.recv_timeout(Duration::from_secs(15)).unwrap(), 200);
+    assert_eq!(post(addr, "run-a", &message("model-json")).status, 200);
+    upstream.release.send(()).unwrap();
+    assert_eq!(results.recv_timeout(Duration::from_secs(15)).unwrap(), 200);
+    forwarder.stop();
+}
+
+#[test]
+fn a_caller_that_stops_reading_is_cut_off_and_its_slot_freed() {
+    let endpoint = FakeEndpoint::start(&["run-a"]);
+    let upstream = FakeUpstream::start();
+    let forwarder = Forwarder::start(
+        &endpoint.path,
+        &upstream.url(),
+        &[
+            ("QUORUM_INFERENCE_CLIENT_STALL_TIMEOUT_SECS", "1"),
+            ("QUORUM_INFERENCE_RUN_MAX_IN_FLIGHT", "1"),
+        ],
+    );
+    let addr = forwarder.addr;
+    let mut body = message("model-flood-stream");
+    body["stream"] = json!(true);
+    let body = body.to_string();
+
+    // Ask for a very large stream and never read a byte of it.
+    let mut stalled = TcpStream::connect(addr).unwrap();
+    write!(
+        stalled,
+        "POST /v1/messages HTTP/1.1\r\nHost: {addr}\r\n\
+         x-api-key: run-a\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while upstream.seen().is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    // While it holds the run's only slot, the run can do nothing else.
+    assert_eq!(post(addr, "run-a", &message("model-json")).status, 429);
+
+    // The stalled connection is dropped at the bound and the slot comes
+    // back, with the peer still not reading.
+    let started = Instant::now();
+    let freed = loop {
+        if post(addr, "run-a", &message("model-json")).status == 200 {
+            break true;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    assert!(freed, "the stalled request still holds its slot");
+
+    // The peer finds its connection ended, not merely paused.
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut sink = Vec::new();
+    match stalled.read_to_end(&mut sink) {
+        Ok(_) => {}
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset),
+    }
+    assert!(!String::from_utf8_lossy(&sink).contains("message_stop"));
+    forwarder.stop();
+}
+
+#[test]
+fn a_stream_is_cut_when_its_run_is_no_longer_live() {
+    let endpoint = FakeEndpoint::start(&["run-a"]);
+    let upstream = FakeUpstream::start();
+    let forwarder = Forwarder::start(
+        &endpoint.path,
+        &upstream.url(),
+        &[("QUORUM_INFERENCE_AUTH_RECHECK_SECS", "1")],
+    );
+    let addr = forwarder.addr;
+    let mut body = message("model-gated-stream");
+    body["stream"] = json!(true);
+    let body = body.to_string();
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        stream,
+        "POST /v1/messages HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         x-api-key: run-a\r\nContent-Length: {body_len}\r\n\r\n{body}",
+        body_len = body.len()
+    )
+    .unwrap();
+    let mut received = String::new();
+    let mut buffer = [0_u8; 4096];
+    while !received.contains("message_start") {
+        let read = stream.read(&mut buffer).unwrap();
+        assert!(read > 0, "stream closed early: {received:?}");
+        received.push_str(std::str::from_utf8(&buffer[..read]).unwrap());
+    }
+    // The stream survives a recheck while its run is live.
+    thread::sleep(Duration::from_millis(1500));
+    // The run ends. The upstream is still holding the stream open, and the
+    // forwarder ends it within the recheck interval.
+    endpoint.finish("run-a");
+    let started = Instant::now();
+    let mut rest = String::new();
+    stream.read_to_string(&mut rest).unwrap();
+    received.push_str(&rest);
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(received.contains("event: error"), "{received}");
+    assert!(received.contains("run is no longer live"), "{received}");
+    assert!(!received.contains("message_stop"), "{received}");
+    forwarder.stop();
+}
+
 /// A raw request on its own connection; `None` when the server closed or
 /// reset the connection before an answer could be read.
 fn raw_exchange(addr: SocketAddr, request: &[u8], read_timeout: Duration) -> Option<u16> {
@@ -1259,8 +1567,8 @@ fn oversized_and_stalled_requests_are_cut_off() {
         format!("POST /v1/messages HTTP/1.1\r\nHost: {addr}\r\nx-api-key: run-a\r\n{extra}\r\n")
     };
 
-    // A body declared over the 32 MiB bound is refused before it is read.
-    let declared = head(&format!("Content-Length: {}\r\n", 32 * 1024 * 1024 + 1));
+    // A body declared over the 8 MiB bound is refused before it is read.
+    let declared = head(&format!("Content-Length: {}\r\n", 8 * 1024 * 1024 + 1));
     assert_eq!(
         raw_exchange(addr, declared.as_bytes(), Duration::from_secs(10)),
         Some(413)
@@ -1360,6 +1668,34 @@ fn configuration_errors_are_usage_errors_that_never_print_the_credential() {
         (
             "http://127.0.0.1:9",
             vec![("QUORUM_INFERENCE_RUN_TOKEN_CAP", "lots")],
+        ),
+        (
+            "http://127.0.0.1:9",
+            vec![("QUORUM_INFERENCE_RUN_MAX_IN_FLIGHT", "0")],
+        ),
+        (
+            "http://127.0.0.1:9",
+            vec![("QUORUM_INFERENCE_CLIENT_STALL_TIMEOUT_SECS", "0")],
+        ),
+        (
+            "http://127.0.0.1:9",
+            vec![("QUORUM_INFERENCE_AUTH_RECHECK_SECS", "never")],
+        ),
+        (
+            "http://127.0.0.1:9",
+            vec![("QUORUM_INFERENCE_ALLOW_COMPACTION", "yes")],
+        ),
+        // Compaction cannot be enabled without allowing its beta.
+        (
+            "http://127.0.0.1:9",
+            vec![("QUORUM_INFERENCE_ALLOW_COMPACTION", "1")],
+        ),
+        (
+            "http://127.0.0.1:9",
+            vec![
+                ("QUORUM_INFERENCE_ALLOW_COMPACTION", "1"),
+                ("QUORUM_INFERENCE_ALLOWED_BETAS", "beta-a"),
+            ],
         ),
         (
             "http://127.0.0.1:9",

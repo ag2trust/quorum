@@ -41,6 +41,8 @@ struct RunUsage {
     settled: u64,
     /// Tokens held for requests still in flight.
     reserved: u64,
+    /// Requests being served for this run right now.
+    in_flight: usize,
     last_seen: Instant,
 }
 
@@ -49,6 +51,7 @@ impl RunUsage {
         Self {
             settled: 0,
             reserved: 0,
+            in_flight: 0,
             last_seen: Instant::now(),
         }
     }
@@ -58,10 +61,11 @@ impl RunUsage {
     }
 }
 
-/// Result of asking whether a run may start another request.
+/// Why a run may not start another request.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Admission {
-    Admitted,
+pub(super) enum Refusal {
+    /// The run already has its maximum number of requests in flight.
+    Busy,
     /// The run's settled and reserved tokens already reach its cap.
     CapReached,
     /// The ledger tracks its maximum number of runs and this one is new.
@@ -72,14 +76,16 @@ pub(super) enum Admission {
 #[derive(Debug)]
 pub(super) struct Ledger {
     cap: Option<u64>,
+    max_in_flight: usize,
     capacity: usize,
     runs: Mutex<HashMap<String, RunUsage>>,
 }
 
 impl Ledger {
-    pub(super) fn new(cap: Option<u64>, capacity: usize) -> Self {
+    pub(super) fn new(cap: Option<u64>, max_in_flight: usize, capacity: usize) -> Self {
         Self {
             cap,
+            max_in_flight,
             capacity,
             runs: Mutex::default(),
         }
@@ -92,25 +98,34 @@ impl Ledger {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Start tracking `run` and refuse it early if nothing is left of its
-    /// cap. This runs before the request body is read; `reserve` makes the
-    /// binding decision once the request's size is known.
-    pub(super) fn admit(&self, run: &str) -> Admission {
+    /// Take one of `run`'s in-flight request slots, or say why it may not
+    /// have one. This runs before the request body is read, so a run can
+    /// make the forwarder buffer only as many bodies as it has slots, and
+    /// refuses early a run with nothing left of its cap; `reserve` makes the
+    /// binding cap decision once the request's size is known.
+    pub(super) fn enter(self: &Arc<Self>, run: &str) -> Result<Slot, Refusal> {
         let mut runs = self.runs();
         if !runs.contains_key(run) {
             if runs.len() >= self.capacity {
-                return Admission::Full;
+                return Err(Refusal::Full);
             }
             runs.insert(run.to_string(), RunUsage::new());
         }
         let Some(usage) = runs.get_mut(run) else {
-            return Admission::Full;
+            return Err(Refusal::Full);
         };
         usage.last_seen = Instant::now();
-        match self.cap {
-            Some(cap) if usage.committed() >= cap => Admission::CapReached,
-            _ => Admission::Admitted,
+        if usage.in_flight >= self.max_in_flight {
+            return Err(Refusal::Busy);
         }
+        if self.cap.is_some_and(|cap| usage.committed() >= cap) {
+            return Err(Refusal::CapReached);
+        }
+        usage.in_flight += 1;
+        Ok(Slot {
+            ledger: Arc::clone(self),
+            run: run.to_string(),
+        })
     }
 
     /// Hold `tokens` for one request, or `None` if the run's settled and
@@ -135,11 +150,13 @@ impl Ledger {
         })
     }
 
-    /// Up to `limit` tracked runs, least recently seen first.
-    pub(super) fn least_recent(&self, limit: usize) -> Vec<String> {
+    /// Up to `limit` tracked runs with nothing in flight, least recently
+    /// seen first.
+    pub(super) fn least_recent_idle(&self, limit: usize) -> Vec<String> {
         let runs = self.runs();
         let mut entries: Vec<(&String, Instant)> = runs
             .iter()
+            .filter(|(_, usage)| usage.in_flight == 0 && usage.reserved == 0)
             .map(|(run, usage)| (run, usage.last_seen))
             .collect();
         entries.sort_by_key(|(_, seen)| *seen);
@@ -156,6 +173,23 @@ impl Ledger {
     }
 }
 
+/// One of a run's in-flight request slots, held until the request's response
+/// has been delivered or abandoned.
+#[derive(Debug)]
+pub(super) struct Slot {
+    ledger: Arc<Ledger>,
+    run: String,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Some(usage) = self.ledger.runs().get_mut(&self.run) {
+            usage.in_flight = usage.in_flight.saturating_sub(1);
+            usage.last_seen = Instant::now();
+        }
+    }
+}
+
 /// Tokens held against a run for one in-flight request. Dropping it without
 /// an explicit outcome charges the whole hold: the safe default for any path
 /// that loses track of what the upstream did.
@@ -168,6 +202,10 @@ pub(super) struct Reservation {
 }
 
 impl Reservation {
+    pub(super) fn held(&self) -> u64 {
+        self.held
+    }
+
     /// Replace the hold with a better bound, once the upstream has reported
     /// the request's real input. May raise the hold above the estimate.
     pub(super) fn hold(&mut self, tokens: u64) {
@@ -249,6 +287,8 @@ impl Counts {
 #[derive(Debug, Default)]
 pub(super) struct Meter {
     counts: Counts,
+    /// Sum of the per-iteration usage the upstream itemized, when it did.
+    iterations: Option<u64>,
     input_known: bool,
     final_seen: bool,
     line: Vec<u8>,
@@ -258,6 +298,20 @@ pub(super) struct Meter {
 impl Meter {
     pub(super) fn counts(&self) -> Counts {
         self.counts
+    }
+
+    /// Everything the upstream billed for this response. When the upstream
+    /// did more than produce the returned message (compacting the
+    /// conversation, or retrying on another model) it itemizes each step
+    /// under `usage.iterations`, and the top-level counts cover the returned
+    /// message only; the larger of the two is charged.
+    pub(super) fn billed(&self) -> u64 {
+        self.counts.total().max(self.iterations.unwrap_or(0))
+    }
+
+    /// Whether the upstream itemized this response's steps.
+    pub(super) fn itemized(&self) -> bool {
+        self.iterations.is_some()
     }
 
     /// Whether the upstream has reported this request's input tokens.
@@ -276,6 +330,22 @@ impl Meter {
     fn apply(&mut self, usage: &Value) -> bool {
         let field = |name: &str| usage.get(name).and_then(Value::as_u64);
         let mut any = false;
+        if let Some(iterations) = usage.get("iterations").and_then(Value::as_array) {
+            let sum = iterations.iter().fold(0_u64, |sum, step| {
+                [
+                    "input_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                    "output_tokens",
+                ]
+                .iter()
+                .filter_map(|name| step.get(name).and_then(Value::as_u64))
+                .fold(sum, u64::saturating_add)
+            });
+            // Itemized usage only grows over a response.
+            self.iterations = Some(self.iterations.unwrap_or(0).max(sum));
+            any = true;
+        }
         if let Some(value) = field("input_tokens") {
             self.counts.input = value;
             self.input_known = true;
@@ -370,18 +440,17 @@ mod tests {
     use serde_json::json;
 
     fn ledger(cap: Option<u64>, capacity: usize) -> Arc<Ledger> {
-        Arc::new(Ledger::new(cap, capacity))
+        Arc::new(Ledger::new(cap, 2, capacity))
     }
 
     #[test]
     fn reservations_count_against_the_cap_until_reconciled() {
         let ledger = ledger(Some(100), 8);
-        assert_eq!(ledger.admit("run-a"), Admission::Admitted);
         // Two in-flight requests may hold the whole cap; a third may not.
         let first = ledger.reserve("run-a", 60).unwrap();
         let second = ledger.reserve("run-a", 40).unwrap();
         assert!(ledger.reserve("run-a", 1).is_none());
-        assert_eq!(ledger.admit("run-a"), Admission::CapReached);
+        assert_eq!(ledger.enter("run-a").unwrap_err(), Refusal::CapReached);
         // Another run has its own allowance.
         let other = ledger.reserve("run-b", 100).unwrap();
         assert!(ledger.reserve("run-b", 1).is_none());
@@ -398,9 +467,26 @@ mod tests {
         assert!(ledger.reserve("run-a", 51).is_none());
         // A hold dropped without an outcome is charged in full too.
         drop(ledger.reserve("run-a", 50).unwrap());
-        assert_eq!(ledger.admit("run-a"), Admission::CapReached);
+        assert_eq!(ledger.enter("run-a").unwrap_err(), Refusal::CapReached);
         assert!(ledger.reserve("run-a", 1).is_none());
         assert!(ledger.reserve("run-a", 0).is_some());
+    }
+
+    #[test]
+    fn each_run_has_its_own_in_flight_slots() {
+        let ledger = ledger(None, 8);
+        let first = ledger.enter("run-a").unwrap();
+        let second = ledger.enter("run-a").unwrap();
+        assert_eq!(ledger.enter("run-a").unwrap_err(), Refusal::Busy);
+        // Another run is unaffected.
+        let other = ledger.enter("run-b").unwrap();
+        drop(first);
+        let third = ledger.enter("run-a").unwrap();
+        assert_eq!(ledger.enter("run-a").unwrap_err(), Refusal::Busy);
+        // Forgetting a run mid-request leaves its slots harmless to drop.
+        ledger.forget("run-a");
+        drop((second, third, other));
+        drop(ledger.enter("run-a").unwrap());
     }
 
     #[test]
@@ -442,25 +528,28 @@ mod tests {
         let held = ledger.reserve("run-a", u64::MAX).unwrap();
         ledger.reserve("run-a", u64::MAX).unwrap().release();
         assert_eq!(held.settle(7), 7);
-        assert_eq!(ledger.admit("run-a"), Admission::Admitted);
+        drop(ledger.enter("run-a").unwrap());
     }
 
     #[test]
     fn ledger_is_bounded_and_releases_only_forgotten_runs() {
         let ledger = ledger(Some(10), 2);
-        assert_eq!(ledger.admit("run-a"), Admission::Admitted);
+        drop(ledger.enter("run-a").unwrap());
         ledger.reserve("run-a", 10).unwrap().keep();
         std::thread::sleep(std::time::Duration::from_millis(5));
-        assert_eq!(ledger.admit("run-b"), Admission::Admitted);
-        assert_eq!(ledger.admit("run-c"), Admission::Full);
+        let busy = ledger.enter("run-b").unwrap();
+        assert_eq!(ledger.enter("run-c").unwrap_err(), Refusal::Full);
         // A tracked run is still served, and still capped, while full.
-        assert_eq!(ledger.admit("run-a"), Admission::CapReached);
+        assert_eq!(ledger.enter("run-a").unwrap_err(), Refusal::CapReached);
+        // Only runs with nothing in flight are offered for release.
+        assert_eq!(ledger.least_recent_idle(8), vec!["run-a".to_string()]);
+        drop(busy);
         std::thread::sleep(std::time::Duration::from_millis(5));
-        ledger.admit("run-a");
-        assert_eq!(ledger.least_recent(1), vec!["run-b".to_string()]);
+        let _ = ledger.enter("run-a");
+        assert_eq!(ledger.least_recent_idle(1), vec!["run-b".to_string()]);
         ledger.forget("run-b");
-        assert_eq!(ledger.admit("run-c"), Admission::Admitted);
-        assert_eq!(ledger.admit("run-a"), Admission::CapReached);
+        drop(ledger.enter("run-c").unwrap());
+        assert_eq!(ledger.enter("run-a").unwrap_err(), Refusal::CapReached);
     }
 
     #[test]
@@ -492,6 +581,48 @@ mod tests {
         empty.observe_final(&json!({"service_tier": "standard"}));
         empty.observe_final(&json!({"output_tokens": 5}));
         assert!(!empty.final_seen());
+    }
+
+    #[test]
+    fn itemized_steps_are_charged_over_the_top_level_counts() {
+        // The upstream compacted the conversation, then answered. The
+        // top-level counts cover the answer only.
+        let mut meter = Meter::default();
+        meter.observe_final(&json!({
+            "input_tokens": 23000,
+            "output_tokens": 1000,
+            "iterations": [
+                {"type": "compaction", "input_tokens": 180000, "output_tokens": 3500},
+                {"type": "message", "input_tokens": 23000, "output_tokens": 1000,
+                 "cache_read_input_tokens": 500}
+            ]
+        }));
+        assert!(meter.final_seen());
+        assert!(meter.itemized());
+        assert_eq!(meter.counts().total(), 24000);
+        assert_eq!(meter.billed(), 208000);
+        // A step list that covers less than the top-level counts never
+        // lowers the charge, and no step list changes nothing.
+        let mut meter = Meter::default();
+        meter.observe_final(&json!({"input_tokens": 10, "output_tokens": 5, "iterations": []}));
+        assert_eq!(meter.billed(), 15);
+        let mut meter = Meter::default();
+        meter.observe_final(&json!({"input_tokens": 10, "output_tokens": 5}));
+        assert!(!meter.itemized());
+        assert_eq!(meter.billed(), 15);
+        // Streamed: itemized usage arrives with the closing usage.
+        let mut meter = Meter::default();
+        meter.feed_events(
+            concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":20,\"output_tokens\":1}}}\n\n",
+                "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9,\"iterations\":[",
+                "{\"type\":\"compaction\",\"input_tokens\":300,\"output_tokens\":40},",
+                "{\"type\":\"message\",\"input_tokens\":20,\"output_tokens\":9}]}}\n\n",
+            )
+            .as_bytes(),
+        );
+        assert!(meter.final_seen() && meter.itemized());
+        assert_eq!(meter.billed(), 369);
     }
 
     fn stream() -> Vec<u8> {

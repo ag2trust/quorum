@@ -414,29 +414,56 @@ This is a non-binding view of ongoing directions, not a release schedule:
   automatically, agent prompts still instruct the shell commands, and its GitHub tools
   remain unimplemented.
 - `quorum inference-forwarder --listen <SOCKETADDR>` gives a sandboxed managed run model
-  access without the upstream credential. It mirrors `POST /v1/messages` (streaming or
-  not) and `POST /v1/messages/count_tokens` on loopback plain HTTP; a run points
-  `ANTHROPIC_BASE_URL` at it and presents its run capability as the API key. Each request
-  is authorized by the daemon endpoint while the run is live, then re-sent with the
-  operator's credential. Requests that would make the upstream act for the run are refused
-  with 400: any tool that is not a custom tool, `mcp_servers`, `container`, content
-  sourced by URL or stored file, and `image` and `document` blocks even when inline
-  (their token cost is not bounded by their size, so it could not be held against a cap). Configure it in the forwarder's own environment, which a
-  run must not inherit: `QUORUM_INFERENCE_UPSTREAM_API_KEY` (required),
-  `QUORUM_INFERENCE_UPSTREAM_URL` (default `https://api.anthropic.com`; `http://` only for
-  a loopback host), `QUORUM_INFERENCE_ALLOWED_MODELS` and `QUORUM_INFERENCE_ALLOWED_BETAS`
-  (comma-separated; unset allows any model and no `anthropic-beta` value),
-  `QUORUM_INFERENCE_RUN_TOKEN_CAP` (input plus output tokens per run, then 429), and
-  `QUORUM_INFERENCE_UPSTREAM_TIMEOUT_SECS` (default 300). Every `/v1/messages` request
-  must state `max_tokens`. With a cap set, a request is admitted only if the run's
-  remaining allowance covers `max_tokens` plus an upper bound on its input (one token per
-  body byte, plus 1024 for upstream framing); that amount is held while the request is in flight, so concurrent requests
-  cannot pass the cap together, and is replaced by the upstream's reported usage when the
-  response completes. A response that ends without final usage (the caller hung up, the
-  stream broke, the upstream went silent after the request was sent) is charged the whole
-  hold. Token counts are kept in the forwarder's memory, so they outlive a daemon restart
-  and reset when the forwarder restarts. Nothing starts the forwarder automatically, and
-  its logs carry metadata only.
+  access without the upstream credential. It mirrors `POST /v1/messages` only (streaming
+  or not) on loopback plain HTTP; a run points `ANTHROPIC_BASE_URL` at it and presents its
+  run capability as the API key. Each request is authorized by the daemon endpoint while
+  the run is live, then re-sent with the operator's credential; a stream is re-checked
+  every `QUORUM_INFERENCE_AUTH_RECHECK_SECS` (default 60) and cut once its run ends.
+  Nothing starts the forwarder automatically, and its logs carry metadata only.
+  - **Request allowlist.** Anything not listed is refused with 400, so a request cannot
+    make the upstream act for the run. Top-level fields: `model`, `max_tokens`, `messages`,
+    `system`, `tools`, `tool_choice`, `stream`, `temperature`, `top_p`, `top_k`,
+    `stop_sequences`, `metadata`, `thinking`, `output_config`, `cache_control`. Content
+    blocks: `text`, `tool_use`, `tool_result` (a string or text blocks), `thinking`,
+    `redacted_thinking`. Tools: only tools the run executes itself (no `type`, or
+    `custom`). Images and documents are refused even inline: their token cost is not
+    bounded by their size, so it could not be held against a cap.
+  - **Configuration** lives in the forwarder's own environment, which a run must not
+    inherit: `QUORUM_INFERENCE_UPSTREAM_API_KEY` (required), `QUORUM_INFERENCE_UPSTREAM_URL`
+    (default `https://api.anthropic.com`; `http://` only for a loopback host; TLS is
+    verified against the bundled public web roots only, so an upstream behind a private
+    certificate authority is not reachable), `QUORUM_INFERENCE_ALLOWED_MODELS` and
+    `QUORUM_INFERENCE_ALLOWED_BETAS` (comma-separated; unset allows any model and no
+    `anthropic-beta` value), `QUORUM_INFERENCE_RUN_TOKEN_CAP`,
+    `QUORUM_INFERENCE_RUN_MAX_IN_FLIGHT` (default 2),
+    `QUORUM_INFERENCE_UPSTREAM_TIMEOUT_SECS` (upstream silence, default 600), and
+    `QUORUM_INFERENCE_CLIENT_STALL_TIMEOUT_SECS` (a caller that stops reading, default 60).
+  - **Token cap.** The cap counts input plus output tokens, not cost: models are priced
+    very differently, so set `QUORUM_INFERENCE_ALLOWED_MODELS` whenever the cap is meant
+    to bound spend. Every request must state `max_tokens`. A request is admitted only if
+    the run's remaining allowance covers `max_tokens` plus an upper bound on its input
+    (one token per body byte, plus 1024 for upstream framing); that amount is held while
+    the request is in flight, so concurrent requests cannot pass the cap together, and
+    is replaced by the upstream's reported usage when the response completes. A response
+    that ends without final usage (the caller hung up, the stream broke, the upstream
+    went silent after the request was sent) is charged the whole hold. Counts are kept
+    in the forwarder's memory: they outlive a daemon restart and reset when the forwarder
+    restarts.
+  - **Compaction** (the upstream summarizing a long conversation) is off by default.
+    `QUORUM_INFERENCE_ALLOW_COMPACTION=1`, together with a `compact-*` value in
+    `QUORUM_INFERENCE_ALLOWED_BETAS`, admits `context_management` with compaction edits
+    only and `compaction` blocks in replayed assistant content. The upstream bills a
+    compaction step outside a response's top-level usage and itemizes it under
+    `usage.iterations`; the forwarder charges the itemized total, and doubles the input
+    part of the hold for such requests. A streamed response that does not itemize its
+    steps is charged its whole hold.
+  - **Limits.** 16 connections; 8 MiB request bodies (requests are text only; about twice
+    a million-token conversation); a 64 KiB request head; a connection takes no new
+    request after one hour. Worst case, each connection buffers one body at about four
+    times its size while it is checked, roughly 512 MiB in all, and one run can occupy
+    only its in-flight slots' share. A loopback peer with no capability can still occupy
+    connection slots with unfinished request heads until each times out (10 seconds):
+    the listener trusts loopback not to be hostile at that level.
 
 ## Working on Quorum
 

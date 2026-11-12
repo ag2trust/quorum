@@ -23,17 +23,18 @@ use quorum_core::error::{QuorumError, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::future::Future;
-use std::hash::{Hash, Hasher};
+use std::hash::BuildHasher;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 use tokio_rustls::rustls;
-use usage::{Admission, Counts, Ledger, Meter, Reservation};
+use usage::{Counts, Ledger, Meter, Refusal, Reservation, Slot};
 
 const PROTOCOL_VERSION: u8 = 1;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -42,15 +43,19 @@ const MAX_CAPABILITY_BYTES: usize = 128;
 const MAX_ENV_BYTES: usize = 4096;
 
 const MESSAGES_PATH: &str = "/v1/messages";
-const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
 const DEFAULT_UPSTREAM: &str = "https://api.anthropic.com";
 const DEFAULT_API_VERSION: &str = "2023-06-01";
 
-/// Bound on one request body, matching the largest request the mirrored API
-/// accepts. A body is read only after its run capability is authorized.
-const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Bound on one request body. Requests are text only (the policy admits no
+/// images or documents), and a million-token conversation is about 4 MiB of
+/// JSON, so this leaves a twofold margin. A body is read only after its run
+/// is authorized and holds one of its in-flight slots. Worst case, every
+/// connection buffers one: the parsed body costs about three times its size
+/// and its re-serialized copy once more, roughly 32 MiB a connection and
+/// 512 MiB in all, with any one run limited to its in-flight slots' share.
+const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Bound on an upstream response that is buffered rather than streamed.
-const MAX_BUFFERED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BUFFERED_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Read-buffer bound for one request head. A head is refused once this much
 /// of it is buffered without completing, so a head slightly over can pass.
 const MAX_HEAD_BYTES: usize = 64 * 1024;
@@ -68,49 +73,31 @@ const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound on reaching the upstream, including its TLS handshake.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default bound on the upstream's silence: before its response head, and
-/// between chunks of a streamed response.
-const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 300;
+/// between chunks of a streamed response. A large non-streamed reply can
+/// take minutes to begin.
+const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 600;
+/// Default bound on a caller that stops reading its response.
+const DEFAULT_CLIENT_STALL_TIMEOUT_SECS: u64 = 60;
+/// Default interval at which a stream's run is checked again with the
+/// daemon; a stream outlives its run by at most this long.
+const DEFAULT_AUTH_RECHECK_SECS: u64 = 60;
+/// Default number of requests one run may have in flight.
+const DEFAULT_RUN_MAX_IN_FLIGHT: usize = 2;
+/// A connection this old takes no further requests; the one in flight, if
+/// any, may finish.
+const CONNECTION_LIFETIME: Duration = Duration::from_secs(60 * 60);
+/// A connection is dropped outright at this age: its lifetime plus the
+/// longest a single request can legitimately still take.
+const CONNECTION_HARD_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60 + 15 * 60);
 /// Bound on one streamed response from first byte to last.
 const MAX_STREAM_DURATION: Duration = Duration::from_secs(60 * 60);
 /// After SIGINT/SIGTERM, open connections get this long to finish.
 const HTTP_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 /// Runs whose usage is tracked at once.
 const MAX_TRACKED_RUNS: usize = 4096;
-/// Least-recently-seen runs re-checked with the daemon when the ledger fills.
+/// Idle runs re-checked with the daemon, off the request path, when the
+/// ledger fills.
 const LEDGER_SWEEP_BATCH: usize = 64;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Route {
-    Messages,
-    CountTokens,
-}
-
-impl Route {
-    fn of(method: &Method, path: &str) -> Option<Self> {
-        if method != Method::POST {
-            return None;
-        }
-        match path {
-            MESSAGES_PATH => Some(Self::Messages),
-            COUNT_TOKENS_PATH => Some(Self::CountTokens),
-            _ => None,
-        }
-    }
-
-    const fn path(self) -> &'static str {
-        match self {
-            Self::Messages => MESSAGES_PATH,
-            Self::CountTokens => COUNT_TOKENS_PATH,
-        }
-    }
-
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Messages => "messages",
-            Self::CountTokens => "count_tokens",
-        }
-    }
-}
 
 /// Where requests are re-sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +172,13 @@ struct Forwarder {
     credential: HeaderValue,
     policy: Policy,
     upstream_timeout: Duration,
+    client_stall_timeout: Duration,
+    auth_recheck: Duration,
+    /// Per-process key for run tags, so a tag cannot be matched against a
+    /// guessed run id outside this process.
+    tag_key: std::collections::hash_map::RandomState,
+    /// Whether a ledger sweep is already running.
+    sweeping: AtomicBool,
     ledger: Arc<Ledger>,
     endpoint_slots: tokio::sync::Semaphore,
     tls: Option<tokio_rustls::TlsConnector>,
@@ -195,8 +189,8 @@ struct Forwarder {
 struct Run {
     task_id: i64,
     role: String,
-    /// Stable, non-reversible tag for log lines. The run id is the bearer
-    /// credential, so it is never logged itself.
+    /// Keyed tag for log lines, stable within one forwarder process. The
+    /// run id is the bearer credential, so it is never logged itself.
     tag: String,
 }
 
@@ -228,12 +222,6 @@ struct EndpointInventory {
 #[derive(Debug, Deserialize)]
 struct EndpointError {
     code: String,
-}
-
-fn run_tag(capability: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    capability.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
 }
 
 impl Forwarder {
@@ -281,7 +269,7 @@ impl Forwarder {
                 Ok(Run {
                     task_id: inventory.task_id,
                     role: inventory.role,
-                    tag: run_tag(capability),
+                    tag: format!("{:016x}", self.tag_key.hash_one(capability)),
                 })
             }
             (false, None, Some(error)) if error.code == "unauthorized" => {
@@ -291,20 +279,25 @@ impl Forwarder {
         }
     }
 
-    /// Admit a run against its token cap. When the ledger is full, runs the
-    /// daemon no longer accepts are dropped from it and admission is retried
-    /// once; a run that is still live keeps its count.
-    async fn admit(&self, capability: &str) -> Admission {
-        match self.ledger.admit(capability) {
-            Admission::Full => {}
-            admission => return admission,
+    /// Re-check idle tracked runs with the daemon and stop tracking those it
+    /// no longer accepts. Runs on its own task, one at a time, so no request
+    /// waits on it; a run that is still live keeps its count.
+    fn sweep_in_background(self: &Arc<Self>) {
+        if self.sweeping.swap(true, Ordering::AcqRel) {
+            return;
         }
-        for tracked in self.ledger.least_recent(LEDGER_SWEEP_BATCH) {
-            if matches!(self.authorize(&tracked).await, Err(AuthFailure::Rejected)) {
-                self.ledger.forget(&tracked);
+        let forwarder = Arc::clone(self);
+        tokio::spawn(async move {
+            for tracked in forwarder.ledger.least_recent_idle(LEDGER_SWEEP_BATCH) {
+                if matches!(
+                    forwarder.authorize(&tracked).await,
+                    Err(AuthFailure::Rejected)
+                ) {
+                    forwarder.ledger.forget(&tracked);
+                }
             }
-        }
-        self.ledger.admit(capability)
+            forwarder.sweeping.store(false, Ordering::Release);
+        });
     }
 }
 
@@ -434,7 +427,6 @@ where
 /// completion, a header value, or either credential.
 struct RequestLog {
     run: Run,
-    route: Route,
     model: Option<String>,
 }
 
@@ -443,12 +435,11 @@ impl RequestLog {
         let model = self.model.as_deref().map_or("-".into(), printable);
         let total = run_total.map_or("-".into(), |total| total.to_string());
         eprintln!(
-            "quorum inference-forwarder: run={} task={} role={} route={} model={} status={} \
+            "quorum inference-forwarder: run={} task={} role={} model={} status={} \
              input_tokens={} output_tokens={} run_total_tokens={}",
             self.run.tag,
             self.run.task_id,
             self.run.role,
-            self.route.name(),
             model,
             status,
             counts.input_total(),
@@ -473,13 +464,13 @@ async fn handle(forwarder: Arc<Forwarder>, request: Request<Body>) -> Response {
         ));
     }
     // Any query is ignored: nothing from it is forwarded.
-    let Some(route) = Route::of(&parts.method, parts.uri.path()) else {
+    if parts.method != Method::POST || parts.uri.path() != MESSAGES_PATH {
         return closing(refusal(
             StatusCode::NOT_FOUND,
             "not_found_error",
             "not found",
         ));
-    };
+    }
     let Some(capability) = run_capability(&parts.headers) else {
         return closing(refusal(
             StatusCode::UNAUTHORIZED,
@@ -505,32 +496,34 @@ async fn handle(forwarder: Arc<Forwarder>, request: Request<Body>) -> Response {
             ))
         }
     };
-    let mut log = RequestLog {
-        run,
-        route,
-        model: None,
-    };
-    if route == Route::Messages {
-        match forwarder.admit(capability).await {
-            Admission::Admitted => {}
-            Admission::CapReached => {
-                return closing(log.refuse(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "rate_limit_error",
-                    "this run has used its token allowance; no further model requests are available to it",
-                ))
-            }
-            Admission::Full => {
-                log.emit(503, Counts::default(), None);
-                return closing(error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "overloaded_error",
-                    "forwarder is tracking its maximum number of runs",
-                    true,
-                ));
-            }
+    let mut log = RequestLog { run, model: None };
+    // Taken before the body is read and held until the response is
+    // delivered or abandoned, so one run cannot occupy the listener.
+    let slot = match forwarder.ledger.enter(capability) {
+        Ok(slot) => slot,
+        Err(Refusal::Busy) => {
+            return closing(log.refuse(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "this run already has its maximum number of requests in flight",
+            ))
         }
-    }
+        Err(Refusal::CapReached) => return closing(log.refuse(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "this run has used its token allowance; no further model requests are available to it",
+        )),
+        Err(Refusal::Full) => {
+            forwarder.sweep_in_background();
+            log.emit(503, Counts::default(), None);
+            return closing(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "overloaded_error",
+                "forwarder is tracking its maximum number of runs",
+                true,
+            ));
+        }
+    };
 
     let declared_length = parts
         .headers
@@ -577,7 +570,7 @@ async fn handle(forwarder: Arc<Forwarder>, request: Request<Body>) -> Response {
         return invalid(&log, "request body must be valid JSON");
     };
     drop(bytes);
-    let admitted = match forwarder.policy.admit(&value, route == Route::Messages) {
+    let admitted = match forwarder.policy.admit(&value) {
         Ok(admitted) => admitted,
         Err(message) => return invalid(&log, &message),
     };
@@ -616,30 +609,34 @@ async fn handle(forwarder: Arc<Forwarder>, request: Request<Body>) -> Response {
     };
     drop(value);
 
-    // Hold the most this request could cost before anything is sent. Token
-    // counting generates nothing and is not charged.
-    let charge = match (route, admitted.max_tokens) {
-        (Route::Messages, Some(max_tokens)) => {
-            let hold = usage::estimated_input_tokens(outbound.len()).saturating_add(max_tokens);
-            match forwarder.ledger.reserve(capability, hold) {
-                Some(reservation) => Some(Charge {
-                    reservation,
-                    max_tokens,
-                }),
-                None => {
-                    return log.refuse(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "rate_limit_error",
-                        "this run's remaining token allowance cannot cover this request's \
-                         max_tokens plus its estimated input",
-                    )
-                }
-            }
-        }
-        _ => None,
+    // Hold the most this request could cost before anything is sent. When
+    // the upstream may compact the conversation it reads the input a second
+    // time to summarize it, so the input part of the hold is doubled.
+    let input_bound = usage::estimated_input_tokens(outbound.len());
+    let input_bound = if admitted.compaction {
+        input_bound.saturating_mul(2)
+    } else {
+        input_bound
+    };
+    let Some(reservation) = forwarder
+        .ledger
+        .reserve(capability, input_bound.saturating_add(admitted.max_tokens))
+    else {
+        return log.refuse(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "this run's remaining token allowance cannot cover this request's \
+             max_tokens plus its estimated input",
+        );
+    };
+    let charge = Charge {
+        reservation,
+        max_tokens: admitted.max_tokens,
+        compaction: admitted.compaction,
+        _slot: slot,
     };
     let response = match forwarder
-        .send(route, outbound, api_version, betas.as_deref())
+        .send(outbound, api_version, betas.as_deref())
         .await
     {
         Ok(response) => response,
@@ -668,24 +665,42 @@ async fn handle(forwarder: Arc<Forwarder>, request: Request<Body>) -> Response {
             };
             // A request that was sent may still be served and billed, so its
             // hold is charged; one that never left costs nothing.
-            let run_total = charge.map(|charge| {
-                if sent {
-                    charge.reservation.keep()
-                } else {
-                    charge.reservation.release()
-                }
-            });
-            log.emit(status.as_u16(), Counts::default(), run_total);
+            let run_total = if sent {
+                charge.reservation.keep()
+            } else {
+                charge.reservation.release()
+            };
+            log.emit(status.as_u16(), Counts::default(), Some(run_total));
             return error_response(status, "api_error", message, true);
         }
     };
-    forwarder.relay(response, charge, log).await
+    forwarder.relay(response, charge, capability, log).await
 }
 
-/// The hold one generating request has on its run's allowance.
+/// What one admitted request holds: tokens of its run's allowance, and one
+/// of the run's in-flight slots.
 struct Charge {
     reservation: Reservation,
     max_tokens: u64,
+    compaction: bool,
+    _slot: Slot,
+}
+
+impl Charge {
+    /// Close the hold against what the upstream reported and return the
+    /// run's settled total. A response without closing usage is charged the
+    /// whole hold. So is a streamed response to a request that allowed
+    /// compaction unless the stream itemized its steps: the compaction step
+    /// is billed outside the top-level counts, and without the itemization
+    /// there is no telling whether one ran.
+    fn close(self, meter: &Meter, streamed: bool) -> u64 {
+        let accounted = !(self.compaction && streamed) || meter.itemized();
+        if meter.final_seen() && accounted {
+            self.reservation.settle(meter.billed())
+        } else {
+            self.reservation.keep()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -706,14 +721,13 @@ impl Forwarder {
     /// credential and every other inbound header stay behind.
     async fn send(
         &self,
-        route: Route,
         body: Vec<u8>,
         api_version: HeaderValue,
         betas: Option<&str>,
     ) -> std::result::Result<hyper::Response<Incoming>, UpstreamFailure> {
         let mut request = hyper::Request::builder()
             .method(Method::POST)
-            .uri(format!("{}{}", self.upstream.prefix, route.path()))
+            .uri(format!("{}{MESSAGES_PATH}", self.upstream.prefix))
             .header(header::HOST, self.upstream.host_header())
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT_ENCODING, "identity")
@@ -762,9 +776,10 @@ impl Forwarder {
     /// Turn the upstream's response into the caller's, reconciling the
     /// request's hold with the usage the upstream reports.
     async fn relay(
-        &self,
+        self: &Arc<Self>,
         response: hyper::Response<Incoming>,
-        charge: Option<Charge>,
+        charge: Charge,
+        capability: &str,
         log: RequestLog,
     ) -> Response {
         let (parts, body) = response.into_parts();
@@ -786,47 +801,45 @@ impl Forwarder {
             }
         }
 
-        // An error status means the upstream did no billable work.
-        let mut run_total = None;
-        let charge = match charge {
-            Some(charge) if !status.is_success() => {
-                run_total = Some(charge.reservation.release());
-                None
-            }
-            charge => charge,
-        };
-        let charge = match charge {
-            Some(charge) if is_event_stream => {
-                relayed
-                    .headers_mut()
-                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-                *relayed.body_mut() = Body::new(MeteredStream {
-                    inner: Some(body),
-                    idle: Box::pin(tokio::time::sleep(self.upstream_timeout)),
-                    deadline: Box::pin(tokio::time::sleep(MAX_STREAM_DURATION)),
-                    idle_timeout: self.upstream_timeout,
-                    meter: Meter::default(),
-                    charge: Some(charge),
-                    log,
-                });
-                return relayed;
-            }
-            charge => charge,
-        };
+        if status.is_success() && is_event_stream {
+            relayed
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            *relayed.body_mut() = Body::new(MeteredStream {
+                inner: Some(body),
+                idle: Box::pin(tokio::time::sleep(self.upstream_timeout)),
+                deadline: Box::pin(tokio::time::sleep(MAX_STREAM_DURATION)),
+                idle_timeout: self.upstream_timeout,
+                recheck: Box::pin(tokio::time::sleep(self.auth_recheck)),
+                checking: None,
+                forwarder: Arc::clone(self),
+                capability: capability.to_string(),
+                meter: Meter::default(),
+                charge: Some(charge),
+                log,
+            });
+            return relayed;
+        }
 
-        // From here a dropped `charge` keeps its whole hold, which is right
-        // for every way a successful response can fail to report its usage.
         let read = tokio::time::timeout(
             self.upstream_timeout,
             read_limited(body, MAX_BUFFERED_RESPONSE_BYTES),
         )
         .await;
-        let keep =
-            |charge: Option<Charge>| charge.map(|charge| charge.reservation.keep()).or(run_total);
+        // An error status means the upstream did no billable work. A
+        // successful response that cannot be read to its usage is charged
+        // the whole hold.
+        let unread = |charge: Charge| {
+            if status.is_success() {
+                charge.reservation.keep()
+            } else {
+                charge.reservation.release()
+            }
+        };
         let bytes = match read {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(_)) => {
-                log.emit(502, Counts::default(), keep(charge));
+                log.emit(502, Counts::default(), Some(unread(charge)));
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
@@ -835,7 +848,7 @@ impl Forwarder {
                 );
             }
             Err(_) => {
-                log.emit(504, Counts::default(), keep(charge));
+                log.emit(504, Counts::default(), Some(unread(charge)));
                 return error_response(
                     StatusCode::GATEWAY_TIMEOUT,
                     "api_error",
@@ -850,7 +863,7 @@ impl Forwarder {
         if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
             || usage::contains(&bytes, self.credential.as_bytes())
         {
-            log.emit(502, Counts::default(), keep(charge));
+            log.emit(502, Counts::default(), Some(unread(charge)));
             return refusal(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
@@ -858,7 +871,7 @@ impl Forwarder {
             );
         }
         let mut meter = Meter::default();
-        let settled = charge.map(|charge| {
+        let run_total = if status.is_success() {
             if let Some(usage) = serde_json::from_slice::<Value>(&bytes)
                 .ok()
                 .as_ref()
@@ -866,13 +879,11 @@ impl Forwarder {
             {
                 meter.observe_final(usage);
             }
-            if meter.final_seen() {
-                charge.reservation.settle(meter.counts().total())
-            } else {
-                charge.reservation.keep()
-            }
-        });
-        log.emit(status.as_u16(), meter.counts(), settled.or(run_total));
+            charge.close(&meter, false)
+        } else {
+            charge.reservation.release()
+        };
+        log.emit(status.as_u16(), meter.counts(), Some(run_total));
         *relayed.body_mut() = Body::from(bytes);
         relayed
     }
@@ -912,6 +923,12 @@ struct MeteredStream {
     idle: Pin<Box<tokio::time::Sleep>>,
     deadline: Pin<Box<tokio::time::Sleep>>,
     idle_timeout: Duration,
+    /// When the stream's run is next checked with the daemon.
+    recheck: Pin<Box<tokio::time::Sleep>>,
+    /// A check in progress; resolves to whether the run was rejected.
+    checking: Option<Pin<Box<dyn Future<Output = bool> + Send>>>,
+    forwarder: Arc<Forwarder>,
+    capability: String,
     meter: Meter,
     /// Held until the stream is dropped, however it ends.
     charge: Option<Charge>,
@@ -935,6 +952,33 @@ impl HttpBody for MeteredStream {
         cx: &mut Context<'_>,
     ) -> Poll<Option<std::result::Result<Frame<Bytes>, Self::Error>>> {
         let this = self.get_mut();
+        if this.inner.is_none() {
+            return Poll::Ready(None);
+        }
+        // A stream must not outlive its run: ask the daemon again at each
+        // interval and end the stream once the run is rejected. A daemon
+        // that cannot be reached leaves the stream to its other bounds.
+        if this.checking.is_none() && this.recheck.as_mut().poll(cx).is_ready() {
+            let forwarder = Arc::clone(&this.forwarder);
+            let capability = this.capability.clone();
+            this.checking = Some(Box::pin(async move {
+                matches!(
+                    forwarder.authorize(&capability).await,
+                    Err(AuthFailure::Rejected)
+                )
+            }));
+        }
+        if let Some(check) = this.checking.as_mut() {
+            if let Poll::Ready(rejected) = check.as_mut().poll(cx) {
+                this.checking = None;
+                if rejected {
+                    return Poll::Ready(Some(Ok(this.fail("run is no longer live"))));
+                }
+                let next = tokio::time::Instant::now() + this.forwarder.auth_recheck;
+                this.recheck.as_mut().reset(next);
+                let _ = this.recheck.as_mut().poll(cx);
+            }
+        }
         let Some(inner) = this.inner.as_mut() else {
             return Poll::Ready(None);
         };
@@ -950,11 +994,16 @@ impl HttpBody for MeteredStream {
                     // held at its ceiling until the closing usage arrives.
                     if let Some(charge) = this.charge.as_mut() {
                         let counts = this.meter.counts();
-                        charge.reservation.hold(
-                            counts
-                                .input_total()
-                                .saturating_add(counts.output_total().max(charge.max_tokens)),
-                        );
+                        let known = counts
+                            .input_total()
+                            .saturating_add(counts.output_total().max(charge.max_tokens));
+                        // With compaction the reported input may leave out
+                        // a step, so the hold is only ever raised.
+                        charge.reservation.hold(if charge.compaction {
+                            known.max(charge.reservation.held())
+                        } else {
+                            known
+                        });
                     }
                 }
                 this.idle
@@ -984,13 +1033,10 @@ impl Drop for MeteredStream {
         // Runs whether the stream completed, failed, or the caller hung up.
         // Only a stream that delivered its closing usage is charged what it
         // used; any other ending is charged the hold.
-        let run_total = self.charge.take().map(|charge| {
-            if self.meter.final_seen() {
-                charge.reservation.settle(self.meter.counts().total())
-            } else {
-                charge.reservation.keep()
-            }
-        });
+        let run_total = self
+            .charge
+            .take()
+            .map(|charge| charge.close(&self.meter, true));
         self.log.emit(200, self.meter.counts(), run_total);
     }
 }
@@ -1038,6 +1084,19 @@ fn list_env(name: &str) -> Result<Option<Vec<String>>> {
     Ok((!entries.is_empty()).then_some(entries))
 }
 
+/// A duration in whole seconds, from 1 to 3600, or `default` when unset.
+fn seconds_env(name: &str, default: u64) -> Result<u64> {
+    match optional_env(name, 32)? {
+        None => Ok(default),
+        Some(value) => match value.parse::<u64>() {
+            Ok(seconds) if (1..=3600).contains(&seconds) => Ok(seconds),
+            _ => Err(invalid_env(name)),
+        },
+    }
+}
+
+/// Server certificates are verified against the bundled public web roots
+/// only; an upstream behind a private certificate authority is not reachable.
 fn tls_connector() -> Result<tokio_rustls::TlsConnector> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -1071,14 +1130,44 @@ impl Forwarder {
                 _ => return Err(invalid_env(cap_name)),
             },
         };
-        let timeout_name = "QUORUM_INFERENCE_UPSTREAM_TIMEOUT_SECS";
-        let timeout = match optional_env(timeout_name, 32)? {
-            None => DEFAULT_UPSTREAM_TIMEOUT_SECS,
-            Some(value) => match value.parse::<u64>() {
-                Ok(seconds) if (1..=3600).contains(&seconds) => seconds,
-                _ => return Err(invalid_env(timeout_name)),
+        let timeout = seconds_env(
+            "QUORUM_INFERENCE_UPSTREAM_TIMEOUT_SECS",
+            DEFAULT_UPSTREAM_TIMEOUT_SECS,
+        )?;
+        let client_stall_timeout = seconds_env(
+            "QUORUM_INFERENCE_CLIENT_STALL_TIMEOUT_SECS",
+            DEFAULT_CLIENT_STALL_TIMEOUT_SECS,
+        )?;
+        let auth_recheck = seconds_env(
+            "QUORUM_INFERENCE_AUTH_RECHECK_SECS",
+            DEFAULT_AUTH_RECHECK_SECS,
+        )?;
+        let in_flight_name = "QUORUM_INFERENCE_RUN_MAX_IN_FLIGHT";
+        let max_in_flight = match optional_env(in_flight_name, 32)? {
+            None => DEFAULT_RUN_MAX_IN_FLIGHT,
+            Some(value) => match value.parse::<usize>() {
+                Ok(limit) if (1..=MAX_HTTP_CONNECTIONS).contains(&limit) => limit,
+                _ => return Err(invalid_env(in_flight_name)),
             },
         };
+        let allowed_betas = list_env("QUORUM_INFERENCE_ALLOWED_BETAS")?.unwrap_or_default();
+        let compaction_name = "QUORUM_INFERENCE_ALLOW_COMPACTION";
+        let allow_compaction = match optional_env(compaction_name, 8)?.as_deref() {
+            None | Some("0") => false,
+            Some("1") => true,
+            Some(_) => return Err(invalid_env(compaction_name)),
+        };
+        // Compaction is unusable without its beta, so enabling one without
+        // allowing the other is a configuration mistake, not a silent no-op.
+        if allow_compaction
+            && !allowed_betas
+                .iter()
+                .any(|beta| beta.starts_with(policy::COMPACTION_BETA_PREFIX))
+        {
+            return Err(QuorumError::Usage(format!(
+                "{compaction_name} requires a compaction beta in QUORUM_INFERENCE_ALLOWED_BETAS"
+            )));
+        }
         let tls = upstream.tls.then(tls_connector).transpose()?;
         Ok(Self {
             endpoint: PathBuf::from(endpoint),
@@ -1087,10 +1176,15 @@ impl Forwarder {
             credential,
             policy: Policy {
                 allowed_models: list_env("QUORUM_INFERENCE_ALLOWED_MODELS")?,
-                allowed_betas: list_env("QUORUM_INFERENCE_ALLOWED_BETAS")?.unwrap_or_default(),
+                allowed_betas,
+                allow_compaction,
             },
             upstream_timeout: Duration::from_secs(timeout),
-            ledger: Arc::new(Ledger::new(cap, MAX_TRACKED_RUNS)),
+            client_stall_timeout: Duration::from_secs(client_stall_timeout),
+            auth_recheck: Duration::from_secs(auth_recheck),
+            tag_key: std::collections::hash_map::RandomState::new(),
+            sweeping: AtomicBool::new(false),
+            ledger: Arc::new(Ledger::new(cap, max_in_flight, MAX_TRACKED_RUNS)),
             endpoint_slots: tokio::sync::Semaphore::new(MAX_ENDPOINT_EXCHANGES),
             tls,
         })
@@ -1121,6 +1215,7 @@ pub fn run(addr: SocketAddr) -> Result<()> {
             .await
             .map_err(bind_error)?;
         let local = listener.local_addr().map_err(bind_error)?;
+        let client_stall_timeout = forwarder.client_stall_timeout;
         let app = axum::Router::new().fallback(move |request: Request<Body>| {
             let forwarder = Arc::clone(&forwarder);
             async move { handle(forwarder, request).await }
@@ -1145,6 +1240,7 @@ pub fn run(addr: SocketAddr) -> Result<()> {
                             stream,
                             app.clone(),
                             shutdown.subscribe(),
+                            client_stall_timeout,
                             slot,
                         ));
                     }
@@ -1184,29 +1280,132 @@ async fn accept_with_slot(
     }
 }
 
+/// A client connection that records how long a write to it has been pending,
+/// so a peer that stops reading can be detected from outside the connection
+/// task's own polling.
+struct WatchedIo {
+    inner: TcpStream,
+    blocked_since: Arc<Mutex<Option<tokio::time::Instant>>>,
+}
+
+impl WatchedIo {
+    fn note<T>(&self, poll: &Poll<T>) {
+        let mut blocked = self
+            .blocked_since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match poll {
+            Poll::Pending => {
+                blocked.get_or_insert_with(tokio::time::Instant::now);
+            }
+            Poll::Ready(_) => *blocked = None,
+        }
+    }
+}
+
+impl AsyncRead for WatchedIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for WatchedIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.note(&poll);
+        poll
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.note(&poll);
+        poll
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// Serve one HTTP/1.1 connection until it closes, its request head times
-/// out, or shutdown is signalled. `_slot` is held for the connection's life.
+/// out, its peer stops reading, it reaches its lifetime, or shutdown is
+/// signalled. `_slot` is held for the connection's life.
+///
+/// The stall and lifetime bounds are timers of this task, not of the
+/// response body, so they fire even while nothing polls the response: a peer
+/// that stops reading leaves the body unpolled and a write pending.
 async fn serve_connection(
     stream: TcpStream,
     app: axum::Router,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    client_stall_timeout: Duration,
     _slot: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _ = stream.set_nodelay(true);
+    let blocked_since = Arc::new(Mutex::new(None));
+    let io = WatchedIo {
+        inner: stream,
+        blocked_since: Arc::clone(&blocked_since),
+    };
     let connection = hyper::server::conn::http1::Builder::new()
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(HTTP_HEADER_READ_TIMEOUT)
         .max_buf_size(MAX_HEAD_BYTES)
         .serve_connection(
-            hyper_util::rt::TokioIo::new(stream),
+            hyper_util::rt::TokioIo::new(io),
             hyper_util::service::TowerToHyperService::new(app),
         );
-    tokio::pin!(connection);
-    tokio::select! {
-        _ = connection.as_mut() => {}
-        _ = shutdown.changed() => {
-            connection.as_mut().graceful_shutdown();
-            let _ = connection.await;
+    let stalled = async {
+        let tick = client_stall_timeout.min(Duration::from_millis(250));
+        loop {
+            tokio::time::sleep(tick).await;
+            let blocked = *blocked_since
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if blocked.is_some_and(|since| since.elapsed() >= client_stall_timeout) {
+                return;
+            }
+        }
+    };
+    let lifetime = tokio::time::sleep(CONNECTION_LIFETIME);
+    let hard_lifetime = tokio::time::sleep(CONNECTION_HARD_LIFETIME);
+    tokio::pin!(connection, stalled, lifetime, hard_lifetime);
+    let mut draining = false;
+    loop {
+        tokio::select! {
+            _ = connection.as_mut() => break,
+            // Dropping the connection drops its request, which releases the
+            // run's in-flight slot and charges what the request still held.
+            _ = &mut stalled => break,
+            _ = &mut hard_lifetime => break,
+            _ = &mut lifetime, if !draining => {
+                draining = true;
+                connection.as_mut().graceful_shutdown();
+            }
+            _ = shutdown.changed(), if !draining => {
+                draining = true;
+                connection.as_mut().graceful_shutdown();
+            }
         }
     }
 }
