@@ -18,6 +18,7 @@ mod orchestrator_mcp;
 mod output;
 mod paths;
 mod resource_health;
+mod secret_file;
 mod serve;
 mod serve_config;
 mod verdict;

@@ -357,6 +357,7 @@ fn forwarder_command(endpoint: &Path, upstream: &str, env: &[(&str, &str)]) -> C
         .env("QUORUM_REPO", "test/repo")
         .env("QUORUM_INFERENCE_UPSTREAM_URL", upstream)
         .env("QUORUM_INFERENCE_UPSTREAM_API_KEY", UPSTREAM_KEY)
+        .env_remove(KEY_FILE_ENV)
         .env_remove("QUORUM_INFERENCE_ALLOWED_MODELS")
         .env_remove("QUORUM_INFERENCE_ALLOWED_BETAS")
         .env_remove("QUORUM_INFERENCE_RUN_TOKEN_CAP")
@@ -379,7 +380,11 @@ fn forwarder_command(endpoint: &Path, upstream: &str, env: &[(&str, &str)]) -> C
 
 impl Forwarder {
     fn start(endpoint: &Path, upstream: &str, env: &[(&str, &str)]) -> Self {
-        let mut child = forwarder_command(endpoint, upstream, env).spawn().unwrap();
+        Self::spawn(forwarder_command(endpoint, upstream, env))
+    }
+
+    fn spawn(mut command: Command) -> Self {
+        let mut child = command.spawn().unwrap();
         let stderr = child.stderr.take().unwrap();
         let (sender, lines) = mpsc::channel();
         thread::spawn(move || {
@@ -1734,14 +1739,17 @@ fn configuration_errors_are_usage_errors_that_never_print_the_credential() {
         (output.status.code(), stderr)
     };
 
+    // Neither credential source is set.
     let mut command = forwarder_command(&endpoint, "http://127.0.0.1:9", &[]);
     command.env_remove("QUORUM_INFERENCE_UPSTREAM_API_KEY");
+    command.env_remove(KEY_FILE_ENV);
     let (code, stderr) = run(command);
     assert_eq!(code, Some(2), "{stderr}");
     assert!(
         stderr.contains("QUORUM_INFERENCE_UPSTREAM_API_KEY"),
         "{stderr}"
     );
+    assert!(stderr.contains(KEY_FILE_ENV), "{stderr}");
 
     // A credential that cannot be a header value is refused without echo.
     let bad_key = format!("{UPSTREAM_KEY}\nx-injected: 1");
@@ -1816,6 +1824,192 @@ fn configuration_errors_are_usage_errors_that_never_print_the_credential() {
     command.arg("inference-forwarder");
     let (code, _) = run(command);
     assert_eq!(code, Some(2));
+}
+
+// ------------------------------------------------------- credential file
+
+const KEY_FILE_ENV: &str = "QUORUM_INFERENCE_UPSTREAM_API_KEY_FILE";
+/// The upstream credential when it is read from a file.
+const FILE_KEY: &str = "upstream-file-secret-7d31";
+
+fn key_file(dir: &Path, name: &str, contents: &[u8], mode: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join(name);
+    std::fs::write(&path, contents).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    path
+}
+
+/// The forwarder with its credential in a file instead of the environment.
+fn file_forwarder_command(endpoint: &Path, upstream: &str, key_file: &Path) -> Command {
+    let mut command = forwarder_command(endpoint, upstream, &[]);
+    command
+        .env_remove("QUORUM_INFERENCE_UPSTREAM_API_KEY")
+        .env(KEY_FILE_ENV, key_file);
+    command
+}
+
+#[test]
+fn the_upstream_credential_can_be_read_from_a_file() {
+    let endpoint = FakeEndpoint::start(&["run-a"]);
+    let upstream = FakeUpstream::start();
+    let dir = tempfile::tempdir().unwrap();
+    // As a read-only mounted secret: readable through its group, writable by
+    // no one, ending in the newline an editor or `echo` leaves.
+    let path = key_file(dir.path(), "key", format!("{FILE_KEY}\n").as_bytes(), 0o440);
+    let forwarder = Forwarder::spawn(file_forwarder_command(
+        &endpoint.path,
+        &upstream.url(),
+        &path,
+    ));
+
+    // The credential never enters the forwarder's environment.
+    #[cfg(target_os = "linux")]
+    {
+        let environ = std::fs::read(format!("/proc/{}/environ", forwarder.child.id())).unwrap();
+        assert!(!String::from_utf8_lossy(&environ).contains(FILE_KEY));
+    }
+
+    let reply = post(forwarder.addr, "run-a", &message("model-json"));
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(!reply.body.contains(FILE_KEY), "{}", reply.body);
+    let seen = upstream.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].header("x-api-key"), [FILE_KEY]);
+
+    for line in forwarder.stop() {
+        assert!(
+            !line.contains(FILE_KEY),
+            "log line leaks the credential: {line}"
+        );
+    }
+}
+
+#[test]
+fn an_unsafe_or_malformed_credential_file_is_refused_without_echo() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = dir.path().join("endpoint.sock");
+    let upstream = "http://127.0.0.1:9";
+    // A forwarder that starts instead of refusing fails the case, not hangs it.
+    let refused = |mut command: Command, case: &str| -> String {
+        let mut child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{case}: the forwarder started instead of refusing");
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert_eq!(status.code(), Some(2), "{case}: {stderr}");
+        for secret in [FILE_KEY, UPSTREAM_KEY] {
+            assert!(
+                !stderr.contains(secret),
+                "{case} leaks {secret:?}: {stderr}"
+            );
+        }
+        stderr
+    };
+    let good = key_file(dir.path(), "good", FILE_KEY.as_bytes(), 0o400);
+
+    // Both sources at once is ambiguous: refuse and name both.
+    let mut command = file_forwarder_command(&endpoint, upstream, &good);
+    command.env("QUORUM_INFERENCE_UPSTREAM_API_KEY", UPSTREAM_KEY);
+    let stderr = refused(command, "both set");
+    assert!(stderr.contains(KEY_FILE_ENV), "{stderr}");
+    assert!(
+        stderr
+            .replace(KEY_FILE_ENV, "")
+            .contains("QUORUM_INFERENCE_UPSTREAM_API_KEY"),
+        "{stderr}"
+    );
+
+    let symlink = dir.path().join("symlink");
+    std::os::unix::fs::symlink(&good, &symlink).unwrap();
+    let fifo = dir.path().join("fifo");
+    let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    let oversized = FILE_KEY.repeat(4096 / FILE_KEY.len() + 1);
+    let cases = [
+        ("missing", dir.path().join("missing"), "cannot be opened"),
+        ("symlink", symlink, "symbolic link"),
+        ("directory", dir.path().to_path_buf(), "regular file"),
+        ("fifo", fifo, "regular file"),
+        (
+            "oversized",
+            key_file(dir.path(), "big", oversized.as_bytes(), 0o600),
+            "larger than",
+        ),
+        ("empty", key_file(dir.path(), "empty", b"", 0o600), "empty"),
+        (
+            "only a newline",
+            key_file(dir.path(), "newline", b"\n", 0o600),
+            "empty",
+        ),
+        (
+            "space",
+            key_file(
+                dir.path(),
+                "space",
+                format!("{FILE_KEY} {FILE_KEY}").as_bytes(),
+                0o600,
+            ),
+            "printable",
+        ),
+        (
+            "control character",
+            key_file(
+                dir.path(),
+                "control",
+                format!("{FILE_KEY}\x1b[0m").as_bytes(),
+                0o600,
+            ),
+            "printable",
+        ),
+        (
+            "header injection",
+            key_file(
+                dir.path(),
+                "inject",
+                format!("{FILE_KEY}\r\nx-injected: 1").as_bytes(),
+                0o600,
+            ),
+            "printable",
+        ),
+        (
+            "group-writable",
+            key_file(dir.path(), "group", FILE_KEY.as_bytes(), 0o620),
+            "writable",
+        ),
+        (
+            "world-writable",
+            key_file(dir.path(), "world", FILE_KEY.as_bytes(), 0o602),
+            "writable",
+        ),
+    ];
+    for (case, path, reason) in cases {
+        let stderr = refused(file_forwarder_command(&endpoint, upstream, &path), case);
+        assert!(stderr.contains(KEY_FILE_ENV), "{case}: {stderr}");
+        assert!(stderr.contains(reason), "{case}: {stderr}");
+    }
+
+    // An empty path names no file.
+    let stderr = refused(
+        file_forwarder_command(&endpoint, upstream, Path::new("")),
+        "empty path",
+    );
+    assert!(stderr.contains(KEY_FILE_ENV), "{stderr}");
 }
 
 // ------------------------------------------------------------- real daemon

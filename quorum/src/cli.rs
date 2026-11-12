@@ -441,8 +441,11 @@ pub enum Command {
     /// Forward Messages API requests from managed runs to a model upstream,
     /// so a sandboxed run gets model access without the upstream credential.
     /// Each request presents its run capability as `x-api-key` (or
-    /// `Authorization: Bearer`); the upstream credential and limits are read
-    /// from `QUORUM_INFERENCE_*` in this process's environment.
+    /// `Authorization: Bearer`); limits are read from `QUORUM_INFERENCE_*` in
+    /// this process's environment. The upstream credential is read at startup
+    /// from the file named by `QUORUM_INFERENCE_UPSTREAM_API_KEY_FILE`
+    /// (recommended: it keeps the credential out of the environment) or from
+    /// `QUORUM_INFERENCE_UPSTREAM_API_KEY`; set exactly one.
     #[command(name = "inference-forwarder")]
     InferenceForwarder {
         /// Serve at `http://<addr>/v1/messages`. Loopback addresses only;
