@@ -37,6 +37,7 @@ Slice 1 adds `quorum/tests/support/hostile_git.rs`. Later slices reuse it.
     - `filter.t.clean`, `filter.t.smudge`, `filter.t.process`
     - `diff.t.textconv`, `diff.t.command`, `diff.external`
     - `merge.t.driver`
+    - `gpg.program`, `gpg.ssh.program`, `gpg.x509.program`
     - `credential.helper`
     - `remote.origin.url`, `remote.origin.pushurl`, `remote.origin.uploadpack`,
       `remote.origin.receivepack`
@@ -45,7 +46,10 @@ Slice 1 adds `quorum/tests/support/hostile_git.rs`. Later slices reuse it.
     - `includeIf.gitdir:…`
   - Other planted state:
     - `.git/info/attributes`
-    - a `.gitattributes` in the tree with `* filter=t diff=t merge=t`
+    - a `.gitattributes` in the tree with `* filter=t diff=t merge=t`, plus `export-subst`,
+      `export-ignore`, `eol=crlf`, and `conflict-marker-size=50000000` entries
+    - a commit with a hand-made `gpgsig` header over a file containing `$Format:%G?$`
+    - a `gpg` tripwire first on the test `PATH`
     - `.githooks/pre-push` with `core.hooksPath=.githooks`
     - an executable `preflight.sh` tripwire
     - a symlinked repository instruction file and provider project-config file pointing at a
@@ -78,21 +82,27 @@ Slice 1 adds `quorum/tests/support/hostile_git.rs`. Later slices reuse it.
   - an object-format mismatch.
 
 **CI.** A job runs every hostile suite on the git floor (2.43) as well as on the runner's
-current git. The prerequisite adds it.
+current git. The suites do not exist until slice 1 creates this fixture, so the job is added
+right after slice 1 merges, as a separate `main` hotfix (workflow files are hotfix-class) synced
+into `develop`.
 
 ## Prerequisite. CI gate for this repository (`main` hotfix, synced to `develop`)
 
-Move `.githooks/pre-push`'s checks into required CI jobs, and add the floor-git job:
+`.githooks/pre-push` runs two checks. Both must be required CI checks before daemon pushes stop
+running the hook:
 
-- base-branch check;
-- `cargo fmt --check`;
-- the job running the hostile suites on the floor git.
+- **Base-branch check.** No CI job runs it today. The `main` hotfix that adds one is being
+  prepared as a separate PR (owner, 2026-11-12).
+- **`cargo fmt --check`.** CI already runs `cargo fmt --all --check` on every pull request
+  (`.github/workflows/ci.yml:19-27`). What remains is to confirm that `fmt` is a required check
+  in branch protection for `main` and `develop`. That is a repository setting, not a PR.
 
-Nothing else may land before this, because slice 2 removes the hook from daemon pushes. The
-owner confirmed this order on 2026-11-12; the hotfix, starting with the base-branch check, is
-being prepared as a separate PR to `main`.
+Slice 2 removes the hook from daemon pushes and must not land before both are in place. Later
+clone-mode push work (slice 10) comes after slice 2 anyway. Slices 1 and 3–9 do not change
+daemon pushes and are not blocked, although the owner's order keeps this prerequisite first.
 
-Verification: CI rejects a PR with `fmt` drift and a PR branched from a feature branch.
+Verification: a PR branched from a feature branch fails the new CI job, a PR with `fmt` drift
+fails `fmt`, and branch protection lists both as required.
 
 ## 1. Hardened git constructor
 
@@ -106,8 +116,12 @@ Add `quorum_core::git::{LocalGit, TransportGit}`, the spec's two profiles:
 - startup checks for the empty directories and the git floor, applied wherever the constructors
   run;
 - the `inherit` URL-rewrite check;
-- an attribute-source override that sets `GIT_ATTR_SOURCE=<ours>` and is used only by
-  `merge-tree` (slice 14). Every other local-profile command uses the empty tree.
+- `-c gpg.program=false -c gpg.ssh.program=false -c gpg.x509.program=false` in the `-c` list;
+- `archive` always with `--worktree-attributes`;
+- `AttrTree::sanitized(ours)`: the sanitized attribute tree from the spec, which keeps only
+  built-in `merge` attributes and is bounded to 1 MiB of input. It is used as `GIT_ATTR_SOURCE`
+  only by `merge-tree` (slice 14) and `show --remerge-diff` (`review_materials`, slice 13).
+  Every other local-profile command uses the empty tree.
 
 Additive; nothing calls it yet.
 
@@ -128,8 +142,18 @@ Tests:
 - **URL rewriting:** `plant_operator`'s `insteadOf` makes `--get-url` differ, so startup fails
   with exit 2. `pushInsteadOf` is detected by the config check.
 - **`--end-of-options`:** a ref argument `--upload-pack=…` is passed as data, not as an option.
-- **Attribute source:** the exact env of a `merge-tree` call has `GIT_ATTR_SOURCE=<ours>`, and
-  every other command's has the empty tree.
+- **Attribute source:** the exact env of a `merge-tree` call and of a `show --remerge-diff`
+  call has `GIT_ATTR_SOURCE` set to the sanitized tree, and every other command's has the empty
+  tree.
+- **Sanitized attribute tree:** from a fixture with root and nested `.gitattributes`, the tree
+  keeps `merge=union`, `merge=binary`, `merge=text`, `-merge`, `!merge`, and `merge`, and turns
+  `binary` into `-merge`, each at its original path. It drops `conflict-marker-size`,
+  `merge=evil`, `filter`, `diff`, `eol`, `export-subst`, macro definitions, and comments.
+  Input over 1 MiB yields the empty tree and an event.
+- **Archive is verbatim:** `archive` of the planted commit, with the `gpg` tripwire on `PATH`
+  and `gpg.program` set in the private repository's config by the test, leaves the tripwire
+  empty. The `export-ignore` file is present, `$Format:%H$` and `$Format:%G?$` stay literal, and
+  the `eol=crlf` file keeps LF.
 - **Version gate:** a fake `git` reporting `2.42` makes clone-mode startup fail with exit 2 and
   an error naming `2.42` and the floor `2.43`. In linked mode it logs a warning naming `2.42`
   and startup continues. A fake `git` reporting `2.43.0` passes in both modes.
@@ -139,8 +163,12 @@ Tests:
 After the prerequisite, route the shared `git_command` through the hardened constructor's
 command-line set in both modes:
 
-- an empty `core.hooksPath`, the protocol allowlist, and `GIT_ATTR_SOURCE` for commands that do
-  not check out files;
+- an empty `core.hooksPath`, the protocol allowlist, signature programs set to `false`, and
+  `GIT_ATTR_SOURCE` for commands that do not check out files;
+- `--worktree-attributes` on the planner view's `archive` in `repo_dir` (audit row M25, a
+  current exposure on `develop`);
+- the container image moved to a current git (`Dockerfile:32` pins 2.39, which predates
+  `GIT_ATTR_SOURCE`), with the image smoke test asserting that its git is at least the floor;
 - a push URL from `remote_url` (or derived once at startup), replacing R1, with the rewrite
   check;
 - removal of `QUORUM_CONTINUATION_BASE_BRANCH` and the `hook-stdout` diagnostic section.
@@ -159,12 +187,19 @@ Tests:
   - the tripwire has no `pre-push`, `reference-transaction`, or `preflight.sh` entry.
 - **Startup GC:** GC of a worktree with planted `.gitattributes`, `filter.t.clean`, and
   `info/attributes` fires no filter. The directory is retired, not deleted.
+- **Planner archive (linked mode):** with the planted `gpgsig` commit as `repo_dir`'s `HEAD`,
+  `gpg.program` planted in `repo_dir`'s config, and the `gpg` tripwire on `PATH`, building the
+  planner view leaves the tripwire empty, and `$Format:%G?$` stays literal in the view.
 - **LFS:** each of these parks the publication with `lfs-unsupported`, and nothing is pushed:
   - a repository with `filter=lfs` in `.gitattributes`;
-  - a delivered tree with an LFS pointer file and no `filter=lfs` attribute.
+  - a delivered tree with an LFS pointer file and no `filter=lfs` attribute;
+  - a pointer file with the legacy `hawser` header;
+  - a tree whose listing exceeds the detection bound (fails closed).
 
-  A file that mentions the pointer header line but not as its first line, or is over 1 KiB, does
-  not park.
+  None of these parks: a file that has the pointer header line but not as its first line, a
+  1 KiB or larger file that starts with it, or `filter=lfs` inside a `.gitattributes` comment.
+  An unchanged base is not rescanned: a second publication on the same base runs no
+  `cat-file` for base blobs.
 - **Existing tests:** all linked-mode publication and cleanup tests stay green.
 
 ## 3. Untrusted-file reader and symlink-safe removal
@@ -263,7 +298,7 @@ Tests:
 Add these keys to the parser:
 
 - `workspace_mode`, `private_repo`, `remote_url`, `git_transport_config`;
-- `[workspace_limits]`, including `max_objects` and `max_inflated_bytes`;
+- `[workspace_limits]`, including `max_objects`, `max_inflated_bytes`, and `max_export_bytes`;
 - `git_fsck_ignore`.
 
 Add `PrivateRepo`, which owns its manager mutex, and its operations:
@@ -475,14 +510,21 @@ Tests (real `quorum serve` with `--incomplete-clone-mode`, a `file://` remote, a
 
 Read-only roles get no `.git` (owner decision, 2026-11-12). Implement:
 
-- `Workspace::export_tree(sha)`: `archive` of the frozen commit from the private repository,
-  extracted in staging with the planner view's bounded extraction and handed over with the
-  no-replace rename;
+- `Workspace::export_tree(sha)`: `archive --worktree-attributes` of the frozen commit from the
+  private repository, bounded by `max_export_bytes` and the 30 s timeout. A Rust no-follow
+  extractor replaces the system `tar` and works relative to a staging directory descriptor. The
+  result is handed over with the no-replace rename. The planner view uses the same path;
+- the `export-too-large` and `export-unsafe-path` parks, with no retry, and timeout as a bounded
+  infrastructure retry;
+- the discovery ceiling: `GIT_CEILING_DIRECTORIES` for every run;
+  `GIT_DIR=<state dir>/empty/.none` and `QUORUM_REPO` for every read-only run; and the startup
+  refusal of a `worktree_base` with a `.git` in itself or an ancestor;
 - reviewer, review-only, and continuation-reviewer workspaces as the exported tree of the
   verified PR head (`refs/quorum/pr/<n>`), with the read-only mount mode and the inputs
   directory passed to the launcher, and no export declaration;
 - `PrivateRepo::review_materials`, written into the inputs directory, with `<base>` and `<head>`
-  chosen per review kind;
+  chosen per review kind, and `remerge.patch` produced with the merge's sanitized attribute tree;
+- an empty inputs directory for the planner;
 - a durable seeded head SHA in the reviewer journal, replacing R17, with the fail-safe fallback
   for legacy journals;
 - the planner frozen view as the exported tree of the frozen SHA, and frozen-base capture from
@@ -498,7 +540,26 @@ Tests:
 - **No `.git`:** for each read-only role (planner, reviewer, review-only, continuation
   reviewer), the workspace contains no `.git` directory or file, no refs, and no objects. Its
   files equal `ls-tree -r` of the frozen commit, with symlinks kept as symlinks. A tree with
-  `export-ignore` and `export-subst` attributes is exported verbatim.
+  `export-ignore`, `export-subst`, and `eol=crlf` attributes is exported verbatim.
+- **Hostile export:** the planted `gpgsig` commit with an `export-subst` file containing
+  `$Format:%G?$`, plus the `gpg` tripwire first on `PATH`, leaves the tripwire empty, and the
+  file stays literal.
+- **Extractor:**
+  - a tree with an `A` symlink to a sentinel directory and an `a/pwn` file is refused with
+    `export-unsafe-path` on a case-insensitive filesystem (macOS default, or a case-folding
+    test volume), and the sentinel directory stays empty;
+  - symlinks with absolute and `../..` targets are created as symlinks and never followed, and
+    the files they point at are unchanged;
+  - a hand-built tar stream with an absolute path, a `..` component, a `.git` component, a
+    hardlink entry, and a device entry is refused, entry by entry.
+- **Export bounds:** a frozen tree whose archive exceeds a lowered `max_export_bytes` parks the
+  task with `export-too-large` after exactly one attempt, with no retry or backoff loop. A
+  simulated timeout retries at most 3 times, then parks.
+- **Enclosing repository:** `worktree_base` is placed under a scratch repository whose
+  `remote.origin.url` names a decoy. Startup refuses with exit 2, naming the enclosing `.git`.
+  With the startup check bypassed by a test seam, a read-only run's `git rev-parse
+  --show-toplevel` and `quorum` CLI calls (`paths::resolve_repo`, `git_toplevel`) find no
+  repository, and the CLI resolves the configured repository through `QUORUM_REPO`.
 - **No export for read-only roles:** the launcher receives no export declaration, and the
   export command is never spawned, as the local launcher's test hook records. A read-only run
   that runs `git init` and commits in its workspace leaves no bundle in its outbox, and nothing
@@ -516,6 +577,8 @@ Tests:
   - a `diff=t` attribute plus a global textconv tripwire does not fire;
   - an oversized diff is truncated, with a `TRUNCATED` trailer listing the omitted paths;
   - `remerge.patch` is present for a daemon-made merge;
+  - for a daemon merge that came out clean through `merge=union`, `remerge.patch` has no hunk
+    for that file (with the empty tree it would show `remerge CONFLICT (content)`);
   - a branch-sync CI-fix review's materials cover exactly the range from the recorded merge to
     the gated head.
 
@@ -523,8 +586,10 @@ Tests:
 
 Replace R5–R8 in clone mode:
 
-- `merge-tree --write-tree` in the private repository, with `GIT_ATTR_SOURCE=<ours>` (owner
-  decision, 2026-11-12: built-in merge attributes are honored, custom drivers stay impossible);
+- `merge-tree --write-tree` in the private repository, with `GIT_ATTR_SOURCE` set to the
+  sanitized attribute tree of `<ours>` (owner decision, 2026-11-12: built-in merge attributes
+  are honored, custom drivers stay impossible; sanitizing follows review), under rule 16's
+  process group, timeout, and Linux rlimits;
 - `commit-tree` for clean merges;
 - conflicted paths from `--name-only` output;
 - conflict seeding with `<ours>` and `<theirs>` both as starts and excludes;
@@ -543,6 +608,9 @@ Tests:
   `merge.evil.driver` anywhere and a `.gitconfig` in the tree defining one, executes nothing (the
   tripwire stays empty). Git falls back to its text merge: an overlapping edit is listed as a
   conflict, and a non-overlapping edit merges cleanly.
+- **`conflict-marker-size`:** a three-line conflicting file with `conflict-marker-size=50000000`
+  in `<ours>` produces default 7-character markers. The merge finishes within the timeout, and
+  on Linux under `RLIMIT_AS`.
 - **`--ff` semantics:** when the base is an ancestor of the head, no merge commit is made.
 
 ## 15. Recovery, reconciliation, and replay in clone mode
@@ -603,8 +671,7 @@ Tests:
 Before this slice:
 
 - the separate read-only role prompt work has landed, since read-only workspaces have no `.git`;
-- the container image ships a current git release instead of the distribution's 2.39
-  (`Dockerfile:32`), which is below the floor.
+- the container image ships a current git release (done in slice 2).
 
 Set the `workspace_mode` default to `clone`, and remove `--incomplete-clone-mode`. Update
 `README.md`, `docs/serve-config.example.toml`, and the workspace and lifecycle sections of
@@ -615,8 +682,7 @@ Tests:
 - A local operator with no new keys starts in clone mode, with `remote_url` derived and logged,
   and completes the slice 12 happy path.
 - The full clone suite passes on the floor git and on a current git.
-- The container image's smoke test asserts that its git is at least the floor and that clone
-  mode starts.
+- The container image's smoke test asserts that clone mode starts.
 
 ## 18. Remove the linked-worktree mode
 

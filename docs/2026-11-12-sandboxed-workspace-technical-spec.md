@@ -166,26 +166,36 @@ repository's pre-push hook, so a repository that relied on that hook as a gate f
 must enforce the same checks in CI.
 
 **Early hardening of the linked-worktree mode.** The worst paths should not wait for the flip.
-Once this repository's pre-push checks run in CI, the shared `git_command` gains, in both
-modes, an empty `core.hooksPath`, the protocol allowlist, `GIT_ATTR_SOURCE` for commands that do
-not check out files, and a push URL taken from configuration (or derived once at startup)
-instead of from the worktree. Teardown also stops snapshotting worktrees with `git add -A` and
-retires their directories instead. This closes highest-risk findings 1, 3, and the hook half
-of 2. Linked mode stays exploitable through filter, driver, and transport keys an agent can
-write into the shared git directory, including `info/attributes`, which no command-line
-override neutralizes. Only the clone model removes that.
+Once this repository's pre-push checks run in CI, the shared `git_command` gains, in both modes,
+an empty `core.hooksPath`, the protocol allowlist, `GIT_ATTR_SOURCE` for commands that do not
+check out files, signature programs set to `false`, and a push URL taken from configuration (or
+derived once at startup) instead of from the worktree. The planner view's `archive` gains
+`--worktree-attributes` (audit row M25). Teardown also stops snapshotting worktrees with
+`git add -A` and retires their directories instead. The container image moves to a current git
+in the same change: its git 2.39 predates `GIT_ATTR_SOURCE` (2.41), so attribute isolation
+would otherwise be inactive in the image. This closes highest-risk findings 1 and 3, and the
+hook half of finding 2. Linked mode stays exploitable through filter, driver, and transport keys
+an agent can write into the shared git directory, including `info/attributes`, which no
+command-line override neutralizes. Only the clone model removes that.
 
 **Git LFS.** Daemon pushes have never uploaded LFS objects themselves; the LFS pre-push hook
 did. With hooks disabled, a push would publish pointer files without their objects. LFS is
 refused for now. Both modes detect LFS use in the base or delivered tree and park the task with
 the reason `lfs-unsupported` instead of pushing. Detection runs in the private repository or
-`repo_dir` and looks for either signal:
+`repo_dir`, reads no file content beyond what it needs, and looks for either signal:
 
-- `filter=lfs` in any `.gitattributes`, found with a bounded `git grep`;
-- a pointer file. Candidates are blobs that a bounded `git grep` finds containing the line
-  `version https://git-lfs.github.com/spec/v1`. A candidate counts if it is under 1 KiB and
-  that line is its first, as `cat-file` shows. A pointer file without a matching attribute
-  still parks.
+- **`filter=lfs`.** Only `.gitattributes` blobs are read, found by path with `ls-tree -r`, and
+  comment lines are skipped.
+- **A pointer file.** `ls-tree -r -l` lists blob sizes; only blobs under 1 KiB are candidates.
+  `cat-file --batch` reads each candidate, and it counts if its first line is
+  `version https://git-lfs.github.com/spec/v1` or the legacy
+  `version https://hawser.github.com/spec/v1`. A pointer file without a matching attribute
+  still parks; a document that quotes the header line anywhere but its first line, or is
+  1 KiB or larger, does not.
+
+The base tree's result is cached by tree SHA. For a delivered tree only the paths changed against
+the base (`diff-tree -r`) are examined. If a listing exceeds its output bound, detection fails
+closed: the task parks with `lfs-unsupported` and the detail `detection bound exceeded`.
 
 Supporting LFS would mean uploading LFS objects (`git lfs push`) from the private repository
 with a daemon-chosen binary. That is future work.
@@ -288,7 +298,7 @@ push, and `ls-remote` against the operator remote URL.
 | `GIT_CONFIG_NOSYSTEM` | `1` | unset | `1` |
 | `GIT_CONFIG_GLOBAL` | `/dev/null` | unset | `/dev/null` |
 | `GIT_ATTR_NOSYSTEM` | `1` | `1` | `1` |
-| `GIT_ATTR_SOURCE` | empty tree `4b825dc…` (SHA-1) or its SHA-256 equivalent; `<ours>` for `merge-tree` only (see below) | same | same |
+| `GIT_ATTR_SOURCE` | empty tree `4b825dc…` (SHA-1) or its SHA-256 equivalent; the sanitized attribute tree of `<ours>` for `merge-tree` and `show --remerge-diff` only (see below) | same | same |
 | `GIT_ALLOW_PROTOCOL` | `file` | the scheme of `remote_url` | the scheme of `remote_url` |
 | `GIT_CEILING_DIRECTORIES` | `<state dir>` | same | same |
 | `GIT_TERMINAL_PROMPT`, `GIT_OPTIONAL_LOCKS` | `0`, `0` | same | same |
@@ -327,6 +337,7 @@ deployment with an external launcher must use `hermetic`.
 -c gc.auto=0 -c maintenance.auto=false -c fetch.writeCommitGraph=false
 -c core.bigFileThreshold=16m -c core.deltaBaseCacheLimit=32m -c pack.threads=1
 -c commit.gpgSign=false -c tag.gpgSign=false -c push.gpgSign=false
+-c gpg.program=false -c gpg.ssh.program=false -c gpg.x509.program=false
 -c diff.external= -c core.pager=cat
 -c credential.helper=          # local profile and hermetic transport only
 ```
@@ -344,19 +355,52 @@ IDs. Each becomes `-c fetch.fsck.<id>=ignore` on transport fetches only, never o
 filter or driver defined in any configuration the command reads, an attribute can only select
 built-in behavior.
 
-`merge-tree` is the other exception. It runs with `GIT_ATTR_SOURCE=<ours>`, the tree being
-merged into, which is the tree whose attributes a work-tree `git merge` would read. A
-daemon-side merge therefore honors the tree's `.gitattributes` for git's built-in merge
-behaviors (`merge=text`, `merge=binary`, `merge=union`, and `-merge`). Custom merge drivers
-remain impossible: a `merge=<name>` attribute selects a driver only through
-`merge.<name>.driver` configuration, and none exists in any configuration the command reads. For
-an attribute naming an undefined driver, git falls back to its built-in text merge. Every other
-setting in the local profile is unchanged for `merge-tree`, and every other command keeps the
-empty tree. With git 2.53 on a scratch bare repository:
+Merges are the other exception. `merge-tree` and `show --remerge-diff` run with
+`GIT_ATTR_SOURCE=<attr tree>`, a sanitized attribute tree the daemon builds from `<ours>`, the
+tree being merged into, which is the tree whose attributes a work-tree `git merge` would read.
+The same tree must be used for both commands. Otherwise a merge that came out clean through
+`merge=union` shows a spurious `remerge CONFLICT (content)` hunk in `remerge.patch`, so a
+reviewer sees a conflict that never happened. For a remerge diff, `<ours>` is the merge's first
+parent.
 
-- `merge=union` merged cleanly with `GIT_ATTR_SOURCE=<ours>` and conflicted with the empty tree.
-  With no attribute source set, git 2.53 also ignored the attributes of a bare repository's
-  `HEAD`, so the source is always set explicitly.
+The attribute tree is built in Rust from the `.gitattributes` blobs of `<ours>`, read with
+`ls-tree -r` and `cat-file`:
+
+- Each kept line has its pattern and only these merge attributes: `merge=text`,
+  `merge=binary`, `merge=union`, `-merge`, `!merge`, and `merge`. The built-in `binary` macro
+  becomes `-merge`.
+- Everything else is dropped: other attributes, including `conflict-marker-size`; `merge=`
+  with any other value; macro definitions; and comments.
+- The sanitized blobs are written with `hash-object -w` and assembled with `mktree` at the same
+  paths, so directory-scoped `.gitattributes` keep their scope.
+- The input is bounded to 1 MiB of `.gitattributes` content in total. Over the bound the daemon
+  uses the empty tree, so every file gets the built-in text merge, and records an event.
+
+The result honors the tree's built-in merge behaviors and nothing else. Custom merge drivers
+remain impossible twice over:
+
+- a `merge=<name>` attribute is not copied into the attribute tree;
+- even if it were, it selects a driver only through `merge.<name>.driver` configuration, and
+  none exists in any configuration the command reads. For an attribute naming an undefined
+  driver, git falls back to its built-in text merge.
+
+`conflict-marker-size` is dropped because git does not cap it. With git 2.53, one three-line
+conflicting file with `conflict-marker-size=50000000` in the raw `<ours>` attributes took 1.1 s
+and 160 MB resident in `merge-tree`, against 0.03 s and 10 MB with the empty tree. The cost grows
+linearly with the value. `merge-tree` and `show --remerge-diff` also run under rule 16's
+process group, timeout, and Linux rlimits (see "Bundle verification rules"), so any remaining
+resource path is bounded; a merge killed that way takes the "any other exit" path below.
+
+Every other setting in the local profile is unchanged for these two commands, and every other
+command keeps the empty tree. With git 2.53 on a scratch bare repository:
+
+- `merge=union` merged cleanly with `<ours>` as the attribute source and conflicted with the
+  empty tree. With no attribute source set, git 2.53 also ignored the attributes of a bare
+  repository's `HEAD`, so the source is always set explicitly.
+- A hand-built sanitized tree holding only `u.txt merge=union` merged `u.txt` cleanly and gave
+  the `conflict-marker-size=50000000` file default 7-character markers, in 0.04 s and 10 MB.
+- For that union merge, `show --remerge-diff` printed a `remerge CONFLICT (content)` hunk with
+  the empty tree as the attribute source, and nothing with `<ours>`.
 - `merge=evil` with no driver configuration ran nothing and fell back to the text merge. When
   both sides edited the same line, git reported a conflict with standard markers; when they
   edited different lines, the merge was clean (exit 0). A `.gitconfig` in the tree defining
@@ -364,14 +408,31 @@ empty tree. With git 2.53 on a scratch bare repository:
 - As a control, the same attribute with `-c merge.evil.driver=…` did run that command. The
   daemon never passes such a key, and the private repository's config allowlist has none.
 
+`git archive` is different: by default it ignores `GIT_ATTR_SOURCE` and applies the archived
+tree's own attributes. With git 2.53, the empty tree as the attribute source, and no system or
+global configuration, a plain `archive` did all of these:
+
+- dropped an `export-ignore` file;
+- expanded `$Format:%H$` in an `export-subst` file;
+- converted an `eol=crlf` file to CRLF.
+
+Worse, a commit with a hand-made `gpgsig` header and an `export-subst` file containing
+`$Format:%G?$` made `archive` spawn `gpg` from `PATH` on attacker data. Every archive therefore
+passes `--worktree-attributes`. In a bare repository with the empty tree as the attribute source,
+that makes the export verbatim: the `export-ignore` file was present, `$Format…$` stayed literal,
+line endings were kept, and no `gpg` ran. As defense in depth, the `-c` list also sets every
+signature program to `false`.
+
 **What this rules out.** The daemon cannot run hooks (`core.hooksPath` points at an empty
 directory, and repository and global hooks paths are overridden). It cannot run a configured
 filter, textconv, external diff, merge driver, fsmonitor, editor, pager, or askpass. None is
 defined in the private repository's own config, global and system config are ignored by the
-local profile, and repository attributes are read only by seeding and by `merge-tree`, where
-they can select only built-in behavior (`GIT_ATTR_SOURCE` is the empty tree everywhere else).
-Transports other than local files and the remote's scheme are refused before connection. With
-git 2.53, the local profile refused `ext::` and `https` URLs ("transport not allowed") and still
+local profile, and repository attributes are read only by the seeding checkout and, after
+sanitizing, by `merge-tree` and `show --remerge-diff`. There they can select only built-in
+behavior. Everywhere else `GIT_ATTR_SOURCE` is the empty tree, and `archive` also passes
+`--worktree-attributes` so the archived tree's own attributes are not applied. No signature
+program can run. Transports other than local files and the remote's scheme are refused before
+connection. With git 2.53, the local profile refused `ext::` and `https` URLs ("transport not allowed") and still
 read a bundle file. Network fetches run with `fetch.fsckObjects=true`. Bundle imports do not
 rely on fetch-side fsck, which only covers bundles from git 2.48 onward. They run
 `index-pack --strict` explicitly (see "Bundle verification rules").
@@ -400,8 +461,9 @@ that uses it, and logs the result.
   floor checks functionality, not patch currency; Quorum neither fails nor warns on a git that
   lacks the latest security fixes.
 - **Container image:** the image always ships a current git release. Today it pins the
-  distribution's 2.39 (`Dockerfile:32`), which is below the floor, so the image moves to a
-  current git before the default flip.
+  distribution's 2.39 (`Dockerfile:32`), which is below the floor and predates
+  `GIT_ATTR_SOURCE`. The image moves to a current git with the early linked-mode hardening
+  (plan slice 2).
 
 **Inherited `GIT_*` variables.** Both profiles start from a cleared environment, so variables in
 the daemon's own environment cannot redirect a command. That covers `GIT_DIR`,
@@ -459,17 +521,61 @@ roles do not get a clone. Their workspace is an exported tree of the frozen comm
 staging and handed over with the same no-replace rename:
 
 ```
-git --git-dir=<private_repo> archive --format=tar --end-of-options <frozen sha>
-# piped into the bounded extraction the planner view uses today
-# (quorum/src/serve/mod.rs:6476-6560), with <staging>/<name> as the target
+git --git-dir=<private_repo> archive --worktree-attributes --format=tar \
+    --end-of-options <frozen sha>
+# local profile: GIT_ATTR_SOURCE is the empty tree, and every signature program is `false`
 ```
 
-The workspace holds no `.git` directory or file, no refs, and no objects. Everything else a
-read-only role needs from history (diff, log, file lists) comes as daemon-written files in the
-run's inputs directory (see "Review and planning materials"). There is nothing to export, so the
-launcher receives no export declaration and the export step does not run for these roles. The
-archive uses the local profile, so `export-ignore` and `export-subst` attributes are not applied
-and the role sees the tree exactly as committed.
+`--worktree-attributes` is required. Without it `archive` applies the archived tree's own
+`export-ignore`, `export-subst`, and `eol` attributes despite `GIT_ATTR_SOURCE`, and
+`export-subst` can make it run `gpg` (see "Hardened git invocation"). With it, the role sees the
+tree exactly as committed.
+
+**Extraction.** The daemon extracts the stream itself in Rust instead of with the system `tar`.
+Git can store paths that collide on a case-insensitive filesystem: a tree with an `A` symlink
+and an `a/pwn` file passed `fsck --strict`. System `tar` is safe there only through its default
+symlink handling, which differs between implementations. The extractor works relative to a
+directory descriptor for `<staging>/<name>`:
+
+- It creates every directory and file with `openat(…, O_NOFOLLOW | O_CREAT | O_EXCL)`, walking
+  components with `O_NOFOLLOW | O_DIRECTORY`, so it never writes through a symlink.
+- It creates symlinks with `symlinkat` and never resolves their targets. Absolute and `..`
+  targets are kept as data, because they point nowhere the daemon follows.
+- It refuses an entry with an absolute path, a `..` or `.git` component, or an entry type other
+  than a file, directory, or symlink.
+- It refuses an entry whose path meets an existing symlink or entry, as a case-folding
+  collision does.
+
+**Bounds.** The archive stream is bounded by `max_export_bytes` (`[workspace_limits]`, default
+256 MiB, today's planner-view bound at `quorum/src/serve/mod.rs:6059`) and by the planner view's
+30 s timeout.
+
+- A stream over the bound parks the task with `export-too-large` without retry. A repository
+  that large does not shrink on retry, so this is not a seeding failure.
+- A refused entry parks the task with `export-unsafe-path`, naming the path, without retry.
+- A timeout is an infrastructure failure, retried at most 3 times like an import, then parked
+  with `export-too-large`.
+
+The planner's frozen view uses the same export, bound, and extractor.
+
+**Contents.** The workspace holds no `.git` directory or file, no refs, and no objects.
+Everything else a read-only role needs from history (diff, log, file lists) comes as
+daemon-written files in the run's inputs directory (see "Review and planning materials"). There
+is nothing to export, so the launcher receives no export declaration and the export step does
+not run for these roles.
+
+**No discovery outside the workspace.** Git searches parent directories for a repository when
+the current one has no `.git`. If `worktree_base` sat inside a repository, such as a dotfiles
+repository in `$HOME` or `repo_dir` itself, an agent's `git` commands and the CLI's own
+fallbacks would act on that repository. Those fallbacks are `paths::resolve_repo`
+(`quorum/src/paths.rs:28-47`) and `git_toplevel` (`paths.rs:122`). Therefore:
+
+- every run's environment sets `GIT_CEILING_DIRECTORIES` to the workspace's parent;
+- a read-only run's environment also sets `GIT_DIR` to a path that does not exist and that the
+  run cannot create (`<state dir>/empty/.none`, as for `gh`);
+- every read-only run receives `QUORUM_REPO`;
+- startup refuses, with exit 2, a `worktree_base` that has a `.git` entry in itself or in any
+  ancestor. The check is a filesystem walk and runs no git.
 
 Seed variants. *Start* is the commit the delivered tip must descend from. *Exclude* is the
 export declaration's exclude set. Every exclude SHA is recorded durably when the workspace is
@@ -514,8 +620,9 @@ Repository identity cannot come from the workspace, which has no remote:
 - **Restricted spawns** (planner, classifier) have it removed by `strip_coordination_env`
   (`quorum/src/serve/agent.rs:1219-1229`). If such a run invokes the CLI, `paths::resolve_repo`
   falls back to `git remote get-url origin` (`quorum/src/paths.rs:28-47`), which fails in a
-  workspace. Clone mode keeps `QUORUM_REPO` for those spawns, since it is not a credential, or
-  the run must not use the CLI.
+  workspace, or, without the discovery ceiling, reads an enclosing repository. Clone mode keeps
+  `QUORUM_REPO` for those spawns, and gives it to every read-only run, since it is not a
+  credential.
 - **Prompts that still name `gh` commands** need `GH_REPO=<owner/name>` in the run
   environment. That sets the repository, not a credential.
 
@@ -829,7 +936,7 @@ are everything it gets from the repository's history.
 | `diffstat.txt` | `diff --stat=200 --no-color <base>...<head>` | 256 KiB |
 | `files.json` | `diff --name-status -z` | 1 MiB |
 | `log.json` | `log --format=%H%x00%P%x00%an%x00%aI%x00%s -z <base>..<head>` | `max_commits` entries |
-| `remerge.patch` | `show --remerge-diff <merge>` for each daemon-made merge in range | 1 MiB |
+| `remerge.patch` | `show --remerge-diff <merge>` for each daemon-made merge in range, with the merge's sanitized attribute tree as `GIT_ATTR_SOURCE` (see "Hardened git invocation") | 1 MiB |
 
 The tree itself is the role's workspace, exported as described under "Seed", so the inputs
 directory carries no copy of it. The daemon picks `<base>` and `<head>` per review kind, so every
@@ -845,8 +952,14 @@ cannot run in a workspace without `.git`. The default therefore does not flip to
 until that prompt work has landed.
 
 The planner's frozen view is the exported tree of `refs/remotes/origin/<base>` at the frozen SHA
-in the private repository, which is what it receives today from `repo_dir`. The daemon no longer
-reads `repo_dir`'s `HEAD` (`quorum/src/serve/mod.rs:6493,6752`).
+in the private repository. That is today's view with two differences: the source is the private
+repository, not `repo_dir`'s `HEAD` (`quorum/src/serve/mod.rs:6493,6752`), and the export is
+verbatim. Today's archive applies `export-ignore`, `export-subst`, and `eol` from the tree (audit
+row M25), so files can differ from what the planner sees today.
+
+In this design the planner's inputs directory is created but empty: it has no PR range, and
+today's planner view carries no history either. If the read-only prompt work gives the planner
+history, it uses `review_materials` with a range ending at the frozen SHA.
 
 Planner deliverable paths are classified the same way. Today
 `classify_writable_deliverable_path_blocking` (`quorum-core/src/decomposition.rs:130-200`,
@@ -861,7 +974,7 @@ repository instead, using `ls-tree` per path component and refusing any componen
 The daemon computes merges in the private repository and never runs `git merge` in a work tree.
 
 ```
-GIT_ATTR_SOURCE=<ours> \
+GIT_ATTR_SOURCE=<attr tree of ours> \
 git --git-dir=<private_repo> merge-tree --write-tree --name-only --no-messages <ours> <theirs>
 ```
 
@@ -873,16 +986,17 @@ git --git-dir=<private_repo> merge-tree --write-tree --name-only --no-messages <
   `sync_conflicted_files` (`worktree.rs:1348`). The daemon seeds a judgment or continuation
   workspace at `<ours>` with `<theirs>` present, and the run's instructions tell the agent to
   run the merge itself. The import requires the delivered tip to descend from both `<ours>` and
-  `<theirs>` (rule 14, `merge-not-completed`). The agent's `git merge` runs in its own sandbox, where hooks and drivers
-  are its own business. The existing contract that the daemon prepares `MERGE_HEAD` changes
-  accordingly, and the prompt text at `quorum/src/serve/mod.rs:3127-3130` changes with it.
+  `<theirs>` (rule 14, `merge-not-completed`). The agent's `git merge` runs in its own sandbox,
+  where hooks and drivers are its own business. The existing contract that the daemon prepares
+  `MERGE_HEAD` changes accordingly, and the prompt text at `quorum/src/serve/mod.rs:3127-3130`
+  changes with it.
 - **Any other exit.** A loud failure, as today.
 
-`merge-tree` reads attributes from `<ours>` (see "Hardened git invocation"), so a repository
-relying on `merge=union`, `merge=binary`, or `-merge` keeps that behavior in daemon-side merges.
-A repository relying on a custom merge driver does not: no driver configuration exists, git
-falls back to its text merge, and any resulting conflict goes to the agent, who resolves it in
-the sandbox.
+`merge-tree` reads the sanitized attribute tree built from `<ours>` (see "Hardened git
+invocation"), so a repository relying on `merge=union`, `merge=binary`, or `-merge` keeps that
+behavior in daemon-side merges. A repository relying on a custom merge driver or on
+`conflict-marker-size` does not: those attributes are dropped, git uses its text merge with
+default markers, and any resulting conflict goes to the agent, who resolves it in the sandbox.
 
 ## Recovery, preservation, and startup reconciliation
 
@@ -934,6 +1048,7 @@ max_bundle_bytes = 268435456         # 256 MiB
 max_blob_bytes = 104857600           # 100 MiB
 max_commits = 2000
 max_review_diff_bytes = 4194304      # 4 MiB
+max_export_bytes = 268435456         # 256 MiB, read-only workspace and planner view export
 max_objects = 100000
 max_inflated_bytes = 1073741824      # 1 GiB, declared total in the pack pre-scan
 superseded_workspace_retention_secs = 604800
@@ -956,12 +1071,15 @@ migration fetch.
 | Same rejection rule on consecutive runs of a task, up to the existing rework or retry cap | durable counter (workspace state) | park with the rule as the park reason (`tasks::park`), `PublicationFailureKind::Other` | n/a |
 | An `exclude` SHA from the declaration missing from the private repository | checked before rule 10, against the daemon's own record | park; a daemon-side inconsistency, not the run's fault | n/a |
 | Import infrastructure failure (spawn failure, `ENOSPC`, lock) | process or IO result | staged copy kept; retried on the next tick, at most 3 times; then park | n/a |
-| LFS in use (`filter=lfs` or a pointer file in the base or delivered tree) | bounded `git grep` in the private repository, with `cat-file` confirming pointer candidates | park with `lfs-unsupported`; nothing pushed | n/a |
+| LFS in use (`filter=lfs` or a pointer file in the base or delivered tree), or the detection bound exceeded | `ls-tree` and `cat-file --batch` in the private repository (see "Git LFS") | park with `lfs-unsupported`; nothing pushed | n/a |
 | `remote_url` rewritten by `url.*.insteadOf` or `pushInsteadOf` under `inherit` | `ls-remote --get-url` and the config check | exit 2 at startup; park at push time | n/a |
 | Push rejected (lease, non-fast-forward, remote policy) | `push --porcelain` | unchanged: `push_rejection` park path (`worktree.rs:160`), without the local hook section | n/a |
 | Seeding failure (private fetch, disk, rename) | process or IO result | existing provisioning-failure path: release the claim, retry with backoff | n/a |
+| Read-only export over `max_export_bytes` | bounded stream | park with `export-too-large`; no retry | n/a |
+| Read-only export entry refused by the extractor (absolute or `..` path, `.git` component, path through a symlink, case-folding collision, unsupported entry type) | Rust extractor | park with `export-unsafe-path`, naming the path; no retry | n/a |
+| Read-only export timeout | 30 s timeout | infrastructure failure: retried at most 3 times, then park with `export-too-large` | n/a |
 | Operator remote unreachable on fetch | transport result | existing fetch-failure handling (dependency defer, provision retry) | n/a |
-| Invalid `remote_url`, private repository config drift, non-empty `empty-hooks`, old git | startup check | refuse to start, exit 2 for configuration and exit 3 for state | n/a |
+| Invalid `remote_url`, private repository config drift, non-empty `empty-hooks`, old git, `worktree_base` inside a repository | startup check | refuse to start, exit 2 for configuration and exit 3 for state | n/a |
 
 `NonFailover` follows the existing meaning: an execution-boundary failure that must not move the
 run to another provider route (`quorum-core/src/routing_attempts.rs:20-31`).
@@ -1044,8 +1162,10 @@ recovery, so no runs are alive.
 
 Operators who pushed through the daemon and relied on a repository pre-push hook must move those
 checks to CI. For this repository, the hook's base-branch and formatting checks
-(`.githooks/pre-push`) must be required CI jobs before the early linked-mode hardening lands. The
-`main` hotfix that does this is being prepared as a separate PR (see "Decisions").
+(`.githooks/pre-push`) must be required CI jobs before the early linked-mode hardening lands.
+`cargo fmt --all --check` already runs on every pull request (`.github/workflows/ci.yml:19-27`);
+it must also be a required check in branch protection. The base-branch check has no CI job yet.
+The `main` hotfix adding one is being prepared as a separate PR (see "Decisions").
 
 ## Security properties and residual risk
 
@@ -1072,6 +1192,12 @@ Residual:
   rest on the pre-scan alone.
 - The early linked-mode hardening leaves filter, driver, and transport keys in the shared git
   directory reachable until the clone model is the only model.
+- Merges read a sanitized subset of repository attributes. A git bug in how `merge-tree` applies
+  the built-in `union`, `binary`, or `text` merge would be reachable from repository content.
+  Rule 16's timeout and rlimits bound its cost, not its correctness.
+- A read-only workspace contains symlinks with arbitrary targets, created but never followed by
+  the daemon. Under local permissive the agent can follow them, as it can reach anything on the
+  machine.
 - `inherit` transport configuration is operator-owned but, under local permissive, writable by
   agents like everything else on that machine.
 - Hostile content does reach the remote. That is the point of a pull request. It is verified by
@@ -1092,13 +1218,16 @@ The owner settled these on 2026-11-12. They were open questions in the first dra
    read-only role prompt work, which must land before the default flips (see "Seed" and "Review
    and planning materials").
 3. **Merge attributes.** Daemon-side merges (`merge-tree`) honor the tree's `.gitattributes`
-   for git's built-in merge behaviors, such as `union`, `binary`, and `text`, by reading
-   attributes from `<ours>`. Custom merge drivers stay impossible because no driver
-   configuration exists in any configuration the daemon's git reads. Every other command keeps
-   the empty-tree attribute source (see "Hardened git invocation").
-4. **CI gate.** The `main` hotfix that moves this repository's pre-push checks, starting with
-   the base-branch check, into required CI is being prepared as a separate PR. It remains the
-   first prerequisite: nothing else in the plan lands before it.
+   for git's built-in merge behaviors, such as `union`, `binary`, and `text`. Custom merge
+   drivers stay impossible because no driver configuration exists in any configuration the
+   daemon's git reads. Following review, the daemon reads a sanitized attribute tree built from
+   `<ours>` that keeps only those `merge` attributes, so `conflict-marker-size` cannot exhaust
+   memory. `show --remerge-diff` uses the same tree. Every other command keeps the empty-tree
+   attribute source, and `archive` also passes `--worktree-attributes` (see "Hardened git
+   invocation").
+4. **CI gate.** The `main` hotfix adding a CI job for the pre-push base-branch check is being
+   prepared as a separate PR. Together with making `fmt` a required check, it is the first
+   prerequisite. Slice 2, which removes the hook from daemon pushes, must not land before it.
 5. **Git LFS.** Refused for now. LFS use, including a bare pointer file, is detected and the
    task parks with `lfs-unsupported`. Uploading LFS objects from the private repository is
    future work.
@@ -1131,7 +1260,7 @@ linked worktree.
 | S4 | `quorum/src/paths.rs:122` | `git rev-parse --show-toplevel` | As S3. |
 | S5 | `quorum/src/serve/merge.rs:1433,1462,1557` | `sh -c` of operator-supplied hidden test seams (`--merge-cmd` and similar) | Operator input, not repository code. |
 | S6 | `quorum/src/serve/merge.rs:1501,1538` | `git rev-parse HEAD` in `repo_dir` inside the same test seam | Test-only executor; production uses `GhMergeExecutor`. |
-| S7 | `quorum/src/serve/mod.rs:6528` | `tar -xf` of a daemon-produced `git archive` stream into a temp dir | A tree cannot hold both a symlink and a path through it. Removal is symlink-safe. Source moves (M25). |
+| S7 | `quorum/src/serve/mod.rs:6528` | `tar -xf` of a daemon-produced `git archive` stream into a temp dir | Not repository code, but safety rests on the system `tar`'s default symlink handling: paths that collide on a case-insensitive filesystem (an `A` symlink and an `a/pwn` file) pass `fsck --strict`. Replaced by the Rust no-follow extractor ("Seed"). Removal is symlink-safe. Source moves (M25). |
 | S8 | `quorum/src/serve/session_log.rs:597-910`; `quorum/src/web.rs:838-1096` | Session stream and transcript files | Written by Quorum from agent pipes; content is data. |
 | S9 | `quorum/src/serve/cleanup.rs:523-532`; `recovery.rs:569-575` | `canonicalize` plus `symlink_metadata` before removal | Already symlink-checked. Superseded by symlink-safe removal. |
 
@@ -1163,7 +1292,7 @@ linked worktree.
 | M22 | `recover.rs:315,865` | Recover snapshot `update-ref`, `commit-tree` | Store only; the tree source is removed (R13). |
 | M23 | `recover.rs:470-547` (`520`) | `resume_branch_from_recover` | |
 | M24 | `recover.rs:446,454,742,933,961,992,1051` | Recover-ref listing, trust check, uniqueness, ancestry, pruning, deletion | |
-| M25 | `quorum/src/serve/mod.rs:6493,6516` | Planner view: `rev-parse HEAD` and `git archive` in `repo_dir` | Reads the operator checkout's `HEAD`. Becomes the frozen SHA in the private repository. |
+| M25 | `quorum/src/serve/mod.rs:6493,6516` | Planner view: `rev-parse HEAD` and `git archive` in `repo_dir` | Reads the operator checkout's `HEAD`. Becomes the frozen SHA in the private repository. **Current exposure on `develop`:** `archive` applies the tree's own attributes, so `export-subst` with `$Format:%G?$` on a commit with a forged `gpgsig` header makes the daemon run the signature program, either `gpg` from `PATH` or a `gpg.program` in `repo_dir`'s agent-writable config (both verified with git 2.53). Fixed by `--worktree-attributes` and `gpg.program=false` in the early hardening. |
 | M26 | `quorum/src/serve/mod.rs:6752` | `repository_head_sha` (frozen-base capture from `repo_dir` `HEAD`) | As M25. |
 | M27 | `quorum/src/serve/mod.rs:24585-24625` | Sync-branch cleanup: `ls-remote origin`, `push origin --delete` in `repo_dir` | |
 | M28 | `quorum-core/src/decomposition.rs:130-200` (via `quorum/src/serve/planner.rs:286-301`, from `mod.rs:9329` and `agent_endpoint.rs:1201`) | Planner deliverable paths canonicalized against `repo_dir`'s working tree | Stale in clone mode and agent-writable in linked mode. Becomes an `ls-tree` walk of the frozen tree. |
