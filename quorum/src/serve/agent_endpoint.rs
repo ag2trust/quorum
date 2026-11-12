@@ -40,6 +40,9 @@ pub const PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 32;
 const PROTOCOL_VERSION: u8 = 1;
 const SOCKET_FILE: &str = "endpoint.sock";
+/// Bound on one owner alert body. The feed itself is unbounded; this endpoint
+/// is not, so the alert uses the same ceiling as a reaction reason.
+pub const MAX_OWNER_ALERT_BYTES: usize = 8 * 1024;
 const PROCESSING: u8 = 0;
 const CANCELLED: u8 = 1;
 const COMMITTING: u8 = 2;
@@ -57,9 +60,18 @@ struct Request {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Operation {
     AppendNote {
-        task_id: i64,
-        agent: String,
+        /// Optional identity constraints. When present they must match the
+        /// capability; when absent the capability's own task and agent apply.
+        #[serde(default)]
+        task_id: Option<i64>,
+        #[serde(default)]
+        agent: Option<String>,
         note: String,
+    },
+    /// Reviewer-only critical feed message addressed to the owner. Authority
+    /// and authorship come from a live `reviewer` run capability.
+    AlertOwner {
+        body: String,
     },
     Submit {
         #[serde(default)]
@@ -153,6 +165,9 @@ enum ResponseResult {
     },
     PlanAccepted {
         graph_id: i64,
+    },
+    Message {
+        seq: i64,
     },
     Inventory {
         repository: String,
@@ -627,6 +642,13 @@ fn process_request_blocking(
     state: &AtomicU8,
     deadline: Instant,
 ) -> std::result::Result<Response, EndpointFailure> {
+    // The alert TTL is the operator's configured message TTL, exactly what
+    // `quorum post` applies. It is read before the write transaction opens so
+    // no file I/O happens under the database write lock.
+    let owner_alert_ttl = match request.operation {
+        Operation::AlertOwner { .. } => Some(configured_message_ttl()?),
+        _ => None,
+    };
     let mut conn = quorum_core::db::open(db_path)
         .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
     let tx = begin_immediate(&mut conn)
@@ -639,7 +661,9 @@ fn process_request_blocking(
             note,
         } => {
             let context = resolve_any_role(&tx, &request.capability)?;
-            if task_id != context.task_id || agent != context.agent {
+            if task_id.is_some_and(|task_id| task_id != context.task_id)
+                || agent.is_some_and(|agent| agent != context.agent)
+            {
                 return Err(EndpointFailure::new(
                     "invalid_operation",
                     "task identity does not match run authority",
@@ -656,6 +680,25 @@ fn process_request_blocking(
             .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?
             .ok_or_else(|| EndpointFailure::new("internal", "request processing failed"))?;
             Response::success(ResponseResult::TaskNote { note_id })
+        }
+        Operation::AlertOwner { body } => {
+            let context = resolve(&tx, &request.capability, "reviewer")?;
+            validate_owner_alert(&body)?;
+            let ttl = owner_alert_ttl
+                .ok_or_else(|| EndpointFailure::new("internal", "request processing failed"))?;
+            let posted = quorum_core::feed::post_tx(
+                &tx,
+                &context.agent,
+                "critical",
+                None,
+                &body,
+                None,
+                Some("owner"),
+                ttl,
+                quorum_core::clock::now(),
+            )
+            .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+            Response::success(ResponseResult::Message { seq: posted.seq })
         }
         Operation::Submit {
             summary,
@@ -1360,6 +1403,25 @@ fn validate_progress_note(note: &str) -> std::result::Result<(), EndpointFailure
     Ok(())
 }
 
+fn validate_owner_alert(body: &str) -> std::result::Result<(), EndpointFailure> {
+    if body.is_empty() || body.len() > MAX_OWNER_ALERT_BYTES || body.contains('\0') {
+        return Err(EndpointFailure::new(
+            "invalid_operation",
+            "invalid owner alert",
+        ));
+    }
+    Ok(())
+}
+
+/// The message TTL `quorum post` uses when `--ttl` is omitted: the operator
+/// config's `message_ttl_secs`, or its default when no config file exists.
+fn configured_message_ttl() -> std::result::Result<i64, EndpointFailure> {
+    crate::paths::config_path()
+        .and_then(|path| crate::config::load(&path))
+        .map(|config| config.message_ttl_secs)
+        .map_err(|_| EndpointFailure::new("internal", "request processing failed"))
+}
+
 fn validate_submission(
     capability: &str,
     context: &LiveRunContext,
@@ -1892,9 +1954,17 @@ mod tests {
                 reason: Some("planner should not react".into()),
             },
             Operation::AppendNote {
-                task_id: 1,
-                agent: "Planner".into(),
+                task_id: Some(1),
+                agent: Some("Planner".into()),
                 note: "planner should not append".into(),
+            },
+            Operation::AppendNote {
+                task_id: None,
+                agent: None,
+                note: "planner should not append".into(),
+            },
+            Operation::AlertOwner {
+                body: "planner should not alert".into(),
             },
             Operation::Protocol {
                 operation: ProtocolOperation::PullRequestRead,
@@ -1908,6 +1978,284 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM mailbox", [], |row| row.get(0))
             .unwrap();
         assert_eq!(mailbox_count, 0);
+    }
+
+    /// A live worker (task 100) and a live reviewer (task 101, PR 77), plus a
+    /// revoked reviewer capability, with no planner involved.
+    fn live_run_fixture() -> PlannerFixture {
+        let fixture = PlannerFixture::new();
+        fixture.execute(
+            "INSERT INTO tasks
+               (id,title,status,assignee,reviewer,created_by,created_at,updated_at,refs)
+             VALUES (100,'worker fixture','working','Worker',NULL,'test',1000,1000,NULL),
+                    (101,'review fixture','in-review',NULL,'Reviewer','test',1000,1000,'{\"pr\":77}'),
+                    (102,'revoked fixture','in-review',NULL,'Gone','test',1000,1000,'{\"pr\":78}');
+             INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at,revoked_at)
+             VALUES ('live-worker',100,'Worker','worker',1001,NULL),
+                    ('live-reviewer',101,'Reviewer','reviewer',1001,NULL),
+                    ('revoked-reviewer',102,'Gone','reviewer',1001,1002);
+             INSERT INTO agent_runs(task_id,agent_name,role,model,effort,provider,spawned_at)
+             VALUES (100,'Worker','worker','test','high','test',1001);
+             INSERT INTO agent_runs
+               (task_id,agent_name,role,model,effort,provider,spawned_at,
+                review_cap_run_id,review_pr,review_head_sha)
+             VALUES (101,'Reviewer','reviewer','test','high','test',1001,'live-reviewer',77,
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),
+                    (102,'Gone','reviewer','test','high','test',1001,'revoked-reviewer',78,
+                     'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');",
+        );
+        fixture
+    }
+
+    fn count(fixture: &PlannerFixture, table: &str) -> i64 {
+        quorum_core::db::open(&fixture.db_path)
+            .unwrap()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn note_row(fixture: &PlannerFixture, note_id: i64) -> (i64, String, String) {
+        quorum_core::db::open(&fixture.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT task_id,agent,body FROM task_notes WHERE id=?1",
+                [note_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    /// Without identity fields the note lands on the capability's own task as
+    /// its own agent, for a worker and for a reviewer alike.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn append_note_without_identity_uses_the_capability() {
+        let fixture = live_run_fixture();
+        for (capability, task_id, agent) in [
+            ("live-worker", 100, "Worker"),
+            ("live-reviewer", 101, "Reviewer"),
+        ] {
+            let response = fixture
+                .call(
+                    capability,
+                    Operation::AppendNote {
+                        task_id: None,
+                        agent: None,
+                        note: format!("progress from {agent}"),
+                    },
+                )
+                .await
+                .unwrap();
+            let value = result_value(&response)["result"].clone();
+            assert_eq!(value["type"], "task_note");
+            assert_eq!(
+                note_row(&fixture, value["note_id"].as_i64().unwrap()),
+                (task_id, agent.to_string(), format!("progress from {agent}"))
+            );
+        }
+        assert_eq!(count(&fixture, "task_notes"), 2);
+    }
+
+    /// Identity fields stay constraints: a full or partial match is accepted,
+    /// and either field disagreeing with the capability writes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn append_note_identity_fields_must_match_when_present() {
+        let fixture = live_run_fixture();
+        for (task_id, agent) in [
+            (Some(100), Some("Worker")),
+            (Some(100), None),
+            (None, Some("Worker")),
+        ] {
+            let response = fixture
+                .call(
+                    "live-worker",
+                    Operation::AppendNote {
+                        task_id,
+                        agent: agent.map(str::to_string),
+                        note: "matching identity".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let note_id = result_value(&response)["result"]["note_id"]
+                .as_i64()
+                .unwrap();
+            assert_eq!(
+                note_row(&fixture, note_id),
+                (100, "Worker".to_string(), "matching identity".to_string())
+            );
+        }
+        assert_eq!(count(&fixture, "task_notes"), 3);
+
+        for (task_id, agent) in [
+            (Some(101), Some("Worker")),
+            (Some(100), Some("Reviewer")),
+            (Some(101), None),
+            (None, Some("Reviewer")),
+        ] {
+            let error = fixture
+                .call(
+                    "live-worker",
+                    Operation::AppendNote {
+                        task_id,
+                        agent: agent.map(str::to_string),
+                        note: "mismatched identity".into(),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "invalid_operation");
+            assert_eq!(error.message, "task identity does not match run authority");
+        }
+        assert_eq!(count(&fixture, "task_notes"), 3);
+    }
+
+    /// Older clients always send both fields, and newer ones may omit them;
+    /// both wire shapes must decode, and unknown fields stay rejected.
+    #[test]
+    fn append_note_wire_shape_accepts_optional_identity() {
+        let with: Request = serde_json::from_value(json!({
+            "version": 1, "capability": "c",
+            "operation": {"type":"append_note","task_id":7,"agent":"A","note":"n"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            with.operation,
+            Operation::AppendNote { task_id: Some(7), agent: Some(ref agent), .. } if agent == "A"
+        ));
+        let without: Request = serde_json::from_value(json!({
+            "version": 1, "capability": "c",
+            "operation": {"type":"append_note","note":"n"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            without.operation,
+            Operation::AppendNote {
+                task_id: None,
+                agent: None,
+                ..
+            }
+        ));
+        assert!(serde_json::from_value::<Request>(json!({
+            "version": 1, "capability": "c",
+            "operation": {"type":"append_note","note":"n","task":7}
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<Request>(json!({
+            "version": 1, "capability": "c",
+            "operation": {"type":"alert_owner","body":"b","to":"someone"}
+        }))
+        .is_err());
+    }
+
+    /// A live reviewer's alert is one critical feed message to the owner,
+    /// authored by the capability's agent, with a live expiry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alert_owner_posts_one_critical_message_as_the_reviewer() {
+        let fixture = live_run_fixture();
+        let response = fixture
+            .call(
+                "live-reviewer",
+                Operation::AlertOwner {
+                    body: "merge is unsafe".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let value = result_value(&response)["result"].clone();
+        assert_eq!(value["type"], "message");
+        let seq = value["seq"].as_i64().unwrap();
+        assert!(seq > 0);
+
+        type MessageShape = (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            i64,
+        );
+        let row: MessageShape = quorum_core::db::open(&fixture.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT author,kind,topic,body,recipient,refs,ts,expires_at
+                 FROM messages WHERE seq=?1",
+                [seq],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            (&row.0[..], &row.1[..], &row.2[..], &row.3[..]),
+            (
+                "Reviewer",
+                "critical",
+                quorum_core::feed::DEFAULT_TOPIC,
+                "merge is unsafe"
+            )
+        );
+        assert_eq!(row.4.as_deref(), Some("owner"));
+        assert_eq!(row.5, None);
+        assert!(row.7 > row.6, "alert must be live when written: {row:?}");
+        assert_eq!(count(&fixture, "messages"), 1);
+        assert_eq!(count(&fixture, "mailbox"), 0);
+    }
+
+    /// Only a live reviewer may alert the owner, and only with a bounded,
+    /// NUL-free, non-empty body. Every refusal leaves the feed untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alert_owner_rejections_write_nothing() {
+        let fixture = live_run_fixture();
+        for capability in ["live-worker", "revoked-reviewer", "planner-cap", "unknown"] {
+            let error = fixture
+                .call(
+                    capability,
+                    Operation::AlertOwner {
+                        body: "not allowed".into(),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "unauthorized", "{capability}");
+            assert_eq!(error.message, "run authority rejected");
+        }
+        for body in [
+            String::new(),
+            "nul\0inside".to_string(),
+            "x".repeat(MAX_OWNER_ALERT_BYTES + 1),
+        ] {
+            let error = fixture
+                .call("live-reviewer", Operation::AlertOwner { body })
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "invalid_operation");
+            assert_eq!(error.message, "invalid owner alert");
+        }
+        assert_eq!(count(&fixture, "messages"), 0);
+
+        fixture
+            .call(
+                "live-reviewer",
+                Operation::AlertOwner {
+                    body: "x".repeat(MAX_OWNER_ALERT_BYTES),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(count(&fixture, "messages"), 1);
     }
 
     /// The planner's inventory is what lets its MCP shell advertise
