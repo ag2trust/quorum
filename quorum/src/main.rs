@@ -11,6 +11,7 @@ mod cli;
 mod cockpit;
 mod config;
 mod graph_blocker;
+mod inference_forwarder;
 mod input;
 mod output;
 mod paths;
@@ -145,7 +146,10 @@ fn run() -> Result<i32> {
     // Best-effort: log genuinely abnormal failures (exit 3) — never normal lost-race (1) or
     // usage errors (2).
     if let Err(ref e) = result {
-        if e.exit_code() == 3 && source != "agent-mcp" && !managed_endpoint_command(source) {
+        if e.exit_code() == 3
+            && !matches!(source, "agent-mcp" | "inference-forwarder")
+            && !managed_endpoint_command(source)
+        {
             best_effort_errlog(source, &e.to_string());
         }
     }
@@ -185,6 +189,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Message { .. } => "message",
         cli::Command::React { .. } => "react",
         cli::Command::AgentMcp { .. } => "agent-mcp",
+        cli::Command::InferenceForwarder { .. } => "inference-forwarder",
         cli::Command::Submit { .. } => "submit",
         cli::Command::ReviewDraft { .. } => "review-draft",
         cli::Command::Serve { .. } => "serve",
@@ -1232,6 +1237,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         }
         cli::Command::AgentMcp { listen } => {
             agent_mcp::run(listen)?;
+            Ok(0)
+        }
+        cli::Command::InferenceForwarder { listen } => {
+            inference_forwarder::run(listen)?;
             Ok(0)
         }
         cli::Command::Submit {
