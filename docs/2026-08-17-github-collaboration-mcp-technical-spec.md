@@ -194,7 +194,12 @@ server at `/mcp` instead of stdio. It is not part of the daemon and nothing laun
 automatically: an operator starts it with `QUORUM_AGENT_ENDPOINT` and `QUORUM_REPO`, and it
 reaches the daemon only through the endpoint socket. Its limits are:
 
-- Loopback addresses only, plain HTTP. A non-loopback address is a usage error.
+- Loopback addresses only, plain HTTP. A non-loopback address is a usage error, and a request
+  whose `Host` is not a loopback name is refused.
+- The run id is the only secret on this transport. A loopback port is reachable by every local
+  user and process, not only the run it was started for, and plain HTTP gives the bearer no
+  confidentiality on the host. Anyone on the machine who learns a live run id can act as that
+  run for as long as it stays live.
 - The run capability is the `Authorization: Bearer <run id>` header of each request. A missing or
   malformed header is answered `401` before MCP runs. The capability is read per request, never
   stored, and the daemon endpoint authorizes every call from it exactly as it does over stdio.
@@ -204,7 +209,21 @@ reaches the daemon only through the endpoint socket. Its limits are:
   `react`, and `task_note` to a worker; `submit_review`, `task_note`, and `alert_owner` to a
   reviewer. They proxy the endpoint's `Submit`, `React`, `AppendNote`, and `AlertOwner` operations.
   `AlertOwner` writes one critical feed message to the owner as the reviewer capability's agent.
-  None is idempotent: each accepted call writes another row.
+  None is idempotent: each accepted call writes another row. `alert_owner`, like `quorum post`,
+  has no rate or count bound: a live reviewer capability can post any number of alerts, each up
+  to 8192 bytes.
+- Bounded resources: at most 8 connections are served at once (further ones wait in the listen
+  backlog) and at most 8 daemon endpoint exchanges are in flight, against the endpoint's 32
+  connection slots. A request head must arrive within 10 seconds on a new or idle connection (so
+  an idle keep-alive connection is closed after 10 seconds), a request must complete within
+  15 seconds (`408` otherwise), and a body is at most 256 KiB (`413` otherwise). These bounds are
+  enforced before the bearer is checked against the daemon, so a local process without any valid
+  run id can still occupy all 8 connections and delay other callers; it cannot hold them past
+  those time bounds without reconnecting. After SIGINT or SIGTERM open connections get 5 seconds
+  to finish and are then dropped; a signal already sent to the daemon is not undone.
+- The adapter keeps no per-request state between requests. The MCP library's per-service tool
+  schema cache, which never evicts, is confined to one request by building a fresh service for
+  each one.
 - The role-scoped GitHub operations remain unimplemented on this transport as on stdio.
 - Worker and reviewer prompts still instruct the shell commands, and managed launches still
   inject the stdio server; this transport changes neither.
