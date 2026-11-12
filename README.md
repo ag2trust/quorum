@@ -418,7 +418,8 @@ This is a non-binding view of ongoing directions, not a release schedule:
   or not) on loopback plain HTTP; a run points `ANTHROPIC_BASE_URL` at it and presents its
   run capability as the API key. Each request is authorized by the daemon endpoint while
   the run is live, then re-sent with the operator's credential; a stream is re-checked
-  every `QUORUM_INFERENCE_AUTH_RECHECK_SECS` (default 60) and cut once its run ends.
+  every `QUORUM_INFERENCE_AUTH_RECHECK_SECS` (default 60) and cut once its run ends, or
+  once two intervals pass without the daemon confirming the run is live.
   Nothing starts the forwarder automatically, and its logs carry metadata only.
   - **Request allowlist.** Anything not listed is refused with 400, so a request cannot
     make the upstream act for the run. Top-level fields: `model`, `max_tokens`, `messages`,
@@ -455,8 +456,8 @@ This is a non-binding view of ongoing directions, not a release schedule:
     only and `compaction` blocks in replayed assistant content. The upstream bills a
     compaction step outside a response's top-level usage and itemizes it under
     `usage.iterations`; the forwarder charges the itemized total, and doubles the input
-    part of the hold for such requests. A streamed response that does not itemize its
-    steps is charged its whole hold.
+    part of the hold for such requests. A response to such a request that does not
+    itemize its steps, streamed or not, is charged its whole hold.
   - **Limits.** 16 connections; 8 MiB request bodies (requests are text only; about twice
     a million-token conversation); a 64 KiB request head; a connection takes no new
     request after one hour. Worst case, each connection buffers one body at about four

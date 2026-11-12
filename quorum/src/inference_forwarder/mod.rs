@@ -66,6 +66,9 @@ const MAX_HTTP_CONNECTIONS: usize = 16;
 /// Daemon endpoint exchanges in flight at once, kept well under the
 /// endpoint's own connection slots.
 const MAX_ENDPOINT_EXCHANGES: usize = 8;
+/// Further endpoint exchanges kept for re-checking open streams. With the
+/// request-path exchanges this stays under the endpoint's connection slots.
+const MAX_RECHECK_EXCHANGES: usize = 4;
 /// A connection must deliver a complete request head within this bound.
 const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// An authorized request must deliver its whole body within this bound.
@@ -181,6 +184,9 @@ struct Forwarder {
     sweeping: AtomicBool,
     ledger: Arc<Ledger>,
     endpoint_slots: tokio::sync::Semaphore,
+    /// Endpoint exchanges reserved for re-checking open streams, so a burst
+    /// of new requests cannot starve them.
+    recheck_slots: tokio::sync::Semaphore,
     tls: Option<tokio_rustls::TlsConnector>,
 }
 
@@ -229,6 +235,14 @@ impl Forwarder {
     /// repository. Nothing is cached: a revoked or finished run is refused on
     /// its next request.
     async fn authorize(&self, capability: &str) -> std::result::Result<Run, AuthFailure> {
+        self.authorize_with(capability, &self.endpoint_slots).await
+    }
+
+    async fn authorize_with(
+        &self,
+        capability: &str,
+        slots: &tokio::sync::Semaphore,
+    ) -> std::result::Result<Run, AuthFailure> {
         let body = serde_json::to_vec(&json!({
             "version": PROTOCOL_VERSION,
             "capability": capability,
@@ -236,7 +250,7 @@ impl Forwarder {
         }))
         .map_err(|_| AuthFailure::Unavailable)?;
         let exchange = async {
-            let _slot = self.endpoint_slots.acquire().await;
+            let _slot = slots.acquire().await;
             let mut stream = UnixStream::connect(&self.endpoint).await?;
             stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
             stream.write_all(&body).await?;
@@ -689,12 +703,12 @@ struct Charge {
 impl Charge {
     /// Close the hold against what the upstream reported and return the
     /// run's settled total. A response without closing usage is charged the
-    /// whole hold. So is a streamed response to a request that allowed
-    /// compaction unless the stream itemized its steps: the compaction step
-    /// is billed outside the top-level counts, and without the itemization
-    /// there is no telling whether one ran.
-    fn close(self, meter: &Meter, streamed: bool) -> u64 {
-        let accounted = !(self.compaction && streamed) || meter.itemized();
+    /// whole hold. So is any response to a request that allowed compaction
+    /// unless it itemized its steps: a compaction step is billed outside the
+    /// top-level counts, and without the itemization there is no telling
+    /// whether one ran.
+    fn close(self, meter: &Meter) -> u64 {
+        let accounted = !self.compaction || meter.itemized();
         if meter.final_seen() && accounted {
             self.reservation.settle(meter.billed())
         } else {
@@ -812,6 +826,7 @@ impl Forwarder {
                 idle_timeout: self.upstream_timeout,
                 recheck: Box::pin(tokio::time::sleep(self.auth_recheck)),
                 checking: None,
+                unverified: Box::pin(tokio::time::sleep(self.auth_recheck * 2)),
                 forwarder: Arc::clone(self),
                 capability: capability.to_string(),
                 meter: Meter::default(),
@@ -879,7 +894,7 @@ impl Forwarder {
             {
                 meter.observe_final(usage);
             }
-            charge.close(&meter, false)
+            charge.close(&meter)
         } else {
             charge.reservation.release()
         };
@@ -925,8 +940,10 @@ struct MeteredStream {
     idle_timeout: Duration,
     /// When the stream's run is next checked with the daemon.
     recheck: Pin<Box<tokio::time::Sleep>>,
-    /// A check in progress; resolves to whether the run was rejected.
-    checking: Option<Pin<Box<dyn Future<Output = bool> + Send>>>,
+    /// A check in progress.
+    checking: Option<Pin<Box<dyn Future<Output = Option<AuthFailure>> + Send>>>,
+    /// Fires when the run has gone too long without a successful check.
+    unverified: Pin<Box<tokio::time::Sleep>>,
     forwarder: Arc<Forwarder>,
     capability: String,
     meter: Meter,
@@ -956,28 +973,38 @@ impl HttpBody for MeteredStream {
             return Poll::Ready(None);
         }
         // A stream must not outlive its run: ask the daemon again at each
-        // interval and end the stream once the run is rejected. A daemon
-        // that cannot be reached leaves the stream to its other bounds.
+        // interval and end the stream once the run is rejected. This fails
+        // closed: a stream whose run has not been confirmed live for two
+        // intervals is ended too, whether the daemon is unreachable or the
+        // checks are not completing.
         if this.checking.is_none() && this.recheck.as_mut().poll(cx).is_ready() {
             let forwarder = Arc::clone(&this.forwarder);
             let capability = this.capability.clone();
             this.checking = Some(Box::pin(async move {
-                matches!(
-                    forwarder.authorize(&capability).await,
-                    Err(AuthFailure::Rejected)
-                )
+                forwarder
+                    .authorize_with(&capability, &forwarder.recheck_slots)
+                    .await
+                    .err()
             }));
         }
         if let Some(check) = this.checking.as_mut() {
-            if let Poll::Ready(rejected) = check.as_mut().poll(cx) {
+            if let Poll::Ready(outcome) = check.as_mut().poll(cx) {
                 this.checking = None;
-                if rejected {
-                    return Poll::Ready(Some(Ok(this.fail("run is no longer live"))));
+                let now = tokio::time::Instant::now();
+                let interval = this.forwarder.auth_recheck;
+                match outcome {
+                    Some(AuthFailure::Rejected) => {
+                        return Poll::Ready(Some(Ok(this.fail("run is no longer live"))));
+                    }
+                    Some(AuthFailure::Unavailable) => {}
+                    None => this.unverified.as_mut().reset(now + interval * 2),
                 }
-                let next = tokio::time::Instant::now() + this.forwarder.auth_recheck;
-                this.recheck.as_mut().reset(next);
+                this.recheck.as_mut().reset(now + interval);
                 let _ = this.recheck.as_mut().poll(cx);
             }
+        }
+        if this.unverified.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Some(Ok(this.fail("run could not be confirmed live"))));
         }
         let Some(inner) = this.inner.as_mut() else {
             return Poll::Ready(None);
@@ -1033,10 +1060,7 @@ impl Drop for MeteredStream {
         // Runs whether the stream completed, failed, or the caller hung up.
         // Only a stream that delivered its closing usage is charged what it
         // used; any other ending is charged the hold.
-        let run_total = self
-            .charge
-            .take()
-            .map(|charge| charge.close(&self.meter, true));
+        let run_total = self.charge.take().map(|charge| charge.close(&self.meter));
         self.log.emit(200, self.meter.counts(), run_total);
     }
 }
@@ -1186,6 +1210,7 @@ impl Forwarder {
             sweeping: AtomicBool::new(false),
             ledger: Arc::new(Ledger::new(cap, max_in_flight, MAX_TRACKED_RUNS)),
             endpoint_slots: tokio::sync::Semaphore::new(MAX_ENDPOINT_EXCHANGES),
+            recheck_slots: tokio::sync::Semaphore::new(MAX_RECHECK_EXCHANGES),
             tls,
         })
     }

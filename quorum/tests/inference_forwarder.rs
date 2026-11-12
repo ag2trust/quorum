@@ -207,6 +207,14 @@ fn serve_upstream(
                         {"type": "compaction", "input_tokens": 400, "output_tokens": 60},
                         {"type": "message", "input_tokens": 30, "output_tokens": 5}]}}),
         ),
+        // A compacting response that does not itemize its steps.
+        "model-compacting-plain" => respond(
+            &mut stream,
+            "200 OK",
+            &json!({"id": "msg_1", "type": "message", "role": "assistant",
+                    "content": [{"type": "text", "text": COMPLETION}],
+                    "usage": {"input_tokens": 30, "output_tokens": 5}}),
+        ),
         "model-flood-stream" => {
             // Far more than the socket buffers of a peer that is not reading.
             let _ = stream.write_all(STREAM_HEAD.as_bytes());
@@ -267,6 +275,8 @@ struct FakeEndpoint {
     _dir: tempfile::TempDir,
     path: PathBuf,
     live: Arc<Mutex<HashSet<String>>>,
+    /// While set, connections are closed without an answer.
+    down: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FakeEndpoint {
@@ -278,9 +288,14 @@ impl FakeEndpoint {
             live.iter().map(|run| (*run).to_string()).collect(),
         ));
         let known = Arc::clone(&live);
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unavailable = Arc::clone(&down);
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
+                if unavailable.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue;
+                }
                 let mut prefix = [0_u8; 4];
                 if stream.read_exact(&mut prefix).is_err() {
                     continue;
@@ -311,7 +326,12 @@ impl FakeEndpoint {
             _dir: dir,
             path,
             live,
+            down,
         }
+    }
+
+    fn go_down(&self) {
+        self.down.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn finish(&self, run: &str) {
@@ -1357,20 +1377,23 @@ fn compaction_is_admitted_only_when_enabled_and_its_usage_is_charged() {
         ["compact-2026-01-12"]
     );
 
-    // A streamed response that does not itemize its steps cannot show
-    // whether a compaction ran, so it is charged its whole hold: twice the
-    // input bound, plus max_tokens.
-    let mut streamed = compacting("model-stream", json!([{"type": "compact_20260112"}]));
-    streamed["stream"] = json!(true);
-    let reply = send(
-        addr,
-        "POST",
-        "/v1/messages",
-        &headers,
-        &streamed.to_string(),
-    );
+    // A response that does not itemize its steps cannot show whether a
+    // compaction ran, so it is charged its whole hold, twice the input bound
+    // plus max_tokens, whether it was streamed or not.
+    let edits = json!([{"type": "compact_20260112"}]);
+    let plain = compacting("model-compacting-plain", edits.clone());
+    let reply = send(addr, "POST", "/v1/messages", &headers, &plain.to_string());
     assert_eq!(reply.status, 200, "{}", reply.body);
-    let streamed_hold = 2 * (streamed.to_string().len() as u64 + 1024) + 64;
+    let plain_hold = 2 * (plain.to_string().len() as u64 + 1024) + 64;
+    let mut streamed = compacting("model-stream", edits);
+    streamed["stream"] = json!(true);
+    let body = streamed.to_string();
+    let reply = send(addr, "POST", "/v1/messages", &headers, &body);
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let streamed_hold = 2 * (body.len() as u64 + 1024) + 64;
+    // A request that does not ask for compaction is charged what it used.
+    let reply = post(addr, "run-a", &message("model-json"));
+    assert_eq!(reply.status, 200, "{}", reply.body);
 
     let logs = forwarder.stop();
     let total = |model: &str| {
@@ -1381,7 +1404,18 @@ fn compaction_is_admitted_only_when_enabled_and_its_usage_is_charged() {
         line.rsplit_once("run_total_tokens=").unwrap().1.to_string()
     };
     assert_eq!(total("model-compacting"), "495");
-    assert_eq!(total("model-stream"), (495 + streamed_hold).to_string());
+    assert_eq!(
+        total("model-compacting-plain"),
+        (495 + plain_hold).to_string()
+    );
+    assert_eq!(
+        total("model-stream"),
+        (495 + plain_hold + streamed_hold).to_string()
+    );
+    assert_eq!(
+        total("model-json"),
+        (495 + plain_hold + streamed_hold + 15).to_string()
+    );
 }
 
 #[test]
@@ -1534,6 +1568,68 @@ fn a_stream_is_cut_when_its_run_is_no_longer_live() {
     assert!(received.contains("run is no longer live"), "{received}");
     assert!(!received.contains("message_stop"), "{received}");
     forwarder.stop();
+}
+
+#[test]
+fn a_stream_is_cut_when_its_run_can_no_longer_be_confirmed_live() {
+    let endpoint = FakeEndpoint::start(&["run-a"]);
+    let upstream = FakeUpstream::start();
+    let forwarder = Forwarder::start(
+        &endpoint.path,
+        &upstream.url(),
+        &[("QUORUM_INFERENCE_AUTH_RECHECK_SECS", "1")],
+    );
+    let addr = forwarder.addr;
+    let mut body = message("model-gated-stream");
+    body["stream"] = json!(true);
+    let body = body.to_string();
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    write!(
+        stream,
+        "POST /v1/messages HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         x-api-key: run-a\r\nContent-Length: {body_len}\r\n\r\n{body}",
+        body_len = body.len()
+    )
+    .unwrap();
+    let mut received = String::new();
+    let mut buffer = [0_u8; 4096];
+    while !received.contains("message_start") {
+        let read = stream.read(&mut buffer).unwrap();
+        assert!(read > 0, "stream closed early: {received:?}");
+        received.push_str(std::str::from_utf8(&buffer[..read]).unwrap());
+    }
+    // The daemon endpoint stops answering. Nothing says the run ended, but
+    // nothing confirms it is live either: the stream is ended once two
+    // recheck intervals pass without a successful check.
+    endpoint.go_down();
+    let started = Instant::now();
+    let mut rest = String::new();
+    stream.read_to_string(&mut rest).unwrap();
+    received.push_str(&rest);
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(received.contains("event: error"), "{received}");
+    assert!(
+        received.contains("run could not be confirmed live"),
+        "{received}"
+    );
+    assert!(!received.contains("message_stop"), "{received}");
+    // The stream never reported closing usage, so its hold is kept: the
+    // reported input (10) plus its whole max_tokens (64).
+    let logs = forwarder.stop();
+    assert!(
+        logs.iter()
+            .any(|line| line.contains("model=model-gated-stream")
+                && line.ends_with("run_total_tokens=74")),
+        "{logs:?}"
+    );
 }
 
 /// A raw request on its own connection; `None` when the server closed or
