@@ -5,12 +5,18 @@
 **Spec:** `docs/2026-11-12-sandboxed-workspace-technical-spec.md`
 **Implementation base:** `origin/develop` at `b090a1a`
 
-Fourteen slices. Each is one PR against `develop` with its own tests and leaves `develop`
-green. Slices 1–4 harden today's behavior in both modes. Slices 5–12 build the clone model
-beside the linked-worktree model, which stays the default and is unchanged. Slice 13 migrates
-and flips the default. Slice 14 deletes the legacy path one release later.
+The plan is one prerequisite and eighteen slices. Each slice is one PR against `develop` with
+its own tests, and leaves `develop` green.
 
-Until slice 13, `workspace_mode = "clone"` starts only with the hidden test-only flag
+- **Prerequisite and slices 1–6** harden today's behavior in both modes. That includes the worst
+  linked-mode paths, so they do not wait for the flip.
+- **Slices 7–15** build the clone model beside the linked-worktree model, which stays the
+  default.
+- **Slice 16** migrates.
+- **Slice 17** flips the default.
+- **Slice 18** deletes the legacy path one release later.
+
+Until slice 17, `workspace_mode = "clone"` starts only with the hidden test-only flag
 `--incomplete-clone-mode`, following the existing hidden-seam precedent (`--merge-cmd`).
 Operators cannot enable a partial clone mode.
 
@@ -18,13 +24,13 @@ Operators cannot enable a partial clone mode.
 
 Slice 1 adds `quorum/tests/support/hostile_git.rs`. Later slices reuse it.
 
-- **Tripwire.** Every planted command appends its name to a file under a per-test
-  `TRIPWIRE` directory. Every hostile test ends by asserting the directory is empty for
-  daemon-side operations, and lists what fired for run-side operations, which are expected to
-  fire.
+- **Tripwire.** Every planted command appends its name to a file under a per-test `TRIPWIRE`
+  directory. Each hostile test ends by asserting either of these:
+  - for daemon-side operations, the directory is empty;
+  - for run-side operations, which are expected to fire, it lists what fired.
 - **`plant_workspace(dir)`.**
   - Hooks: `post-checkout`, `pre-push`, `reference-transaction`, `post-merge`,
-    `pre-merge-commit`, `pre-commit`, `post-rewrite`, `pre-auto-gc`.
+    `pre-merge-commit`, `pre-commit`, `post-rewrite`, `post-index-change`, `pre-auto-gc`.
   - `.git/config` keys:
     - `core.hooksPath`, `core.fsmonitor`, `core.sshCommand`, `core.pager`, `core.editor`,
       `core.askPass`, `core.alternateRefsCommand`
@@ -34,398 +40,552 @@ Slice 1 adds `quorum/tests/support/hostile_git.rs`. Later slices reuse it.
     - `credential.helper`
     - `remote.origin.url`, `remote.origin.pushurl`, `remote.origin.uploadpack`,
       `remote.origin.receivepack`
+    - `uploadpack.hideRefs`
     - `include.path` pointing at a second planted file that sets `core.hooksPath`
     - `includeIf.gitdir:…`
-  - Tree content:
-    - `.gitattributes` with `* filter=t diff=t merge=t`
+  - Other planted state:
+    - `.git/info/attributes`
+    - a `.gitattributes` in the tree with `* filter=t diff=t merge=t`
     - `.githooks/pre-push` with `core.hooksPath=.githooks`
     - an executable `preflight.sh` tripwire
-    - a planted executable named like each provider binary at the workspace root
-- **`plant_operator(home)`.** The same keys in a global `.gitconfig` under a test `HOME`.
-- **`plant_repo_dir(dir)`.** The same keys in the operator checkout's config and `hooks/`.
+    - a symlinked repository instruction file and provider project-config file pointing at a
+      sentinel secret
+    - an executable named like each provider binary at the workspace root
+- **`plant_operator(home)`.** The same keys in a global `.gitconfig` under a test `HOME`, plus
+  `url.<decoy>.insteadOf` and `url.<decoy>.pushInsteadOf` rewriting the remote URL.
+- **`plant_repo_dir(dir)`.** The same keys in the operator checkout's config, `hooks/`,
+  `info/attributes`, and each `worktrees/*/config.worktree`.
+- **`plant_parent_env()`.** The daemon's own environment sets:
+  - `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`;
+  - `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`;
+  - `GIT_EXEC_PATH` (a directory holding a tripwire `git-*`);
+  - `GIT_TEMPLATE_DIR`;
+  - `GIT_CONFIG_PARAMETERS`, and `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0`
+    (setting `core.hooksPath`);
+  - `GH_TOKEN`.
+- **`hostile_bundle` builders.** Hand-built bundles: header text plus a pack written with
+  `pack-objects` from an attacker repository using `hash-object --literally` and
+  `mktree --missing`. Cases:
+  - foreign blob;
+  - foreign merge parent;
+  - foreign `REF_DELTA` base;
+  - delta bomb, a small delta declaring a multi-GiB result;
+  - zlib stream longer than its declared size;
+  - extra refs, a tag, `HEAD`;
+  - no prerequisite;
+  - an unseeded prerequisite;
+  - v3 `@filter`;
+  - an object-format mismatch.
+
+**CI.** A job runs every hostile suite on the git floor (2.43) as well as on the runner's
+current git. The prerequisite adds it.
+
+## Prerequisite. CI gate for this repository (`main` hotfix, synced to `develop`)
+
+Move `.githooks/pre-push`'s checks into required CI jobs, and add the floor-git job:
+
+- base-branch check;
+- `cargo fmt --check`;
+- the job running the hostile suites on the floor git.
+
+Nothing else may land before this, because slice 2 removes the hook from daemon pushes.
+
+Verification: CI rejects a PR with `fmt` drift and a PR branched from a feature branch.
 
 ## 1. Hardened git constructor
 
-Add `quorum_core::git::{LocalGit, TransportGit}`, the two profiles in the spec's "Hardened git
-invocation" section:
+Add `quorum_core::git::{LocalGit, TransportGit}`, the spec's two profiles:
 
-- cleared environment and allowlist;
-- the full `-c` list;
+- cleared environment and allowlists, including the `inherit` allowlist;
+- the `-c` list;
 - `--git-dir` only, run from `<state dir>/empty`;
 - `--end-of-options`;
 - SHA and ref validators;
-- startup checks for the empty directories and the git version.
+- startup checks for the empty directories and the git floor, applied wherever the constructors
+  run;
+- the `inherit` URL-rewrite check.
 
-This slice is additive and nothing calls the new constructors yet.
+Additive; nothing calls it yet.
 
 Tests:
 
-- Unit tests: exact argv and env for both profiles. `inherit` keeps `HOME` and `SSH_AUTH_SOCK`
-  and strips every `GIT_*` variable. `hermetic` clears both.
-- `plant_operator` plus a planted `GIT_CONFIG_PARAMETERS` in the parent env. With the local
-  profile, `rev-parse`, `update-ref`, `fetch` from a `file://` repo, `diff`, and `archive` all
-  succeed and the tripwire is empty. A `reference-transaction` hook in the global
-  `core.hooksPath` does not fire.
-- Protocol: the local profile rejects `ext::sh -c …`, `https://`, and `ssh://`. The transport
+- **Unit:** exact argv and env for both profiles. `inherit` passes only its allowlist, never
+  `GH_TOKEN`, `GITHUB_TOKEN`, `QUORUM_*`, `GIT_*`, `GIT_SSH_COMMAND`, or `GIT_ASKPASS`.
+  `hermetic` clears everything.
+- **Planted environment:** `plant_operator` plus `plant_parent_env`. With the local profile, all
+  of these succeed with the tripwire empty: `rev-parse`, `update-ref`, a `file://` fetch,
+  `diff`, `archive`, `index-pack --strict`. In particular:
+  - a `reference-transaction` hook in the global `core.hooksPath` does not fire;
+  - no inherited `GIT_*` variable is honored;
+  - the tripwire `git-*` in `GIT_EXEC_PATH` never runs;
+  - `GH_TOKEN` is absent from the child's environment, as a recorded `env` dump shows.
+- **Protocol:** the local profile rejects `ext::sh -c …`, `https://`, and `ssh://`. The transport
   profile for an `https` remote rejects `file://` and `ext::`.
-- `--end-of-options`: a ref argument `--upload-pack=…` is passed as data, not as an option.
-- Version gate: a fake `git` reporting `2.37` fails startup with exit 2.
+- **URL rewriting:** `plant_operator`'s `insteadOf` makes `--get-url` differ, so startup fails
+  with exit 2. `pushInsteadOf` is detected by the config check.
+- **`--end-of-options`:** a ref argument `--upload-pack=…` is passed as data, not as an option.
+- **Version gate:** a fake `git` reporting `2.42` makes clone-mode startup fail with exit 2, and
+  makes linked mode log a warning.
 
-## 2. Untrusted-file reader and symlink-safe removal
+## 2. Early linked-mode hardening
+
+After the prerequisite, route the shared `git_command` through the hardened constructor's
+command-line set in both modes:
+
+- an empty `core.hooksPath`, the protocol allowlist, and `GIT_ATTR_SOURCE` for commands that do
+  not check out files;
+- a push URL from `remote_url` (or derived once at startup), replacing R1, with the rewrite
+  check;
+- removal of `QUORUM_CONTINUATION_BASE_BRANCH` and the `hook-stdout` diagnostic section.
+
+Teardown and startup GC stop snapshotting worktrees (R13's `git add -A`) and retire worktree
+directories instead, then `git worktree prune` in `repo_dir`. LFS detection parks with
+`lfs-unsupported` before any push.
+
+Tests:
+
+- **Push from a hostile worktree (linked mode):**
+  - `plant_workspace` in the worktree, plus `core.hooksPath=.githooks` and a `preflight.sh`
+    tripwire in the tree, plus `plant_repo_dir`;
+  - the daemon push succeeds to the configured URL;
+  - the decoy URL in the worktree's `remote.origin.url` is untouched;
+  - the tripwire has no `pre-push`, `reference-transaction`, or `preflight.sh` entry.
+- **Startup GC:** GC of a worktree with planted `.gitattributes`, `filter.t.clean`, and
+  `info/attributes` fires no filter. The directory is retired, not deleted.
+- **LFS:** a repository with `filter=lfs` in `.gitattributes` parks the publication with
+  `lfs-unsupported`, and nothing is pushed.
+- **Existing tests:** all linked-mode publication and cleanup tests stay green.
+
+## 3. Untrusted-file reader and symlink-safe removal
 
 Add `quorum/src/untrusted_fs.rs`:
 
 - `open_regular_beneath(root_fd, rel, cap)`, component-wise `openat` with `O_NOFOLLOW`, or
   `openat2` on Linux;
-- `copy_capped_to_private(…)`, which writes the copy `O_EXCL`, mode `0600`;
-- `remove_tree(root)`, which refuses a symlink root and wraps `remove_dir_all`.
+- `copy_capped_to_private(…)`, which writes a temp file `O_EXCL` with mode `0600`, `fsync`s it,
+  and renames it;
+- `remove_tree(root)`, which refuses a symlink root, restores owner write bits on real
+  directories through no-follow descriptors, skips symlinks, and wraps `remove_dir_all`.
 
-Adopt it for HARDEN rows H1 and H2 (provider project-config discovery and the auth-state
-copy-back).
+Adopt it for HARDEN rows H1, H2, and H3. Bound H1's discovery walk to the workspace root.
 
 Tests:
 
-- final symlink, intermediate symlinked directory, `..` component;
-- FIFO, which must return promptly without blocking;
-- hardlink to a file outside the root (`st_nlink == 2`);
-- sparse file over the cap;
-- file growing past the cap during the copy, written by a concurrent writer;
-- directory where a file is expected.
-- `remove_tree`: a tree containing a symlink to a sentinel directory outside the root leaves the
-  sentinel intact, and a symlink root is refused.
-- H1: a project `.mcp.json` symlinked to an outside file is refused, and an oversized one is
-  refused with a clear launch failure. Existing H1 behavior tests stay green.
-- H2: an invocation-home auth file replaced by a symlink to a sentinel secret does not copy the
-  sentinel into the durable home.
+- **Reader:** each of these is refused:
+  - final symlink, intermediate symlinked directory, `..` component;
+  - FIFO, which must return promptly without blocking;
+  - hardlink to an outside file (`st_nlink == 2`);
+  - sparse file over the cap;
+  - file growing past the cap during the copy;
+  - directory where a file is expected.
+- **Removal:**
+  - a tree with a symlink to an outside sentinel leaves the sentinel intact;
+  - a tree whose directories are `0500`, removed by the run's own `chmod`, is removed fully;
+  - a symlink inside it pointing at a sentinel file keeps the sentinel's mode unchanged;
+  - a symlink root is refused.
+- **H1:** a provider project-config file symlinked to a sentinel is refused, as is an
+  oversized one. With the workspace's `.git` deleted and a planted config in the parent
+  directory, the walk never reads the parent.
+- **H2:** an invocation-home auth file replaced by a symlink to a sentinel secret does not copy
+  the sentinel into the durable home.
+- **H3:** a symlinked repository instruction file pointing at a sentinel secret never reaches the
+  restricted run's arguments or prompt. A regular one is passed as bytes.
 
-## 3. `gh` and repository-less `git` from an empty directory
+## 4. `gh` and repository-less `git` from an empty directory
 
 Add one `GhCommand` constructor. It runs from `<state dir>/empty` with mandatory `--repo`, and
 sets `GH_REPO`, `GIT_DIR=<empty>/.none`, `GIT_CEILING_DIRECTORIES`, and the prompt and update
-switches. Port EMPTY-DIR rows E1–E3 and E5–E10. Port E4 (self-update `ls-remote`) and E11
-(`check-ref-format`) to the local or transport git profile with an explicit URL. This applies
-in both modes.
-
-`quorum serve` stops calling `gh repo view` in `repo_dir`. It uses `repo`, then
-`parse_repo_from_url` on the configured or derived URL.
+switches. Port EMPTY-DIR rows E1–E3 and E5–E10. Port E4 and E11 to the local or transport
+profile. `quorum serve` stops calling `gh repo view` in `repo_dir`. This applies in both modes.
 
 Tests:
 
-- A fake `gh` on `PATH` records `cwd`, argv, and env. Every daemon `gh` call site, driven by the
-  existing integration tests (publication, merge, collector, cleanup, branch sync, drift), has
-  `cwd` equal to the empty directory, carries `--repo` or `GH_REPO`, and has `GIT_DIR` pointing
-  at the nonexistent path.
-- With the daemon's cwd and `repo_dir` set to a repository whose planted `remote.origin.url`
-  names a different `owner/name`, every recorded call still targets the configured repository.
-- `gh api repos/{owner}/{repo}/…` calls carry `GH_REPO`, so the placeholders cannot come from a
-  remote.
-- E11: `validate_target_branch` gives the same accept and reject results as today, and spawns
-  `git` from the empty directory.
+- **Fake `gh`:** a fake `gh` on `PATH` records `cwd`, argv, and env. For every daemon `gh` call
+  site, driven by existing integration tests:
+  - `cwd` is the empty directory;
+  - `--repo` or `GH_REPO` is present;
+  - `GIT_DIR` points at the nonexistent path.
+- **Decoy remote:** with `repo_dir` and the daemon's cwd naming a decoy repository through
+  `remote.origin.url`, every call still targets the configured repository. `gh api` calls carry
+  `GH_REPO`.
+- **Real `gh` (owner-run contract test, following the guide's real-binary rule):** each
+  subcommand Quorum uses runs against a scratch GitHub repository with the empty-directory
+  environment and `GIT_DIR=…/.none`. The subcommands are `pr create`, `pr view`, `pr list`,
+  `pr close`, `pr checks`, `pr comment`, `pr merge`, `pr review`, `repo view`, and `api`. Each
+  must succeed, and none may report a git discovery error.
+- **E11:** `validate_target_branch` gives the same accept and reject results as today, spawned
+  from the empty directory.
 
-## 4. Provider executable resolution
+## 5. Provider executable and provider-home resolution
 
-REMOVE row R18. `routed_provider_executable_in_path` resolves a bare name only through absolute
-`PATH` entries and accepts a configured path only when it is absolute. Relative `PATH` entries
-and relative configured paths are rejected with the existing fallback launch failure. This
-applies in both modes.
+REMOVE rows R18 and R19:
+
+- bare names resolve only through absolute `PATH` entries;
+- a configured executable path must be absolute;
+- a provider-home path must be absolute.
 
 Tests:
 
-- `PATH=.:<bin>` with a planted executable at the workspace root resolves to `<bin>`, never the
-  planted file.
-- `PATH=::<bin>` behaves the same.
-- A relative `agent_bin` fails the fallback launch with `NonFailover`, and the tripwire is
-  empty.
+- `PATH=.:<bin>` and `PATH=::<bin>`, with a planted executable at the workspace root, resolve to
+  `<bin>`.
+- A relative `agent_bin` fails the fallback launch with `NonFailover`.
+- A relative provider-home setting is refused.
+- In all three cases the tripwire is empty.
 
-## 5. Configuration and the private repository
+## 6. Planner deliverable-path classification
+
+Move M28. In clone mode `classify_writable_deliverable_path_blocking` walks the frozen tree in
+the private repository with `ls-tree`, refusing symlink (`120000`) and gitlink (`160000`)
+components. Linked mode keeps the working-tree check. This slice is gated on the private
+repository from slice 7, so it lands after slice 7. It is listed here because it is a narrow
+audit fix.
+
+Tests:
+
+- The frozen tree has `docs` as a symlink to `/etc`, so the deliverable `docs/new.md` is
+  refused.
+- A planted symlink in `repo_dir`'s working tree has no effect in clone mode.
+- The existing classification tests stay green in linked mode.
+
+## 7. Configuration and the private repository
 
 Add these keys to the parser:
 
 - `workspace_mode`, `private_repo`, `remote_url`, `git_transport_config`;
-- `[workspace_limits]`.
+- `[workspace_limits]`, including `max_objects` and `max_inflated_bytes`;
+- `git_fsck_ignore`.
 
 Add `PrivateRepo`, which owns its manager mutex, and its operations:
 
-- create with an empty template and Quorum-written config;
-- verify at startup (unexpected config keys, `hooks/`, `info/attributes`, alternates, overlap
-  with `worktree_base`, `log_dir`, or `repo_dir`, and the staging device ID);
-- `remote_url` validation and the one-time derivation via `git config --file`;
-- `fetch_branch`, `fetch_pr_head` (with fsck), `resolve`, and `is_ancestor`.
-
-Linked-worktree startup is unchanged. `clone` mode starts only with `--incomplete-clone-mode`.
+- create, with the config allowlist that accepts git-written platform keys;
+- verify at startup (hooks, `info/attributes`, `info/grafts`, `shallow`, both alternates files,
+  overlap, staging device);
+- URL validation and derivation;
+- `fetch_branch` and `fetch_pr_head` with fsck and `git_fsck_ignore`;
+- `resolve` and `is_ancestor`.
 
 Tests:
 
-- URL validation. Accepted: `https`, `ssh`, scp-like, and `file`. Rejected with exit 2:
-  `ext::`, `fd::`, `-oProxyCommand=…`, an embedded `user:pass@`, CR/LF, and an empty URL.
-- Derivation reads only `<repo_dir>/.git/config`. A planted `include.path` in that file is not
-  followed. A `repo_dir` whose `.git` is a file requires an explicit `remote_url`.
-- Startup refuses each tampered private-repository state with exit 3 and a message naming it:
-  extra config key, hook file, `info/attributes`, alternates, overlap, cross-device staging.
-- `fetch_pr_head` of a fork-like source containing an fsck-invalid tree (an entry named `.git`,
-  or a `..` path, built with `git mktree --missing` in a fixture) fails with `fsck-failed`, and
-  no ref is created.
-- With `plant_repo_dir` and `plant_operator` active, `fetch_branch` honors neither, and the
-  tripwire is empty, under both `inherit` and `hermetic`. `inherit` still overrides the planted
-  global `core.hooksPath` and `core.fsmonitor`.
+- **URL validation.** Accepted: `https`, `ssh`, scp-like, `file`. Rejected with exit 2:
+  `ext::`, `fd::`, `-oProxyCommand=…`, `user:pass@`, CR/LF, empty.
+- **Derivation:** reads only `<repo_dir>/.git/config` and ignores a planted `include.path` there.
+  A `.git` file instead of a directory requires an explicit URL.
+- **Tampered state:** startup refuses each tampered private-repository state with exit 3:
+  - an unknown config key;
+  - a hook file;
+  - `info/attributes`, `info/grafts`, `shallow`, `objects/info/alternates`, or
+    `objects/info/http-alternates`;
+  - overlap, or staging on another device.
 
-## 6. Bundle header parser and verified import
+  Platform keys written by `git init` (`core.ignorecase`, `core.precomposeunicode`,
+  `extensions.objectformat`) are accepted.
+- **fsck:** `fetch_pr_head` of a source containing an fsck-invalid tree fails, and no ref is
+  created. The same history fetched with its message ID in `git_fsck_ignore` succeeds.
+- **Planted operator and checkout:** under `plant_repo_dir` and `plant_operator`, `fetch_branch`
+  leaves the tripwire empty under both `inherit` and `hermetic`.
 
-Add `bundle::parse_header` (pure Rust). Add
-`PrivateRepo::import_bundle(staged_copy, Expectation { task_id, run_id, branch, start, exclude, limits })`,
-implementing verification rules 4–15 from the spec, quarantine-ref promotion, and prune on
-rejection.
+## 8. Pack pre-scan, quarantined indexing, and verified import
 
-Tests (each rejection asserts the exact rule code, that no `refs/quorum/tasks/*` ref moved, that
-`refs/quorum/import/*` is empty, and that `git count-objects` shows no retained loose objects
-after prune):
+Add `bundle::parse_header` and `pack::prescan`. Both are pure Rust; `prescan` adds a `flate2`
+dependency with the pure-Rust backend. Add
+`PrivateRepo::import_bundle(staged_copy, Expectation { task_id, run_id, branch, starts, exclude, limits })`,
+implementing spec rules 4–16:
 
-- **Extra refs:** `bundle create --all`, which carries `HEAD`, another branch, and the task
-  branch. Rule: `unexpected-refs`.
-- **Other branch only:** a bundle of `refs/heads/other`. Rule: `unexpected-refs`.
-- **Task branch plus a tag.** Rule: `unexpected-refs`.
-- **Unrelated history:** a bundle from an unrelated repository with no prerequisites. Rule:
-  `no-prerequisite`. The same bundle exported with a forged prerequisite that is present but
-  not seeded: rule `foreign-prerequisite`.
-- **Unrelated root through a merge:** the task branch merges an unrelated root
-  (`--allow-unrelated-histories`) and descends from the base. Rule: `new-root`.
-- **Prerequisite not in the private repository:** exported against a commit the private
-  repository never had. Rule: `missing-prerequisite`.
-- **Rewritten history on rework:** the tip does not descend from the last imported head. Rule:
-  `unrelated-history`.
-- **No new commits:** `bundle create` refuses an empty bundle. A hand-built header whose tip
-  equals the start gets rule `no-new-commits`.
-- **Oversized:**
-  - a staged copy over `max_bundle_bytes` (rule `oversized-bundle`);
-  - a highly compressible 200 MiB blob inside a small bundle (rule `oversized-blob`, with bounded
-    memory checked by the test);
-  - `max_commits + 1` commits (rule `too-many-commits`).
-- **Malformed header:** a v1 or `# v4` header, a 65 KiB header line, a NUL in a ref name,
-  invalid hex, and a v3 `@filter=blob:none` capability. Rules: `malformed-header` and
-  `unsupported-bundle`. An `@object-format` mismatch: `unsupported-bundle`.
-- **fsck:** a bundle carrying a tree with a `.gitmodules` URL starting with `-`, or a `.git`
-  entry. Rule: `fsck-failed`.
-- **Hostile planting:** `plant_operator` plus a workspace planted with every hook and key
-  produces a valid bundle. The import succeeds and the tripwire shows no daemon-side firing.
-  Only the run-side export, performed by the test, may fire planted workspace hooks.
-- **Idempotent replay:** importing the same staged copy twice for the same run ID gives one
-  promotion and a clean second outcome.
+- quarantine `index-pack --strict --fix-thin`;
+- provenance with the single `bad-prerequisite` code;
+- external-delta-base and object-membership checks;
+- history rules, including descent from every start;
+- resource limits and classification;
+- ordered pack promotion and startup cleanup of leftover quarantines.
 
-## 7. Hardened publication from the private repository
+Tests. Each rejection asserts:
 
-Port M1–M4 and M15–M21 to `PrivateRepo`:
+- the exact rule code;
+- no `refs/quorum/tasks/*` ref moved;
+- no quarantine directory remains;
+- the private repository's object set is unchanged (`cat-file --batch-all-objects --batch-check`
+  before and after);
+- the staged copy is deleted.
+
+Cases:
+
+- **Foreign blob:** a commit whose tree names a blob present only under another task's head.
+  Rule: `foreign-object`. The blob is not readable through any new ref.
+- **Foreign merge parent:** a merge whose second parent is another task's unpublished commit.
+  Rule: `foreign-object`. Ancestry from the start holds and no new root is introduced, so only
+  membership catches it.
+- **Foreign `REF_DELTA` base:** a delta against a blob outside every prerequisite tree. Rule:
+  `foreign-delta-base`.
+- **Legitimate thin bundle:** a bundle from the fixed export command whose pack deltas against
+  the prerequisite tree imports successfully, with the appended base excluded from "received".
+- **Rejected packed objects:** an import of more than 100 objects rejected late, on
+  `too-many-commits` with a low limit, leaves none of its objects in the private repository.
+  This is the case `prune` cannot clean.
+- **Delta bomb:** a few-KiB delta declaring a 4 GiB result. Rule: `oversized-object`, from the
+  pre-scan, before any git process starts. The test asserts git was not spawned. A zlib stream
+  inflating past its declared size gives `malformed-pack`.
+- **Resource:** on Linux, a pack that passes the pre-scan but makes `index-pack` exceed a
+  lowered `RLIMIT_AS` gives `resource`, charged to the run. `ENOSPC`, simulated with a full
+  tmpfs, is an infrastructure failure and keeps the staged copy.
+- **Refs:** `bundle create --all`, another branch only, and the task branch plus a tag each give
+  `unexpected-refs`.
+- **Prerequisites:**
+  - unrelated history with no prerequisite gives `no-prerequisite`;
+  - a forged prerequisite that is present but unseeded, and one that is absent, both give
+    `bad-prerequisite`, with identical error text;
+  - more than 64 prerequisites gives `malformed-header`.
+- **History:**
+  - an unrelated root merged in gives `new-root`;
+  - rewritten history on rework gives `unrelated-history`;
+  - a conflicting-variant delivery that drops `<theirs>` gives `merge-not-completed`;
+  - a tip equal to the start gives `no-new-commits`.
+- **Size:**
+  - a staged copy over `max_bundle_bytes` gives `oversized-bundle`;
+  - a 200 MiB compressible blob gives `oversized-object`;
+  - `max_commits + 1` commits gives `too-many-commits`.
+- **Header:**
+  - v1, `# v4`, an oversized header, a NUL in a ref, or bad hex gives `malformed-header`;
+  - v3 `@filter` or an object-format mismatch gives `unsupported-bundle`;
+  - v2 in a SHA-256 repository gives `unsupported-bundle`.
+- **fsck:** a `.gitmodules` URL starting with `-`, or a `.git` tree entry. Rule: `fsck-failed`.
+- **Hostile planting:** `plant_operator` plus `plant_parent_env` with a valid bundle. The import
+  succeeds, and the tripwire shows no daemon-side firing.
+- **Replay and crash:**
+  - importing the same staged copy twice gives one promotion;
+  - a crash injected after the `.pack` move and before the `.idx` move, then a restart, gives a
+    consistent private repository and an idempotent re-import.
+
+## 9. Workspace state, seeding, retirement, and cleanup
+
+Add the durable workspace state (additive migration):
+
+- `seeded_base_sha`, `seeded_upstream_sha`, `imported_head_sha`;
+- the consecutive-rejection counter and last rule code.
+
+Add `Workspace::seed(variant)` in staging, followed by a no-replace rename. Add
+`Workspace::retire` and the retention sweep, using `remove_tree`. Reconciliation skips
+`.retired/` and staging. No chmod of seeded trees.
+
+Tests:
+
+- **Seeded workspace:**
+  - no remote, no `hooks/`, and only the identity in its config;
+  - no `.git/objects` file with `st_nlink > 1`;
+  - the exclude set recorded for each seed variant matches the spec table.
+- **Hostile repository content:**
+  - the base commit contains filter, diff, and merge attributes, symlinks to `$HOME` and to the
+    DB, `.githooks/post-checkout`, and an executable `preflight.sh`;
+  - seeding checks them out verbatim;
+  - the tripwire is empty, even with `plant_operator` setting `core.hooksPath`,
+    `post-index-change`, and global filter drivers;
+  - the modes of the files the symlinks point at are unchanged.
+- **Retirement:**
+  - a run-chmodded read-only workspace containing symlinks to a sentinel and a FIFO is retired
+    and swept without touching the sentinel, without blocking, and without running git;
+  - `.retired/` and staging entries are never reconciled as workspaces.
+- **Rename:** a run-created empty directory at the target name makes the no-replace rename fail
+  loudly instead of replacing it.
+
+## 10. Hardened publication from the private repository
+
+Port M1–M4 and M15–M21 to `PrivateRepo`, for clone mode:
 
 - pin, retire, and reconcile publication sources;
-- `push_new_branch` and `push_to_pr_head`, with the same lease, fast-forward, and `ls-remote`
-  checks, using `push --no-verify --porcelain --end-of-options <remote_url>`;
-- cleanup tombstones;
-- task-ref deletion.
+- `push_new_branch` and `push_to_pr_head`, with lease, fast-forward, and `ls-remote` checks;
+- tombstones and task-ref deletion.
 
-Clone mode uses these. Linked-worktree mode is unchanged. Remove
-`QUORUM_CONTINUATION_BASE_BRANCH` and the `hook-stdout` section from clone-mode push
-diagnostics.
+This is an API with direct tests. Lifecycle wiring is slice 12.
 
 Tests:
 
-- **Planted `pre-push` (the core regression):**
-  - The pushed tree contains `.githooks/pre-push` and a `preflight.sh` tripwire.
-  - The operator config sets `core.hooksPath=.githooks`, and `plant_operator` sets a global
-    `core.hooksPath` to a tripwire hooks directory.
-  - The push succeeds, and the remote ref equals the imported head.
-  - The tripwire is empty, so neither `pre-push`, `reference-transaction`, nor `preflight.sh`
-    ran.
-- **Push target:** the push goes to `remote_url` even when `repo_dir` and the workspace both name
-  a different `origin` URL. The decoy remote is unchanged.
+- **Planted `pre-push`:**
+  - the pushed tree contains `.githooks/pre-push` and a `preflight.sh` tripwire;
+  - `plant_operator` sets a global `core.hooksPath`;
+  - the push succeeds, the remote ref equals the imported head, and the tripwire is empty.
+- **URL rewrites:**
+  - the push goes to `remote_url` even when `repo_dir` and the workspace name decoy origins;
+  - a `pushInsteadOf` planted after startup is caught by the before-push check, and nothing is
+    pushed to the decoy.
 - **Credentials:** under `hermetic`, a planted global `credential.helper` tripwire does not fire.
-- **Remote rejection:** a bare `file://` remote with a `pre-receive` that rejects. The remote's
-  own hook runs, as it must, and the task parks with the existing push-rejection reason, which
-  contains the remote text and no local hook section.
+- **Remote rejection:** a `file://` remote's `pre-receive` rejects, which is the remote's own
+  hook and is expected to run. The API returns the rejection text with no local hook section.
 - **Lease and fast-forward:** the existing `push_to_pr_head` tests are ported with the private
   repository as the source.
 
-## 8. Workspace seeding, retirement, and cleanup
+## 11. Run outbox and export step (plumbing only)
 
-Add `Workspace::seed(variant)` in staging, followed by `rename` into `worktree_base`. Add
-`Workspace::retire` and the retention sweep, using `untrusted_fs::remove_tree`. Add the DB fields
-`seeded_base_sha` and `imported_head_sha` (additive migration).
+The local launcher creates the outbox and runs the fixed export command (`--version=3`) after the
+agent exits, including on timeout and kill. It runs in a new process group with a 60 s
+group-kill timeout and an allowlisted environment. This environment is new; today only the
+orchestrator token is stripped. `fake_agent` gains a commit-and-exit mode. Nothing consumes the
+bundle yet.
 
 Tests:
 
-- The seeded workspace has no remote, no `hooks/`, and only the identity in its config. No file
-  under `.git/objects` has `st_nlink > 1`. The rename is the only step that touches
-  `worktree_base`.
-- **Hostile repository content:** the base commit contains `.gitattributes` with filter, diff,
-  and merge drivers, symlinks, `.githooks/post-checkout`, and an executable `preflight.sh`.
-  Seeding checks them out verbatim, and the tripwire is empty, even with `plant_operator`
-  setting `core.hooksPath` and filter drivers globally.
-- A planted global `post-checkout` hook does not run during the seeding checkout.
-- **Retirement:** a workspace containing symlinks to a sentinel directory outside, and a FIFO,
-  is retired and swept without touching the sentinel, without blocking, and without running
-  git.
-- **Staging collision:** a pre-existing staging directory with the same name is retired first.
-  Seeding never runs inside it.
+- The export of a `fake_agent` commit produces a v3 bundle with exactly the task ref and the
+  declared prerequisites.
+- **Export environment:** the export's environment (dumped by a test hook) contains no
+  `GH_TOKEN`, `GITHUB_TOKEN`, `SSH_AUTH_SOCK`, `QUORUM_*`, or orchestrator token.
+- **Leftover processes:** an export whose workspace config spawns a long-running child (through
+  a run-side planted `core.fsmonitor`) leaves no surviving process after the group kill.
+- The export of a reused rework workspace uses `seeded_upstream_sha` and succeeds, while the
+  base has since moved upstream.
 
-## 9. Run outbox, export step, and worker flow in clone mode
+## 12. Worker lifecycle and failure mapping in clone mode
 
-The local launcher creates the outbox and runs the fixed export command after the agent exits,
-including on timeout and kill. It runs in a separate process group with a scrubbed environment.
-`fake_agent` gains a commit-and-exit mode. Clone-mode workers follow the lifecycle steps in the
-spec: seed, run, export, collect, import, publish. Add the failure mapping from the spec's
-"Failure modes" table for `no-delivery` and `bundle-rejected:<rule>` (`AgentFailed`,
-`NonFailover`, and the park after repeated rejection).
+Wire seed → run → export → collect → import → publish for workers. Map `no-delivery`,
+`bundle-rejected:<rule>` (`AgentFailed`, `NonFailover`), the park after repeated rejection
+(using the slice 9 counter), infrastructure retries, `lfs-unsupported`, and push rejection.
 
 Tests (real `quorum serve` with `--incomplete-clone-mode`, a `file://` remote, a fake `gh`, and
 `fake_agent`):
 
-- **Happy path:** the worker commits in its workspace. A PR is created from the imported head,
-  the remote branch equals that head, and the task enters review.
-- **Hostile workspace end to end:** `fake_agent` runs `plant_workspace` before committing. The
-  task publishes. The tripwire shows no daemon-side entries. The test also checks entries from
-  the export step, which are allowed but bounded by the export's hardening, so none is expected.
-- **Symlinked bundle:** `fake_agent` replaces `delivery.bundle` with a symlink to the daemon's DB
-  file. Outcome: `AgentFailed` with `bundle-rejected:unsafe-file`, the DB bytes never reach
-  `imports/`, and nothing is pushed.
-- **Symlinked outbox subpath:** the outbox is replaced by a symlink to a directory containing a
-  valid bundle from another task. Rejected (`unsafe-file`).
+- **Happy path:** PR created from the imported head; the task enters review.
+- **Hostile workspace end to end:** `plant_workspace` before committing. The task publishes, and
+  the tripwire shows no daemon-side entries.
+- **Symlinked bundle:** `delivery.bundle` is a symlink to the daemon DB. Outcome: `unsafe-file`,
+  the DB bytes never reach `imports/`, and nothing is pushed.
+- **Symlinked outbox subpath:** the outbox is replaced by a symlink to another task's valid
+  bundle. Outcome: `unsafe-file`.
 - **FIFO bundle:** the daemon tick does not block, and the outcome is `unsafe-file`.
-- **Oversized bundle:** the outcome is `oversized-bundle`, and `imports/` stays below the cap.
-- **No commits:** the worker signals done without committing, so the outcome is `no-delivery`,
-  with the retry budget consumed as for an agent failure.
-- **Other branch:** the worker commits only on another branch, so the outcome is `no-delivery`.
-  The export names only the task branch.
-- **Repeated rejection:** the same rule on consecutive runs parks the task at the configured cap,
-  and the park reason names the rule.
-- **Rework:** a second worker run reuses the workspace. Its bundle's prerequisite is the last
-  imported head, and the push is fast-forward.
-- **Crash between collect and import:** restart replays the staged copy idempotently.
+- **Oversized bundle:** the outcome is `oversized-bundle`, and `imports/` stays under the cap.
+- **No commits, or another branch only:** `no-delivery`, charged to the retry budget.
+- **Foreign-object bundle through the lifecycle:** `fake_agent` replaces the export with the
+  slice 8 foreign-blob bundle. Outcome: `bundle-rejected:foreign-object`, and nothing is pushed.
+- **Repeated rejection:** the same rule on consecutive runs parks at the cap, with the rule in
+  the reason. This is the park test moved here from the publication slice.
+- **Push rejection:** a remote `pre-receive` rejection parks through the existing
+  push-rejection path.
+- **LFS:** an LFS base parks with `lfs-unsupported`.
+- **Rework:** the second run reuses the workspace, and its push is a fast-forward.
 
-## 10. Read-only roles and planning in clone mode
+## 13. Read-only roles and planning in clone mode
 
 Implement:
 
 - reviewer, review-only, and continuation-reviewer seeding at `refs/quorum/pr/<n>`, with the
-  read-only mode passed to the launcher;
-- a durable seeded head SHA in the reviewer journal, replacing R17;
-- the planner frozen view and frozen-base capture from the private repository, replacing M25
-  and M26;
-- `PrivateRepo::review_materials`, which writes the spec's file set into the run's inputs
-  directory.
-
-Prompts are unchanged; that is separate work.
+  read-only mount mode passed to the launcher;
+- a durable seeded head SHA in the reviewer journal, replacing R17, with the fail-safe fallback
+  for legacy journals;
+- the planner frozen view and frozen-base capture from the private repository (M25, M26);
+- `PrivateRepo::review_materials`;
+- `QUORUM_REPO` kept for restricted spawns, and `GH_REPO` set in run environments.
 
 Tests:
 
-- **Reviewer verdict recovery:** recovery reads the journal's seeded SHA. A reviewer workspace
-  whose `HEAD` was moved by `fake_agent`, or whose `.git` was replaced by a symlink, does not
-  change the recovered SHA, and no git runs in it.
-- **Planner view:** the view is built from the frozen SHA even when `repo_dir`'s `HEAD` moves.
-  A planted `repo_dir` config has no effect.
+- **Reviewer verdict recovery:** a reviewer workspace whose `HEAD` was moved, or whose `.git` is
+  a symlink, does not change the recovered SHA, and no git runs in it. A legacy journal row
+  without a seeded SHA yields no recovered verdict and a fresh review.
+- **Planner view:** the view follows the frozen SHA even when `repo_dir`'s `HEAD` moves, and a
+  planted `repo_dir` config has no effect.
+- **Restricted spawn:** a planner spawn in a clone workspace with no remote resolves the
+  repository through `QUORUM_REPO`.
 - **Review materials:**
   - outputs match `git diff` and `git log` on a fixture;
-  - a `diff=t` attribute plus a global `diff.t.textconv` tripwire does not fire;
-  - an oversized diff is truncated at the bound, with a `TRUNCATED` trailer listing the
-    omitted paths;
+  - a `diff=t` attribute plus a global textconv tripwire does not fire;
+  - an oversized diff is truncated, with a `TRUNCATED` trailer listing the omitted paths;
   - `remerge.patch` is present for a daemon-made merge.
 
-## 11. Continuation and branch synchronization via `merge-tree`
+## 14. Continuation and branch synchronization via `merge-tree`
 
 Replace R5–R8 in clone mode:
 
 - `merge-tree --write-tree` in the private repository;
-- `commit-tree` for clean merges, pushed through the hardened push for branch sync, and used as
-  the continuation seed;
-- for conflicts, the conflicted paths come from `--name-only` output, the workspace is seeded at
-  `<ours>` with `<theirs>` present, and run instructions tell the agent to merge;
-- prompt text at `quorum/src/serve/mod.rs:3127-3130` adjusted for clone mode.
+- `commit-tree` for clean merges;
+- conflicted paths from `--name-only` output;
+- conflict seeding with `<ours>` and `<theirs>` both as starts and excludes;
+- adjusted prompt text at `quorum/src/serve/mod.rs:3127-3130`.
 
 Tests:
 
-- **Clean merge:** the continuation seed equals the expected two-parent merge commit. Branch sync
-  pushes it, and the existing completion ancestry checks pass.
-- **Conflict:** the judgment task body lists exactly the conflicted files. The seeded workspace
-  has both commits. The agent's merge in the workspace, which is run-side, then exports and
-  imports as a normal delivery.
-- **Hostile merge configuration:** a tree attribute `merge=t` plus a global `merge.t.driver`
-  tripwire. The daemon-side merge does not fire it. Without the driver, a `merge=union`
-  repository produces a conflict, as the spec accepts.
+- **Clean merge:** the seed is the expected two-parent merge commit, and branch sync pushes it.
+- **Conflict:** the task body lists exactly the conflicted files. The agent's run-side merge
+  exports and imports. A delivery that resolves by dropping `<theirs>` is rejected with
+  `merge-not-completed`.
+- **Hostile merge configuration:** `merge=t` plus a global driver tripwire does not fire.
 - **`--ff` semantics:** when the base is an ancestor of the head, no merge commit is made.
 
-## 12. Recovery, reconciliation, and cleanup in clone mode
+## 15. Recovery, reconciliation, and replay in clone mode
 
-Port M19–M24 (tombstones, recover refs) to the private repository. Implement:
+Port M19–M24 to the private repository. Implement:
 
-- startup directory reconciliation under `worktree_base`: keep allocated directories, retire
-  unallocated ones, unlink top-level symlinks;
-- staged-bundle replay at startup;
-- publication-pin reconciliation against the private repository;
-- resume-from-recover through seeding (R13–R16 replaced in clone mode).
+- startup directory reconciliation;
+- staged-bundle and quarantine replay, including the crash-between-collect-and-import case moved
+  here from the worker slice;
+- publication-pin reconciliation;
+- resume-from-recover through seeding.
 
 Tests:
 
-- **Startup GC:** an unallocated workspace containing planted `.gitattributes`, filters, and
-  hooks is retired, and no git runs. The tripwire is empty, which is the regression for R13's
-  `git add -A`.
-- **Top-level symlink:** a symlink under `worktree_base` pointing at `$HOME` is unlinked, and the
-  target is intact.
-- **Resume from recover:** a recover ref's snapshot tree is reproduced as uncommitted changes in
-  the new workspace, through staging, and the old workspace is retired, not deleted.
+- **Startup GC:** an unallocated hostile workspace is retired with no git run and the tripwire
+  empty.
+- **Top-level symlink:** a symlink under `worktree_base` is unlinked, and its target is intact.
+- **Resume from recover:** the snapshot tree is reproduced as uncommitted changes in a new
+  workspace.
+- **Crash between collect and import:** restart replays the staged copy once.
+- **Crash during promotion:** restart leaves a consistent private repository and re-imports.
 - **Tombstones and pins:** the existing CAS tests are ported, plus a crash after the tombstone is
   written and before DB settlement.
-- **Process crash during import:** the quarantine ref and staged copy are found at startup and
-  resolved, either replayed or pruned.
 
-## 13. Migration and default flip
+## 16. Migration (not yet default)
 
-Prerequisite: this repository's pre-push checks (base-branch and `fmt`) run as required CI jobs.
-That is a `main` hotfix-class change, synced to `develop`, landed before this slice.
+Implement the spec's migration:
 
-Implement:
-
-- the one-time legacy import from `repo_dir` (task branch heads, publication pins, recover
-  refs, cleanup tombstones) with fsck;
-- the durable migration marker (additive);
-- refusal to switch back once the marker exists;
-- legacy worktrees left in place, with one logged event per task;
-- in-progress branch syncs restarted from pinned tips;
-- the `workspace_mode` default flipped to `clone`, and `--incomplete-clone-mode` removed.
-
-Update `README.md`, `docs/serve-config.example.toml`, and the workspace and lifecycle sections of
-`docs/2026-06-23-quorum-design.md`, since product behavior changes.
+- the quiescence and URL-agreement preconditions;
+- the expected-ref list from the database;
+- explicit-refspec fetches;
+- heads taken from publication pins where an intent exists;
+- `base` from provenance;
+- verification that every expected ref arrived;
+- the planted-state report for `repo_dir`;
+- the marker written at completion;
+- refusal to switch back.
 
 Tests:
 
-- **Migration:** a DB plus a `repo_dir` with legacy linked worktrees, in-flight tasks, recover
-  refs, and publication pins migrate. Every non-terminal task's head is imported, and every
-  legacy worktree directory is byte-identical afterwards.
-- **Replay:** a second start does not re-import. The marker exists, and the import does not run
-  again.
-- **Fallback refused:** `workspace_mode = "linked-worktree"` after migration exits 2 with a clear
-  message.
-- **Hostile `repo_dir`:** `plant_repo_dir` with every key and hook. The migration fetch succeeds,
-  and the tripwire is empty (the `upload-pack` path).
-- **No configuration:** a local operator with no new keys starts in clone mode, with
-  `remote_url` derived and logged, and completes the slice 9 happy path.
+- **Migration:** a DB plus a `repo_dir` with legacy worktrees, review-stage tasks, recover refs,
+  publication pins, and tombstones migrate. Every expected ref is present with its expected SHA,
+  and every legacy worktree directory is byte-identical afterwards.
+- **Quiescence:** a task in `working` with a legacy worktree blocks startup with exit 2, naming
+  the task.
+- **Hidden refs:** `uploadpack.hideRefs` in `repo_dir` hiding a recover ref fails migration with
+  exit 3, and no marker is written.
+- **Publication pin:** a pending intent's head comes from the pin, not from a branch tip that
+  moved after it.
+- **URL mismatch:** a derived URL naming another `owner/name` exits 2.
+- **Crash:** a crash before the marker reruns migration idempotently. After the marker, setting
+  `linked-worktree` exits 2.
+- **Planted state:** `plant_repo_dir` produces one warning event listing the hooks, keys, and
+  `info/attributes` it found, and the tripwire is empty.
 
-## 14. Remove the linked-worktree mode
+## 17. Default flip
 
-One release after slice 13, delete:
+Set the `workspace_mode` default to `clone`, and remove `--incomplete-clone-mode`. Update
+`README.md`, `docs/serve-config.example.toml`, and the workspace and lifecycle sections of
+`docs/2026-06-23-quorum-design.md`.
 
-- the linked-worktree code paths in `worktree.rs` and `recover.rs` (REMOVE rows R1–R16);
-- `disable_push`;
-- the `workspace_mode = "linked-worktree"` value. It remains a recognized value that exits 2
-  with a migration message.
+Tests:
 
-Tighten the source-scan test (`quorum-core/src/git.rs:48`). Outside `PrivateRepo`, the
-seeding module, and the local launcher's export step, production code must not construct a
-`git` or `gh` process, pass `-C`, or set `current_dir` on one.
+- A local operator with no new keys starts in clone mode, with `remote_url` derived and logged,
+  and completes the slice 12 happy path.
+- The full clone suite passes on the floor git and on a current git.
+
+## 18. Remove the linked-worktree mode
+
+One release after slice 17:
+
+- delete the linked-worktree paths (REMOVE rows R1–R16) and `disable_push`;
+- keep `workspace_mode = "linked-worktree"` as a recognized value that exits 2 with a migration
+  message;
+- tighten the source-scan test (`quorum-core/src/git.rs:48`).
 
 Tests:
 
 - The source-scan test fails on a deliberately added `git -C` in a fixture copy.
-- The full clone-mode suite from slices 5–13 still passes.
+- The full clone suite passes.
 
 ## Verification per slice
 
 Each slice runs `rtk proxy ./preflight.sh` before its PR, as the repository guide requires. The
-`hostile_git` tripwire suites run in the normal test target, not behind a feature flag, so
-every later change keeps the property.
+`hostile_git` suites run in the normal test target and in the floor-git CI job, not behind a
+feature flag, so every later change keeps the property.
