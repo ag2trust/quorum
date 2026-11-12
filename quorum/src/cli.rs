@@ -438,6 +438,18 @@ pub enum Command {
         #[arg(long)]
         repo: Option<String>,
     },
+    /// Forward Messages API requests from managed runs to a model upstream,
+    /// so a sandboxed run gets model access without the upstream credential.
+    /// Each request presents its run capability as `x-api-key` (or
+    /// `Authorization: Bearer`); the upstream credential and limits are read
+    /// from `QUORUM_INFERENCE_*` in this process's environment.
+    #[command(name = "inference-forwarder")]
+    InferenceForwarder {
+        /// Serve at `http://<addr>/v1/messages`. Loopback addresses only;
+        /// plain HTTP.
+        #[arg(long, value_name = "SOCKETADDR")]
+        listen: std::net::SocketAddr,
+    },
     /// Signal task completion (worker) or emit a review verdict (reviewer).
     /// The daemon endpoint writes the mailbox row after deriving authority from
     /// the run capability; CLI task, PR, and identity flags are compatibility inputs.
