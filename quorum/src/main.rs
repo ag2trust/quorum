@@ -10,8 +10,10 @@ mod cheatsheet;
 mod cli;
 mod cockpit;
 mod config;
+mod coordinator;
 mod graph_blocker;
 mod input;
+mod orchestrator_mcp;
 mod output;
 mod paths;
 mod resource_health;
@@ -26,14 +28,6 @@ use serve::merge::MergeExecutor as _;
 
 const EMBEDDED_SKILL: &str = include_str!("../../.claude/skills/quorum/SKILL.md");
 const MIN_EXTERNAL_POLL_INTERVAL_SECS: u64 = 30;
-
-#[derive(serde::Serialize)]
-struct TaskGetView<'a> {
-    #[serde(flatten)]
-    task: &'a quorum_core::tasks::TaskDetail,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    arbiter: Option<quorum_core::stats::ArbiterVerdict>,
-}
 
 const DEFAULT_SERVE_TOML: &str = "\
 # quorum serve config — edit repository paths and routing percentages as needed.
@@ -185,6 +179,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Message { .. } => "message",
         cli::Command::React { .. } => "react",
         cli::Command::AgentMcp { .. } => "agent-mcp",
+        cli::Command::OrchestratorMcp { .. } => "orchestrator-mcp",
         cli::Command::Submit { .. } => "submit",
         cli::Command::ReviewDraft { .. } => "review-draft",
         cli::Command::Serve { .. } => "serve",
@@ -619,52 +614,22 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             repo,
         } => {
             let body = read_optional_body(body_stdin, body_file)?;
-            // Explicit body source that resolves empty/whitespace-only is bad input.
-            // Omitting the body flag entirely (None) remains valid.
-            if let Some(ref text) = body {
-                if text.trim().is_empty() {
-                    return Err(QuorumError::Usage(
-                        "explicit task body (--body-stdin/--body-file) must not be empty or whitespace-only"
-                            .into(),
-                    ));
-                }
-            }
-            quorum_core::tasks::validate_creator_labels(labels.as_deref())?;
-            quorum_core::tasks::validate_creator_refs(refs.as_deref())?;
-            let resolved_repo = resolve_repo_override(repo.as_deref())?;
-            let target_branch =
-                base_branch.unwrap_or(serve_config::task_create_base_branch(&resolved_repo)?);
-            quorum_core::tasks::validate_target_branch(&target_branch)?;
-            let mut conn = quorum_core::db::open(&paths::ensure_repo_dir(&resolved_repo)?)?;
-            let id = match review_only {
-                Some(pr) => quorum_core::tasks::create_review_only_no_rework(
-                    &mut conn,
-                    &created_by,
-                    &title,
-                    body.as_deref(),
-                    priority.unwrap_or(0),
-                    labels.as_deref(),
-                    refs.as_deref(),
-                    depends_on.as_deref(),
-                    pr,
-                    Some(&target_branch),
-                    now,
-                )?,
-                None => quorum_core::tasks::create_with_continue_pr_and_target_branch(
-                    &mut conn,
-                    &created_by,
-                    &title,
-                    body.as_deref(),
-                    priority.unwrap_or(0),
-                    labels.as_deref(),
-                    refs.as_deref(),
-                    depends_on.as_deref(),
-                    review_pr,
-                    continue_pr,
-                    Some(&target_branch),
-                    now,
-                )?,
+            let task = coordinator::NewTask {
+                created_by: &created_by,
+                title: &title,
+                body: body.as_deref(),
+                priority,
+                labels: labels.as_deref(),
+                refs: refs.as_deref(),
+                depends_on: depends_on.as_deref(),
+                review_pr,
+                review_only,
+                continue_pr,
+                base_branch: base_branch.as_deref(),
             };
+            coordinator::validate_new_task(&task)?;
+            let resolved_repo = resolve_repo_override(repo.as_deref())?;
+            let id = coordinator::task_create(&resolved_repo, &task, now)?;
             output::emit(&serde_json::json!({ "id": id, "repo": resolved_repo }));
             Ok(0)
         }
@@ -885,13 +850,9 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             Ok(0)
         }
         cli::Command::TaskGet { task_id } => {
-            let conn = quorum_core::db::open(&paths::db_path()?)?;
-            match quorum_core::tasks::get_with_notes(&conn, task_id)? {
-                Some(t) => {
-                    output::emit(&TaskGetView {
-                        task: &t,
-                        arbiter: quorum_core::stats::arbiter_verdict(&conn, task_id)?,
-                    });
+            match coordinator::task_get(&paths::db_path()?, task_id)? {
+                Some(view) => {
+                    output::emit(&view);
                     Ok(0)
                 }
                 None => {
@@ -1186,20 +1147,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     ));
                 }
             };
-            let db = paths::db_path()?;
-            let mut conn = quorum_core::db::open(&db)?;
-            let row = quorum_core::mailbox::MailboxRow {
-                agent: from,
-                kind: quorum_core::mailbox::MailboxKind::Message,
-                task_id: None,
-                pr: None,
-                verdict: None,
-                feedback: None,
-                note: None,
-                to_agent: Some(to),
-                payload: Some(payload),
-            };
-            let id = quorum_core::mailbox::append(&mut conn, &row)?;
+            let id = coordinator::message(&paths::db_path()?, from, to, payload)?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
             Ok(0)
         }
@@ -1232,6 +1180,16 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         }
         cli::Command::AgentMcp { listen } => {
             agent_mcp::run(listen)?;
+            Ok(0)
+        }
+        cli::Command::OrchestratorMcp {
+            listen,
+            token_file,
+            identity,
+            allowed_host,
+            repo,
+        } => {
+            orchestrator_mcp::run(listen, &token_file, identity, allowed_host, repo)?;
             Ok(0)
         }
         cli::Command::Submit {
@@ -1417,80 +1375,9 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             }
         }
         cli::Command::TaskRetry { task_id, by } => {
-            let mut conn = quorum_core::db::open(&paths::db_path()?)?;
-            let cancelled = quorum_core::tasks::cancelled_dep_ids(&conn, task_id)?;
-            if !cancelled.is_empty() {
-                output::emit(&serde_json::json!({
-                    "ok": false,
-                    "reason": "dependency cancelled — unsatisfiable; \
-                               edit depends_on or close the dependent",
-                    "cancelled_deps": cancelled,
-                }));
-                return Ok(1);
-            }
-            if let Some(reason) = quorum_core::tasks::reviewer_cap_retry_refusal(&conn, task_id)? {
-                output::emit(&serde_json::json!({
-                    "ok": false,
-                    "outcome": "task-retry-rejected",
-                    "reason": reason,
-                }));
-                return Ok(1);
-            }
-            let retried =
-                match quorum_core::tasks::retry_parked(&mut conn, task_id, &by, true, now)? {
-                    some @ Some(_) => some,
-                    None => {
-                        quorum_core::tasks::retry_provider_blocked(&mut conn, task_id, &by, now)?
-                    }
-                };
-            match retried {
-                Some(task) => {
-                    output::emit(&quorum_core::tasks::TaskCompact::from(&task));
-                    Ok(0)
-                }
-                None => match quorum_core::decomposition::retry_exhausted_planning(
-                    &mut conn, task_id, &by, now,
-                )? {
-                    quorum_core::decomposition::PlanningRetryOutcome::Retried {
-                        graph_id,
-                        generation,
-                    } => {
-                        let task = quorum_core::tasks::get(&conn, task_id)?.ok_or_else(|| {
-                            QuorumError::Io(format!(
-                                "retried decomposition source #{task_id} disappeared"
-                            ))
-                        })?;
-                        output::emit(&serde_json::json!({
-                            "ok": true,
-                            "outcome": "decomposition-planning-retried",
-                            "graph_id": graph_id,
-                            "retry_generation": generation,
-                            "task": quorum_core::tasks::TaskCompact::from(&task),
-                        }));
-                        Ok(0)
-                    }
-                    quorum_core::decomposition::PlanningRetryOutcome::RetryCapExhausted {
-                        retry_count,
-                    } => {
-                        output::emit(&serde_json::json!({
-                            "ok": false,
-                            "outcome": "decomposition-planning-retry-rejected",
-                            "reason": "operator retry cap exhausted; inspect the planning failures and rescope or close the source",
-                            "retry_count": retry_count,
-                            "retry_cap": quorum_core::decomposition::MAX_OPERATOR_RETRIES,
-                        }));
-                        Ok(1)
-                    }
-                    quorum_core::decomposition::PlanningRetryOutcome::NotEligible => {
-                        output::emit(&serde_json::json!({
-                            "ok": false,
-                            "outcome": "task-retry-rejected",
-                            "reason": "task is not daemon-parked, provider-blocked, or an eligible exhausted decomposition source",
-                        }));
-                        Ok(1)
-                    }
-                },
-            }
+            let (json, exit) = coordinator::task_retry(&paths::db_path()?, task_id, &by, now)?;
+            println!("{json}");
+            Ok(exit)
         }
         cli::Command::DecompositionAdoptRecovery {
             original_child_id,
@@ -1584,6 +1471,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             exit_when_gone,
             doctor_enabled,
         } => {
+            // The orchestrator MCP token is not a daemon input. If the
+            // operator exported it anyway, drop it here, before any thread
+            // exists, so no process the daemon starts can inherit it.
+            std::env::remove_var(orchestrator_mcp::TOKEN_ENV);
             use serve_config::*;
 
             // Step 1: determine repo identity (needed for default config path).
@@ -2586,7 +2477,7 @@ fn main() {
 mod tests {
     use super::{
         assemble_status_snapshot, parse_ttl, resolve_repo_override, resolve_web_log_dir,
-        tail_output_for_line, validate_external_poll_interval, wait_child_stdout, TaskGetView,
+        tail_output_for_line, validate_external_poll_interval, wait_child_stdout,
     };
 
     #[test]
@@ -2608,15 +2499,12 @@ mod tests {
         .unwrap();
         conn.execute("UPDATE tasks SET terminal_leaf=1 WHERE id=?1", [id])
             .unwrap();
-        let task = quorum_core::tasks::get_with_notes(&conn, id)
+        drop(conn);
+        let view = crate::coordinator::task_get(&dir.path().join("task-get.db"), id)
             .unwrap()
             .unwrap();
 
-        let json = serde_json::to_value(TaskGetView {
-            task: &task,
-            arbiter: None,
-        })
-        .unwrap();
+        let json = serde_json::to_value(view).unwrap();
         assert_eq!(json["terminal_leaf"], true);
     }
 

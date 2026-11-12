@@ -408,6 +408,36 @@ pub enum Command {
         #[arg(long, value_name = "SOCKETADDR")]
         listen: Option<std::net::SocketAddr>,
     },
+    /// Serve the coordinator MCP tools for one repository over Streamable HTTP
+    /// at `http://<addr>/mcp`: create, list, inspect, cancel, and retry tasks,
+    /// and message a managed agent, all as the one `--identity`. Plain HTTP.
+    /// Every request must carry the operator's token as
+    /// `Authorization: Bearer <token>`; the token is read only from
+    /// `--token-file`, never from an argument value or the environment.
+    #[command(name = "orchestrator-mcp")]
+    OrchestratorMcp {
+        /// Address to bind. A non-loopback address also requires `--allowed-host`.
+        #[arg(long, value_name = "SOCKETADDR")]
+        listen: std::net::SocketAddr,
+        /// File holding the bearer token (32 to 512 printable ASCII
+        /// characters). It must be owned by the current user and not readable
+        /// by group or others.
+        #[arg(long = "token-file", value_name = "PATH")]
+        token_file: PathBuf,
+        /// The coordinator identity every tool acts as: the creator of tasks
+        /// it creates, the sender of its messages, and the identity whose
+        /// creator-or-assignee standing decides what it may cancel.
+        #[arg(long, value_name = "NAME")]
+        identity: String,
+        /// A `Host` (or `host:port`) clients may address. Repeatable. The
+        /// loopback names are always accepted on a loopback bind.
+        #[arg(long = "allowed-host", value_name = "HOST")]
+        allowed_host: Vec<String>,
+        /// Target repo as owner/name, which must already have a database.
+        /// Defaults to `QUORUM_REPO`, then the current checkout.
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Signal task completion (worker) or emit a review verdict (reviewer).
     /// The daemon endpoint writes the mailbox row after deriving authority from
     /// the run capability; CLI task, PR, and identity flags are compatibility inputs.

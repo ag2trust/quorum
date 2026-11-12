@@ -53,13 +53,13 @@ const HTTP_MCP_PATH: &str = "/mcp";
 /// Bound on one HTTP request body. An endpoint request is at most
 /// `MAX_FRAME_BYTES`; the allowance covers the JSON-RPC envelope and string
 /// escaping around the largest payload the endpoint would accept.
-const MAX_HTTP_BODY_BYTES: usize = 4 * MAX_FRAME_BYTES;
+pub(crate) const MAX_HTTP_BODY_BYTES: usize = 4 * MAX_FRAME_BYTES;
 /// Open HTTP connections served at once. HTTP/1.1 carries one request per
 /// connection at a time, so this is also the bound on concurrent requests.
 /// Further connections wait in the kernel's listen backlog. It is kept well
 /// under the daemon endpoint's 32 connection slots so this listener cannot
 /// starve the CLI path that shares them.
-const MAX_HTTP_CONNECTIONS: usize = 8;
+pub(crate) const MAX_HTTP_CONNECTIONS: usize = 8;
 /// Endpoint exchanges in flight at once, counted separately from connections
 /// because a blocking exchange outlives a client that hung up on it.
 const MAX_ENDPOINT_EXCHANGES: usize = MAX_HTTP_CONNECTIONS;
@@ -314,7 +314,7 @@ fn submit_plan_tool() -> Tool {
 
 /// One tool result, always a single JSON text block so the planner reads the
 /// daemon's own verdict rather than prose.
-fn json_result(value: Value, is_error: bool) -> CallToolResult {
+pub(crate) fn json_result(value: Value, is_error: bool) -> CallToolResult {
     let content = vec![ContentBlock::text(value.to_string())];
     if is_error {
         CallToolResult::error(content)
@@ -479,7 +479,7 @@ struct AlertOwnerArguments {
     body: String,
 }
 
-fn invalid_arguments(message: impl Into<String>) -> CallToolResult {
+pub(crate) fn invalid_arguments(message: impl Into<String>) -> CallToolResult {
     json_result(
         json!({"code": "invalid_arguments", "message": message.into()}),
         true,
@@ -489,7 +489,7 @@ fn invalid_arguments(message: impl Into<String>) -> CallToolResult {
 /// Decode a signalling tool's arguments against its closed shape. Absent
 /// arguments are an empty object; an unknown or mistyped field is refused here
 /// and never reaches the endpoint.
-fn signal_arguments<T: serde::de::DeserializeOwned>(
+pub(crate) fn signal_arguments<T: serde::de::DeserializeOwned>(
     tool: &str,
     arguments: Option<Map<String, Value>>,
 ) -> std::result::Result<T, CallToolResult> {
@@ -543,15 +543,15 @@ fn validate_review(
     Ok(None)
 }
 
-fn bounded_string(min: usize, max: usize) -> Value {
+pub(crate) fn bounded_string(min: usize, max: usize) -> Value {
     json!({"type":"string","minLength":min,"maxLength":max})
 }
 
-fn positive_integer() -> Value {
+pub(crate) fn positive_integer() -> Value {
     json!({"type":"integer","minimum":1})
 }
 
-fn github_schema(properties: Value, required: &[&str]) -> Arc<Map<String, Value>> {
+pub(crate) fn github_schema(properties: Value, required: &[&str]) -> Arc<Map<String, Value>> {
     let value = json!({
         "type": "object",
         "additionalProperties": false,
@@ -1316,10 +1316,80 @@ fn run_http(addr: SocketAddr) -> Result<()> {
             MAX_ENDPOINT_EXCHANGES,
         ))),
     };
+    // The default allowed hosts are the loopback names.
+    serve_http(
+        HttpListener {
+            command: "agent-mcp",
+            title: "agent MCP",
+            max_connections: MAX_HTTP_CONNECTIONS,
+            header_read_timeout: HTTP_HEADER_READ_TIMEOUT,
+            max_admitted_requests: None,
+        },
+        addr,
+        stateless_http_config(),
+        server,
+        |headers: &HeaderMap| match bearer_capability(headers) {
+            Some(_) => Ok(()),
+            None => Err(StatusCode::UNAUTHORIZED),
+        },
+    )
+}
+
+/// Stateless Streamable HTTP: no sessions, no server-initiated stream, one
+/// bounded JSON body per request.
+pub(crate) fn stateless_http_config() -> StreamableHttpServerConfig {
+    StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_max_request_body_bytes(MAX_HTTP_BODY_BYTES)
+}
+
+/// What distinguishes one HTTP listener from another. The request timeout,
+/// body cap, shutdown drain, and per-request service are shared.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HttpListener {
+    /// Subcommand name, printed in the listening line.
+    pub command: &'static str,
+    /// Name used in startup errors.
+    pub title: &'static str,
+    /// Open connections served at once; further ones wait in the backlog.
+    pub max_connections: usize,
+    /// A connection must deliver a complete request head within this bound,
+    /// whether it is new or idle between requests.
+    pub header_read_timeout: Duration,
+    /// `None`: a connection slot is the only admission bound. `Some(n)`: at
+    /// most `n` requests the gate admitted are in flight at once, and a
+    /// request the gate refuses also closes its connection, so a peer that
+    /// cannot pass the gate holds a connection slot only until its refusal
+    /// or the head timeout and never holds a request slot.
+    pub max_admitted_requests: Option<usize>,
+}
+
+/// Serve one tools-only MCP server over Streamable HTTP at `/mcp` until
+/// SIGINT or SIGTERM, with this module's time and body bounds.
+///
+/// `gate` sees every request's headers before MCP runs and before the body
+/// is read; the status it returns refuses the request.
+pub(crate) fn serve_http<S, G>(
+    listener_bounds: HttpListener,
+    addr: SocketAddr,
+    config: StreamableHttpServerConfig,
+    server: S,
+    gate: G,
+) -> Result<()>
+where
+    S: ServerHandler + Clone + Send + Sync + 'static,
+    G: Fn(&HeaderMap) -> std::result::Result<(), StatusCode> + Clone + Send + Sync + 'static,
+{
+    let HttpListener { command, title, .. } = listener_bounds;
+    let admitted = listener_bounds
+        .max_admitted_requests
+        .map(|requests| Arc::new(tokio::sync::Semaphore::new(requests)));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|_| QuorumError::Io("failed to start agent MCP runtime".into()))?;
+        .map_err(|_| QuorumError::Io(format!("failed to start {title} runtime")))?;
     runtime.block_on(async move {
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .map_err(|e| QuorumError::Io(format!("failed to register SIGINT handler: {e}")))?;
@@ -1327,17 +1397,10 @@ fn run_http(addr: SocketAddr) -> Result<()> {
             .map_err(|e| QuorumError::Io(format!("failed to register SIGTERM handler: {e}")))?;
         let listener = tokio::net::TcpListener::bind(addr)
             .await
-            .map_err(|e| QuorumError::Io(format!("failed to bind agent MCP listener: {e}")))?;
+            .map_err(|e| QuorumError::Io(format!("failed to bind {title} listener: {e}")))?;
         let local = listener
             .local_addr()
-            .map_err(|e| QuorumError::Io(format!("failed to bind agent MCP listener: {e}")))?;
-        // Stateless: no sessions, no server-initiated stream, one JSON body
-        // per request. The default allowed hosts are the loopback names.
-        let config = StreamableHttpServerConfig::default()
-            .with_legacy_session_mode(false)
-            .with_json_response(true)
-            .with_sse_keep_alive(None)
-            .with_max_request_body_bytes(MAX_HTTP_BODY_BYTES);
+            .map_err(|e| QuorumError::Io(format!("failed to bind {title} listener: {e}")))?;
         let cancel = config.cancellation_token.clone();
         let app = axum::Router::new()
             .route(
@@ -1359,11 +1422,17 @@ fn run_http(addr: SocketAddr) -> Result<()> {
                     async move { service.handle(request).await }
                 }),
             )
-            .layer(axum::middleware::from_fn(bound_request));
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let gate = gate.clone();
+                    let admitted = admitted.clone();
+                    async move { bound_request(gate, admitted, request, next).await }
+                },
+            ));
         // The one line a launcher needs to learn a port-0 bind.
-        eprintln!("quorum agent-mcp listening on http://{local}{HTTP_MCP_PATH}");
+        eprintln!("quorum {command} listening on http://{local}{HTTP_MCP_PATH}");
 
-        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_CONNECTIONS));
+        let slots = Arc::new(tokio::sync::Semaphore::new(listener_bounds.max_connections));
         let (shutdown, _) = tokio::sync::watch::channel(false);
         let mut connections = tokio::task::JoinSet::new();
         loop {
@@ -1378,6 +1447,7 @@ fn run_http(addr: SocketAddr) -> Result<()> {
                     if let Some((stream, slot)) = accepted {
                         connections.spawn(serve_http_connection(
                             stream,
+                            listener_bounds.header_read_timeout,
                             app.clone(),
                             shutdown.subscribe(),
                             slot,
@@ -1389,8 +1459,8 @@ fn run_http(addr: SocketAddr) -> Result<()> {
         // Signals only start shutdown. Stop accepting, tell rmcp and every
         // connection to finish, and wait a bounded time. A connection still
         // open after that (a half-sent request, a stalled peer) is dropped:
-        // an endpoint exchange already in flight is one atomic daemon
-        // operation whose outcome the daemon alone decides.
+        // an operation already in flight is one atomic operation whose
+        // outcome its owner alone decides.
         drop(listener);
         cancel.cancel();
         let _ = shutdown.send(true);
@@ -1427,13 +1497,14 @@ async fn accept_with_slot(
 /// out, or shutdown is signalled. `_slot` is held for the connection's life.
 async fn serve_http_connection(
     stream: tokio::net::TcpStream,
+    header_read_timeout: Duration,
     app: axum::Router,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     _slot: tokio::sync::OwnedSemaphorePermit,
 ) {
     let connection = hyper::server::conn::http1::Builder::new()
         .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(HTTP_HEADER_READ_TIMEOUT)
+        .header_read_timeout(header_read_timeout)
         .serve_connection(
             hyper_util::rt::TokioIo::new(stream),
             hyper_util::service::TowerToHyperService::new(app),
@@ -1463,43 +1534,76 @@ fn validate_loopback(addr: SocketAddr) -> Result<()> {
 /// endpoint's own plus no whitespace, so a malformed credential is refused
 /// here without being forwarded, stored, or echoed.
 fn bearer_capability(headers: &HeaderMap) -> Option<&str> {
+    bearer_token(headers, MAX_CAPABILITY_BYTES)
+}
+
+/// The credential of exactly one well-formed `Authorization: Bearer <token>`
+/// header of at most `max_bytes`, or `None`.
+pub(crate) fn bearer_token(headers: &HeaderMap, max_bytes: usize) -> Option<&str> {
     let mut values = headers.get_all(header::AUTHORIZATION).iter();
     let value = values.next()?;
     if values.next().is_some() {
         return None;
     }
-    let (scheme, capability) = value.to_str().ok()?.split_once(' ')?;
+    let (scheme, token) = value.to_str().ok()?.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("Bearer")
-        || capability.is_empty()
-        || capability.len() > MAX_CAPABILITY_BYTES
-        || capability
+        || token.is_empty()
+        || token.len() > max_bytes
+        || token
             .chars()
             .any(|character| character == '\0' || character.is_whitespace())
     {
         return None;
     }
-    Some(capability)
+    Some(token)
 }
 
-/// Refuse a request without a well-formed bearer before it reaches MCP, and
-/// bound how long an admitted one may take to produce its response. The bound
-/// covers reading the body, which rmcp does inside the service.
-async fn bound_request(
+/// Refuse a request the gate rejects before it reaches MCP, and bound how
+/// long an admitted one may take to produce its response. The bound covers
+/// waiting for a request slot and reading the body, which rmcp does inside
+/// the service.
+async fn bound_request<G>(
+    gate: G,
+    admitted: Option<Arc<tokio::sync::Semaphore>>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
-) -> axum::response::Response {
-    if bearer_capability(request.headers()).is_none() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-            "Unauthorized",
-        )
-            .into_response();
+) -> axum::response::Response
+where
+    G: Fn(&HeaderMap) -> std::result::Result<(), StatusCode>,
+{
+    if let Err(status) = gate(request.headers()) {
+        let mut response = if status == StatusCode::UNAUTHORIZED {
+            (
+                status,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                "Unauthorized",
+            )
+                .into_response()
+        } else {
+            (status, status.canonical_reason().unwrap_or("Refused")).into_response()
+        };
+        // Its body is never read. Where admitted requests are counted, the
+        // connection is closed too, so a refused peer keeps nothing open.
+        if admitted.is_some() {
+            response.headers_mut().insert(
+                header::CONNECTION,
+                axum::http::HeaderValue::from_static("close"),
+            );
+        }
+        return response;
     }
-    match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, next.run(request)).await {
+    let admitted_request = async {
+        // The semaphore is never closed, so acquisition cannot fail.
+        let _slot = match admitted {
+            Some(slots) => slots.acquire_owned().await.ok(),
+            None => None,
+        };
+        next.run(request).await
+    };
+    match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, admitted_request).await {
         Ok(response) => response,
-        // Dropping the request future cancels its handler. A signal already
-        // sent to the daemon is not undone, so its outcome is unknown.
+        // Dropping the request future cancels its handler. An operation
+        // already sent is not undone, so its outcome is unknown.
         Err(_) => (
             StatusCode::REQUEST_TIMEOUT,
             [(header::CONNECTION, "close")],

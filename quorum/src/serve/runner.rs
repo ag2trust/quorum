@@ -687,6 +687,15 @@ const GATE_WRAPPER: &str = concat!(
     "exec \"$@\""
 );
 
+/// Remove operator secrets that no managed process may inherit, whatever its
+/// role or MCP wiring. The orchestrator MCP token is not a Quorum input at
+/// all, but an operator who exported it must not thereby hand a managed
+/// agent coordinator authority. Call this after applying a spec's
+/// environment so nothing re-adds it.
+pub(crate) fn strip_operator_secrets(command: &mut Command) {
+    command.env_remove(crate::orchestrator_mcp::TOKEN_ENV);
+}
+
 /// Start a process-group leader that waits on a close-on-exec pipe before it
 /// replaces itself with `program`. Provider adapters append their normal argv,
 /// environment, cwd, and stdio configuration to the returned command.
