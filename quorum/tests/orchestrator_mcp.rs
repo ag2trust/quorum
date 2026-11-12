@@ -45,10 +45,21 @@ fn orchestrator_command(home: &Path, listen: &str) -> Command {
     command
 }
 
+/// An owner-only token file, as the listener requires.
 fn write_token(dir: &Path, token: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("orchestrator.token");
     std::fs::write(&path, format!("{token}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     path
+}
+
+/// The listener serves only a repository that already has a database.
+fn init(home: &Path) {
+    if !db_path(home).exists() {
+        let output = cli(home, &["init"]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+    }
 }
 
 /// One running listener process and the address it reported binding.
@@ -85,10 +96,18 @@ impl Listener {
         Self { child, addr }
     }
 
-    /// The orchestrator listener on loopback with the token in a file.
+    /// The orchestrator listener on loopback, acting as `Coordinator`.
     fn orchestrator(home: &Path) -> Self {
+        Self::orchestrator_as(home, "Coordinator")
+    }
+
+    fn orchestrator_as(home: &Path, identity: &str) -> Self {
+        init(home);
         let mut command = orchestrator_command(home, "127.0.0.1:0");
-        command.arg("--token-file").arg(write_token(home, TOKEN));
+        command
+            .arg("--token-file")
+            .arg(write_token(home, TOKEN))
+            .args(["--identity", identity]);
         Self::spawn(command, "orchestrator-mcp")
     }
 
@@ -311,7 +330,6 @@ fn tools_run_the_coordinator_operations_against_a_real_database() {
         addr,
         "task_create",
         json!({
-            "created_by": "Coordinator",
             "title": "Fix the thing",
             "body": body,
             "priority": 3,
@@ -364,7 +382,7 @@ fn tools_run_the_coordinator_operations_against_a_real_database() {
     let review = ok(
         addr,
         "task_create",
-        json!({"created_by": "Coordinator", "title": "Review PR #7", "review_only": 7}),
+        json!({"title": "Review PR #7", "review_only": 7}),
     );
     let review_id = review["id"].as_i64().unwrap();
     let review_task = ok(addr, "task_get", json!({"task_id": review_id}));
@@ -397,7 +415,7 @@ fn tools_run_the_coordinator_operations_against_a_real_database() {
     let sent = ok(
         addr,
         "message_agent",
-        json!({"from": "Coordinator", "to": "AgentOne", "body": "status?"}),
+        json!({"to": "AgentOne", "body": "status?"}),
     );
     let mailbox_id = sent["mailbox_id"].as_i64().unwrap();
     let message: (String, String, String, String) = quorum_core::db::open(&db)
@@ -421,32 +439,64 @@ fn tools_run_the_coordinator_operations_against_a_real_database() {
 
     // Cancellation is the guarded storage update: only the creator or the
     // assignee, only while unfinished. Every refusal leaves state alone.
+    // A second listener bound to another identity is neither the creator
+    // nor the assignee, so it cannot cancel this task or attach a note to it.
+    let stranger = Listener::orchestrator_as(home, "Stranger");
+    let notes = count(&db, "SELECT COUNT(*) FROM task_notes");
     let (code, _) = refused(
-        addr,
+        stranger.addr,
         "task_cancel",
-        json!({"agent": "Stranger", "task_id": id}),
+        json!({"task_id": id, "note": "not mine"}),
     );
     assert_eq!(code, "rejected");
     assert_eq!(status_of(&db, id), "open");
-    let (code, _) = refused(
-        addr,
-        "task_cancel",
-        json!({"agent": "Coordinator", "task_id": 999_999}),
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM task_notes"), notes);
+    // What it creates and sends carries its own identity, not the caller's.
+    let theirs = ok(stranger.addr, "task_create", json!({"title": "theirs"}))["id"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        ok(stranger.addr, "task_get", json!({"task_id": theirs}))["created_by"],
+        "Stranger"
     );
-    assert_eq!(code, "rejected");
-    // A task that is not parked is not retryable.
-    let (code, _) = refused(
-        addr,
-        "task_retry",
-        json!({"task_id": id, "by": "Coordinator"}),
+    let (code, _) = refused(addr, "task_cancel", json!({"task_id": theirs}));
+    assert_eq!(
+        code, "rejected",
+        "the first identity cannot cancel it either"
     );
+    assert_eq!(
+        ok(stranger.addr, "task_cancel", json!({"task_id": theirs}))["status"],
+        "cancelled"
+    );
+    stranger.stop();
+    let (code, _) = refused(addr, "task_cancel", json!({"task_id": 999_999}));
     assert_eq!(code, "rejected");
+    // A task that is not parked is not retryable. The refusal carries the
+    // command's own fields beside `code` and `message`.
+    let (is_error, retry) = call_as(addr, TOKEN, "task_retry", json!({"task_id": id}));
+    assert!(is_error, "{retry}");
+    let from_cli = cli(
+        home,
+        &[
+            "task-retry",
+            "--task-id",
+            &id.to_string(),
+            "--by",
+            "Coordinator",
+        ],
+    );
+    assert_eq!(from_cli.status.code(), Some(1));
+    let mut expected: Value = serde_json::from_slice(&from_cli.stdout).unwrap();
+    assert_eq!(expected["outcome"], "task-retry-rejected");
+    expected["code"] = json!("rejected");
+    expected["message"] = expected["reason"].clone();
+    assert_eq!(retry, expected);
     assert_eq!(status_of(&db, id), "open");
 
     let cancelled = ok(
         addr,
         "task_cancel",
-        json!({"agent": "Coordinator", "task_id": id, "note": "superseded"}),
+        json!({"task_id": id, "note": "superseded"}),
     );
     assert_eq!(cancelled["status"], "cancelled");
     assert_eq!(status_of(&db, id), "cancelled");
@@ -462,19 +512,11 @@ fn tools_run_the_coordinator_operations_against_a_real_database() {
 
     // Already finished: a clean negative, and no second note.
     let notes = count(&db, "SELECT COUNT(*) FROM task_notes");
-    let (code, _) = refused(
-        addr,
-        "task_cancel",
-        json!({"agent": "Coordinator", "task_id": id, "note": "again"}),
-    );
+    let (code, _) = refused(addr, "task_cancel", json!({"task_id": id, "note": "again"}));
     assert_eq!(code, "rejected");
     assert_eq!(count(&db, "SELECT COUNT(*) FROM task_notes"), notes);
-    let (code, _) = refused(
-        addr,
-        "task_retry",
-        json!({"task_id": id, "by": "Coordinator"}),
-    );
-    assert_eq!(code, "rejected");
+    let (is_error, retry) = call_as(addr, TOKEN, "task_retry", json!({"task_id": id}));
+    assert!(is_error && retry["code"] == "rejected", "{retry}");
     assert_eq!(status_of(&db, id), "cancelled");
 
     let (code, _) = refused(addr, "task_get", json!({"task_id": 999_999}));
@@ -511,7 +553,7 @@ fn every_request_needs_exactly_the_operator_token() {
     let list = json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}});
     let create = json!({
         "jsonrpc":"2.0","id":1,"method":"tools/call",
-        "params":{"name":"task_create","arguments":{"created_by":"x","title":"t"}}
+        "params":{"name":"task_create","arguments":{"title":"t"}}
     });
 
     let same_length_wrong = format!("Bearer {}X", &TOKEN[..TOKEN.len() - 1]);
@@ -541,6 +583,19 @@ fn every_request_needs_exactly_the_operator_token() {
             assert_eq!(status, 401, "{authorization:?}: {text}");
             assert_eq!(text, "Unauthorized", "{authorization:?}");
         }
+    }
+    // Authentication is decided first: without the token, a foreign Host or
+    // a browser Origin learns nothing more than 401.
+    let listed = list.to_string();
+    let mut with_origin = MCP_HEADERS.to_vec();
+    with_origin.push(("Origin", "http://localhost:3000"));
+    for (host, headers) in [
+        ("evil.example", &MCP_HEADERS[..]),
+        (&addr.to_string()[..], &with_origin[..]),
+        ("evil.example", &with_origin[..]),
+    ] {
+        let (status, text) = http_as(addr, host, "POST", "/mcp", headers, listed.as_bytes());
+        assert_eq!((status, text.as_str()), (401, "Unauthorized"), "{host}");
     }
     // The gate covers every method and path.
     let host = addr.to_string();
@@ -589,27 +644,33 @@ fn every_request_needs_exactly_the_operator_token() {
     assert_eq!(http_as(addr, &host, "POST", "/", &authorized, b"{}").0, 404);
     assert_eq!(http_as(addr, &host, "GET", "/mcp", &authorized, b"").0, 405);
     listener.stop();
-
-    // The environment is the other token source.
-    let mut command = orchestrator_command(home, "127.0.0.1:0");
-    command.env("QUORUM_ORCHESTRATOR_TOKEN", TOKEN);
-    let listener = Listener::spawn(command, "orchestrator-mcp");
-    assert_eq!(post_mcp(listener.addr, &[&good], &list).0, 200);
-    assert_eq!(post_mcp(listener.addr, &[], &list).0, 401);
-    listener.stop();
 }
 
 #[test]
-fn startup_refuses_a_missing_token_and_an_unnamed_non_loopback_bind() {
+fn startup_refuses_unsafe_or_incomplete_configuration() {
+    use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();
     let home = root.path();
+    init(home);
     let token_file = write_token(home, TOKEN);
     let token_file = token_file.to_str().unwrap();
-    let short = home.join("short.token");
-    std::fs::write(&short, "too-short").unwrap();
-    let spaced = home.join("spaced.token");
-    std::fs::write(&spaced, format!("{} {}", &TOKEN[..20], &TOKEN[20..])).unwrap();
+    let private = |name: &str, contents: &str, mode: u32| {
+        let path = home.join(name);
+        std::fs::write(&path, contents).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path.to_str().unwrap().to_string()
+    };
+    let short = private("short.token", "too-short", 0o600);
+    let spaced = private(
+        "spaced.token",
+        &format!("{} {}", &TOKEN[..20], &TOKEN[20..]),
+        0o600,
+    );
+    let group_readable = private("group.token", TOKEN, 0o640);
+    let world_readable = private("world.token", TOKEN, 0o604);
     let absent = home.join("absent.token");
+    let absent = absent.to_str().unwrap();
+    let directory = home.to_str().unwrap();
 
     let refused = |listen: &str, args: &[&str], env: &[(&str, &str)]| {
         let mut command = orchestrator_command(home, listen);
@@ -623,58 +684,117 @@ fn startup_refuses_a_missing_token_and_an_unnamed_non_loopback_bind() {
             Some(2),
             "{listen} {args:?} {env:?}: {output:?}"
         );
-        assert!(!String::from_utf8_lossy(&output.stderr).contains(TOKEN));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(!stderr.contains(TOKEN), "{stderr}");
+        stderr
     };
+    let id = ["--identity", "Coordinator"];
+
     // No token: refused on loopback and on every other address.
     for listen in ["127.0.0.1:0", "0.0.0.0:0", "[::]:0", "192.0.2.1:8811"] {
-        refused(listen, &[], &[]);
-        refused(listen, &["--allowed-host", "quorum.test"], &[]);
+        refused(listen, &id, &[]);
+        refused(
+            listen,
+            &["--identity", "Coordinator", "--allowed-host", "quorum.test"],
+            &[],
+        );
     }
+    // The token file must be a well-formed secret only its owner can read.
+    for file in [&short[..], &spaced, absent, directory] {
+        refused(
+            "127.0.0.1:0",
+            &["--identity", "Coordinator", "--token-file", file],
+            &[],
+        );
+    }
+    for file in [&group_readable, &world_readable] {
+        let stderr = refused(
+            "127.0.0.1:0",
+            &["--identity", "Coordinator", "--token-file", file],
+            &[],
+        );
+        assert!(stderr.contains("group or others"), "{stderr}");
+    }
+    // The token is never an argument, and the environment is not a source:
+    // an exported token is refused even beside a valid file.
     refused(
         "127.0.0.1:0",
-        &["--token-file", short.to_str().unwrap()],
+        &["--identity", "Coordinator", "--token", TOKEN],
         &[],
     );
-    refused(
+    refused("127.0.0.1:0", &id, &[("QUORUM_ORCHESTRATOR_TOKEN", TOKEN)]);
+    let stderr = refused(
         "127.0.0.1:0",
-        &["--token-file", spaced.to_str().unwrap()],
-        &[],
-    );
-    refused(
-        "127.0.0.1:0",
-        &["--token-file", absent.to_str().unwrap()],
-        &[],
-    );
-    refused(
-        "127.0.0.1:0",
-        &[],
-        &[("QUORUM_ORCHESTRATOR_TOKEN", "short")],
-    );
-    refused(
-        "127.0.0.1:0",
-        &["--token-file", token_file],
+        &["--identity", "Coordinator", "--token-file", token_file],
         &[("QUORUM_ORCHESTRATOR_TOKEN", TOKEN)],
     );
-    // The token is never an argument.
-    refused("127.0.0.1:0", &["--token", TOKEN], &[]);
+    assert!(stderr.contains("is not read"), "{stderr}");
+    // One coordinator identity is required and must be a plain name.
+    refused("127.0.0.1:0", &["--token-file", token_file], &[]);
+    for identity in ["", "  ", "two\nlines"] {
+        refused(
+            "127.0.0.1:0",
+            &["--token-file", token_file, "--identity", identity],
+            &[],
+        );
+    }
     // A token alone does not open a non-loopback bind: its hosts are named.
-    refused("0.0.0.0:0", &["--token-file", token_file], &[]);
     refused(
         "0.0.0.0:0",
-        &["--token-file", token_file, "--allowed-host", "bad host"],
+        &["--identity", "Coordinator", "--token-file", token_file],
+        &[],
+    );
+    refused(
+        "0.0.0.0:0",
+        &[
+            "--identity",
+            "Coordinator",
+            "--token-file",
+            token_file,
+            "--allowed-host",
+            "bad host",
+        ],
         &[],
     );
     // A managed run cannot start a coordinator listener.
     refused(
         "127.0.0.1:0",
-        &["--token-file", token_file],
+        &["--identity", "Coordinator", "--token-file", token_file],
         &[("QUORUM_RUN_ID", "worker-cap")],
     );
-    refused("localhost", &["--token-file", token_file], &[]);
+    refused(
+        "localhost",
+        &["--identity", "Coordinator", "--token-file", token_file],
+        &[],
+    );
+    // A repository without a database is refused, and none is created.
+    for repo in ["other/repo", "not-a-repo"] {
+        refused(
+            "127.0.0.1:0",
+            &[
+                "--identity",
+                "Coordinator",
+                "--token-file",
+                token_file,
+                "--repo",
+                repo,
+            ],
+            &[],
+        );
+    }
+    assert!(!home.join("repos/other__repo").exists());
 
     // With a token and a named host, a non-loopback bind serves that host only.
     let mut command = orchestrator_command(home, "0.0.0.0:0");
-    command.args(["--token-file", token_file, "--allowed-host", "quorum.test"]);
+    command.args([
+        "--identity",
+        "Coordinator",
+        "--token-file",
+        token_file,
+        "--allowed-host",
+        "quorum.test",
+    ]);
     let listener = Listener::spawn(command, "orchestrator-mcp");
     let addr = listener.addr;
     let list = json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}).to_string();
@@ -710,7 +830,7 @@ fn free_text_is_bounded_and_text_safe() {
     let addr = listener.addr;
     let db = db_path(home);
     let create = |extra: Value| {
-        let mut arguments = json!({"created_by": "Coordinator", "title": "t"});
+        let mut arguments = json!({"title": "t"});
         for (key, value) in extra.as_object().unwrap() {
             arguments[key] = value.clone();
         }
@@ -722,9 +842,8 @@ fn free_text_is_bounded_and_text_safe() {
         create(json!({"title": ""})),
         create(json!({"title": "line\nbreak"})),
         create(json!({"title": "nul\u{0}"})),
-        create(json!({"created_by": "c".repeat(129)})),
-        create(json!({"created_by": "nul\u{0}"})),
-        create(json!({"created_by": "tab\there"})),
+        // The identity is the listener's, never an argument.
+        create(json!({"created_by": "Someone"})),
         create(json!({"body": "b".repeat(64 * 1024 + 1)})),
         create(json!({"body": "has\u{0}nul"})),
         create(json!({"body": "   \n"})),
@@ -740,7 +859,7 @@ fn free_text_is_bounded_and_text_safe() {
         create(json!({"base_branch": "b".repeat(256)})),
         create(json!({"unknown": true})),
         create(json!({"title": 5})),
-        json!({"title": "no creator"}),
+        json!({"body": "no title"}),
     ];
     for arguments in invalid {
         let (code, message) = refused(addr, "task_create", arguments.clone());
@@ -749,48 +868,46 @@ fn free_text_is_bounded_and_text_safe() {
     for (tool, arguments) in [
         (
             "message_agent",
-            json!({"from": "a", "to": "b", "body": "m".repeat(32 * 1024 + 1)}),
+            json!({"to": "b", "body": "m".repeat(32 * 1024 + 1)}),
         ),
-        (
-            "message_agent",
-            json!({"from": "a", "to": "b", "body": "x\u{0}"}),
-        ),
-        (
-            "message_agent",
-            json!({"from": "a\u{0}", "to": "b", "body": "x"}),
-        ),
+        ("message_agent", json!({"to": "b", "body": "x\u{0}"})),
+        ("message_agent", json!({"to": "b\u{0}", "body": "x"})),
+        ("task_cancel", json!({"task_id": 1, "note": "n\u{0}"})),
         (
             "task_cancel",
-            json!({"agent": "a", "task_id": 1, "note": "n\u{0}"}),
+            json!({"task_id": 1, "note": "n".repeat(32 * 1024 + 1)}),
         ),
+        ("task_cancel", json!({"task_id": -1})),
+        ("task_cancel", json!({"task_id": 1, "agent": "Someone"})),
         (
-            "task_cancel",
-            json!({"agent": "a", "task_id": 1, "note": "n".repeat(32 * 1024 + 1)}),
+            "message_agent",
+            json!({"from": "Someone", "to": "b", "body": "x"}),
         ),
-        ("task_cancel", json!({"agent": "a", "task_id": -1})),
+        ("task_list", json!({"offset": -1})),
         ("task_list", json!({"limit": 0})),
         ("task_list", json!({"limit": 201})),
         ("task_list", json!({"status": "x\u{0}"})),
         ("task_log", json!({"task_id": 1, "since": -1})),
         ("task_get", json!({"task_id": 0})),
         ("task_get", json!({})),
-        ("task_retry", json!({"task_id": 1, "by": ""})),
+        ("task_retry", json!({"task_id": 1, "by": "Someone"})),
     ] {
         let (code, message) = refused(addr, tool, arguments.clone());
         assert_eq!(code, "invalid_arguments", "{tool} {arguments}: {message}");
     }
 
     // Bytes that are not UTF-8 never become a request, let alone a row.
-    let mut raw = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"task_create","arguments":{"created_by":"c","title":""#.to_vec();
+    let mut raw = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"task_create","arguments":{"title":""#.to_vec();
     raw.extend_from_slice(&[0xff, 0xfe, 0xc3, 0x28]);
     raw.extend_from_slice(br#""}}}"#);
     let good = format!("Bearer {TOKEN}");
     let mut authorized = MCP_HEADERS.to_vec();
     authorized.push(("Authorization", &good));
     let (status, text) = http_as(addr, &addr.to_string(), "POST", "/mcp", &authorized, &raw);
+    assert_eq!(status, 415, "{text}");
     assert!(
-        (400..500).contains(&status) || text.contains("\"error\""),
-        "{status}: {text}"
+        text.starts_with("fail to deserialize request body"),
+        "{text}"
     );
 
     // The HTTP body cap is the agent adapter's: 256 KiB.
@@ -838,11 +955,7 @@ fn concurrent_creates_and_cancels_are_decided_by_storage() {
         let creators: Vec<_> = (0..12)
             .map(|n| {
                 thread::spawn(move || {
-                    ok(
-                        addr,
-                        "task_create",
-                        json!({"created_by": "Coordinator", "title": format!("task {n}")}),
-                    )["id"]
+                    ok(addr, "task_create", json!({"title": format!("task {n}")}))["id"]
                         .as_i64()
                         .unwrap()
                 })
@@ -860,12 +973,7 @@ fn concurrent_creates_and_cancels_are_decided_by_storage() {
         let cancellers: Vec<_> = (0..12)
             .map(|_| {
                 thread::spawn(move || {
-                    call_as(
-                        addr,
-                        TOKEN,
-                        "task_cancel",
-                        json!({"agent": "Coordinator", "task_id": target}),
-                    )
+                    call_as(addr, TOKEN, "task_cancel", json!({"task_id": target}))
                 })
             })
             .collect();
@@ -894,6 +1002,266 @@ fn concurrent_creates_and_cancels_are_decided_by_storage() {
     }
     assert_eq!(count(&db, "SELECT COUNT(*) FROM tasks"), 60);
     assert_eq!(count(&db, "SELECT COUNT(*) FROM errors"), 0);
+    listener.stop();
+}
+
+/// The text of one tool result exactly as the listener sent it.
+fn result_text(addr: SocketAddr, name: &str, arguments: Value) -> String {
+    let response = rpc(
+        addr,
+        TOKEN,
+        "tools/call",
+        json!({"name": name, "arguments": arguments}),
+    );
+    assert_ne!(response["result"]["isError"], true, "{response:#}");
+    response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+const RESULT_CAP: usize = 128 * 1024;
+
+#[test]
+fn results_are_bounded_and_paged_through_the_listener() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path();
+    let listener = Listener::orchestrator(home);
+    let addr = listener.addr;
+    let db = db_path(home);
+
+    // task_list: summary rows only, and every row reachable by offset.
+    let mut created = Vec::new();
+    for n in 0..5 {
+        created.push(
+            ok(
+                addr,
+                "task_create",
+                json!({"title": format!("task {n}"), "body": "b".repeat(60_000)}),
+            )["id"]
+                .as_i64()
+                .unwrap(),
+        );
+    }
+    let mut seen = Vec::new();
+    let mut offset = 0;
+    loop {
+        let text = result_text(addr, "task_list", json!({"limit": 2, "offset": offset}));
+        assert!(text.len() < 4096, "a page of summaries carries no body");
+        let page: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(page["total"], 5);
+        assert_eq!(page["offset"], offset);
+        for task in page["tasks"].as_array().unwrap() {
+            assert!(task.get("body").is_none());
+            seen.push(task["id"].as_i64().unwrap());
+        }
+        match page["next_offset"].as_i64() {
+            Some(next) => {
+                assert_eq!(page["truncated"], true);
+                offset = next;
+            }
+            None => {
+                assert_eq!(page["truncated"], false);
+                break;
+            }
+        }
+    }
+    assert_eq!(seen, created);
+    let past = ok(addr, "task_list", json!({"offset": 50}));
+    assert_eq!(past["tasks"], json!([]));
+    assert_eq!(past["truncated"], false);
+
+    // task_get: 80 notes of 8000 bytes cannot fit; the newest survive and the
+    // result says how many were left out.
+    let id = created[0];
+    {
+        let conn = quorum_core::db::open(&db).unwrap();
+        for n in 0..80 {
+            conn.execute(
+                "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, 'Writer', ?3)",
+                params![id, 2000 + n, format!("{n:04}{}", "n".repeat(7996))],
+            )
+            .unwrap();
+        }
+    }
+    let text = result_text(addr, "task_get", json!({"task_id": id}));
+    assert!(text.len() <= RESULT_CAP, "{}", text.len());
+    let view: Value = serde_json::from_str(&text).unwrap();
+    let notes = view["notes"].as_array().unwrap();
+    assert!(!notes.is_empty() && notes.len() < 80, "{}", notes.len());
+    assert!(notes.last().unwrap()["body"]
+        .as_str()
+        .unwrap()
+        .starts_with("0079"));
+    assert_eq!(view["notes_omitted"], 80 - notes.len());
+    assert_eq!(view["body"].as_str().unwrap().len(), 60_000);
+    assert!(view.get("body_truncated").is_none());
+
+    // A body too large for one result on its own is shortened and flagged.
+    quorum_core::db::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET body=?2 WHERE id=?1",
+            params![created[1], "é".repeat(150_000)],
+        )
+        .unwrap();
+    let text = result_text(addr, "task_get", json!({"task_id": created[1]}));
+    assert!(text.len() <= RESULT_CAP, "{}", text.len());
+    let view: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(view["body_truncated"], true);
+    assert!(view["body"].as_str().unwrap().chars().all(|c| c == 'é'));
+
+    // task_log: 250 events of 2000 bytes are read in bounded pages, in order,
+    // by following `next_since`.
+    {
+        let conn = quorum_core::db::open(&db).unwrap();
+        let expires = quorum_core::clock::now() + 86_400;
+        for n in 0..250 {
+            conn.execute(
+                "INSERT INTO events(ts, kind, subject, body, expires_at)
+                 VALUES (?1, 'test_event', ?2, ?3, ?4)",
+                params![3000 + n, format!("task#{id}"), "e".repeat(2000), expires],
+            )
+            .unwrap();
+        }
+    }
+    let mut since = 0;
+    let mut sequence = Vec::new();
+    let mut pages = 0;
+    loop {
+        let text = result_text(addr, "task_log", json!({"task_id": id, "since": since}));
+        assert!(text.len() <= RESULT_CAP, "{}", text.len());
+        let page: Value = serde_json::from_str(&text).unwrap();
+        let events = page["events"].as_array().unwrap();
+        assert!(events.len() <= 100);
+        sequence.extend(events.iter().map(|event| event["seq"].as_i64().unwrap()));
+        pages += 1;
+        if page["truncated"] == true {
+            since = page["next_since"].as_i64().unwrap();
+            assert_eq!(Some(&since), sequence.last());
+        } else {
+            assert!(page.get("next_since").is_none());
+            break;
+        }
+        assert!(pages < 20, "paging did not advance");
+    }
+    assert!(pages > 3, "200 KiB per hundred events cannot fit one page");
+    assert_eq!(sequence.len(), 251, "task_created plus the 250 inserted");
+    assert!(sequence.windows(2).all(|pair| pair[0] < pair[1]));
+    listener.stop();
+}
+
+#[test]
+fn an_internal_failure_is_logged_for_the_operator_and_hidden_from_the_caller() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path();
+    let listener = Listener::orchestrator(home);
+    let addr = listener.addr;
+    let db = db_path(home);
+    // Task intake reads the operator's serve configuration; break it.
+    let config = home.join("serve/test__repo.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        "merge_token_file = \"/secret/path\"\nbase_branch = [broken\n",
+    )
+    .unwrap();
+
+    for arguments in [
+        json!({"title": "t"}),
+        json!({"title": "t", "base_branch": "main"}),
+    ] {
+        let (code, message) = refused(addr, "task_create", arguments);
+        assert_eq!(code, "internal");
+        for leaked in ["serve", "toml", "secret", home.to_str().unwrap()] {
+            assert!(!message.contains(leaked), "{message}");
+        }
+    }
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM tasks"), 0);
+    let logged: Vec<(String, String)> = {
+        let conn = quorum_core::db::open(&db).unwrap();
+        let mut statement = conn.prepare("SELECT source, detail FROM errors").unwrap();
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    };
+    assert_eq!(logged.len(), 2, "{logged:?}");
+    for (source, detail) in &logged {
+        assert_eq!(source, "orchestrator-mcp");
+        assert!(detail.starts_with("task_create: "), "{detail}");
+        assert!(detail.contains("bad serve config"), "{detail}");
+    }
+    // Reads do not depend on that file and still work.
+    assert_eq!(ok(addr, "task_list", json!({}))["total"], 0);
+    listener.stop();
+}
+
+/// One connection that has sent `payload` and nothing more.
+fn stalled(addr: SocketAddr, payload: &[u8]) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.write_all(payload).unwrap();
+    stream
+}
+
+#[test]
+fn peers_without_the_token_cannot_hold_the_listener() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path();
+    let listener = Listener::orchestrator(home);
+    let addr = listener.addr;
+    let list = json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}});
+    let good = format!("Bearer {TOKEN}");
+
+    // A refused request is answered before its body is read and its
+    // connection is closed: it never waits on, or holds, a request slot.
+    let refused_head = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer wrong-token-wrong-token-wrong-token\r\n\
+         Content-Type: application/json\r\nContent-Length: 200000\r\n\r\n"
+    );
+    for _ in 0..40 {
+        let mut stream = stalled(addr, refused_head.as_bytes());
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut raw = Vec::new();
+        stream
+            .read_to_end(&mut raw)
+            .expect("a refused connection must be closed, not held open");
+        let raw = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+        assert!(raw.starts_with("http/1.1 401"), "{raw}");
+        assert!(raw.contains("connection: close"), "{raw}");
+    }
+
+    // Peers that never finish a request head fill every connection slot (32)
+    // and more. They are cut off at the 2 second head timeout, so a caller
+    // with the token is served shortly after, not when they choose to leave.
+    let partial = format!("POST /mcp HTTP/1.1\r\nHost: {addr}\r\n");
+    let squatters: Vec<TcpStream> = (0..48)
+        .map(|n| stalled(addr, if n % 2 == 0 { b"" } else { partial.as_bytes() }))
+        .collect();
+    thread::sleep(Duration::from_millis(200));
+    let started = Instant::now();
+    let (status, body) = post_mcp(addr, &[&good], &list);
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "served after {:?}",
+        started.elapsed()
+    );
+    // Every squatter has been disconnected by the listener.
+    for mut squatter in squatters {
+        squatter
+            .set_read_timeout(Some(Duration::from_secs(8)))
+            .unwrap();
+        let mut raw = Vec::new();
+        squatter
+            .read_to_end(&mut raw)
+            .expect("an unfinished request head must be cut off");
+    }
+    assert_eq!(post_mcp(addr, &[&good], &list).0, 200);
     listener.stop();
 }
 
@@ -1110,16 +1478,10 @@ fn agent_and_orchestrator_tools_never_cross_listeners() {
 
     // Orchestrator tools do not exist on the agent listener, for a live run.
     for (name, arguments) in [
-        (
-            "task_create",
-            json!({"created_by": "Worker", "title": "escalate"}),
-        ),
-        ("task_cancel", json!({"agent": "test", "task_id": 200})),
+        ("task_create", json!({"title": "escalate"})),
+        ("task_cancel", json!({"task_id": 200})),
         ("task_list", json!({})),
-        (
-            "message_agent",
-            json!({"from": "Worker", "to": "AgentOne", "body": "x"}),
-        ),
+        ("message_agent", json!({"to": "AgentOne", "body": "x"})),
     ] {
         let response = rpc(
             agent.addr,
@@ -1158,7 +1520,7 @@ fn agent_and_orchestrator_tools_never_cross_listeners() {
     let id = ok(
         orchestrator.addr,
         "task_create",
-        json!({"created_by": "Coordinator", "title": "held", "depends_on": [200]}),
+        json!({"title": "held", "depends_on": [200]}),
     )["id"]
         .as_i64()
         .unwrap();
@@ -1168,11 +1530,7 @@ fn agent_and_orchestrator_tools_never_cross_listeners() {
         .unwrap()
         .iter()
         .any(|task| task["id"] == id));
-    let cancelled = ok(
-        orchestrator.addr,
-        "task_cancel",
-        json!({"agent": "Coordinator", "task_id": id}),
-    );
+    let cancelled = ok(orchestrator.addr, "task_cancel", json!({"task_id": id}));
     assert_eq!(cancelled["status"], "cancelled");
     thread::sleep(Duration::from_millis(2500));
     assert_eq!(status_of(&db, id), "cancelled");
