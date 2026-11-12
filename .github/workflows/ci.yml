@@ -26,6 +26,37 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # The pre-push hook's branch-base gate, enforced for pull requests so it
+  # still applies to pushes that bypass hooks. It reproduces the hook's ref
+  # tuple: `opened`/`reopened` checks the whole branch like a new-branch push;
+  # `synchronize` checks only that push, continuing from the previous PR head
+  # (`github.event.before`) like the daemon's continuation publication. Pushes
+  # to main are already-reviewed merges, so the job passes without checking
+  # them and keeps `test` running there.
+  branch-base:
+    name: branch-base
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+      - name: Check PR branch base
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BASE: ${{ github.base_ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BEFORE_SHA: ${{ github.event.action == 'synchronize' && github.event.before || '' }}
+        run: |
+          set -- --quick --pr-base="$PR_BASE" --proposed-sha="$PR_HEAD_SHA"
+          if [ -n "$PR_BEFORE_SHA" ]; then
+            set -- "$@" --continuation-from="$PR_BEFORE_SHA"
+          fi
+          ./preflight.sh "$@"
+      - name: Not a pull request
+        if: github.event_name != 'pull_request'
+        run: echo "branch-base checks pull requests only"
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest
@@ -39,7 +70,7 @@ jobs:
 
   test:
     name: test
-    needs: [fmt, clippy, shell-tests]
+    needs: [fmt, branch-base, clippy, shell-tests]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -72,6 +103,7 @@ jobs:
       - run: scripts/test-dev-install.sh
       - run: scripts/test-dogfood-install.sh
       - run: scripts/test-preflight.sh
+      - run: scripts/test-preflight-pr-base.sh
       - run: scripts/test-preflight-resource-guards.sh
       - run: docker/entrypoint_test.sh
 

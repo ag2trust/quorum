@@ -1242,7 +1242,7 @@ grep -q 'PREFLIGHT: FAIL (cargo test)' "$TMP/full-compile-failure.out"
 # CI uses the same collector so it compiles once with the explicit test-support
 # feature, waits for cheap mechanical jobs, and preserves a four-thread total
 # budget while exercising binary-level concurrency.
-grep -Fqx '    needs: [fmt, clippy, shell-tests]' \
+grep -Fqx '    needs: [fmt, branch-base, clippy, shell-tests]' \
   "$ROOT/.github/workflows/ci.yml"
 grep -Fqx '          --test-jobs 2' "$ROOT/.github/workflows/ci.yml"
 grep -Fqx '          --test-threads 2' "$ROOT/.github/workflows/ci.yml"
