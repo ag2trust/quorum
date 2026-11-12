@@ -408,6 +408,28 @@ pub enum Command {
         #[arg(long, value_name = "SOCKETADDR")]
         listen: Option<std::net::SocketAddr>,
     },
+    /// Serve the coordinator MCP tools for one repository over Streamable HTTP
+    /// at `http://<addr>/mcp`: create, list, inspect, cancel, and retry tasks,
+    /// and message a managed agent. Plain HTTP. Every request must carry the
+    /// operator's token as `Authorization: Bearer <token>`; the token comes
+    /// from `--token-file` or `QUORUM_ORCHESTRATOR_TOKEN`, never an argument.
+    #[command(name = "orchestrator-mcp")]
+    OrchestratorMcp {
+        /// Address to bind. A non-loopback address also requires `--allowed-host`.
+        #[arg(long, value_name = "SOCKETADDR")]
+        listen: std::net::SocketAddr,
+        /// File holding the bearer token (32 to 512 printable ASCII characters).
+        #[arg(long = "token-file", value_name = "PATH")]
+        token_file: Option<PathBuf>,
+        /// A `Host` (or `host:port`) clients may address. Repeatable. The
+        /// loopback names are always accepted on a loopback bind.
+        #[arg(long = "allowed-host", value_name = "HOST")]
+        allowed_host: Vec<String>,
+        /// Target repo as owner/name. Defaults to `QUORUM_REPO`, then the
+        /// current checkout.
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Signal task completion (worker) or emit a review verdict (reviewer).
     /// The daemon endpoint writes the mailbox row after deriving authority from
     /// the run capability; CLI task, PR, and identity flags are compatibility inputs.

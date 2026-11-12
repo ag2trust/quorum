@@ -13,6 +13,7 @@ mod config;
 mod coordinator;
 mod graph_blocker;
 mod input;
+mod orchestrator_mcp;
 mod output;
 mod paths;
 mod resource_health;
@@ -178,6 +179,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Message { .. } => "message",
         cli::Command::React { .. } => "react",
         cli::Command::AgentMcp { .. } => "agent-mcp",
+        cli::Command::OrchestratorMcp { .. } => "orchestrator-mcp",
         cli::Command::Submit { .. } => "submit",
         cli::Command::ReviewDraft { .. } => "review-draft",
         cli::Command::Serve { .. } => "serve",
@@ -1178,6 +1180,15 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         }
         cli::Command::AgentMcp { listen } => {
             agent_mcp::run(listen)?;
+            Ok(0)
+        }
+        cli::Command::OrchestratorMcp {
+            listen,
+            token_file,
+            allowed_host,
+            repo,
+        } => {
+            orchestrator_mcp::run(listen, token_file, allowed_host, repo)?;
             Ok(0)
         }
         cli::Command::Submit {
