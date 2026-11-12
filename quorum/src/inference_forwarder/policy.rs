@@ -189,8 +189,10 @@ fn check_tools(body: &Map<String, Value>) -> Result<(), String> {
 }
 
 /// Refuse content that makes the upstream read something the caller did not
-/// send inline: a source fetched by URL, a stored file, or a container
-/// upload. Model-authored `tool_use` input is opaque data and is not walked.
+/// send inline (a source fetched by URL, a stored file, a container upload)
+/// and content whose token cost its size does not bound (images and
+/// documents). Model-authored `tool_use` input is opaque data and is not
+/// walked.
 fn check_blocks(content: &Value, depth: usize) -> Result<(), String> {
     let Some(blocks) = content.as_array() else {
         return Ok(());
@@ -205,8 +207,19 @@ fn check_blocks(content: &Value, depth: usize) -> Result<(), String> {
         if block.contains_key("file_id") {
             return Err("file references are not available through this forwarder".into());
         }
-        if block.get("type").and_then(Value::as_str) == Some("container_upload") {
-            return Err("container uploads are not available through this forwarder".into());
+        match block.get("type").and_then(Value::as_str) {
+            Some("container_upload") => {
+                return Err("container uploads are not available through this forwarder".into())
+            }
+            // Images and documents cost tokens by dimensions and pages, not
+            // by size, so no bound on a request's input could be held
+            // against the run's allowance. They are refused even inline.
+            Some(kind @ ("image" | "document")) => {
+                return Err(format!(
+                    "{kind} content is not available through this forwarder; send text"
+                ))
+            }
+            _ => {}
         }
         match block.get("source") {
             None | Some(Value::Null) => {}
@@ -272,13 +285,10 @@ mod tests {
             {"type": "custom", "name": "write", "input_schema": {"type": "object"}}
         ]);
         policy.admit(&with("tools", tools), true).unwrap();
-        // Inline sources, tool results, and cache breakpoints are ordinary.
+        // Text, tool results, and cache breakpoints are ordinary.
         let messages = json!([
             {"role": "user", "content": [
-                {"type": "text", "text": "t", "cache_control": {"type": "ephemeral"}},
-                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}},
-                {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "x"}},
-                {"type": "document", "source": {"type": "content", "content": [{"type": "text", "text": "x"}]}}
+                {"type": "text", "text": "t", "cache_control": {"type": "ephemeral"}}
             ]},
             // A model-authored tool input may use any key names it likes.
             {"role": "assistant", "content": [
@@ -357,6 +367,32 @@ mod tests {
             refused(&with("system", json!([block])));
         }
         refused(&with("messages", json!("not an array")));
+    }
+
+    #[test]
+    fn images_and_documents_are_refused_even_inline() {
+        let image = json!({"type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}});
+        let pdf = json!({"type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": "AA=="}});
+        let text_document = json!({"type": "document",
+            "source": {"type": "text", "media_type": "text/plain", "data": "x"}});
+        let content_document = json!({"type": "document",
+            "source": {"type": "content", "content": [{"type": "text", "text": "x"}]}});
+        for (block, kind) in [
+            (image, "image"),
+            (pdf, "document"),
+            (text_document, "document"),
+            (content_document, "document"),
+        ] {
+            let top = json!([{"role": "user", "content": [block]}]);
+            let message = refused(&with("messages", top));
+            assert!(message.starts_with(&format!("{kind} content")), "{message}");
+            let nested = json!([{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t", "content": [block]}
+            ]}]);
+            refused(&with("messages", nested));
+        }
     }
 
     #[test]

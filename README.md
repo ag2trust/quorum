@@ -419,8 +419,9 @@ This is a non-binding view of ongoing directions, not a release schedule:
   `ANTHROPIC_BASE_URL` at it and presents its run capability as the API key. Each request
   is authorized by the daemon endpoint while the run is live, then re-sent with the
   operator's credential. Requests that would make the upstream act for the run are refused
-  with 400: any tool that is not a custom tool, `mcp_servers`, `container`, and content
-  sourced by URL or stored file. Configure it in the forwarder's own environment, which a
+  with 400: any tool that is not a custom tool, `mcp_servers`, `container`, content
+  sourced by URL or stored file, and `image` and `document` blocks even when inline
+  (their token cost is not bounded by their size, so it could not be held against a cap). Configure it in the forwarder's own environment, which a
   run must not inherit: `QUORUM_INFERENCE_UPSTREAM_API_KEY` (required),
   `QUORUM_INFERENCE_UPSTREAM_URL` (default `https://api.anthropic.com`; `http://` only for
   a loopback host), `QUORUM_INFERENCE_ALLOWED_MODELS` and `QUORUM_INFERENCE_ALLOWED_BETAS`
@@ -428,8 +429,8 @@ This is a non-binding view of ongoing directions, not a release schedule:
   `QUORUM_INFERENCE_RUN_TOKEN_CAP` (input plus output tokens per run, then 429), and
   `QUORUM_INFERENCE_UPSTREAM_TIMEOUT_SECS` (default 300). Every `/v1/messages` request
   must state `max_tokens`. With a cap set, a request is admitted only if the run's
-  remaining allowance covers `max_tokens` plus an input estimate of one token per two
-  body bytes; that amount is held while the request is in flight, so concurrent requests
+  remaining allowance covers `max_tokens` plus an upper bound on its input (one token per
+  body byte, plus 1024 for upstream framing); that amount is held while the request is in flight, so concurrent requests
   cannot pass the cap together, and is replaced by the upstream's reported usage when the
   response completes. A response that ends without final usage (the caller hung up, the
   stream broke, the upstream went silent after the request was sent) is charged the whole

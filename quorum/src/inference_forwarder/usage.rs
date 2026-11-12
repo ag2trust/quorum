@@ -1,7 +1,7 @@
 //! Per-run token accounting for the inference forwarder.
 //!
 //! A request is admitted only if the run's cap can cover the most it could
-//! cost: its `max_tokens` plus an estimate of its input. That amount is
+//! cost: its `max_tokens` plus an upper bound on its input. That amount is
 //! reserved while the request is in flight, so concurrent requests cannot
 //! together pass the cap, and is replaced by the upstream's own `usage`
 //! report when one arrives. A request that ends without a final report,
@@ -21,11 +21,18 @@ use std::time::Instant;
 /// hundred bytes; a longer line is skipped rather than buffered.
 const MAX_EVENT_LINE_BYTES: usize = 64 * 1024;
 
-/// Input tokens assumed for a request body before the upstream reports the
-/// real figure: one per two bytes, which over-estimates ordinary text and
-/// code roughly twofold and inline base64 media by far more.
+/// Input tokens the upstream adds that no request byte accounts for: the
+/// instructions it prepends when tools are declared (a few hundred tokens)
+/// and its framing of each message.
+const FRAMING_TOKENS: u64 = 1024;
+
+/// Upper bound on a request's input tokens, assumed until the upstream
+/// reports the real figure. Text cannot cost more than one token per byte,
+/// and the request policy admits no content whose cost is independent of its
+/// size (images and documents are priced by dimensions and pages). Ordinary
+/// text and code come in around a quarter of this.
 pub(super) fn estimated_input_tokens(body_bytes: usize) -> u64 {
-    (body_bytes as u64).div_ceil(2)
+    (body_bytes as u64).saturating_add(FRAMING_TOKENS)
 }
 
 #[derive(Debug)]
@@ -458,9 +465,10 @@ mod tests {
 
     #[test]
     fn input_is_estimated_from_the_body_size() {
-        assert_eq!(estimated_input_tokens(0), 0);
-        assert_eq!(estimated_input_tokens(1), 1);
-        assert_eq!(estimated_input_tokens(4096), 2048);
+        // Never less than one token per byte, whatever the size.
+        for bytes in [0, 1, 4096, 32 * 1024 * 1024] {
+            assert_eq!(estimated_input_tokens(bytes), bytes as u64 + FRAMING_TOKENS);
+        }
     }
 
     #[test]

@@ -162,6 +162,7 @@ fn serve_upstream(
         raw_body,
     };
     let key = seen.header("x-api-key").join(",");
+    let body_bytes = seen.raw_body.len();
     recorded.lock().unwrap().push(seen);
 
     let respond = |stream: &mut TcpStream, status: &str, body: &Value| {
@@ -199,14 +200,17 @@ fn serve_upstream(
         }
         "model-slow" => thread::sleep(Duration::from_secs(20)),
         "model-held" => {
-            // Stay in flight until the test lets this request finish.
+            // Stay in flight until the test lets this request finish, then
+            // bill it as the densest text possible: one input token per
+            // request byte, and every output token it asked for.
             let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(20));
             respond(
                 &mut stream,
                 "200 OK",
                 &json!({"id": "msg_1", "type": "message", "role": "assistant",
                         "content": [{"type": "text", "text": COMPLETION}],
-                        "usage": {"input_tokens": 10, "output_tokens": 5}}),
+                        "usage": {"input_tokens": body_bytes,
+                                  "output_tokens": body["max_tokens"]}}),
             );
         }
         "model-refused-key" => respond(
@@ -487,9 +491,10 @@ fn message(model: &str) -> Value {
 }
 
 /// What the forwarder holds against a run while this request is in flight:
-/// one input token per two body bytes, plus the request's `max_tokens`.
+/// one input token per body byte plus 1024 for the upstream's own framing,
+/// plus the request's `max_tokens`.
 fn hold(body: &Value) -> u64 {
-    (body.to_string().len() as u64).div_ceil(2) + body["max_tokens"].as_u64().unwrap()
+    body.to_string().len() as u64 + 1024 + body["max_tokens"].as_u64().unwrap()
 }
 
 fn cap_env(cap: u64) -> String {
@@ -711,6 +716,13 @@ fn requests_outside_the_policy_get_400_and_nothing_is_forwarded() {
     let file_document = json!([{"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": "t", "content": [
             {"type": "document", "source": {"type": "file", "file_id": "file_1"}}]}]}]);
+    let inline_document = json!([{"role": "user", "content": [
+        {"type": "document", "source":
+            {"type": "base64", "media_type": "application/pdf", "data": "AA=="}}]}]);
+    let inline_image = json!([{"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t", "content": [
+            {"type": "image", "source":
+                {"type": "base64", "media_type": "image/png", "data": "AA=="}}]}]}]);
     for (body, expected) in [
         (
             with(
@@ -748,10 +760,21 @@ fn requests_outside_the_policy_get_400_and_nothing_is_forwarded() {
             with("container", json!("container_1")),
             "container is not available",
         ),
-        (with("messages", url_image), "url sources are not available"),
+        (
+            with("messages", url_image),
+            "image content is not available",
+        ),
         (
             with("messages", file_document),
-            "file sources are not available",
+            "document content is not available",
+        ),
+        (
+            with("messages", inline_document),
+            "document content is not available",
+        ),
+        (
+            with("messages", inline_image),
+            "image content is not available",
         ),
         (message("model-other"), "model model-other is not allowed"),
         (with("model", json!(null)), "model must be"),
@@ -1107,12 +1130,17 @@ fn a_stream_the_caller_abandons_is_charged_its_whole_hold() {
 }
 
 #[test]
-fn concurrent_requests_cannot_together_exceed_the_cap() {
+fn concurrent_requests_with_dense_bodies_cannot_together_exceed_the_cap() {
     let endpoint = FakeEndpoint::start(&["run-a"]);
     let upstream = FakeUpstream::start();
-    let body = message("model-held");
+    // Text that costs close to a token per byte. The fake upstream bills
+    // exactly one input token per request byte and the full max_tokens.
+    let mut body = message("model-held");
+    body["messages"][0]["content"] = json!("7 9 4 1 ".repeat(512));
+    let billed = body.to_string().len() as u64 + 64;
     // Room for exactly two requests in flight.
-    let cap = cap_env(2 * hold(&body));
+    let cap_tokens = 2 * hold(&body);
+    let cap = cap_env(cap_tokens);
     let forwarder = Forwarder::start(
         &endpoint.path,
         &upstream.url(),
@@ -1149,14 +1177,53 @@ fn concurrent_requests_cannot_together_exceed_the_cap() {
         let status = results.recv_timeout(Duration::from_secs(15)).unwrap();
         assert_eq!(status, 200);
     }
-    // Both holds were reconciled to the 15 tokens each request really used,
-    // so the run can go on: 30 used, and another request's hold fits.
+    // Even billed at the densest rate, the two admitted requests stay
+    // within the cap, and what they did not use is free again.
+    assert!(2 * billed <= cap_tokens, "{billed} {cap_tokens}");
     assert_eq!(post(addr, "run-a", &message("model-json")).status, 200);
     assert_eq!(upstream.seen().len(), 3);
     let logs = forwarder.stop();
+    let final_total = format!("run_total_tokens={}", 2 * billed + 15);
     assert!(
         logs.iter()
-            .any(|line| line.contains("model=model-json") && line.ends_with("run_total_tokens=45")),
+            .any(|line| line.contains("model=model-json") && line.ends_with(&final_total)),
+        "{logs:?}"
+    );
+}
+
+#[test]
+fn holds_are_released_on_completion_so_a_run_is_not_starved() {
+    let endpoint = FakeEndpoint::start(&["run-a"]);
+    let upstream = FakeUpstream::start();
+    // Each request holds over a thousand tokens and uses 15 (whole) or 30
+    // (streamed). The cap covers the real usage of nine requests plus the
+    // tenth's hold, and no more: kept holds would refuse the second request.
+    let whole = message("model-json");
+    let mut streamed = message("model-stream");
+    streamed["stream"] = json!(true);
+    let cap_tokens = 5 * 15 + 4 * 30 + hold(&streamed);
+    assert!(2 * hold(&whole) > cap_tokens);
+    assert!(5 * 15 + 5 * 30 + hold(&whole) > cap_tokens);
+    let cap = cap_env(cap_tokens);
+    let forwarder = Forwarder::start(
+        &endpoint.path,
+        &upstream.url(),
+        &[("QUORUM_INFERENCE_RUN_TOKEN_CAP", &cap)],
+    );
+    let addr = forwarder.addr;
+    for round in 0..5 {
+        assert_eq!(post(addr, "run-a", &whole).status, 200, "round {round}");
+        let reply = post(addr, "run-a", &streamed);
+        assert_eq!(reply.status, 200, "round {round}");
+        assert!(reply.body.contains("message_stop"));
+    }
+    // 225 tokens used; the next hold no longer fits.
+    assert_eq!(post(addr, "run-a", &whole).status, 429);
+    assert_eq!(upstream.seen().len(), 10);
+    let logs = forwarder.stop();
+    assert!(
+        logs.iter().any(|line| line
+            .ends_with("status=200 input_tokens=10 output_tokens=20 run_total_tokens=225")),
         "{logs:?}"
     );
 }
