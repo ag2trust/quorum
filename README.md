@@ -406,6 +406,13 @@ This is a non-binding view of ongoing directions, not a release schedule:
 - An HTTP MCP server for outside orchestrating agents is planned in Quorum, running from
   the container alongside `quorum web`. Its listener, authentication, and tool set are not
   settled.
+- `quorum agent-mcp --listen <SOCKETADDR>` serves the managed-run MCP adapter over
+  Streamable HTTP at `/mcp`, so a managed worker or reviewer can signal the daemon without
+  the `quorum` binary or its socket. It is a first step, not the server above: it binds
+  loopback only, speaks plain HTTP, authorizes each request by its run capability sent as
+  a bearer token, and sends no tool-list-changed notification. Nothing starts it
+  automatically, agent prompts still instruct the shell commands, and its GitHub tools
+  remain unimplemented.
 
 ## Working on Quorum
 
