@@ -345,6 +345,17 @@ impl AgentEndpoint {
             )));
         }
 
+        // Only the location is resolved here. The file is read per owner
+        // alert, as `quorum post` reads it per post, so starting the endpoint
+        // neither depends on nor caches the operator config's contents.
+        let operator_config = match crate::paths::config_path() {
+            Ok(path) => path,
+            Err(error) => {
+                drop(listener);
+                cleanup_artifacts(&locator, &artifact_dir);
+                return Err(error);
+            }
+        };
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let db_path = db_path.to_path_buf();
         let repository = repository.to_string();
@@ -357,6 +368,7 @@ impl AgentEndpoint {
             db_path,
             repository,
             plan_validation,
+            operator_config,
             shutdown_rx,
         ));
         super::log("agent endpoint ready");
@@ -437,6 +449,7 @@ async fn run_listener(
     db_path: PathBuf,
     repository: String,
     plan_validation: PlanValidation,
+    operator_config: PathBuf,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut connections = JoinSet::new();
@@ -451,6 +464,7 @@ async fn run_listener(
                             db_path.clone(),
                             repository.clone(),
                             plan_validation.clone(),
+                            operator_config.clone(),
                         ));
                     }
                     Err(_) => super::log("agent endpoint accept failed"),
@@ -470,9 +484,18 @@ async fn serve_connection(
     db_path: PathBuf,
     repository: String,
     plan_validation: PlanValidation,
+    operator_config: PathBuf,
 ) {
     let response = match read_request(&mut stream).await {
-        Ok(request) => match process_request(db_path, repository, plan_validation, request).await {
+        Ok(request) => match process_request(
+            db_path,
+            repository,
+            plan_validation,
+            operator_config,
+            request,
+        )
+        .await
+        {
             Ok(response) => response,
             Err(error) => {
                 if error.is_abnormal() {
@@ -538,12 +561,14 @@ async fn process_request(
     db_path: PathBuf,
     repository: String,
     plan_validation: PlanValidation,
+    operator_config: PathBuf,
     request: Request,
 ) -> std::result::Result<Response, EndpointFailure> {
     process_request_with_timeout(
         db_path,
         repository,
         plan_validation,
+        operator_config,
         request,
         PROCESS_TIMEOUT,
     )
@@ -554,6 +579,7 @@ async fn process_request_with_timeout(
     db_path: PathBuf,
     repository: String,
     plan_validation: PlanValidation,
+    operator_config: PathBuf,
     request: Request,
     process_timeout: Duration,
 ) -> std::result::Result<Response, EndpointFailure> {
@@ -605,7 +631,14 @@ async fn process_request_with_timeout(
     let deadline = Instant::now() + process_timeout;
     let blocking_state = Arc::clone(&state);
     let mut task = tokio::task::spawn_blocking(move || {
-        process_request_blocking(&db_path, &repository, request, &blocking_state, deadline)
+        process_request_blocking(
+            &db_path,
+            &repository,
+            &operator_config,
+            request,
+            &blocking_state,
+            deadline,
+        )
     });
 
     match tokio::time::timeout(process_timeout, &mut task).await {
@@ -638,15 +671,28 @@ async fn process_request_with_timeout(
 fn process_request_blocking(
     db_path: &Path,
     repository: &str,
+    operator_config: &Path,
     request: Request,
     state: &AtomicU8,
     deadline: Instant,
 ) -> std::result::Result<Response, EndpointFailure> {
     // The alert TTL is the operator's configured message TTL, exactly what
-    // `quorum post` applies. It is read before the write transaction opens so
-    // no file I/O happens under the database write lock.
-    let owner_alert_ttl = match request.operation {
-        Operation::AlertOwner { .. } => Some(configured_message_ttl()?),
+    // `quorum post` applies. Reading it is file I/O, which must not happen
+    // under the database write lock, so it is read before the transaction.
+    // Authority and the body are decided first, on a short read, so a caller
+    // with no reviewer authority is answered `unauthorized` whatever state
+    // the config file is in. The write transaction below resolves authority
+    // again and is the one that counts.
+    let owner_alert_ttl = match &request.operation {
+        Operation::AlertOwner { body } => {
+            {
+                let conn = quorum_core::db::open(db_path)
+                    .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+                resolve(&conn, &request.capability, "reviewer")?;
+            }
+            validate_owner_alert(body)?;
+            Some(configured_message_ttl(operator_config)?)
+        }
         _ => None,
     };
     let mut conn = quorum_core::db::open(db_path)
@@ -1359,7 +1405,7 @@ fn record_call_in_tx(
 }
 
 fn resolve(
-    tx: &Transaction<'_>,
+    tx: &rusqlite::Connection,
     capability: &str,
     role: &str,
 ) -> std::result::Result<LiveRunContext, EndpointFailure> {
@@ -1415,9 +1461,8 @@ fn validate_owner_alert(body: &str) -> std::result::Result<(), EndpointFailure> 
 
 /// The message TTL `quorum post` uses when `--ttl` is omitted: the operator
 /// config's `message_ttl_secs`, or its default when no config file exists.
-fn configured_message_ttl() -> std::result::Result<i64, EndpointFailure> {
-    crate::paths::config_path()
-        .and_then(|path| crate::config::load(&path))
+fn configured_message_ttl(operator_config: &Path) -> std::result::Result<i64, EndpointFailure> {
+    crate::config::load(operator_config)
         .map(|config| config.message_ttl_secs)
         .map_err(|_| EndpointFailure::new("internal", "request processing failed"))
 }
@@ -1529,6 +1574,9 @@ mod tests {
         _dir: tempfile::TempDir,
         db_path: PathBuf,
         plan_validation: PlanValidation,
+        /// Inside the fixture's own directory and absent unless a test
+        /// writes it, so no test reads the developer's real config.
+        operator_config: PathBuf,
     }
 
     impl PlannerFixture {
@@ -1567,6 +1615,7 @@ mod tests {
             .unwrap();
             drop(conn);
             Self {
+                operator_config: dir.path().join("config.toml"),
                 _dir: dir,
                 db_path,
                 plan_validation: PlanValidation {
@@ -1596,6 +1645,7 @@ mod tests {
                 self.db_path.clone(),
                 "test/repo".into(),
                 self.plan_validation.clone(),
+                self.operator_config.clone(),
                 Request {
                     version,
                     capability: capability.into(),
@@ -2209,9 +2259,77 @@ mod tests {
         );
         assert_eq!(row.4.as_deref(), Some("owner"));
         assert_eq!(row.5, None);
-        assert!(row.7 > row.6, "alert must be live when written: {row:?}");
+        assert_eq!(
+            row.7 - row.6,
+            quorum_core::feed::DEFAULT_MESSAGE_TTL_SECS,
+            "with no operator config the alert uses the default message TTL"
+        );
         assert_eq!(count(&fixture, "messages"), 1);
         assert_eq!(count(&fixture, "mailbox"), 0);
+    }
+
+    /// The operator config supplies the alert TTL, and it is consulted only
+    /// after authority and the body are settled: with a malformed config an
+    /// unauthorized or invalid call still gets its own refusal, and only a
+    /// call that would otherwise post fails as `internal`. Nothing is written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn alert_owner_reads_the_operator_config_only_after_authorization() {
+        let fixture = live_run_fixture();
+        std::fs::write(&fixture.operator_config, "message_ttl_secs = 777\n").unwrap();
+        let response = fixture
+            .call(
+                "live-reviewer",
+                Operation::AlertOwner {
+                    body: "configured ttl".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let seq = result_value(&response)["result"]["seq"].as_i64().unwrap();
+        let ttl: i64 = quorum_core::db::open(&fixture.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT expires_at - ts FROM messages WHERE seq=?1",
+                [seq],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ttl, 777);
+
+        std::fs::write(&fixture.operator_config, "message_ttl_secs = [not toml").unwrap();
+        for capability in ["live-worker", "revoked-reviewer", "planner-cap", "unknown"] {
+            let error = fixture
+                .call(
+                    capability,
+                    Operation::AlertOwner {
+                        body: "not allowed".into(),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "unauthorized", "{capability}");
+        }
+        let invalid = fixture
+            .call(
+                "live-reviewer",
+                Operation::AlertOwner {
+                    body: String::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code, "invalid_operation");
+        let unreadable = fixture
+            .call(
+                "live-reviewer",
+                Operation::AlertOwner {
+                    body: "would post".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(unreadable.code, "internal");
+        assert_eq!(count(&fixture, "messages"), 1);
     }
 
     /// Only a live reviewer may alert the owner, and only with a bounded,
@@ -2688,6 +2806,7 @@ mod tests {
                         fixture.db_path.clone(),
                         "test/repo".into(),
                         plan_validation,
+                        fixture.operator_config.clone(),
                         Request {
                             version: PROTOCOL_VERSION,
                             capability: "planner-cap".into(),
@@ -2832,6 +2951,7 @@ mod tests {
                 repo_dir: dir.path().to_path_buf(),
                 path_resolver: super::super::planner::WritablePathResolver::default(),
             },
+            dir.path().join("config.toml"),
             Request {
                 version: PROTOCOL_VERSION,
                 capability: "timeout-cap".into(),
