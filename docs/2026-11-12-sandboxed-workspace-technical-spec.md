@@ -75,8 +75,10 @@ directory would hand the sandbox the daemon's hooks and config.
 | **Private repository** | A bare repository the daemon creates and alone uses, at `private_repo`. Never mounted into, linked from, or shared with a run. |
 | **Workspace** | One task's self-contained clone under `worktree_base`. Written by runs; untrusted in its entirety. |
 | **Staging directory** | A daemon-only directory on the same filesystem as `worktree_base`, where a workspace is built before it is handed to a run. |
-| **Run outbox** | A per-run directory, outside the workspace, where the run leaves its bundle and manifest. Written by the run; untrusted. |
+| **Session directory** | A per-task directory outside the workspace where the coding runner keeps its own conversation state so a later run of the same task can resume. Written by runs; untrusted; the daemon never parses it except through the untrusted-file reader. |
+| **Run outbox** | A per-run directory, outside the workspace, where the run leaves its bundle. Written by the run; untrusted. |
 | **Export step** | The fixed command that creates the bundle. It is part of the run and executes inside the run's isolation, never in the daemon. |
+| **Import quarantine** | A per-import object directory inside the private repository's `objects/` filesystem. A bundle's pack is indexed there, checked, and either moved into the private repository or deleted. |
 | **Launcher** | Whatever starts a run's processes. The built-in local launcher starts them on the operator's machine; an external launcher starts them in a sandbox. |
 | **Operator remote URL** | `remote_url`: the only URL the daemon fetches from or pushes to. |
 
@@ -101,10 +103,10 @@ and bounds time and output (`worktree.rs:207-315`). Nothing else is hardened.
 | Class | Rows | Meaning |
 |---|---|---|
 | SAFE | 9 | Keep as is. Not repository code, or the agent process itself. |
-| MOVE | 27 | Keep the operation; run it against the private repository with the hardened environment. |
+| MOVE | 28 | Keep the operation; run it against the private repository with the hardened environment. |
 | EMPTY-DIR | 11 | `gh` or repository-less `git`; run from a daemon-owned empty directory with an explicit repository or URL. |
-| REMOVE | 18 | Delete; the responsibility moves into the run, into workspace seeding, or into durable state. |
-| HARDEN | 2 | File reads of run-written state; route through the untrusted-file reader. |
+| REMOVE | 19 | Delete; the responsibility moves into the run, into workspace seeding, or into durable state. |
+| HARDEN | 3 | File reads of run-written state; route through the untrusted-file reader. |
 
 Highest risk, in order:
 
@@ -125,6 +127,11 @@ Highest risk, in order:
 
 No production path runs `preflight.sh`, tests, or another repository script directly. The only
 route to them is the hooks above, which this design removes.
+
+Outside the daemon, the operator's own tooling also executes `repo_dir` state:
+`scripts/serve-supervisor.sh:154-164` runs `git fetch`, `git merge --ff-only`, and
+`./dev-install.sh` in `repo_dir` on self-update. Hooks or config planted there through a linked
+worktree stay planted after migration, so migration reports them (see "Migration").
 
 ## Mode decision
 
@@ -156,6 +163,23 @@ remote. Agents already publish only through the daemon, so a missing remote chan
 that works today. A daemon push no longer runs the repository's pre-push hook, so a repository
 that relied on that hook as a gate for daemon pushes must enforce the same checks in CI.
 
+**Early hardening of the linked-worktree mode.** The worst paths should not wait for the flip.
+Once this repository's pre-push checks run in CI, the shared `git_command` gains, in both
+modes, an empty `core.hooksPath`, the protocol allowlist, `GIT_ATTR_SOURCE` for commands that do
+not check out files, and a push URL taken from configuration (or derived once at startup)
+instead of from the worktree. Teardown also stops snapshotting worktrees with `git add -A` and
+retires their directories instead. This closes highest-risk findings 1, 3, and the hook half
+of 2. Linked mode stays exploitable through filter, driver, and transport keys an agent can
+write into the shared git directory, including `info/attributes`, which no command-line
+override neutralizes. Only the clone model removes that.
+
+**Git LFS.** Daemon pushes have never uploaded LFS objects themselves; the LFS pre-push hook
+did. With hooks disabled, a push would publish pointer files without their objects. Both modes
+therefore detect LFS use (`filter=lfs` in a `.gitattributes` of the base or delivered tree,
+found with a bounded `git grep` in the private repository or `repo_dir`) and park the task with
+the reason `lfs-unsupported` instead of pushing. Supporting LFS would mean running `git lfs
+push` from the private repository with a daemon-chosen binary; that is an open question.
+
 ## Architecture
 
 ```
@@ -167,7 +191,7 @@ that relied on that hook as a gate for daemon pushes must enforce the same check
    │ private repository (bare, daemon-only)│──────────────────┘
    │  refs/remotes/origin/*                │
    │  refs/quorum/tasks/<id>/{base,head}   │◀── import + verify ── staged bundle copy
-   │  refs/quorum/import/<run>             │                            ▲
+   │  objects/quorum-quarantine/<run>      │                            ▲
    │  refs/quorum-publication/*, recover,  │                 untrusted-file reader
    │  cleanup tombstones                   │                            │
    └──────────────┬────────────────────────┘                  run outbox/<run>/delivery.bundle
@@ -187,7 +211,11 @@ directory the daemon executes against.
   Startup refuses overlap.
 - **Creation.** `git init --bare --template=<empty template dir>` under the hardened
   environment, with `--object-format` set to the upstream's format (SHA-1 unless configured).
-  The daemon then writes the config itself and treats any key it did not write as corruption:
+  The daemon then writes the config itself. Startup compares the config with an allowlist: the
+  keys the daemon writes, plus the keys `git init` itself writes on some platforms
+  (`core.repositoryformatversion`, `core.filemode`, `core.ignorecase`,
+  `core.precomposeunicode`, `core.symlinks`, `extensions.objectformat`). Any other key is
+  treated as corruption.
 
   ```
   [core] repositoryformatversion, bare = true, logAllRefUpdates = false
@@ -196,8 +224,9 @@ directory the daemon executes against.
   [uploadpack] allowAnySHA1InWant = false, allowReachableSHA1InWant = false
   ```
 
-  `hooks/` is absent. `info/attributes`, `info/exclude`, and `objects/info/alternates` must be
-  absent; startup verifies all of this before the first command.
+  `hooks/`, `info/attributes`, `info/exclude`, `info/grafts`, `shallow`,
+  `objects/info/alternates`, and `objects/info/http-alternates` must be absent. Startup verifies
+  all of this before the first command.
 - **Ref namespaces.**
 
   | Ref | Writer | Meaning |
@@ -206,7 +235,6 @@ directory the daemon executes against.
   | `refs/quorum/pr/<n>` | hardened fetch | A fetched `refs/pull/<n>/head`. |
   | `refs/quorum/tasks/<id>/base` | seeding | The commit a task's first workspace was seeded from. |
   | `refs/quorum/tasks/<id>/head` | import | The last verified task commit. The only source of publication. |
-  | `refs/quorum/import/<run>` | import | Quarantine during verification; never outlives the import. |
   | `refs/quorum-publication/task-<id>` | publication | Existing pin; moves here unchanged. |
   | `refs/quorum-recover/...` | recovery | Existing recover refs; move here unchanged. |
   | `refs/quorum/cleanup/...` | cleanup | Existing tombstones; move here unchanged. |
@@ -217,8 +245,12 @@ directory the daemon executes against.
   `WorktreeManager.lock` does today. Commands keep `run_git`'s timeout, output bound, and
   kill-and-reap.
 - **Maintenance.** Automatic GC is off. The daemon runs `git gc --prune=<age>` under the lock
-  at startup and after every 50 imports, with the local timeout. A rejected import prunes its
-  own objects immediately (see "Import and verification").
+  at startup and after every 50 imports, with the local timeout. A rejected import never puts
+  objects into the private repository: its quarantine directory is deleted (see "Bundle
+  verification rules").
+- **Workspace state per task** (durable, additive columns): `seeded_base_sha` (the first seed),
+  `seeded_upstream_sha` (the `origin/<base>` tip given to the current workspace),
+  `imported_head_sha`, and a consecutive-rejection counter with the last rule code.
 
 ## Hardened git invocation
 
@@ -242,7 +274,7 @@ push, and `ls-remote` against the operator remote URL.
 
 | Variable | Local profile | Transport profile, `inherit` | Transport profile, `hermetic` |
 |---|---|---|---|
-| Inherited environment | cleared; then `PATH` from the daemon, `HOME=<state dir>/empty`, `LC_ALL=C`, `TZ=UTC` | inherited, minus every `GIT_*` variable | as the local profile |
+| Inherited environment | cleared; then `PATH` from the daemon, `HOME=<state dir>/empty`, `LC_ALL=C`, `TZ=UTC` | cleared; then an allowlist copied from the daemon: `PATH`, `HOME`, `USER`, `LOGNAME`, `TMPDIR`, `LANG`, `LC_*`, `SSH_AUTH_SOCK`. Never `GH_TOKEN`, `GITHUB_TOKEN`, `QUORUM_*`, or any `GIT_*` | as the local profile |
 | `GIT_CONFIG_NOSYSTEM` | `1` | unset | `1` |
 | `GIT_CONFIG_GLOBAL` | `/dev/null` | unset | `/dev/null` |
 | `GIT_ATTR_NOSYSTEM` | `1` | `1` | `1` |
@@ -252,15 +284,25 @@ push, and `ls-remote` against the operator remote URL.
 | `GIT_TERMINAL_PROMPT`, `GIT_OPTIONAL_LOCKS` | `0`, `0` | same | same |
 | `GIT_NO_REPLACE_OBJECTS` | `1` | same | same |
 | `GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_PAGER` | `false`, `false`, `cat` | same | same |
-| `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_SSH_COMMAND`, `GIT_SSH` | unset | inherited | unset |
+| `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_SSH_COMMAND`, `GIT_SSH` | unset | unset | unset |
 
-`inherit` keeps the operator's global and system git configuration for transport commands
-only, so a local operator's credential helper and SSH setup keep working. That configuration
-belongs to the operator, not to a run. Under the local permissive profile it is still reachable
-by the agent, as everything on that machine is. `hermetic` reads no configuration outside the
-private repository. It authenticates only through the separate credential-supply contract and
-is accepted now for `file://` remotes and tests. A deployment with an external launcher must
-use `hermetic`.
+`inherit` keeps the operator's global and system git configuration files for transport commands
+only, so a local operator's credential helper and SSH configuration keep working. That
+configuration belongs to the operator, not to a run. Under the local permissive profile it is
+still reachable by the agent, as everything on that machine is. Because it is not daemon-owned,
+`inherit` also guards against URL rewriting. Before the first transport command and before every
+push, the daemon runs:
+
+- `git ls-remote --get-url --end-of-options <remote_url>` and requires the output to equal
+  `remote_url`;
+- `git config --get-regexp '^url\..*\.(push)?insteadof$'`, and refuses if any `pushInsteadOf`
+  prefix matches `remote_url`.
+
+A rewrite is refused, with exit 2 at startup and a park at push time, instead of being followed.
+
+`hermetic` reads no configuration outside the private repository. It authenticates only through
+the separate credential-supply contract and is accepted now for `file://` remotes and tests. A
+deployment with an external launcher must use `hermetic`.
 
 **Command-line configuration (both profiles)**
 
@@ -273,6 +315,7 @@ use `hermetic`.
 -c transfer.fsckObjects=true -c fetch.fsckObjects=true -c receive.fsckObjects=true
 -c submodule.recurse=false -c fetch.recurseSubmodules=false -c push.recurseSubmodules=no
 -c gc.auto=0 -c maintenance.auto=false -c fetch.writeCommitGraph=false
+-c core.bigFileThreshold=16m -c core.deltaBaseCacheLimit=32m -c pack.threads=1
 -c commit.gpgSign=false -c tag.gpgSign=false -c push.gpgSign=false
 -c diff.external= -c core.pager=cat
 -c credential.helper=          # local profile and hermetic transport only
@@ -282,23 +325,54 @@ Command-line `-c` values take precedence over every configuration file, so in `i
 operator `core.hooksPath` or `core.fsmonitor` is still overridden. Diff-producing commands also
 pass `--no-ext-diff --no-textconv --no-color`.
 
+Transport fetches may need an escape hatch for upstream history that strict fsck rejects (for
+example, old commits with malformed author lines). The `git_fsck_ignore` key lists fsck message
+IDs. Each becomes `-c fetch.fsck.<id>=ignore` on transport fetches only, never on bundle imports.
+
+`GIT_ATTR_SOURCE` is not applied to the seeding checkout. There, honoring the tree's `eol` and
+`working-tree-encoding` attributes is needed for a correct checkout, and it is safe: with no
+filter or driver defined in any configuration the command reads, an attribute can only select
+built-in behavior.
+
 **What this rules out.** The daemon cannot run hooks (`core.hooksPath` points at an empty
 directory, and repository and global hooks paths are overridden). It cannot run a configured
 filter, textconv, external diff, merge driver, fsmonitor, editor, pager, or askpass. None is
 defined in the private repository's own config, global and system config are ignored by the
-local profile, and repository attributes are not read (`GIT_ATTR_SOURCE` is the empty tree).
-Transports other than local files and the remote's scheme are refused before connection. With
-git 2.53, the local profile refused `ext::` and `https` URLs ("transport not allowed") and still
-fetched from a bundle file. Malformed objects are refused by `fsck` on every fetch.
+local profile, and repository attributes are not read outside seeding (`GIT_ATTR_SOURCE` is
+the empty tree). Transports other than local files and the remote's scheme are refused before
+connection. With git 2.53, the local profile refused `ext::` and `https` URLs ("transport not
+allowed") and still read a bundle file. Network fetches run with `fetch.fsckObjects=true`.
+Bundle imports do not rely on fetch-side fsck, which only covers bundles from git 2.48 onward.
+They run `index-pack --strict` explicitly (see "Bundle verification rules").
 
 **URL validation.** `remote_url` must be `https://`, `ssh://`, scp-like `user@host:path`, or
 `file://`. Transport-helper syntax (`<name>::`), a leading `-`, control characters, and embedded
 credentials are rejected at startup with exit 2. The URL is never read from any repository
 config at run time.
 
-**Git version.** Startup in clone mode requires git 2.40 or later (`GIT_ATTR_SOURCE`; 2.38 for
-`merge-tree --write-tree`) and logs the detected version. Operators are expected to track
-upstream git security releases. The floor checks functionality, not patch currency.
+**Git version.** The hardened constructor checks `git --version` once at startup, in every mode
+that uses it, and logs the result.
+
+- **Floor: 2.43.**
+  - `GIT_ATTR_SOURCE` arrived in 2.41, and older git ignores it silently.
+  - `merge-tree --write-tree` with an attribute source was unreliable before 2.43.
+  - Below 2.43, clone mode refuses to start (exit 2).
+  - Below 2.43, the linked-worktree mode's early hardening logs that attribute isolation is
+    inactive and continues; that mode's hardening is best effort anyway.
+- **Not version-dependent:** bundle object checking uses `index-pack --strict` and does not
+  depend on 2.48's fetch-side bundle fsck.
+- **CI:** a job runs the hostile-git suites on the floor version as well as on a current
+  release.
+- **Security releases:** operators are expected to track upstream git security releases. The
+  floor checks functionality, not patch currency.
+
+**Inherited `GIT_*` variables.** Both profiles start from a cleared environment, so variables in
+the daemon's own environment cannot redirect a command. That covers `GIT_DIR`,
+`GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+`GIT_EXEC_PATH`, `GIT_TEMPLATE_DIR`, `GIT_CONFIG_PARAMETERS`, and
+`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`. The import quarantine is the
+only case where the daemon sets `GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT_DIRECTORIES`
+itself.
 
 **Source-scan test.** The existing test `production_git_commands_use_the_shared_constructor`
 (`quorum-core/src/git.rs:48`) is extended so that production code outside the
@@ -310,15 +384,17 @@ command, use `-C`, or set `current_dir` for a `git` or `gh` process.
 ### 1. Allocate
 
 A task allocation keeps its existing durable fields (branch name, workspace path under
-`worktree_base`). It adds the seeded base SHA and the last imported head SHA. The path binding
-lives only in the database; Git has no worktree registration to reconcile.
+`worktree_base`). It adds the workspace state listed under "Private repository". The path
+binding lives only in the database; Git has no worktree registration to reconcile.
 
 ### 2. Seed
 
 The daemon builds every workspace in the staging directory and hands it over with one
-`rename(2)` into `worktree_base`. Git therefore never runs in a directory that a run has ever
-been able to write. Staging must be on the same filesystem as `worktree_base`; startup checks
-the device IDs.
+no-replace rename into `worktree_base`. That is `renameat2(RENAME_NOREPLACE)` on Linux and
+`renamex_np(RENAME_EXCL)` on macOS; plain `rename(2)` would silently replace an empty directory
+a run created at the target. Git therefore never runs in a directory that a run has ever been
+able to write. Staging must be on the same filesystem as `worktree_base`; startup checks the
+device IDs.
 
 ```
 git init --template=<empty template dir> <staging>/<name>
@@ -336,23 +412,32 @@ git --git-dir=… config user.name <operator identity> ; user.email <…>
   the daemon's objects. The seeding test asserts `st_nlink == 1` on workspace object files.
 - The workspace has no remote, no hooks directory, and no config beyond the identity. Agents
   publish only through the daemon.
-- Before the handoff, the daemon chmods the tree for the role. The launcher owns the mount mode
-  (read-only for non-writing roles).
+- The daemon does not chmod the seeded tree. The tree may contain symlinks from hostile
+  content, such as a fork's PR head, and a permission walk could follow one into daemon files.
+  Read-only is the launcher's mount mode for non-writing roles. Under local permissive there is
+  no read-only enforcement, and none is claimed.
 
-Seed variants:
+Seed variants. *Start* is the commit the delivered tip must descend from. *Exclude* is the
+export declaration's exclude set. Every exclude SHA is recorded durably when the workspace is
+seeded.
 
-| Run | Seeded `refs/heads/<branch>` | Extra refs |
-|---|---|---|
-| First worker run | the verified base tip; also written to `refs/quorum/tasks/<id>/base` | `origin/<base>` |
-| Rework or retry | `refs/quorum/tasks/<id>/head`; the existing workspace is reused when present | refreshed `origin/<base>` |
-| Reviewer, review-only, continuation reviewer | `refs/quorum/pr/<n>` at the verified PR head SHA | `origin/<base>` |
-| Continuation worker, clean base merge | a daemon-made merge commit (see "Branch synchronization and continuation") | `origin/<base>` |
-| Continuation worker or sync judgment, conflicting | the PR head or sync target tip; the run's instructions say which commit to merge | the commit to merge, as `refs/remotes/origin/<branch>` |
-| Resume from a recover ref | the recover snapshot's parent commit; the snapshot tree is checked out in staging and the index is reset to the parent, reproducing uncommitted changes | `origin/<base>` |
+| Run | Seeded `refs/heads/<branch>` | Extra refs | Start | Exclude |
+|---|---|---|---|---|
+| First worker run | the verified base tip; also written to `refs/quorum/tasks/<id>/base` | `origin/<base>` | base | base, upstream tip |
+| Rework or retry (workspace reused) | nothing; the daemon does not touch it | nothing | imported head | imported head, `seeded_upstream_sha` |
+| Rework or retry (workspace missing) | `refs/quorum/tasks/<id>/head` in a new workspace | `origin/<base>` | imported head | imported head, new upstream tip |
+| Reviewer, review-only, continuation reviewer | `refs/quorum/pr/<n>` at the verified PR head SHA | `origin/<base>` | n/a (no export) | n/a |
+| Continuation worker, clean base merge | a daemon-made merge commit (see "Branch synchronization and continuation") | `origin/<base>` | the merge | the merge, upstream tip |
+| Continuation worker or sync judgment, conflicting | `<ours>` (the PR head or sync target tip) | `<theirs>` as `refs/remotes/origin/<branch>` | `<ours>` **and** `<theirs>` | `<ours>`, `<theirs>`, upstream tip |
+| Resume from a recover ref | the recover snapshot's parent commit; the snapshot tree is checked out in staging and the index is reset to the parent, reproducing uncommitted changes | `origin/<base>` | the parent | the parent, upstream tip |
 
-A reused workspace (rework) is never touched by daemon git. When a run needs a different
-starting point (a new continuation base, a recovery), the daemon seeds a new workspace and
-retires the old directory (see "Cleanup").
+A reused workspace (rework) is never touched by daemon git, so its `origin/<base>` is not
+refreshed. Its exclude set names the upstream tip it was actually seeded with, which the
+workspace holds, not the current tip, which it does not. When a run needs a different starting
+point (a new continuation base, a recovery), the daemon seeds a new workspace and retires the
+old directory (see "Cleanup").
+
+A full re-seed per review run copies the repository's objects each time; see open questions.
 
 ### 3. Hand off to the run
 
@@ -362,12 +447,20 @@ The launcher seam receives, per run:
 - the session directory path (outside the workspace and per task);
 - the run outbox path, `<state dir>/runs/<run_id>/outbox/`, which the daemon creates empty with
   mode `0700`;
-- for writing roles, an export declaration: `{ branch, exclude: [sha…], file: "delivery.bundle" }`.
-  `exclude` lists every commit the daemon seeded: the task base or last head, plus the
-  `origin/<base>` tip it seeded.
+- for writing roles, an export declaration: `{ branch, exclude: [sha…], file: "delivery.bundle" }`,
+  with `exclude` taken from the seed-variant table.
 
-The run's environment already carries `QUORUM_REPO` (`quorum/src/serve/agent.rs:1223`), so
-the CLI inside a workspace never needs a remote to identify the repository.
+Repository identity cannot come from the workspace, which has no remote:
+
+- **Agent-MCP runs** already receive `QUORUM_REPO` as one of the run fields copied into the MCP
+  child (`AGENT_MCP_ENV_VARS`, `quorum/src/serve/runner.rs:777-782`).
+- **Restricted spawns** (planner, classifier) have it removed by `strip_coordination_env`
+  (`quorum/src/serve/agent.rs:1219-1229`). If such a run invokes the CLI, `paths::resolve_repo`
+  falls back to `git remote get-url origin` (`quorum/src/paths.rs:28-47`), which fails in a
+  workspace. Clone mode keeps `QUORUM_REPO` for those spawns, since it is not a credential, or
+  the run must not use the CLI.
+- **Prompts that still name `gh` commands** need `GH_REPO=<owner/name>` in the run
+  environment. That sets the repository, not a credential.
 
 ### 4. Export (run-side)
 
@@ -376,21 +469,30 @@ isolation as the run:
 
 ```
 git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c gc.auto=0 \
-    -C <workspace> bundle create --version=2 <outbox>/delivery.bundle \
+    -C <workspace> bundle create --version=3 <outbox>/delivery.bundle \
     refs/heads/<branch> --not <exclude…>
 ```
 
-with `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null`. The step may also write
-`<outbox>/manifest.json`, `{ "dirty": bool }`, from `git status --porcelain`. The manifest is
-informational only and is size-capped at 4 KiB.
+with `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null`. Version 3 carries
+`@object-format`, which a SHA-256 repository needs and which the import checks. The export writes
+nothing else. A status manifest was considered and dropped: `git status` runs clean filters and
+recurses into submodules, which would add run-side processes the launcher must then contain for
+no lifecycle benefit.
 
 The export step runs against the workspace by design. It is the run working on its own files.
 Under the isolated runtime profile it executes in the sandbox, with no network and no
-credentials. Under the local permissive profile the local launcher runs it as a separate process
-group with a scrubbed environment: no `GH_TOKEN`, no `SSH_AUTH_SOCK`, no credential helper, no
-orchestrator token (`strip_operator_secrets`, `quorum/src/serve/runner.rs:695`). That gives it
-no authority the agent did not already have. The hardening flags are defense in depth for the
-run, not a daemon guarantee.
+credentials. Under the local permissive profile the local launcher runs it:
+
+- in a new process group, killed and reaped as a group after a fixed timeout (60 s), so a
+  process it spawns cannot outlive it;
+- with an environment built from an allowlist (`PATH`, `HOME`, `LANG`, `LC_*`, `TMPDIR`, plus
+  the git variables above). No `GH_TOKEN`, `GITHUB_TOKEN`, `SSH_AUTH_SOCK`, `QUORUM_*`, or
+  orchestrator token.
+
+No such scrubbed environment exists today. `strip_operator_secrets`
+(`quorum/src/serve/runner.rs:695`) removes only the orchestrator token, so the allowlist is new
+work in the export slice. The export has no authority the agent did not already have. Its
+hardening flags are defense in depth for the run, not a daemon guarantee.
 
 A worker's lifecycle "done" signal is unchanged. Publication now waits until the run has exited
 and the export step has finished. If a run stays alive after a terminal signal, the daemon ends
@@ -399,16 +501,18 @@ it after a bounded grace period.
 ### 5. Collect
 
 The daemon opens `<outbox>/delivery.bundle` with the untrusted-file reader (see "Untrusted file
-handling") and streams it into `<state dir>/imports/<run_id>.bundle`, created `O_EXCL` with
-mode `0600`, up to `max_bundle_bytes`. Every later step uses only this private copy, so the run
-cannot change the bytes between verification and import. A missing bundle maps to "no
-delivery" (see "Failure modes").
+handling"). It streams the bundle, up to `max_bundle_bytes`, into a temporary file in
+`<state dir>/imports/` created `O_EXCL` with mode `0600`, `fsync`s it, and renames it to
+`<run_id>.bundle`. A crash therefore never leaves a partial copy under the final name. Every
+later step uses only this private copy, so the run cannot change the bytes between
+verification and import. A missing bundle maps to "no delivery" (see "Failure modes").
 
 ### 6. Import and verify
 
-See "Bundle verification rules". On success, `refs/quorum/tasks/<id>/head` moves to the
-verified tip in one `update-ref --stdin` transaction, which also deletes the quarantine ref, and
-the staged copy is removed.
+See "Bundle verification rules". On success the quarantined pack moves into the private
+repository and `refs/quorum/tasks/<id>/head` moves to the verified tip with an expected-old
+`update-ref`. The staged copy is removed on success and on rejection. It is kept only across an
+infrastructure retry.
 
 ### 7. Publish
 
@@ -433,9 +537,9 @@ Publication keeps its durable intent, pin, lease, and verification stages
 
 ### 8. Next run
 
-A rework run reuses the workspace and exports with `exclude = [head, origin/<base> tip]`. If the
-agent rewrote already-imported history, the new bundle does not descend from the last head and
-import rejects it. That is the same fast-forward-only rule `push_to_pr_head` enforces today
+A rework run reuses the workspace and exports with `exclude = [imported head,
+seeded_upstream_sha]`. If the agent rewrote already-imported history, the new bundle does not
+descend from the last head and import rejects it. That is the same fast-forward-only rule `push_to_pr_head` enforces today
 (`worktree.rs:1644-1666`).
 
 ### 9. Cleanup
@@ -443,7 +547,10 @@ import rejects it. That is the same fast-forward-only rule `push_to_pr_head` enf
 The daemon deletes workspaces, staging directories, outboxes, and session directories with
 symlink-safe recursive removal, never with git. `std::fs::remove_dir_all` does not follow
 symlinks on Unix (std since 1.58.1), and a wrapper refuses a root that is itself a symlink or
-not a directory. A superseded workspace (re-seeded, or found unreferenced at startup) is renamed
+not a directory. A run may have removed write permission from its own directories. The wrapper
+therefore walks the tree without following links, restoring the owner write bit on each real
+directory through a descriptor opened with `O_NOFOLLOW | O_DIRECTORY`, and skips symlinks. A
+superseded workspace (re-seeded, or found unreferenced at startup) is renamed
 to `worktree_base/.retired/<name>-<unix time>` and deleted after
 `superseded_workspace_retention_secs`. Uncommitted work is never destroyed immediately, and the
 daemon never needs `git status` to find out whether there is any. A terminal task's workspace is
@@ -451,8 +558,22 @@ retired the same way.
 
 ## Bundle verification rules
 
-Steps run in order. The first failure rejects the bundle with a stable rule code, deletes the
-quarantine ref, and prunes.
+The rules run in order. The first failure rejects the bundle with a stable rule code. A
+rejected bundle never writes an object or a ref into the private repository: its pack only ever
+exists in the import quarantine, which is deleted on rejection.
+
+The design follows from two findings with git 2.53:
+
+- **Foreign objects pass fetch-based checks.** A hand-built bundle with a valid prerequisite can
+  reference objects the private repository already holds but the run was never given. One case
+  is a tree entry naming another task's blob. Another is a merge whose second parent is another
+  task's unpublished commit, known only by its SHA. Such a bundle passes `bundle verify`,
+  `fetch` with `fetch.fsckObjects=true`, ancestry, and root checks, and the foreign blob then
+  becomes readable through the imported ref. Rules 12 and 13 close this.
+- **Rejected objects stay on disk.** Deleting the ref of a rejected fetch and running
+  `prune --expire=now` left the rejected commit present: a fetch of more than
+  `fetch.unpackLimit` objects keeps a pack, and `prune` removes only loose objects. Rule 9's
+  quarantine closes this.
 
 **A. File (untrusted-file reader)**
 
@@ -467,47 +588,123 @@ Rule codes: `unsafe-file`, `oversized-bundle`.
 4. The first line is `# v2 git bundle` or `# v3 git bundle`. The header ends at the first empty
    line and is at most 64 KiB.
 5. In v3, the only allowed capability is `@object-format=<the private repository's format>`. Any
-   `@filter=` or unknown capability is rejected. v2 implies SHA-1.
+   `@filter=` or unknown capability is rejected. v2 is accepted only for a SHA-1 repository.
 6. **Exactly one ref line**, and its name is exactly `refs/heads/<task branch>`. A second ref,
    `HEAD`, any other branch, any tag, or a non-`refs/heads/` name is rejected. The experiment
    with `bundle create --all` produced `HEAD` and every branch, which this rule refuses.
-7. **At least one prerequisite.** Every prerequisite SHA is well-formed. A bundle with no
-   prerequisites carries full history and is rejected.
+7. **Between 1 and 64 prerequisites**, each well-formed. A bundle with no prerequisites carries
+   full history and is rejected.
 
 Rule codes: `malformed-header`, `unsupported-bundle`, `unexpected-refs`, `no-prerequisite`.
 
-**C. Objects (local profile, in the private repository)**
+**C. Pack pre-scan (Rust, streaming, before any git process reads the pack)**
 
-8. `git bundle verify <copy>` succeeds. Every prerequisite is present.
-9. Every prerequisite is an ancestor of, or equal to, one of the export declaration's `exclude`
-   SHAs (`merge-base --is-ancestor`). A prerequisite the daemon never seeded is rejected even if
-   the object happens to exist.
-10. `git fetch --no-tags --no-write-fetch-head --no-recurse-submodules --end-of-options <copy>
-    refs/heads/<branch>:refs/quorum/import/<run>` succeeds with `fetch.fsckObjects=true`.
+8. The pack after the header is parsed entry by entry. Each zlib stream is inflated with the
+   output discarded, so memory stays bounded. The scan rejects any of the following:
+   - an entry count above `max_objects` (default 100,000);
+   - a declared object size, or a declared delta result size from the delta header, above
+     `max_blob_bytes`;
+   - a declared total above `max_inflated_bytes` (default 1 GiB);
+   - an inflated stream longer than its declared size;
+   - a malformed entry or trailer.
 
-Rule codes: `missing-prerequisite`, `foreign-prerequisite`, `fsck-failed`.
+   The scan records the base OID of every `REF_DELTA` entry. CPU is bounded by the declared
+   sizes, which are capped, so a tiny delta that declares a multi-GiB result is refused before
+   git inflates it.
 
-**D. History**
+Rule codes: `malformed-pack`, `oversized-object`, `too-many-objects`.
 
-11. The imported tip descends from the run's starting commit (`base` for a first run, `head` for
-    a rework). For a clean continuation, the starting commit is the daemon-made merge.
-12. The tip differs from the starting commit. Equal means no new commits.
-13. The range introduces no new root commit: `rev-list --max-parents=0 <tip> --not <exclude…>`
-    is empty. This refuses unrelated history smuggled in through a merge.
-14. `rev-list --count <tip> --not <exclude…>` is at most `max_commits` (default 2,000).
-15. Every blob in `rev-list --objects <tip> --not <exclude…>`, sized with
-    `cat-file --batch-check`, is at most `max_blob_bytes` (default 100 MiB, GitHub's hard file
-    limit). The total is at most `4 × max_bundle_bytes`. Both bounds are checked while
-    streaming, so a highly compressible blob cannot exhaust daemon memory or a later workspace's
-    disk.
+**D. Quarantined indexing (local profile)**
 
-Rule codes: `unrelated-history`, `no-new-commits`, `new-root`, `too-many-commits`,
-`oversized-blob`.
+9. The pack is indexed into a fresh quarantine directory,
+   `<private_repo>/objects/quorum-quarantine/<run_id>/pack/`, with
+   `GIT_OBJECT_DIRECTORY` set to the quarantine and `GIT_ALTERNATE_OBJECT_DIRECTORIES` set to
+   the private repository's `objects/`:
 
-On rejection, the daemon deletes `refs/quorum/import/<run>` and runs
-`git prune --expire=now` under the manager lock, bounded by the local timeout, so rejected
-objects do not accumulate. Imports are serialized, so pruning cannot race another import's
-quarantine.
+   ```
+   git --git-dir=<private_repo> index-pack --strict --fix-thin --stdin \
+       --max-input-size=<max_bundle_bytes>
+   ```
+
+   `--strict` runs fsck on every received object. Bundle packs are thin: indexing a normal
+   bundle pack without `--fix-thin` failed with `pack has 1 unresolved delta`. `--fix-thin`
+   resolves the external bases from the private repository and appends them to the quarantined
+   pack. Rule 12 checks those bases. The process runs under the resource limits in rule 16.
+
+Rule code: `fsck-failed`.
+
+Every later check runs with the same quarantine environment, so new objects resolve without
+touching the private repository.
+
+**E. Provenance**
+
+10. Every prerequisite must be present and must be an ancestor of, or equal to, one of the
+    export declaration's `exclude` SHAs. Presence comes from `cat-file -e` and ancestry from
+    `merge-base --is-ancestor`. A missing prerequisite and a present-but-unseeded one give the
+    same code, so a run cannot probe which SHAs the private repository holds.
+11. The tip resolves from the quarantined pack.
+
+Rule code: `bad-prerequisite`.
+
+**F. Object membership**
+
+12. Every external delta base recorded in rule 8 must be an object in the tree of one of the
+    validated prerequisites (`ls-tree -r -t <prerequisite>`, plus the prerequisite commit and
+    its root tree). These are the only bases `pack-objects --thin` uses. A `REF_DELTA` against
+    any other object would let the pack reproduce content the run was never given.
+13. Every object in `rev-list --objects --no-object-names <tip> --not <exclude…>` must have been
+    received in the pack: it is in the quarantined pack's index (`show-index`), and it is not
+    one of the external bases `--fix-thin` appended. This refuses both foreign-object shapes above. An
+    object that resolves only through the private repository, such as another task's blob or
+    commit, a recover snapshot, or a PR head, means the bundle relied on something it did not
+    carry.
+
+Rule codes: `foreign-delta-base`, `foreign-object`.
+
+Received objects outside that range, which a well-formed export does not produce, are allowed
+but count toward every cap.
+
+**G. History**
+
+14. The tip descends from every start commit in the seed-variant table: `base` for a first run,
+    `head` for a rework, the merge for a clean continuation, and both `<ours>` and `<theirs>`
+    for a conflicting continuation or sync judgment. So an agent cannot "resolve" a conflict by
+    dropping `<theirs>`. The tip must also differ from each start commit, since equal means no
+    new commits.
+15. Beyond those:
+    - the range introduces no new root commit (`rev-list --max-parents=0 <tip> --not
+      <exclude…>` is empty);
+    - `rev-list --count` is at most `max_commits` (default 2,000);
+    - every blob, sized with `cat-file --batch-check`, is at most `max_blob_bytes` (default
+      100 MiB, GitHub's hard file limit).
+
+    These recheck the pre-scan's declared sizes against the actual objects.
+
+Rule codes: `unrelated-history`, `merge-not-completed`, `no-new-commits`, `new-root`,
+`too-many-commits`, `oversized-blob`.
+
+**H. Resources**
+
+16. Every git process in the import:
+    - runs in its own process group, killed and reaped as a group;
+    - runs under the local timeout and `core.bigFileThreshold=16m`,
+      `core.deltaBaseCacheLimit=32m`, `pack.threads=1`;
+    - on Linux, also runs under `RLIMIT_AS`, `RLIMIT_CPU`, and `RLIMIT_FSIZE` set in
+      `pre_exec` (default 2 GiB, 120 s, `2 × max_bundle_bytes`).
+
+    macOS does not enforce `RLIMIT_AS`, so local permissive deployments there rely on the
+    pre-scan and the timeout. A git process killed by a signal, by an rlimit, or by the timeout
+    while importing a staged bundle gives `resource`, a rejection charged to the run. A spawn
+    failure or `ENOSPC` is an infrastructure failure (see "Failure modes").
+
+Rule code: `resource`.
+
+**Promotion.** The quarantined `.pack` is moved into `<private_repo>/objects/pack/`, then its
+`.rev` if present, then its `.idx` last, so a reader never sees an index without its pack. The
+quarantine is on the same filesystem, so each move is a rename. Then
+`update-ref refs/quorum/tasks/<id>/head <tip> <expected-old>` runs, and the quarantine directory
+is removed. Imports are serialized under the manager mutex. At startup, a quarantine directory
+without a completed promotion is deleted and its staged copy replayed (see "Recovery").
 
 ## Untrusted file handling
 
@@ -522,8 +719,13 @@ A single module, `untrusted_fs`, is the only way the daemon reads a path a run c
 - It requires `S_ISREG` and `st_nlink == 1` (a hardlink to a daemon secret is refused), and a
   size at most the caller's cap. It reads with that cap enforced and refuses rather than
   truncating unless the caller asked for a bounded prefix.
-- Parsed content (manifests, provider config) is size-capped before parsing, must be UTF-8 with
-  no NUL, and is treated as data.
+- Parsed content (provider project config, repository instruction files) is size-capped before
+  parsing, must be UTF-8 with no NUL, and is treated as data.
+- Provider adapters that read workspace files use the workspace itself as the trusted root.
+  Today these are a provider's project-config files and a repository instruction file at the
+  workspace root that is passed into a restricted run's system prompt. The adapter receives the
+  bytes, or a daemon-written copy, and never a path that a symlink could redirect. Discovery
+  walks never leave the workspace root, even when the run has deleted `.git`.
 - Directories a run can write are deleted only with the symlink-safe removal above. The daemon
   never `canonicalize`s a run-writable path to decide where to write.
 
@@ -546,6 +748,13 @@ All `gh` processes come from one constructor (Appendix A, EMPTY-DIR rows):
   inspects a local branch.
 - `quorum serve` no longer resolves `owner/name` with `gh repo view` in `repo_dir`
   (`quorum/src/main.rs:417-438`). It uses `repo`, or parses `remote_url`.
+
+A fake `gh` cannot show whether the real binary tolerates `GIT_DIR` pointing at a nonexistent
+path for each subcommand Quorum uses. Following the repository guide's rule that CLI boundaries
+need real-binary tests, an owner-run contract test exercises the real `gh` with that
+environment against a scratch repository, for every subcommand Quorum uses: `pr create`,
+`pr view`, `pr list`, `pr close`, `pr checks`, `pr comment`, `pr merge`, `pr review`,
+`repo view`, and `api`.
 
 `git check-ref-format` in `validate_target_branch` (`quorum-core/src/tasks.rs:1571`) runs from
 the empty directory with the local profile.
@@ -574,6 +783,14 @@ The planner's frozen view is built from `refs/remotes/origin/<base>` at the froz
 private repository. The daemon no longer reads `repo_dir`'s `HEAD`
 (`quorum/src/serve/mod.rs:6493,6752`).
 
+Planner deliverable paths are classified the same way. Today
+`classify_writable_deliverable_path_blocking` (`quorum-core/src/decomposition.rs:130-200`,
+reached through `planner::validate_for_source` from `quorum/src/serve/mod.rs:9329` and `quorum/src/serve/agent_endpoint.rs:1201`)
+canonicalizes each path against `repo_dir`'s working tree. That tree is stale in clone mode and
+agent-writable in linked mode. In clone mode the check walks the frozen tree in the private
+repository instead, using `ls-tree` per path component and refusing any component with mode
+`120000` (symlink) or `160000` (gitlink).
+
 ## Branch synchronization and continuation
 
 The daemon computes merges in the private repository and never runs `git merge` in a work tree.
@@ -589,7 +806,8 @@ git --git-dir=<private_repo> merge-tree --write-tree --name-only --no-messages <
 - **Conflict (exit 1).** The output lists the conflicted paths. These replace
   `sync_conflicted_files` (`worktree.rs:1348`). The daemon seeds a judgment or continuation
   workspace at `<ours>` with `<theirs>` present, and the run's instructions tell the agent to
-  run the merge itself. The agent's `git merge` runs in its own sandbox, where hooks and drivers
+  run the merge itself. The import requires the delivered tip to descend from both `<ours>` and
+  `<theirs>` (rule 14, `merge-not-completed`). The agent's `git merge` runs in its own sandbox, where hooks and drivers
   are its own business. The existing contract that the daemon prepares `MERGE_HEAD` changes
   accordingly, and the prompt text at `quorum/src/serve/mod.rs:3127-3130` changes with it.
 - **Any other exit.** A loud failure, as today.
@@ -616,8 +834,14 @@ resolve. The agent then resolves it in the sandbox. This is accepted.
 - **Publication pins and cleanup tombstones** keep their CAS semantics in the private
   repository.
 - **Staged bundle copies** found at startup are re-imported if the run's publication is still
-  pending, and deleted otherwise. Import is idempotent because the quarantine ref name is
-  derived from the run ID.
+  pending, and deleted otherwise. Leftover `objects/quorum-quarantine/<run_id>` directories are
+  deleted first. Import is idempotent: promotion uses an expected-old `update-ref`, and a pack
+  already promoted for the run is detected by its checksum.
+- **Reconciliation scope.** Directory reconciliation lists only direct children of
+  `worktree_base`. It skips `.retired/` and the staging directory, which have their own sweeps.
+- **Legacy journals** (migrated tasks) have no seeded head SHA for verdict recovery. Recovery
+  then takes the existing fail-safe path: it returns no recovered verdict and keeps the task
+  for a fresh review (`quorum/src/serve/mod.rs:5543-5545`).
 
 ## Configuration surface
 
@@ -642,7 +866,12 @@ max_bundle_bytes = 268435456         # 256 MiB
 max_blob_bytes = 104857600           # 100 MiB
 max_commits = 2000
 max_review_diff_bytes = 4194304      # 4 MiB
+max_objects = 100000
+max_inflated_bytes = 1073741824      # 1 GiB, declared total in the pack pre-scan
 superseded_workspace_retention_secs = 604800
+
+# fsck message IDs ignored on transport fetches from remote_url only (never on bundle imports).
+# git_fsck_ignore = ["missingEmail"]
 ```
 
 `worktree_base` keeps its name and now holds workspaces. `repo_dir` remains for the operator's
@@ -655,15 +884,16 @@ migration fetch.
 | Failure | Detection | Lifecycle mapping | Routing disposition |
 |---|---|---|---|
 | No bundle after a worker's done signal (no commits, export failed) | outbox empty after run exit | `AgentFailed { reason: "no-delivery: <exporter status>" }` through the existing worker failure and retry budget | `NonFailover` |
-| Bundle rejected (A to D) | verification rule | `AgentFailed { reason: "bundle-rejected:<rule>" }`; nothing pushed; event records the rule and bounded detail | `NonFailover` |
-| Same rejection rule on consecutive runs of a task, up to the existing rework or retry cap | durable counter | park with the rule as the park reason (`tasks::park`), `PublicationFailureKind::Other` | n/a |
-| Seeded base or head missing from the private repository | prerequisite check against the declaration | park; a daemon-side inconsistency, not the run's fault | n/a |
-| Import infrastructure failure (spawn, timeout, disk full, lock) | process result | staged copy kept; retried on the next tick, at most 3 times; then park | n/a |
+| Bundle rejected (rules 1–16, including `resource`) | verification rule | `AgentFailed { reason: "bundle-rejected:<rule>" }`; nothing pushed; quarantine and staged copy deleted; event records the rule and bounded detail | `NonFailover` |
+| Same rejection rule on consecutive runs of a task, up to the existing rework or retry cap | durable counter (workspace state) | park with the rule as the park reason (`tasks::park`), `PublicationFailureKind::Other` | n/a |
+| An `exclude` SHA from the declaration missing from the private repository | checked before rule 10, against the daemon's own record | park; a daemon-side inconsistency, not the run's fault | n/a |
+| Import infrastructure failure (spawn failure, `ENOSPC`, lock) | process or IO result | staged copy kept; retried on the next tick, at most 3 times; then park | n/a |
+| LFS in use (`filter=lfs` in the base or delivered tree) | bounded `git grep` in the private repository | park with `lfs-unsupported`; nothing pushed | n/a |
+| `remote_url` rewritten by `url.*.insteadOf` or `pushInsteadOf` under `inherit` | `ls-remote --get-url` and the config check | exit 2 at startup; park at push time | n/a |
 | Push rejected (lease, non-fast-forward, remote policy) | `push --porcelain` | unchanged: `push_rejection` park path (`worktree.rs:160`), without the local hook section | n/a |
 | Seeding failure (private fetch, disk, rename) | process or IO result | existing provisioning-failure path: release the claim, retry with backoff | n/a |
 | Operator remote unreachable on fetch | transport result | existing fetch-failure handling (dependency defer, provision retry) | n/a |
 | Invalid `remote_url`, private repository config drift, non-empty `empty-hooks`, old git | startup check | refuse to start, exit 2 for configuration and exit 3 for state | n/a |
-| Run-written manifest malformed or oversized | untrusted reader or parser | ignored and logged; never affects lifecycle | n/a |
 
 `NonFailover` follows the existing meaning: an execution-boundary failure that must not move the
 run to another provider route (`quorum-core/src/routing_attempts.rs:20-31`).
@@ -678,38 +908,74 @@ The launcher interface is separate work. This design needs only two things to cr
    command inside the run's isolation after the agent process ends, including on timeout or
    kill, and reports the exporter's exit status and up to 2 KiB of stderr.
 
-The local launcher is today's provider adapters (`quorum/src/serve/agent.rs`,
-`codex_agent.rs`, `grok_agent.rs`, via `runner::gated_command`) plus the export step. The
-adapters keep `current_dir(workspace)`. They must stop reading workspace files except through
-`untrusted_fs` (Appendix A, HARDEN rows), and the fallback route's executable must resolve
-against the daemon's `PATH` or an absolute path, never the workspace (REMOVE row R18).
+The local launcher is today's provider adapters (the `*_agent.rs` modules under
+`quorum/src/serve/`, started through `runner::gated_command`) plus the export step. The adapters
+keep `current_dir(workspace)`. They must stop reading workspace files except through
+`untrusted_fs` (Appendix A, HARDEN rows). Neither a provider executable nor a provider home may
+resolve relative to the workspace (REMOVE rows R18 and R19).
 
 ## Migration for local operators
 
-On the first start with `workspace_mode = "clone"`, under the existing startup recovery (no runs
-are alive):
+Migration runs on the first start with `workspace_mode = "clone"`, under the existing startup
+recovery, so no runs are alive.
 
-1. Create and verify the private repository and derive or validate `remote_url`.
-2. Import legacy state from `repo_dir`. This is one hardened `file://` fetch with fsck, of each
-   non-terminal task's `refs/heads/<branch>` into `refs/quorum/tasks/<id>/head`, and of
-   `refs/quorum-publication/*`, `refs/quorum-recover/*`, and `refs/quorum/cleanup/*` into the
-   same names. It spawns `git-upload-pack` against `repo_dir`. That is the one operation that
-   still reads `repo_dir`'s possibly agent-written config. It runs once, only under the local
-   permissive profile, where the legacy trust already applied. Git honors upload-pack's command
-   hook (`uploadpack.packObjectsHook`) only from protected configuration, never from repository
-   config.
-3. Leave every legacy linked worktree on disk, untouched and unregistered from Quorum. Log one
-   event per task with its path, and state that uncommitted changes were not carried over and
-   remain there for the operator. Quorum never deletes them.
-4. A branch synchronization with a kept conflict worktree restarts from its pinned tips through
+**Preconditions (refuse to start, exit 2, listing what blocks):**
+
+- **Quiescence.** No non-terminal task holds a legacy *writing* allocation, meaning a worker in
+  `working` or `rework` with an allocated linked worktree. Its uncommitted work would otherwise
+  leave the lifecycle while staying on disk. Operators let those tasks reach review or a
+  terminal state under `linked-worktree` without admitting new work, then restart. Tasks in
+  `open`, `in-review`, or `merging`, and terminal tasks, do not block.
+- **URL agreement.** A `remote_url` derived from `<repo_dir>/.git/config` must parse, with
+  `parse_repo_from_url`, to the configured `repo`. That file was writable through every linked
+  worktree, so a mismatch is refused, not followed.
+
+**Steps:**
+
+1. Create and verify the private repository and validate `remote_url`.
+2. **Build the expected-ref list from the database**, never from `repo_dir`'s advertisement:
+   - each non-terminal task's branch;
+   - each publication intent's pinned `local_sha`;
+   - each recorded recover ref and cleanup tombstone, with its SHA.
+3. **Import** with one hardened `file://` fetch per expected ref, using explicit refspecs, no
+   globs, and fsck.
+   - Where a publication intent exists, `refs/quorum/tasks/<id>/head` is set from its pinned
+     `local_sha`, not from the branch tip, since the pin is what publication replays.
+   - Otherwise it is set from the branch tip, which must descend from the allocation's recorded
+     provenance SHA.
+   - `refs/quorum/tasks/<id>/base` is set from that provenance SHA.
+   - Recover refs, publication pins, and tombstones keep their names.
+   - After the fetch, every expected ref must exist with its expected SHA where the database
+     records one. Config in `repo_dir` such as `uploadpack.hideRefs` or `transfer.hideRefs` can
+     hide refs from upload-pack, so a missing ref fails migration (exit 3) instead of being
+     skipped silently.
+   - The fetch spawns `git-upload-pack` against `repo_dir`. That is the one operation that still
+     reads `repo_dir`'s possibly agent-written config. It runs once, only under the local
+     permissive profile, where the legacy trust already applied. Git honors upload-pack's
+     command hook (`uploadpack.packObjectsHook`) only from protected configuration, never from
+     repository config.
+4. **Report planted state in `repo_dir`.** Quorum never modifies `repo_dir`. Instead it emits one
+   warning event listing what it finds:
+   - hook files other than `*.sample` in `.git/hooks/`, and in any configured `core.hooksPath`;
+   - config keys in `.git/config` and `.git/worktrees/*/config.worktree` outside a short
+     allowlist (`core.*` defaults, `remote.origin.url`, `remote.origin.fetch`, `branch.*`,
+     `user.*`);
+   - `.git/info/attributes`.
+
+   The operator's own git, and `scripts/serve-supervisor.sh:154-164` (`git merge` then
+   `./dev-install.sh` in `repo_dir`), would otherwise keep running them.
+5. Leave every legacy linked worktree on disk, untouched and unregistered from Quorum. Log one
+   event per task with its path.
+6. A branch synchronization with a kept conflict worktree restarts from its pinned tips through
    `merge-tree`.
-5. Record a durable one-row marker in the same transaction as the first clone-mode allocation
-   (additive, forward-only migration), so step 2 runs exactly once. Switching back to
-   `linked-worktree` after the marker exists is refused, with exit 2.
+7. **Write the durable one-row marker at completion**, in one transaction after every import is
+   verified (an additive, forward-only migration). A crash before that point reruns the whole
+   migration, which is idempotent: refs are set with expected-old values. Switching back to
+   `linked-worktree` after the marker exists is refused with exit 2.
 
 Operators who pushed through the daemon and relied on a repository pre-push hook must move those
 checks to CI. For this repository, the hook's base-branch and formatting checks
-(`.githooks/pre-push`) must be required CI jobs before the default flips.
+(`.githooks/pre-push`) must be required CI jobs before the early linked-mode hardening lands.
 
 ## Security properties and residual risk
 
@@ -730,8 +996,12 @@ shares the operator's machine, and Quorum does not claim otherwise.
 
 Residual:
 
-- Git itself parses hostile objects during fetch, fsck, diff, and archive. Mitigations are fsck,
-  size bounds, timeouts, and a current git. A git parser vulnerability remains a daemon risk.
+- Git itself parses hostile objects during indexing, fsck, diff, and archive. Mitigations are
+  the Rust pre-scan, `index-pack --strict`, size caps, process-group timeouts, Linux rlimits,
+  and a current git. A git parser vulnerability remains a daemon risk. On macOS, memory bounds
+  rest on the pre-scan alone.
+- The early linked-mode hardening leaves filter, driver, and transport keys in the shared git
+  directory reachable until the clone model is the only model.
 - `inherit` transport configuration is operator-owned but, under local permissive, writable by
   agents like everything else on that machine.
 - Hostile content does reach the remote. That is the point of a pull request. It is verified by
@@ -739,19 +1009,33 @@ Residual:
 
 ## Open questions
 
-1. **Workspace disk cost.** Full `--no-local` clones per task. Should a shallow seed
-   (`fetch --depth`) be offered? Bundle prerequisites still work, but agents lose history.
-2. **Snapshotting uncommitted work.** Is retaining superseded workspaces for seven days enough,
+1. **Workspace disk cost.** Each task gets a full clone; objects are copied, not hardlinked.
+   Should a shallow seed (`fetch --depth`) be offered? Bundle prerequisites still work, but
+   agents lose history.
+2. **Full re-seed per review run.** Every reviewer, review-only, and continuation-reviewer run
+   gets a fresh clone at the PR head, which costs disk and time on large repositories. Should
+   read-only roles instead get only the review materials and an exported tree (`git archive`)
+   with no `.git`, once the read-only prompt work lands?
+3. **Snapshotting uncommitted work.** Is retaining superseded workspaces for seven days enough,
    or should the export step also produce a snapshot bundle, imported only into
    `refs/quorum-recover/*` and never published?
-3. **Default limits.** 256 MiB bundle, 100 MiB blob, 2,000 commits, 4 MiB review diff. Are these
-   acceptable defaults?
-4. **Minimum git version.** Should the floor fail on versions without the latest upstream
-   security fixes, or only warn?
-5. **This repository's pre-push gate.** Moving base-branch and `fmt` checks into required CI
-   jobs is a `main` hotfix-class change. Who schedules it relative to the default flip?
-6. **Conflict handling.** Is it acceptable that `merge=union` and similar attribute-driven merge
-   behaviors stop applying to daemon-side merges?
+4. **Default limits.** 256 MiB bundle, 100 MiB blob, 2,000 commits, 100,000 objects, 1 GiB
+   declared inflated size, 4 MiB review diff, and on Linux a 2 GiB import address space. Are
+   these acceptable?
+5. **Minimum git version.** The floor is 2.43. Should Quorum also fail on releases without the
+   latest upstream security fixes, or only warn? Self-hosters on older distribution git (Debian
+   12 ships 2.39) would need a newer git for clone mode.
+6. **This repository's pre-push gate.** Moving the base-branch and `fmt` checks into required CI
+   jobs is a `main` hotfix-class change, and it must land before the early linked-mode
+   hardening. Who schedules it?
+7. **Losing attribute-driven merges.** Daemon-side merges ignore `merge=union` and similar
+   attributes, so some merges that resolved automatically become conflicts for the agent. Is
+   that acceptable, or should `merge-tree` honor tree attributes (safe, since no driver
+   configuration is present)?
+8. **Git LFS.** LFS repositories are detected and parked as unsupported. Should a later change
+   run `git lfs push` from the private repository with an operator-pinned binary?
+9. **Migration quiescence.** Is it acceptable that operators must let writing tasks reach review
+   before enabling clone mode, or should Quorum provide an explicit drain control for this?
 
 ## Appendix A — Audit
 
@@ -774,7 +1058,7 @@ linked worktree.
 | S8 | `quorum/src/serve/session_log.rs:597-910`; `quorum/src/web.rs:838-1096` | Session stream and transcript files | Written by Quorum from agent pipes; content is data. |
 | S9 | `quorum/src/serve/cleanup.rs:523-532`; `recovery.rs:569-575` | `canonicalize` plus `symlink_metadata` before removal | Already symlink-checked. Superseded by symlink-safe removal. |
 
-### MOVE to the private repository (27)
+### MOVE to the private repository (28)
 
 | # | Site | Operation | Note |
 |---|---|---|---|
@@ -805,6 +1089,7 @@ linked worktree.
 | M25 | `quorum/src/serve/mod.rs:6493,6516` | Planner view: `rev-parse HEAD` and `git archive` in `repo_dir` | Reads the operator checkout's `HEAD`. Becomes the frozen SHA in the private repository. |
 | M26 | `quorum/src/serve/mod.rs:6752` | `repository_head_sha` (frozen-base capture from `repo_dir` `HEAD`) | As M25. |
 | M27 | `quorum/src/serve/mod.rs:24585-24625` | Sync-branch cleanup: `ls-remote origin`, `push origin --delete` in `repo_dir` | |
+| M28 | `quorum-core/src/decomposition.rs:130-200` (via `quorum/src/serve/planner.rs:286-301`, from `mod.rs:9329` and `agent_endpoint.rs:1201`) | Planner deliverable paths canonicalized against `repo_dir`'s working tree | Stale in clone mode and agent-writable in linked mode. Becomes an `ls-tree` walk of the frozen tree. |
 
 ### EMPTY-DIR (11)
 
@@ -822,7 +1107,7 @@ linked worktree.
 | E10 | `quorum/src/main.rs:417-438` | `gh repo view` to resolve `owner/name` at serve startup | `repo_dir` |
 | E11 | `quorum-core/src/tasks.rs:1571` | `git check-ref-format --branch` (daemon callers `mod.rs:1825,1885,24948`) | inherited cwd |
 
-### REMOVE (18)
+### REMOVE (19)
 
 | # | Site | Operation | Replacement |
 |---|---|---|---|
@@ -844,13 +1129,15 @@ linked worktree.
 | R16 | `recover.rs:607-727` (`620,644,653,683,698,708`) | `cherry-pick --no-commit`, `reset --hard`, `clean`, `status` in the worktree | Seed with the snapshot tree in staging |
 | R17 | `quorum/src/serve/mod.rs:5528` | Verdict recovery: `git rev-parse HEAD` with cwd = reviewer worktree from the journal | Durable seeded head SHA |
 | R18 | `quorum/src/serve/mod.rs:26790-26874` (`routed_provider_executable_in_path`) | Fallback provider executable resolved relative to the worktree (relative path or relative `PATH` entry) | Absolute path or daemon `PATH` only |
+| R19 | `quorum/src/serve/grok_agent.rs:910-922` | A relative provider-home path is joined to the worktree, so the provider loads a run-written home | Absolute path only |
 
-### HARDEN (2)
+### HARDEN (3)
 
 | # | Site | Read | Problem |
 |---|---|---|---|
-| H1 | `quorum/src/serve/grok_agent.rs:558-612` | Project MCP sources (`.grok/config.toml`, `.mcp.json`, `.cursor/mcp.json`) in the worktree **and each parent up to a `.git`** | `read_to_string` follows symlinks and is unbounded. |
+| H1 | `quorum/src/serve/grok_agent.rs:558-612` | A provider's project-config files, read in the worktree **and each parent up to a `.git`** | `read_to_string` follows symlinks and is unbounded. If the run deletes `.git`, the walk (`:566`) climbs into the worktree's parent directories. |
 | H2 | `quorum/src/serve/grok_agent.rs:820-880` | Provider auth state copied back from the agent-writable invocation home into the operator's home | `fs::metadata` follows symlinks; `fs::read` is unbounded. |
+| H3 | `quorum/src/serve/agent.rs:517-519,633-635` | The repository instruction file at the worktree root, checked with `is_file()` (which follows symlinks) and passed by path into a restricted planner or classifier run's system prompt | A symlink pulls any operator-readable file into the prompt. The daemon must pass bytes read through `untrusted_fs`. |
 
 ### Prompt text that names git or `gh` for read-only roles
 
