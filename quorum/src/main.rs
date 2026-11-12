@@ -1185,10 +1185,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         cli::Command::OrchestratorMcp {
             listen,
             token_file,
+            identity,
             allowed_host,
             repo,
         } => {
-            orchestrator_mcp::run(listen, token_file, allowed_host, repo)?;
+            orchestrator_mcp::run(listen, &token_file, identity, allowed_host, repo)?;
             Ok(0)
         }
         cli::Command::Submit {
@@ -1470,6 +1471,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             exit_when_gone,
             doctor_enabled,
         } => {
+            // The orchestrator MCP token is not a daemon input. If the
+            // operator exported it anyway, drop it here, before any thread
+            // exists, so no process the daemon starts can inherit it.
+            std::env::remove_var(orchestrator_mcp::TOKEN_ENV);
             use serve_config::*;
 
             // Step 1: determine repo identity (needed for default config path).

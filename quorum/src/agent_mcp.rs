@@ -1318,7 +1318,13 @@ fn run_http(addr: SocketAddr) -> Result<()> {
     };
     // The default allowed hosts are the loopback names.
     serve_http(
-        "agent-mcp",
+        HttpListener {
+            command: "agent-mcp",
+            title: "agent MCP",
+            max_connections: MAX_HTTP_CONNECTIONS,
+            header_read_timeout: HTTP_HEADER_READ_TIMEOUT,
+            max_admitted_requests: None,
+        },
         addr,
         stateless_http_config(),
         server,
@@ -1339,14 +1345,34 @@ pub(crate) fn stateless_http_config() -> StreamableHttpServerConfig {
         .with_max_request_body_bytes(MAX_HTTP_BODY_BYTES)
 }
 
+/// What distinguishes one HTTP listener from another. The request timeout,
+/// body cap, shutdown drain, and per-request service are shared.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HttpListener {
+    /// Subcommand name, printed in the listening line.
+    pub command: &'static str,
+    /// Name used in startup errors.
+    pub title: &'static str,
+    /// Open connections served at once; further ones wait in the backlog.
+    pub max_connections: usize,
+    /// A connection must deliver a complete request head within this bound,
+    /// whether it is new or idle between requests.
+    pub header_read_timeout: Duration,
+    /// `None`: a connection slot is the only admission bound. `Some(n)`: at
+    /// most `n` requests the gate admitted are in flight at once, and a
+    /// request the gate refuses also closes its connection, so a peer that
+    /// cannot pass the gate holds a connection slot only until its refusal
+    /// or the head timeout and never holds a request slot.
+    pub max_admitted_requests: Option<usize>,
+}
+
 /// Serve one tools-only MCP server over Streamable HTTP at `/mcp` until
-/// SIGINT or SIGTERM, with this module's connection, time, and body bounds.
+/// SIGINT or SIGTERM, with this module's time and body bounds.
 ///
-/// `gate` sees every request's headers before MCP runs; the status it returns
-/// refuses the request. `label` names the command in the listening line and in
-/// errors.
+/// `gate` sees every request's headers before MCP runs and before the body
+/// is read; the status it returns refuses the request.
 pub(crate) fn serve_http<S, G>(
-    label: &'static str,
+    listener_bounds: HttpListener,
     addr: SocketAddr,
     config: StreamableHttpServerConfig,
     server: S,
@@ -1356,10 +1382,14 @@ where
     S: ServerHandler + Clone + Send + Sync + 'static,
     G: Fn(&HeaderMap) -> std::result::Result<(), StatusCode> + Clone + Send + Sync + 'static,
 {
+    let HttpListener { command, title, .. } = listener_bounds;
+    let admitted = listener_bounds
+        .max_admitted_requests
+        .map(|requests| Arc::new(tokio::sync::Semaphore::new(requests)));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|_| QuorumError::Io(format!("failed to start {label} runtime")))?;
+        .map_err(|_| QuorumError::Io(format!("failed to start {title} runtime")))?;
     runtime.block_on(async move {
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .map_err(|e| QuorumError::Io(format!("failed to register SIGINT handler: {e}")))?;
@@ -1367,10 +1397,10 @@ where
             .map_err(|e| QuorumError::Io(format!("failed to register SIGTERM handler: {e}")))?;
         let listener = tokio::net::TcpListener::bind(addr)
             .await
-            .map_err(|e| QuorumError::Io(format!("failed to bind {label} listener: {e}")))?;
+            .map_err(|e| QuorumError::Io(format!("failed to bind {title} listener: {e}")))?;
         let local = listener
             .local_addr()
-            .map_err(|e| QuorumError::Io(format!("failed to bind {label} listener: {e}")))?;
+            .map_err(|e| QuorumError::Io(format!("failed to bind {title} listener: {e}")))?;
         let cancel = config.cancellation_token.clone();
         let app = axum::Router::new()
             .route(
@@ -1395,13 +1425,14 @@ where
             .layer(axum::middleware::from_fn(
                 move |request: axum::extract::Request, next: axum::middleware::Next| {
                     let gate = gate.clone();
-                    async move { bound_request(gate, request, next).await }
+                    let admitted = admitted.clone();
+                    async move { bound_request(gate, admitted, request, next).await }
                 },
             ));
         // The one line a launcher needs to learn a port-0 bind.
-        eprintln!("quorum {label} listening on http://{local}{HTTP_MCP_PATH}");
+        eprintln!("quorum {command} listening on http://{local}{HTTP_MCP_PATH}");
 
-        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_CONNECTIONS));
+        let slots = Arc::new(tokio::sync::Semaphore::new(listener_bounds.max_connections));
         let (shutdown, _) = tokio::sync::watch::channel(false);
         let mut connections = tokio::task::JoinSet::new();
         loop {
@@ -1416,6 +1447,7 @@ where
                     if let Some((stream, slot)) = accepted {
                         connections.spawn(serve_http_connection(
                             stream,
+                            listener_bounds.header_read_timeout,
                             app.clone(),
                             shutdown.subscribe(),
                             slot,
@@ -1465,13 +1497,14 @@ async fn accept_with_slot(
 /// out, or shutdown is signalled. `_slot` is held for the connection's life.
 async fn serve_http_connection(
     stream: tokio::net::TcpStream,
+    header_read_timeout: Duration,
     app: axum::Router,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     _slot: tokio::sync::OwnedSemaphorePermit,
 ) {
     let connection = hyper::server::conn::http1::Builder::new()
         .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(HTTP_HEADER_READ_TIMEOUT)
+        .header_read_timeout(header_read_timeout)
         .serve_connection(
             hyper_util::rt::TokioIo::new(stream),
             hyper_util::service::TowerToHyperService::new(app),
@@ -1527,30 +1560,47 @@ pub(crate) fn bearer_token(headers: &HeaderMap, max_bytes: usize) -> Option<&str
 
 /// Refuse a request the gate rejects before it reaches MCP, and bound how
 /// long an admitted one may take to produce its response. The bound covers
-/// reading the body, which rmcp does inside the service.
+/// waiting for a request slot and reading the body, which rmcp does inside
+/// the service.
 async fn bound_request<G>(
     gate: G,
+    admitted: Option<Arc<tokio::sync::Semaphore>>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response
 where
     G: Fn(&HeaderMap) -> std::result::Result<(), StatusCode>,
 {
-    match gate(request.headers()) {
-        Ok(()) => {}
-        Err(StatusCode::UNAUTHORIZED) => {
-            return (
-                StatusCode::UNAUTHORIZED,
+    if let Err(status) = gate(request.headers()) {
+        let mut response = if status == StatusCode::UNAUTHORIZED {
+            (
+                status,
                 [(header::WWW_AUTHENTICATE, "Bearer")],
                 "Unauthorized",
             )
-                .into_response();
+                .into_response()
+        } else {
+            (status, status.canonical_reason().unwrap_or("Refused")).into_response()
+        };
+        // Its body is never read. Where admitted requests are counted, the
+        // connection is closed too, so a refused peer keeps nothing open.
+        if admitted.is_some() {
+            response.headers_mut().insert(
+                header::CONNECTION,
+                axum::http::HeaderValue::from_static("close"),
+            );
         }
-        Err(status) => {
-            return (status, status.canonical_reason().unwrap_or("Refused")).into_response();
-        }
+        return response;
     }
-    match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, next.run(request)).await {
+    let admitted_request = async {
+        // The semaphore is never closed, so acquisition cannot fail.
+        let _slot = match admitted {
+            Some(slots) => slots.acquire_owned().await.ok(),
+            None => None,
+        };
+        next.run(request).await
+    };
+    match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, admitted_request).await {
         Ok(response) => response,
         // Dropping the request future cancels its handler. An operation
         // already sent is not undone, so its outcome is unknown.

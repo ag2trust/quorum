@@ -38,10 +38,10 @@ pub fn validate_new_task(task: &NewTask) -> Result<()> {
 /// Create one task in `repo`'s database and return its id. The caller has
 /// already run [`validate_new_task`].
 pub fn task_create(repo: &str, task: &NewTask, now: i64) -> Result<i64> {
-    let target_branch = match task.base_branch {
-        Some(branch) => branch.to_string(),
-        None => crate::serve_config::task_create_base_branch(repo)?,
-    };
+    // The serve configuration is read even when a base branch is given, so a
+    // malformed one fails task intake loudly instead of only its default.
+    let configured = crate::serve_config::task_create_base_branch(repo)?;
+    let target_branch = task.base_branch.map_or(configured, str::to_string);
     quorum_core::tasks::validate_target_branch(&target_branch)?;
     let mut conn = quorum_core::db::open(&crate::paths::ensure_repo_dir(repo)?)?;
     match task.review_only {

@@ -4,8 +4,9 @@
 //! at `/mcp` and exposes the coordinator subset of the CLI for one repository:
 //! create, list, inspect, cancel, and retry tasks, and message a managed
 //! agent. Every tool runs the operation its CLI command runs, as one
-//! short-lived SQLite connection per call. Nothing here transitions lifecycle,
-//! talks to GitHub, or controls the daemon process.
+//! short-lived SQLite connection per call, acting as the single coordinator
+//! identity the operator bound at startup. Nothing here transitions
+//! lifecycle, talks to GitHub, or controls the daemon process.
 //!
 //! It is a separate listener from the managed-agent adapter and shares no
 //! authority with it: the only credential it accepts is the operator's bearer
@@ -15,7 +16,7 @@
 
 use crate::agent_mcp::{
     bearer_token, bounded_string, github_schema, invalid_arguments, json_result, positive_integer,
-    serve_http, signal_arguments, stateless_http_config, MAX_HTTP_CONNECTIONS,
+    serve_http, signal_arguments, stateless_http_config, HttpListener,
 };
 use axum::http::{header, HeaderMap, StatusCode};
 use quorum_core::error::{QuorumError, Result};
@@ -35,15 +36,28 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-/// The operator may supply the token in this variable instead of a file.
-const TOKEN_ENV: &str = "QUORUM_ORCHESTRATOR_TOKEN";
+/// Not a token source. An operator who exports it anyway is refused at
+/// startup, and the daemon removes it from every process it starts.
+pub(crate) const TOKEN_ENV: &str = "QUORUM_ORCHESTRATOR_TOKEN";
 /// A token shorter than this is refused at startup: it is the only secret
 /// guarding task intake, possibly on a non-loopback address.
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_TOKEN_BYTES: usize = 512;
 const MAX_TOKEN_FILE_BYTES: u64 = 4096;
 const MAX_ALLOWED_HOSTS: usize = 16;
+
+/// Requests the gate admitted that may be in flight at once, and so also the
+/// bound on concurrent database operations.
+const MAX_ADMITTED_REQUESTS: usize = 8;
+/// Open connections, authenticated or not. Deliberately larger than the
+/// admitted-request bound: a peer without the token can occupy these, each
+/// only until its request head is refused or times out, and never a request
+/// slot.
+const MAX_CONNECTIONS: usize = 32;
+/// A request head must arrive within this bound on a new or idle connection.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 const MAX_IDENTITY_BYTES: usize = 128;
 const MAX_TITLE_BYTES: usize = 512;
@@ -76,6 +90,8 @@ const MESSAGE_AGENT: &str = "message_agent";
 #[derive(Debug, Clone)]
 struct Orchestrator {
     repo: String,
+    /// The one coordinator identity every tool acts as.
+    identity: Arc<str>,
     db: PathBuf,
     /// Bounds blocking database work, counted separately from connections
     /// because a blocking operation outlives a client that hung up on it.
@@ -100,10 +116,6 @@ fn tool(
     )
 }
 
-fn identity() -> Value {
-    bounded_string(1, MAX_IDENTITY_BYTES)
-}
-
 fn tools() -> Vec<Tool> {
     vec![
         tool(
@@ -117,7 +129,6 @@ fn tools() -> Vec<Tool> {
              the task through its lifecycle. Not idempotent: every accepted call creates a task. \
              Success is {\"id\":N,\"repo\":\"owner/name\"}.",
             json!({
-                "created_by": identity(),
                 "title": bounded_string(1, MAX_TITLE_BYTES),
                 "body": bounded_string(1, MAX_BODY_BYTES),
                 "priority": {"type":"integer"},
@@ -138,7 +149,7 @@ fn tools() -> Vec<Tool> {
                 "review_only": positive_integer(),
                 "base_branch": bounded_string(1, quorum_core::tasks::MAX_TARGET_BRANCH_BYTES)
             }),
-            &["created_by", "title"],
+            &["title"],
             false,
             false,
         ),
@@ -146,12 +157,15 @@ fn tools() -> Vec<Tool> {
             TASK_LIST,
             "List tasks as summary rows without bodies (`quorum task-list --brief`), highest \
              priority first, optionally filtered by `status`, `label`, or `assignee`. Returns \
-             {\"tasks\":[...],\"total\":N,\"truncated\":bool}.",
+             {\"tasks\":[...],\"total\":N,\"offset\":N,\"truncated\":bool} and, when rows remain, \
+             `next_offset` to pass as `offset`. Pages are separate reads, so a queue that \
+             changes between them can repeat or skip a row.",
             json!({
                 "status": bounded_string(1, MAX_FILTER_BYTES),
                 "label": bounded_string(1, MAX_FILTER_BYTES),
-                "assignee": identity(),
-                "limit": {"type":"integer","minimum":1,"maximum":MAX_PAGE}
+                "assignee": bounded_string(1, MAX_IDENTITY_BYTES),
+                "limit": {"type":"integer","minimum":1,"maximum":MAX_PAGE},
+                "offset": {"type":"integer","minimum":0}
             }),
             &[],
             true,
@@ -171,7 +185,8 @@ fn tools() -> Vec<Tool> {
         tool(
             TASK_LOG,
             "Read one task's lifecycle events in order (`quorum log --refs task#N`). Pass the \
-             last `seq` seen as `since` to read on. Returns {\"events\":[...],\"truncated\":bool}.",
+             last `seq` seen as `since` to read on. Returns {\"events\":[...],\"truncated\":bool}; \
+             when truncated, `next_since` is the `since` that continues.",
             json!({
                 "task_id": positive_integer(),
                 "since": {"type":"integer","minimum":0},
@@ -184,18 +199,18 @@ fn tools() -> Vec<Tool> {
         tool(
             TASK_CANCEL,
             "Cancel one task that has not finished (`quorum task-update --status cancelled`). \
-             `agent` must be the task's creator or current assignee. A decomposed source task \
+             This server's coordinator identity must be the task's creator or current assignee, \
+             exactly as on the command line. A decomposed source task \
              also needs `expected_revision` (from task_get) and cancels its whole graph. The \
              daemon stops the task's managed agents on its next tick. `note` records why. A task \
-             that is unknown, already done, failed, or cancelled, or that `agent` may not cancel, \
+             that is unknown, already done, failed, or cancelled, or that this identity may not cancel, \
              is refused with code `rejected` and nothing changes.",
             json!({
-                "agent": identity(),
                 "task_id": positive_integer(),
                 "expected_revision": {"type":"integer","minimum":0},
                 "note": bounded_string(1, MAX_NOTE_BYTES)
             }),
-            &["agent", "task_id"],
+            &["task_id"],
             false,
             true,
         ),
@@ -204,23 +219,24 @@ fn tools() -> Vec<Tool> {
             "Resume a task the daemon parked after a bounded failure or that is provider-blocked, \
              or retry an eligible exhausted decomposition plan (`quorum task-retry`). It keeps \
              the task's PR, branch, dependencies, and rework context. It is not a general retry \
-             for terminal failures: any other task is refused with code `rejected`.",
-            json!({"task_id": positive_integer(), "by": identity()}),
-            &["task_id", "by"],
+             for terminal failures: any other task is refused with code `rejected`, carrying the \
+             command's own `outcome`, `reason`, and any `cancelled_deps` or `retry_count`.",
+            json!({"task_id": positive_integer()}),
+            &["task_id"],
             false,
             false,
         ),
         tool(
             MESSAGE_AGENT,
             "Queue a message for one daemon-managed agent (`quorum message`). The daemon delivers \
-             it as a turn when that agent is idle. A message never changes task lifecycle. Not \
+             it as a turn when that agent is idle, from this server's coordinator identity. A \
+             message never changes task lifecycle. Not \
              idempotent. Success is {\"ok\":true,\"mailbox_id\":N}.",
             json!({
-                "from": identity(),
-                "to": identity(),
+                "to": bounded_string(1, MAX_IDENTITY_BYTES),
                 "body": bounded_string(1, MAX_MESSAGE_BYTES)
             }),
-            &["from", "to", "body"],
+            &["to", "body"],
             false,
             false,
         ),
@@ -230,7 +246,6 @@ fn tools() -> Vec<Tool> {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TaskCreateArguments {
-    created_by: String,
     title: String,
     #[serde(default)]
     body: Option<String>,
@@ -263,6 +278,8 @@ struct TaskListArguments {
     assignee: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,7 +301,6 @@ struct TaskLogArguments {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TaskCancelArguments {
-    agent: String,
     task_id: i64,
     #[serde(default)]
     expected_revision: Option<i64>,
@@ -296,13 +312,11 @@ struct TaskCancelArguments {
 #[serde(deny_unknown_fields)]
 struct TaskRetryArguments {
     task_id: i64,
-    by: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MessageAgentArguments {
-    from: String,
     to: String,
     body: String,
 }
@@ -399,22 +413,23 @@ fn json_len(value: &Value) -> usize {
     value.to_string().len()
 }
 
-/// Drop rows from the end of `rows` until `{key: rows, ...extra}` fits one
-/// result, and report whether any row was left out.
-fn bounded_rows(key: &str, mut rows: Vec<Value>, more: bool, extra: Value) -> Value {
-    let mut truncated = more;
-    loop {
-        let mut result = extra.as_object().cloned().unwrap_or_default();
-        result.insert(key.into(), Value::Array(rows.clone()));
-        result.insert("truncated".into(), Value::Bool(truncated));
-        let result = Value::Object(result);
-        if json_len(&result) <= MAX_RESULT_BYTES || rows.is_empty() {
-            return result;
-        }
-        rows.pop();
-        truncated = true;
+/// Drop rows from the end of `rows` until they fit one result beside
+/// `overhead` bytes of other fields. Returns whether any row was dropped.
+fn fit_rows(rows: &mut Vec<Value>, overhead: usize) -> bool {
+    let mut size: usize = overhead + rows.iter().map(|row| json_len(row) + 1).sum::<usize>();
+    let mut dropped = false;
+    while size > MAX_RESULT_BYTES {
+        let Some(row) = rows.pop() else {
+            break;
+        };
+        size -= json_len(&row) + 1;
+        dropped = true;
     }
+    dropped
 }
+
+/// Room left in a listing result for its few scalar fields.
+const LISTING_OVERHEAD_BYTES: usize = 256;
 
 /// Keep the newest `MAX_DETAIL_ROWS` entries of the array at `key`.
 fn keep_newest(view: &mut Map<String, Value>, key: &str, omitted_key: &str) {
@@ -489,7 +504,6 @@ impl Orchestrator {
     }
 
     async fn task_create(&self, arguments: TaskCreateArguments) -> Checked<CallToolResult> {
-        line("created_by", &arguments.created_by, MAX_IDENTITY_BYTES)?;
         line("title", &arguments.title, MAX_TITLE_BYTES)?;
         if let Some(body) = &arguments.body {
             text("body", body, MAX_BODY_BYTES)?;
@@ -560,10 +574,11 @@ impl Orchestrator {
             )?;
         }
         let repo = self.repo.clone();
+        let identity = Arc::clone(&self.identity);
         Ok(self
             .blocking(TASK_CREATE, move |_db| {
-                let mut task = crate::coordinator::NewTask {
-                    created_by: &arguments.created_by,
+                let task = crate::coordinator::NewTask {
+                    created_by: &identity,
                     title: &arguments.title,
                     body: arguments.body.as_deref(),
                     priority: arguments.priority,
@@ -576,15 +591,11 @@ impl Orchestrator {
                     base_branch: arguments.base_branch.as_deref(),
                 };
                 crate::coordinator::validate_new_task(&task)?;
-                // The default base branch comes from the operator's serve
-                // configuration. A failure to read it is the operator's to
-                // see, never the caller's: its text can quote that file.
-                let configured;
-                if task.base_branch.is_none() {
-                    configured = crate::serve_config::task_create_base_branch(&repo)
-                        .map_err(|error| QuorumError::Io(error.to_string()))?;
-                    task.base_branch = Some(&configured);
-                }
+                // Task intake reads the operator's serve configuration. A
+                // failure to read it is the operator's to see, never the
+                // caller's: its text names and can quote that file.
+                crate::serve_config::task_create_base_branch(&repo)
+                    .map_err(|error| QuorumError::Io(error.to_string()))?;
                 let id = crate::coordinator::task_create(&repo, &task, quorum_core::clock::now())?;
                 Ok(json_result(json!({"id": id, "repo": repo}), false))
             })
@@ -601,28 +612,40 @@ impl Orchestrator {
             line("assignee", assignee, MAX_IDENTITY_BYTES)?;
         }
         let limit = page(arguments.limit)?;
+        let offset = arguments.offset.unwrap_or(0);
+        if offset < 0 {
+            return Err(invalid_arguments("offset must be >= 0"));
+        }
         Ok(self
             .blocking(TASK_LIST, move |db| {
-                let tasks = {
+                let (page, total) = {
                     let conn = quorum_core::db::open(db)?;
-                    quorum_core::tasks::list(
+                    quorum_core::tasks::list_brief_page(
                         &conn,
                         arguments.status.as_deref(),
                         arguments.label.as_deref(),
                         arguments.assignee.as_deref(),
+                        limit as i64,
+                        offset,
                     )?
                 };
-                let total = tasks.len();
-                let rows = tasks
+                let mut rows = page
                     .iter()
-                    .take(limit)
-                    .map(|task| serde_json::to_value(quorum_core::tasks::TaskBrief::from(task)))
+                    .map(serde_json::to_value)
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(|error| QuorumError::Io(error.to_string()))?;
-                Ok(json_result(
-                    bounded_rows("tasks", rows, total > limit, json!({"total": total})),
-                    false,
-                ))
+                fit_rows(&mut rows, LISTING_OVERHEAD_BYTES);
+                let next = offset.saturating_add(rows.len() as i64);
+                let mut result = json!({"total": total, "offset": offset});
+                // No progress is possible past a single row too large to
+                // return; `truncated` without `next_offset` says so.
+                let more = next < total && offset < total;
+                if more && !rows.is_empty() {
+                    result["next_offset"] = Value::from(next);
+                }
+                result["truncated"] = Value::Bool(more);
+                result["tasks"] = Value::Array(rows);
+                Ok(json_result(result, false))
             })
             .await)
     }
@@ -667,23 +690,25 @@ impl Orchestrator {
                         quorum_core::clock::now(),
                     )?
                 };
-                let more = events.len() > limit;
+                let mut more = events.len() > limit;
                 events.truncate(limit);
-                let rows = events
+                let mut rows = events
                     .iter()
                     .map(serde_json::to_value)
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(|error| QuorumError::Io(error.to_string()))?;
-                Ok(json_result(
-                    bounded_rows("events", rows, more, json!({})),
-                    false,
-                ))
+                more |= fit_rows(&mut rows, LISTING_OVERHEAD_BYTES);
+                let mut result = json!({"truncated": more});
+                if let (true, Some(last)) = (more, rows.last()) {
+                    result["next_since"] = last["seq"].clone();
+                }
+                result["events"] = Value::Array(rows);
+                Ok(json_result(result, false))
             })
             .await)
     }
 
     async fn task_cancel(&self, arguments: TaskCancelArguments) -> Checked<CallToolResult> {
-        line("agent", &arguments.agent, MAX_IDENTITY_BYTES)?;
         positive("task_id", arguments.task_id)?;
         if arguments.expected_revision.is_some_and(|value| value < 0) {
             return Err(invalid_arguments("expected_revision must be >= 0"));
@@ -691,11 +716,13 @@ impl Orchestrator {
         if let Some(note) = &arguments.note {
             text("note", note, MAX_NOTE_BYTES)?;
         }
+        let identity = Arc::clone(&self.identity);
         Ok(self
             .blocking(TASK_CANCEL, move |db| {
                 let now = quorum_core::clock::now();
                 let mut conn = quorum_core::db::open(db)?;
-                // The guarded UPDATE inside `update` is the whole decision:
+                // The guarded UPDATE inside `update` is the whole decision,
+                // including the creator-or-assignee rule for this identity:
                 // zero rows is a clean negative, whoever else is racing.
                 let fields = quorum_core::tasks::TaskUpdate {
                     status: Some("cancelled"),
@@ -704,7 +731,7 @@ impl Orchestrator {
                 };
                 let task = match quorum_core::tasks::update(
                     &mut conn,
-                    &arguments.agent,
+                    &identity,
                     arguments.task_id,
                     &fields,
                     now,
@@ -713,17 +740,19 @@ impl Orchestrator {
                     Err(QuorumError::NotHolder) => {
                         return Ok(refusal(
                             "rejected",
-                            "not cancelled: the task is unknown, already finished, or `agent` \
-                             is neither its creator nor its assignee",
+                            "not cancelled: the task is unknown, already finished, or this \
+                             coordinator identity is neither its creator nor its assignee",
                         ));
                     }
                     Err(error) => return Err(error),
                 };
+                // As on the command line, the note is a second transaction
+                // after the cancellation has committed.
                 let mut compact = quorum_core::tasks::TaskCompact::from(&task);
                 if let Some(note) = &arguments.note {
                     compact.note_id = quorum_core::tasks::add_note(
                         &mut conn,
-                        &arguments.agent,
+                        &identity,
                         arguments.task_id,
                         note,
                         now,
@@ -738,37 +767,41 @@ impl Orchestrator {
 
     async fn task_retry(&self, arguments: TaskRetryArguments) -> Checked<CallToolResult> {
         positive("task_id", arguments.task_id)?;
-        line("by", &arguments.by, MAX_IDENTITY_BYTES)?;
+        let identity = Arc::clone(&self.identity);
         Ok(self
             .blocking(TASK_RETRY, move |db| {
                 let (emitted, exit) = crate::coordinator::task_retry(
                     db,
                     arguments.task_id,
-                    &arguments.by,
+                    &identity,
                     quorum_core::clock::now(),
                 )?;
+                let mut value: Value = serde_json::from_str(&emitted)
+                    .map_err(|error| QuorumError::Io(error.to_string()))?;
                 if exit == 0 {
-                    let value = serde_json::from_str(&emitted)
-                        .map_err(|error| QuorumError::Io(error.to_string()))?;
                     return Ok(json_result(value, false));
                 }
-                let reason = serde_json::from_str::<Value>(&emitted)
-                    .ok()
-                    .and_then(|value| value["reason"].as_str().map(str::to_owned))
-                    .unwrap_or_else(|| "the task is not eligible for retry".into());
-                Ok(refusal("rejected", reason))
+                // A refusal keeps every field the command emits (`outcome`,
+                // `reason`, `cancelled_deps`, `retry_count`, `retry_cap`)
+                // beside this server's `code` and `message`.
+                let message = value["reason"]
+                    .as_str()
+                    .unwrap_or("the task is not eligible for retry")
+                    .to_string();
+                value["code"] = Value::from("rejected");
+                value["message"] = Value::from(message);
+                Ok(json_result(value, true))
             })
             .await)
     }
 
     async fn message_agent(&self, arguments: MessageAgentArguments) -> Checked<CallToolResult> {
-        line("from", &arguments.from, MAX_IDENTITY_BYTES)?;
         line("to", &arguments.to, MAX_IDENTITY_BYTES)?;
         text("body", &arguments.body, MAX_MESSAGE_BYTES)?;
+        let identity = self.identity.to_string();
         Ok(self
             .blocking(MESSAGE_AGENT, move |db| {
-                let id =
-                    crate::coordinator::message(db, arguments.from, arguments.to, arguments.body)?;
+                let id = crate::coordinator::message(db, identity, arguments.to, arguments.body)?;
                 Ok(json_result(json!({"ok": true, "mailbox_id": id}), false))
             })
             .await)
@@ -907,49 +940,46 @@ fn valid_token(token: &str) -> bool {
         && token.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
-/// Load the operator's bearer token from `--token-file` or the environment.
-/// It is never accepted as an argument value, and it is required: this
-/// listener has no unauthenticated mode on any address.
-fn load_token(token_file: Option<&Path>) -> Result<Vec<u8>> {
-    // Taken out of the environment at once so nothing started later by this
-    // process can inherit it.
-    let from_env = std::env::var_os(TOKEN_ENV);
-    std::env::remove_var(TOKEN_ENV);
-    let token = match (token_file, from_env) {
-        (Some(_), Some(_)) => {
-            return Err(QuorumError::Usage(format!(
-                "orchestrator-mcp takes its token from --token-file or {TOKEN_ENV}, not both"
-            )));
-        }
-        (None, None) => {
-            return Err(QuorumError::Usage(format!(
-                "orchestrator-mcp requires a bearer token: pass --token-file or set {TOKEN_ENV}"
-            )));
-        }
-        (Some(path), None) => {
-            use std::io::Read as _;
-            let unreadable = |error: std::io::Error| {
-                QuorumError::Usage(format!("cannot read --token-file: {error}"))
-            };
-            let mut contents = String::new();
-            std::fs::File::open(path)
-                .map_err(unreadable)?
-                .take(MAX_TOKEN_FILE_BYTES)
-                .read_to_string(&mut contents)
-                .map_err(unreadable)?;
-            contents.trim_end_matches(['\r', '\n']).to_string()
-        }
-        (None, Some(value)) => value
-            .into_string()
-            .map_err(|_| QuorumError::Usage(format!("{TOKEN_ENV} is not valid UTF-8")))?,
-    };
-    if !valid_token(&token) {
+/// Load the operator's bearer token from `--token-file`, the only source.
+///
+/// The file must be a regular file owned by this user with no group or other
+/// permission bits, so no other user can read it. That does not hide it from
+/// processes of the same user; see the design record's trust model.
+fn load_token(token_file: &Path) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let unreadable =
+        |error: std::io::Error| QuorumError::Usage(format!("cannot read --token-file: {error}"));
+    let file = std::fs::File::open(token_file).map_err(unreadable)?;
+    // Checked on the open descriptor, so the file read is the file checked.
+    let metadata = file.metadata().map_err(unreadable)?;
+    if !metadata.is_file() {
+        return Err(QuorumError::Usage(
+            "--token-file must be a regular file".into(),
+        ));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(QuorumError::Usage(
+            "--token-file must be owned by the user running orchestrator-mcp".into(),
+        ));
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err(QuorumError::Usage(
+            "--token-file must not be readable by group or others (chmod 600)".into(),
+        ));
+    }
+    let mut contents = String::new();
+    file.take(MAX_TOKEN_FILE_BYTES)
+        .read_to_string(&mut contents)
+        .map_err(unreadable)?;
+    let token = contents.trim_end_matches(['\r', '\n']);
+    if !valid_token(token) {
         return Err(QuorumError::Usage(format!(
             "the orchestrator token must be {MIN_TOKEN_BYTES} to {MAX_TOKEN_BYTES} printable \
              ASCII characters with no spaces"
         )));
     }
-    Ok(token.into_bytes())
+    Ok(token.as_bytes().to_vec())
 }
 
 /// The `Host` names a request may carry. A loopback bind accepts the loopback
@@ -988,32 +1018,61 @@ fn allowed_hosts(addr: SocketAddr, configured: Vec<String>) -> Result<Vec<String
 
 pub fn run(
     listen: SocketAddr,
-    token_file: Option<PathBuf>,
+    token_file: &Path,
+    identity: String,
     hosts: Vec<String>,
     repo: Option<String>,
 ) -> Result<()> {
-    let token = load_token(token_file.as_deref())?;
-    // A managed run reaches the daemon through its endpoint and has no
-    // database authority; it must not become a coordinator by starting this.
+    // The environment is not a token source: it is inherited by child
+    // processes and outlives the reason it was set. Refuse rather than let an
+    // operator believe an exported token is in use.
+    if std::env::var_os(TOKEN_ENV).is_some() {
+        return Err(QuorumError::Usage(format!(
+            "{TOKEN_ENV} is not read; put the token in a file and pass --token-file"
+        )));
+    }
+    let token = load_token(token_file)?;
+    // Advisory only: a managed run normally has no database to serve, and a
+    // process that controls its own environment can unset this. The token
+    // file and database permissions are the boundary, not this check.
     if std::env::var_os("QUORUM_RUN_ID").is_some() {
         return Err(QuorumError::Usage(
             "orchestrator-mcp cannot be started from a daemon-managed run".into(),
         ));
     }
+    if line("identity", &identity, MAX_IDENTITY_BYTES).is_err() {
+        return Err(QuorumError::Usage(format!(
+            "--identity must be 1 to {MAX_IDENTITY_BYTES} bytes with no control characters"
+        )));
+    }
     let hosts = allowed_hosts(listen, hosts)?;
     let repo = crate::resolve_repo_override(repo.as_deref())?;
-    let db = crate::paths::ensure_repo_dir(&repo)?;
+    // Serve only a repository that already has a database. Opening a missing
+    // path would create an empty one for a mistyped name.
+    let db = crate::paths::db_path_for_repo(&repo)?;
+    if !db.is_file() {
+        return Err(QuorumError::Usage(format!(
+            "no Quorum database for {repo}; run `quorum init` for that repository first"
+        )));
+    }
     // Fail at startup, not on the first call, when the database is unusable
     // or newer than this binary.
     drop(quorum_core::db::open(&db)?);
     let server = Orchestrator {
         repo,
+        identity: identity.into(),
         db,
-        slots: Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_CONNECTIONS)),
+        slots: Arc::new(tokio::sync::Semaphore::new(MAX_ADMITTED_REQUESTS)),
     };
     let token: Arc<[u8]> = token.into();
     serve_http(
-        "orchestrator-mcp",
+        HttpListener {
+            command: "orchestrator-mcp",
+            title: "orchestrator MCP",
+            max_connections: MAX_CONNECTIONS,
+            header_read_timeout: HEADER_READ_TIMEOUT,
+            max_admitted_requests: Some(MAX_ADMITTED_REQUESTS),
+        },
         listen,
         stateless_http_config().with_allowed_hosts(hosts),
         server,
@@ -1096,14 +1155,15 @@ mod tests {
 
     #[test]
     fn listed_rows_are_dropped_from_the_end_until_they_fit() {
-        let rows: Vec<Value> = (0..40)
+        let mut rows: Vec<Value> = (0..40)
             .map(|id| json!({"id": id, "t": "x".repeat(8000)}))
             .collect();
-        let bounded = bounded_rows("tasks", rows, false, json!({"total": 40}));
-        assert!(json_len(&bounded) <= MAX_RESULT_BYTES);
-        assert_eq!(bounded["truncated"], true);
-        assert_eq!(bounded["total"], 40);
-        assert_eq!(bounded["tasks"][0]["id"], 0);
-        assert!(bounded["tasks"].as_array().unwrap().len() < 40);
+        assert!(fit_rows(&mut rows, LISTING_OVERHEAD_BYTES));
+        assert!(json_len(&Value::Array(rows.clone())) + LISTING_OVERHEAD_BYTES <= MAX_RESULT_BYTES);
+        assert_eq!(rows[0]["id"], 0);
+        assert!(!rows.is_empty() && rows.len() < 40);
+        let mut small = vec![json!({"id": 1})];
+        assert!(!fit_rows(&mut small, LISTING_OVERHEAD_BYTES));
+        assert_eq!(small.len(), 1);
     }
 }
