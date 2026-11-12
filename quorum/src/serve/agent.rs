@@ -559,6 +559,8 @@ impl AgentProc {
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
         }
+
+        crate::serve::runner::strip_operator_secrets(&mut cmd);
         if agent_mcp.is_some() {
             strip_managed_mcp_authority(&mut cmd);
         }
@@ -664,6 +666,8 @@ impl AgentProc {
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
         }
+
+        crate::serve::runner::strip_operator_secrets(&mut cmd);
         if agent_mcp.is_some() {
             strip_managed_mcp_authority(&mut cmd);
         }
@@ -1201,7 +1205,13 @@ enum RestrictedMode {
 /// nested stdio child: the endpoint must never acquire ambient GitHub or
 /// Quorum-home authority merely because Claude happens to inherit it.
 fn strip_managed_mcp_authority(cmd: &mut Command) {
-    for name in ["GH_TOKEN", "GITHUB_TOKEN", "QUORUM_HOME", "GH_CONFIG_DIR"] {
+    for name in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "QUORUM_HOME",
+        "GH_CONFIG_DIR",
+        "QUORUM_ORCHESTRATOR_TOKEN",
+    ] {
         cmd.env_remove(name);
     }
 }
@@ -1214,6 +1224,7 @@ fn strip_coordination_env(cmd: &mut Command) {
         "QUORUM_RUN_ID",
         "GH_TOKEN",
         "GITHUB_TOKEN",
+        "QUORUM_ORCHESTRATOR_TOKEN",
     ] {
         cmd.env_remove(name);
     }
@@ -1374,6 +1385,7 @@ mod tests {
         let _github = EnvRestore::poison("GITHUB_TOKEN", "ambient-github-token");
         let _quorum_home = EnvRestore::poison("QUORUM_HOME", "/ambient/quorum-home");
         let _gh_config = EnvRestore::poison("GH_CONFIG_DIR", "/ambient/gh-config");
+        let _orchestrator = EnvRestore::poison("QUORUM_ORCHESTRATOR_TOKEN", "ambient-token");
 
         let root = tempfile::tempdir().unwrap();
         let capture = root.path().join("mcp-child-environment.log");
@@ -1394,6 +1406,7 @@ mod tests {
                    printf 'github=%s\\n' \"$GITHUB_TOKEN\"\n\\
                    printf 'quorum_home=%s\\n' \"$QUORUM_HOME\"\n\\
                    printf 'gh_config=%s\\n' \"$GH_CONFIG_DIR\"\n\\
+                   printf 'orchestrator=%s\\n' \"$QUORUM_ORCHESTRATOR_TOKEN\"\n\\
                  }} > '{capture}.partial' && mv '{capture}.partial' '{capture}'\n",
                 capture = capture.display()
             ),
@@ -1451,7 +1464,13 @@ mod tests {
             captured.contains("endpoint=/tmp/quorum-agent.sock\n"),
             "{captured}"
         );
-        for absent in ["gh=\n", "github=\n", "quorum_home=\n", "gh_config=\n"] {
+        for absent in [
+            "gh=\n",
+            "github=\n",
+            "quorum_home=\n",
+            "gh_config=\n",
+            "orchestrator=\n",
+        ] {
             assert!(captured.contains(absent), "{captured}");
         }
     }

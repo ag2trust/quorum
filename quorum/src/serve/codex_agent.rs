@@ -408,6 +408,7 @@ impl CodexProc {
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
         }
+        crate::serve::runner::strip_operator_secrets(&mut cmd);
         // A planner without an MCP server holds no endpoint authority, so every
         // coordination name is removed. A planner with one must keep its run
         // envelope: Codex copies exactly `AGENT_MCP_ENV_VARS` out of this
@@ -465,6 +466,7 @@ impl CodexProc {
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
         }
+        crate::serve::runner::strip_operator_secrets(&mut cmd);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -522,6 +524,7 @@ impl CodexProc {
         for (k, v) in env_vars {
             cmd.env(k, v);
         }
+        crate::serve::runner::strip_operator_secrets(&mut cmd);
         cmd.current_dir(worktree);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -580,6 +583,7 @@ impl CodexProc {
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
         }
+        crate::serve::runner::strip_operator_secrets(&mut cmd);
         cmd.current_dir(&spec.worktree);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -633,6 +637,7 @@ impl CodexProc {
         for (key, value) in env_vars {
             cmd.env(key, value);
         }
+        crate::serve::runner::strip_operator_secrets(&mut cmd);
         cmd.current_dir(worktree)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -954,6 +959,7 @@ fn strip_planner_coordination_env(cmd: &mut Command) {
         "QUORUM_RUN_ID",
         "GH_TOKEN",
         "GITHUB_TOKEN",
+        "QUORUM_ORCHESTRATOR_TOKEN",
     ] {
         cmd.env_remove(name);
     }
@@ -963,7 +969,13 @@ fn strip_planner_coordination_env(cmd: &mut Command) {
 /// envelope survives because the stdio MCP child needs it; the database home
 /// and every GitHub credential do not reach the provider or its child.
 fn strip_planner_mcp_ambient_authority(cmd: &mut Command) {
-    for name in ["QUORUM_HOME", "GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"] {
+    for name in [
+        "QUORUM_HOME",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_CONFIG_DIR",
+        "QUORUM_ORCHESTRATOR_TOKEN",
+    ] {
         cmd.env_remove(name);
     }
 }
@@ -1290,7 +1302,7 @@ mod tests {
         std::fs::write(
             &fake_codex,
             r#"#!/bin/sh
-printf '{"repo":"%s","agent":"%s","run":"%s","endpoint":"%s","home":"%s","gh":"%s","openai":"%s"}\n' "$QUORUM_REPO" "$QUORUM_AGENT" "$QUORUM_RUN_ID" "$QUORUM_AGENT_ENDPOINT" "$QUORUM_HOME" "$GH_TOKEN" "$OPENAI_API_KEY"
+printf '{"repo":"%s","agent":"%s","run":"%s","endpoint":"%s","home":"%s","gh":"%s","openai":"%s","orchestrator":"%s"}\n' "$QUORUM_REPO" "$QUORUM_AGENT" "$QUORUM_RUN_ID" "$QUORUM_AGENT_ENDPOINT" "$QUORUM_HOME" "$GH_TOKEN" "$OPENAI_API_KEY" "$QUORUM_ORCHESTRATOR_TOKEN"
 "#,
         )
         .unwrap();
@@ -1314,6 +1326,7 @@ printf '{"repo":"%s","agent":"%s","run":"%s","endpoint":"%s","home":"%s","gh":"%
                     ),
                     ("QUORUM_HOME".into(), "home-authority".into()),
                     ("GH_TOKEN".into(), "gh-authority".into()),
+                    ("QUORUM_ORCHESTRATOR_TOKEN".into(), "operator-token".into()),
                     ("OPENAI_API_KEY".into(), "provider-auth".into()),
                 ],
                 ..test_spec()
@@ -1339,6 +1352,7 @@ printf '{"repo":"%s","agent":"%s","run":"%s","endpoint":"%s","home":"%s","gh":"%
             }
             assert_eq!(observed["home"], "");
             assert_eq!(observed["gh"], "");
+            assert_eq!(observed["orchestrator"], "");
             // Provider authentication is untouched in both shapes.
             assert_eq!(observed["openai"], "provider-auth");
         }
