@@ -745,6 +745,28 @@ fn http_listener_derives_authority_per_request_and_signals_the_daemon() {
         .0,
         "request_too_large"
     );
+    // The same runs over stdio keep exactly their pre-existing inventories:
+    // no signalling tool is advertised or routed there.
+    assert_stdio_inventory(
+        &endpoint,
+        "worker-cap",
+        "Worker",
+        &["delivery_report_write"],
+    );
+    assert_stdio_inventory(
+        &endpoint,
+        "reviewer-cap",
+        "Reviewer",
+        &[
+            "pull_request_read",
+            "add_issue_comment",
+            "pull_request_review_write",
+            "add_comment_to_pending_review",
+            "add_reply_to_pull_request_comment",
+            "resolve_review_thread",
+            "github_operation_read",
+        ],
+    );
     // The stub operations still answer exactly as they do over stdio.
     let stub = rpc(
         addr,
@@ -1162,21 +1184,27 @@ fn listen_refuses_non_loopback_and_malformed_addresses() {
     }
 }
 
-/// The signalling tools exist only over HTTP. A stdio shell for the same kind
-/// of run advertises exactly its pre-existing inventory and treats the new
-/// names as unknown, so launches that use stdio are unaffected.
-#[test]
-fn stdio_inventory_and_routing_are_unchanged() {
-    let endpoint = FakeEndpoint::start();
+const SIGNAL_TOOLS: [&str; 5] = [
+    "submit_work",
+    "submit_review",
+    "react",
+    "task_note",
+    "alert_owner",
+];
+
+/// Drive one stdio shell for `capability`: it must advertise
+/// `tools/list_changed`, list exactly `expected`, and treat every signalling
+/// tool name as unknown.
+fn assert_stdio_inventory(endpoint: &Path, capability: &str, agent: &str, expected: &[&str]) {
     let mut child = Command::new(quorum_bin())
         .arg("agent-mcp")
-        .env("QUORUM_AGENT_ENDPOINT", &endpoint.path)
-        .env("QUORUM_RUN_ID", "planner-cap")
+        .env("QUORUM_AGENT_ENDPOINT", endpoint)
+        .env("QUORUM_RUN_ID", capability)
         .env("QUORUM_REPO", "test/repo")
-        .env("QUORUM_AGENT", "Planner")
+        .env("QUORUM_AGENT", agent)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
@@ -1207,23 +1235,12 @@ fn stdio_inventory_and_routing_are_unchanged() {
         }),
     );
     assert_eq!(
-        initialized["result"]["capabilities"]["tools"]["listChanged"],
-        true
+        initialized["result"]["capabilities"]["tools"]["listChanged"], true,
+        "{capability}"
     );
-    assert_eq!(
-        tool_names(&request(2, "tools/list", json!({}))),
-        vec!["submit_plan"]
-    );
-    for (id, name) in [
-        "submit_work",
-        "submit_review",
-        "react",
-        "task_note",
-        "alert_owner",
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    let listed = request(2, "tools/list", json!({}));
+    assert_eq!(tool_names(&listed), expected, "{capability}");
+    for (id, name) in SIGNAL_TOOLS.into_iter().enumerate() {
         let response = request(
             10 + id as i64,
             "tools/call",
@@ -1234,4 +1251,193 @@ fn stdio_inventory_and_routing_are_unchanged() {
     }
     drop(input);
     assert!(child.wait().unwrap().success());
+}
+
+/// The signalling tools exist only over HTTP. A stdio planner shell
+/// advertises exactly its pre-existing inventory and treats the new names as
+/// unknown. The worker and reviewer stdio inventories are asserted against
+/// the real daemon in the listener test above.
+#[test]
+fn stdio_inventory_and_routing_are_unchanged() {
+    let endpoint = FakeEndpoint::start();
+    assert_stdio_inventory(&endpoint.path, "planner-cap", "Planner", &["submit_plan"]);
+}
+
+/// A raw request on its own connection; `None` when the server closed the
+/// connection without answering.
+fn raw_exchange(addr: SocketAddr, request: &[u8], read_timeout: Duration) -> Option<u16> {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(read_timeout)).unwrap();
+    stream.write_all(request).unwrap();
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .expect("no response and no close");
+    String::from_utf8_lossy(&raw)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+}
+
+const PARTIAL_HEAD: &[u8] = b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n";
+const PARTIAL_BODY: &[u8] = b"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+    Authorization: Bearer x\r\nContent-Type: application/json\r\n\
+    Accept: application/json, text/event-stream\r\nContent-Length: 100\r\n\r\n{";
+
+#[test]
+fn http_rejects_foreign_hosts_and_oversized_bodies() {
+    let dir = tempfile::tempdir().unwrap();
+    let shell = HttpShell::start(&dir.path().join("absent.sock"), &[]);
+    let addr = shell.addr;
+    let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+
+    // DNS-rebinding guard: a request naming a non-loopback host is refused
+    // even with a well-formed bearer; the loopback names are accepted.
+    for (host, status) in [
+        ("evil.example", 403),
+        ("192.0.2.1", 403),
+        (&format!("evil.example:{}", addr.port())[..], 403),
+        (&format!("localhost:{}", addr.port())[..], 200),
+        (&addr.to_string()[..], 200),
+    ] {
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
+             Authorization: Bearer x\r\nContent-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\nContent-Length: {}\r\n\r\n{list}",
+            list.len()
+        );
+        assert_eq!(
+            raw_exchange(addr, request.as_bytes(), Duration::from_secs(10)),
+            Some(status),
+            "Host: {host}"
+        );
+    }
+
+    // The body cap is 256 KiB. Just under it is read and parsed; over it is
+    // refused with 413 whatever it contains.
+    let body = |bytes: usize| {
+        json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"task_note","arguments":{"note":"n".repeat(bytes)}}
+        })
+    };
+    let (status, _) = post_mcp(addr, &["Bearer x"], &body(255 * 1024));
+    assert_eq!(status, 200);
+    let (status, text) = post_mcp(addr, &["Bearer x"], &body(257 * 1024));
+    assert_eq!(status, 413, "{}", &text[..text.len().min(200)]);
+    shell.stop();
+}
+
+/// Without a bound, one peer that stops mid-request would keep the listener
+/// alive forever after SIGTERM. Shutdown must finish within the drain bound
+/// (5s) and still exit 0.
+#[test]
+fn sigterm_exits_within_the_drain_bound_with_half_sent_requests_open() {
+    for payload in [&b""[..], PARTIAL_HEAD, PARTIAL_BODY] {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = HttpShell::start(&dir.path().join("absent.sock"), &[]);
+        let mut stalled = TcpStream::connect(shell.addr).unwrap();
+        stalled.write_all(payload).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        // `stop` asserts exit code 0.
+        shell.stop();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "shutdown took {elapsed:?} with {} stalled bytes",
+            payload.len()
+        );
+        drop(stalled);
+    }
+}
+
+/// At most eight connections are served at once. A ninth is not refused and
+/// not served: it waits in the listen backlog until a slot frees.
+#[test]
+fn connections_beyond_the_cap_wait_for_a_free_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let shell = HttpShell::start(&dir.path().join("absent.sock"), &[]);
+    let addr = shell.addr;
+    // Eight stalled request heads hold every slot (for up to the 10s
+    // header-read bound, well beyond this test's own waits).
+    let mut holders: Vec<TcpStream> = (0..8)
+        .map(|_| {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            stream.write_all(PARTIAL_HEAD).unwrap();
+            stream
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(300));
+
+    let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+    let mut ninth = TcpStream::connect(addr).unwrap();
+    ninth
+        .write_all(
+            format!(
+                "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+                 Authorization: Bearer x\r\nContent-Type: application/json\r\n\
+                 Accept: application/json, text/event-stream\r\nContent-Length: {}\r\n\r\n{list}",
+                list.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    ninth
+        .set_read_timeout(Some(Duration::from_millis(1500)))
+        .unwrap();
+    let mut byte = [0_u8; 1];
+    let waiting = ninth.read(&mut byte).unwrap_err();
+    assert!(
+        matches!(
+            waiting.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "the ninth connection was answered or closed while all slots were held: {waiting}"
+    );
+
+    // Freeing one slot lets the queued request through, complete and intact.
+    drop(holders.pop());
+    ninth
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut raw = Vec::new();
+    ninth.read_to_end(&mut raw).unwrap();
+    let raw = String::from_utf8(raw).unwrap();
+    assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+    assert!(raw.contains("agent endpoint unavailable"), "{raw}");
+    drop(holders);
+    shell.stop();
+}
+
+/// A connection that never completes its request head is closed after the
+/// 10s header-read bound, and a request whose body never arrives is answered
+/// 408 after the 15s request bound; neither holds its slot indefinitely.
+#[test]
+fn stalled_requests_are_cut_off_at_their_time_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let shell = HttpShell::start(&dir.path().join("absent.sock"), &[]);
+    let addr = shell.addr;
+    let started = Instant::now();
+    let head = thread::spawn(move || {
+        let status = raw_exchange(addr, PARTIAL_HEAD, Duration::from_secs(25));
+        (status, started.elapsed())
+    });
+    let body = thread::spawn(move || {
+        let status = raw_exchange(addr, PARTIAL_BODY, Duration::from_secs(30));
+        (status, started.elapsed())
+    });
+    let (head_status, head_elapsed) = head.join().unwrap();
+    assert_ne!(head_status, Some(200));
+    assert!(
+        (Duration::from_secs(9)..Duration::from_secs(14)).contains(&head_elapsed),
+        "stalled head ended after {head_elapsed:?} with {head_status:?}"
+    );
+    let (body_status, body_elapsed) = body.join().unwrap();
+    assert_eq!(body_status, Some(408));
+    assert!(
+        (Duration::from_secs(14)..Duration::from_secs(20)).contains(&body_elapsed),
+        "stalled body ended after {body_elapsed:?}"
+    );
+    shell.stop();
 }
