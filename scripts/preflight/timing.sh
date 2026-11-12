@@ -18,7 +18,7 @@ each entry to a compiler-artifact message by ``(--crate-name, --test)``.
 Execution time is measured by invoking each test executable directly and
 wall-clocking its run. Integration tests and benches receive the
 ``CARGO_BIN_EXE_<name>`` variables ``cargo test`` would set for their package's
-bins, and their result-cache key covers those bins' contents.
+bins, and every test's result-cache key covers its package's bins' contents.
 
 Outputs (under ``target/preflight-timing/`` by default):
   timing.json                  — machine-readable artifact
@@ -325,13 +325,19 @@ def attach_cargo_bin_exe_env(
     tests do not get it. Since Cargo's build-dir layout moved test executables
     away from the bins, helpers such as ``assert_cmd::cargo::cargo_bin`` can
     only find a bin through this variable, so direct execution must provide it.
+
+    Every test unit of the package, unit tests included, also records the
+    package's bins as ``package_bins``: unit tests can spawn them too (for
+    example by locating them in the target directory), so the result-cache key
+    covers them for all of the package's tests.
     """
     for binary in binaries:
-        kinds = binary.get("target_kinds") or []
-        if "test" not in kinds and "bench" not in kinds:
-            continue
         bins = package_bins.get(binary.get("package_id") or "", {})
-        if bins:
+        if not bins:
+            continue
+        binary["package_bins"] = dict(sorted(bins.items()))
+        kinds = binary.get("target_kinds") or []
+        if "test" in kinds or "bench" in kinds:
             binary["cargo_env"] = {
                 f"CARGO_BIN_EXE_{name}": path
                 for name, path in sorted(bins.items())
@@ -435,11 +441,14 @@ def test_result_cache_key(
 ) -> str | None:
     """Return the result-cache key for one test binary, or ``None`` to miss.
 
-    A test that receives ``CARGO_BIN_EXE_*`` exercises those bins as well as
-    its own executable, and a bin can change without relinking the test. Key
-    such tests on the content of every injected bin too, so a changed (or
-    missing) bin re-runs the test instead of replaying a stale green result.
-    ``hashes`` memoizes file digests across binaries within one run.
+    A test can exercise its package's bins as well as its own executable,
+    and a bin can change without relinking the test: integration tests reach
+    them through ``CARGO_BIN_EXE_*`` and unit tests may spawn them from the
+    target directory. Key every test of a package that has bins on the
+    content of each of those bins too, so a changed (or missing) bin re-runs
+    the package's tests instead of replaying a stale green result. Tests of a
+    package without bins keep the plain executable hash. ``hashes`` memoizes
+    file digests across binaries within one run.
     """
     def digest_of(path: str) -> str | None:
         if path not in hashes:
@@ -447,11 +456,11 @@ def test_result_cache_key(
         return hashes[path]
 
     digest = digest_of(binary["executable"])
-    env = binary.get("cargo_env") or {}
-    if digest is None or not env:
+    bins = binary.get("package_bins") or {}
+    if digest is None or not bins:
         return digest
-    key = hashlib.sha256(b"timing-test-result-v2\0" + digest.encode())
-    for name, path in sorted(env.items()):
+    key = hashlib.sha256(b"timing-test-result-v3\0" + digest.encode())
+    for name, path in sorted(bins.items()):
         bin_digest = digest_of(path)
         if bin_digest is None:
             return None
@@ -514,9 +523,11 @@ def select_test_binaries_to_execute(
     Hash the actual output rather than build inputs: the timing wrapper can
     chain sccache, whose rebuilds need not produce deterministic paths or
     timestamps. This intentionally reduces repeat coverage for unchanged
-    concurrency canaries; changed binaries (or changed bins injected through
-    ``CARGO_BIN_EXE_*``) always run, and operators can delete
-    test-results.json to force a full execution pass.
+    concurrency canaries; changed test binaries, and every test of a package
+    whose bins changed, always run. Inputs a test reads at runtime other than
+    its executable and its package's bins (repository files, external tools)
+    are not part of the key; operators can delete test-results.json to force a
+    full execution pass.
     """
     cached = load_test_result_cache(cache_path)
     runnable: list[dict] = []
@@ -2409,6 +2420,11 @@ def self_test() -> int:
         assert tests[0]["cargo_env"] == expected_env, tests[0]
         assert tests[1]["cargo_env"] == expected_env, tests[1]
         assert all("cargo_env" not in t for t in tests[2:]), tests[2:]
+        # Unit tests get no env but still key their results on the bins.
+        assert all(
+            t["package_bins"] == {"app": str(app_bin)} for t in tests[:4]
+        ), tests[:4]
+        assert "package_bins" not in tests[4], tests[4]
 
         integration = tests[0]
         Path(integration["executable"]).write_text("#!/bin/sh\nexit 0\n")
@@ -2418,8 +2434,20 @@ def self_test() -> int:
         app_bin.write_text("app v2\n")
         key_v2 = test_result_cache_key(integration, {})
         assert key_v2 is not None and key_v2 != key_v1
+        unit = tests[2]
+        Path(unit["executable"]).write_text("#!/bin/sh\n# unit\nexit 0\n")
+        unit_v2 = test_result_cache_key(unit, {})
+        app_bin.write_text("app v3\n")
+        unit_v3 = test_result_cache_key(unit, {})
+        assert None not in (unit_v2, unit_v3) and unit_v2 != unit_v3
+        other = tests[4]
+        Path(other["executable"]).write_text("#!/bin/sh\n# other\nexit 0\n")
+        assert test_result_cache_key(other, {}) == executable_hash(
+            other["executable"]
+        )
         app_bin.unlink()
         assert test_result_cache_key(integration, {}) is None
+        assert test_result_cache_key(unit, {}) is None
 
     # ---- (1) artifact + bounded top-N ----
     with tempfile.TemporaryDirectory() as tmp:

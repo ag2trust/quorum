@@ -881,6 +881,19 @@ assert envs == {
     "app-bin-unit": None,
     "other-it": {"CARGO_BIN_EXE_other_helper": f"{sys.argv[2]}/other-helper"},
 }, envs
+# Every test unit, unit tests included, keys its result on its package's bins.
+bins = {
+    b["executable"].rsplit("/", 1)[-1]: b.get("package_bins")
+    for b in data["test_binaries"]
+}
+app_bins = {"app": f"{sys.argv[2]}/app", "app_tool": f"{sys.argv[2]}/app_tool"}
+assert bins == {
+    "app-it": app_bins,
+    "app-bench": app_bins,
+    "app-lib": app_bins,
+    "app-bin-unit": app_bins,
+    "other-it": {"other_helper": f"{sys.argv[2]}/other-helper"},
+}, bins
 PY
 
 # Unchanged tests and bins replay the green result without executing.
@@ -888,11 +901,17 @@ run_bin_env_timing cached
 [ ! -s "$TMP/bin-env-launches.log" ]
 grep -q '^test binaries: 0 executed, 5 cached$' "$BIN_ENV/out/summary.txt"
 
-# A changed bin re-runs exactly the tests that see it, even though their own
-# executables are unchanged.
+# A changed bin re-runs every test of its package, unit tests included (they
+# may spawn the bin from the target directory), even though their own
+# executables are unchanged; other packages' tests stay cached.
 printf 'app v2\n' >"$BIN_ENV/app"
 run_bin_env_timing changed-bin
-printf '%s\n' app-bench app-it >"$TMP/bin-env-launches.expected"
+printf '%s\n' app-bench app-bin-unit app-it app-lib \
+  >"$TMP/bin-env-launches.expected"
+cmp "$TMP/bin-env-launches.expected" "$TMP/bin-env-launches.sorted"
+printf 'helper v2\n' >"$BIN_ENV/other-helper"
+run_bin_env_timing changed-other-bin
+printf '%s\n' other-it >"$TMP/bin-env-launches.expected"
 cmp "$TMP/bin-env-launches.expected" "$TMP/bin-env-launches.sorted"
 
 # Test execution stops at the first failed binary boundary. The failed binary
