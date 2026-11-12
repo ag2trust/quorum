@@ -150,8 +150,8 @@ live capability. Public CLI requests are not attempt-scoped and use the compatib
 
 The initial endpoint is a local framed-JSON IPC channel, implemented as an owner-only Unix-domain
 socket on supported runtimes. The daemon endpoint itself does not listen on TCP; the separate
-`quorum agent-mcp --listen` adapter described below is the only TCP listener, and it is a client
-of this socket. Each bounded request carries the run
+`quorum agent-mcp --listen` adapter described below is the only TCP listener in front of it,
+and it is a client of this socket. Each bounded request carries the run
 capability and one closed operation; responses use closed bounded schemas. The daemon exposes
 the existing `submit`/`react` signals, the role-scoped MCP operations, and the established public
 CLI compatibility family through this channel—no SQL, daemon filesystem path, arbitrary command,

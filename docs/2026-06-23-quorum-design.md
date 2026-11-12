@@ -93,7 +93,9 @@ daemon alone writes SQLite and performs the remote operation. The MCP process ne
 Quorum database, GitHub credentials, or lifecycle authority. An operator may instead run the
 same adapter with `--listen` as a loopback-only Streamable HTTP server authorized per request by
 the run capability; nothing launches it automatically (see the GitHub collaboration MCP
-technical spec).
+technical spec). A separate, operator-started `quorum orchestrator-mcp`
+listener exposes the coordinator commands to an outside agent behind an operator token (see
+"Orchestrator MCP" below).
 
 For contained runs, the same local endpoint carries the existing run-scoped `submit` and `react`
 signals and the closed established public-command family, so those commands need neither a
@@ -124,7 +126,9 @@ Quorum-mediated collaboration operations.
 General coordination stays CLI-first. Outside a contained managed runner, each short-lived
 command opens SQLite, performs one atomic operation, emits JSON, and exits; inside one, the same
 public CLI surface uses the closed local endpoint exchange above. Quorum does not add a general
-HTTP daemon, remote MCP listener, OAuth surface, port, or second source of coordination state.
+HTTP daemon, OAuth surface, or second source of coordination state. The one listener that may
+leave loopback is the operator-started orchestrator MCP described below; it adds a transport
+for existing coordinator commands, not a new operation or authority.
 
 Managed GitHub collaboration is the narrow exception because direct Repository Service
 credentials and shell-composed Markdown are the wrong boundary for an untrusted coding run. The
@@ -136,9 +140,82 @@ state for the current attempt/lifecycle/inventory descriptor and invalidates it 
 daemon-authorized phase handoff; the adapter is neither durable authority nor a second source of
 coordination state. It forwards closed typed requests to a narrow local daemon endpoint, SQLite
 holds every durable operation request and binding, and `quorum serve` executes remote GitHub work
-outside transactions. Restricted internal model roles receive no MCP. The separate
-outside/task-creator MCP requires its own authentication and remote-transport design and is not
-implied by this agent interface.
+outside transactions. Restricted internal model roles receive no MCP. The separate orchestrator
+MCP below has its own listener and authentication and is not implied by this agent interface.
+
+## Orchestrator MCP
+
+`quorum orchestrator-mcp --listen <SOCKETADDR>` serves a tools-only Streamable HTTP MCP at `/mcp`
+for an outside coordinating agent that cannot run `quorum` commands beside the database. It is a
+separate process and listener from `quorum agent-mcp`; nothing starts it automatically and the
+daemon does not depend on it. It serves one repository, resolved at startup like any CLI command
+(`--repo`, then `QUORUM_REPO`, then the current checkout).
+
+**Tools.** The set is the coordinator subset of the CLI and nothing else. Each tool runs the
+operation its command runs, on one short-lived SQLite connection per call:
+
+| Tool | CLI operation |
+|---|---|
+| `task_create` | `task-create`, including `continue_pr`, `review_pr`, `review_only` |
+| `task_list` | `task-list --brief` |
+| `task_get` | `task-get` |
+| `task_log` | `log --refs task#N` |
+| `task_cancel` | `task-update --status cancelled` with an optional note |
+| `task_retry` | `task-retry` |
+| `message_agent` | `message` |
+
+There is no tool for claiming, submitting, verdicts, `task-close`, body or dependency edits,
+decomposition adoption, branch sync, the feed, stops, or anything that starts, stops, or signals
+`quorum serve`. The daemon alone transitions lifecycle (invariant 11): a created task is an
+ordinary row the daemon picks up, a cancellation is the same guarded `UPDATE` the CLI issues, and
+a message is one mailbox row. Concurrency safety is storage's: the server holds no task state,
+takes no lock of its own, and a lost race is zero guarded rows reported as a refusal.
+
+Caller identities (`created_by`, `agent`, `by`, `from`) are arguments, as they are flags on the
+CLI. The server does not add an identity model: whoever holds the token has exactly the
+coordinator authority a local shell with database access has, including cancelling as a task's
+creator or assignee by naming it.
+
+**Trust model.**
+
+- The operator's bearer token is the only credential. It is read from `--token-file` or
+  `QUORUM_ORCHESTRATOR_TOKEN` (not both), never from an argument value, must be 32 to 512
+  printable ASCII characters, and is required on every address: there is no unauthenticated
+  mode, loopback included. The variable is removed from the process environment once read.
+  Each request must carry exactly one `Authorization: Bearer <token>` header; it is compared
+  in constant time, and anything else is `401` before MCP runs.
+- A run capability never authenticates here. The server does not consult run capabilities at
+  all, shares no tool with the agent adapter, and refuses to start when `QUORUM_RUN_ID` is set.
+  A managed run that can reach the agent adapter therefore gains nothing at this listener
+  without the operator token, and the operator token is not a run at the agent adapter. The
+  token must be kept where managed agents cannot read it.
+- Bind policy: any address is accepted because a token is always required. A loopback bind
+  answers to the loopback host names. A non-loopback bind has no default host and requires at
+  least one `--allowed-host <host[:port]>`; a request whose `Host` is not listed is `403`. An
+  authenticated request carrying an `Origin` header is `403`: no browser client is supported.
+- The transport is plain HTTP. On a non-loopback address the token and all task text cross the
+  network unencrypted unless the operator places the listener behind TLS termination or on a
+  network they trust. Quorum does not terminate TLS.
+- The token grants task intake for the repository: its holder can make the daemon run agents on
+  text it chooses and can cancel work. Treat it like write access to the task queue.
+
+**Bounds.** The listener reuses the agent adapter's HTTP implementation and limits: 8
+connections, a 10 second request-head timeout, a 15 second request timeout, a 256 KiB body, a
+5 second shutdown drain, stateless requests, and a fresh MCP service per request. At most 8
+database operations run at once. Free text is valid UTF-8 by JSON decoding, is refused when it
+is empty, contains NUL, or exceeds its limit (identities 128 bytes, title 512, task body
+64 KiB, note and message 32 KiB, `refs` 4096 bytes of JSON, 16 labels, 64 dependencies), and is
+SQL-bound. Names and titles also refuse control characters. Results are JSON of at most
+128 KiB: listings return at most 200 rows and say when they were truncated, and `task_get`
+keeps the newest 50 notes and runs, then drops older notes, then shortens the body, naming each
+reduction. Results carry task data only; the token, run capabilities, and file paths are not
+returned.
+
+**Outcomes.** A refusal is a tool error whose text is `{"code","message"}`. `invalid_arguments`
+is the CLI's exit 2, `rejected` its exit 1 (for example cancelling an unknown, finished, or
+foreign task) and records nothing, `not_found` is a missing task, and `internal` is exit 3: its
+detail goes to the operator's `errors` log, not to the caller. `task_create` and `message_agent`
+are not idempotent; after a transport failure the outcome is unknown.
 
 ## Concurrency & atomicity (no daemon required)
 
