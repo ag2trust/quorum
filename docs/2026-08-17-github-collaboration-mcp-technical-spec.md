@@ -76,9 +76,10 @@ container does not need the repository database merely to signal its existing li
 credentialed Repository Service and Quorum database remain across a process/container boundary
 inaccessible to the managed runner. If the daemon and runner share an OS boundary from which the
 runner can read daemon environment, files, database, or credentialed sockets, the deployment MUST
-NOT claim physical GitHub credential isolation. In a managed deployment the operator supplies the
-credentialed adapter or broker without making Quorum aware of the operator's accounts, sessions,
-key management, GitHub App installation identity, or control-plane state.
+NOT claim physical GitHub credential isolation. In a managed deployment the deployment operator
+supplies the credentialed adapter or broker without making Quorum aware of the deployment's users
+and accounts, sessions, key management, GitHub App installation identity, or control-plane
+state.
 
 ## Authority model
 
@@ -625,10 +626,10 @@ pending result rather than blocking the agent or creating a second request.
 
 `publisher_scope` is an opaque, stable Repository Service namespace: credentials that GitHub
 treats as the same pending-review actor MUST resolve to the same scope. It is daemon-derived,
-never agent input, and contains no operator account, GitHub App installation, session, or
-key-management identity. This contract does not choose the eventual GitHub App actor; it only
-requires an adapter to preserve the namespace equivalence needed for safe serialization and
-cleanup.
+never agent input, and contains no deployment user or account, GitHub App installation,
+session, or key-management identity. This contract does not choose the eventual GitHub App
+actor; it only requires an adapter to preserve the namespace equivalence needed for safe
+serialization and cleanup.
 
 Every reviewer attempt gets an unguessable daemon-owned `review_owner_marker` with at least 128
 bits of randomness that is not returned to the agent. The `create` operation initializes the
@@ -778,11 +779,11 @@ adapter may use the installed `gh` binary and its existing daemon-side authentic
 must cross stdin/JSON rather than argv. Command execution reuses the existing 30-second timeout,
 kill/reap behavior, and 1 MiB stdout/stderr caps.
 
-The interface is provider-neutral at Quorum's boundary. An operator-supplied adapter in a managed
-deployment may send the same typed operation to a trusted credential broker that mints
-exact-repository, minimum-permission, short-lived GitHub App installation authority. The Quorum
-runtime never receives the operator's user, GitHub App installation, key-management, or session
-identity.
+The interface is provider-neutral at Quorum's boundary. In a managed deployment, an adapter
+supplied by the deployment operator may send the same typed operation to a trusted credential
+broker that mints exact-repository, minimum-permission, short-lived GitHub App installation
+authority. The Quorum runtime never receives the deployment's user or account, GitHub App
+installation, key-management, or session identity.
 
 Every mutation response uses a closed disposition: confirmed effect with exact remote evidence,
 definitely unsent with pre-handoff transport proof, or ambiguous. An adapter may additionally
@@ -995,15 +996,16 @@ Every implementation task is deliberately small or medium and independently revi
     runtime inputs contain no GitHub credential or database and remote writes require the
     daemon/broker. This slice adds no endpoint operation or per-command proxy behavior.
 
-Slices 1 and 2 are foundations. Slice 3 depends on both. Slice 4 depends on 3. Slice 5 depends on
-4. Slice 6 depends on 1 and 2; slice 7 depends on 1; and both can proceed independently after
-their prerequisites. Slice 8 depends on 1 and may finish before provider or prompt migration.
-Slice 9 depends on 1–3. Slice 10 depends on 3–9. The graph is acyclic: public-command parity is
-delivered by slice 8 before slice 10 consumes it. No task may broaden itself into the outside MCP
-or an operator's control-plane implementation. Parent terminalization remains in slice 1, generic
-retention/sweep mechanics and their race coverage remain in slice 2, and review-sequence retention
-coverage remains in slice 4; this ownership correction adds no slice or dependency edge, so all
-ten tasks remain independently reviewable and S/M-sized.
+Slices 1 and 2 are foundations. Slice 3 depends on both. Slice 4 depends on 3. Slice 5 depends
+on 4. Slice 6 depends on 1 and 2; slice 7 depends on 1; and both can proceed independently
+after their prerequisites. Slice 8 depends on 1 and may finish before provider or prompt
+migration. Slice 9 depends on 1–3. Slice 10 depends on 3–9. The graph is acyclic:
+public-command parity is delivered by slice 8 before slice 10 consumes it. No task may broaden
+itself into the outside MCP or a deployment operator's control-plane implementation. Parent
+terminalization remains in slice 1, generic retention/sweep mechanics and their race coverage
+remain in slice 2, and review-sequence retention coverage remains in slice 4; this ownership
+correction adds no slice or dependency edge, so all ten tasks remain independently reviewable
+and S/M-sized.
 
 ## Rollout
 
