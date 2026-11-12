@@ -1,12 +1,13 @@
 #!/bin/sh
-# Regression tests for preflight's pull-request branch-base mode (`--pr-base`),
-# which the CI `branch-base` job runs so the pre-push hook's branch-base gate
-# still applies to pushes that bypass hooks.
+# Regression tests for the CI `branch-base` check: scripts/ci-branch-base.sh
+# and preflight's pull-request mode (`--pr-base`) behind it, which keep the
+# pre-push hook's branch-base gate in force for pushes that bypass hooks.
 
 set -eu
 
 ROOT=$(git rev-parse --show-toplevel)
 PREFLIGHT="$ROOT/preflight.sh"
+CI_CHECK="$ROOT/scripts/ci-branch-base.sh"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -39,14 +40,28 @@ commit_as() {
   git commit -qm "work by $1" -m "Co-Authored-By: $1 <$1@example.invalid>"
 }
 
-# pr_check NAME BASE HEAD [extra preflight args...] — the CI job's invocation.
+# pr_check NAME BASE HEAD [BEFORE] — the workflow's invocation: the CI script
+# with the workflow's environment (BEFORE only for `synchronize`), run from a
+# detached checkout of a GitHub-style refs/pull/N/merge commit (parents: base
+# tip, PR head) in a linked worktree, so the fixture's own HEAD is untouched.
 pr_check() {
   name=$1
   base=$2
   head=$3
-  shift 3
-  PATH="$BIN:$PATH" "$PREFLIGHT" --quick --pr-base="$base" \
-    --proposed-sha="$head" "$@" >"$TMP/$name.out" 2>&1
+  before=${4:-}
+  if git rev-parse --verify -q "refs/remotes/origin/$base" >/dev/null; then
+    merge=$(git commit-tree "$head^{tree}" -p "refs/remotes/origin/$base" \
+      -p "$head" -m "Merge $head into $base")
+  else
+    merge=$head
+  fi
+  git update-ref refs/pull/1/merge "$merge"
+  git -C "$CI_CHECKOUT" checkout -q --detach refs/pull/1/merge
+  (
+    cd "$CI_CHECKOUT"
+    PR_BASE=$base PR_HEAD_SHA=$head PR_BEFORE_SHA=$before PATH="$BIN:$PATH" \
+      "$CI_CHECK"
+  ) >"$TMP/$name.out" 2>&1
 }
 
 expect_pass() {
@@ -59,7 +74,7 @@ expect_pass() {
   grep -q 'PREFLIGHT: PASS (branch base for a pull request into' "$TMP/$name.out"
 }
 
-# expect_fail NAME PATTERN BASE HEAD [extra preflight args...]
+# expect_fail NAME PATTERN BASE HEAD [BEFORE]
 expect_fail() {
   name=$1
   pattern=$2
@@ -80,6 +95,8 @@ printf 'base\n' > state
 git add state
 git commit -qm 'base'
 git push -q origin main
+CI_CHECKOUT="$TMP/ci-checkout"
+git worktree add -q --detach "$CI_CHECKOUT" HEAD
 
 # develop carries two sessions not yet synced to main.
 git switch -qc develop
@@ -134,7 +151,7 @@ git switch -q --detach "$HOTFIX"
 git merge -q --no-ff origin/main -m 'merge advanced main into hotfix'
 commit_as Hot-1 hotfix-1
 expect_pass hotfix-continuation main "$(git rev-parse HEAD)" \
-  --continuation-from="$HOTFIX"
+  "$HOTFIX"
 
 # Feature branches from develop must not target main, current or older.
 expect_fail feature-into-main 'PR into main carries 2 origin/develop commit(s)' \
@@ -174,7 +191,7 @@ git switch -q --detach "$FEATURE"
 git merge -q --no-ff origin/develop -m 'merge origin/develop into remediation'
 commit_as Remediate-B feature
 REMEDIATION=$(git rev-parse HEAD)
-expect_pass remediation-push develop "$REMEDIATION" --continuation-from="$FEATURE"
+expect_pass remediation-push develop "$REMEDIATION" "$FEATURE"
 grep -q 'continuation-owned commits excluding published head' \
   "$TMP/remediation-push.out"
 expect_fail remediation-whole-branch 'sessions in branch-owned commits' \
@@ -185,26 +202,34 @@ git switch -q --detach "$FEATURE"
 commit_as Push-X feature
 commit_as Push-Y feature
 expect_fail stacked-push 'sessions in branch-owned commits' \
-  develop "$(git rev-parse HEAD)" --continuation-from="$FEATURE"
+  develop "$(git rev-parse HEAD)" "$FEATURE"
+
+# Known gap (stateless, per push): once a stacked push has failed, a later
+# clean push is judged on its own commits only and passes while the stacked
+# commits stay in the PR. A sticky check (continue from the last head that
+# passed) must turn this into a failure; update this case when it lands.
+STACKED_PUSH=$(git rev-parse HEAD)
+commit_as Push-Y feature
+expect_pass known-gap-later-push develop "$(git rev-parse HEAD)" "$STACKED_PUSH"
 
 # A sync PR whose head is develop advances with every merge into develop.
 expect_pass sync-pr-advances main "$(git rev-parse origin/develop)" \
-  --continuation-from="$DEVELOP_SYNC_BEFORE"
+  "$DEVELOP_SYNC_BEFORE"
 
 # A rewritten PR head (force push / rebase update) is checked as a new branch.
 git switch -q --detach origin/develop
 commit_as Feat-A feature
 REWRITTEN=$(git rev-parse HEAD)
-expect_pass rewritten-head develop "$REWRITTEN" --continuation-from="$FEATURE"
+expect_pass rewritten-head develop "$REWRITTEN" "$FEATURE"
 grep -q 'is not an ancestor' "$TMP/rewritten-head.out"
 git switch -q --detach origin/develop
 commit_as Feat-A feature
 commit_as Stack-C feature
 expect_fail rewritten-stacked 'sessions in branch-owned commits' \
-  develop "$(git rev-parse HEAD)" --continuation-from="$FEATURE"
+  develop "$(git rev-parse HEAD)" "$FEATURE"
 expect_fail unknown-previous-head 'sessions in branch-owned commits' \
   develop "$(git rev-parse HEAD)" \
-  --continuation-from=0123456789abcdef0123456789abcdef01234567
+  0123456789abcdef0123456789abcdef01234567
 
 # A PR into any other branch continues from that branch, as the daemon does
 # for a task whose base branch is neither main nor develop.
@@ -224,7 +249,7 @@ git switch -q --detach "$RELEASE_PR"
 git merge -q --no-ff origin/release -m 'merge origin/release into PR'
 commit_as Release-PR release-pr
 expect_pass other-base-continuation release "$(git rev-parse HEAD)" \
-  --continuation-from="$RELEASE_PR"
+  "$RELEASE_PR"
 
 # --- Usage and environment errors --------------------------------------------
 
@@ -262,11 +287,40 @@ if [ -s "$CARGO_LOG" ]; then
   exit 1
 fi
 
-# CI wires the job ahead of the expensive test job.
-grep -Fqx '  branch-base:' "$ROOT/.github/workflows/ci.yml"
-grep -Fq -- '--pr-base="$PR_BASE" --proposed-sha="$PR_HEAD_SHA"' \
-  "$ROOT/.github/workflows/ci.yml"
-grep -Fq -- "github.event.action == 'synchronize' && github.event.before || ''" \
-  "$ROOT/.github/workflows/ci.yml"
+# The CI script requires the workflow's base and head.
+expect_ci_usage() {
+  name=$1
+  set +e
+  (
+    cd "$CI_CHECKOUT"
+    env PR_BASE="$2" PR_HEAD_SHA="$3" PR_BEFORE_SHA= PATH="$BIN:$PATH" "$CI_CHECK"
+  ) >"$TMP/$name.out" 2>&1
+  status=$?
+  set -e
+  [ "$status" -eq 2 ] || {
+    cat "$TMP/$name.out" >&2
+    echo "expected $name to exit 2, got $status" >&2
+    exit 1
+  }
+}
+expect_ci_usage ci-no-base '' "$FEATURE"
+expect_ci_usage ci-no-head develop ''
+
+# The workflow runs that script with that environment, in its own workflow
+# outside ci.yml's cancel-in-progress group, without persisted credentials.
+WORKFLOW="$ROOT/.github/workflows/branch-base.yml"
+grep -Fqx '    name: branch-base' "$WORKFLOW"
+grep -Fqx '        run: scripts/ci-branch-base.sh' "$WORKFLOW"
+grep -Fqx '          PR_BASE: ${{ github.base_ref }}' "$WORKFLOW"
+grep -Fqx '          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}' "$WORKFLOW"
+grep -Fqx "          PR_BEFORE_SHA: \${{ github.event.action == 'synchronize' && github.event.before || '' }}" \
+  "$WORKFLOW"
+grep -Fqx '          fetch-depth: 0' "$WORKFLOW"
+grep -Fqx '          persist-credentials: false' "$WORKFLOW"
+if grep -q '^concurrency:' "$WORKFLOW" \
+  || grep -q 'branch-base' "$ROOT/.github/workflows/ci.yml"; then
+  echo 'branch-base must stay outside any cancelling concurrency group' >&2
+  exit 1
+fi
 
 echo 'test-preflight-pr-base: PASS'
