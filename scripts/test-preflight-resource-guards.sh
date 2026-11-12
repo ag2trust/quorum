@@ -32,6 +32,7 @@ EOF
 cat >"$BIN/docker" <<'EOF'
 #!/bin/sh
 printf 'docker %s\n' "$*" >>"${PREFLIGHT_DOCKER_LOG:?}"
+[ "$1" != version ] || printf '%s\n' "${PREFLIGHT_DOCKER_ARCH-amd64}"
 exit 0
 EOF
 cat >"$BIN/sqlite3" <<'EOF'
@@ -92,6 +93,8 @@ EOF
 cat >"$REPO/docker/verify.sh" <<'EOF'
 #!/bin/sh
 printf 'verify %s\n' "$1" >>"${PREFLIGHT_DOCKER_LOG:?}"
+printf 'verify-skip [%s]\n' "${VERIFY_SKIP_REPLACE_SUITES:-}" \
+  >>"${PREFLIGHT_DOCKER_LOG:?}"
 EOF
 chmod +x "$REPO/docker/entrypoint_test.sh" "$REPO/docker/verify.sh"
 
@@ -123,7 +126,8 @@ printf '# packaging change\n' >>"$REPO/Dockerfile"
 : >"$TMP/docker.log"
 (
   cd "$REPO"
-  PREFLIGHT_DOCKER_LOG="$TMP/docker.log" PATH="$BIN:$PATH" ./preflight.sh
+  VERIFY_SKIP_REPLACE_SUITES=inherited PREFLIGHT_DOCKER_LOG="$TMP/docker.log" \
+    PATH="$BIN:$PATH" ./preflight.sh
 ) >"$TMP/container-change.out"
 grep -qx 'docker buildx version' "$TMP/docker.log"
 grep -qx 'docker info' "$TMP/docker.log"
@@ -132,6 +136,42 @@ grep -q '^docker buildx build --load --platform linux/amd64 --tag quorum-preflig
 grep -q '^verify quorum-preflight:' "$TMP/docker.log"
 grep -q '^docker image rm quorum-preflight:' "$TMP/docker.log"
 grep -q 'PREFLIGHT: PASS (all 6 gates green;' "$TMP/container-change.out"
+! grep -q 'PREFLIGHT: PASS (all 6 gates green; container-replacement suites deferred' \
+  "$TMP/container-change.out"
+# An amd64 Docker server runs every replacement suite, clearing an inherited
+# skip request from the caller's own environment, and never skips.
+grep -qxF 'docker version --format {{.Server.Arch}}' "$TMP/docker.log"
+grep -qxF 'verify-skip []' "$TMP/docker.log"
+! grep -q 'skipping container-replacement suites' "$TMP/container-change.out"
+
+# A non-amd64 Docker server skips only the replacement suites, loudly, and
+# docker/verify.sh still runs for the rest of the container gate.
+: >"$TMP/docker.log"
+(
+  cd "$REPO"
+  PREFLIGHT_DOCKER_ARCH=arm64 PREFLIGHT_DOCKER_LOG="$TMP/docker.log" \
+    PATH="$BIN:$PATH" ./preflight.sh --docker
+) >"$TMP/arm64-server.out"
+grep -qx 'PREFLIGHT: skipping container-replacement suites — Docker server is arm64, not amd64; required CI enforces them' \
+  "$TMP/arm64-server.out"
+grep -q '^verify quorum-preflight:' "$TMP/docker.log"
+grep -qxF 'verify-skip [Docker server is arm64, not amd64]' "$TMP/docker.log"
+grep -q 'PREFLIGHT: PASS (all 6 gates green; container-replacement suites deferred to required CI;' \
+  "$TMP/arm64-server.out"
+
+# An unreadable Docker server architecture fails the gate closed, without
+# running docker/verify.sh at all.
+: >"$TMP/docker.log"
+if (
+  cd "$REPO"
+  PREFLIGHT_DOCKER_ARCH= PREFLIGHT_DOCKER_LOG="$TMP/docker.log" \
+    PATH="$BIN:$PATH" ./preflight.sh --docker
+) >"$TMP/no-arch.out" 2>&1; then
+  printf 'expected an empty Docker server architecture to fail preflight\n' >&2
+  exit 1
+fi
+grep -q 'cannot read Docker server architecture' "$TMP/no-arch.out"
+! grep -q '^verify ' "$TMP/docker.log"
 
 # Both other documented container-specific surfaces make the same decision.
 git -C "$REPO" checkout -q -- Dockerfile
