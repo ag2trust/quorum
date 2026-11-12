@@ -1,8 +1,9 @@
 //! Read a one-line secret, such as an API key, from a file.
 //!
 //! A secret in a file stays out of the process environment, which child
-//! processes inherit and container tooling displays. The file is checked on
-//! the descriptor that is read, so the file checked is the file read.
+//! processes inherit and container tooling displays. Symbolic links are
+//! followed, as secret volumes use them; every check is made on the
+//! descriptor that is read, so the file checked is the file read.
 
 use std::path::Path;
 
@@ -11,13 +12,13 @@ pub(crate) const MAX_SECRET_FILE_BYTES: u64 = 4096;
 
 /// Read the secret held in `path`.
 ///
-/// The path's last component must not be a symbolic link, and it must name a
-/// regular file of at most [`MAX_SECRET_FILE_BYTES`] that neither its group
-/// nor others may write, so no other user can substitute the secret. Group
-/// and other read access are allowed: a secret mounted read-only into a
-/// container is often owned by another user and readable through its group
-/// or by everyone in the container. Who may read the file is the deployer's
-/// decision, made by the mount.
+/// The path, after any symbolic links, must name a regular file of at most
+/// [`MAX_SECRET_FILE_BYTES`] that neither its group nor others may write; its
+/// owner and the directory that holds it are trusted. Group and other read
+/// access are allowed: a secret mounted read-only into a container is often
+/// owned by another user and readable through its group or by everyone in the
+/// container. Who may read the file is the deployer's decision, made by the
+/// mount.
 ///
 /// One trailing newline (`\n` or `\r\n`) is removed. What remains must be one
 /// or more printable ASCII characters with no spaces. An error describes the
@@ -27,14 +28,11 @@ pub(crate) fn read(path: &Path) -> Result<String, String> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
     let file = std::fs::OpenOptions::new()
         .read(true)
-        // Refuse a symbolic link, never block on a FIFO with no writer, and
-        // never adopt a terminal: what was opened is checked next.
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        // Never block on a FIFO with no writer and never adopt a terminal:
+        // what was opened is checked next.
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(path)
-        .map_err(|error| match error.raw_os_error() {
-            Some(libc::ELOOP) => "must not be a symbolic link".to_string(),
-            _ => format!("cannot be opened: {error}"),
-        })?;
+        .map_err(|error| format!("cannot be opened: {error}"))?;
     let metadata = file
         .metadata()
         .map_err(|error| format!("cannot be read: {error}"))?;
@@ -136,11 +134,7 @@ mod tests {
 
     #[test]
     fn only_a_regular_file_is_read() {
-        let (dir, target) = file_with(SECRET.as_bytes(), 0o600);
-
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(refusal(&link).contains("symbolic link"));
+        let (dir, _target) = file_with(SECRET.as_bytes(), 0o600);
 
         assert!(refusal(dir.path()).contains("regular file"));
 
@@ -151,6 +145,44 @@ mod tests {
         assert!(refusal(&fifo).contains("regular file"));
 
         assert!(refusal(&dir.path().join("missing")).contains("cannot be opened"));
+    }
+
+    #[test]
+    fn a_symbolic_link_is_followed_and_its_target_checked() {
+        use std::os::unix::fs::symlink;
+        // A projected secret volume: `key -> ..data/key`, `..data -> ..<ts>/`.
+        let (dir, _target) = file_with(b"", 0o600);
+        let version = dir.path().join("..2026_11_12");
+        std::fs::create_dir(&version).unwrap();
+        std::fs::write(version.join("key"), SECRET).unwrap();
+        std::fs::set_permissions(version.join("key"), std::fs::Permissions::from_mode(0o444))
+            .unwrap();
+        symlink("..2026_11_12", dir.path().join("..data")).unwrap();
+        symlink("..data/key", dir.path().join("key")).unwrap();
+        assert_eq!(read(&dir.path().join("key")).unwrap(), SECRET);
+
+        // The target is held to every rule a file named directly is.
+        let to_dir = dir.path().join("to-dir");
+        symlink(&version, &to_dir).unwrap();
+        assert!(refusal(&to_dir).contains("regular file"));
+
+        let fifo = dir.path().join("fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let to_fifo = dir.path().join("to-fifo");
+        symlink(&fifo, &to_fifo).unwrap();
+        assert!(refusal(&to_fifo).contains("regular file"));
+
+        let writable = dir.path().join("writable");
+        std::fs::write(&writable, SECRET).unwrap();
+        std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o620)).unwrap();
+        let to_writable = dir.path().join("to-writable");
+        symlink(&writable, &to_writable).unwrap();
+        assert!(refusal(&to_writable).contains("writable"));
+
+        let dangling = dir.path().join("dangling");
+        symlink(dir.path().join("missing"), &dangling).unwrap();
+        assert!(refusal(&dangling).contains("cannot be opened"));
     }
 
     #[test]
@@ -170,6 +202,9 @@ mod tests {
             let (_dir, path) = file_with(contents, 0o600);
             assert!(refusal(&path).contains("empty"), "{contents:?}");
         }
+        // A carriage return alone is not a newline.
+        let (_dir, path) = file_with(b"\r", 0o600);
+        assert!(refusal(&path).contains("printable"));
 
         for contents in [
             format!("{SECRET} tail"),

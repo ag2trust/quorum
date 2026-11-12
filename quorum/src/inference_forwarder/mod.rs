@@ -1124,14 +1124,17 @@ const CREDENTIAL_FILE_ENV: &str = "QUORUM_INFERENCE_UPSTREAM_API_KEY_FILE";
 
 /// The upstream credential, from exactly one of a file named by
 /// `QUORUM_INFERENCE_UPSTREAM_API_KEY_FILE` or the value of
-/// `QUORUM_INFERENCE_UPSTREAM_API_KEY`.
+/// `QUORUM_INFERENCE_UPSTREAM_API_KEY`. An empty variable is not a source,
+/// as with every optional setting, though an empty file variable on its own
+/// is refused rather than reported as missing.
 ///
 /// A credential read from a file is never placed in this process's
 /// environment; the forwarder starts no child process in any case. The
 /// file's path is no secret, so its variable may stay set.
 fn upstream_credential() -> Result<HeaderValue> {
-    let from_file = std::env::var_os(CREDENTIAL_FILE_ENV).is_some();
-    let from_env = std::env::var_os(CREDENTIAL_ENV).is_some();
+    let file = std::env::var_os(CREDENTIAL_FILE_ENV);
+    let from_file = file.as_ref().is_some_and(|path| !path.is_empty());
+    let from_env = std::env::var_os(CREDENTIAL_ENV).is_some_and(|value| !value.is_empty());
     let (name, value) = match (from_file, from_env) {
         (true, true) => {
             return Err(QuorumError::Usage(format!(
@@ -1139,13 +1142,18 @@ fn upstream_credential() -> Result<HeaderValue> {
                  set only one"
             )))
         }
+        (false, false) if file.is_some() => return Err(invalid_env(CREDENTIAL_FILE_ENV)),
         (false, false) => {
             return Err(QuorumError::Usage(format!(
                 "inference-forwarder requires {CREDENTIAL_FILE_ENV} or {CREDENTIAL_ENV}"
             )))
         }
         (true, false) => {
-            let path = required_env(CREDENTIAL_FILE_ENV, MAX_ENV_BYTES)?;
+            // Any path the platform accepts, UTF-8 or not.
+            let path = file.unwrap_or_default();
+            if path.len() > MAX_ENV_BYTES {
+                return Err(invalid_env(CREDENTIAL_FILE_ENV));
+            }
             let value = crate::secret_file::read(std::path::Path::new(&path))
                 .map_err(|reason| QuorumError::Usage(format!("{CREDENTIAL_FILE_ENV} {reason}")))?;
             (CREDENTIAL_FILE_ENV, value)

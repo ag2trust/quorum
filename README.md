@@ -435,15 +435,16 @@ This is a non-binding view of ongoing directions, not a release schedule:
     bounded by their size, so it could not be held against a cap.
   - **Upstream credential.** Set exactly one of `QUORUM_INFERENCE_UPSTREAM_API_KEY_FILE`
     (recommended) or `QUORUM_INFERENCE_UPSTREAM_API_KEY`; both or neither is a startup
-    error. The file form names a file read once at startup, so the credential never
-    appears in the forwarder's environment, in container configuration, or in
-    `docker inspect`; the path itself is not secret. The file's last path component must
-    not be a symbolic link (name the resolved file), and it must be a regular file of at
-    most 4 KiB that its group and others cannot write. Group and other read access is
-    allowed, so a read-only mounted secret owned by another user (for example `0440` or
-    `0444`) works; restrict who can read it through the mount. The file holds the
-    credential on one line of printable ASCII with no spaces; one trailing newline is
-    ignored. Errors name the variable and the reason, never the credential.
+    error, and an empty variable does not count as set. The file form names a file read
+    once at startup, so the credential never appears in the forwarder's environment, in
+    container configuration, or in `docker inspect`; the path itself is not secret.
+    Symbolic links are followed. The file must be a regular file of at most 4 KiB that
+    its group and others cannot write; its owner and directory are trusted. Group and
+    other read access is allowed, so a read-only mounted secret owned by another user
+    (for example `0440` or `0444`) works; restrict who can read it through the mount.
+    The file holds the credential on one line of printable ASCII with no spaces; one
+    trailing newline is ignored. Errors name the variable and the reason, never the
+    credential.
   - **Configuration** lives in the forwarder's own environment, which a run must not
     inherit: the upstream credential (above), `QUORUM_INFERENCE_UPSTREAM_URL`
     (default `https://api.anthropic.com`; `http://` only for a loopback host; TLS is

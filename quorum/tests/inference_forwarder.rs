@@ -1935,15 +1935,20 @@ fn an_unsafe_or_malformed_credential_file_is_refused_without_echo() {
         "{stderr}"
     );
 
+    // A symbolic link is followed, and its target is checked.
     let symlink = dir.path().join("symlink");
-    std::os::unix::fs::symlink(&good, &symlink).unwrap();
+    std::os::unix::fs::symlink(
+        key_file(dir.path(), "linked", FILE_KEY.as_bytes(), 0o620),
+        &symlink,
+    )
+    .unwrap();
     let fifo = dir.path().join("fifo");
     let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
     let oversized = FILE_KEY.repeat(4096 / FILE_KEY.len() + 1);
     let cases = [
         ("missing", dir.path().join("missing"), "cannot be opened"),
-        ("symlink", symlink, "symbolic link"),
+        ("symlink to a group-writable file", symlink, "writable"),
         ("directory", dir.path().to_path_buf(), "regular file"),
         ("fifo", fifo, "regular file"),
         (
@@ -1956,6 +1961,11 @@ fn an_unsafe_or_malformed_credential_file_is_refused_without_echo() {
             "only a newline",
             key_file(dir.path(), "newline", b"\n", 0o600),
             "empty",
+        ),
+        (
+            "only a carriage return",
+            key_file(dir.path(), "return", b"\r", 0o600),
+            "printable",
         ),
         (
             "space",
@@ -2010,6 +2020,57 @@ fn an_unsafe_or_malformed_credential_file_is_refused_without_echo() {
         "empty path",
     );
     assert!(stderr.contains(KEY_FILE_ENV), "{stderr}");
+
+    // A path need not be UTF-8: it is opened, not reported as missing.
+    let path = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"/nonexistent/\xff");
+    let stderr = refused(
+        file_forwarder_command(&endpoint, upstream, Path::new(path)),
+        "non-UTF-8 path",
+    );
+    assert!(stderr.contains("cannot be opened"), "{stderr}");
+
+    // An empty credential is no source at all.
+    let mut command = forwarder_command(&endpoint, upstream, &[]);
+    command.env("QUORUM_INFERENCE_UPSTREAM_API_KEY", "");
+    let stderr = refused(command, "empty credential alone");
+    assert!(stderr.contains("requires"), "{stderr}");
+}
+
+#[test]
+fn an_empty_credential_variable_counts_as_unset() {
+    let endpoint = FakeEndpoint::start(&["run-a"]);
+    let dir = tempfile::tempdir().unwrap();
+    // A secret volume names its file through a symbolic link.
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(
+        key_file(dir.path(), "key", FILE_KEY.as_bytes(), 0o444),
+        &link,
+    )
+    .unwrap();
+
+    // An empty variable, as interpolating an unset one leaves, is not a
+    // second source: the file is used.
+    let upstream = FakeUpstream::start();
+    let mut command = file_forwarder_command(&endpoint.path, &upstream.url(), &link);
+    command.env("QUORUM_INFERENCE_UPSTREAM_API_KEY", "");
+    let forwarder = Forwarder::spawn(command);
+    let reply = post(forwarder.addr, "run-a", &message("model-json"));
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(upstream.seen()[0].header("x-api-key"), [FILE_KEY]);
+    for line in forwarder.stop() {
+        assert!(
+            !line.contains(FILE_KEY),
+            "log line leaks the credential: {line}"
+        );
+    }
+
+    // Likewise an empty file variable beside the credential itself.
+    let upstream = FakeUpstream::start();
+    let forwarder = Forwarder::start(&endpoint.path, &upstream.url(), &[(KEY_FILE_ENV, "")]);
+    let reply = post(forwarder.addr, "run-a", &message("model-json"));
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(upstream.seen()[0].header("x-api-key"), [UPSTREAM_KEY]);
+    forwarder.stop();
 }
 
 // ------------------------------------------------------------- real daemon
