@@ -145,11 +145,13 @@ MCP below has its own listener and authentication and is not implied by this age
 
 ## Orchestrator MCP
 
-`quorum orchestrator-mcp --listen <SOCKETADDR>` serves a tools-only Streamable HTTP MCP at `/mcp`
-for an outside coordinating agent that cannot run `quorum` commands beside the database. It is a
-separate process and listener from `quorum agent-mcp`; nothing starts it automatically and the
-daemon does not depend on it. It serves one repository, resolved at startup like any CLI command
-(`--repo`, then `QUORUM_REPO`, then the current checkout).
+`quorum orchestrator-mcp --listen <SOCKETADDR> --token-file <PATH> --identity <NAME>` serves a
+tools-only Streamable HTTP MCP at `/mcp` for an outside coordinating agent that cannot run
+`quorum` commands beside the database. It is a separate process and listener from
+`quorum agent-mcp`; nothing starts it automatically and the daemon does not depend on it. It
+serves one repository, resolved at startup like any CLI command (`--repo`, then `QUORUM_REPO`,
+then the current checkout). That repository must already have a database: a name without one is
+a usage error, and no database is created for it.
 
 **Tools.** The set is the coordinator subset of the CLI and nothing else. Each tool runs the
 operation its command runs, on one short-lived SQLite connection per call:
@@ -157,7 +159,7 @@ operation its command runs, on one short-lived SQLite connection per call:
 | Tool | CLI operation |
 |---|---|
 | `task_create` | `task-create`, including `continue_pr`, `review_pr`, `review_only` |
-| `task_list` | `task-list --brief` |
+| `task_list` | `task-list --brief`, one page per call |
 | `task_get` | `task-get` |
 | `task_log` | `log --refs task#N` |
 | `task_cancel` | `task-update --status cancelled` with an optional note |
@@ -170,52 +172,86 @@ decomposition adoption, branch sync, the feed, stops, or anything that starts, s
 ordinary row the daemon picks up, a cancellation is the same guarded `UPDATE` the CLI issues, and
 a message is one mailbox row. Concurrency safety is storage's: the server holds no task state,
 takes no lock of its own, and a lost race is zero guarded rows reported as a refusal.
+`task_cancel` with a note is two transactions, the cancellation and then the note, exactly as
+`task-update --status cancelled --note-file` is.
 
-Caller identities (`created_by`, `agent`, `by`, `from`) are arguments, as they are flags on the
-CLI. The server does not add an identity model: whoever holds the token has exactly the
-coordinator authority a local shell with database access has, including cancelling as a task's
-creator or assignee by naming it.
+**Identity.** The operator binds one coordinator identity at startup with the required
+`--identity <NAME>` (1 to 128 bytes, no control characters). No tool takes an identity argument.
+Every tool acts as that identity: it is the `created_by` of tasks it creates, the sender of its
+messages, the `--by` of its retries, and the `--agent` of its cancellations. `task_cancel`
+therefore applies the CLI's own rule for that identity: it cancels only a task that identity
+created or is assigned, through the same guarded update, and a decomposed source also needs
+`expected_revision`. The token grants exactly this one identity's coordinator authority over the
+repository. It cannot act as another creator, as a managed agent, or as the daemon. Two
+coordinators that must not cancel each other's work run two listeners with two identities and
+two tokens.
 
 **Trust model.**
 
-- The operator's bearer token is the only credential. It is read from `--token-file` or
-  `QUORUM_ORCHESTRATOR_TOKEN` (not both), never from an argument value, must be 32 to 512
-  printable ASCII characters, and is required on every address: there is no unauthenticated
-  mode, loopback included. The variable is removed from the process environment once read.
-  Each request must carry exactly one `Authorization: Bearer <token>` header; it is compared
-  in constant time, and anything else is `401` before MCP runs.
+- The operator's bearer token is the only credential, and `--token-file` is its only source. It
+  is never an argument value. The environment is not a source: an environment is inherited by
+  child processes and is not scoped to one command, so a set `QUORUM_ORCHESTRATOR_TOKEN` is a
+  usage error rather than a silently ignored or silently honored secret. As a second guard for
+  an operator who exports it anyway, `quorum serve` removes that name from its own environment
+  at startup and from every managed process it starts.
+- The token file must be a regular file owned by the user running the command with no group or
+  other permission bits; anything else is a usage error. The token is 32 to 512 printable ASCII
+  characters. A token is required on every address: there is no unauthenticated mode, loopback
+  included. Each request must carry exactly one `Authorization: Bearer <token>` header; it is
+  compared in constant time, and anything else is `401` before MCP runs and before the body is
+  read, whatever `Host` or `Origin` the request carries.
+- File permissions separate users, not processes of one user. A managed agent that runs as the
+  same user as this listener, without a sandbox that hides the file, can read the token. Keep
+  the token file where managed agents cannot read it: run the listener as a different user
+  from the agents, or keep the file outside what the agents' containment exposes.
 - A run capability never authenticates here. The server does not consult run capabilities at
-  all, shares no tool with the agent adapter, and refuses to start when `QUORUM_RUN_ID` is set.
-  A managed run that can reach the agent adapter therefore gains nothing at this listener
-  without the operator token, and the operator token is not a run at the agent adapter. The
-  token must be kept where managed agents cannot read it.
+  all and shares no tool with the agent adapter. A managed run that can reach the agent adapter
+  therefore gains nothing at this listener without the operator token, and the operator token
+  is not a run at the agent adapter. The server also refuses to start when `QUORUM_RUN_ID` is
+  set; that check is advisory, since a process controls its own environment, and the token file
+  and database permissions are the actual boundary.
 - Bind policy: any address is accepted because a token is always required. A loopback bind
   answers to the loopback host names. A non-loopback bind has no default host and requires at
-  least one `--allowed-host <host[:port]>`; a request whose `Host` is not listed is `403`. An
-  authenticated request carrying an `Origin` header is `403`: no browser client is supported.
+  least one `--allowed-host <host[:port]>`; an authenticated request whose `Host` is not listed
+  is `403`. An authenticated request carrying an `Origin` header is `403`: no browser client is
+  supported.
 - The transport is plain HTTP. On a non-loopback address the token and all task text cross the
   network unencrypted unless the operator places the listener behind TLS termination or on a
   network they trust. Quorum does not terminate TLS.
 - The token grants task intake for the repository: its holder can make the daemon run agents on
-  text it chooses and can cancel work. Treat it like write access to the task queue.
+  text it chooses, can cancel what its identity created, and can message any managed agent.
+  Treat it like write access to the task queue.
 
-**Bounds.** The listener reuses the agent adapter's HTTP implementation and limits: 8
-connections, a 10 second request-head timeout, a 15 second request timeout, a 256 KiB body, a
-5 second shutdown drain, stateless requests, and a fresh MCP service per request. At most 8
-database operations run at once. Free text is valid UTF-8 by JSON decoding, is refused when it
-is empty, contains NUL, or exceeds its limit (identities 128 bytes, title 512, task body
-64 KiB, note and message 32 KiB, `refs` 4096 bytes of JSON, 16 labels, 64 dependencies), and is
-SQL-bound. Names and titles also refuse control characters. Results are JSON of at most
-128 KiB: listings return at most 200 rows and say when they were truncated, and `task_get`
-keeps the newest 50 notes and runs, then drops older notes, then shortens the body, naming each
-reduction. Results carry task data only; the token, run capabilities, and file paths are not
-returned.
+**Bounds.** The listener reuses the agent adapter's HTTP implementation: a 15 second request
+timeout, a 256 KiB body, a 5 second shutdown drain, stateless requests, and a fresh MCP service
+per request. Its admission differs so that a peer without the token cannot occupy the working
+capacity. Up to 32 connections are open at once, and a request head must arrive within
+2 seconds on a new or idle connection. A request the gate refuses is answered without reading
+its body and its connection is closed. Only requests that passed the gate take one of 8 request
+slots, which is also the bound on concurrent database operations. An unauthenticated peer can
+therefore hold connection slots only, each for at most 2 seconds, and never a request slot. A
+peer that can reach the port can still slow new connections by reconnecting continuously; that
+is left to the network in front of the listener. The agent adapter's own bounds are unchanged.
 
-**Outcomes.** A refusal is a tool error whose text is `{"code","message"}`. `invalid_arguments`
-is the CLI's exit 2, `rejected` its exit 1 (for example cancelling an unknown, finished, or
-foreign task) and records nothing, `not_found` is a missing task, and `internal` is exit 3: its
-detail goes to the operator's `errors` log, not to the caller. `task_create` and `message_agent`
-are not idempotent; after a transport failure the outcome is unknown.
+Free text is valid UTF-8 by JSON decoding (a body that is not is `415`), is refused when it is
+empty, contains NUL, or exceeds its limit (title 512 bytes, task body 64 KiB, note and message
+32 KiB, `refs` 4096 bytes of JSON, 16 labels, 64 dependencies), and is SQL-bound. Names and
+titles also refuse control characters. Results are JSON of at most 128 KiB. `task_list` reads
+summary columns only, never task bodies, returns at most 200 rows from `offset`, and gives
+`next_offset` while rows remain; pages are separate short reads, so a queue that changes
+between them can repeat or skip a row. `task_log` returns at most 200 events and `next_since`
+while more remain. `task_get` keeps the newest 50 notes and runs, then drops older notes, then
+shortens the body, naming each reduction. Results carry task data only; the token, run
+capabilities, and file paths are not returned.
+
+**Outcomes.** A refusal is a tool error whose text is JSON with `code` and `message`.
+`invalid_arguments` is the CLI's exit 2. `rejected` is its exit 1 (for example cancelling an
+unknown, finished, or foreign task) and records nothing; a `task_retry` refusal also carries
+the command's own `outcome`, `reason`, `cancelled_deps`, `retry_count`, and `retry_cap`.
+`not_found` is a missing task. `internal` is exit 3, plus any failure to read the operator's
+serve configuration during task intake: its detail goes to the `errors` log with source
+`orchestrator-mcp`, not to the caller. `task_create` and `message_agent` are not idempotent;
+after a transport failure the outcome is unknown.
 
 ## Concurrency & atomicity (no daemon required)
 

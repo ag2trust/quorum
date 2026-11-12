@@ -403,12 +403,13 @@ This is a non-binding view of ongoing directions, not a release schedule:
   hosted Quorum service.
 - The existing loopback-only, read-only web dashboard may expand as local
   inspection needs are proven, while retaining its local, read-only posture.
-- `quorum orchestrator-mcp --listen <SOCKETADDR>` serves an HTTP MCP server at `/mcp` for an
-  outside orchestrating agent: create, list, inspect, cancel, and retry tasks, and message a
-  managed agent, each through the same operation as its CLI command. It requires an operator
-  bearer token (`--token-file` or `QUORUM_ORCHESTRATOR_TOKEN`), speaks plain HTTP, needs
-  `--allowed-host` for a non-loopback bind, and is started by the operator, not automatically.
-  The design record's "Orchestrator MCP" section states its trust model and limits.
+- `quorum orchestrator-mcp --listen <SOCKETADDR> --token-file <PATH> --identity <NAME>` serves
+  an HTTP MCP server at `/mcp` for an outside orchestrating agent: create, list, inspect,
+  cancel, and retry tasks, and message a managed agent, each through the same operation as its
+  CLI command and all as the one bound identity. It requires an operator bearer token in an
+  owner-only file, speaks plain HTTP, needs `--allowed-host` for a non-loopback bind, and is
+  started by the operator, not automatically. The design record's "Orchestrator MCP" section
+  states its trust model and limits.
 - `quorum agent-mcp --listen <SOCKETADDR>` serves the managed-run MCP adapter over
   Streamable HTTP at `/mcp`, so a managed worker or reviewer can signal the daemon without
   the `quorum` binary or its socket. It is separate from the server above: it binds
