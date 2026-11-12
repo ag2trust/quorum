@@ -413,6 +413,24 @@ This is a non-binding view of ongoing directions, not a release schedule:
   a bearer token, and sends no tool-list-changed notification. Nothing starts it
   automatically, agent prompts still instruct the shell commands, and its GitHub tools
   remain unimplemented.
+- `quorum inference-forwarder --listen <SOCKETADDR>` gives a sandboxed managed run model
+  access without the upstream credential. It mirrors `POST /v1/messages` (streaming or
+  not) and `POST /v1/messages/count_tokens` on loopback plain HTTP; a run points
+  `ANTHROPIC_BASE_URL` at it and presents its run capability as the API key. Each request
+  is authorized by the daemon endpoint while the run is live, then re-sent with the
+  operator's credential. Requests that would make the upstream act for the run are refused
+  with 400: any tool that is not a custom tool, `mcp_servers`, `container`, and content
+  sourced by URL or stored file. Configure it in the forwarder's own environment, which a
+  run must not inherit: `QUORUM_INFERENCE_UPSTREAM_API_KEY` (required),
+  `QUORUM_INFERENCE_UPSTREAM_URL` (default `https://api.anthropic.com`; `http://` only for
+  a loopback host), `QUORUM_INFERENCE_ALLOWED_MODELS` and `QUORUM_INFERENCE_ALLOWED_BETAS`
+  (comma-separated; unset allows any model and no `anthropic-beta` value),
+  `QUORUM_INFERENCE_RUN_TOKEN_CAP` (input plus output tokens per run, then 429), and
+  `QUORUM_INFERENCE_UPSTREAM_TIMEOUT_SECS` (default 300). Token counts are kept in the
+  forwarder's memory, so they outlive a daemon restart and reset when the forwarder
+  restarts; the cap is checked when a request arrives, so a request already in flight can
+  overshoot it. Nothing starts the forwarder automatically, and its logs carry metadata
+  only.
 
 ## Working on Quorum
 
