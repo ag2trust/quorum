@@ -1192,16 +1192,23 @@ fn sanitize_gitattributes(input: &[u8]) -> Vec<u8> {
         if line.is_empty() || line[0] == b'#' || line.starts_with(b"[attr]") {
             continue;
         }
-        let pattern_end = quoted_pattern_end(line).unwrap_or_else(|| {
-            line.iter()
-                .position(|b| ATTR_BLANK.contains(b))
-                .unwrap_or(line.len())
-        });
-        let (pattern, states) = line.split_at(pattern_end);
-        let negative = pattern.starts_with(b"!") || pattern.starts_with(b"\"!");
-        if negative {
+        // Mirror attr.c: a pattern that unquotes cleanly is the quoted span;
+        // otherwise (including invalid escapes) git reads the raw bytes up to
+        // the first blank, quote characters and all.
+        let (pattern_end, name) = match unquote_c_style(line) {
+            Some((end, unquoted)) => (end, unquoted),
+            None => {
+                let end = line
+                    .iter()
+                    .position(|b| ATTR_BLANK.contains(b))
+                    .unwrap_or(line.len());
+                (end, line[..end].to_vec())
+            }
+        };
+        if name.starts_with(b"!") || name.starts_with(b"[attr]") {
             continue;
         }
+        let (pattern, states) = line.split_at(pattern_end);
         let kept: Vec<&[u8]> = states
             .split(|b| ATTR_BLANK.contains(b))
             .filter_map(|state| match state {
@@ -1224,21 +1231,52 @@ fn sanitize_gitattributes(input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// End (exclusive) of a C-quoted pattern, or `None` if the line does not start
-/// with a closed quote (git then reads the pattern up to the first blank).
-fn quoted_pattern_end(line: &[u8]) -> Option<usize> {
+/// Git's `unquote_c_style` applied to the start of `line`: the end (exclusive)
+/// of the closing quote and the unquoted bytes, or `None` when the line does
+/// not start with a quote or the quoted span is unterminated or contains an
+/// escape git rejects (anything but `\a\b\f\n\r\t\v\\\"` and `\[0-3][0-7][0-7]`).
+fn unquote_c_style(line: &[u8]) -> Option<(usize, Vec<u8>)> {
     if line.first() != Some(&b'"') {
         return None;
     }
+    let mut out = Vec::new();
     let mut index = 1;
-    while index < line.len() {
-        match line[index] {
-            b'\\' => index += 2,
-            b'"' => return Some(index + 1),
-            _ => index += 1,
+    loop {
+        match *line.get(index)? {
+            b'"' => return Some((index + 1, out)),
+            b'\\' => {
+                let escaped = *line.get(index + 1)?;
+                index += 2;
+                let byte = match escaped {
+                    b'a' => 0x07,
+                    b'b' => 0x08,
+                    b'f' => 0x0c,
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'v' => 0x0b,
+                    b'\\' | b'"' => escaped,
+                    b'0'..=b'3' => {
+                        let octal = |offset: usize| {
+                            line.get(index + offset)
+                                .copied()
+                                .filter(|digit| (b'0'..=b'7').contains(digit))
+                                .map(|digit| digit - b'0')
+                        };
+                        let (middle, low) = (octal(0)?, octal(1)?);
+                        index += 2;
+                        ((escaped - b'0') << 6) | (middle << 3) | low
+                    }
+                    _ => return None,
+                };
+                out.push(byte);
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
         }
     }
-    None
 }
 
 #[cfg(test)]
@@ -1689,6 +1727,56 @@ mod tests {
         );
         let long = format!("*.l {} merge=union\n", "x".repeat(ATTR_MAX_LINE_LENGTH));
         assert!(sanitize_gitattributes(long.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn sanitizer_splits_invalid_quoted_patterns_at_the_first_blank_like_git() {
+        // git's unquote_c_style rejects these escapes, so git reads the raw
+        // pattern up to the first blank and the rest as attribute states.
+        let input = br#""u\q conflict-marker-size=50000000" merge
+"u\08 conflict-marker-size=7" merge
+"u\4007 conflict-marker-size=7" merge
+"u\0 conflict-marker-size=7" merge
+"open conflict-marker-size=7 merge
+"esc\" merge=union
+"ok\101\t\"\\" merge=union conflict-marker-size=7
+"\041neg" merge=union
+"[attr]merge conflict-marker-size=7" merge
+"#
+        .as_slice();
+        assert_eq!(
+            String::from_utf8(sanitize_gitattributes(input)).unwrap(),
+            r#""u\q merge
+"u\08 merge
+"u\4007 merge
+"u\0 merge
+"open merge
+"esc\" merge=union
+"ok\101\t\"\\" merge=union
+"#
+        );
+    }
+
+    #[test]
+    fn unquote_c_style_matches_git() {
+        assert_eq!(
+            unquote_c_style(br#""a\a\b\f\n\r\t\v\\\"\000\377z" rest"#),
+            Some((
+                br#""a\a\b\f\n\r\t\v\\\"\000\377z""#.len(),
+                b"a\x07\x08\x0c\n\r\t\x0b\\\"\x00\xffz".to_vec()
+            ))
+        );
+        for rejected in [
+            br#""\q""#.as_slice(),
+            br#""\08""#,
+            br#""\400""#,
+            br#""\0""#,
+            br#""\"#,
+            br#""open"#,
+            b"plain",
+        ] {
+            assert_eq!(unquote_c_style(rejected), None, "{rejected:?}");
+        }
     }
 
     #[test]

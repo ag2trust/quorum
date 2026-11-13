@@ -329,6 +329,61 @@ fn sanitized_attribute_tree_keeps_only_builtin_merge_attributes() {
     fixture.tripwire.assert_empty();
 }
 
+/// git rejects `\q` and a bad octal escape in a quoted pattern and splits the
+/// line at the first blank, so attributes inside the "quotes" are live. The
+/// sanitized tree must not carry them; git itself is the oracle.
+#[test]
+fn sanitized_attribute_tree_drops_states_hidden_by_invalid_quoting() {
+    let fixture = Fixture::new();
+    let work = fixture.path().join("quoted");
+    std::fs::create_dir_all(&work).unwrap();
+    git(&work, &["init", "-q", "-b", "main"]);
+    std::fs::write(
+        work.join(".gitattributes"),
+        "\"u\\q conflict-marker-size=50000000\" merge\n\
+         \"u\\08 conflict-marker-size=7\" merge=union\n\
+         \"[attr]merge conflict-marker-size=9\" merge\n",
+    )
+    .unwrap();
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-q", "-m", "quoted"]);
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    let local = fixture
+        .startup(None)
+        .local(work.join(".git"), ObjectFormat::Sha1);
+    let attrs = AttrTree::sanitized(&local, &head).unwrap();
+    assert!(attrs.bound_exceeded().is_none());
+
+    let check = |source: &str| {
+        git_cmd_lines(
+            &work,
+            &[
+                "check-attr",
+                "--source",
+                source,
+                "-a",
+                "--",
+                "\"uq",
+                "\"u08",
+            ],
+        )
+    };
+    // Control: the raw tree really does set conflict-marker-size.
+    let raw = check(&head);
+    assert!(
+        raw.iter().any(|line| line.contains("conflict-marker-size")),
+        "{raw:?}"
+    );
+    assert_eq!(
+        check(attrs.sha()),
+        [
+            "\"\\\"uq\": merge: set",
+            "\"\\\"u08\": merge: union",
+        ]
+    );
+    fixture.tripwire.assert_empty();
+}
+
 fn git_cmd_lines(dir: &Path, args: &[&str]) -> Vec<String> {
     crate::git(dir, args).lines().map(String::from).collect()
 }
