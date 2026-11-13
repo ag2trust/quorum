@@ -25,6 +25,10 @@
 #   ./preflight.sh          # local gates; container build only for container changes
 #   ./preflight.sh --docker # force all six gates, including the container build
 #   ./preflight.sh --quick  # gates 1+2 only (what the pre-push hook runs)
+#   ./preflight.sh --quick --pr-base=<branch> --proposed-sha=<head> \
+#     [--continuation-from=<previous-head>]
+#                           # gate 1 only, for one pull-request push (the CI
+#                           # `branch-base` job; no Cargo)
 
 set -u
 
@@ -37,6 +41,8 @@ PROPOSED_SHA=
 PROPOSED_SET=0
 HOOK_FORMAT_ONLY=0
 FORCE_DOCKER=0
+PR_BASE=
+PR_BASE_SET=0
 for arg in "$@"; do
   case "$arg" in
     --quick) QUICK=1 ;;
@@ -60,6 +66,12 @@ for arg in "$@"; do
       PROPOSED_SET=1
       ;;
     --hook-format-only) HOOK_FORMAT_ONLY=1 ;;
+    --pr-base=*)
+      [ "$PR_BASE_SET" -eq 0 ] \
+        || { printf 'preflight.sh: duplicate --pr-base\n' >&2; exit 2; }
+      PR_BASE=${arg#*=}
+      PR_BASE_SET=1
+      ;;
     -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
     *) printf 'preflight.sh: unknown arg: %s\n' "$arg" >&2; exit 2 ;;
   esac
@@ -78,7 +90,7 @@ if [ "$PROPOSED_SET" -eq 1 ] && [ -z "$PROPOSED_SHA" ]; then
   exit 2
 fi
 if { [ "$CONTINUATION_SET" -eq 1 ] || [ "$CONTINUATION_BASE_SET" -eq 1 ] \
-  || [ "$PROPOSED_SET" -eq 1 ] \
+  || [ "$PROPOSED_SET" -eq 1 ] || [ "$PR_BASE_SET" -eq 1 ] \
   || [ "$HOOK_FORMAT_ONLY" -eq 1 ]; } && [ "$QUICK" -ne 1 ]; then
   printf 'preflight.sh: hook-only options require --quick\n' >&2
   exit 2
@@ -87,7 +99,26 @@ if [ "$CONTINUATION_SET" -eq 1 ] && [ "$PROPOSED_SET" -ne 1 ]; then
   printf 'preflight.sh: --continuation-from requires --proposed-sha\n' >&2
   exit 2
 fi
-if [ "$CONTINUATION_SET" -eq 1 ] && [ "$CONTINUATION_BASE_SET" -ne 1 ]; then
+# Pull-request mode derives the continuation base from the PR's own base
+# branch, exactly as the daemon derives QUORUM_CONTINUATION_BASE_BRANCH from
+# the task's base branch when it publishes a continuation.
+if [ "$PR_BASE_SET" -eq 1 ]; then
+  if [ -z "$PR_BASE" ] \
+    || ! git check-ref-format "refs/heads/$PR_BASE" >/dev/null 2>&1; then
+    printf 'preflight.sh: --pr-base requires a branch name\n' >&2
+    exit 2
+  fi
+  if [ "$PROPOSED_SET" -ne 1 ]; then
+    printf 'preflight.sh: --pr-base requires --proposed-sha\n' >&2
+    exit 2
+  fi
+  if [ "$CONTINUATION_BASE_SET" -eq 1 ] || [ "$HOOK_FORMAT_ONLY" -eq 1 ]; then
+    printf 'preflight.sh: --pr-base conflicts with --continuation-base and --hook-format-only\n' >&2
+    exit 2
+  fi
+fi
+if [ "$CONTINUATION_SET" -eq 1 ] && [ "$CONTINUATION_BASE_SET" -ne 1 ] \
+  && [ "$PR_BASE_SET" -ne 1 ]; then
   printf 'preflight.sh: --continuation-from requires --continuation-base\n' >&2
   exit 2
 fi
@@ -507,6 +538,34 @@ if [ "$PROPOSED_SET" -eq 1 ]; then
     || fail "proposed SHA is not a local commit"
   TIP=$PROPOSED_SHA
 fi
+# Pull-request mode (CI) reproduces the pre-push tuple the publishing push
+# would have supplied: an `opened` PR is a new branch (whole branch-owned
+# range); a `synchronize` PR is a continuation from the previous PR head. The
+# hook refuses non-fast-forward updates before this gate, but GitHub can
+# rewrite a PR head (force push, rebase-update), so a previous head that is not
+# an ancestor is evaluated as a newly published branch instead.
+PR_MAINLINES=
+if [ "$PR_BASE_SET" -eq 1 ]; then
+  git rev-parse --verify --quiet "refs/remotes/origin/$PR_BASE^{commit}" >/dev/null \
+    || fail "PR base origin/$PR_BASE not found — gate cannot run"
+  if [ "$CONTINUATION_SET" -eq 1 ]; then
+    if git cat-file -e "$CONTINUATION_FROM^{commit}" 2>/dev/null \
+      && git merge-base --is-ancestor "$CONTINUATION_FROM" "$TIP"; then
+      CONTINUATION_BASE=refs/remotes/origin/$PR_BASE
+    else
+      printf 'previous PR head %s is not an ancestor of %s — checking the whole branch\n' \
+        "$CONTINUATION_FROM" "$TIP"
+      CONTINUATION_FROM=
+    fi
+  fi
+  # Commits already on either mainline were gated by their own pull requests.
+  # A PR head that tracks develop (a develop -> main sync) advances with every
+  # merge into develop; those merges are not this PR's publication.
+  PR_MAINLINES=origin/main
+  if git rev-parse --verify --quiet origin/develop >/dev/null; then
+    PR_MAINLINES="origin/main origin/develop"
+  fi
+fi
 # A full author gate has no pre-push tuple, but a daemon-prepared PR
 # continuation still has authoritative local evidence: its configured remote
 # upstream is the published PR head. Recognize the initial continuation when a
@@ -607,7 +666,9 @@ else
     # base are inherited integration input, not work authored by this worker.
     # Exclude both histories while retaining the merge and worker commits.
     BASE_REF="$CONTINUATION_FROM + $CONTINUATION_BASE"
-    OWN_COMMITS=$(git rev-list "$TIP" --not "$CONTINUATION_FROM" "$CONTINUATION_BASE")
+    # shellcheck disable=SC2086 # PR_MAINLINES is a list of fixed ref names.
+    OWN_COMMITS=$(git rev-list "$TIP" --not "$CONTINUATION_FROM" "$CONTINUATION_BASE" \
+      $PR_MAINLINES)
     printf 'continuation-owned commits excluding published head and %s:\n' \
       "$CONTINUATION_BASE"
     if [ -n "$OWN_COMMITS" ]; then
@@ -664,6 +725,26 @@ else
     printf 'note: %s commit(s) ahead carry no Co-Authored-By trailer — sessions unattributable; eyeball the commit list above\n' "$N_AHEAD"
   fi
   printf 'branch base OK (%s session(s) ahead of %s)\n' "$N_SESSIONS" "$BASE_REF"
+  # A push has no target branch, so the hook cannot see this; a pull request
+  # does. Only hotfixes cut from main and develop -> main syncs target main
+  # (AGENTS.md, Git and delivery workflow). A PR into main that carries
+  # develop-only commits is therefore a sync, which may add merge commits
+  # (promotion, conflict resolution) but no authored work of its own.
+  if [ "$PR_BASE" = main ] \
+    && git rev-parse --verify --quiet origin/develop >/dev/null; then
+    N_NOT_MAIN=$(git rev-list --count "$TIP" --not origin/main)
+    N_NOT_MAINLINES=$(git rev-list --count "$TIP" --not origin/main origin/develop)
+    if [ "$N_NOT_MAIN" -ne "$N_NOT_MAINLINES" ]; then
+      SYNC_AUTHORED=$(git rev-list --no-merges "$TIP" --not origin/main origin/develop)
+      if [ -n "$SYNC_AUTHORED" ]; then
+        printf 'non-merge commits outside origin/main and origin/develop:\n'
+        git show -s --oneline $SYNC_AUTHORED
+        fail "PR into main carries $((N_NOT_MAIN - N_NOT_MAINLINES)) origin/develop commit(s) plus its own work — feature branches target develop; only hotfixes cut from origin/main and develop -> main syncs target main"
+      fi
+      printf 'develop -> main sync: %s origin/develop commit(s), no authored commits outside both mainlines\n' \
+        "$((N_NOT_MAIN - N_NOT_MAINLINES))"
+    fi
+  fi
 fi
 if [ "$INTEGRATION" -eq 0 ] && [ -z "$CONTINUATION_FROM" ] \
   && [ -z "$CONFIGURED_CONTINUATION_FROM" ]; then
@@ -671,6 +752,12 @@ if [ "$INTEGRATION" -eq 0 ] && [ -z "$CONTINUATION_FROM" ] \
   # existing full-suite behavior rather than trying to infer a safe diff base.
   INERT_DIFF_BASE=$BASE_REF
 fi
+fi
+
+if [ "$PR_BASE_SET" -eq 1 ]; then
+  # CI runs formatting in its own `fmt` job; this mode needs no Rust toolchain.
+  printf '\nPREFLIGHT: PASS (branch base for a pull request into %s)\n' "$PR_BASE"
+  exit 0
 fi
 
 # --- Gate 2: cargo fmt --------------------------------------------------------
@@ -749,6 +836,7 @@ TEST_EXECUTION_SUMMARY=$(test_execution_summary) \
 # its packaging/runtime surface (or --docker), while required CI runs it for
 # every PR. Fixtures without the image sources retain the four Cargo gates.
 CONTAINER_GATE=0
+REPLACE_SUITES_SKIPPED=0
 if [ "$FORCE_DOCKER" -eq 1 ] \
   && { [ ! -f Dockerfile ] || [ ! -x docker/entrypoint_test.sh ] \
     || [ ! -x docker/verify.sh ]; }; then
@@ -791,7 +879,27 @@ if [ -f Dockerfile ] && [ -x docker/entrypoint_test.sh ] \
     trap cleanup_preflight_image 0
     docker buildx build --load --platform linux/amd64 \
       --tag "$PREFLIGHT_IMAGE_TAG" . || fail "Docker image build"
-    ./docker/verify.sh "$PREFLIGHT_IMAGE_TAG" \
+
+    # The container-replacement suites (replace-abrupt.sh, replace-negative.sh)
+    # are unreliable on a non-amd64 Docker server with a host bind-mounted DB
+    # (observed: Bus errors, and committed writes silently lost; cause under
+    # investigation, see task #382), so they are skipped only there.
+    # docker/verify.sh runs them unless told otherwise, and the required CI
+    # container job (native amd64) always enforces them.
+    DOCKER_SERVER_ARCH=$(docker version --format '{{.Server.Arch}}') \
+      && [ -n "$DOCKER_SERVER_ARCH" ] \
+      || fail "cannot read Docker server architecture"
+    # Always set explicitly so a value inherited from the caller's environment
+    # can never request a skip on an amd64 server.
+    VERIFY_SKIP_REPLACE_SUITES=
+    if [ "$DOCKER_SERVER_ARCH" != amd64 ]; then
+      REPLACE_SUITES_SKIPPED=1
+      VERIFY_SKIP_REPLACE_SUITES="Docker server is $DOCKER_SERVER_ARCH, not amd64"
+      printf 'PREFLIGHT: skipping container-replacement suites — Docker server is %s, not amd64; required CI enforces them\n' \
+        "$DOCKER_SERVER_ARCH"
+    fi
+    VERIFY_SKIP_REPLACE_SUITES="$VERIFY_SKIP_REPLACE_SUITES" \
+      ./docker/verify.sh "$PREFLIGHT_IMAGE_TAG" \
       || fail "Docker image verification"
   else
     printf 'PREFLIGHT: skipping linux/amd64 container build — no container-specific changes (required CI still runs it; use --docker to force locally)\n'
@@ -811,7 +919,10 @@ if [ -n "$FULL_GATE_FINGERPRINT" ]; then
   fi
 fi
 
-if [ "$CONTAINER_GATE" -eq 1 ]; then
+if [ "$CONTAINER_GATE" -eq 1 ] && [ "$REPLACE_SUITES_SKIPPED" -eq 1 ]; then
+  printf '\nPREFLIGHT: PASS (all 6 gates green; container-replacement suites deferred to required CI; %s)\n' \
+    "$TEST_EXECUTION_SUMMARY"
+elif [ "$CONTAINER_GATE" -eq 1 ]; then
   printf '\nPREFLIGHT: PASS (all 6 gates green; %s)\n' "$TEST_EXECUTION_SUMMARY"
 elif [ -f Dockerfile ] && [ -x docker/entrypoint_test.sh ] \
   && [ -x docker/verify.sh ]; then
