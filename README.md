@@ -1,5 +1,7 @@
 # Quorum
 
+[![boost my agents](https://boostmyagents.com/badge/brevitize.svg)](https://boostmyagents.com/d/brevitize)
+
 > [!WARNING]
 > **Experimental — not ready for production.** Quorum is under active development,
 > has sharp edges, and may change its commands, configuration, schemas, and behavior
