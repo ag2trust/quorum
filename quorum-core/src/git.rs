@@ -7,7 +7,7 @@
 //! working directory, a fixed `-c` list, and `--end-of-options` before data.
 //! They are additive; no daemon path uses them yet.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -49,8 +49,12 @@ pub const ATTR_TREE_INPUT_LIMIT: u64 = 1024 * 1024;
 /// Number of `.gitattributes` files [`AttrTree::sanitized`] reads before it
 /// falls back to the empty tree. Bounds the `hash-object`/`mktree` processes.
 pub const ATTR_TREE_FILE_LIMIT: usize = 256;
+/// Number of directories (one `mktree` each) [`AttrTree::sanitized`] builds
+/// before it falls back to the empty tree.
+pub const ATTR_TREE_DIR_LIMIT: usize = 1024;
 /// Output bound for the tree listing [`AttrTree::sanitized`] reads.
 const ATTR_TREE_LISTING_LIMIT: usize = 16 * 1024 * 1024;
+/// One deadline for every process [`AttrTree::sanitized`] runs.
 const ATTR_TREE_TIMEOUT: Duration = Duration::from_secs(60);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -605,7 +609,10 @@ impl TransportGit {
     /// command and before every push:
     ///
     /// - `ls-remote --get-url` must print `remote_url` unchanged (`insteadOf`);
-    /// - no `pushInsteadOf` prefix may match `remote_url`.
+    /// - no `pushInsteadOf` prefix may match `remote_url`;
+    /// - no `remote.<remote_url>.*` section may exist: git treats a URL that
+    ///   names a configured remote as that remote, so its `pushurl`,
+    ///   `receivepack`, or `uploadpack` would apply.
     pub fn verify_remote_url(&self) -> Result<()> {
         let output = self
             .command("ls-remote")
@@ -628,7 +635,11 @@ impl TransportGit {
         }
         let output = self
             .command("config")
-            .args(["-z", "--get-regexp", r"^url\..*\.(push)?insteadof$"])
+            .args([
+                "-z",
+                "--get-regexp",
+                r"^(url\..*\.(push)?insteadof|remote\..*\..*)$",
+            ])
             .output_bounded(None, STARTUP_OUTPUT_LIMIT, STARTUP_TIMEOUT)?;
         match output.status.code() {
             Some(0) => {}
@@ -645,6 +656,12 @@ impl TransportGit {
             let Some((key, prefix)) = entry.split_once('\n') else {
                 continue;
             };
+            if key.starts_with(&format!("remote.{}.", self.remote_url)) {
+                return Err(QuorumError::Usage(format!(
+                    "remote_url {:?} names a configured remote ({key})",
+                    self.remote_url
+                )));
+            }
             if key.ends_with(".pushinsteadof") && self.remote_url.starts_with(prefix) {
                 return Err(QuorumError::Usage(format!(
                     "remote_url {:?} is rewritten for push by {key} = {prefix:?}",
@@ -906,12 +923,25 @@ impl AttrTree {
 
     /// The sanitized attribute tree of `ours` (a commit or tree SHA): every
     /// `.gitattributes` blob keeps only the built-in `merge` attributes, at its
-    /// original path. Over [`ATTR_TREE_INPUT_LIMIT`] of input (or
-    /// [`ATTR_TREE_FILE_LIMIT`] files) it is the empty tree, and
+    /// original path. Over [`ATTR_TREE_INPUT_LIMIT`] of input,
+    /// [`ATTR_TREE_FILE_LIMIT`] files, or [`ATTR_TREE_DIR_LIMIT`] directories
+    /// it is the empty tree, and
     /// [`AttrTree::bound_exceeded`] carries the detail for an event.
     ///
     /// Use it only for `merge-tree` and `show --remerge-diff`.
     pub fn sanitized(git: &LocalGit, ours: &str) -> Result<Self> {
+        let deadline = Instant::now() + ATTR_TREE_TIMEOUT;
+        let remaining = || {
+            deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or_else(|| {
+                    QuorumError::Io(format!(
+                        "sanitized attribute tree of {ours}: timed out after {}s",
+                        ATTR_TREE_TIMEOUT.as_secs()
+                    ))
+                })
+        };
         let over = |detail: String| AttrTree {
             sha: git.format.empty_tree().to_string(),
             bound_exceeded: Some(detail),
@@ -920,7 +950,7 @@ impl AttrTree {
             .command("ls-tree")
             .args(["-r", "-l", "-z"])
             .sha(ours)?
-            .output_bounded(None, ATTR_TREE_LISTING_LIMIT, ATTR_TREE_TIMEOUT)
+            .output_bounded(None, ATTR_TREE_LISTING_LIMIT, remaining()?)
         {
             Ok(output) => checked(output, "ls-tree")?,
             Err(error) if error.to_string().contains("byte limit") => {
@@ -963,6 +993,20 @@ impl AttrTree {
         if files.is_empty() {
             return Ok(AttrTree::empty(git.format));
         }
+        let mut all_dirs: HashSet<&[u8]> = HashSet::new();
+        for (path, _) in &files {
+            let mut dir = split_parent(path).0;
+            while all_dirs.insert(dir) && !dir.is_empty() {
+                dir = split_parent(dir).0;
+            }
+        }
+        if all_dirs.len() > ATTR_TREE_DIR_LIMIT {
+            return Ok(over(format!(
+                "{ours} has .gitattributes files in {} directories, over the \
+                 {ATTR_TREE_DIR_LIMIT}-directory bound",
+                all_dirs.len()
+            )));
+        }
 
         // Read every blob in one `cat-file --batch`.
         let mut request = Vec::new();
@@ -974,7 +1018,7 @@ impl AttrTree {
             git.command("cat-file").arg("--batch").output_bounded(
                 Some(request),
                 ATTR_TREE_INPUT_LIMIT as usize + files.len() * 128,
-                ATTR_TREE_TIMEOUT,
+                remaining()?,
             )?,
             "cat-file --batch",
         )?;
@@ -1027,7 +1071,7 @@ impl AttrTree {
                         .output_bounded(
                             Some(sanitized.clone()),
                             STARTUP_OUTPUT_LIMIT,
-                            ATTR_TREE_TIMEOUT,
+                            remaining()?,
                         )?;
                     let blob = parse_sha(&checked(output, "hash-object")?, git.format)?;
                     blob_shas.insert(sanitized, blob.clone());
@@ -1069,7 +1113,7 @@ impl AttrTree {
             let output = git.command("mktree").arg("-z").output_bounded(
                 Some(input),
                 STARTUP_OUTPUT_LIMIT,
-                ATTR_TREE_TIMEOUT,
+                remaining()?,
             )?;
             let tree = parse_sha(&checked(output, "mktree")?, git.format)?;
             if dir.is_empty() {

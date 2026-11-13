@@ -11,7 +11,7 @@ mod hostile_git;
 use hostile_git::*;
 use quorum_core::git::{
     AttrTree, HardenedGit, LocalGit, ObjectFormat, TransportConfig, WorkspaceMode,
-    ATTR_TREE_INPUT_LIMIT, EMPTY_TREE_SHA1,
+    ATTR_TREE_DIR_LIMIT, ATTR_TREE_INPUT_LIMIT, EMPTY_TREE_SHA1,
 };
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -185,6 +185,26 @@ fn transport_refuses_rewritten_remote_urls() {
     let transport = construct(&[]).unwrap();
     assert_eq!(transport.remote_url(), remote);
     assert_eq!(transport.scheme(), "https");
+
+    // A remote section named after the URL redirects a push by URL through
+    // its pushurl/receivepack, which `--get-url` does not show.
+    let fixture = Fixture::new();
+    plant_operator(&fixture.home, &fixture.tripwire, remote, &[]);
+    let receivepack = fixture.tripwire.command("named-remote-receivepack");
+    let mut config = std::fs::read_to_string(fixture.home.join(".gitconfig")).unwrap();
+    config.push_str(&format!(
+        "[remote \"{remote}\"]\n\tpushurl = ext::{rp}\n\treceivepack = {rp}\n",
+        rp = receivepack.display()
+    ));
+    std::fs::write(fixture.home.join(".gitconfig"), config).unwrap();
+    let repo = private_repo(fixture.path());
+    let error = fixture
+        .startup(None)
+        .transport(&repo, ObjectFormat::Sha1, remote, TransportConfig::Inherit)
+        .unwrap_err();
+    assert_eq!(error.exit_code(), 2, "{error}");
+    assert!(error.to_string().contains("configured remote"), "{error}");
+    fixture.tripwire.assert_empty();
 }
 
 #[test]
@@ -311,6 +331,31 @@ fn sanitized_attribute_tree_keeps_only_builtin_merge_attributes() {
 
 fn git_cmd_lines(dir: &Path, args: &[&str]) -> Vec<String> {
     crate::git(dir, args).lines().map(String::from).collect()
+}
+
+#[test]
+fn attribute_tree_directory_count_is_bounded() {
+    let fixture = Fixture::new();
+    let work = fixture.path().join("deep");
+    // Each file adds five directories; together they exceed the bound while
+    // staying under the file and input bounds.
+    let files = ATTR_TREE_DIR_LIMIT / 5 + 1;
+    for index in 0..files {
+        let dir = work.join(format!("d{index}/a/b/c/e"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".gitattributes"), "*.txt merge=union\n").unwrap();
+    }
+    git(&work, &["init", "-q", "-b", "main"]);
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-q", "-m", "deep"]);
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    let local = fixture
+        .startup(None)
+        .local(work.join(".git"), ObjectFormat::Sha1);
+    let attrs = AttrTree::sanitized(&local, &head).unwrap();
+    assert_eq!(attrs.sha(), EMPTY_TREE_SHA1);
+    let event = attrs.bound_exceeded().expect("bound event");
+    assert!(event.contains("directory bound"), "{event}");
 }
 
 #[test]
