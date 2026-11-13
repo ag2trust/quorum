@@ -167,7 +167,7 @@ command-line set in both modes:
   `GIT_ATTR_SOURCE` for commands that do not check out files;
 - the planner view's `archive` already isolated (audit row M25, fixed ahead of this slice:
   a daemon-owned git directory over `repo_dir`'s object store, no repository config or
-  attributes, signature programs set to `false`);
+  attributes, signature programs set to `false`, tree paths validated by `read-tree`);
 - the container image moved to a current git (`Dockerfile:32` pins 2.39, which predates
   `GIT_ATTR_SOURCE`), with the image smoke test asserting that its git is at least the floor;
 - a push URL from `remote_url` (or derived once at startup), replacing R1, with the rewrite

@@ -6473,6 +6473,125 @@ async fn cached_frozen_planner_view(
     Ok(path)
 }
 
+/// A daemon-owned git directory that borrows only a repository's object store.
+///
+/// The repository's config, `info/attributes`, and refs are writable by agents
+/// in linked mode, and through them `git archive` run in the repository would
+/// execute filter drivers and signature programs as the daemon (audit row M25).
+/// Commands from [`PlannerArchiveSource::git_command`] read no system, global,
+/// or repository config and no attribute file. The directory has no
+/// `.gitattributes`, so `--worktree-attributes` (which treats it as the work
+/// tree) also skips the archived tree's own attributes.
+struct PlannerArchiveSource {
+    directory: tempfile::TempDir,
+    objects: std::ffi::OsString,
+}
+
+impl PlannerArchiveSource {
+    async fn create(repo: &Path, git_bin: &Path, deadline: tokio::time::Instant) -> Result<Self> {
+        let mut lookup = tokio::process::Command::from(quorum_core::git::git_command(git_bin));
+        lookup
+            .args([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+                "--show-object-format",
+            ])
+            .current_dir(repo);
+        let output = run_publication_gh_command_with_limit(
+            lookup,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            4096,
+            "planner object store lookup",
+        )
+        .await
+        .map_err(QuorumError::Io)?;
+        let refused = || {
+            QuorumError::Io(format!(
+                "planner object store lookup failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        };
+        if !output.status.success() {
+            return Err(refused());
+        }
+        let (objects, format) = output
+            .stdout
+            .strip_suffix(b"\n")
+            .and_then(|stdout| {
+                let split = stdout.iter().rposition(|byte| *byte == b'\n')?;
+                Some((&stdout[..split], &stdout[split + 1..]))
+            })
+            .ok_or_else(refused)?;
+        #[cfg(unix)]
+        let objects = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(objects.to_vec())
+        };
+        #[cfg(not(unix))]
+        let objects =
+            std::ffi::OsString::from(String::from_utf8(objects.to_vec()).map_err(|_| refused())?);
+        if !Path::new(&objects).is_absolute() {
+            return Err(refused());
+        }
+        let config = match format {
+            b"sha1" => None,
+            b"sha256" => Some(
+                "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectFormat = sha256\n",
+            ),
+            _ => return Err(refused()),
+        };
+
+        let failed =
+            |error: std::io::Error| QuorumError::Io(format!("planner view failed: {error}"));
+        let directory = tempfile::Builder::new()
+            .prefix("quorum-planner-git-")
+            .tempdir()
+            .map_err(failed)?;
+        for subdirectory in ["objects", "refs"] {
+            std::fs::create_dir(directory.path().join(subdirectory)).map_err(failed)?;
+        }
+        std::fs::write(directory.path().join("HEAD"), "ref: refs/heads/main\n").map_err(failed)?;
+        if let Some(config) = config {
+            std::fs::write(directory.path().join("config"), config).map_err(failed)?;
+        }
+        Ok(Self { directory, objects })
+    }
+
+    fn path(&self) -> &Path {
+        self.directory.path()
+    }
+
+    fn git_command(&self, git_bin: &Path) -> tokio::process::Command {
+        let mut command = tokio::process::Command::from(quorum_core::git::git_command(git_bin));
+        command
+            .arg("--git-dir")
+            .arg(self.path())
+            .args([
+                "-c",
+                "core.attributesFile=/dev/null",
+                "-c",
+                "gpg.program=false",
+                "-c",
+                "gpg.openpgp.program=false",
+                "-c",
+                "gpg.ssh.program=false",
+                "-c",
+                "gpg.x509.program=false",
+            ])
+            .env("GIT_OBJECT_DIRECTORY", &self.objects)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .current_dir(self.path());
+        command
+    }
+}
+
 async fn frozen_planner_view_with_options(
     repo: &Path,
     frozen_sha: &str,
@@ -6507,83 +6626,51 @@ async fn frozen_planner_view_with_options(
             )));
         }
 
-        let mut objects_command =
-            tokio::process::Command::from(quorum_core::git::git_command(&git_bin));
-        objects_command
+        let isolated = PlannerArchiveSource::create(&repo, &git_bin, deadline).await?;
+
+        // `archive --worktree-attributes` skips the index load that rejects
+        // `.git` components and `..` in tree paths, so validate the tree
+        // first: without this a crafted commit could plant a working `.git`
+        // in the view, which is the planner's working directory.
+        let mut validate_command = isolated.git_command(&git_bin);
+        validate_command
             .args([
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-path",
-                "objects",
+                "-c",
+                "core.protectHFS=true",
+                "-c",
+                "core.protectNTFS=true",
+                "read-tree",
+                &frozen_sha,
             ])
-            .current_dir(&repo);
-        let objects = run_publication_gh_command_with_limit(
-            objects_command,
+            .env("GIT_INDEX_FILE", isolated.path().join("validation-index"));
+        let validation = run_publication_gh_command_with_limit(
+            validate_command,
             deadline.saturating_duration_since(tokio::time::Instant::now()),
-            4096,
-            "planner object directory lookup",
+            PLANNER_ARCHIVE_DIAGNOSTIC_BYTES,
+            "planner tree validation",
         )
         .await
         .map_err(QuorumError::Io)?;
-        let objects = String::from_utf8(objects.stdout)
-            .ok()
-            .filter(|_| objects.status.success())
-            .and_then(|stdout| stdout.strip_suffix('\n').map(PathBuf::from))
-            .filter(|path| path.is_absolute())
-            .ok_or_else(|| QuorumError::Io("planner object directory lookup failed".into()))?;
-
-        // Archive from a daemon-owned git directory that borrows only the
-        // object store. The repository's config, info/attributes, and refs are
-        // writable by agents in linked mode: through them `git archive` would
-        // run filter drivers and signature programs as the daemon (audit row
-        // M25). In this directory no repository config is read, and
-        // --worktree-attributes with no work tree also skips the archived
-        // tree's own attributes (export-subst, export-ignore, filters).
-        let isolated = tempfile::Builder::new()
-            .prefix("quorum-planner-git-")
-            .tempdir()
-            .map_err(|error| QuorumError::Io(format!("planner view failed: {error}")))?;
-        for directory in ["objects", "refs"] {
-            std::fs::create_dir(isolated.path().join(directory))
-                .map_err(|error| QuorumError::Io(format!("planner view failed: {error}")))?;
+        if !validation.status.success() {
+            return Err(QuorumError::Io(format!(
+                "planner frozen tree was refused: {}",
+                String::from_utf8_lossy(&validation.stderr).trim()
+            )));
         }
-        std::fs::write(isolated.path().join("HEAD"), "ref: refs/heads/main\n")
-            .map_err(|error| QuorumError::Io(format!("planner view failed: {error}")))?;
 
         let view = tempfile::Builder::new()
             .prefix("quorum-planner-")
             .tempdir()
             .map_err(|error| QuorumError::Io(format!("planner view failed: {error}")))?;
 
-        let mut archive_command =
-            tokio::process::Command::from(quorum_core::git::git_command(&git_bin));
+        let mut archive_command = isolated.git_command(&git_bin);
         archive_command
-            .arg("--git-dir")
-            .arg(isolated.path())
             .args([
-                "-c",
-                "core.attributesFile=/dev/null",
-                "-c",
-                "gpg.program=false",
-                "-c",
-                "gpg.openpgp.program=false",
-                "-c",
-                "gpg.ssh.program=false",
-                "-c",
-                "gpg.x509.program=false",
                 "archive",
                 "--worktree-attributes",
                 "--format=tar",
                 &frozen_sha,
             ])
-            .env("GIT_OBJECT_DIRECTORY", &objects)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-            .env_remove("GIT_COMMON_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .current_dir(isolated.path())
             .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -65236,6 +65323,99 @@ exec /bin/cat '{stdout}'
     }
 
     #[tokio::test]
+    async fn planner_view_refuses_a_tree_with_a_git_directory() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str], input: Option<&str>| {
+            use std::io::Write;
+            let mut child = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.unwrap_or("").as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "git {:?} failed", args);
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"], None);
+        // An agent that writes objects and HEAD can commit a tree that the
+        // index would refuse: a `.git` directory whose config would run a
+        // program in any git command started in the extracted view.
+        let blob = git(
+            &["hash-object", "-w", "--stdin"],
+            Some("[core]\n\tbare = false\n"),
+        );
+        let inner = git(
+            &["mktree"],
+            Some(&format!(
+                "100644 blob {blob}\tconfig\n100644 blob {blob}\tHEAD\n"
+            )),
+        );
+        let root = git(
+            &["mktree"],
+            Some(&format!(
+                "040000 tree {inner}\t.git\n100644 blob {blob}\tok\n"
+            )),
+        );
+        let commit = git(
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit-tree",
+                &root,
+                "-m",
+                "crafted",
+            ],
+            None,
+        );
+        git(&["update-ref", "HEAD", &commit], None);
+
+        let error = frozen_planner_view(repo.path(), &commit)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("planner frozen tree was refused"), "{error}");
+        assert!(error.contains(".git"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn planner_view_archives_a_sha256_repository() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?} failed", args);
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q", "--object-format=sha256"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.path().join("state.txt"), "frozen").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "frozen"]);
+        let frozen = git(&["rev-parse", "HEAD"]);
+        assert_eq!(frozen.len(), 64);
+
+        let view = frozen_planner_view(repo.path(), &frozen).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(view.path().join("state.txt")).unwrap(),
+            "frozen"
+        );
+    }
+
+    #[tokio::test]
     async fn cached_planner_view_reuses_a_frozen_sha_replaces_a_new_sha_and_releases() {
         let repo = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
@@ -65464,7 +65644,8 @@ exec /bin/cat '{stdout}'
         std::fs::write(
             &git_wrapper,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = -c ] && [ \"$2\" = core.fsmonitor=false ]; then shift 2; fi\nif [ \"$1\" = rev-parse ]; then exec '{}' \"$@\"; fi\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+                "#!/bin/sh\nif [ \"$1\" = -c ] && [ \"$2\" = core.fsmonitor=false ]; then shift 2; fi\nif [ \"$1\" = rev-parse ]; then exec '{}' \"$@\"; fi\ncase \" $* \" in *\" read-tree \"*) exec '{}' \"$@\";; esac\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+                real_git,
                 real_git,
                 archive_pid.display()
             ),
