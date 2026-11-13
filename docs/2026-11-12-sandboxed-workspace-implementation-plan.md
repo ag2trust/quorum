@@ -5,16 +5,18 @@
 **Spec:** `docs/2026-11-12-sandboxed-workspace-technical-spec.md`
 **Implementation base:** `origin/develop` at `b090a1a`
 
-The plan is one prerequisite and eighteen slices. Each slice is one PR against `develop` with
+The plan is one prerequisite and seventeen slices. Each slice is one PR against `develop` with
 its own tests, and leaves `develop` green.
 
 - **Prerequisite and slices 1–6** harden today's behavior in both modes. That includes the worst
-  linked-mode paths, so they do not wait for the flip.
+  linked-mode paths, which matter because linked-worktree mode stays the default.
 - **Slices 7–15** build the clone model beside the linked-worktree model, which stays the
   default.
-- **Slice 16** migrates.
-- **Slice 17** flips the default.
-- **Slice 18** deletes the legacy path one release later.
+- **Slice 16** adds the one-time migration into clone mode.
+- **Slice 17** lets operators select clone mode. The default stays `linked-worktree`.
+
+No slice removes the linked-worktree mode or changes the default (see the spec's "Mode
+decision").
 
 Until slice 17, `workspace_mode = "clone"` starts only with the hidden test-only flag
 `--incomplete-clone-mode`, following the existing hidden-seam precedent (`--merge-cmd`).
@@ -311,6 +313,12 @@ Add `PrivateRepo`, which owns its manager mutex, and its operations:
 - `fetch_branch` and `fetch_pr_head` with fsck and `git_fsck_ignore`;
 - `resolve` and `is_ancestor`.
 
+Extend the source-scan test (`quorum-core/src/git.rs:48`), which today bans only direct
+`Command::new("git")` construction, with a ban on `-C` and on `current_dir` for a `git` or `gh`
+process outside the private-repository module, the export step, and a fixed list of
+linked-worktree modules. It lands here, with the first clone-mode code, so the guarantee holds
+while clone mode is written.
+
 Tests:
 
 - **URL validation.** Accepted: `https`, `ssh`, scp-like, `file`. Rejected with exit 2:
@@ -330,6 +338,8 @@ Tests:
   created. The same history fetched with its message ID in `git_fsck_ignore` succeeds.
 - **Planted operator and checkout:** under `plant_repo_dir` and `plant_operator`, `fetch_branch`
   leaves the tripwire empty under both `inherit` and `hermetic`.
+- **Source scan:** the test fails on a deliberately added `git -C` or `current_dir` in a fixture
+  copy of a module outside the linked-worktree list, and passes on the tree as it stands.
 
 ## 8. Pack pre-scan, quarantined indexing, and verified import
 
@@ -636,7 +646,7 @@ Tests:
 - **Tombstones and pins:** the existing CAS tests are ported, plus a crash after the tombstone is
   written and before DB settlement.
 
-## 16. Migration (not yet default)
+## 16. Migration (clone mode still hidden)
 
 Implement the spec's migration:
 
@@ -648,7 +658,9 @@ Implement the spec's migration:
 - verification that every expected ref arrived;
 - the planted-state report for `repo_dir`;
 - the marker written at completion;
-- refusal to switch back.
+- refusal to switch back. Linked-worktree mode is permanent, but a linked-worktree daemon cannot
+  read migrated state, so opting in is one-way for an existing state directory (see the spec's
+  "Mode decision" and open question 4).
 
 Tests:
 
@@ -667,37 +679,30 @@ Tests:
 - **Planted state:** `plant_repo_dir` produces one warning event listing the hooks, keys, and
   `info/attributes` it found, and the tripwire is empty.
 
-## 17. Default flip
+## 17. Clone mode as an operator option
 
 Before this slice:
 
 - the separate read-only role prompt work has landed, since read-only workspaces have no `.git`;
 - the container image ships a current git release (done in slice 2).
 
-Set the `workspace_mode` default to `clone`, and remove `--incomplete-clone-mode`. Update
-`README.md`, `docs/serve-config.example.toml`, and the workspace and lifecycle sections of
-`docs/2026-06-23-quorum-design.md`.
+Remove `--incomplete-clone-mode`, so operators can set `workspace_mode = "clone"`. The default
+stays `linked-worktree`. Update `README.md`, `docs/serve-config.example.toml`, and the workspace
+and lifecycle sections of `docs/2026-06-23-quorum-design.md` to describe both modes, and to say
+when to choose clone mode: when agents run with less authority than the daemon, in a sandbox or
+a container. A CLI's own restricted mode is a future case: today's managed Codex and Claude
+launches run unconfined (see the spec's "Mode decision"). State that opting in is one-way for an
+existing state directory.
 
 Tests:
 
-- A local operator with no new keys starts in clone mode, with `remote_url` derived and logged,
-  and completes the slice 12 happy path.
+- A local operator with no new keys starts in linked-worktree mode, behaves as before this
+  slice, and is never offered or forced into migration.
+- An operator who sets only `workspace_mode = "clone"` starts in clone mode, with `remote_url`
+  derived and logged, and completes the slice 12 happy path.
 - The full clone suite passes on the floor git and on a current git.
-- The container image's smoke test asserts that clone mode starts.
-
-## 18. Remove the linked-worktree mode
-
-One release after slice 17:
-
-- delete the linked-worktree paths (REMOVE rows R1–R16) and `disable_push`;
-- keep `workspace_mode = "linked-worktree"` as a recognized value that exits 2 with a migration
-  message;
-- tighten the source-scan test (`quorum-core/src/git.rs:48`).
-
-Tests:
-
-- The source-scan test fails on a deliberately added `git -C` in a fixture copy.
-- The full clone suite passes.
+- The container image's smoke test asserts that the default mode starts, and that clone mode
+  starts when selected.
 
 ## Verification per slice
 
