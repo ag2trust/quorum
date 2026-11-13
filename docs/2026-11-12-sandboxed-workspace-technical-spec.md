@@ -94,13 +94,15 @@ describe clone mode, except the last two.
 Deployment profiles follow `docs/2026-08-17-github-collaboration-mcp-technical-spec.md`:
 
 - **Local permissive.** The local launcher. The agent shares the operator's machine and can
-  reach anything the operator can, unless its CLI's own restricted mode confines it. In clone
-  mode the daemon still executes no repository code and never shares a git directory with a
-  run, but it does not claim a containment boundary.
+  reach anything the operator can. In clone mode the daemon still executes no repository code
+  and never shares a git directory with a run, but it does not claim a containment boundary.
+  Today's managed worker and reviewer launches are unconfined (see "Mode decision").
 - **Isolated runtime.** An external launcher. It needs clone mode, since a sandbox cannot use a
-  linked worktree (see "Problem"). The run sees only its workspace, its session directory, and
-  its outbox, reaches only the daemon's run-facing endpoints, and holds no repository
-  credential.
+  linked worktree (see "Problem"). Startup must refuse an external launcher with
+  `workspace_mode = "linked-worktree"` (exit 2); the launcher interface work carries that
+  check. The run sees only its workspace, its session directory, and its outbox, reaches only
+  the daemon's run-facing endpoints, and holds no repository credential. Model access for a
+  confined run is provided by whoever runs the confinement; Quorum provides no model route.
 
 ## Current-state audit
 
@@ -151,9 +153,35 @@ mode").
 **Clone mode is opt-in, and linked-worktree mode stays the default.** `workspace_mode =
 "linked-worktree" | "clone"` selects the model, and `linked-worktree` is the default. Clone mode
 is for operators who run agents with less authority than the daemon: agents in a sandbox or a
-container, or under a CLI's own restricted mode. Linked-worktree mode is kept and is not
-scheduled for removal. While the slices land, clone mode starts only behind a hidden test-only
-flag. Operators can select it once the clone path covers every role.
+container, or, in future, under a CLI's own restricted mode. Linked-worktree mode is kept and is
+not scheduled for removal. While the slices land, clone mode starts only behind a hidden
+test-only flag. Operators can select it once the clone path covers every role.
+
+Opting into clone mode is one-way for an existing state directory. Migration moves every task's
+commits, recover refs, publication pins, and tombstones into the private repository and records
+clone workspaces in the database (see "Migration to clone mode"). A linked-worktree daemon reads
+none of that state, and no path copies it back into `repo_dir`; doing so would return
+agent-produced objects to the checkout that linked mode shares with its runs. Startup therefore
+refuses `linked-worktree` once the migration marker exists. Whether a reverse path is needed is
+an open question.
+
+Quorum's own managed launches run unconfined today, in either mode:
+
+- Codex worker and reviewer launches always pass `--dangerously-bypass-approvals-and-sandbox`
+  (`quorum/src/serve/codex_agent.rs:52,85`), and that flag overrides `-s`: with codex-cli
+  0.166.0, `-s read-only --dangerously-bypass-approvals-and-sandbox` reports
+  `sandbox: danger-full-access`. Setting `[codex] sandbox` therefore does not confine a managed
+  worker or reviewer, and does not make a linked-worktree deployment a confined one. Only the
+  restricted planner and classifier launches keep Codex's read-only sandbox.
+- Claude runs with `--permission-mode dontAsk` and, by default, an allowlist that includes
+  `Bash` (`quorum/src/serve/agent.rs:59,550`), so its shell commands are not confined.
+- Grok's `sandbox = "workspace"` cannot commit in a linked worktree: the worker cannot create
+  the linked worktree's `index.lock` or write the common directory's `FETCH_HEAD`
+  (`docs/2026-06-23-quorum-design.md:2822-2832`). That is why its default is `off`.
+
+A CLI's own restricted mode is therefore a forward-looking case, not a deployment Quorum
+supports today. The Grok result also shows that a confined agent cannot practically work in a
+linked worktree, which shares its git directory with the operator's checkout.
 
 This is the owner's decision of 2026-11-13. An earlier draft made clone the only model: the
 default was to flip to `clone` and the linked-worktree path was to be deleted one release later.
@@ -162,7 +190,7 @@ Rationale:
 
 - **A confined agent needs it.** When an agent runs with less authority than the daemon, any
   repository code the daemon executes is an escalation. An agent that writes a hook, filter, or
-  driver today gets it run by the daemon with the operator's GitHub credentials, and the four
+  driver today gets it run by the daemon with the operator's GitHub credentials, and the five
   highest-risk findings are reachable from any agent that can write its worktree. Only clone
   mode removes every one of those paths, and only clone mode works when the agent cannot see
   the operator's checkout at all (see "Problem"). An unconfined local agent already holds the
@@ -502,11 +530,11 @@ only case where the daemon sets `GIT_OBJECT_DIRECTORY` and `GIT_ALTERNATE_OBJECT
 itself.
 
 **Source-scan test.** The existing test `production_git_commands_use_the_shared_constructor`
-(`quorum-core/src/git.rs:48`) is extended so that production code outside the
-private-repository module, the local launcher's export step, and the linked-worktree mode's own
-modules must not construct a git command, use `-C`, or set `current_dir` for a `git` or `gh`
-process. The linked-worktree exception is a fixed list of modules, so clone-mode code cannot
-grow a new `-C` site unnoticed.
+(`quorum-core/src/git.rs:48`) bans only direct `Command::new("git")` construction outside the
+shared constructor. It is extended with a ban on `-C` and on `current_dir` for a `git` or `gh`
+process, everywhere outside the private-repository module, the local launcher's export step,
+and a fixed list of linked-worktree modules. The extension lands with the first clone-mode code
+(plan slice 7), so clone-mode code cannot grow a new `-C` site unnoticed while it is written.
 
 ## Workspace lifecycle
 
@@ -1063,7 +1091,8 @@ New `serve` keys, with the existing precedence (flag over file, unknown keys rej
 
 ```toml
 # Workspace git model: "linked-worktree" (default) or "clone" (opt-in, for agents that run with
-# less authority than the daemon; see "Mode decision").
+# less authority than the daemon; see "Mode decision"). Selecting "clone" migrates the state
+# directory once, and that is one-way: after the migration, "linked-worktree" is refused.
 # workspace_mode = "clone"
 # The keys below apply to clone mode only.
 # Bare repository used only by the daemon. Default: <state dir>/repository.git.
@@ -1192,7 +1221,8 @@ startup recovery, so no runs are alive.
 7. **Write the durable one-row marker at completion**, in one transaction after every import is
    verified (an additive, forward-only migration). A crash before that point reruns the whole
    migration, which is idempotent: refs are set with expected-old values. Switching back to
-   `linked-worktree` after the marker exists is refused with exit 2.
+   `linked-worktree` after the marker exists is refused with exit 2, since a linked-worktree
+   daemon cannot read the migrated state (see "Mode decision").
 
 In either mode, operators who pushed through the daemon and relied on a repository pre-push hook
 must move those checks to CI, because the early hardening disables hooks in both modes. For this
@@ -1279,6 +1309,10 @@ The owner settled these on 2026-11-12. They were open questions in the first dra
    these acceptable?
 3. **Migration quiescence.** Is it acceptable that operators must let writing tasks reach review
    before enabling clone mode, or should Quorum provide an explicit drain control for this?
+4. **Reverse migration.** Linked-worktree mode is now permanent, so an operator may want to
+   leave clone mode. Is a reverse path needed, or is starting from a fresh state directory
+   enough? A reverse path would have to export task heads from the private repository into
+   `repo_dir` without trusting anything a run wrote.
 
 ## Appendix A — Audit
 

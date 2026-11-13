@@ -313,6 +313,12 @@ Add `PrivateRepo`, which owns its manager mutex, and its operations:
 - `fetch_branch` and `fetch_pr_head` with fsck and `git_fsck_ignore`;
 - `resolve` and `is_ancestor`.
 
+Extend the source-scan test (`quorum-core/src/git.rs:48`), which today bans only direct
+`Command::new("git")` construction, with a ban on `-C` and on `current_dir` for a `git` or `gh`
+process outside the private-repository module, the export step, and a fixed list of
+linked-worktree modules. It lands here, with the first clone-mode code, so the guarantee holds
+while clone mode is written.
+
 Tests:
 
 - **URL validation.** Accepted: `https`, `ssh`, scp-like, `file`. Rejected with exit 2:
@@ -332,6 +338,8 @@ Tests:
   created. The same history fetched with its message ID in `git_fsck_ignore` succeeds.
 - **Planted operator and checkout:** under `plant_repo_dir` and `plant_operator`, `fetch_branch`
   leaves the tripwire empty under both `inherit` and `hermetic`.
+- **Source scan:** the test fails on a deliberately added `git -C` or `current_dir` in a fixture
+  copy of a module outside the linked-worktree list, and passes on the tree as it stands.
 
 ## 8. Pack pre-scan, quarantined indexing, and verified import
 
@@ -650,7 +658,9 @@ Implement the spec's migration:
 - verification that every expected ref arrived;
 - the planted-state report for `repo_dir`;
 - the marker written at completion;
-- refusal to switch back.
+- refusal to switch back. Linked-worktree mode is permanent, but a linked-worktree daemon cannot
+  read migrated state, so opting in is one-way for an existing state directory (see the spec's
+  "Mode decision" and open question 4).
 
 Tests:
 
@@ -680,8 +690,9 @@ Remove `--incomplete-clone-mode`, so operators can set `workspace_mode = "clone"
 stays `linked-worktree`. Update `README.md`, `docs/serve-config.example.toml`, and the workspace
 and lifecycle sections of `docs/2026-06-23-quorum-design.md` to describe both modes, and to say
 when to choose clone mode: when agents run with less authority than the daemon, in a sandbox or
-a container, or under a CLI's own restricted mode. Fix the linked-worktree exception in the
-source-scan test (`quorum-core/src/git.rs:48`) to a named list of modules.
+a container. A CLI's own restricted mode is a future case: today's managed Codex and Claude
+launches run unconfined (see the spec's "Mode decision"). State that opting in is one-way for an
+existing state directory.
 
 Tests:
 
@@ -692,8 +703,6 @@ Tests:
 - The full clone suite passes on the floor git and on a current git.
 - The container image's smoke test asserts that the default mode starts, and that clone mode
   starts when selected.
-- The source-scan test fails on a deliberately added `git -C` in a fixture copy of a module
-  outside the linked-worktree list.
 
 ## Verification per slice
 
