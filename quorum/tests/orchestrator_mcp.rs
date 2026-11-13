@@ -668,6 +668,11 @@ fn startup_refuses_unsafe_or_incomplete_configuration() {
     );
     let group_readable = private("group.token", TOKEN, 0o640);
     let world_readable = private("world.token", TOKEN, 0o604);
+    // A blank line after the token is not the single trailing newline the
+    // shared secret-file reader strips; it is refused like any other
+    // embedded non-printable content.
+    let blank_tail = private("blank-tail.token", &format!("{TOKEN}\n\n"), 0o600);
+    let empty = private("empty.token", "", 0o600);
     let absent = home.join("absent.token");
     let absent = absent.to_str().unwrap();
     let directory = home.to_str().unwrap();
@@ -701,7 +706,7 @@ fn startup_refuses_unsafe_or_incomplete_configuration() {
         );
     }
     // The token file must be a well-formed secret only its owner can read.
-    for file in [&short[..], &spaced, absent, directory] {
+    for file in [&short[..], &spaced, &blank_tail, &empty, absent, directory] {
         refused(
             "127.0.0.1:0",
             &["--identity", "Coordinator", "--token-file", file],

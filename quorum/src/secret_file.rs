@@ -24,8 +24,37 @@ pub(crate) const MAX_SECRET_FILE_BYTES: u64 = 4096;
 /// or more printable ASCII characters with no spaces. An error describes the
 /// file, never its contents.
 pub(crate) fn read(path: &Path) -> Result<String, String> {
-    use std::io::Read as _;
-    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::unix::fs::MetadataExt as _;
+    let (file, metadata) = open_and_stat(path)?;
+    if metadata.mode() & 0o022 != 0 {
+        return Err("must not be writable by group or others".into());
+    }
+    parse(file, &metadata)
+}
+
+/// Read the secret held in `path`, as [`read`], but trust no one besides
+/// `owner_uid` to reach it at all.
+///
+/// Unlike `read`, group and other access of any kind — not just write — is
+/// refused, and the file must be owned by `owner_uid`. Use this for a secret
+/// that is itself an access credential rather than one deployed by a trusted
+/// mount: nothing short of the owner may even read it.
+pub(crate) fn read_owner_only(path: &Path, owner_uid: u32) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let (file, metadata) = open_and_stat(path)?;
+    if metadata.uid() != owner_uid {
+        return Err("must be owned by the user reading it".into());
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err("must not be accessible by group or others".into());
+    }
+    parse(file, &metadata)
+}
+
+/// Open `path`, following symbolic links, and stat the descriptor that was
+/// opened so every later check is made on the file that is read.
+fn open_and_stat(path: &Path) -> Result<(std::fs::File, std::fs::Metadata), String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     let file = std::fs::OpenOptions::new()
         .read(true)
         // Never block on a FIFO with no writer and never adopt a terminal:
@@ -39,9 +68,14 @@ pub(crate) fn read(path: &Path) -> Result<String, String> {
     if !metadata.is_file() {
         return Err("must be a regular file".into());
     }
-    if metadata.mode() & 0o022 != 0 {
-        return Err("must not be writable by group or others".into());
-    }
+    Ok((file, metadata))
+}
+
+/// Read and validate the secret from an already opened and stat-checked
+/// file. Permission and ownership checks happen before this is called; this
+/// is only the size bound, trailing-newline trim, and content shape.
+fn parse(file: std::fs::File, metadata: &std::fs::Metadata) -> Result<String, String> {
+    use std::io::Read as _;
     let too_large = || format!("must not be larger than {MAX_SECRET_FILE_BYTES} bytes");
     if metadata.len() > MAX_SECRET_FILE_BYTES {
         return Err(too_large());
@@ -215,6 +249,35 @@ mod tests {
         ] {
             let (_dir, path) = file_with(contents.as_bytes(), 0o600);
             assert!(refusal(&path).contains("printable"), "{contents:?}");
+        }
+    }
+
+    #[test]
+    fn owner_only_accepts_the_owner_and_refuses_everyone_else() {
+        let euid = unsafe { libc::geteuid() };
+
+        let (_dir, path) = file_with(SECRET.as_bytes(), 0o600);
+        assert_eq!(read_owner_only(&path, euid).unwrap(), SECRET);
+
+        let reason = read_owner_only(&path, euid + 1).expect_err("owner mismatch is refused");
+        assert!(!reason.contains(SECRET), "{reason}");
+        assert!(reason.contains("owned by"), "{reason}");
+    }
+
+    #[test]
+    fn owner_only_refuses_any_group_or_other_access_not_just_write() {
+        let euid = unsafe { libc::geteuid() };
+        // `read` accepts these for a trusted, read-only mounted secret;
+        // `read_owner_only` must not, since nothing but the owner may reach
+        // this secret at all.
+        for mode in [0o640, 0o644, 0o604, 0o606, 0o620, 0o666] {
+            let (_dir, path) = file_with(SECRET.as_bytes(), mode);
+            let reason = read_owner_only(&path, euid).expect_err("group/other access is refused");
+            assert!(!reason.contains(SECRET), "{reason}");
+            assert!(
+                reason.contains("group or others"),
+                "mode {mode:o}: {reason}"
+            );
         }
     }
 }
