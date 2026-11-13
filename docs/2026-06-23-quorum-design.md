@@ -866,6 +866,21 @@ only through an explicit outside request)
   `**/*.md` or `.claude/**` rule: `.claude/skills/quorum/SKILL.md`, `schema.sql`, and the
   served web assets are `include_str!` build inputs. The daemon's CI remains the
   unconditional full-suite backstop.
+- **CI branch-base check:** the pre-push hook's branch-base gate also runs as the
+  `branch-base` pull-request workflow (`.github/workflows/branch-base.yml` →
+  `scripts/ci-branch-base.sh` → `preflight.sh --quick --pr-base`), so it still applies
+  to pushes made without hooks. It reproduces the hook's ref tuple: `opened`/`reopened`
+  judges the whole branch-owned range like a new-branch push; `synchronize` judges only
+  that push as a continuation from the previous PR head with the PR base as continuation
+  base. Commits on `origin/main` or `origin/develop` are excluded. Because a PR, unlike a
+  push, has a target, a PR into `main` that carries `origin/develop` commits must be a
+  develop→main sync (merge commits only outside both mainlines). Accepted gaps: the check
+  is stateless and per push, so a later clean push turns a failed check green while the
+  earlier push's commits remain; reopened or rewritten heads fall back to a whole-branch
+  check that can fail a legitimate multi-session remediation PR; retargeting does not
+  re-run it; and `pull_request` runs the PR's own copy of the workflow and scripts, so it
+  catches mistakes, not attacks. The workflow has no concurrency group, so runs are never
+  cancelled.
 - **Rework cap:** per-task, configured, and frozen at daemon adoption. The serve
   config knob `max_rework` (validated `>= 1`; unset falls back to the compiled
   default `REWORK_CAP = 7`) is stamped onto each task inside the *same* write
