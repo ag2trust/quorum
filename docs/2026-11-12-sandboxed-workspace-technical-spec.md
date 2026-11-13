@@ -36,6 +36,10 @@ directory would hand the sandbox the daemon's hooks and config.
 
 ## Goals
 
+This design adds a second workspace model, clone mode, beside today's linked worktrees (see
+"Mode decision"). Clone mode is opt-in; linked-worktree mode stays the default. The goals below
+describe clone mode, except the last two.
+
 - The daemon executes no repository code: no hooks, filters, drivers, configured commands,
   tests, preflight, or repository scripts, in any deployment profile.
 - A writing role's workspace is a self-contained clone. A read-only role's workspace is an
@@ -54,10 +58,14 @@ directory would hand the sandbox the daemon's hooks and config.
   fill its volume.
 - Read-only roles are served diffs, history, file lists, and trees from the private repository
   as files, and have no repository to run `git` against.
-- Local operators keep working, with one documented migration.
+- Linked-worktree mode stays the default, and its worst paths are hardened early (see "Mode
+  decision").
+- Local operators who keep the default keep working without a migration. Selecting clone mode
+  takes one documented migration.
 
 ## Non-goals
 
+- Removing the linked-worktree mode, or making clone mode the default.
 - The sandbox launcher interface (typed run/stop/inspect). This spec names the seam it plugs
   into and the two things it must carry (mounts and the export step); the interface itself is
   separate work.
@@ -74,7 +82,7 @@ directory would hand the sandbox the daemon's hooks and config.
 | Term | Meaning |
 |---|---|
 | **Private repository** | A bare repository the daemon creates and alone uses, at `private_repo`. Never mounted into, linked from, or shared with a run. |
-| **Workspace** | A run's directory under `worktree_base`: a self-contained clone for a writing role, or an exported tree with no `.git` for a read-only role (planner, reviewer, review-only, continuation reviewer). Written by runs; untrusted in its entirety. |
+| **Workspace** | In clone mode, a run's directory under `worktree_base`: a self-contained clone for a writing role, or an exported tree with no `.git` for a read-only role (planner, reviewer, review-only, continuation reviewer). Written by runs; untrusted in its entirety. |
 | **Staging directory** | A daemon-only directory on the same filesystem as `worktree_base`, where a workspace is built before it is handed to a run. |
 | **Session directory** | A per-task directory outside the workspace where the coding runner keeps its own conversation state so a later run of the same task can resume. Written by runs; untrusted; the daemon never parses it except through the untrusted-file reader. |
 | **Run outbox** | A per-run directory, outside the workspace, where the run leaves its bundle. Written by the run; untrusted. |
@@ -86,11 +94,13 @@ directory would hand the sandbox the daemon's hooks and config.
 Deployment profiles follow `docs/2026-08-17-github-collaboration-mcp-technical-spec.md`:
 
 - **Local permissive.** The local launcher. The agent shares the operator's machine and can
-  reach anything the operator can. The daemon still executes no repository code and never
-  shares a git directory with a run, but it does not claim a containment boundary.
-- **Isolated runtime.** An external launcher. The run sees only its workspace, its session
-  directory, and its outbox, reaches only the daemon's run-facing endpoints, and holds no
-  repository credential.
+  reach anything the operator can, unless its CLI's own restricted mode confines it. In clone
+  mode the daemon still executes no repository code and never shares a git directory with a
+  run, but it does not claim a containment boundary.
+- **Isolated runtime.** An external launcher. It needs clone mode, since a sandbox cannot use a
+  linked worktree (see "Problem"). The run sees only its workspace, its session directory, and
+  its outbox, reaches only the daemon's run-facing endpoints, and holds no repository
+  credential.
 
 ## Current-state audit
 
@@ -106,7 +116,7 @@ and bounds time and output (`worktree.rs:207-315`). Nothing else is hardened.
 | SAFE | 9 | Keep as is. Not repository code, or the agent process itself. |
 | MOVE | 28 | Keep the operation; run it against the private repository with the hardened environment. |
 | EMPTY-DIR | 11 | `gh` or repository-less `git`; run from a daemon-owned empty directory with an explicit repository or URL. |
-| REMOVE | 19 | Delete; the responsibility moves into the run, into workspace seeding, or into durable state. |
+| REMOVE | 19 | Not used in clone mode; the responsibility moves into the run, into workspace seeding, or into durable state. R1, R13's `git add -A`, R18, and R19 are also removed from linked-worktree mode; the other linked-worktree rows remain as that mode's implementation. |
 | HARDEN | 3 | File reads of run-written state; route through the untrusted-file reader. |
 
 Highest risk, in order:
@@ -127,57 +137,74 @@ Highest risk, in order:
    agent-written tree, so a planted file is launched as the next route's provider.
 
 No production path runs `preflight.sh`, tests, or another repository script directly. The only
-route to them is the hooks above, which this design removes.
+route to them is through the hooks, filters, and drivers above. The early hardening disables
+hooks in both modes; only clone mode removes the filter and driver routes.
 
 Outside the daemon, the operator's own tooling also executes `repo_dir` state:
 `scripts/serve-supervisor.sh:154-164` runs `git fetch`, `git merge --ff-only`, and
 `./dev-install.sh` in `repo_dir` on self-update. Hooks or config planted there through a linked
-worktree stay planted after migration, so migration reports them (see "Migration").
+worktree stay planted after migration, so migration reports them (see "Migration to clone
+mode").
 
 ## Mode decision
 
-**The clone model becomes the only workspace model.** It ships behind
-`workspace_mode = "linked-worktree" | "clone"` while the slices land. The default flips to
-`clone` once the clone path covers every role, and the linked-worktree path is deleted one
-release later.
+**Clone mode is opt-in, and linked-worktree mode stays the default.** `workspace_mode =
+"linked-worktree" | "clone"` selects the model, and `linked-worktree` is the default. Clone mode
+is for operators who run agents with less authority than the daemon: agents in a sandbox or a
+container, or under a CLI's own restricted mode. Linked-worktree mode is kept and is not
+scheduled for removal. While the slices land, clone mode starts only behind a hidden test-only
+flag. Operators can select it once the clone path covers every role.
+
+This is the owner's decision of 2026-11-13. An earlier draft made clone the only model: the
+default was to flip to `clone` and the linked-worktree path was to be deleted one release later.
 
 Rationale:
 
-- **It is right for local operators too.** The four highest-risk findings are just as
-  exploitable on a laptop. An agent that writes a hook today gets it run by the daemon with the
-  operator's GitHub credentials, whether or not a sandbox exists.
-- **Two git lifecycles would double the riskiest code.** `worktree.rs` and `recover.rs` are
-  about 3,600 production lines of serialized git state handling. Keeping both lifecycles
-  permanently would mean every lifecycle fix, recovery path, and adversarial test exists twice,
-  and the weaker path stays exploitable.
-- **The profile is a launcher choice, not a git model.** Local permissive and isolated runtime
-  differ only in where the run's processes, including the export step, execute. The daemon-side
-  model is identical, so the guarantee "the daemon executes no repository code" has one
-  implementation and one test suite.
-- **The temporary switch keeps `develop` green.** Each slice adds clone-mode behavior beside
-  the current behavior, with its own tests, and the default flips only when the clone path is
-  complete.
+- **A confined agent needs it.** When an agent runs with less authority than the daemon, any
+  repository code the daemon executes is an escalation. An agent that writes a hook, filter, or
+  driver today gets it run by the daemon with the operator's GitHub credentials, and the four
+  highest-risk findings are reachable from any agent that can write its worktree. Only clone
+  mode removes every one of those paths, and only clone mode works when the agent cannot see
+  the operator's checkout at all (see "Problem"). An unconfined local agent already holds the
+  operator's authority, so the daemon running its code is not an escalation. For such an agent
+  the early hardening below closes the worst paths, and the linked model's cheaper workspaces
+  remain a reasonable default.
+- **Keeping both models has a known cost.** `worktree.rs` and `recover.rs` are about 3,600
+  production lines of serialized git state handling. Keeping linked-worktree mode means every
+  lifecycle fix, recovery path, and adversarial test exists twice, once per model, and linked
+  mode stays exploitable through the keys the early hardening cannot neutralize (below). That
+  cost is accepted to keep the local default unchanged.
+- **The profile is a launcher choice, not a git model.** Within clone mode, local permissive and
+  isolated runtime differ only in where the run's processes, including the export step,
+  execute. The daemon-side model is identical, so the clone-mode guarantee "the daemon executes
+  no repository code" has one implementation and one test suite.
+- **The hidden switch keeps `develop` green.** Each slice adds clone-mode behavior beside the
+  current behavior, with its own tests, and operators can select clone mode only when the clone
+  path is complete.
 
-What local operators see after the flip: worker workspaces are full clones instead of linked
-worktrees, so they cost disk (see "Decisions"), read-only roles get an exported tree with no
-`.git`, and an agent's workspace has no `origin` remote. Agents already publish only through the
-daemon, so a missing remote changes nothing that works today. A daemon push no longer runs the
-repository's pre-push hook, so a repository that relied on that hook as a gate for daemon pushes
-must enforce the same checks in CI.
+What operators see when they select clone mode: worker workspaces are full clones instead of
+linked worktrees, so they cost disk (see "Decisions"), read-only roles get an exported tree with
+no `.git`, and an agent's workspace has no `origin` remote. Agents already publish only through
+the daemon, so a missing remote changes nothing that works today. Operators who keep the default
+see only the early hardening below. In both modes, a daemon push no longer runs the repository's
+pre-push hook, so a repository that relied on that hook as a gate for daemon pushes must enforce
+the same checks in CI.
 
-**Early hardening of the linked-worktree mode.** The worst paths should not wait for the flip.
-Once this repository's pre-push checks run in CI, the shared `git_command` gains, in both modes,
-an empty `core.hooksPath`, the protocol allowlist, `GIT_ATTR_SOURCE` for commands that do not
-check out files, signature programs set to `false`, and a push URL taken from configuration (or
-derived once at startup) instead of from the worktree. The planner view's `archive` already
-runs from a daemon-owned git directory that borrows only `repo_dir`'s object store (audit row
-M25, fixed ahead of this slice). Teardown also stops snapshotting worktrees with
-`git add -A` and retires their directories instead. The container image moves to a current git
-in the same change: its git 2.39 predates `GIT_ATTR_SOURCE` (2.41), so attribute isolation
-would otherwise be inactive in the image. This closes highest-risk findings 1 and 3, and the
+**Early hardening of the linked-worktree mode.** Linked-worktree mode stays the default, so its
+worst paths are hardened directly, ahead of clone mode. Once this repository's pre-push checks
+run in CI, the shared `git_command` gains, in both modes, an empty `core.hooksPath`, the
+protocol allowlist, `GIT_ATTR_SOURCE` for commands that do not check out files, signature
+programs set to `false`, and a push URL taken from configuration (or derived once at startup)
+instead of from the worktree. The planner view's `archive` already runs from a daemon-owned git
+directory that borrows only `repo_dir`'s object store (audit row M25, fixed ahead of this
+slice). Teardown also stops snapshotting worktrees with `git add -A` and retires their
+directories instead. The container image moves to a current git in the same change: its git 2.39
+predates `GIT_ATTR_SOURCE` (2.41), so attribute isolation would otherwise be inactive in the
+image. This closes highest-risk findings 1 and 3, and the
 hook half of finding 2. Linked mode stays exploitable through filter, driver, and transport keys
 an agent can write into the shared git directory, including `info/attributes`, which no
-command-line override neutralizes. Only the clone model removes that.
+command-line override neutralizes. Only clone mode removes that, so an operator who confines
+agents should select it.
 
 **Git LFS.** Daemon pushes have never uploaded LFS objects themselves; the LFS pre-push hook
 did. With hooks disabled, a push would publish pointer files without their objects. LFS is
@@ -453,7 +480,7 @@ that uses it, and logs the result.
     and the floor.
   - Below 2.43, the linked-worktree mode's early hardening logs a warning naming the version
     found, says that attribute isolation is inactive, and continues; that mode's hardening is
-    best effort anyway. The warning lasts until the linked-worktree mode is removed.
+    best effort anyway.
 - **Not version-dependent:** bundle object checking uses `index-pack --strict` and does not
   depend on 2.48's fetch-side bundle fsck.
 - **CI:** a job runs the hostile-git suites on the floor version as well as on a current
@@ -476,8 +503,10 @@ itself.
 
 **Source-scan test.** The existing test `production_git_commands_use_the_shared_constructor`
 (`quorum-core/src/git.rs:48`) is extended so that production code outside the
-private-repository module and the local launcher's export step must not construct a git
-command, use `-C`, or set `current_dir` for a `git` or `gh` process.
+private-repository module, the local launcher's export step, and the linked-worktree mode's own
+modules must not construct a git command, use `-C`, or set `current_dir` for a `git` or `gh`
+process. The linked-worktree exception is a fixed list of modules, so clone-mode code cannot
+grow a new `-C` site unnoticed.
 
 ## Workspace lifecycle
 
@@ -949,8 +978,8 @@ The internal API is
 `PrivateRepo::review_materials(base, head, limits) -> ReviewMaterials { dir, base_sha, head_sha, truncated }`.
 These materials and the exported tree are the input to the separate read-only role prompt work.
 Today's read-only prompts name `git` commands (`quorum/src/serve/reviewer.rs:218,477-492`) that
-cannot run in a workspace without `.git`. The default therefore does not flip to clone mode
-until that prompt work has landed.
+cannot run in a workspace without `.git`. Operators therefore cannot select clone mode until that
+prompt work has landed.
 
 The planner's frozen view is the exported tree of `refs/remotes/origin/<base>` at the frozen SHA
 in the private repository. That is today's view with two differences: the source is the private
@@ -1033,9 +1062,10 @@ default markers, and any resulting conflict goes to the agent, who resolves it i
 New `serve` keys, with the existing precedence (flag over file, unknown keys rejected):
 
 ```toml
-# Workspace git model. "linked-worktree" is deprecated and is removed one release after
-# "clone" becomes the default.
-workspace_mode = "clone"
+# Workspace git model: "linked-worktree" (default) or "clone" (opt-in, for agents that run with
+# less authority than the daemon; see "Mode decision").
+# workspace_mode = "clone"
+# The keys below apply to clone mode only.
 # Bare repository used only by the daemon. Default: <state dir>/repository.git.
 # private_repo = "/home/user/.quorum/repos/owner__name/repository.git"
 # The only URL Quorum fetches from and pushes to. If unset under the local launcher, it is read
@@ -1060,10 +1090,10 @@ superseded_workspace_retention_secs = 604800
 # git_fsck_ignore = ["missingEmail"]
 ```
 
-`worktree_base` keeps its name and now holds workspaces. `repo_dir` remains for the operator's
-checkout: self-update, and one-time URL derivation and migration. In clone mode no managed run
-touches it, and the daemon runs nothing in it except `git config --file` and the one-time
-migration fetch.
+`worktree_base` keeps its name and, in clone mode, holds workspaces. `repo_dir` remains for the
+operator's checkout: self-update, and one-time URL derivation and migration. In clone mode no
+managed run touches it, and the daemon runs nothing in it except `git config --file` and the
+one-time migration fetch.
 
 ## Failure modes
 
@@ -1104,10 +1134,11 @@ keep `current_dir(workspace)`. They must stop reading workspace files except thr
 `untrusted_fs` (Appendix A, HARDEN rows). Neither a provider executable nor a provider home may
 resolve relative to the workspace (REMOVE rows R18 and R19).
 
-## Migration for local operators
+## Migration to clone mode
 
-Migration runs on the first start with `workspace_mode = "clone"`, under the existing startup
-recovery, so no runs are alive.
+Operators who keep the default `linked-worktree` mode never migrate. An operator who selects
+clone mode migrates once, on the first start with `workspace_mode = "clone"`, under the existing
+startup recovery, so no runs are alive.
 
 **Preconditions (refuse to start, exit 2, listing what blocks):**
 
@@ -1163,16 +1194,17 @@ recovery, so no runs are alive.
    migration, which is idempotent: refs are set with expected-old values. Switching back to
    `linked-worktree` after the marker exists is refused with exit 2.
 
-Operators who pushed through the daemon and relied on a repository pre-push hook must move those
-checks to CI. For this repository, the hook's base-branch and formatting checks
-(`.githooks/pre-push`) must be required CI jobs before the early linked-mode hardening lands.
+In either mode, operators who pushed through the daemon and relied on a repository pre-push hook
+must move those checks to CI, because the early hardening disables hooks in both modes. For this
+repository, the hook's base-branch and formatting checks (`.githooks/pre-push`) must be required
+CI jobs before the early linked-mode hardening lands.
 `cargo fmt --all --check` already runs on every pull request (`.github/workflows/ci.yml:19-27`);
 it must also be a required check in branch protection. The base-branch check has no CI job yet.
 The `main` hotfix adding one is being prepared as a separate PR (see "Decisions").
 
 ## Security properties and residual risk
 
-Holds in both profiles once the default flips:
+Holds in clone mode, in both profiles:
 
 - The daemon runs no hook, filter, driver, configured command, test, preflight, or repository
   script.
@@ -1193,8 +1225,10 @@ Residual:
   the Rust pre-scan, `index-pack --strict`, size caps, process-group timeouts, Linux rlimits,
   and a current git. A git parser vulnerability remains a daemon risk. On macOS, memory bounds
   rest on the pre-scan alone.
-- The early linked-mode hardening leaves filter, driver, and transport keys in the shared git
-  directory reachable until the clone model is the only model.
+- In linked-worktree mode, which stays the default, the early hardening leaves filter, driver,
+  and transport keys in the shared git directory reachable. None of the clone-mode properties
+  above hold there. Operators whose agents run with less authority than the daemon should select
+  clone mode.
 - Merges read a sanitized subset of repository attributes. A git bug in how `merge-tree` applies
   the built-in `union`, `binary`, or `text` merge would be reachable from repository content.
   Rule 16's timeout and rlimits bound its cost, not its correctness.
@@ -1211,15 +1245,15 @@ Residual:
 The owner settled these on 2026-11-12. They were open questions in the first draft.
 
 1. **Git floor.** Clone mode refuses to start below git 2.43, with an error that names the
-   version found. The linked-worktree mode only warns, until that mode is removed. Quorum does
-   not gate on git security-release currency. The container image always ships a current git
-   (see "Hardened git invocation").
+   version found. The linked-worktree mode only warns. Quorum does not gate on git
+   security-release currency. The container image always ships a current git (see "Hardened
+   git invocation").
 2. **Clone cost.** Workers get a full, self-contained clone; there is no shallow seed. Read-only
    roles (planner, reviewer, review-only, continuation reviewer) get no `.git` at all: an
    exported tree of the frozen commit plus daemon-supplied review materials (diff, history, file
    lists) as files. They have no export step. Those materials are the input to the separate
-   read-only role prompt work, which must land before the default flips (see "Seed" and "Review
-   and planning materials").
+   read-only role prompt work, which must land before operators can select clone mode (see
+   "Seed" and "Review and planning materials").
 3. **Merge attributes.** Daemon-side merges (`merge-tree`) honor the tree's `.gitattributes`
    for git's built-in merge behaviors, such as `union`, `binary`, and `text`. Custom merge
    drivers stay impossible because no driver configuration exists in any configuration the
