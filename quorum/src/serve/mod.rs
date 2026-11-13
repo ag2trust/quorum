@@ -6473,6 +6473,18 @@ async fn cached_frozen_planner_view(
     Ok(path)
 }
 
+/// Well-known empty tree for the object format implied by `frozen_sha`, used
+/// as the planner archive's attribute source. Unknown formats fail closed.
+fn planner_view_empty_tree(frozen_sha: &str) -> Result<&'static str> {
+    match frozen_sha.len() {
+        40 => Ok("4b825dc642cb6eb9a060e54bf8d69288fbee4904"),
+        64 => Ok("6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"),
+        _ => Err(QuorumError::Io(format!(
+            "planner view: unsupported frozen base object id {frozen_sha}"
+        ))),
+    }
+}
+
 async fn frozen_planner_view_with_options(
     repo: &Path,
     frozen_sha: &str,
@@ -6512,10 +6524,29 @@ async fn frozen_planner_view_with_options(
             .tempdir()
             .map_err(|error| QuorumError::Io(format!("planner view failed: {error}")))?;
 
+        // QDEP-7 / audit row M25: the export must be verbatim and must not run
+        // a repository-configured signature program. `--worktree-attributes`
+        // with an empty-tree attribute source stops the archived tree's own
+        // `export-subst`/`export-ignore`/`eol` attributes from applying, and
+        // every signature program is `false` as defense in depth.
+        let empty_tree = planner_view_empty_tree(&frozen_sha)?;
         let mut archive_command =
             tokio::process::Command::from(quorum_core::git::git_command(&git_bin));
         archive_command
-            .args(["archive", "--format=tar", &frozen_sha])
+            .args([
+                "-c",
+                "gpg.program=false",
+                "-c",
+                "gpg.ssh.program=false",
+                "-c",
+                "gpg.x509.program=false",
+                "archive",
+                "--worktree-attributes",
+                "--format=tar",
+                "--end-of-options",
+                &frozen_sha,
+            ])
+            .env("GIT_ATTR_SOURCE", empty_tree)
             .current_dir(&repo)
             .kill_on_drop(true)
             .stdout(Stdio::piped())
@@ -65287,6 +65318,107 @@ exec /bin/cat '{stdout}'
             error.contains("archive exceeded 1024-byte limit"),
             "{error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_view_archive_runs_no_signature_program_and_keeps_export_subst_literal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?} failed", args);
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        let placeholder = "sig=$Format:%G?$ head=$Format:%H$\n";
+        std::fs::write(
+            repo.path().join(".gitattributes"),
+            "subst.txt export-subst\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("subst.txt"), placeholder).unwrap();
+        git(&["add", ".gitattributes", "subst.txt"]);
+        git(&["commit", "-qm", "export-subst"]);
+        let tree = git(&["rev-parse", "HEAD^{tree}"]);
+
+        // A hand-made gpgsig header is enough for `%G?` to verify the commit.
+        let commit_text = format!(
+            "tree {tree}\nauthor t <t@example.com> 0 +0000\ncommitter t <t@example.com> 0 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n AAAA\n -----END PGP SIGNATURE-----\n\nsigned\n"
+        );
+        let commit_file = repo.path().join("commit.txt");
+        std::fs::write(&commit_file, commit_text).unwrap();
+        let frozen = git(&[
+            "hash-object",
+            "-t",
+            "commit",
+            "-w",
+            commit_file.to_str().unwrap(),
+        ]);
+        std::fs::remove_file(&commit_file).unwrap();
+        git(&["reset", "-q", "--hard", &frozen]);
+
+        let tools = tempfile::tempdir().unwrap();
+        let tripwire_log = tools.path().join("tripwire.log");
+        let tripwire = tools.path().join("tripwire");
+        std::fs::write(
+            &tripwire,
+            format!(
+                "#!/bin/sh\necho \"$0 $*\" >> '{}'\nexit 1\n",
+                tripwire_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tripwire, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for key in ["gpg.program", "gpg.ssh.program", "gpg.x509.program"] {
+            git(&["config", key, tripwire.to_str().unwrap()]);
+        }
+
+        let view = frozen_planner_view_with_options(
+            repo.path(),
+            &frozen,
+            Path::new("git"),
+            Path::new("tar"),
+            Duration::from_secs(15),
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !tripwire_log.exists(),
+            "planner archive ran a signature program: {}",
+            std::fs::read_to_string(&tripwire_log).unwrap_or_default()
+        );
+        assert_eq!(
+            std::fs::read_to_string(view.path().join("subst.txt")).unwrap(),
+            placeholder,
+            "planner view expanded export-subst"
+        );
+        assert_eq!(
+            std::fs::read_to_string(view.path().join(".gitattributes")).unwrap(),
+            "subst.txt export-subst\n"
+        );
+    }
+
+    #[test]
+    fn planner_view_empty_tree_fails_closed_for_unknown_object_format() {
+        assert_eq!(
+            planner_view_empty_tree(&"a".repeat(40)).unwrap(),
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+        );
+        assert_eq!(
+            planner_view_empty_tree(&"a".repeat(64)).unwrap(),
+            "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
+        );
+        assert!(planner_view_empty_tree("abc").is_err());
     }
 
     #[cfg(unix)]
