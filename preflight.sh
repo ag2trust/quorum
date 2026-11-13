@@ -889,17 +889,18 @@ if [ -f Dockerfile ] && [ -x docker/entrypoint_test.sh ] \
     DOCKER_SERVER_ARCH=$(docker version --format '{{.Server.Arch}}') \
       && [ -n "$DOCKER_SERVER_ARCH" ] \
       || fail "cannot read Docker server architecture"
-    if [ "$DOCKER_SERVER_ARCH" = amd64 ]; then
-      VERIFY_SKIP_REPLACE_SUITES= ./docker/verify.sh "$PREFLIGHT_IMAGE_TAG" \
-        || fail "Docker image verification"
-    else
+    # Always set explicitly so a value inherited from the caller's environment
+    # can never request a skip on an amd64 server.
+    VERIFY_SKIP_REPLACE_SUITES=
+    if [ "$DOCKER_SERVER_ARCH" != amd64 ]; then
       REPLACE_SUITES_SKIPPED=1
+      VERIFY_SKIP_REPLACE_SUITES="Docker server is $DOCKER_SERVER_ARCH, not amd64"
       printf 'PREFLIGHT: skipping container-replacement suites — Docker server is %s, not amd64; required CI enforces them\n' \
         "$DOCKER_SERVER_ARCH"
-      VERIFY_SKIP_REPLACE_SUITES="Docker server is $DOCKER_SERVER_ARCH, not amd64" \
-        ./docker/verify.sh "$PREFLIGHT_IMAGE_TAG" \
-        || fail "Docker image verification"
     fi
+    VERIFY_SKIP_REPLACE_SUITES="$VERIFY_SKIP_REPLACE_SUITES" \
+      ./docker/verify.sh "$PREFLIGHT_IMAGE_TAG" \
+      || fail "Docker image verification"
   else
     printf 'PREFLIGHT: skipping linux/amd64 container build — no container-specific changes (required CI still runs it; use --docker to force locally)\n'
   fi
