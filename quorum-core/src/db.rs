@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 79;
+pub const SCHEMA_VERSION: i64 = 83;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1556,6 +1556,30 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                      ON agent_runs(failed_agent_run_id)",
             )?;
         }
+        // v80 adds the owner-selected review-only/no-rework mode. Additive: every
+        // historical row keeps `0`, so existing `--review-pr` tasks retain their
+        // review + remediation lifecycle.
+        if current < 80 && !column_exists(conn, "tasks", "no_rework")? {
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN no_rework INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        // v81 = recover_refs (new CREATE TABLE IF NOT EXISTS in SCHEMA_SQL; additive,
+        // so fresh DBs and upgrades alike materialize it above — no ALTER needed).
+        // v82 = planner_submission_calls, the per-call `submit_plan` ledger. Net-new
+        // table — the `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL (which runs above)
+        // handles fresh DBs and upgrades alike; no ALTER or backfill needed.
+        // v83 records the provider error behind a reviewer provision strike. Additive:
+        // existing rows keep their counts and read NULL, meaning no recorded error.
+        if current < 83
+            && !column_exists(conn, "reviewer_provision_attempts", "last_provider_error")?
+        {
+            conn.execute(
+                "ALTER TABLE reviewer_provision_attempts ADD COLUMN last_provider_error TEXT",
+                [],
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1760,6 +1784,53 @@ mod tests {
         }
     }
 
+    /// A v79 database predates the review-only/no-rework mode. Upgrading adds
+    /// `tasks.no_rework` with a zero default for existing rows (so historical
+    /// `--review-pr` tasks keep remediation), and a second open is a no-op.
+    #[test]
+    fn v79_to_v80_adds_no_rework_column_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v79-no-rework.db");
+        {
+            let raw = Connection::open(&path).unwrap();
+            apply_pragmas(&raw).unwrap();
+            migrate(&raw).unwrap();
+            raw.execute_batch(
+                "INSERT INTO tasks(title, status, created_by, created_at, updated_at, review_only)
+                     VALUES ('legacy review', 'in-review', 'owner', 1, 1, 1);
+                 ALTER TABLE tasks DROP COLUMN no_rework;
+                 PRAGMA user_version=79;",
+            )
+            .unwrap();
+            assert!(!column_exists(&raw, "tasks", "no_rework").unwrap());
+        }
+        let migrated = open(&path).unwrap();
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert!(column_exists(&migrated, "tasks", "no_rework").unwrap());
+        let (review_only, no_rework): (i64, i64) = migrated
+            .query_row(
+                "SELECT review_only, no_rework FROM tasks WHERE title='legacy review'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((review_only, no_rework), (1, 0));
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        assert!(column_exists(&reopened, "tasks", "no_rework").unwrap());
+        assert_eq!(
+            reopened
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
     /// A v73 database (schema fixed at `PRAGMA user_version=73` before v74's
     /// per-attempt plan snapshot column landed) migrates forward on open and
     /// the ALTER stays idempotent across a second open on the same file.
@@ -1839,6 +1910,143 @@ mod tests {
                 |row| row.get::<_, bool>(0),
             )
             .unwrap());
+    }
+
+    /// A v81 database predates the `submit_plan` call ledger. Upgrading must
+    /// create it without touching durable planner submissions, and a later
+    /// ordinary open must preserve ledger rows.
+    #[test]
+    fn v81_to_v82_adds_planner_submission_calls_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v81-planner-submission-calls.db");
+        {
+            let raw = Connection::open(&path).unwrap();
+            apply_pragmas(&raw).unwrap();
+            migrate(&raw).unwrap();
+            raw.execute_batch(
+                "DROP TABLE planner_submission_calls;
+                 INSERT INTO planner_submissions(run_id, graph_id, response_json, rejections,
+                                                 accepted_at)
+                     VALUES ('run-seeded', 7, '{\"kind\":\"plan\"}', 2, 100);
+                 PRAGMA user_version=81;",
+            )
+            .unwrap();
+        }
+
+        let seeded = |conn: &Connection| -> (i64, String, i64, i64) {
+            conn.query_row(
+                "SELECT graph_id, response_json, rejections, accepted_at
+                 FROM planner_submissions WHERE run_id='run-seeded'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+        };
+        let expected = (7, "{\"kind\":\"plan\"}".to_string(), 2, 100);
+
+        let migrated = open(&path).unwrap();
+        assert_eq!(seeded(&migrated), expected);
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        // The table exists because this insert succeeds against its full shape.
+        migrated
+            .execute(
+                "INSERT INTO planner_submission_calls
+                     (run_id, seq, received_at, accepted, rejection_category)
+                 VALUES ('run-seeded', 1, 200, 0, 'validation')",
+                [],
+            )
+            .unwrap();
+
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        let ledger_row: (i64, i64, i64, String) = reopened
+            .query_row(
+                "SELECT seq, received_at, accepted, rejection_category
+                 FROM planner_submission_calls WHERE run_id='run-seeded'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(ledger_row, (1, 200, 0, "validation".to_string()));
+        assert_eq!(seeded(&reopened), expected);
+        assert_eq!(
+            migrate(&reopened).unwrap().migrated_from,
+            SCHEMA_VERSION,
+            "a current database re-enters migrate as a no-op"
+        );
+    }
+
+    /// A v82 database predates the stored provider error. Upgrading must add the
+    /// column without disturbing strike rows, and rerunning the migration must
+    /// not re-ALTER or clobber a stored error.
+    #[test]
+    fn v82_to_v83_adds_provider_error_column_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v82-provider-error.db");
+        {
+            let raw = Connection::open(&path).unwrap();
+            apply_pragmas(&raw).unwrap();
+            migrate(&raw).unwrap();
+            raw.execute_batch(
+                "ALTER TABLE reviewer_provision_attempts DROP COLUMN last_provider_error;
+                 INSERT INTO reviewer_provision_attempts
+                     (task_id, pr_number, role, head_sha, attempts, last_attempt_at)
+                     VALUES (7, 42, 'r1', 'sha-seeded', 2, 100);
+                 PRAGMA user_version=82;",
+            )
+            .unwrap();
+        }
+
+        let seeded = |conn: &Connection| -> (String, i64, i64, Option<String>) {
+            conn.query_row(
+                "SELECT head_sha, attempts, last_attempt_at, last_provider_error
+                 FROM reviewer_provision_attempts
+                 WHERE task_id=7 AND pr_number=42 AND role='r1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+        };
+
+        let mut migrated = open(&path).unwrap();
+        assert_eq!(seeded(&migrated), ("sha-seeded".to_string(), 2, 100, None));
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        // The surviving row keeps counting toward the same budget.
+        assert_eq!(
+            crate::provision_attempts::record_provider_failure(
+                &mut migrated,
+                7,
+                42,
+                "r1",
+                "sha-seeded",
+                "boom"
+            )
+            .unwrap(),
+            3
+        );
+
+        // Force the v83 branch to run again over the already-added column.
+        migrated.execute_batch("PRAGMA user_version=82;").unwrap();
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        let after_rerun = seeded(&reopened);
+        assert_eq!(after_rerun.1, 3);
+        assert_eq!(after_rerun.3.as_deref(), Some("boom"));
+        assert_eq!(
+            migrate(&reopened).unwrap().migrated_from,
+            SCHEMA_VERSION,
+            "a current database re-enters migrate as a no-op"
+        );
     }
 
     /// A v75 database predates branch synchronization storage. Upgrading must

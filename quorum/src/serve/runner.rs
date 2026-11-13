@@ -687,6 +687,15 @@ const GATE_WRAPPER: &str = concat!(
     "exec \"$@\""
 );
 
+/// Remove operator secrets that no managed process may inherit, whatever its
+/// role or MCP wiring. The orchestrator MCP token is not a Quorum input at
+/// all, but an operator who exported it must not thereby hand a managed
+/// agent coordinator authority. Call this after applying a spec's
+/// environment so nothing re-adds it.
+pub(crate) fn strip_operator_secrets(command: &mut Command) {
+    command.env_remove(crate::orchestrator_mcp::TOKEN_ENV);
+}
+
 /// Start a process-group leader that waits on a close-on-exec pipe before it
 /// replaces itself with `program`. Provider adapters append their normal argv,
 /// environment, cwd, and stdio configuration to the returned command.
@@ -1190,6 +1199,20 @@ impl RunnerProc {
         }
     }
 
+    /// Failure evidence for a one-shot turn that ended without a response.
+    /// An exited process is finalized first so its buffered records count;
+    /// the captured output is returned so the caller keeps its usage. This
+    /// reaps an exited leader, so an owner that signals the numeric pgid must
+    /// retire it first.
+    pub async fn failed_turn_evidence(&mut self) -> (Option<RunnerFailure>, Vec<CapturedOutput>) {
+        let captured = if matches!(self.try_wait(), Ok(Some(_))) {
+            self.finalize_pre_authoritative_evidence().await
+        } else {
+            Vec::new()
+        };
+        (self.observed_pre_authoritative_failure(), captured)
+    }
+
     pub fn observed_planner_live_failure(&self) -> Option<RunnerFailure> {
         self.failure_tracker().observed_planner_live_failure()
     }
@@ -1217,10 +1240,28 @@ impl RunnerProc {
     /// Normalize a line for immediate stream delivery. Grok terminal records
     /// are raw evidence first; their lifecycle events are exposed separately
     /// only after the adapter proves terminal process evidence is complete.
-    pub fn normalize_stream_line(&self, raw: &str) -> Vec<AgentEvent> {
+    pub fn normalize_stream_line(&mut self, raw: &str) -> Vec<AgentEvent> {
         match self {
             Self::Grok(_) => GrokProc::normalize_stream_line(raw),
-            Self::Claude(_) | Self::Codex(_) => normalize_line(self.kind(), raw),
+            Self::Claude(proc) => proc.normalize_stream_line(raw),
+            Self::Codex(_) => normalize_line(self.kind(), raw),
+        }
+    }
+
+    /// True while the provider has a tool call or background task that has
+    /// not finished. Only Claude's persistent child reports this today.
+    pub fn has_outstanding_work(&self) -> bool {
+        matches!(self, Self::Claude(proc) if proc.has_outstanding_work())
+    }
+
+    pub fn unfed_turn_open(&self) -> bool {
+        matches!(self, Self::Claude(proc) if proc.unfed_turn_open())
+    }
+
+    pub fn unfed_turns_since_feed(&self) -> u32 {
+        match self {
+            Self::Claude(proc) => proc.unfed_turns_since_feed(),
+            Self::Codex(_) | Self::Grok(_) => 0,
         }
     }
 
@@ -1316,15 +1357,20 @@ impl RunnerProc {
     }
 }
 
+/// The classified failure carried by a launch `io::Error`, if any.
+pub fn launch_failure(error: &std::io::Error) -> Option<RunnerFailure> {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<RunnerFailure>())
+        .cloned()
+}
+
 fn classify_launch_error(kind: AgentKind, error: std::io::Error) -> RunnerFailure {
     // A Claude child can exit while the first stdin write races it. Its
     // adapter has already waited for the exit and classified its bounded
     // stderr, so preserve that evidence instead of letting BrokenPipe win.
-    if let Some(failure) = error
-        .get_ref()
-        .and_then(|source| source.downcast_ref::<RunnerFailure>())
-    {
-        return failure.clone();
+    if let Some(failure) = launch_failure(&error) {
+        return failure;
     }
     let disposition = match error.kind() {
         std::io::ErrorKind::TimedOut
@@ -1384,7 +1430,8 @@ impl AgentKind {
         } else {
             Err(format!(
                 "unknown model '{model}': cannot resolve provider \
-                 (expected claude-*/Claude alias, supported OpenAI model, grok-4.5, or grok-4.6)"
+                 (expected claude-*/Claude alias, supported OpenAI model, or supported Grok model: {})",
+                super::grok_agent::SUPPORTED_MODELS.join(", ")
             ))
         }
     }
@@ -1464,6 +1511,20 @@ pub enum AgentEvent {
     /// events). Not terminal.
     MidTurnUsage {
         tokens: i64,
+    },
+    /// Provider progress without turn semantics: a tool call returned, a
+    /// background task changed state, or a provider record the daemon must
+    /// observe but never act on (e.g. a result for a turn it did not feed).
+    /// Refreshes the idle watchdog only.
+    Liveness {
+        summary: String,
+    },
+    /// Usage reported by a provider `result` for a turn the daemon did not
+    /// feed (self-continuation). Never terminal, but its spend still counts
+    /// against the slot's token and cost budgets.
+    UnfedTurnUsage {
+        usage: Option<TokenUsage>,
+        cost_usd: Option<f64>,
     },
 }
 
@@ -2855,9 +2916,26 @@ mod tests {
 
     #[test]
     fn normalize_unknown_event_type_is_inert() {
-        let line = r#"{"type":"system","message":"init"}"#;
+        let line = r#"{"type":"mystery","message":"init"}"#;
         let events = normalize_claude_line(line);
         assert!(events.is_empty(), "unknown events must be inert");
+        let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#;
+        assert!(normalize_claude_line(line).is_empty());
+    }
+
+    #[test]
+    fn normalize_system_and_tool_result_lines_are_liveness_only() {
+        for line in [
+            r#"{"type":"system","subtype":"task_started","task_id":"b1","description":"tests"}"#,
+            r#"{"type":"system","subtype":"init"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}"#,
+        ] {
+            let events = normalize_claude_line(line);
+            assert!(
+                matches!(events.as_slice(), [AgentEvent::Liveness { .. }]),
+                "{line} must refresh liveness without turn semantics: {events:?}"
+            );
+        }
     }
 
     #[test]
@@ -2936,9 +3014,16 @@ mod tests {
     fn for_model_grok_is_exact_and_closed() {
         assert_eq!(AgentKind::for_model("grok-4.5").unwrap(), AgentKind::Grok);
         assert_eq!(AgentKind::for_model("grok-4.6").unwrap(), AgentKind::Grok);
+        assert_eq!(AgentKind::for_model("grok-4.7").unwrap(), AgentKind::Grok);
         assert!(AgentKind::for_model("grok").is_err());
-        assert!(AgentKind::for_model("grok-4.7").is_err());
+        assert!(AgentKind::for_model("grok-4.7-build-fast").is_err());
         assert!(AgentKind::for_model("/opt/bin/grok").is_err());
+
+        let error = AgentKind::for_model("grok-4.7-build-fast").unwrap_err();
+        assert!(
+            error.contains(&crate::serve::grok_agent::SUPPORTED_MODELS.join(", ")),
+            "{error}"
+        );
     }
 
     #[test]

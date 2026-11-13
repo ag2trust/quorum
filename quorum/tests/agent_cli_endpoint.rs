@@ -390,6 +390,8 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
             r#"{"category":"boundary-violation","affected_task":102,"violated_assigned_boundary":"worker-only file","evidence":["changed another task"]}"#,
         ],
     ));
+    let reason_file = root.path().join("reason.txt");
+    std::fs::write(&reason_file, "need the schema decision\n").unwrap();
     let reaction = success_id(command(
         &home,
         &endpoint,
@@ -402,6 +404,8 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
             "999",
             "--state",
             "blocked",
+            "--reason-file",
+            reason_file.to_str().unwrap(),
         ],
     ));
     let worker_note_file = root.path().join("worker-note.txt");
@@ -503,7 +507,7 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
                 103,
                 None,
                 None,
-                None,
+                Some("need the schema decision".into()),
                 Some("blocked".into()),
                 None
             ),
@@ -625,6 +629,8 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
                 "101",
                 "--state",
                 "blocked",
+                "--reason-file",
+                reason_file.to_str().unwrap(),
             ],
         ),
         (
@@ -650,6 +656,63 @@ fn managed_completion_is_endpoint_only_and_authoritative() {
         "rejected calls wrote mailbox rows"
     );
     daemon.stop();
+}
+
+#[test]
+fn react_blocked_and_needs_info_require_a_reason_and_reject_bad_text() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let endpoint = root.path().join("no-endpoint.sock");
+    for state in ["blocked", "needs-info"] {
+        // Missing reason: usage error before any endpoint connection.
+        command(
+            &home,
+            &endpoint,
+            "any-cap",
+            &["react", "--agent", "W", "--task-id", "1", "--state", state],
+        )
+        .code(2)
+        .stderr(predicates::str::contains("requires a reason"));
+        let nul = root.path().join("nul.txt");
+        std::fs::write(&nul, b"bad\0reason").unwrap();
+        command(
+            &home,
+            &endpoint,
+            "any-cap",
+            &[
+                "react",
+                "--agent",
+                "W",
+                "--task-id",
+                "1",
+                "--state",
+                state,
+                "--reason-file",
+                nul.to_str().unwrap(),
+            ],
+        )
+        .code(2);
+        let big = root.path().join("big.txt");
+        std::fs::write(&big, "x".repeat(9000)).unwrap();
+        command(
+            &home,
+            &endpoint,
+            "any-cap",
+            &[
+                "react",
+                "--agent",
+                "W",
+                "--task-id",
+                "1",
+                "--state",
+                state,
+                "--reason-file",
+                big.to_str().unwrap(),
+            ],
+        )
+        .code(2)
+        .stderr(predicates::str::contains("limit"));
+    }
 }
 
 #[test]

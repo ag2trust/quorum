@@ -448,6 +448,13 @@ fn render_queue(queue: &[QueueTask], sty: &Style, w: &mut dyn Write, width: usiz
             pr_str,
         );
         let _ = writeln!(w, "      {}", truncate(&q.title, width.saturating_sub(6)));
+        if let Some(reason) = q.hold_reason.as_deref() {
+            let _ = writeln!(
+                w,
+                "      {}",
+                sty.dim(&truncate(reason, width.saturating_sub(6)))
+            );
+        }
     }
 }
 
@@ -475,7 +482,10 @@ fn render_reviewing(reviewing: &[ReviewingTask], sty: &Style, w: &mut dyn Write,
             truncate(&task.title, 36),
             pr,
             truncate(reviewer, 16),
-            task.state,
+            match task.reason.as_deref() {
+                Some(reason) => format!("{} — {reason}", task.state),
+                None => task.state.clone(),
+            },
         );
     }
 }
@@ -538,9 +548,24 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
         } else {
             String::new()
         };
+        let review_unmerged_suffix = if b.review_unmerged.is_empty() {
+            String::new()
+        } else {
+            let deps: Vec<String> = b
+                .review_unmerged
+                .iter()
+                .map(|d| {
+                    format!(
+                        "dependency #{} is review-only closed without merge ({})",
+                        d.id, d.outcome
+                    )
+                })
+                .collect();
+            format!(" ({})", deps.join("; "))
+        };
         let _ = writeln!(
             w,
-            "  #{:<5} {:<8} {:<18} {:<8} {} waits on {}{}{}",
+            "  #{:<5} {:<8} {:<18} {:<8} {} waits on {}{}{}{}",
             b.id,
             b.provider.as_deref().unwrap_or("pending"),
             b.model.as_deref().unwrap_or("pending"),
@@ -549,6 +574,7 @@ fn render_blocked(blocked: &[BlockedTask], sty: &Style, w: &mut dyn Write, width
             dep,
             missing_suffix,
             deadlocked_suffix,
+            review_unmerged_suffix,
         );
         let _ = writeln!(w, "      {}", truncate(&b.title, width.saturating_sub(6)));
     }
@@ -716,6 +742,21 @@ fn render_decomposition(
 
 fn pipeline_state(p: &PipelineTask, sty: &Style) -> (String, String) {
     if p.status == "done" {
+        if let Some(outcome) = p.review_outcome.as_deref() {
+            // A review-only task that closed without merging (no rework).
+            let label = match outcome {
+                "changes_requested" => "review-only: changes requested",
+                "ci_failed" => "review-only: CI failed",
+                "merge_conflict" => "review-only: merge conflict",
+                _ => "review-only: closed",
+            };
+            let icon = if sty.color {
+                sty.dim("✋")
+            } else {
+                "[closed]".to_string()
+            };
+            return (icon, label.to_string());
+        }
         let icon = if sty.color {
             sty.green("✅")
         } else {
@@ -1129,6 +1170,7 @@ mod tests {
             tier_eff: "opus47·md".into(),
             priority: 10,
             pr: None,
+            hold_reason: None,
         });
         s.blocked.push(BlockedTask {
             id: 3,
@@ -1140,6 +1182,7 @@ mod tests {
             waiting_on: vec![1],
             deadlocked_on: vec![],
             missing_deps: vec![],
+            review_unmerged: vec![],
         });
 
         let mut buf = Vec::new();
@@ -1169,6 +1212,30 @@ mod tests {
                 .all(|line| !line.contains("gpt-5.6-terra") || !line.contains("c2")),
             "complexity leaked into model: {output}"
         );
+    }
+
+    #[test]
+    fn queue_renders_planner_hold_reason() {
+        let mut s = default_stats();
+        s.queue_tasks.push(QueueTask {
+            id: 80,
+            title: "decompose the router".into(),
+            provider: Some("pending".into()),
+            model: Some("pending".into()),
+            effort: Some("pending".into()),
+            tier_eff: "—".into(),
+            priority: 1,
+            pr: None,
+            hold_reason: Some("waiting for graph #74 (source #697) before planning".into()),
+        });
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("waiting for graph #74 (source #697) before planning"),
+            "{output}"
+        );
+        assert!(output.contains("decompose the router"), "{output}");
     }
 
     #[test]
@@ -1281,10 +1348,30 @@ mod tests {
             pr: Some(42),
             blocked: false,
             arbiter: None,
+            mode: None,
+            review_outcome: None,
         };
         let (icon, label) = pipeline_state(&done, &sty);
         assert_eq!(icon, "[merged]");
         assert_eq!(label, "merged");
+
+        let review_only_merged = PipelineTask {
+            mode: Some("review-only".into()),
+            ..done
+        };
+        let (icon, label) = pipeline_state(&review_only_merged, &sty);
+        assert_eq!((icon.as_str(), label.as_str()), ("[merged]", "merged"));
+
+        let review_only_closed = PipelineTask {
+            review_outcome: Some("changes_requested".into()),
+            ..review_only_merged
+        };
+        let (icon, label) = pipeline_state(&review_only_closed, &sty);
+        assert_eq!(icon, "[closed]");
+        assert_eq!(
+            label, "review-only: changes requested",
+            "a closed review-only verdict must never render as merged"
+        );
 
         let pending = PipelineTask {
             id: 4,
@@ -1296,6 +1383,8 @@ mod tests {
             pr: Some(99),
             blocked: false,
             arbiter: None,
+            mode: None,
+            review_outcome: None,
         };
         let (icon, _) = pipeline_state(&pending, &sty);
         assert_eq!(icon, "[working]");
@@ -1335,6 +1424,7 @@ mod tests {
             pr: Some(193),
             reviewer: Some("R1".into()),
             state: "reviewing".into(),
+            reason: None,
         });
         let sty = Style::plain();
         let mut buf = Vec::new();
@@ -1451,6 +1541,7 @@ mod tests {
             tier_eff: "pending".into(),
             priority: 0,
             pr: None,
+            hold_reason: None,
         });
         let sty = Style::plain();
         let mut buf = Vec::new();
@@ -1471,6 +1562,7 @@ mod tests {
             pr: Some(400),
             reviewer: None,
             state: "merging".into(),
+            reason: None,
         });
         let sty = Style::plain();
         let mut buf = Vec::new();
@@ -1480,6 +1572,48 @@ mod tests {
             output.contains("merging"),
             "merging state must render: {output}"
         );
+    }
+
+    #[test]
+    fn reviewing_section_renders_awaiting_reason() {
+        let mut s = default_stats();
+        s.reviewing.push(ReviewingTask {
+            id: 11,
+            title: "unclassified".into(),
+            pr: Some(401),
+            reviewer: None,
+            state: "awaiting reviewer".into(),
+            reason: Some("classification pending".into()),
+        });
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("awaiting reviewer — classification pending"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn reviewing_section_renders_approved_merge_pending_state() {
+        let mut s = default_stats();
+        s.reviewing.push(ReviewingTask {
+            id: 12,
+            title: "approved".into(),
+            pr: Some(402),
+            reviewer: None,
+            state: quorum_core::stats::APPROVED_MERGE_PENDING.into(),
+            reason: Some("all required reviews approved at head abc123".into()),
+        });
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output
+                .contains("approved, merge pending — all required reviews approved at head abc123"),
+            "{output}"
+        );
+        assert!(!output.contains("awaiting reviewer"), "{output}");
     }
 
     // ── #177: MERGE WAIT section ────────────────────────────────────
@@ -1612,6 +1746,7 @@ mod tests {
             waiting_on: vec![4, 6, 9],
             deadlocked_on: vec![],
             missing_deps: vec![],
+            review_unmerged: vec![],
         });
         let mut buf = Vec::new();
         render_with_style(&s, &Style::plain(), &mut buf);
@@ -1628,6 +1763,34 @@ mod tests {
     }
 
     #[test]
+    fn blocked_names_review_only_dependency_closed_without_merge() {
+        let mut s = default_stats();
+        s.blocked.push(BlockedTask {
+            id: 30,
+            title: "waits on rejected review".into(),
+            tier_eff: "opus46·md".into(),
+            provider: None,
+            model: None,
+            effort: None,
+            waiting_on: vec![12],
+            deadlocked_on: vec![],
+            missing_deps: vec![],
+            review_unmerged: vec![quorum_core::stats::ReviewUnmergedDep {
+                id: 12,
+                outcome: "changes_requested".into(),
+            }],
+        });
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        let line = output.lines().find(|l| l.contains("#30")).unwrap();
+        assert!(
+            line.contains("dependency #12 is review-only closed without merge (changes_requested)"),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn blocked_mixed_live_and_cancelled_deps() {
         let mut s = default_stats();
         s.blocked.push(BlockedTask {
@@ -1640,6 +1803,7 @@ mod tests {
             waiting_on: vec![3, 5, 7],
             deadlocked_on: vec![5],
             missing_deps: vec![],
+            review_unmerged: vec![],
         });
         let mut buf = Vec::new();
         render_with_style(&s, &Style::plain(), &mut buf);
@@ -1668,6 +1832,7 @@ mod tests {
             waiting_on: vec![404],
             deadlocked_on: vec![],
             missing_deps: vec![404],
+            review_unmerged: vec![],
         });
         s.blocked.push(BlockedTask {
             id: 31,
@@ -1679,6 +1844,7 @@ mod tests {
             waiting_on: vec![405],
             deadlocked_on: vec![],
             missing_deps: vec![],
+            review_unmerged: vec![],
         });
 
         let mut buf = Vec::new();
@@ -1918,6 +2084,7 @@ mod tests {
             pr: None,
             reviewer: Some("R-err".into()),
             state: "reviewing".into(),
+            reason: None,
         });
         let sty = Style::plain();
         let mut buf = Vec::new();

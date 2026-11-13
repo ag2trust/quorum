@@ -283,18 +283,7 @@ pub fn insert_worker_with_assignment_and_capability(
         role_assignment_id,
         spawned_at,
     )?;
-    let bound = tx.execute(
-        "UPDATE run_capabilities
-         SET agent_run_id=?2
-         WHERE run_id=?1 AND task_id=?3 AND agent=?4 AND role='worker'
-           AND revoked_at IS NULL AND agent_run_id IS NULL",
-        params![capability_run_id, run_id, task_id, agent_name],
-    )?;
-    if bound != 1 {
-        return Err(QuorumError::Io(
-            "initial worker capability could not bind its immutable run".into(),
-        ));
-    }
+    crate::capabilities::bind_worker_run_tx(&tx, capability_run_id, run_id, task_id, agent_name)?;
     tx.commit().map_err(map_sql_err)?;
     Ok(run_id)
 }

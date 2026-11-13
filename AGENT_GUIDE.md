@@ -26,6 +26,9 @@ Quorum is an opinionated Git/GitHub coding pipeline for agents. The only human-f
 surface is read-only status/inspection. Avoid human workflow features, manual pruning, or
 general-purpose orchestration abstractions.
 
+Quorum is unaware of any hosted deployment. Accounts, tenancy, billing, and hosting-specific
+code, configuration, or docs do not belong in this repository.
+
 ## Repository-wide invariants
 
 These contracts apply to every relevant change:

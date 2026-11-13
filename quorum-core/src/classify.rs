@@ -184,12 +184,34 @@ const INCOMPLETE_CLASSIFICATION_PREDICATE: &str = r#"
 /// Query active tasks and policy-parked tasks whose v2 classification is
 /// incomplete. Malformed legacy refs are candidates rather than a query error.
 pub fn unclassified_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>> {
-    let query = format!(
-        "SELECT id, revision, substr(title, 1, ?1), substr(body, 1, ?2) FROM tasks
-         WHERE (status IN ('open', 'working', 'in-review', 'rework', 'merging')
+    unclassified_tasks_where(
+        conn,
+        "(status IN ('open', 'working', 'in-review', 'rework', 'merging')
                 OR CASE WHEN status='failed' AND json_valid(refs)
                         THEN json_extract(refs, '$.classifier_policy_parked')=1
-                        ELSE 0 END)
+                        ELSE 0 END)",
+    )
+}
+
+/// Unclassified tasks that have already started (`working`, `in-review`,
+/// `rework`) — exactly the set a decomposition drain waits on
+/// (`tasks::count_started_non_terminal_excluding`). A review-only task is
+/// created directly `in-review` and unclassified, and its reviewer cannot
+/// dispatch until it is classified. A decomposition freeze therefore admits the
+/// classifier for this set only: these tasks can never become a planning
+/// source or claim new implementation work, and the drain cannot finish until
+/// they reach a terminal state.
+pub fn unclassified_started_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>> {
+    unclassified_tasks_where(conn, "status IN ('working', 'in-review', 'rework')")
+}
+
+fn unclassified_tasks_where(
+    conn: &Connection,
+    status_predicate: &str,
+) -> Result<Vec<TaskForClassification>> {
+    let query = format!(
+        "SELECT id, revision, substr(title, 1, ?1), substr(body, 1, ?2) FROM tasks
+         WHERE {status_predicate}
          AND {INCOMPLETE_CLASSIFICATION_PREDICATE}
          ORDER BY priority DESC, id
          LIMIT ?3"

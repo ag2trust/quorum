@@ -118,7 +118,13 @@ hosted service or a general-purpose workflow system.
 
 Review-only tasks (`--review-pr`) intentionally skip initial managed
 implementation. If blocking feedback requires code changes, the daemon enters
-rework and provisions managed remediation for the existing PR.
+rework and provisions managed remediation for the existing PR. Reviewer-only
+tasks (`--review-only`) also skip implementation but never enter rework: an
+approval merges normally, while requested changes, failed CI, or a merge
+conflict close the task as `done` with a durable `refs.review_outcome`, a
+findings note, a daemon-owned GitHub REQUEST_CHANGES review, and an owner alert.
+Such an unmerged close does not satisfy dependents: they stay blocked until their
+`depends_on` is edited.
 
 ## Managed roles
 
@@ -167,11 +173,13 @@ model = "claude-opus-5-5"
 effort = "high"
 
 [routing.classifier]
-terra = 100
+terra = 95
+opus = 5
 [routing.planner]
 opus = 100
 [routing.collector]
-terra = 100
+terra = 95
+opus = 5
 [routing.worker.3]
 terra = 80
 opus = 20
@@ -183,8 +191,13 @@ opus = 20
 Configuration requires pools for classifier, planner, collector, workers at
 complexities 1–5, and reviewers at complexities 1–5. Every referenced profile
 must be valid for its runner, every weight must be positive, and each pool must
-total exactly 100. The planner pool currently accepts Claude profiles; the
-complete example reflects that constraint.
+total exactly 100. Classifier and collector turns fail over to another pool
+profile when a provider is unavailable, so name two providers in those pools. A
+single-provider pool alerts the owner and retries only within each role's
+budget. Task classification stays pending, but planning classification holds its
+graph and fails the source task after two provider failures, and a collection
+dead-letters after five attempts. The planner pool currently accepts Claude
+profiles; the complete example reflects that constraint.
 
 Weights are not independent per-call randomness. For each pool Quorum builds a
 shuffled, durable 100-slot assignment epoch containing the configured number of
@@ -200,7 +213,9 @@ session. Even with no rework, it can spend tokens on the intake classifier, an
 optional planner and classifiers for proposed children, implementation, R1, R2,
 the post-merge collector, and qualifying follow-up planning when activated.
 Provider retries and an optional doctor turn can add further calls. A decomposed
-parent can also produce several child implementation and review paths.
+parent can also produce several child implementation and review paths. At most
+`max_graph_children_working` children of one graph implement at once; the key
+defaults to `cap`, must be at least 1, and is effectively bounded by `cap`.
 
 Set token, USD, and wall-clock ceilings in the
 [serve configuration](docs/serve-config.example.toml); the exact flags are also
@@ -318,10 +333,25 @@ Review the existing implementation and merge it if it is sound.
 EOF
 ```
 
+Review a PR without ever letting Quorum change it:
+
+```sh
+quorum task-create \
+  --created-by coordinator \
+  --title "Review PR #412" \
+  --review-only 412 \
+  --body-stdin <<'EOF'
+Review the external contribution; merge it only if it is sound.
+EOF
+```
+
 `--continue-pr` creates a managed worker from the recorded PR head. `--review-pr` skips the
-initial worker and starts with review. They are mutually exclusive. If a review-only PR
-receives blocking feedback, the daemon enters rework and provisions a managed remediation
-worker for that existing PR.
+initial worker and starts with review. If a `--review-pr` PR receives blocking feedback,
+the daemon enters rework and provisions a managed remediation worker for that existing PR.
+`--review-only` also starts with review, but Quorum never reworks the PR: approval merges,
+and requested changes, failed CI, or a merge conflict end the task as `done` with
+`refs.review_outcome` (`changes_requested`, `ci_failed`, or `merge_conflict`) and the
+findings. `--continue-pr`, `--review-pr`, and `--review-only` are mutually exclusive.
 
 Give implementation tasks a concrete outcome, relevant constraints, and a way to verify
 the result. The daemon chooses complexity, model, and effort. Managed agents receive their
@@ -362,7 +392,7 @@ result, `2` for bad input, and `3` for an internal or database failure.
 
 This is a non-binding view of ongoing directions, not a release schedule:
 
-- Grok Build worker routing is active for the exact `grok-4.5` and `grok-4.6`
+- Grok Build worker routing is active for the exact `grok-4.5`, `grok-4.6`, and `grok-4.7`
   models; attended real-CLI worker and lifecycle canaries remain
   required before production use.
 - Continuity for turn-oriented runners is being matured, including sticky and
@@ -375,6 +405,84 @@ This is a non-binding view of ongoing directions, not a release schedule:
   hosted Quorum service.
 - The existing loopback-only, read-only web dashboard may expand as local
   inspection needs are proven, while retaining its local, read-only posture.
+- `quorum orchestrator-mcp --listen <SOCKETADDR> --token-file <PATH> --identity <NAME>` serves
+  an HTTP MCP server at `/mcp` for an outside orchestrating agent: create, list, inspect,
+  cancel, and retry tasks, and message a managed agent, each through the same operation as its
+  CLI command and all as the one bound identity. It requires an operator bearer token in an
+  owner-only file, speaks plain HTTP, needs `--allowed-host` for a non-loopback bind, and is
+  started by the operator, not automatically. The design record's "Orchestrator MCP" section
+  states its trust model and limits.
+- `quorum agent-mcp --listen <SOCKETADDR>` serves the managed-run MCP adapter over
+  Streamable HTTP at `/mcp`, so a managed worker or reviewer can signal the daemon without
+  the `quorum` binary or its socket. It is separate from the server above: it binds
+  loopback only, speaks plain HTTP, authorizes each request by its run capability sent as
+  a bearer token, and sends no tool-list-changed notification. Nothing starts it
+  automatically, agent prompts still instruct the shell commands, and its GitHub tools
+  remain unimplemented.
+- `quorum inference-forwarder --listen <SOCKETADDR>` gives a sandboxed managed run model
+  access without the upstream credential. It mirrors `POST /v1/messages` only (streaming
+  or not) on loopback plain HTTP; a run points `ANTHROPIC_BASE_URL` at it and presents its
+  run capability as the API key. Each request is authorized by the daemon endpoint while
+  the run is live, then re-sent with the operator's credential; a stream is re-checked
+  every `QUORUM_INFERENCE_AUTH_RECHECK_SECS` (default 60) and cut once its run ends, or
+  once two intervals pass without the daemon confirming the run is live.
+  Nothing starts the forwarder automatically, and its logs carry metadata only.
+  - **Request allowlist.** Anything not listed is refused with 400, so a request cannot
+    make the upstream act for the run. Top-level fields: `model`, `max_tokens`, `messages`,
+    `system`, `tools`, `tool_choice`, `stream`, `temperature`, `top_p`, `top_k`,
+    `stop_sequences`, `metadata`, `thinking`, `output_config`, `cache_control`. Content
+    blocks: `text`, `tool_use`, `tool_result` (a string or text blocks), `thinking`,
+    `redacted_thinking`. Tools: only tools the run executes itself (no `type`, or
+    `custom`). Images and documents are refused even inline: their token cost is not
+    bounded by their size, so it could not be held against a cap.
+  - **Upstream credential.** Set exactly one of `QUORUM_INFERENCE_UPSTREAM_API_KEY_FILE`
+    (recommended) or `QUORUM_INFERENCE_UPSTREAM_API_KEY`; both or neither is a startup
+    error, and an empty variable does not count as set. The file form names a file read
+    once at startup, so the credential never appears in the forwarder's environment, in
+    container configuration, or in `docker inspect`; the path itself is not secret.
+    Symbolic links are followed. The file must be a regular file of at most 4 KiB that
+    its group and others cannot write; its owner and directory are trusted. Group and
+    other read access is allowed, so a read-only mounted secret owned by another user
+    (for example `0440` or `0444`) works; restrict who can read it through the mount.
+    The file holds the credential on one line of printable ASCII with no spaces; one
+    trailing newline is ignored. Errors name the variable and the reason, never the
+    credential.
+  - **Configuration** lives in the forwarder's own environment, which a run must not
+    inherit: the upstream credential (above), `QUORUM_INFERENCE_UPSTREAM_URL`
+    (default `https://api.anthropic.com`; `http://` only for a loopback host; TLS is
+    verified against the bundled public web roots only, so an upstream behind a private
+    certificate authority is not reachable), `QUORUM_INFERENCE_ALLOWED_MODELS` and
+    `QUORUM_INFERENCE_ALLOWED_BETAS` (comma-separated; unset allows any model and no
+    `anthropic-beta` value), `QUORUM_INFERENCE_RUN_TOKEN_CAP`,
+    `QUORUM_INFERENCE_RUN_MAX_IN_FLIGHT` (default 2),
+    `QUORUM_INFERENCE_UPSTREAM_TIMEOUT_SECS` (upstream silence, default 600), and
+    `QUORUM_INFERENCE_CLIENT_STALL_TIMEOUT_SECS` (a caller that stops reading, default 60).
+  - **Token cap.** The cap counts input plus output tokens, not cost: models are priced
+    very differently, so set `QUORUM_INFERENCE_ALLOWED_MODELS` whenever the cap is meant
+    to bound spend. Every request must state `max_tokens`. A request is admitted only if
+    the run's remaining allowance covers `max_tokens` plus an upper bound on its input
+    (one token per body byte, plus 1024 for upstream framing); that amount is held while
+    the request is in flight, so concurrent requests cannot pass the cap together, and
+    is replaced by the upstream's reported usage when the response completes. A response
+    that ends without final usage (the caller hung up, the stream broke, the upstream
+    went silent after the request was sent) is charged the whole hold. Counts are kept
+    in the forwarder's memory: they outlive a daemon restart and reset when the forwarder
+    restarts.
+  - **Compaction** (the upstream summarizing a long conversation) is off by default.
+    `QUORUM_INFERENCE_ALLOW_COMPACTION=1`, together with a `compact-*` value in
+    `QUORUM_INFERENCE_ALLOWED_BETAS`, admits `context_management` with compaction edits
+    only and `compaction` blocks in replayed assistant content. The upstream bills a
+    compaction step outside a response's top-level usage and itemizes it under
+    `usage.iterations`; the forwarder charges the itemized total, and doubles the input
+    part of the hold for such requests. A response to such a request that does not
+    itemize its steps, streamed or not, is charged its whole hold.
+  - **Limits.** 16 connections; 8 MiB request bodies (requests are text only; about twice
+    a million-token conversation); a 64 KiB request head; a connection takes no new
+    request after one hour. Worst case, each connection buffers one body at about four
+    times its size while it is checked, roughly 512 MiB in all, and one run can occupy
+    only its in-flight slots' share. A loopback peer with no capability can still occupy
+    connection slots with unfinished request heads until each times out (10 seconds):
+    the listener trusts loopback not to be hostile at that level.
 
 ## Working on Quorum
 

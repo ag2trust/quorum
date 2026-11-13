@@ -408,6 +408,7 @@ impl CodexProc {
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
         }
+        crate::serve::runner::strip_operator_secrets(&mut cmd);
         // A planner without an MCP server holds no endpoint authority, so every
         // coordination name is removed. A planner with one must keep its run
         // envelope: Codex copies exactly `AGENT_MCP_ENV_VARS` out of this
@@ -465,6 +466,7 @@ impl CodexProc {
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
         }
+        crate::serve::runner::strip_operator_secrets(&mut cmd);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -522,6 +524,7 @@ impl CodexProc {
         for (k, v) in env_vars {
             cmd.env(k, v);
         }
+        crate::serve::runner::strip_operator_secrets(&mut cmd);
         cmd.current_dir(worktree);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -580,6 +583,7 @@ impl CodexProc {
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
         }
+        crate::serve::runner::strip_operator_secrets(&mut cmd);
         cmd.current_dir(&spec.worktree);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -633,6 +637,7 @@ impl CodexProc {
         for (key, value) in env_vars {
             cmd.env(key, value);
         }
+        crate::serve::runner::strip_operator_secrets(&mut cmd);
         cmd.current_dir(worktree)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -844,8 +849,13 @@ fn classify_codex_error_text(message: &str) -> Option<FailureObservation> {
             "Codex reported the selected model unavailable",
         ));
     }
-    if message.contains("429 Too Many Requests")
-        && (message.contains("insufficient_quota") || message.contains("billing_hard_limit"))
+    // ChatGPT-plan exhaustion carries no status code. Match the stable phrase
+    // only: its leading "You’ve" uses a curly apostrophe.
+    if (message.contains("429 Too Many Requests")
+        && (message.contains("insufficient_quota") || message.contains("billing_hard_limit")))
+        || message
+            .to_ascii_lowercase()
+            .contains("hit your usage limit")
     {
         return Some(FailureObservation::classified(
             FailureDisposition::ProviderUnavailable,
@@ -949,6 +959,7 @@ fn strip_planner_coordination_env(cmd: &mut Command) {
         "QUORUM_RUN_ID",
         "GH_TOKEN",
         "GITHUB_TOKEN",
+        "QUORUM_ORCHESTRATOR_TOKEN",
     ] {
         cmd.env_remove(name);
     }
@@ -958,7 +969,13 @@ fn strip_planner_coordination_env(cmd: &mut Command) {
 /// envelope survives because the stdio MCP child needs it; the database home
 /// and every GitHub credential do not reach the provider or its child.
 fn strip_planner_mcp_ambient_authority(cmd: &mut Command) {
-    for name in ["QUORUM_HOME", "GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR"] {
+    for name in [
+        "QUORUM_HOME",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_CONFIG_DIR",
+        "QUORUM_ORCHESTRATOR_TOKEN",
+    ] {
         cmd.env_remove(name);
     }
 }
@@ -1285,7 +1302,7 @@ mod tests {
         std::fs::write(
             &fake_codex,
             r#"#!/bin/sh
-printf '{"repo":"%s","agent":"%s","run":"%s","endpoint":"%s","home":"%s","gh":"%s","openai":"%s"}\n' "$QUORUM_REPO" "$QUORUM_AGENT" "$QUORUM_RUN_ID" "$QUORUM_AGENT_ENDPOINT" "$QUORUM_HOME" "$GH_TOKEN" "$OPENAI_API_KEY"
+printf '{"repo":"%s","agent":"%s","run":"%s","endpoint":"%s","home":"%s","gh":"%s","openai":"%s","orchestrator":"%s"}\n' "$QUORUM_REPO" "$QUORUM_AGENT" "$QUORUM_RUN_ID" "$QUORUM_AGENT_ENDPOINT" "$QUORUM_HOME" "$GH_TOKEN" "$OPENAI_API_KEY" "$QUORUM_ORCHESTRATOR_TOKEN"
 "#,
         )
         .unwrap();
@@ -1309,6 +1326,7 @@ printf '{"repo":"%s","agent":"%s","run":"%s","endpoint":"%s","home":"%s","gh":"%
                     ),
                     ("QUORUM_HOME".into(), "home-authority".into()),
                     ("GH_TOKEN".into(), "gh-authority".into()),
+                    ("QUORUM_ORCHESTRATOR_TOKEN".into(), "operator-token".into()),
                     ("OPENAI_API_KEY".into(), "provider-auth".into()),
                 ],
                 ..test_spec()
@@ -1334,6 +1352,7 @@ printf '{"repo":"%s","agent":"%s","run":"%s","endpoint":"%s","home":"%s","gh":"%
             }
             assert_eq!(observed["home"], "");
             assert_eq!(observed["gh"], "");
+            assert_eq!(observed["orchestrator"], "");
             // Provider authentication is untouched in both shapes.
             assert_eq!(observed["openai"], "provider-auth");
         }
@@ -1520,6 +1539,35 @@ printf '{"quorum_agent":"%s","quorum_home":"%s","quorum_repo":"%s","quorum_run_i
         .expect("real Codex did not launch the configured MCP child")
     }
 
+    fn rollout_is_written(dir: &std::path::Path, thread_id: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                return rollout_is_written(&path, thread_id);
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.contains(thread_id)
+                && name.ends_with(".jsonl")
+                && entry.metadata().is_ok_and(|meta| meta.len() > 0)
+        })
+    }
+
+    /// Codex issues the thread ID before it persists the rollout, and resume
+    /// refuses a thread with no rollout. Wait before killing the fresh process.
+    async fn wait_for_rollout(codex_home: &std::path::Path, thread_id: &str) {
+        let sessions = codex_home.join("sessions");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !rollout_is_written(&sessions, thread_id) {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("real Codex did not persist the fresh thread rollout")
+    }
+
     /// Codex 0.148 clears an MCP child's environment before copying its
     /// defaults and the names in `env_vars`. Exercise that real provider
     /// boundary for a fresh provider-issued thread and its exact resume.
@@ -1583,6 +1631,7 @@ while IFS= read -r request; do :; done
                 other => panic!("fresh Codex did not issue a thread identity: {other:?}"),
             };
         wait_for_mcp_launches(&capture, 1).await;
+        wait_for_rollout(&codex_home, &thread_id).await;
         let _ = fresh.kill_and_reap().await;
 
         let resumed = CodexProc::spawn_resume(
@@ -2038,6 +2087,99 @@ while IFS= read -r _line; do :; done
             CodexProc::failure_observation(fixture).disposition,
             Some(FailureDisposition::ProfileUnavailable)
         );
+    }
+
+    /// Captured from a failed Codex reviewer turn; note the curly apostrophe.
+    const USAGE_LIMIT_MESSAGE: &str = "You\u{2019}ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at Oct 31st, 2026 3:41 AM.";
+
+    fn usage_limit_error_line(message: &str) -> String {
+        serde_json::json!({"type":"error","message":message}).to_string()
+    }
+
+    fn usage_limit_turn_failed_line(message: &str) -> String {
+        serde_json::json!({"type":"turn.failed","error":{"message":message}}).to_string()
+    }
+
+    #[test]
+    fn codex_usage_limit_on_both_failure_records_is_provider_wide() {
+        for message in [
+            USAGE_LIMIT_MESSAGE,
+            "You've hit your usage limit.",
+            "YOU HAVE HIT YOUR USAGE LIMIT",
+        ] {
+            for line in [
+                usage_limit_error_line(message),
+                usage_limit_turn_failed_line(message),
+            ] {
+                assert_eq!(
+                    CodexProc::failure_observation(&line).disposition,
+                    Some(FailureDisposition::ProviderUnavailable),
+                    "{line}"
+                );
+            }
+        }
+
+        // Replays the failed run's record order, where the informational
+        // stderr line must not outrank the classified provider evidence.
+        let failures = FailureTracker::for_kind(AgentKind::Codex);
+        failures.observe_stderr("Reading additional input from stdin...");
+        failures.observe_stdout(r#"{"type":"thread.started","thread_id":"fixture-thread"}"#);
+        failures.observe_stdout(r#"{"type":"turn.started"}"#);
+        failures.observe_stdout(&usage_limit_error_line(USAGE_LIMIT_MESSAGE));
+        failures.observe_stdout(&usage_limit_turn_failed_line(USAGE_LIMIT_MESSAGE));
+        assert_eq!(
+            failures.observed_failure().unwrap().disposition(),
+            FailureDisposition::ProviderUnavailable
+        );
+    }
+
+    #[test]
+    fn codex_rate_limit_and_oversized_usage_limit_stay_unclassified() {
+        for message in [
+            "unexpected status 429 Too Many Requests: rate_limit_exceeded".to_string(),
+            "You\u{2019}ve hit your rate limit. Try again in 20s.".to_string(),
+            "usage limit reached".to_string(),
+            format!("{USAGE_LIMIT_MESSAGE}{}", "x".repeat(16 * 1024)),
+        ] {
+            for line in [
+                usage_limit_error_line(&message),
+                usage_limit_turn_failed_line(&message),
+            ] {
+                let observation = CodexProc::failure_observation(&line);
+                assert_eq!(observation.disposition, None, "{line}");
+                assert!(observation.unknown_failure, "{line}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_limit_text_outside_provider_failure_records_is_not_a_runner_failure() {
+        let lines = [
+            serde_json::json!({"type":"item.completed","item":{"id":"msg","type":"agent_message","text":USAGE_LIMIT_MESSAGE}}),
+            serde_json::json!({"type":"item.completed","item":{"id":"cmd","type":"command_execution","command":"cat review.md","aggregated_output":USAGE_LIMIT_MESSAGE,"exit_code":1,"status":"failed"}}),
+            serde_json::json!({"type":"item.completed","item":{"id":"err","type":"error","message":USAGE_LIMIT_MESSAGE}}),
+        ]
+        .map(|line| line.to_string());
+        for line in &lines {
+            assert_eq!(
+                CodexProc::failure_observation(line),
+                FailureObservation::inert(),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            CodexProc::stderr_failure_observation(USAGE_LIMIT_MESSAGE).disposition,
+            None
+        );
+
+        let script = format!(
+            "printf '%s\\n' '{}' '{}' '{}' '{{\"type\":\"turn.completed\"}}'",
+            lines[0], lines[1], lines[2]
+        );
+        let mut proc = shell_proc(&script).await;
+        while proc.next_raw_line().await.is_some() {}
+        let status = wait_for_exit(&mut proc).await;
+        assert!(proc.classify_pre_authoritative_exit(status).is_none());
     }
 
     #[tokio::test]

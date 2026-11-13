@@ -33,32 +33,50 @@ pub struct ClassifierSlot {
     started_at: tokio::time::Instant,
     stdout_bytes: usize,
     pub usage: super::runner::TokenUsage,
+    /// Route evidence for provider failover. `None` keeps the slot route-blind.
+    pub route: Option<super::role_failover::RoleRoute>,
 }
 
 impl ClassifierSlot {
+    /// Classify a failed turn before the slot is reaped, keeping any usage
+    /// carried by the records this consumes.
+    pub async fn failure_evidence(&mut self) -> Option<super::runner::RunnerFailure> {
+        let (failure, captured) = self.proc.failed_turn_evidence().await;
+        add_captured_usage(&mut self.usage, self.proc.kind(), captured);
+        failure
+    }
+
     /// Terminate and reap the provider before dropping the isolated workspace.
     /// Claude's stream-json process is persistent after a Result event, so
     /// dropping the slot alone would leave the child alive in a deleted cwd.
     pub async fn kill_and_reap(mut self) -> super::runner::TokenUsage {
         let kind = self.proc.kind();
         let terminal_output = self.proc.kill_and_reap().await;
-        for captured in terminal_output {
-            let super::runner::CapturedOutput::Stdout(raw_line) = captured else {
-                continue;
-            };
-            for event in super::runner::normalize_line(kind, &raw_line) {
-                match event {
-                    AgentEvent::TurnCompleted {
-                        usage: Some(usage), ..
-                    }
-                    | AgentEvent::TurnFailed {
-                        usage: Some(usage), ..
-                    } => self.usage.saturating_add_assign(usage),
-                    _ => {}
+        add_captured_usage(&mut self.usage, kind, terminal_output);
+        self.usage
+    }
+}
+
+fn add_captured_usage(
+    total: &mut super::runner::TokenUsage,
+    kind: AgentKind,
+    captured: Vec<super::runner::CapturedOutput>,
+) {
+    for captured in captured {
+        let super::runner::CapturedOutput::Stdout(raw_line) = captured else {
+            continue;
+        };
+        for event in super::runner::normalize_line(kind, &raw_line) {
+            match event {
+                AgentEvent::TurnCompleted {
+                    usage: Some(usage), ..
                 }
+                | AgentEvent::TurnFailed {
+                    usage: Some(usage), ..
+                } => total.saturating_add_assign(usage),
+                _ => {}
             }
         }
-        self.usage
     }
 }
 
@@ -147,6 +165,7 @@ async fn spawn_classifier_configured_with_timeout(
         started_at,
         stdout_bytes: 0,
         usage: super::runner::TokenUsage::default(),
+        route: None,
     })
 }
 

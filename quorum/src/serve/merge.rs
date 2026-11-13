@@ -251,8 +251,10 @@ pub trait MergeExecutor: Send + Sync {
     /// #159: post or verify the daemon-owned REQUEST_CHANGES review carrying the
     /// blocking findings. Managed reviewer agents share the PR author's GitHub
     /// identity, so formal review state stays with the daemon's merge account.
-    fn ensure_changes_requested(&self, _pr: i64, _repo_dir: &Path, _body: &str) {
+    /// Returns `true` when the review is known to exist (verified or posted).
+    fn ensure_changes_requested(&self, _pr: i64, _repo_dir: &Path, _body: &str) -> bool {
         // Default no-op; real executor posts via `gh pr review --request-changes`.
+        true
     }
 }
 
@@ -1387,33 +1389,30 @@ impl MergeExecutor for GhMergeExecutor {
         parse_default_branch_ci(&stdout)
     }
 
-    fn ensure_changes_requested(&self, pr: i64, repo_dir: &Path, body: &str) {
+    fn ensure_changes_requested(&self, pr: i64, repo_dir: &Path, body: &str) -> bool {
         let pr_str = pr.to_string();
+        let post = || {
+            self.build_gh_cmd(
+                &["pr", "review", &pr_str, "--request-changes", "--body", body],
+                repo_dir,
+            )
+            .output()
+            .is_ok_and(|output| output.status.success())
+        };
         let mut cmd = self.build_gh_cmd(
             &["pr", "view", &pr_str, "--json", "reviewDecision"],
             repo_dir,
         );
         let output = match cmd.output() {
             Ok(o) if o.status.success() => o,
-            _ => {
-                // Can't check — post defensively.
-                let _ = self
-                    .build_gh_cmd(
-                        &["pr", "review", &pr_str, "--request-changes", "--body", body],
-                        repo_dir,
-                    )
-                    .output();
-                return;
-            }
+            // Can't check — post defensively.
+            _ => return post(),
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.contains("CHANGES_REQUESTED") {
-            let _ = self
-                .build_gh_cmd(
-                    &["pr", "review", &pr_str, "--request-changes", "--body", body],
-                    repo_dir,
-                )
-                .output();
+        if stdout.contains("CHANGES_REQUESTED") {
+            true
+        } else {
+            post()
         }
     }
 }
@@ -1499,7 +1498,7 @@ impl MergeExecutor for CommandMergeExecutor {
         // query, so use the immutable repository object the fixture exposes
         // as its simulated merge witness. Production uses GhMergeExecutor and
         // must still obtain GitHub's real mergeCommit above.
-        let output = std::process::Command::new("git")
+        let output = quorum_core::git::git_command("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(repo_dir)
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -1536,7 +1535,7 @@ impl MergeExecutor for CommandMergeExecutor {
     }
 
     fn head_sha(&self, _pr: i64, repo_dir: &Path) -> Option<String> {
-        let output = std::process::Command::new("git")
+        let output = quorum_core::git::git_command("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(repo_dir)
             .env("GIT_TERMINAL_PROMPT", "0")

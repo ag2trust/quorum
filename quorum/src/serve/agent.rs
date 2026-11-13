@@ -47,6 +47,9 @@ pub struct AgentProc {
     diagnostics: DiagnosticBuffer,
     failures: FailureTracker,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
+    /// Outstanding tool/background work and exact attribution of `result`
+    /// lines to daemon-fed turns (see `stream::ClaudeTurnTracker`).
+    turns: stream::ClaudeTurnTracker,
 }
 
 /// Tool allowlist for spawned agents (dontAsk auto-denies everything else).
@@ -192,10 +195,67 @@ impl AgentProc {
             Some(Event::Result { result, .. }) => Some(stream::result_text(result)),
             _ => None,
         };
+        let mut events = event.map(normalize_event).unwrap_or_default();
+        if events.is_empty() {
+            if let Some(summary) = stream::claude_liveness_summary(raw) {
+                events.push(AgentEvent::Liveness { summary });
+            }
+        }
         NormalizedLine {
-            events: event.map(normalize_event).unwrap_or_default(),
+            events,
             terminal_text,
         }
+    }
+
+    /// Normalize one line read from this child's stdout for the daemon's
+    /// lifecycle drain. Unlike the stateless `normalize_line`, this updates
+    /// outstanding-work tracking and demotes any `result` that does not end
+    /// the daemon-fed turn (self-continuation after a background task, stale
+    /// backlog) to `Liveness`, so it can never complete or fail a turn.
+    pub fn normalize_stream_line(&mut self, raw: &str) -> Vec<AgentEvent> {
+        let events = Self::normalize_line(raw).events;
+        if self.turns.observe_line(raw) != stream::LineAttribution::Unattributed {
+            return events;
+        }
+        events
+            .into_iter()
+            .flat_map(|event| match event {
+                AgentEvent::TurnCompleted { usage, cost_usd } => vec![
+                    AgentEvent::Liveness {
+                        summary: "ignored result for a turn the daemon did not feed".into(),
+                    },
+                    AgentEvent::UnfedTurnUsage { usage, cost_usd },
+                ],
+                AgentEvent::TurnFailed {
+                    message,
+                    usage,
+                    cost_usd,
+                } => vec![
+                    AgentEvent::Liveness {
+                        summary: format!(
+                            "ignored error result for a turn the daemon did not feed: {}",
+                            message.chars().take(80).collect::<String>()
+                        ),
+                    },
+                    AgentEvent::UnfedTurnUsage { usage, cost_usd },
+                ],
+                other => vec![other],
+            })
+            .collect()
+    }
+
+    /// True while a tool call awaits its result or a background task runs.
+    pub fn has_outstanding_work(&self) -> bool {
+        self.turns.has_outstanding_work()
+    }
+
+    /// Self-continued provider turns completed since the latest daemon feed.
+    pub fn unfed_turns_since_feed(&self) -> u32 {
+        self.turns.unfed_results_since_feed()
+    }
+
+    pub fn unfed_turn_open(&self) -> bool {
+        self.turns.unfed_turn_open()
     }
 
     pub(super) fn failure_observation(raw: &str) -> FailureObservation {
@@ -499,6 +559,8 @@ impl AgentProc {
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
         }
+
+        crate::serve::runner::strip_operator_secrets(&mut cmd);
         if agent_mcp.is_some() {
             strip_managed_mcp_authority(&mut cmd);
         }
@@ -604,6 +666,8 @@ impl AgentProc {
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
         }
+
+        crate::serve::runner::strip_operator_secrets(&mut cmd);
         if agent_mcp.is_some() {
             strip_managed_mcp_authority(&mut cmd);
         }
@@ -656,6 +720,7 @@ impl AgentProc {
             stdin,
             reader,
             line_buffer: Vec::new(),
+            turns: stream::ClaudeTurnTracker::with_implicit_turn(),
             diagnostics,
             failures,
             stderr_task: Some(stderr_task),
@@ -664,6 +729,8 @@ impl AgentProc {
 
     pub async fn feed_turn(&mut self, json_turn: &str) -> std::io::Result<()> {
         self.failures.begin_turn();
+        let (json_turn, command_uuid) = tag_user_turn(json_turn);
+        self.turns.begin_fed_turn(command_uuid);
         self.stdin.write_all(json_turn.as_bytes()).await?;
         self.stdin.write_all(b"\n").await?;
         self.stdin.flush().await?;
@@ -901,6 +968,7 @@ impl AgentProc {
             stdin,
             reader,
             line_buffer: Vec::new(),
+            turns: stream::ClaudeTurnTracker::with_implicit_turn(),
             diagnostics,
             failures,
             stderr_task: None,
@@ -1004,6 +1072,32 @@ fn claude_model_unavailable_text(text: &str) -> bool {
         && (text.contains("not found")
             || text.contains("does not exist")
             || text.contains("not available"))
+}
+
+/// Give a stream-json user turn a fresh `uuid`. Claude Code (verified on
+/// 2.1.304) then reports `command_lifecycle` records for that exact command,
+/// which lets the turn tracker attribute the following `result` exactly. Turns
+/// that are not JSON user objects pass through untouched.
+fn tag_user_turn(json_turn: &str) -> (std::borrow::Cow<'_, str>, Option<String>) {
+    let Ok(serde_json::Value::Object(mut turn)) = serde_json::from_str(json_turn) else {
+        return (std::borrow::Cow::Borrowed(json_turn), None);
+    };
+    if turn.get("type").and_then(|kind| kind.as_str()) != Some("user") {
+        return (std::borrow::Cow::Borrowed(json_turn), None);
+    }
+    if let Some(existing) = turn.get("uuid").and_then(|uuid| uuid.as_str()) {
+        let existing = existing.to_string();
+        return (std::borrow::Cow::Borrowed(json_turn), Some(existing));
+    }
+    let command_uuid = uuid::Uuid::new_v4().to_string();
+    turn.insert(
+        "uuid".into(),
+        serde_json::Value::String(command_uuid.clone()),
+    );
+    (
+        std::borrow::Cow::Owned(serde_json::Value::Object(turn).to_string()),
+        Some(command_uuid),
+    )
 }
 
 fn line_limit_error(limit: usize) -> std::io::Error {
@@ -1111,7 +1205,13 @@ enum RestrictedMode {
 /// nested stdio child: the endpoint must never acquire ambient GitHub or
 /// Quorum-home authority merely because Claude happens to inherit it.
 fn strip_managed_mcp_authority(cmd: &mut Command) {
-    for name in ["GH_TOKEN", "GITHUB_TOKEN", "QUORUM_HOME", "GH_CONFIG_DIR"] {
+    for name in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "QUORUM_HOME",
+        "GH_CONFIG_DIR",
+        "QUORUM_ORCHESTRATOR_TOKEN",
+    ] {
         cmd.env_remove(name);
     }
 }
@@ -1124,6 +1224,7 @@ fn strip_coordination_env(cmd: &mut Command) {
         "QUORUM_RUN_ID",
         "GH_TOKEN",
         "GITHUB_TOKEN",
+        "QUORUM_ORCHESTRATOR_TOKEN",
     ] {
         cmd.env_remove(name);
     }
@@ -1188,6 +1289,7 @@ mod tests {
             stdin,
             reader,
             line_buffer: Vec::new(),
+            turns: stream::ClaudeTurnTracker::with_implicit_turn(),
             diagnostics,
             failures,
             stderr_task: Some(stderr_task),
@@ -1283,10 +1385,13 @@ mod tests {
         let _github = EnvRestore::poison("GITHUB_TOKEN", "ambient-github-token");
         let _quorum_home = EnvRestore::poison("QUORUM_HOME", "/ambient/quorum-home");
         let _gh_config = EnvRestore::poison("GH_CONFIG_DIR", "/ambient/gh-config");
+        let _orchestrator = EnvRestore::poison("QUORUM_ORCHESTRATOR_TOKEN", "ambient-token");
 
         let root = tempfile::tempdir().unwrap();
         let capture = root.path().join("mcp-child-environment.log");
         let fake_quorum = root.path().join("quorum");
+        // Publish the capture with rename: the poll below treats existence as
+        // completion, so a truncating `>` redirect would expose partial lines.
         std::fs::write(
             &fake_quorum,
             format!(
@@ -1301,8 +1406,9 @@ mod tests {
                    printf 'github=%s\\n' \"$GITHUB_TOKEN\"\n\\
                    printf 'quorum_home=%s\\n' \"$QUORUM_HOME\"\n\\
                    printf 'gh_config=%s\\n' \"$GH_CONFIG_DIR\"\n\\
-                 }} > '{}'\n",
-                capture.display()
+                   printf 'orchestrator=%s\\n' \"$QUORUM_ORCHESTRATOR_TOKEN\"\n\\
+                 }} > '{capture}.partial' && mv '{capture}.partial' '{capture}'\n",
+                capture = capture.display()
             ),
         )
         .unwrap();
@@ -1358,9 +1464,111 @@ mod tests {
             captured.contains("endpoint=/tmp/quorum-agent.sock\n"),
             "{captured}"
         );
-        for absent in ["gh=\n", "github=\n", "quorum_home=\n", "gh_config=\n"] {
+        for absent in [
+            "gh=\n",
+            "github=\n",
+            "quorum_home=\n",
+            "gh_config=\n",
+            "orchestrator=\n",
+        ] {
             assert!(captured.contains(absent), "{captured}");
         }
+    }
+
+    #[tokio::test]
+    async fn feed_turn_tags_each_user_turn_with_a_fresh_command_uuid() {
+        let mut proc = shell_proc("read -r a; read -r b; printf '%s\n%s\n' \"$a\" \"$b\"").await;
+        proc.feed_turn(&user_turn("one")).await.unwrap();
+        proc.feed_turn(&user_turn("two")).await.unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(&proc.next_raw_line().await.unwrap()).unwrap();
+        let second: serde_json::Value =
+            serde_json::from_str(&proc.next_raw_line().await.unwrap()).unwrap();
+        for turn in [&first, &second] {
+            let uuid = turn["uuid"].as_str().expect("fed turn carries a uuid");
+            assert_eq!(uuid::Uuid::parse_str(uuid).unwrap().get_version_num(), 4);
+            assert_eq!(turn["message"]["role"], "user");
+        }
+        assert_ne!(first["uuid"], second["uuid"]);
+        assert_eq!(first["message"]["content"], "one");
+        let _ = proc.kill_and_reap().await;
+
+        // Non-JSON or non-user payloads are written verbatim.
+        assert_eq!(tag_user_turn("done").0, "done");
+        assert!(tag_user_turn("done").1.is_none());
+        let control = r#"{"type":"control_request"}"#;
+        assert_eq!(tag_user_turn(control).0, control);
+    }
+
+    #[tokio::test]
+    async fn unfed_result_normalizes_to_liveness_never_a_turn_terminal() {
+        let mut proc = shell_proc("sleep 5").await;
+        let fed = r#"{"type":"result","result":"fed","total_cost_usd":1.0}"#;
+        let unfed = r#"{"type":"result","result":"bg","total_cost_usd":2.0}"#;
+        let unfed_error = r#"{"type":"result","result":"boom","is_error":true}"#;
+        assert!(matches!(
+            proc.normalize_stream_line(fed).as_slice(),
+            [AgentEvent::TurnCompleted { .. }]
+        ));
+        for line in [unfed, unfed_error] {
+            assert!(
+                matches!(
+                    proc.normalize_stream_line(line).as_slice(),
+                    [
+                        AgentEvent::Liveness { .. },
+                        AgentEvent::UnfedTurnUsage { .. }
+                    ]
+                ),
+                "{line}"
+            );
+        }
+        // The next daemon feed opens a new attributable turn.
+        proc.feed_turn(&user_turn("next")).await.unwrap();
+        assert!(matches!(
+            proc.normalize_stream_line(fed).as_slice(),
+            [AgentEvent::TurnCompleted { .. }]
+        ));
+        let _ = proc.kill_and_reap().await;
+    }
+
+    /// Provider boundary: the real CLI reports `command_lifecycle` for the
+    /// daemon's tagged turn before its `result`, so attribution is exact even
+    /// on an auth-failure terminal.
+    #[tokio::test]
+    async fn real_cli_attributes_tagged_turn_result_via_command_lifecycle() {
+        if !claude_available() {
+            eprintln!("skipped: no claude binary on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut spec = classifier_spec(tmp.path(), true);
+        spec.env_vars = no_auth_env(tmp.path());
+        let mut proc = AgentProc::spawn(&spec, None).expect("spawn claude");
+        proc.feed_turn(&user_turn("ping")).await.expect("feed turn");
+        let mut saw_lifecycle = false;
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while let Some(line) = proc.next_raw_line().await {
+                saw_lifecycle |= line.contains(r#""type":"command_lifecycle""#);
+                let events = proc.normalize_stream_line(&line);
+                if events.iter().any(|event| {
+                    matches!(
+                        event,
+                        AgentEvent::TurnCompleted { .. } | AgentEvent::TurnFailed { .. }
+                    )
+                }) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("claude produced no terminal within 60s");
+        let _ = proc.kill_and_reap().await;
+        assert!(
+            saw_lifecycle,
+            "CLI no longer reports command_lifecycle records"
+        );
+        assert!(terminal, "the fed turn's result must be attributed to it");
     }
 
     /// Positive contract: a production-built spec must clear the CLI's

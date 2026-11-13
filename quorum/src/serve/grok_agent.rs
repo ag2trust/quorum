@@ -29,7 +29,7 @@ use tokio::io::ReadBuf;
 use tokio::process::{Child, ChildStdout, Command};
 
 pub const DEFAULT_MODEL: &str = "grok-4.5";
-pub const SUPPORTED_MODELS: &[&str] = &[DEFAULT_MODEL, "grok-4.6"];
+pub const SUPPORTED_MODELS: &[&str] = &[DEFAULT_MODEL, "grok-4.6", "grok-4.7"];
 pub const SUPPORTED_EFFORTS: &[&str] = &["low", "medium", "high"];
 pub const DEFAULT_SANDBOX: &str = "off";
 pub const EXPLICIT_WORKSPACE_SANDBOX: &str = "workspace";
@@ -770,7 +770,13 @@ fn configure_managed_mcp_environment(
     home: &GrokMcpConfigHome,
     spec: &GrokSpec,
 ) -> std::io::Result<()> {
-    for name in ["GH_TOKEN", "GITHUB_TOKEN", "QUORUM_HOME", "GH_CONFIG_DIR"] {
+    for name in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "QUORUM_HOME",
+        "GH_CONFIG_DIR",
+        "QUORUM_ORCHESTRATOR_TOKEN",
+    ] {
         command.env_remove(name);
     }
     let real_home = real_home_for_child(spec)?;
@@ -1231,6 +1237,7 @@ impl GrokProc {
         for (key, value) in &spec.env_vars {
             command.env(key, value);
         }
+        crate::serve::runner::strip_operator_secrets(&mut command);
         // `GROK_CONFIG` deliberately drops code-execution tables including
         // mcp_servers. Point this process at a private full config.toml layer.
         // Its custom workspace profile grants the original Grok state root,
@@ -1311,6 +1318,7 @@ impl GrokProc {
         for (key, value) in &spec.env_vars {
             command.env(key, value);
         }
+        crate::serve::runner::strip_operator_secrets(&mut command);
         if let Some(home) = &mcp_config_home {
             configure_managed_mcp_environment(&mut command, home, spec)?;
         }
@@ -2436,7 +2444,7 @@ mod tests {
             let args = headless_args(&spec, LaunchMode::Normal).unwrap();
             assert!(args.windows(2).any(|pair| pair == ["--model", *model]));
         }
-        spec.model = "grok-4.7".into();
+        spec.model = "grok-4.7-build-fast".into();
         assert_eq!(
             headless_args(&spec, LaunchMode::Normal).unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput
@@ -2999,6 +3007,7 @@ mod tests {
         let _github = EnvRestore::poison("GITHUB_TOKEN", "ambient-github-token");
         let _quorum_home = EnvRestore::poison("QUORUM_HOME", "/ambient/quorum-home");
         let _gh_config = EnvRestore::poison("GH_CONFIG_DIR", "/ambient/gh-config");
+        let _orchestrator = EnvRestore::poison("QUORUM_ORCHESTRATOR_TOKEN", "ambient-token");
 
         let root = tempfile::tempdir().unwrap();
         let worktree = tempfile::tempdir().unwrap();
@@ -3018,6 +3027,7 @@ mod tests {
                    printf 'github=%s\\n' \"$GITHUB_TOKEN\"\n\
                    printf 'quorum_home=%s\\n' \"$QUORUM_HOME\"\n\
                    printf 'gh_config=%s\\n' \"$GH_CONFIG_DIR\"\n\
+                   printf 'orchestrator=%s\\n' \"$QUORUM_ORCHESTRATOR_TOKEN\"\n\
                    printf 'home=%s\\n' \"$HOME\"\n\
                    printf 'launch-end\\n'\n\
                  }} >> '{}'\n",
@@ -3086,7 +3096,13 @@ mod tests {
                 launch.contains("endpoint=/tmp/quorum-agent.sock\n"),
                 "{launch}"
             );
-            for absent in ["gh=\n", "github=\n", "quorum_home=\n", "gh_config=\n"] {
+            for absent in [
+                "gh=\n",
+                "github=\n",
+                "quorum_home=\n",
+                "gh_config=\n",
+                "orchestrator=\n",
+            ] {
                 assert!(launch.contains(absent), "{launch}");
             }
             assert!(

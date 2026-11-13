@@ -1,5 +1,6 @@
 //! Serialized git worktree operations for agent isolation.
 
+use quorum_core::git::git_command;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -15,6 +16,10 @@ const GIT_PIPE_LIMIT: usize = 1024 * 1024;
 // the complete error within the serving layer's provisioning-cause bound.
 const PUSH_REJECTION_MAX_BYTES: usize = 2048;
 
+mod recover;
+pub(crate) use recover::{daemon_attribution, recover_ref_task_id, RECOVER_REFS_PER_TASK};
+pub use recover::{RecoverIdentity, RecoverRef, RecoverResume, ReleaseError};
+
 pub struct WorktreeManager {
     lock: Mutex<()>,
     git_bin: PathBuf,
@@ -26,6 +31,17 @@ pub struct WorktreeManager {
 struct WorktreeRegistration {
     path: PathBuf,
     locked_reason: Option<String>,
+    /// Full ref (`refs/heads/...`) checked out, if any.
+    branch: Option<String>,
+}
+
+/// Outcome of one startup worktree GC pass.
+#[derive(Debug, Default)]
+pub struct WorktreeGc {
+    pub removed: Vec<String>,
+    pub preserved: Vec<RecoverRef>,
+    /// `(path, error)`: work preservation failed, so the worktree was kept.
+    pub preserve_failures: Vec<(String, String)>,
 }
 
 /// A GC candidate must be a direct child of the configured base. Resolve the
@@ -374,8 +390,13 @@ impl WorktreeManager {
         }
     }
 
+    /// Base git command for every daemon invocation.
+    fn git_base(&self) -> Command {
+        Command::from(git_command(&self.git_bin))
+    }
+
     fn git_cmd(&self, repo_dir: &Path) -> Command {
-        let mut cmd = Command::new(&self.git_bin);
+        let mut cmd = self.git_base();
         cmd.arg("-C").arg(repo_dir);
         cmd
     }
@@ -593,7 +614,7 @@ impl WorktreeManager {
         if push_url.is_empty() {
             return Err("git remote get-url origin returned an empty URL".into());
         }
-        let mut push = Command::new(&self.git_bin);
+        let mut push = self.git_base();
         push.arg("-C")
             .arg(worktree_dir)
             .args(["push", &push_url, lease, refspec]);
@@ -601,29 +622,48 @@ impl WorktreeManager {
     }
 
     /// Check if a local branch exists. Caller MUST hold `self.lock`.
-    async fn branch_exists_unlocked(&self, repo_dir: &Path, branch: &str) -> bool {
+    ///
+    /// `Ok(false)` means git positively reported the ref missing (`show-ref --verify` exit 1).
+    /// Spawn failures, timeouts, and any other git failure are errors: reporting them as
+    /// "missing" sent callers down a wrong path with a misleading downstream error.
+    async fn branch_exists_unlocked(&self, repo_dir: &Path, branch: &str) -> Result<bool, String> {
         let mut cmd = self.git_cmd(repo_dir);
-        cmd.args(["rev-parse", "--verify", &format!("refs/heads/{branch}")]);
-        match run_git(cmd, self.local_timeout, "git rev-parse --verify").await {
-            Ok(out) => out.status.success(),
-            Err(_) => false,
+        cmd.args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ]);
+        let out = run_git(cmd, self.local_timeout, "git show-ref --verify").await?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(format!(
+                "git show-ref --verify refs/heads/{branch} failed ({}): {}",
+                out.status,
+                git_diagnostic(&out.stderr)
+            )),
         }
     }
 
     /// Find the worktree path that has `branch` checked out, if any.
-    /// Returns `None` when the branch is free or on any git error.
-    /// Caller MUST hold `self.lock`.
+    /// Returns `Ok(None)` only when the branch is positively free; any git error is
+    /// propagated. Caller MUST hold `self.lock`.
     async fn find_worktree_for_branch_unlocked(
         &self,
         repo_dir: &Path,
         branch: &str,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, String> {
         let mut cmd = self.git_cmd(repo_dir);
         cmd.args(["worktree", "list", "--porcelain"]);
-        let out = match run_git(cmd, self.local_timeout, "git worktree list").await {
-            Ok(out) if out.status.success() => out,
-            _ => return None,
-        };
+        let out = run_git(cmd, self.local_timeout, "git worktree list").await?;
+        if !out.status.success() {
+            return Err(format!(
+                "git worktree list failed ({}): {}",
+                out.status,
+                git_diagnostic(&out.stderr)
+            ));
+        }
         let stdout = String::from_utf8_lossy(&out.stdout);
         let target_ref = format!("branch refs/heads/{branch}");
         let mut current_wt: Option<String> = None;
@@ -631,12 +671,12 @@ impl WorktreeManager {
             if let Some(path) = line.strip_prefix("worktree ") {
                 current_wt = Some(path.to_string());
             } else if line == target_ref {
-                return current_wt;
+                return Ok(current_wt);
             } else if line.is_empty() {
                 current_wt = None;
             }
         }
-        None
+        Ok(None)
     }
 
     pub async fn provision(
@@ -650,10 +690,10 @@ impl WorktreeManager {
 
         let wt_path = worktree_dir.to_path_buf();
 
-        if self.branch_exists_unlocked(repo_dir, branch).await {
+        if self.branch_exists_unlocked(repo_dir, branch).await? {
             if let Some(existing_wt) = self
                 .find_worktree_for_branch_unlocked(repo_dir, branch)
-                .await
+                .await?
             {
                 return Err(format!(
                     "branch collision: '{branch}' already checked out in worktree '{existing_wt}'"
@@ -709,10 +749,10 @@ impl WorktreeManager {
         let base_ref = format!("origin/{remote_branch}");
         let wt_path = worktree_dir.to_path_buf();
 
-        if self.branch_exists_unlocked(repo_dir, branch).await {
+        if self.branch_exists_unlocked(repo_dir, branch).await? {
             if let Some(existing_wt) = self
                 .find_worktree_for_branch_unlocked(repo_dir, branch)
-                .await
+                .await?
             {
                 return Err(format!(
                     "branch collision: '{branch}' already checked out in worktree '{existing_wt}'"
@@ -1204,12 +1244,12 @@ impl WorktreeManager {
         branch: &str,
     ) -> Result<PathBuf, String> {
         let _guard = self.lock.lock().await;
-        if !self.branch_exists_unlocked(repo_dir, branch).await {
+        if !self.branch_exists_unlocked(repo_dir, branch).await? {
             return Err(format!("branch sync local branch {branch} is missing"));
         }
         let Some(existing) = self
             .find_worktree_for_branch_unlocked(repo_dir, branch)
-            .await
+            .await?
         else {
             return Err(format!(
                 "branch sync worktree {} for {branch} is missing; refusing to recreate it without MERGE_HEAD",
@@ -1233,14 +1273,14 @@ impl WorktreeManager {
         branch: &str,
         create_at: Option<&str>,
     ) -> Result<(), String> {
-        let branch_exists = self.branch_exists_unlocked(repo_dir, branch).await;
+        let branch_exists = self.branch_exists_unlocked(repo_dir, branch).await?;
         if !branch_exists && create_at.is_none() {
             return Err(format!("branch sync local branch {branch} is missing"));
         }
         if branch_exists {
             if let Some(existing) = self
                 .find_worktree_for_branch_unlocked(repo_dir, branch)
-                .await
+                .await?
             {
                 let expected = std::fs::canonicalize(worktree_dir).ok();
                 let actual = std::fs::canonicalize(&existing).ok();
@@ -1359,10 +1399,10 @@ impl WorktreeManager {
         let base_ref = format!("refs/quorum-pr/{pr}");
         let wt_path = worktree_dir.to_path_buf();
 
-        if self.branch_exists_unlocked(repo_dir, branch).await {
+        if self.branch_exists_unlocked(repo_dir, branch).await? {
             if let Some(existing_wt) = self
                 .find_worktree_for_branch_unlocked(repo_dir, branch)
-                .await
+                .await?
             {
                 return Err(format!(
                     "branch collision: '{branch}' already checked out in worktree '{existing_wt}'"
@@ -1389,7 +1429,7 @@ impl WorktreeManager {
 
     /// Write one git config setting inside `dir`. Caller MUST hold `self.lock`.
     async fn set_config(&self, dir: &Path, args: &[&str]) -> Result<(), String> {
-        let mut cmd = Command::new(&self.git_bin);
+        let mut cmd = self.git_base();
         cmd.arg("-C").arg(dir).arg("config").args(args);
         let out = run_git(cmd, self.local_timeout, "git config").await?;
         if !out.status.success() {
@@ -1413,7 +1453,7 @@ impl WorktreeManager {
     /// resolves its work tree.
     /// Caller MUST hold `self.lock`.
     async fn enable_worktree_config(&self, worktree_dir: &Path) -> Result<(), String> {
-        let mut worktree_cmd = Command::new(&self.git_bin);
+        let mut worktree_cmd = self.git_base();
         worktree_cmd
             .arg("-C")
             .arg(worktree_dir)
@@ -1441,7 +1481,7 @@ impl WorktreeManager {
             }
         }
 
-        let mut bare_cmd = Command::new(&self.git_bin);
+        let mut bare_cmd = self.git_base();
         bare_cmd
             .arg("-C")
             .arg(worktree_dir)
@@ -1502,7 +1542,7 @@ impl WorktreeManager {
         worktree_dir: &Path,
         expected_sha: &str,
     ) -> Result<(), String> {
-        let mut cmd = Command::new(&self.git_bin);
+        let mut cmd = self.git_base();
         cmd.arg("-C").arg(worktree_dir).args(["rev-parse", "HEAD"]);
         let out = run_git(cmd, self.local_timeout, "git rev-parse HEAD").await?;
         if !out.status.success() {
@@ -1751,13 +1791,47 @@ impl WorktreeManager {
         Ok(source_sha.to_string())
     }
 
+    #[cfg(test)]
     pub async fn gc_orphaned(
         &self,
         repo_dir: &Path,
         worktree_base: &Path,
         active_worktrees: &[&str],
     ) -> Vec<String> {
+        self.gc_orphaned_detailed(
+            repo_dir,
+            worktree_base,
+            active_worktrees,
+            &[],
+            |_, _| async { Ok(()) },
+        )
+        .await
+        .removed
+    }
+
+    /// Startup GC of registered, inactive direct children of `worktree_base`.
+    /// Each candidate's work is snapshotted to a recover ref before the force
+    /// removal; a candidate whose snapshot fails is kept and reported.
+    /// `allocations` are the daemon's `(task_id, branch, worktree)` records,
+    /// used (with the daemon-created directory name) to attribute a snapshot
+    /// to a task; see [`daemon_attribution`].
+    ///
+    /// `record` durably records each candidate's created refs before its
+    /// force removal; a recording failure keeps the worktree.
+    pub async fn gc_orphaned_detailed<F, Fut>(
+        &self,
+        repo_dir: &Path,
+        worktree_base: &Path,
+        active_worktrees: &[&str],
+        allocations: &[(i64, String, String)],
+        mut record: F,
+    ) -> WorktreeGc
+    where
+        F: FnMut(RecoverIdentity, Vec<RecoverRef>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
         let _guard = self.lock.lock().await;
+        let mut gc = WorktreeGc::default();
 
         self.prune_stale_initializing_unlocked(repo_dir, worktree_base)
             .await;
@@ -1766,16 +1840,15 @@ impl WorktreeManager {
             Ok(registrations) => registrations,
             Err(error) => {
                 eprintln!("warn: {error}");
-                return Vec::new();
+                return gc;
             }
         };
 
         let entries = match std::fs::read_dir(worktree_base) {
             Ok(e) => e,
-            Err(_) => return Vec::new(),
+            Err(_) => return gc,
         };
 
-        let mut removed = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             let metadata = match std::fs::symlink_metadata(&path) {
@@ -1802,15 +1875,15 @@ impl WorktreeManager {
                     continue;
                 }
             };
-            if !registrations.iter().any(|registration| {
+            let Some(registration) = registrations.iter().find(|registration| {
                 std::fs::canonicalize(&registration.path).ok().as_ref() == Some(&canonical_path)
-            }) {
+            }) else {
                 eprintln!(
                     "warn: worktree GC leaving unregistered directory {}",
                     path.display()
                 );
                 continue;
-            }
+            };
             if active_worktrees.iter().any(|active| {
                 *active == path_str
                     || std::fs::canonicalize(active).ok().as_ref() == Some(&canonical_path)
@@ -1818,10 +1891,43 @@ impl WorktreeManager {
                 continue;
             }
 
+            let dir_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let identity = RecoverIdentity {
+                task_id: daemon_attribution(&path, registration.branch.as_deref(), allocations),
+                agent: dir_name,
+                reason: "startup_gc".into(),
+                trusted: Vec::new(),
+            };
+            let preserved = match self
+                .preserve_unlocked(repo_dir, Some(&path), None, &identity)
+                .await
+            {
+                Ok(created) if created.is_empty() => Ok(created),
+                Ok(created) => record(identity.clone(), created.clone())
+                    .await
+                    .map(|()| created)
+                    .map_err(|error| format!("recording recover refs: {error}")),
+                Err(error) => Err(error),
+            };
+            match preserved {
+                Ok(created) => gc.preserved.extend(created),
+                Err(error) => {
+                    eprintln!(
+                        "warn: worktree GC keeping {}: work preservation failed: {error}",
+                        path.display()
+                    );
+                    gc.preserve_failures.push((path_str, error));
+                    continue;
+                }
+            }
+
             let mut rm_cmd = self.git_cmd(repo_dir);
             rm_cmd.args(["worktree", "remove", &path_str, "--force"]);
             match run_git(rm_cmd, self.local_timeout, "git worktree remove").await {
-                Ok(out) if out.status.success() => removed.push(path_str),
+                Ok(out) if out.status.success() => gc.removed.push(path_str),
                 Ok(out) => eprintln!(
                     "warn: git worktree remove {} failed: {}",
                     path.display(),
@@ -1832,7 +1938,7 @@ impl WorktreeManager {
                 }
             }
         }
-        removed
+        gc
     }
 
     /// Unlock stale daemon registrations left by an interrupted worktree add,
@@ -1863,10 +1969,14 @@ impl WorktreeManager {
         let mut registrations = Vec::new();
         let mut path = None;
         let mut locked_reason = None;
+        let mut branch = None;
         for line in stdout.lines().chain(std::iter::once("")) {
             if let Some(value) = line.strip_prefix("worktree ") {
                 path = Some(PathBuf::from(value));
                 locked_reason = None;
+                branch = None;
+            } else if let Some(value) = line.strip_prefix("branch ") {
+                branch = Some(value.to_string());
             } else if let Some(reason) = line.strip_prefix("locked ") {
                 locked_reason = Some(reason.to_string());
             } else if line == "locked" {
@@ -1876,6 +1986,7 @@ impl WorktreeManager {
                     registrations.push(WorktreeRegistration {
                         path,
                         locked_reason: locked_reason.take(),
+                        branch: branch.take(),
                     });
                 }
             }
@@ -2013,12 +2124,18 @@ impl WorktreeManager {
 
     /// Remove only when git still reports the exact path/branch binding captured
     /// by a durable cleanup intent. A missing worktree is idempotent success.
-    pub async fn remove_exact(
+    pub async fn remove_exact<F, Fut>(
         &self,
         repo_dir: &Path,
         worktree_dir: &Path,
         branch: &str,
-    ) -> Result<(), String> {
+        identity: &RecoverIdentity,
+        record: F,
+    ) -> Result<Vec<RecoverRef>, String>
+    where
+        F: FnOnce(Vec<RecoverRef>) -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
         let _guard = self.lock.lock().await;
         let mut list = self.git_cmd(repo_dir);
         list.args(["worktree", "list", "--porcelain"]);
@@ -2056,7 +2173,7 @@ impl WorktreeManager {
         let Some(actual) = found else {
             return match std::fs::symlink_metadata(worktree_dir) {
                 Ok(_) => Err("worktree path exists without exact git registration".into()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
                 Err(error) => Err(format!("cannot prove worktree path absence: {error}")),
             };
         };
@@ -2065,13 +2182,24 @@ impl WorktreeManager {
                 "worktree identity mismatch: expected {expected_ref}, found {actual:?}"
             ));
         }
+        // Preserve the checkout's uncommitted state first (the identity comes
+        // from the durable cleanup intent) and destroy nothing if that fails.
+        let created = self
+            .preserve_unlocked(repo_dir, Some(worktree_dir), None, identity)
+            .await
+            .map_err(|error| format!("work preservation failed (worktree kept): {error}"))?;
+        if !created.is_empty() {
+            record(created.clone()).await.map_err(|error| {
+                format!("work preservation failed (worktree kept): recording recover refs: {error}")
+            })?;
+        }
         let mut rm = self.git_cmd(repo_dir);
         rm.args(["worktree", "remove"])
             .arg(worktree_dir)
             .arg("--force");
         let out = run_git(rm, self.local_timeout, "git worktree remove").await?;
         if out.status.success() {
-            Ok(())
+            Ok(created)
         } else {
             Err(format!(
                 "git worktree remove failed: {}",
@@ -3697,13 +3825,15 @@ mod tests {
         let r1 = mgr
             .provision(tmp.path(), "b1", &tmp.path().join("wt1"), "main")
             .await;
-        assert!(r1.unwrap_err().contains("timed out"));
+        let e1 = r1.unwrap_err();
+        assert!(e1.contains("timed out"), "first provision: {e1}");
 
         // Second call also times out — proves mutex was released after first timeout
         let r2 = mgr
             .provision(tmp.path(), "b2", &tmp.path().join("wt2"), "main")
             .await;
-        assert!(r2.unwrap_err().contains("timed out"));
+        let e2 = r2.unwrap_err();
+        assert!(e2.contains("timed out"), "second provision: {e2}");
     }
 
     #[cfg(unix)]
@@ -3784,6 +3914,135 @@ mod tests {
         let removed = mgr.gc_orphaned(repo_dir.path(), wt_base.path(), &[]).await;
         assert!(removed.is_empty());
         assert!(orphan.exists());
+    }
+
+    /// Shim that logs argv, fails the git subcommand named by `fail_on` with a recognisable
+    /// diagnostic, and delegates everything else to the real git.
+    #[cfg(unix)]
+    fn create_failing_probe_shim(dir: &Path, fail_on: &str) -> (PathBuf, PathBuf) {
+        let shim = dir.join("git-probe-fail");
+        let log = dir.join("argv.log");
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\ncase \"$*\" in *'{fail_on}'*) echo 'probe-boom' >&2; exit 128;; esac\nexec git \"$@\"\n",
+            log.display()
+        );
+        std::fs::write(&shim, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (shim, log)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provision_fails_loudly_when_worktree_list_probe_fails() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        // A prior incarnation left the branch behind, not checked out anywhere.
+        assert!(git_output(repo_dir.path(), &["branch", "leftover", "main"])
+            .status
+            .success());
+        let shim_dir = tempfile::tempdir().unwrap();
+        let (shim, _log) = create_failing_probe_shim(shim_dir.path(), "worktree list");
+        let (ft, lt) = (Duration::from_secs(10), Duration::from_secs(10));
+        let mgr = WorktreeManager::with_config(shim, ft, lt);
+        let wt = tempfile::tempdir().unwrap().path().join("wt");
+
+        let err = mgr
+            .provision(repo_dir.path(), "leftover", &wt, "main")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("git worktree list failed") && err.contains("probe-boom"),
+            "probe failure must surface its real cause, got: {err}"
+        );
+        assert!(!wt.exists(), "must not proceed past a failed probe");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provision_fails_loudly_when_branch_probe_errors() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let shim_dir = tempfile::tempdir().unwrap();
+        let (shim, _log) = create_failing_probe_shim(shim_dir.path(), "show-ref");
+        let (ft, lt) = (Duration::from_secs(10), Duration::from_secs(10));
+        let mgr = WorktreeManager::with_config(shim, ft, lt);
+        let wt = tempfile::tempdir().unwrap().path().join("wt");
+
+        let err = mgr
+            .provision(repo_dir.path(), "fresh", &wt, "main")
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("git show-ref --verify") && err.contains("probe-boom"),
+            "got: {err}"
+        );
+        assert!(!wt.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_timeout_is_an_error_not_a_missing_branch() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let shim_dir = tempfile::tempdir().unwrap();
+        let shim = create_hanging_shim(shim_dir.path());
+        let (ft, lt) = short_timeouts();
+        let mgr = WorktreeManager::with_config(shim, ft, lt);
+        let err = mgr
+            .branch_exists_unlocked(repo_dir.path(), "main")
+            .await
+            .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        let err = mgr
+            .find_worktree_for_branch_unlocked(repo_dir.path(), "main")
+            .await
+            .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn probes_distinguish_missing_from_present_with_real_git() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let mgr = WorktreeManager::new();
+        assert!(mgr
+            .branch_exists_unlocked(repo_dir.path(), "main")
+            .await
+            .unwrap());
+        assert!(!mgr
+            .branch_exists_unlocked(repo_dir.path(), "no-such-branch")
+            .await
+            .unwrap());
+        assert!(mgr
+            .find_worktree_for_branch_unlocked(repo_dir.path(), "no-such-branch")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_git_invocations_disable_fsmonitor() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let shim_dir = tempfile::tempdir().unwrap();
+        let (shim, log) = create_failing_probe_shim(shim_dir.path(), "never-matches-anything");
+        let (ft, lt) = (Duration::from_secs(10), Duration::from_secs(10));
+        let mgr = WorktreeManager::with_config(shim, ft, lt);
+        let wt = tempfile::tempdir().unwrap().path().join("wt");
+        mgr.provision(repo_dir.path(), "fsm-branch", &wt, "main")
+            .await
+            .unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = logged.lines().collect();
+        assert!(!lines.is_empty());
+        for line in lines {
+            assert!(
+                line.starts_with("-c core.fsmonitor=false "),
+                "every daemon git call must disable fsmonitor: {line}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5102,32 +5361,43 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let path = base.path().join("owned");
         let mgr = WorktreeManager::new();
+        let id = RecoverIdentity::new(1, "cleanup", "decomposition_cleanup");
         mgr.provision(repo.path(), "daemon/owned", &path, "main")
             .await
             .unwrap();
         let error = mgr
-            .remove_exact(repo.path(), &path, "daemon/other")
+            .remove_exact(repo.path(), &path, "daemon/other", &id, |_| async {
+                Ok(())
+            })
             .await
             .unwrap_err();
         assert!(error.contains("identity mismatch"));
         assert!(path.exists(), "mismatched binding must survive");
-        mgr.remove_exact(repo.path(), &path, "daemon/owned")
-            .await
-            .unwrap();
+        mgr.remove_exact(repo.path(), &path, "daemon/owned", &id, |_| async {
+            Ok(())
+        })
+        .await
+        .unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(mgr
-            .remove_exact(repo.path(), &path, "daemon/owned")
+            .remove_exact(repo.path(), &path, "daemon/owned", &id, |_| async {
+                Ok(())
+            })
             .await
             .unwrap_err()
             .contains("without exact git registration"));
         std::fs::remove_dir(&path).unwrap();
-        mgr.remove_exact(repo.path(), &path, "daemon/owned")
-            .await
-            .unwrap();
+        mgr.remove_exact(repo.path(), &path, "daemon/owned", &id, |_| async {
+            Ok(())
+        })
+        .await
+        .unwrap();
         assert!(!path.exists());
-        mgr.remove_exact(repo.path(), &path, "daemon/owned")
-            .await
-            .unwrap();
+        mgr.remove_exact(repo.path(), &path, "daemon/owned", &id, |_| async {
+            Ok(())
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

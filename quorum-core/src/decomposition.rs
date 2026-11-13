@@ -862,17 +862,18 @@ pub fn bind_frozen_base_and_enter_planning(
     // Bind must recheck drain quiescence atomically: the daemon tick's
     // pre-check reads task status outside this transaction, and a supported
     // operator retry (see `tasks::retry_parked`) can restore a parked task to
-    // `rework`/`in-review` between that read and this update. Refuse the bind
-    // if any started-but-not-terminal task exists other than the planning
-    // source itself, so the drain-to-planning handoff never captures a base
-    // while a merge, remediation, or review is still in flight.
+    // `rework`/`in-review`/`merging` between that read and this update. Refuse
+    // the bind if any started-but-not-terminal task exists other than the
+    // planning source itself, so the drain-to-planning handoff never captures a
+    // base while a merge, remediation, or review is still in flight. This set
+    // must match `tasks::count_started_non_terminal_excluding`.
     let changed = tx.execute(
         "UPDATE task_decompositions SET state='planning',frozen_base_sha=?2,updated_at=?3
          WHERE id=?1 AND state='draining' AND freeze_active=1 AND active=0
            AND frozen_base_sha IS NULL
            AND NOT EXISTS (
                SELECT 1 FROM tasks t
-               WHERE t.status IN ('working','in-review','rework')
+               WHERE t.status IN ('working','in-review','rework','merging')
                  AND t.id != (SELECT g.source_task_id
                               FROM task_decompositions g WHERE g.id=?1)
            )",
@@ -1316,6 +1317,86 @@ pub fn reacquire_freeze(conn: &mut Connection, graph_id: i64, now: i64) -> Resul
     Ok(changed == 1)
 }
 
+/// Started non-terminal tasks, other than the planning source, that carry a
+/// durable provider block, in ascending id order.
+///
+/// Only [`crate::runner_state::provider_block`] classifies a task as blocked:
+/// a parked task, one blocked for any other reason, or one whose refs do not
+/// parse is absent here and so keeps holding the drain. So is a `merging` task:
+/// it is started work that needs no provider turn to finish, so its PR must
+/// land or fall back before the freeze can move.
+pub fn provider_blocked_started_task_ids(
+    conn: &Connection,
+    source_task_id: i64,
+) -> Result<Vec<i64>> {
+    let mut statement = conn.prepare(
+        "SELECT id,refs FROM tasks
+         WHERE status IN ('working','in-review','rework')
+           AND id != ?1 AND refs IS NOT NULL
+         ORDER BY id",
+    )?;
+    let rows = statement.query_map(params![source_task_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut blocked = Vec::new();
+    for row in rows {
+        let (id, refs) = row?;
+        let is_blocked = serde_json::from_str::<serde_json::Value>(&refs)
+            .is_ok_and(|refs| crate::runner_state::provider_block(&refs).is_some());
+        if is_blocked {
+            blocked.push(id);
+        }
+    }
+    Ok(blocked)
+}
+
+/// Drop the freeze of a drain that only provider-blocked tasks are holding,
+/// parking the aggregate in `provider-backoff` with no frozen SHA.
+///
+/// The predicate is re-evaluated under the write lock, because a supported
+/// `tasks::retry_provider_blocked` can land after the caller's read: at least
+/// one started non-terminal task other than the source must exist, every such
+/// task must be provider-blocked, and none may hold a slot in
+/// `live_task_ids`. Budgets are untouched and no attempt is recorded; this is
+/// a wait, not a planning failure. `Ok(false)` is a normal clean negative.
+pub fn release_freeze_for_provider_block(
+    conn: &mut Connection,
+    graph_id: i64,
+    live_task_ids: &[i64],
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let source_task_id = tx
+        .query_row(
+            "SELECT source_task_id FROM task_decompositions WHERE id=?1",
+            params![graph_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    let Some(source_task_id) = source_task_id else {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(false);
+    };
+    let started = crate::tasks::count_started_non_terminal_excluding(&tx, source_task_id)?;
+    let blocked = provider_blocked_started_task_ids(&tx, source_task_id)?;
+    let only_idle_provider_blocks = started > 0
+        && i64::try_from(blocked.len()) == Ok(started)
+        && !blocked.iter().any(|id| live_task_ids.contains(id));
+    if !only_idle_provider_blocks {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(false);
+    }
+    let changed = tx.execute(
+        "UPDATE task_decompositions
+         SET state='provider-backoff',freeze_active=0,frozen_base_sha=NULL,updated_at=?2
+         WHERE id=?1 AND state IN ('freeze-requested','draining')
+           AND active=0 AND freeze_active=1",
+        params![graph_id, now],
+    )?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(changed == 1)
+}
+
 /// Advance a freeze-owning aggregate through its daemon phases. This is a
 /// guarded state write, not an orchestration policy decision.
 pub fn set_frozen_phase(
@@ -1686,7 +1767,10 @@ fn materialize_terminal_children_in_tx(
             ));
         }
         let done: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND status='done')",
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM tasks d WHERE d.id=?1 AND {})",
+                crate::tasks::DEP_SATISFIED_PREDICATE
+            ),
             [dependency],
             |r| r.get(0),
         )?;
@@ -3394,12 +3478,13 @@ fn complete_graph_if_final_child_with_explicit_recovery(
     Ok(true)
 }
 
-/// Fold a terminal generated-child park into its active graph aggregate.
+/// Fold a terminal generated-child hard failure into its active graph aggregate.
 ///
 /// Callers own the surrounding `BEGIN IMMEDIATE` transaction so the child
-/// park, graph blocker, event, and owner alert become visible together. A
+/// failure, graph blocker, event, and owner alert become visible together. A
 /// staged retry/remediation keeps the graph active because the failed child
-/// still has daemon-owned continuation authority.
+/// still has daemon-owned continuation authority, and a retryable daemon park
+/// keeps it active by owner policy (see `RETRYABLE_DAEMON_PARK_CHILD_SQL`).
 pub(crate) fn block_graph_if_child_failed(
     conn: &Connection,
     task_id: i64,
@@ -3411,15 +3496,24 @@ pub(crate) fn block_graph_if_child_failed(
             "embedded NUL in graph child failure reason".into(),
         ));
     }
+    // Owner policy: only a hard child failure holds the graph. A retryable
+    // daemon park (needs-info/blocked reaction, recovery budget, publication,
+    // dependency-base wait, ...) leaves the graph active so independent
+    // siblings keep dispatching; the parked child still keeps the graph from
+    // completing and still blocks its own dependents.
     let graph: Option<(i64, Option<String>)> = conn
         .query_row(
-            "SELECT d.id,child.refs
+            &format!(
+                "SELECT d.id,child.refs
              FROM task_graph_members m
              JOIN task_decompositions d ON d.id=m.graph_id
              JOIN tasks child ON child.id=m.task_id
              WHERE m.task_id=?1 AND m.active=1
                AND d.state='active' AND d.active=1
-               AND child.status='failed'",
+               AND child.status='failed'
+               AND NOT {}",
+                crate::tasks::RETRYABLE_DAEMON_PARK_CHILD_SQL
+            ),
             [task_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -4598,14 +4692,28 @@ mod tests {
                 .unwrap()
         }
 
+        /// A structured generated-child hold naming the parked original. Under
+        /// the current policy a retryable park no longer creates this hold, but
+        /// graphs held by earlier daemons (or by a hard failure) still carry it
+        /// and explicit recovery must keep resolving them.
         fn block_on_modern_generated_child_failure(&mut self) {
-            assert!(block_graph_if_child_failed(
-                &self.conn,
-                self.original,
-                "daemon-owned publication failed",
-                45,
-            )
-            .unwrap());
+            let summary = serde_json::json!({
+                "affected_task": self.original,
+                "reason": "daemon-owned publication failed",
+            })
+            .to_string();
+            assert_eq!(
+                self.conn
+                    .execute(
+                        "UPDATE task_decompositions
+                         SET state='blocked',hold_code='generated-child-failed',
+                             hold_summary=?2,updated_at=45
+                         WHERE id=?1 AND state='active' AND active=1",
+                        params![self.graph, summary],
+                    )
+                    .unwrap(),
+                1
+            );
         }
 
         fn make_legacy_prepublication_eligible(&mut self) {
@@ -4895,9 +5003,14 @@ mod tests {
         conn.execute("UPDATE tasks SET status='rework' WHERE id=2", [])
             .unwrap();
         assert!(!bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 6).unwrap());
+
+        // A retry can restore `merging` too; its approved PR has not landed yet.
+        conn.execute("UPDATE tasks SET status='merging' WHERE id=2", [])
+            .unwrap();
+        assert!(!bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 7).unwrap());
         conn.execute("UPDATE tasks SET status='done' WHERE id=2", [])
             .unwrap();
-        assert!(bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 7).unwrap());
+        assert!(bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 8).unwrap());
     }
 
     #[test]
@@ -7918,19 +8031,12 @@ mod tests {
         let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
             .unwrap()
             .unwrap();
-        let reason = "push rejected after protected-branch update";
+        let reason = "worker reported failed";
         let tx = begin_immediate(&mut conn).unwrap();
+        // A hard failure carries no retryable daemon-park marker.
         tx.execute(
-            "UPDATE tasks SET status='failed',refs=?2,updated_at=5 WHERE id=?1",
-            params![
-                ids[0],
-                serde_json::json!({
-                    "daemon_parked": true,
-                    "daemon_parked_reason": reason,
-                    "daemon_resume_status": "rework"
-                })
-                .to_string()
-            ],
+            "UPDATE tasks SET status='failed',refs='{}',updated_at=5 WHERE id=?1",
+            params![ids[0]],
         )
         .unwrap();
         assert!(block_graph_if_child_failed(&tx, ids[0], reason, 5).unwrap());
@@ -7976,6 +8082,195 @@ mod tests {
         assert_eq!(alert.2, format!("task:{}", ids[0]));
         assert!(alert.3.contains("task graph blocked"));
         assert!(alert.3.contains(reason));
+    }
+
+    fn graph_state_and_hold(conn: &Connection, graph: i64) -> (String, i64, Option<String>) {
+        conn.query_row(
+            "SELECT state,active,hold_code FROM task_decompositions WHERE id=?1",
+            [graph],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    fn implementation_ready_ids(conn: &Connection) -> Vec<i64> {
+        crate::tasks::list_implementation_ready_open(conn)
+            .unwrap()
+            .into_iter()
+            .map(|task| task.id)
+            .collect()
+    }
+
+    /// Owner policy: a retryable daemon park (needs-info/blocked reaction,
+    /// recovery budget, publication, ...) never holds its graph and never
+    /// withholds sibling dispatch. Its own dependents stay blocked.
+    #[test]
+    fn daemon_parked_child_keeps_graph_active_and_siblings_claimable() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[]), child("c", &["a"])],
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        for reason in [
+            "needs-info",
+            "remediation reaped; recovery budget exhausted (3/3)",
+        ] {
+            crate::tasks::park(&mut conn, ids[0], reason, "open", 10)
+                .unwrap()
+                .expect("open child must park");
+            assert_eq!(
+                graph_state_and_hold(&conn, graph),
+                ("active".into(), 1, None),
+                "{reason}: a daemon park must not hold the graph"
+            );
+            let blocked_events: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM events WHERE kind='task_graph_blocked'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(blocked_events, 0, "{reason}");
+            let ready = implementation_ready_ids(&conn);
+            assert!(
+                ready.contains(&ids[1]),
+                "{reason}: sibling stays selectable"
+            );
+            assert!(
+                !ready.contains(&ids[2]),
+                "{reason}: the parked child's dependent stays blocked"
+            );
+            // Restore for the next reason.
+            assert!(
+                crate::tasks::retry_parked(&mut conn, ids[0], "owner", true, 11)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        crate::tasks::park(&mut conn, ids[0], "blocked", "open", 12)
+            .unwrap()
+            .expect("open child must park");
+        let claimed = crate::tasks::claim(&mut conn, "worker", Some(ids[1]), &[], 300, 13)
+            .unwrap()
+            .expect("the authoritative claim must admit the sibling of a parked child");
+        assert_eq!(claimed.status, "working");
+        assert!(
+            crate::tasks::claim(&mut conn, "worker-2", Some(ids[2]), &[], 300, 13)
+                .unwrap()
+                .is_none(),
+            "a dependent of the parked child must not be claimable"
+        );
+    }
+
+    /// Hard failures, and parks that `task-retry` cannot resume, still hold
+    /// the graph and withhold sibling dispatch in both selection and claim.
+    #[test]
+    fn hard_failed_or_terminal_parked_sibling_still_blocks_graph_dispatch() {
+        for (name, refs) in [
+            ("hard failure", serde_json::json!({})),
+            (
+                "park without resume status",
+                serde_json::json!({"daemon_parked": true}),
+            ),
+            (
+                "unsatisfiable dependency park",
+                serde_json::json!({
+                    "daemon_parked": true,
+                    "daemon_resume_status": "open",
+                    "daemon_parked_unsatisfiable": true
+                }),
+            ),
+            (
+                "merged-PR publication park",
+                serde_json::json!({
+                    "daemon_parked": true,
+                    "daemon_resume_status": "in-review",
+                    "daemon_publication_failure_kind": "pr-merged"
+                }),
+            ),
+        ] {
+            let mut conn = setup();
+            let graph = begin(&mut conn);
+            let ids =
+                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+                    .unwrap()
+                    .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='failed',refs=?2,updated_at=5 WHERE id=?1",
+                params![ids[0], refs.to_string()],
+            )
+            .unwrap();
+            // Even before (or without) the graph hold, the shared claim
+            // clause withholds the sibling.
+            assert!(!implementation_ready_ids(&conn).contains(&ids[1]), "{name}");
+            assert!(
+                crate::tasks::claim(&mut conn, "worker", Some(ids[1]), &[], 300, 6)
+                    .unwrap()
+                    .is_none(),
+                "{name}: claim must reject the sibling"
+            );
+            let tx = begin_immediate(&mut conn).unwrap();
+            assert!(
+                block_graph_if_child_failed(&tx, ids[0], name, 7).unwrap(),
+                "{name}: hard failure must hold the graph"
+            );
+            tx.commit().unwrap();
+            assert_eq!(
+                graph_state_and_hold(&conn, graph),
+                ("blocked".into(), 1, Some("generated-child-failed".into())),
+                "{name}"
+            );
+        }
+    }
+
+    /// A parked child keeps the graph from completing even after every other
+    /// child merges; retrying and finishing the parked child completes it.
+    #[test]
+    fn graph_does_not_complete_while_a_parked_child_is_unresolved() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        crate::tasks::park(&mut conn, ids[0], "needs-info", "open", 5)
+            .unwrap()
+            .expect("child must park");
+        assert!(crate::tasks::close_after_merge(&mut conn, ids[1], "merged", 6).unwrap());
+        let state: (String, i64, String) = conn
+            .query_row(
+                "SELECT d.state,d.active,t.status FROM task_decompositions d
+                 JOIN tasks t ON t.id=d.source_task_id WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("active".into(), 1, "decomposed".into()));
+
+        let retried = crate::tasks::retry_parked(&mut conn, ids[0], "owner", true, 7)
+            .unwrap()
+            .expect("the parked child must resume under an active graph");
+        assert_eq!(retried.status, "open");
+        assert!(
+            crate::tasks::claim(&mut conn, "worker", Some(ids[0]), &[], 300, 8)
+                .unwrap()
+                .is_some()
+        );
+        assert!(crate::tasks::close_after_merge(&mut conn, ids[0], "merged", 9).unwrap());
+        let completed: (String, i64, String) = conn
+            .query_row(
+                "SELECT d.state,d.active,t.status FROM task_decompositions d
+                 JOIN tasks t ON t.id=d.source_task_id WHERE d.id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(completed, ("completed".into(), 0, "done".into()));
     }
 
     #[test]
@@ -10651,6 +10946,213 @@ mod tests {
         }
     }
 
+    fn working_children(conn: &Connection, ids: &[i64]) -> usize {
+        ids.iter()
+            .filter(|id| {
+                conn.query_row(
+                    "SELECT status='working' FROM tasks WHERE id=?1",
+                    [id],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap()
+            })
+            .count()
+    }
+
+    fn independent_graph(conn: &mut Connection, children: usize) -> Vec<i64> {
+        let graph = begin(conn);
+        let keys: Vec<String> = (0..children).map(|i| format!("c{i}")).collect();
+        let planned: Vec<PlannedChild> = keys.iter().map(|key| child(key, &[])).collect();
+        materialize_graph(conn, graph, 1, &planned, 4)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn graph_children_limit_four_lets_four_independent_children_start() {
+        let mut conn = setup();
+        let ids = independent_graph(&mut conn, 4);
+        for (index, now) in (5..9).enumerate() {
+            assert_eq!(
+                crate::tasks::list_implementation_ready_open_with_graph_limit(&conn, 4)
+                    .unwrap()
+                    .len(),
+                4 - index,
+                "every unclaimed child stays listed below the limit"
+            );
+            let claimed = crate::tasks::claim_with_graph_limit(
+                &mut conn,
+                &format!("w{index}"),
+                None,
+                &[],
+                60,
+                now,
+                4,
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("claim {} must win under limit 4", index + 1));
+            assert!(ids.contains(&claimed.id));
+        }
+        assert_eq!(working_children(&conn, &ids), 4);
+        // The legacy entry points keep the historical limit of two.
+        let mut legacy = setup();
+        let legacy_ids = independent_graph(&mut legacy, 4);
+        for (index, id) in legacy_ids.iter().enumerate() {
+            let won = crate::tasks::claim(&mut legacy, "w", Some(*id), &[], 60, 5)
+                .unwrap()
+                .is_some();
+            assert_eq!(won, index < 2, "legacy claim {index}");
+        }
+    }
+
+    #[test]
+    fn bounded_dashboard_projection_binds_the_supplied_graph_limit() {
+        let mut conn = setup();
+        let ids = independent_graph(&mut conn, 4);
+        for (index, now) in (5..7).enumerate() {
+            crate::tasks::claim_with_graph_limit(
+                &mut conn,
+                &format!("w{index}"),
+                None,
+                &[],
+                60,
+                now,
+                4,
+            )
+            .unwrap()
+            .unwrap();
+        }
+        let listed = |conn: &Connection, graph_limit| {
+            crate::tasks::list_implementation_ready_open_limited(conn, 20, graph_limit)
+                .unwrap()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>()
+        };
+        let dispatchable = crate::tasks::list_implementation_ready_open_with_graph_limit(&conn, 4)
+            .unwrap()
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<Vec<_>>();
+        assert_eq!(dispatchable.len(), 2);
+        assert!(dispatchable.iter().all(|id| ids.contains(id)));
+        // With two children working, the dashboard agrees with dispatch at
+        // limit 4 and hides the remaining children at limit 2.
+        assert_eq!(listed(&conn, 4), dispatchable);
+        assert!(listed(&conn, 2).is_empty());
+        for bad in [0, -1] {
+            assert!(matches!(
+                crate::tasks::list_implementation_ready_open_limited(&conn, 20, bad),
+                Err(crate::error::QuorumError::Usage(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn graph_children_limit_one_serialises_children() {
+        let mut conn = setup();
+        let ids = independent_graph(&mut conn, 3);
+        crate::tasks::claim_with_graph_limit(&mut conn, "w1", Some(ids[0]), &[], 60, 5, 1)
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::tasks::list_implementation_ready_open_with_graph_limit(&conn, 1)
+                .unwrap()
+                .is_empty(),
+            "listing must agree with the claim predicate"
+        );
+        assert!(
+            crate::tasks::claim_with_graph_limit(&mut conn, "w2", Some(ids[1]), &[], 60, 6, 1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::tasks::claim_with_graph_limit(&mut conn, "w2", None, &["x"], 60, 6, 1)
+                .unwrap()
+                .is_none()
+        );
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
+            .unwrap();
+        let next = crate::tasks::claim_with_graph_limit(&mut conn, "w2", None, &[], 60, 7, 1)
+            .unwrap()
+            .expect("a finished child frees the single slot");
+        assert!(ids[1..].contains(&next.id));
+        assert_eq!(working_children(&conn, &ids), 1);
+    }
+
+    #[test]
+    fn graph_children_limit_below_one_is_usage_error() {
+        let mut conn = setup();
+        let ids = independent_graph(&mut conn, 2);
+        for bad in [0, -1] {
+            assert!(matches!(
+                crate::tasks::claim_with_graph_limit(&mut conn, "w", Some(ids[0]), &[], 60, 5, bad),
+                Err(crate::error::QuorumError::Usage(_))
+            ));
+            assert!(matches!(
+                crate::tasks::list_implementation_ready_open_with_graph_limit(&conn, bad),
+                Err(crate::error::QuorumError::Usage(_))
+            ));
+        }
+        assert_eq!(working_children(&conn, &ids), 0);
+    }
+
+    #[test]
+    fn real_file_concurrent_child_claims_never_exceed_configured_limit() {
+        use std::sync::{Arc, Barrier};
+
+        const CHILDREN: usize = 6;
+        for limit in [1_i64, 3, 6] {
+            for round in 0..15 {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("quorum.db");
+                let mut conn = crate::db::open(&path).unwrap();
+                conn.execute(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES ('large','open','owner',1,1)",
+                    [],
+                )
+                .unwrap();
+                let ids = independent_graph(&mut conn, CHILDREN);
+                drop(conn);
+
+                // Twice as many claimers as children: half target a specific
+                // child, half use the selector path.
+                let barrier = Arc::new(Barrier::new(CHILDREN * 2));
+                let handles: Vec<_> = (0..CHILDREN * 2)
+                    .map(|index| {
+                        let path = path.clone();
+                        let barrier = Arc::clone(&barrier);
+                        let target = (index < CHILDREN).then(|| ids[index]);
+                        std::thread::spawn(move || {
+                            let mut conn = crate::db::open(&path).unwrap();
+                            barrier.wait();
+                            crate::tasks::claim_with_graph_limit(
+                                &mut conn,
+                                &format!("w{index}"),
+                                target,
+                                &[],
+                                60,
+                                10 + round,
+                                limit,
+                            )
+                            .unwrap()
+                            .is_some()
+                        })
+                    })
+                    .collect();
+                let winners = handles
+                    .into_iter()
+                    .map(|handle| usize::from(handle.join().unwrap()))
+                    .sum::<usize>();
+                let conn = crate::db::open(&path).unwrap();
+                let working = working_children(&conn, &ids);
+                assert_eq!(winners, limit as usize, "limit {limit} round {round}");
+                assert_eq!(working, limit as usize, "limit {limit} round {round}");
+            }
+        }
+    }
+
     /// Task #473 blocker 1: graph member cancellation must refresh the
     /// durable park refs of parked dependents. Ordinary `tasks::update`
     /// wires convergence; `cancel_graph_in_tx` is a separate cancellation
@@ -10735,5 +11237,353 @@ mod tests {
             refs["daemon_parked_reason"],
             "dependency #1 is cancelled — unsatisfiable"
         );
+    }
+
+    const BLOCKED_REFS: &str = r#"{"runner_provider_block":{"provider":"codex","reason":"quota"},
+        "runner_retry":{"provider":"codex","model":"gpt-5","effort":"high",
+        "prompt":"finish exact turn","turn_kind":"rework","continuation_id":"thread-1"}}"#;
+
+    fn insert_task(conn: &Connection, status: &str, refs: Option<&str>) -> i64 {
+        conn.execute(
+            "INSERT INTO tasks(title,status,refs,created_by,created_at,updated_at)
+             VALUES ('other',?1,?2,'owner',1,1)",
+            params![status, refs],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// A freeze-owning aggregate in `state` with nonzero budgets and a bound
+    /// SHA, so a release visibly clears the one and preserves the others.
+    fn frozen_graph(conn: &mut Connection, state: &str) -> i64 {
+        let graph = begin_planning(
+            conn,
+            &BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "unused",
+                now: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        conn.execute(
+            "UPDATE task_decompositions
+             SET state=?2,frozen_base_sha='abc',provider_failures=2,proposal_attempts=1
+             WHERE id=?1",
+            params![graph, state],
+        )
+        .unwrap();
+        graph
+    }
+
+    type GraphRow = (String, i64, i64, Option<String>, i64, i64, i64);
+
+    fn graph_row(conn: &Connection, graph: i64) -> GraphRow {
+        conn.query_row(
+            "SELECT state,active,freeze_active,frozen_base_sha,
+                    provider_failures,proposal_attempts,updated_at
+             FROM task_decompositions WHERE id=?1",
+            [graph],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    fn assert_release_refused(conn: &mut Connection, graph: i64, live: &[i64]) {
+        let before = graph_row(conn, graph);
+        assert!(!release_freeze_for_provider_block(conn, graph, live, 99).unwrap());
+        assert_eq!(graph_row(conn, graph), before);
+        let errors: i64 = conn
+            .query_row("SELECT count(*) FROM errors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(errors, 0, "a clean negative must not log an errors row");
+    }
+
+    #[test]
+    fn provider_block_release_moves_both_drain_states_to_backoff() {
+        for state in ["draining", "freeze-requested"] {
+            let (_dir, mut conn) = file_setup();
+            let graph = frozen_graph(&mut conn, state);
+            insert_task(&conn, "rework", Some(BLOCKED_REFS));
+            let blocked_in_review = insert_task(&conn, "in-review", Some(BLOCKED_REFS));
+            let attempts = |conn: &Connection| -> i64 {
+                conn.query_row("SELECT count(*) FROM decomposition_attempts", [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+            };
+            let attempts_before = attempts(&conn);
+
+            // A live id that is not a counted task cannot hold the release.
+            assert!(
+                release_freeze_for_provider_block(&mut conn, graph, &[1, 12_345], 50).unwrap(),
+                "{state}"
+            );
+
+            assert_eq!(
+                graph_row(&conn, graph),
+                ("provider-backoff".into(), 0, 0, None, 2, 1, 50),
+                "{state}"
+            );
+            assert_eq!(attempts(&conn), attempts_before, "{state}");
+            let task_status: String = conn
+                .query_row(
+                    "SELECT status FROM tasks WHERE id=?1",
+                    [blocked_in_review],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(task_status, "in-review", "{state}");
+
+            // The guard is single-shot, and the dropped freeze can be retaken
+            // with no frozen SHA surviving from the released drain.
+            assert_release_refused(&mut conn, graph, &[]);
+            assert!(reacquire_freeze(&mut conn, graph, 51).unwrap());
+            assert_eq!(
+                graph_row(&conn, graph),
+                ("freeze-requested".into(), 0, 1, None, 2, 1, 51),
+                "{state}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_block_release_refuses_while_any_task_keeps_the_drain_held() {
+        let (_dir, mut conn) = file_setup();
+        let graph = frozen_graph(&mut conn, "draining");
+
+        // Zero started tasks is the ordinary drain-complete path, not a release.
+        insert_task(&conn, "open", Some(BLOCKED_REFS));
+        insert_task(&conn, "failed", Some(BLOCKED_REFS));
+        assert_release_refused(&mut conn, graph, &[]);
+
+        let blocked = insert_task(&conn, "working", Some(BLOCKED_REFS));
+        assert_release_refused(&mut conn, graph, &[blocked]);
+
+        for refs in [
+            None,
+            Some(r#"{"pr":7}"#),
+            Some(r#"{"daemon_parked":true,"daemon_parked_reason":"held"}"#),
+            Some("not json"),
+        ] {
+            let holder = insert_task(&conn, "in-review", refs);
+            assert_release_refused(&mut conn, graph, &[]);
+            conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [holder])
+                .unwrap();
+        }
+
+        assert!(release_freeze_for_provider_block(&mut conn, graph, &[], 50).unwrap());
+    }
+
+    /// An approved handoff stays in `merging` until Phase 4e consumes it, so it
+    /// holds the release exactly as it holds the frozen-base bind, even when
+    /// its refs still carry a provider block from an earlier turn.
+    #[test]
+    fn provider_block_release_refuses_while_a_merge_handoff_holds_the_drain() {
+        let (_dir, mut conn) = file_setup();
+        let graph = frozen_graph(&mut conn, "draining");
+        insert_task(&conn, "rework", Some(BLOCKED_REFS));
+
+        let merging = insert_task(
+            &conn,
+            "merging",
+            Some(r#"{"pr":7,"daemon_merge_retry":"requested"}"#),
+        );
+        assert_release_refused(&mut conn, graph, &[]);
+
+        let blocked_refs: serde_json::Value = serde_json::from_str(BLOCKED_REFS).unwrap();
+        conn.execute(
+            "UPDATE tasks SET refs=?2 WHERE id=?1",
+            params![merging, blocked_refs.to_string()],
+        )
+        .unwrap();
+        assert!(!provider_blocked_started_task_ids(&conn, 1)
+            .unwrap()
+            .contains(&merging));
+        assert_release_refused(&mut conn, graph, &[]);
+
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [merging])
+            .unwrap();
+        assert!(release_freeze_for_provider_block(&mut conn, graph, &[], 50).unwrap());
+    }
+
+    #[test]
+    fn provider_block_release_refuses_every_other_graph_shape() {
+        for state in [
+            "planning",
+            "validating",
+            "preclassifying",
+            "provider-backoff",
+            "held",
+            "active",
+            "blocked",
+            "completed",
+            "cancelled",
+        ] {
+            let (_dir, mut conn) = file_setup();
+            let graph = frozen_graph(&mut conn, state);
+            insert_task(&conn, "working", Some(BLOCKED_REFS));
+            assert_release_refused(&mut conn, graph, &[]);
+        }
+
+        let (_dir, mut conn) = file_setup();
+        let graph = frozen_graph(&mut conn, "draining");
+        insert_task(&conn, "working", Some(BLOCKED_REFS));
+        conn.execute(
+            "UPDATE task_decompositions SET active=1 WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        assert_release_refused(&mut conn, graph, &[]);
+        conn.execute(
+            "UPDATE task_decompositions SET active=0,freeze_active=0 WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        assert_release_refused(&mut conn, graph, &[]);
+        assert!(!release_freeze_for_provider_block(&mut conn, graph + 1, &[], 99).unwrap());
+    }
+
+    #[test]
+    fn provider_block_helper_and_release_exclude_the_source() {
+        let (_dir, mut conn) = file_setup();
+        let graph = frozen_graph(&mut conn, "draining");
+        for refs in [Some(BLOCKED_REFS), None] {
+            conn.execute(
+                "UPDATE tasks SET status='working',refs=?1 WHERE id=1",
+                params![refs],
+            )
+            .unwrap();
+            assert!(provider_blocked_started_task_ids(&conn, 1)
+                .unwrap()
+                .is_empty());
+            assert_release_refused(&mut conn, graph, &[]);
+        }
+
+        // An unblocked source does not hold what its blocked peers would not.
+        insert_task(&conn, "rework", Some(BLOCKED_REFS));
+        assert!(release_freeze_for_provider_block(&mut conn, graph, &[], 50).unwrap());
+    }
+
+    #[test]
+    fn provider_blocked_helper_returns_only_runner_provider_blocks_in_id_order() {
+        let conn = setup();
+        let rework = insert_task(&conn, "rework", Some(BLOCKED_REFS));
+        let historical = insert_task(
+            &conn,
+            "working",
+            Some(r#"{"codex_provider_blocked":true,"codex_provider_error":"quota"}"#),
+        );
+        let in_review = insert_task(&conn, "in-review", Some(BLOCKED_REFS));
+        for (status, refs) in [
+            ("working", None),
+            ("working", Some("not json")),
+            ("working", Some("[1]")),
+            ("working", Some(r#"{"pr":7}"#)),
+            ("working", Some(r#"{"daemon_parked":true}"#)),
+            ("working", Some(r#"{"codex_provider_blocked":false}"#)),
+            (
+                "working",
+                Some(r#"{"runner_provider_block":{"provider":"","reason":""}}"#),
+            ),
+            ("working", Some(r#"{"runner_provider_block":"quota"}"#)),
+            ("open", Some(BLOCKED_REFS)),
+            ("failed", Some(BLOCKED_REFS)),
+            ("done", Some(BLOCKED_REFS)),
+        ] {
+            insert_task(&conn, status, refs);
+        }
+
+        assert_eq!(
+            provider_blocked_started_task_ids(&conn, 1).unwrap(),
+            [rework, historical, in_review]
+        );
+    }
+
+    /// A retry committed through another connection after the caller's read
+    /// must make the release a clean false, for both retryable task statuses.
+    #[test]
+    fn provider_block_release_rechecks_a_retry_landing_after_the_callers_read() {
+        for status in ["rework", "working"] {
+            let (dir, mut conn) = file_setup();
+            // A real lease, or the retry's own sweep reaps a `working` task.
+            let task = insert_task(
+                &conn,
+                "open",
+                Some(r#"{"cx_est":1,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null}"#),
+            );
+            crate::tasks::claim(&mut conn, "worker", Some(task), &[], 600, 1)
+                .unwrap()
+                .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status=?2,refs=?3 WHERE id=?1",
+                params![task, status, BLOCKED_REFS],
+            )
+            .unwrap();
+            let graph = frozen_graph(&mut conn, "draining");
+            assert_eq!(
+                provider_blocked_started_task_ids(&conn, 1).unwrap(),
+                [task],
+                "{status}"
+            );
+
+            let mut operator = crate::db::open(&dir.path().join("decomposition.db")).unwrap();
+            crate::tasks::retry_provider_blocked(&mut operator, task, "operator", 40)
+                .unwrap()
+                .unwrap();
+
+            assert!(provider_blocked_started_task_ids(&conn, 1)
+                .unwrap()
+                .is_empty());
+            assert_release_refused(&mut conn, graph, &[]);
+        }
+    }
+
+    /// Release and retry serialize on the write lock: each round has exactly
+    /// one of the two legal outcomes, and neither side sees a BUSY failure.
+    #[test]
+    fn provider_block_release_races_a_retry_across_connections() {
+        for _ in 0..25 {
+            let (dir, mut conn) = file_setup();
+            let graph = frozen_graph(&mut conn, "draining");
+            let task = insert_task(&conn, "rework", Some(BLOCKED_REFS));
+            let path = dir.path().join("decomposition.db");
+            let barrier = std::sync::Barrier::new(2);
+
+            let released = std::thread::scope(|scope| {
+                let release = scope.spawn(|| {
+                    let mut conn = crate::db::open(&path).unwrap();
+                    barrier.wait();
+                    release_freeze_for_provider_block(&mut conn, graph, &[], 50).unwrap()
+                });
+                let retry = scope.spawn(|| {
+                    let mut conn = crate::db::open(&path).unwrap();
+                    barrier.wait();
+                    crate::tasks::retry_provider_blocked(&mut conn, task, "operator", 50).unwrap()
+                });
+                assert!(retry.join().unwrap().is_some());
+                release.join().unwrap()
+            });
+
+            let expected = if released {
+                ("provider-backoff".into(), 0, 0, None, 2, 1, 50)
+            } else {
+                ("draining".into(), 0, 1, Some("abc".into()), 2, 1, 2)
+            };
+            assert_eq!(graph_row(&conn, graph), expected);
+        }
     }
 }

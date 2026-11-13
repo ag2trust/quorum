@@ -100,3 +100,43 @@ fn tail_renders_sanitized_live_fake_codex_planner_attempt() {
     provider.kill().unwrap();
     provider.wait().unwrap();
 }
+
+#[test]
+fn tail_falls_back_to_latest_retained_session_when_agent_not_in_flight() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path()).arg("init").assert().success();
+    let logs = home.path().join("logs");
+    for (dir, body) in [
+        ("worker-1-100", "old\n"),
+        ("worker-1-200", "mid\n"),
+        ("worker-1-200-3", "newest\n"),
+        // Different agent whose name extends ours must never be picked.
+        ("worker-1-9-999", "wrong-agent\n"),
+        ("worker-10-900", "wrong-agent\n"),
+    ] {
+        std::fs::create_dir_all(logs.join(dir)).unwrap();
+        std::fs::write(logs.join(dir).join("stream.jsonl"), body).unwrap();
+    }
+    let out = quorum(home.path())
+        .args(["tail", "worker-1", "--raw"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "newest");
+}
+
+#[test]
+fn tail_unknown_agent_without_retained_logs_exits_2_with_clear_message() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path()).arg("init").assert().success();
+    let out = quorum(home.path())
+        .args(["tail", "ghost"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        err.contains("no session log found for agent 'ghost'"),
+        "{err}"
+    );
+}

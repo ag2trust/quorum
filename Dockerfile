@@ -45,12 +45,14 @@ COPY --from=quorum-builder /src/target/release/quorum /usr/local/bin/quorum
 COPY --from=codex-fetcher /opt/codex /opt/codex
 COPY LICENSE /usr/share/doc/quorum/LICENSE
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY docker/health.sh /usr/local/bin/quorum-health
 COPY docker/serve-codex.toml /usr/share/quorum/serve-codex.toml
-RUN chmod 0555 /usr/local/bin/entrypoint.sh \
+RUN chmod 0555 /usr/local/bin/entrypoint.sh /usr/local/bin/quorum-health \
     && chmod 0444 /usr/share/quorum/serve-codex.toml
 RUN install --directory --owner=10001 --group=10001 \
       /home/quorum \
       /data /data/quorum /data/repos /data/worktrees \
+    && install --directory --owner=10001 --group=10001 --mode=0700 /run/quorum \
     && printf 'quorum:x:10001:\n' >> /etc/group \
     && printf 'quorum:x:10001:10001:Quorum runtime:/home/quorum:/bin/sh\n' >> /etc/passwd \
     && install --directory /usr/share/doc/codex \
@@ -66,6 +68,12 @@ ENV HOME=/home/quorum \
 VOLUME ["/data"]
 WORKDIR /data/repos
 USER 10001:10001
+
+# Readiness: supervisor and both children live, /data paths usable, selected
+# repository DB compatible, daemon authority Alive, loopback Web answers HTTP.
+# Worst-case probe runtime is ~9s (5s status + 2s HTTP + kill grace).
+HEALTHCHECK --interval=30s --timeout=15s --start-period=120s --retries=3 \
+  CMD ["/usr/local/bin/quorum-health", "readiness"]
 
 ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
 CMD ["/usr/local/bin/entrypoint.sh"]

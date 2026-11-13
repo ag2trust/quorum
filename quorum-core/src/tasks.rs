@@ -10,6 +10,7 @@
 
 use crate::db::begin_immediate;
 use crate::error::{QuorumError, Result};
+use crate::git::git_command;
 use crate::lifecycle::{Effect, Event, Status, TaskView};
 use crate::runner_state::{
     self, ContinuationSlot, InitialWorkerSession, PendingTurn, ProviderBlock,
@@ -17,7 +18,6 @@ use crate::runner_state::{
 use crate::sweep::SWEEP_LIMIT;
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use serde::Serialize;
-use std::process::Command;
 
 pub const STATUSES: &[&str] = &[
     "open",
@@ -85,6 +85,8 @@ pub const TERMINAL_RETRY_RECONCILE_LIMIT: i64 = 8;
 /// Legacy one-shot remediation head-check marker. New terminal parks never
 /// write it; restart reconciliation removes it without reviving the task.
 pub const PARKED_HEAD_CHECK_REF: &str = "daemon_parked_head_check";
+/// Maximum number of body/refs/depends-on edits per task.
+pub const MAX_TASK_EDITS: i64 = 3;
 pub const CI_REMEDIATION_REQUESTED_REF: &str = "ci_remediation_requested";
 pub const CI_REMEDIATION_PR_REF: &str = "ci_remediation_pr";
 pub const CI_REMEDIATION_HEAD_SHA_REF: &str = "ci_remediation_head_sha";
@@ -106,6 +108,64 @@ pub const MAX_DEPENDENCY_BASE_WAIT_ATTEMPTS: i64 = 3;
 /// sources. Bound recursive dependency provenance expansion so corrupt graph
 /// data cannot turn one admission read into unbounded work.
 pub const MAX_DEPENDENCY_DECOMPOSITION_DEPTH: usize = 8;
+
+/// Prefix of the durable note recorded on every crash-recovery transition.
+pub const WORKER_FAILURE_NOTE_PREFIX: &str = "worker failure, recovery attempt ";
+const WORKER_FAILURE_CAUSE_LIMIT: usize = 1024;
+
+/// Upper bound on a worker's `react` reason (bytes), enforced at the CLI and
+/// again at the endpoint.
+pub const REACT_REASON_MAX_BYTES: usize = 8 * 1024;
+/// Bounded excerpt of a reaction reason carried in owner alerts and events.
+const PARK_REASON_EXCERPT_CHARS: usize = 300;
+
+/// Validate a `react` reason. `blocked` and `needs-info` require a non-empty
+/// reason (it is the only durable carrier of the question or blocker); other
+/// states accept an optional one. Text safety (invariant 9): no NUL.
+pub fn validate_react_reason(state: &str, reason: Option<&str>) -> Result<Option<String>> {
+    let reason = reason.map(str::trim).filter(|r| !r.is_empty());
+    if matches!(state, "blocked" | "needs-info") && reason.is_none() {
+        return Err(QuorumError::Usage(format!(
+            "react --state {state} requires a reason: pass --reason-stdin or --reason-file"
+        )));
+    }
+    if let Some(reason) = reason {
+        if reason.contains('\0') {
+            return Err(QuorumError::BadInput("embedded NUL byte in reason".into()));
+        }
+        if reason.len() > REACT_REASON_MAX_BYTES {
+            return Err(QuorumError::Usage(format!(
+                "react reason is {} bytes; the limit is {REACT_REASON_MAX_BYTES}",
+                reason.len()
+            )));
+        }
+    }
+    Ok(reason.map(str::to_string))
+}
+
+/// The reason attached to the worker's latest reaction, when that reaction is
+/// `state`. Reactions are consumed into the journal state (which carries no
+/// reason), so the mailbox row stays the durable carrier.
+fn latest_reaction_reason(
+    conn: &Connection,
+    agent: &str,
+    task_id: i64,
+    state: &str,
+) -> Result<Option<String>> {
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT note, feedback FROM mailbox
+             WHERE agent=?1 AND kind='task_update' AND task_id=?2
+             ORDER BY id DESC LIMIT 1",
+            params![agent, task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(row
+        .filter(|(note, _)| note.as_deref() == Some(state))
+        .and_then(|(_, reason)| reason)
+        .filter(|reason| !reason.trim().is_empty()))
+}
 
 /// Return the durable poison-retry generation encoded in task refs. Missing
 /// and malformed values deliberately read as the legacy generation zero: a
@@ -287,6 +347,9 @@ pub struct Task {
     pub reviewer: Option<String>,
     pub rework_round: i64,
     pub review_only: bool,
+    /// v80: `task-create --review-only`. Reviewers review the PR; Quorum never
+    /// reworks it. Always implies `review_only`.
+    pub no_rework: bool,
     pub recovery_attempts: i64,
     pub revision: i64,
     pub edit_count: i64,
@@ -445,19 +508,86 @@ pub fn effect_name(e: &Effect) -> String {
 const COLS: &str = "id, title, body, status, priority, labels, assignee, created_by, \
                     created_at, updated_at, refs, depends_on, author, reviewer, \
                     rework_round, review_only, recovery_attempts, revision, edit_count, \
-                    continue_pr, target_branch, terminal_leaf, rework_cap";
+                    continue_pr, target_branch, terminal_leaf, rework_cap, no_rework";
 
-const DEP_READY_CLAUSE: &str = "(depends_on IS NULL OR NOT EXISTS (
+/// SQL predicate over a dependency row aliased `d`: the dependency satisfies
+/// its dependents only when it is `done` WITHOUT a daemon-owned
+/// `refs.review_outcome`. A review-only (`no_rework`) task that closed on
+/// changes requested, CI failure, or merge conflict is `done` but unmerged,
+/// so its dependents stay blocked (not parked, not failed) as-is.
+macro_rules! dep_satisfied_sql {
+    () => {
+        "(d.status = 'done' AND (CASE WHEN json_valid(COALESCE(d.refs, '{}')) \
+         THEN json_extract(d.refs, '$.review_outcome') END) IS NULL)"
+    };
+}
+
+/// See [`dep_satisfied_sql`]. Every "dependency satisfied" decision —
+/// claim, selection, readiness, status, planner, graph materialization —
+/// must use this exact predicate so they cannot drift.
+pub const DEP_SATISFIED_PREDICATE: &str = dep_satisfied_sql!();
+
+pub const DEP_READY_CLAUSE: &str = concat!(
+    "(depends_on IS NULL OR NOT EXISTS (
     SELECT 1 FROM json_each(depends_on) je
     WHERE NOT EXISTS (
-        SELECT 1 FROM tasks d WHERE d.id = je.value AND d.status = 'done'
+        SELECT 1 FROM tasks d WHERE d.id = je.value AND ",
+    dep_satisfied_sql!(),
+    "
     )
-))";
+))"
+);
+
+/// SQL shape that is true when the aliased `failed` task row is a retryable
+/// daemon park rather than a hard failure: it carries the daemon park marker
+/// and a resume status, its dependencies are not unsatisfiable, and it is not
+/// a publication park that observed the PR already merged (delivery evidence
+/// that `task-retry` refuses). Owner policy: such a park neither holds its
+/// decomposition graph nor blocks sibling dispatch; only hard failures do.
+/// The park still keeps the graph incomplete (the child is not `done`) and
+/// still blocks its own dependents through ordinary dependency readiness.
+macro_rules! retryable_daemon_park_sql {
+    ($t:literal) => {
+        // COALESCE keeps the predicate two-valued: missing keys or NULL refs
+        // must read as "not a retryable park", never as SQL NULL, so that
+        // `NOT <predicate>` stays true for a hard failure.
+        concat!(
+            "(COALESCE((json_valid(",
+            $t,
+            ".refs)
+              AND json_extract(",
+            $t,
+            ".refs,'$.daemon_parked')=1
+              AND json_type(",
+            $t,
+            ".refs,'$.daemon_resume_status')='text'
+              AND COALESCE(json_extract(",
+            $t,
+            ".refs,'$.daemon_parked_unsatisfiable'),0)=0
+              AND COALESCE(json_extract(",
+            $t,
+            ".refs,'$.daemon_publication_failure_kind'),'')!='pr-merged'),0)=1)"
+        )
+    };
+}
+
+/// [`retryable_daemon_park_sql`] over a row aliased `child`, for graph-hold
+/// decisions outside this module.
+pub(crate) const RETRYABLE_DAEMON_PARK_CHILD_SQL: &str = retryable_daemon_park_sql!("child");
 
 // Generated implementation work has additional graph authority. This exact
 // predicate is used both by daemon-side candidate selection and by the
-// authoritative claim transaction so the two paths cannot drift.
-const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
+// authoritative claim transaction so the two paths cannot drift. Only a
+// hard-failed sibling withholds dispatch; a retryable daemon park does not.
+//
+// `$limit` is the SQL placeholder (for example `"?4"`) bound to the per-graph
+// working-children limit. Each caller binds the same validated value so the
+// listing and the claim agree; the placeholder differs only because each
+// statement numbers its parameters independently.
+macro_rules! graph_implementation_ready_clause {
+    ($limit:literal) => {
+        concat!(
+            "(NOT EXISTS (
     SELECT 1 FROM task_graph_members own_member
     WHERE own_member.task_id=tasks.id
 ) OR EXISTS (
@@ -473,14 +603,37 @@ const GRAPH_IMPLEMENTATION_READY_CLAUSE: &str = "(NOT EXISTS (
           JOIN tasks sibling ON sibling.id=sibling_member.task_id
           WHERE sibling_member.graph_id=own_member.graph_id
             AND sibling_member.active=1 AND sibling.status='failed'
+            AND NOT ",
+            retryable_daemon_park_sql!("sibling"),
+            "
       )
-      AND 2 > (
+      AND ",
+            $limit,
+            " > (
           SELECT COUNT(*) FROM task_graph_members sibling_member
           JOIN tasks sibling ON sibling.id=sibling_member.task_id
           WHERE sibling_member.graph_id=own_member.graph_id
             AND sibling_member.active=1 AND sibling.status='working'
       )
-))";
+))"
+        )
+    };
+}
+
+/// Per-graph working-children limit applied by the legacy [`claim`] and
+/// [`list_implementation_ready_open`] entry points. The daemon passes its
+/// configured `max_graph_children_working` (default: worker `cap`) through the
+/// `*_with_graph_limit` variants instead.
+pub const DEFAULT_GRAPH_CHILDREN_WORKING_LIMIT: i64 = 2;
+
+fn validate_graph_children_working_limit(limit: i64) -> Result<()> {
+    if limit < 1 {
+        return Err(QuorumError::Usage(format!(
+            "graph working-children limit must be >= 1 (got {limit})"
+        )));
+    }
+    Ok(())
+}
 
 /// SQL shape for the only flagged root route that requires decomposition.
 /// Missing flags are intentionally equivalent to an empty array.
@@ -528,6 +681,49 @@ macro_rules! branch_sync_ref_present_sql {
     };
 }
 pub const BRANCH_SYNC_REF_PRESENT_SQL: &str = branch_sync_ref_present_sql!();
+
+/// Planner-routing eligibility over a `tasks` row aliased `t`.
+///
+/// This is the cx-ready route — `L` at complexity 5, `XL` at complexity 4 or
+/// 5, and flagged `L` at complexity 4 — plus the per-task exclusions:
+/// review-only, terminal leaf, continuation, a branch-sync ref, and an
+/// existing decomposition or graph membership. `id` is qualified because the
+/// membership subqueries shadow it; the other `refs` checks stay unqualified
+/// and resolve to that same aliased row. The repository-wide one-active-graph
+/// exclusion is not part of this predicate. `planning_candidate` keeps that
+/// clause, and status uses this predicate only to explain a queued task that
+/// the clause is holding.
+///
+/// A branch-sync judgment task bypasses planning exactly like continuation
+/// and review-only work. Selecting it would let routed planning reject it
+/// every tick while an ordinary decomposable candidate waits behind it.
+macro_rules! planner_eligibility_sql {
+    () => {
+        concat!(
+            "(json_valid(t.refs) AND json_extract(t.refs,'$.cx_ready')=1",
+            " AND (",
+            "(json_extract(t.refs,'$.cx_size')='L' AND json_extract(t.refs,'$.cx_est')=5)",
+            " OR (json_extract(t.refs,'$.cx_size')='XL' AND json_extract(t.refs,'$.cx_est') IN (4,5))",
+            " OR (json_extract(t.refs,'$.cx_size')='L'",
+            " AND json_extract(t.refs,'$.cx_est')=4",
+            " AND COALESCE(json_array_length(t.refs, '$.cx_risk_flags'), 0) >= 1)",
+            ")",
+            " AND t.review_only=0",
+            " AND t.terminal_leaf=0",
+            " AND t.continue_pr IS NULL",
+            " AND NOT ",
+            branch_sync_ref_present_sql!(),
+            " AND NOT EXISTS (SELECT 1 FROM task_decompositions planner_source",
+            " WHERE planner_source.source_task_id=t.id)",
+            " AND NOT EXISTS (SELECT 1 FROM task_graph_members planner_member",
+            " WHERE planner_member.task_id=t.id))"
+        )
+    };
+}
+
+/// See [`planner_eligibility_sql`]. Planner selection and the status hold
+/// reason both interpolate this fragment so the route cannot drift.
+pub const PLANNER_ELIGIBILITY_PREDICATE: &str = planner_eligibility_sql!();
 
 // SQL counterpart of the implementation branch in
 // `classification_is_dispatchable`. Callers that need implementation work
@@ -586,6 +782,7 @@ fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
         target_branch: r.get(20)?,
         terminal_leaf: r.get::<_, i64>(21)? != 0,
         rework_cap: r.get(22)?,
+        no_rework: r.get::<_, i64>(23)? != 0,
         ready: false,
     })
 }
@@ -685,6 +882,11 @@ pub fn validate_creator_refs(refs_json: Option<&str>) -> Result<()> {
             "refs key 'pr' is daemon-owned; use --review-pr or --continue-pr".into(),
         ));
     }
+    if let Some(key) = object.keys().find(|key| is_review_outcome_ref(key)) {
+        return Err(QuorumError::Usage(format!(
+            "refs key '{key}' is daemon-owned review-only outcome state"
+        )));
+    }
     if object.contains_key("source_task") {
         return Err(QuorumError::Usage(
             "refs key 'source_task' is daemon-owned recovery provenance".into(),
@@ -706,6 +908,30 @@ pub fn validate_creator_refs(refs_json: Option<&str>) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// The daemon-owned review-only close outcome (`changes_requested`,
+/// `ci_failed`, `merge_conflict`) recorded on a task's refs, if any. A `done`
+/// task carrying one closed without merge and does not satisfy dependents.
+pub fn review_outcome_of(refs: Option<&str>) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(refs?).ok()?;
+    value
+        .get(REVIEW_OUTCOME_REF)
+        .filter(|outcome| !outcome.is_null())
+        .map(|outcome| match outcome.as_str() {
+            Some(text) => text.to_string(),
+            None => outcome.to_string(),
+        })
+}
+
+/// Daemon-owned `--review-only` outcome keys (`review_outcome*`), including
+/// the REQUEST_CHANGES outbox state. Creators can neither set nor erase them.
+fn is_review_outcome_ref(key: &str) -> bool {
+    key.starts_with(REVIEW_OUTCOME_REF)
+}
+
+fn strip_review_outcome_refs(map: &mut serde_json::Map<String, serde_json::Value>) {
+    map.retain(|key, _| !is_review_outcome_ref(key));
 }
 
 fn preserve_classifier_refs(
@@ -738,6 +964,12 @@ fn preserve_protected_refs(
     let Some(next_map) = next.as_object_mut() else {
         return Some(replacement.to_string());
     };
+    // Defense in depth on creator/assignee paths: a replacement can never
+    // introduce or rewrite review outcome state; only the established values
+    // below survive.
+    if preserve_recovery_provenance {
+        strip_review_outcome_refs(next_map);
+    }
     if let Some(existing_map) = existing
         .as_deref()
         .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
@@ -766,7 +998,11 @@ fn preserve_protected_refs(
                     key.as_str(),
                     "source_task" | MERGE_COMMIT_SHA_REF | POISON_RETRY_GENERATION_REF
                 );
-            if classifier_or_pr || runner_state || recovery_provenance {
+            if classifier_or_pr
+                || runner_state
+                || recovery_provenance
+                || is_review_outcome_ref(&key)
+            {
                 next_map.insert(key, value);
             }
         }
@@ -812,10 +1048,12 @@ pub fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<b
         return Ok(true);
     };
     let unmet: i64 = conn.query_row(
-        "SELECT count(*) FROM json_each(?1)
-         WHERE NOT EXISTS (
-             SELECT 1 FROM tasks d WHERE d.id = json_each.value AND d.status = 'done'
-         )",
+        &format!(
+            "SELECT count(*) FROM json_each(?1)
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM tasks d WHERE d.id = json_each.value AND {DEP_SATISFIED_PREDICATE}
+             )"
+        ),
         params![json],
         |r| r.get(0),
     )?;
@@ -834,7 +1072,7 @@ pub fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<b
 pub fn count_started_non_terminal_excluding(conn: &Connection, exclude_id: i64) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT count(*) FROM tasks
-         WHERE status IN ('working','in-review','rework')
+         WHERE status IN ('working','in-review','rework','merging')
            AND id != ?1",
         params![exclude_id],
         |r| r.get(0),
@@ -883,6 +1121,263 @@ pub fn recovered_remediation_retry_requested(refs: Option<&str>) -> bool {
                 .and_then(serde_json::Value::as_bool)
         })
         .unwrap_or(false)
+}
+
+// ── review-only / no-rework outcome (`task-create --review-only`) ────────────
+
+/// Durable verdict of a closed review-only/no-rework task:
+/// `changes_requested`, `ci_failed`, or `merge_conflict`.
+pub const REVIEW_OUTCOME_REF: &str = "review_outcome";
+/// Bounded findings text accompanying [`REVIEW_OUTCOME_REF`].
+pub const REVIEW_OUTCOME_FINDINGS_REF: &str = "review_outcome_findings";
+/// Bounded failing check names for a `ci_failed` outcome.
+pub const REVIEW_OUTCOME_CHECKS_REF: &str = "review_outcome_checks";
+/// Unix time the outcome was recorded.
+pub const REVIEW_OUTCOME_AT_REF: &str = "review_outcome_at";
+/// Durable outbox for the daemon-owned GitHub REQUEST_CHANGES review:
+/// `pending` until the daemon has ensured it, then `posted`.
+pub const REVIEW_OUTCOME_GITHUB_REF: &str = "review_outcome_github";
+
+/// Byte bound for persisted no-rework findings (and the findings note body).
+pub const NO_REWORK_FINDINGS_MAX_BYTES: usize = 4096;
+const NO_REWORK_MAX_CHECKS: usize = 20;
+const NO_REWORK_CHECK_NAME_MAX_BYTES: usize = 200;
+
+fn truncate_utf8(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes.saturating_sub('…'.len_utf8());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// The durable outcome kind for an event that closes a no-rework task, or
+/// `None` for events that are not actionable-rework triggers.
+pub fn no_rework_outcome_kind(event: &Event) -> Option<&'static str> {
+    match event {
+        Event::VerdictChanges => Some("changes_requested"),
+        Event::ChecksFailed { .. } => Some("ci_failed"),
+        Event::MergeConflict => Some("merge_conflict"),
+        _ => None,
+    }
+}
+
+fn no_rework_outcome_label(kind: &str) -> &'static str {
+    match kind {
+        "changes_requested" => "reviewer requested changes",
+        "ci_failed" => "CI checks failed",
+        "merge_conflict" => "PR has a merge conflict",
+        _ => "closed without rework",
+    }
+}
+
+fn bounded_checks(event: &Event) -> Vec<String> {
+    match event {
+        Event::ChecksFailed { checks } => checks
+            .iter()
+            .take(NO_REWORK_MAX_CHECKS)
+            .map(|name| truncate_utf8(name, NO_REWORK_CHECK_NAME_MAX_BYTES))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Human-readable findings body shared by the task note and the daemon's
+/// GitHub REQUEST_CHANGES review. Bounded to [`NO_REWORK_FINDINGS_MAX_BYTES`]
+/// of findings plus a short header.
+fn no_rework_outcome_body(kind: &str, checks: &[String], findings: Option<&str>) -> String {
+    let mut body = format!(
+        "Quorum review-only outcome: {}. This task was created with \
+         `task-create --review-only`, so Quorum closed it without rework; \
+         the PR author owns any follow-up.",
+        no_rework_outcome_label(kind)
+    );
+    if !checks.is_empty() {
+        body.push_str("\n\nFailing checks: ");
+        body.push_str(&checks.join(", "));
+    }
+    if let Some(findings) = findings.map(str::trim).filter(|text| !text.is_empty()) {
+        body.push_str("\n\nFindings:\n");
+        body.push_str(&truncate_utf8(findings, NO_REWORK_FINDINGS_MAX_BYTES));
+    }
+    body
+}
+
+fn no_rework_findings_note(kind: &str, event: &Event, findings: Option<&str>) -> String {
+    no_rework_outcome_body(kind, &bounded_checks(event), findings)
+}
+
+fn set_no_rework_outcome_refs(
+    refs: Option<&str>,
+    kind: &str,
+    event: &Event,
+    findings: Option<&str>,
+    now: i64,
+) -> Result<String> {
+    let mut value: serde_json::Value = match refs {
+        Some(raw) => serde_json::from_str(raw)
+            .map_err(|error| QuorumError::Io(format!("invalid task refs JSON: {error}")))?,
+        None => serde_json::json!({}),
+    };
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| QuorumError::Io("task refs must be a JSON object".into()))?;
+    object.insert(REVIEW_OUTCOME_REF.into(), serde_json::json!(kind));
+    object.insert(REVIEW_OUTCOME_AT_REF.into(), serde_json::json!(now));
+    object.insert(
+        REVIEW_OUTCOME_GITHUB_REF.into(),
+        serde_json::json!("pending"),
+    );
+    let checks = bounded_checks(event);
+    if checks.is_empty() {
+        object.remove(REVIEW_OUTCOME_CHECKS_REF);
+    } else {
+        object.insert(REVIEW_OUTCOME_CHECKS_REF.into(), serde_json::json!(checks));
+    }
+    match findings.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) => {
+            object.insert(
+                REVIEW_OUTCOME_FINDINGS_REF.into(),
+                serde_json::json!(truncate_utf8(text, NO_REWORK_FINDINGS_MAX_BYTES)),
+            );
+        }
+        None => {
+            object.remove(REVIEW_OUTCOME_FINDINGS_REF);
+        }
+    }
+    serde_json::to_string(&value)
+        .map_err(|error| QuorumError::Io(format!("serialize task refs: {error}")))
+}
+
+/// One closed no-rework task whose GitHub REQUEST_CHANGES review the daemon
+/// has not yet ensured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoReworkReviewPost {
+    pub task_id: i64,
+    pub pr: i64,
+    pub body: String,
+}
+
+/// Bounded read of the durable REQUEST_CHANGES outbox. Short read: callers
+/// perform the GitHub call outside any transaction, then
+/// [`mark_no_rework_review_posted`].
+pub fn pending_no_rework_review_posts(
+    conn: &Connection,
+    limit: i64,
+) -> Result<Vec<NoReworkReviewPost>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, refs FROM tasks
+         WHERE status='done' AND no_rework=1 AND json_valid(refs)
+           AND json_extract(refs, '$.review_outcome_github')='pending'
+         ORDER BY id LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut posts = Vec::with_capacity(rows.len());
+    for (task_id, refs) in rows {
+        let Some(pr) = extract_pr_number(&refs) else {
+            continue;
+        };
+        let value: serde_json::Value = refs
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_default();
+        let kind = value[REVIEW_OUTCOME_REF].as_str().unwrap_or_default();
+        let checks = value[REVIEW_OUTCOME_CHECKS_REF]
+            .as_array()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| name.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let findings = value[REVIEW_OUTCOME_FINDINGS_REF].as_str();
+        posts.push(NoReworkReviewPost {
+            task_id,
+            pr,
+            body: no_rework_outcome_body(kind, &checks, findings),
+        });
+    }
+    Ok(posts)
+}
+
+/// Bound on GitHub REQUEST_CHANGES attempts for one closed no-rework task.
+pub const NO_REWORK_REVIEW_POST_MAX_ATTEMPTS: i64 = 5;
+
+/// Record one unconfirmed REQUEST_CHANGES attempt. Returns `"retry"` while
+/// attempts remain, `"failed"` when the bounded budget is exhausted (the entry
+/// leaves the outbox and the owner is alerted), or `"already-consumed"` when
+/// the entry is no longer pending.
+pub fn record_no_rework_review_post_failure(
+    conn: &mut Connection,
+    id: i64,
+    now: i64,
+) -> Result<&'static str> {
+    let tx = begin_immediate(conn)?;
+    let attempts: Option<i64> = tx
+        .query_row(
+            "SELECT COALESCE(json_extract(refs, '$.review_outcome_github_attempts'), 0) + 1
+             FROM tasks
+             WHERE id=?1 AND status='done' AND no_rework=1 AND json_valid(refs)
+               AND json_extract(refs, '$.review_outcome_github')='pending'",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(attempts) = attempts else {
+        tx.commit()?;
+        return Ok("already-consumed");
+    };
+    let exhausted = attempts >= NO_REWORK_REVIEW_POST_MAX_ATTEMPTS;
+    tx.execute(
+        "UPDATE tasks
+         SET refs=json_set(refs,
+                 '$.review_outcome_github_attempts', ?2,
+                 '$.review_outcome_github', CASE WHEN ?3 THEN 'failed' ELSE 'pending' END),
+             updated_at=?4
+         WHERE id=?1",
+        params![id, attempts, exhausted, now],
+    )?;
+    if exhausted {
+        tx.execute(
+            "INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at, recipient)
+             VALUES (?1, 'daemon', ?2, 'alert', ?3, ?4, ?5, 'owner')",
+            params![
+                now,
+                crate::feed::DEFAULT_TOPIC,
+                format!(
+                    "task #{id}: review-only GitHub REQUEST_CHANGES review could not be \
+                     posted after {attempts} attempts; findings are in the task note"
+                ),
+                format!("task:{id}"),
+                now + crate::feed::DEFAULT_MESSAGE_TTL_SECS,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(if exhausted { "failed" } else { "retry" })
+}
+
+/// Consume one REQUEST_CHANGES outbox entry. Guarded: returns `false` when the
+/// entry is no longer pending (another tick or daemon already consumed it).
+pub fn mark_no_rework_review_posted(conn: &mut Connection, id: i64, now: i64) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET refs=json_set(refs, '$.review_outcome_github', 'posted'), updated_at=?2
+         WHERE id=?1 AND status='done' AND no_rework=1 AND json_valid(refs)
+           AND json_extract(refs, '$.review_outcome_github')='pending'",
+        params![id, now],
+    )?;
+    tx.commit()?;
+    Ok(changed == 1)
 }
 
 /// Persist a bounded exact-remediation replacement intent without disturbing
@@ -1073,7 +1568,7 @@ pub fn validate_target_branch(branch: &str) -> Result<()> {
         ));
     }
 
-    let output = Command::new("git")
+    let output = git_command("git")
         .args(["check-ref-format", "--branch", branch])
         .output()
         .map_err(|error| QuorumError::Io(format!("run git check-ref-format: {error}")))?;
@@ -1166,6 +1661,67 @@ pub fn create_with_continue_pr_and_target_branch(
         continue_pr,
         target_branch,
         now,
+    )?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Create a review-only/no-rework task (`task-create --review-only <N>`).
+///
+/// The row is an ordinary review-only task (`in-review`, `review_only=1`,
+/// `refs.pr=N`) so every review-only path applies unchanged, plus
+/// `no_rework=1`, written in the same transaction: reviewers review the PR and
+/// Quorum never reworks it.
+#[allow(clippy::too_many_arguments)]
+pub fn create_review_only_no_rework(
+    conn: &mut Connection,
+    created_by: &str,
+    title: &str,
+    body: Option<&str>,
+    priority: i64,
+    labels: Option<&str>,
+    refs: Option<&str>,
+    depends_on: Option<&str>,
+    pr: i64,
+    target_branch: Option<&str>,
+    now: i64,
+) -> Result<i64> {
+    if pr <= 0 {
+        return Err(QuorumError::Usage("--review-only must be positive".into()));
+    }
+    // Defense in depth: the CLI rejects creator-supplied `review_outcome*`
+    // refs; strip them here too so no caller can pre-seed the daemon's
+    // outcome or its GitHub REQUEST_CHANGES outbox.
+    let sanitized_refs = refs
+        .map(|raw| -> Result<String> {
+            let mut value: serde_json::Value = serde_json::from_str(raw)
+                .map_err(|e| QuorumError::Usage(format!("invalid refs JSON: {e}")))?;
+            let map = value
+                .as_object_mut()
+                .ok_or_else(|| QuorumError::Usage("refs must be a JSON object".into()))?;
+            strip_review_outcome_refs(map);
+            Ok(value.to_string())
+        })
+        .transpose()?;
+    let refs = sanitized_refs.as_deref();
+    let tx = begin_immediate(conn)?;
+    let id = create_task_tx(
+        &tx,
+        created_by,
+        title,
+        body,
+        priority,
+        labels,
+        refs,
+        depends_on,
+        Some(pr),
+        None,
+        target_branch,
+        now,
+    )?;
+    tx.execute(
+        "UPDATE tasks SET no_rework=1 WHERE id=?1 AND review_only=1",
+        params![id],
     )?;
     tx.commit()?;
     Ok(id)
@@ -1305,6 +1861,32 @@ pub fn claim(
     ttl: i64,
     now: i64,
 ) -> Result<Option<Task>> {
+    claim_with_graph_limit(
+        conn,
+        agent,
+        task_id,
+        match_labels,
+        ttl,
+        now,
+        DEFAULT_GRAPH_CHILDREN_WORKING_LIMIT,
+    )
+}
+
+/// [`claim`] with an explicit per-graph working-children limit: an open
+/// generated child is claimable only while fewer than `graph_children_limit`
+/// active siblings of its graph are `working`. The count is evaluated inside
+/// the claim's `BEGIN IMMEDIATE` transaction, so racing claimers serialise on
+/// the write lock and cannot exceed the limit.
+pub fn claim_with_graph_limit(
+    conn: &mut Connection,
+    agent: &str,
+    task_id: Option<i64>,
+    match_labels: &[&str],
+    ttl: i64,
+    now: i64,
+    graph_children_limit: i64,
+) -> Result<Option<Task>> {
+    validate_graph_children_working_limit(graph_children_limit)?;
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, agent, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
@@ -1357,13 +1939,14 @@ pub fn claim(
                        AND (
                          (status='open' AND {NO_PLANNING_FREEZE_CLAUSE}
                             AND {DEP_READY_CLAUSE}
-                            AND {GRAPH_IMPLEMENTATION_READY_CLAUSE})
+                            AND {graph_ready})
                          OR (status='in-review' AND reviewer IS NULL \
                              AND (author IS NULL OR author != ?1))
                      )
-                     RETURNING {COLS}"
+                     RETURNING {COLS}",
+                    graph_ready = graph_implementation_ready_clause!("?4"),
                 ),
-                params![agent, now, id],
+                params![agent, now, id, graph_children_limit],
                 row_to_task,
             )
             .optional()?,
@@ -1382,10 +1965,11 @@ pub fn claim(
                    AND (
                     (status='open' AND {NO_PLANNING_FREEZE_CLAUSE}
                        AND {DEP_READY_CLAUSE}
-                       AND {GRAPH_IMPLEMENTATION_READY_CLAUSE})
+                       AND {graph_ready})
                     OR (status='in-review' AND reviewer IS NULL \
                         AND (author IS NULL OR author != ?1))
-                )"
+                )",
+                graph_ready = graph_implementation_ready_clause!("?3"),
             );
             if !match_labels.is_empty() {
                 use std::fmt::Write as _;
@@ -1394,7 +1978,7 @@ pub fn claim(
                     if i > 0 {
                         selector.push_str(" AND ");
                     }
-                    let _ = write!(selector, "labels LIKE ?{}", i + 3);
+                    let _ = write!(selector, "labels LIKE ?{}", i + 4);
                 }
                 selector.push(')');
             }
@@ -1418,7 +2002,7 @@ pub fn claim(
             );
             let label_pats: Vec<String> =
                 match_labels.iter().map(|l| format!("%\"{l}\"%")).collect();
-            let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&agent, &now];
+            let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&agent, &now, &graph_children_limit];
             for p in &label_pats {
                 bind.push(p);
             }
@@ -1470,7 +2054,7 @@ pub fn claim_provider_retry_rework(
     let updated = tx.execute(
         &format!(
             "UPDATE tasks SET assignee=?1, updated_at=?2
-         WHERE id=?3 AND status='rework' AND assignee IS NULL
+         WHERE id=?3 AND status='rework' AND assignee IS NULL AND no_rework=0
            AND {DEP_READY_CLAUSE}
            AND CASE WHEN json_valid(refs) THEN
                json_type(refs, '$.cx_est')='integer'
@@ -1705,9 +2289,11 @@ pub fn claim_remediation_rework_with_feedback(
         )?;
     }
 
+    // `no_rework=0`: a review-only/no-rework task is never remediated, so it
+    // can never install a remediation lease even if a stale caller asks.
     let status: Option<String> = tx
         .query_row(
-            &format!("SELECT status FROM tasks WHERE id=?1 AND {DEP_READY_CLAUSE}"),
+            &format!("SELECT status FROM tasks WHERE id=?1 AND no_rework=0 AND {DEP_READY_CLAUSE}"),
             params![id],
             |r| r.get(0),
         )
@@ -2107,13 +2693,17 @@ pub fn apply_actionable_rework_event(
             "actionable rework feedback must be non-empty and contain no NUL".into(),
         ));
     }
-    if !matches!(event, Event::VerdictChanges | Event::MergeConflict) {
+    if !matches!(
+        event,
+        Event::VerdictChanges | Event::MergeConflict | Event::ChecksFailed { .. }
+    ) {
         return Err(QuorumError::BadInput(
-            "actionable rework persistence requires VerdictChanges or MergeConflict".into(),
+            "actionable rework persistence requires VerdictChanges, ChecksFailed, or MergeConflict"
+                .into(),
         ));
     }
     let tx = begin_immediate(conn)?;
-    apply_event_tx(tx, agent, id, event, now, |tx| {
+    apply_event_tx_with_findings(tx, agent, id, event, now, Some(feedback), |tx| {
         tx.execute(
             "UPDATE tasks
              SET refs=json_set(COALESCE(refs, '{}'), '$.remediation_feedback', ?2)
@@ -2257,6 +2847,11 @@ fn resolve_dependency_merge_commits(
                 )
             };
             return Ok(Err(description));
+        }
+        if let Some(outcome) = review_outcome_of(refs.as_deref()) {
+            return Ok(Err(format!(
+                "dependency #{task_id} is review-only closed without merge ({outcome})"
+            )));
         }
 
         let graph: Option<(String, i64, i64, Option<i64>)> = conn
@@ -2530,7 +3125,7 @@ pub fn invalidate_recovered_sampling_authority(
 }
 
 /// Remove non-authoritative optional-role evidence without consuming the
-/// owner-authorized merge attempt.
+/// admitted durable merge attempt.
 ///
 /// The task must still own the exact `merging + attempting` boundary. Keeping
 /// that marker makes a crash after this repair conservative: startup parks the
@@ -2699,7 +3294,7 @@ pub fn apply_checks_failed_with_remediation(
     let tx = begin_immediate(conn)?;
     let checks_json = serde_json::to_string(checks)
         .map_err(|error| QuorumError::Io(format!("serialize failing checks: {error}")))?;
-    apply_event_tx(
+    apply_event_tx_with_findings(
         tx,
         "system",
         id,
@@ -2707,6 +3302,7 @@ pub fn apply_checks_failed_with_remediation(
             checks: checks.to_vec(),
         },
         now,
+        Some(feedback),
         |tx| {
             // The lifecycle update has already selected the destination. Only
             // rework receives retry intent; a rework-cap failure remains terminal.
@@ -3349,6 +3945,25 @@ where
     apply_event_tx_with_deferred_sweep(tx, agent, id, event, now, false, before_commit)
 }
 
+/// Variant of [`apply_event_tx`] that carries the actionable findings text for
+/// the transition. Only a review-only/no-rework close consumes it (durable
+/// `refs.review_outcome_findings` and the findings note); every other
+/// transition ignores it.
+fn apply_event_tx_with_findings<F>(
+    tx: Transaction<'_>,
+    agent: &str,
+    id: i64,
+    event: &Event,
+    now: i64,
+    findings: Option<&str>,
+    before_commit: F,
+) -> Result<TransitionResult>
+where
+    F: FnOnce(&Transaction<'_>) -> Result<()>,
+{
+    apply_event_tx_inner(tx, agent, id, event, now, false, findings, before_commit)
+}
+
 fn apply_event_tx_with_deferred_sweep<F>(
     tx: Transaction<'_>,
     agent: &str,
@@ -3356,6 +3971,23 @@ fn apply_event_tx_with_deferred_sweep<F>(
     event: &Event,
     now: i64,
     defer_sweep: bool,
+    before_commit: F,
+) -> Result<TransitionResult>
+where
+    F: FnOnce(&Transaction<'_>) -> Result<()>,
+{
+    apply_event_tx_inner(tx, agent, id, event, now, defer_sweep, None, before_commit)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_event_tx_inner<F>(
+    tx: Transaction<'_>,
+    agent: &str,
+    id: i64,
+    event: &Event,
+    now: i64,
+    defer_sweep: bool,
+    findings: Option<&str>,
     before_commit: F,
 ) -> Result<TransitionResult>
 where
@@ -3429,10 +4061,22 @@ where
         rework_cap: task.effective_rework_cap(),
         pr: extract_pr_from_refs(&task.refs),
         review_only: task.review_only,
+        no_rework: task.no_rework,
     };
 
     let (mut new_status, mut effects) = crate::lifecycle::transition(&view, event)
         .map_err(|e| QuorumError::Usage(e.to_string()))?;
+
+    // Storage-level backstop for the review-only/no-rework contract: no
+    // transition may ever put such a task into a remediation phase.
+    if task.no_rework && matches!(new_status, Status::Rework | Status::Working) {
+        return Err(QuorumError::Io(format!(
+            "task #{id} is review-only (no-rework) and must never enter {new_status}"
+        )));
+    }
+    let no_rework_outcome = (task.no_rework && new_status == Status::Done)
+        .then(|| no_rework_outcome_kind(event))
+        .flatten();
 
     // Recovery budget: crash-recovery transitions (Working/Rework → Open or
     // Rework via AgentFailed/LeaseExpired) are bounded. Park loudly in Failed
@@ -3538,7 +4182,10 @@ where
     // Every Failed park is owner-gated. In particular, daemon teardown must
     // not put a runnable retry marker on a terminal row: after restart the
     // pre-shutdown selection is no longer authoritative.
+    // A no-rework task is never parked for a rework resume: there is no
+    // remediation to retry, so its defensive Failed stays owner-gated.
     let is_remediation_death_park = task.review_only
+        && !task.no_rework
         && status == Status::Rework
         && new_status == Status::Failed
         && matches!(event, Event::AgentFailed { .. } | Event::LeaseExpired);
@@ -3557,6 +4204,23 @@ where
         // leave the task unassigned so the exact-remediation reconciler is
         // visibly responsible for installing its replacement lease.
         assignee = None;
+    }
+
+    if is_crash_recovery {
+        // Durable, bounded record of why the worker died so the replacement
+        // worker's prompt can carry it (owner alerts are ephemeral).
+        let cause = crate::classify::truncate_for_prompt(failure_cause, WORKER_FAILURE_CAUSE_LIMIT);
+        tx.execute(
+            "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, 'daemon', ?3)",
+            params![
+                id,
+                now,
+                format!(
+                    "{WORKER_FAILURE_NOTE_PREFIX}{}\n{cause}",
+                    task.recovery_attempts + 1
+                )
+            ],
+        )?;
     }
 
     for eff in &effects {
@@ -3603,14 +4267,13 @@ where
                 )?;
             }
             Effect::PostFindingsNote => {
+                let body = match no_rework_outcome {
+                    Some(kind) => no_rework_findings_note(kind, event, findings),
+                    None => "review-only task failed: reviewer requested changes".to_string(),
+                };
                 tx.execute(
                     "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        id,
-                        now,
-                        agent,
-                        "review-only task failed: reviewer requested changes"
-                    ],
+                    params![id, now, agent, body],
                 )?;
             }
             Effect::ResumeWorker => {
@@ -3626,6 +4289,15 @@ where
 
     if let Event::SignaledDone { pr } = event {
         refs = Some(merge_pr_into_refs(&task.refs, pr));
+    }
+    if let Some(kind) = no_rework_outcome {
+        refs = Some(set_no_rework_outcome_refs(
+            refs.as_deref(),
+            kind,
+            event,
+            findings,
+            now,
+        )?);
     }
     if matches!(event, Event::SignaledDone { .. } | Event::ReworkPushed)
         && new_status == Status::InReview
@@ -3662,7 +4334,7 @@ where
         &tx,
         &event_kind,
         &lease_target(id),
-        &format!("by {agent}"),
+        &format!("by {agent}{}", event_cause_suffix(event)),
         now,
     )?;
 
@@ -3693,6 +4365,36 @@ where
         task: result_task,
         effects,
     })
+}
+
+const EVENT_CAUSE_MAX_CHECKS: usize = 5;
+const EVENT_CAUSE_MAX_CHECK_CHARS: usize = 80;
+
+/// Durable cause appended to the lifecycle event detail for system-driven rework.
+/// The `ci_remediation_*` refs that also carry this are cleared on the next push, so the
+/// event row is the only lasting record of why the task re-entered rework. Bounded so a
+/// pathological check list cannot grow the events table.
+fn event_cause_suffix(event: &Event) -> String {
+    match event {
+        Event::ChecksFailed { checks } => {
+            let mut names: Vec<String> = checks
+                .iter()
+                .take(EVENT_CAUSE_MAX_CHECKS)
+                .map(|c| {
+                    c.chars()
+                        .map(|ch| if ch.is_control() { ' ' } else { ch })
+                        .take(EVENT_CAUSE_MAX_CHECK_CHARS)
+                        .collect::<String>()
+                })
+                .collect();
+            if checks.len() > EVENT_CAUSE_MAX_CHECKS {
+                names.push(format!("+{} more", checks.len() - EVENT_CAUSE_MAX_CHECKS));
+            }
+            format!(": ci checks failed: {}", names.join(", "))
+        }
+        Event::MergeConflict => ": merge conflict".to_string(),
+        _ => String::new(),
+    }
 }
 
 fn clear_runner_retry_refs(refs: Option<&str>) -> Result<Option<String>> {
@@ -3861,10 +4563,26 @@ pub fn update(
             .is_some_and(|depends_on| existing_depends_on.as_deref() != Some(depends_on))
         || (fields.refs.is_some() && preserved_refs != existing_refs);
 
-    if edit_requested
-        && (fields.expected_revision != Some(revision) || !edit_changed || edit_count >= 3)
-    {
-        return Err(QuorumError::NotHolder);
+    if edit_requested {
+        if fields.expected_revision != Some(revision) {
+            return Err(QuorumError::EditRejected(format!(
+                "stale --expected-revision: task #{id} is at revision {revision}, \
+                 expected {}; re-read the task and retry",
+                fields
+                    .expected_revision
+                    .map_or_else(|| "none".to_string(), |r| r.to_string())
+            )));
+        }
+        if edit_count >= MAX_TASK_EDITS {
+            return Err(QuorumError::EditRejected(format!(
+                "task #{id} has reached the edit limit ({MAX_TASK_EDITS} edits)"
+            )));
+        }
+        if !edit_changed {
+            return Err(QuorumError::EditRejected(format!(
+                "no change: the supplied body/refs/depends-on match task #{id} at revision {revision}"
+            )));
+        }
     }
 
     let generated_member: bool = tx.query_row(
@@ -4012,11 +4730,13 @@ pub fn update(
     if edit_requested {
         let revision_rows = tx.execute(
             "UPDATE tasks SET revision=revision+1,edit_count=edit_count+1,updated_at=?3
-             WHERE id=?1 AND revision=?2 AND edit_count < 3",
-            params![id, revision, now],
+             WHERE id=?1 AND revision=?2 AND edit_count < ?4",
+            params![id, revision, now, MAX_TASK_EDITS],
         )?;
         if revision_rows != 1 {
-            return Err(QuorumError::NotHolder);
+            return Err(QuorumError::EditRejected(format!(
+                "task #{id} changed concurrently or reached the edit limit; re-read and retry"
+            )));
         }
         // An accepted edit before materialization cancels the pending admission
         // aggregate and returns the new revision to ordinary classification.
@@ -4398,7 +5118,20 @@ pub fn fail_worker_assignment(
         },
         now,
         true,
-        |_| Ok(()),
+        |tx| {
+            // `Merging + AgentFailed` returns to `in-review`, where an
+            // unconsumed replay request is unclaimable and also blocks the
+            // ready-approved handoff. Approvals survive, so dropping the
+            // request lets Phase 5/5b queue a fresh one. An `attempting`
+            // marker stays: that attempt's outcome is uncertain.
+            tx.execute(
+                "UPDATE tasks SET refs=json_remove(refs, '$.daemon_merge_retry')
+                 WHERE id=?1 AND status='in-review' AND json_valid(refs)
+                   AND json_extract(refs, '$.daemon_merge_retry')='requested'",
+                params![id],
+            )?;
+            Ok(())
+        },
     )
     .map(|transition| WorkerFailureOutcome::Applied(Box::new(transition)))
 }
@@ -4541,34 +5274,7 @@ pub fn dispose_dead_turn_runner(
         return Ok(DeadTurnRunnerDisposition::OwnershipTransferred);
     }
 
-    let durable_reaction: Option<String> = tx
-        .query_row(
-            "SELECT note FROM mailbox
-             WHERE agent=?1 AND kind='task_update' AND task_id=?2
-               AND consumed_at IS NULL
-             ORDER BY id DESC
-             LIMIT 1",
-            params![agent, id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .map(|state| state.unwrap_or_else(|| "note".into()));
-    // Phase 2 projects consumed reactions into the journal. A durable row
-    // written after its Phase 1 snapshot cannot appear there yet; prefer that
-    // later reaction so the classification has the same last-reaction-wins
-    // semantics as mailbox delivery.
-    let reaction = match durable_reaction {
-        Some(state) => Some(state),
-        None => tx
-            .query_row(
-                "SELECT agent_state FROM journal
-                 WHERE agent=?1 AND role='worker' AND task_id=?2",
-                params![agent, id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten(),
-    };
+    let reaction = latest_worker_reaction_tx(&tx, agent, id)?;
     match reaction.as_deref() {
         Some("failed") => {
             return apply_event_tx(
@@ -4585,26 +5291,7 @@ pub fn dispose_dead_turn_runner(
         }
         Some("blocked" | "needs-info") => {
             let reason = reaction.as_deref().expect("matched explicit reaction");
-            // Preserve the lifecycle phase that the reacting worker owned.
-            // `task-retry` can only reopen `working`, while a rework retry
-            // must remain `rework` for its eventual `ReworkPushed` event.
-            let refs = set_parked_refs(refs_raw.as_deref(), reason, &status, None)?;
-            tx.execute(
-                "UPDATE tasks
-                 SET status='failed', assignee=NULL, refs=?2, updated_at=?3
-                 WHERE id=?1",
-                params![id, refs, now],
-            )?;
-            deactivate_lease(&tx, id, now)?;
-            tx.execute(
-                "INSERT INTO task_notes(task_id, ts, agent, body)
-                 VALUES (?1, ?2, 'daemon', ?3)",
-                params![id, now, format!("parked: {reason}")],
-            )?;
-            crate::events::emit(&tx, "task_parked", &lease_target(id), reason, now)?;
-            alert_owner_of_park(&tx, id, reason, now)?;
-            crate::decomposition::block_graph_if_child_failed(&tx, id, reason, now)?;
-            consume_pending_worker_reactions_tx(&tx, agent, id, now)?;
+            park_worker_on_reaction_tx(&tx, id, agent, reason, &status, refs_raw.as_deref(), now)?;
             tx.commit()?;
             return Ok(DeadTurnRunnerDisposition::ReactionParked);
         }
@@ -4626,14 +5313,188 @@ pub fn dispose_dead_turn_runner(
             block.provider, pending_turn.provider
         )));
     }
+    let newly_blocked = runner_state::provider_block(&refs).as_ref() != Some(block);
     runner_state::set_provider_block(&mut refs, block, pending_turn);
     tx.execute(
         "UPDATE tasks SET refs=?2, updated_at=?3 WHERE id=?1",
         params![id, refs.to_string(), now],
     )?;
+    // A provider block deliberately retains the worker lease until an owner
+    // `task-retry`, so no daemon dispatch will touch the task again. Record
+    // that hold durably and visibly; a replay of the same block adds nothing.
+    if newly_blocked {
+        add_note_tx(
+            &tx,
+            "daemon",
+            id,
+            &provider_block_note(agent, id, block),
+            now,
+        )?;
+    }
     consume_pending_worker_reactions_tx(&tx, agent, id, now)?;
     tx.commit()?;
     Ok(DeadTurnRunnerDisposition::ProviderBlocked)
+}
+
+/// Bounded owner-facing note for a worker provider block.
+fn provider_block_note(agent: &str, id: i64, block: &ProviderBlock) -> String {
+    const MAX_REASON_CHARS: usize = 500;
+    let mut reason: String = block.reason.chars().take(MAX_REASON_CHARS).collect();
+    if block.reason.chars().count() > MAX_REASON_CHARS {
+        reason.push('…');
+    }
+    format!(
+        "provider-blocked: worker {agent} stopped on provider {} ({reason}); \
+         no agent will run and the lease stays held until `quorum task-retry {id}`",
+        block.provider
+    )
+}
+
+/// The worker's latest explicit reaction for this task. Phase 2 projects
+/// consumed reactions into the journal. A durable row written after its
+/// Phase 1 snapshot cannot appear there yet; prefer that later reaction so the
+/// classification has the same last-reaction-wins semantics as mailbox
+/// delivery.
+fn latest_worker_reaction_tx(
+    tx: &rusqlite::Transaction<'_>,
+    agent: &str,
+    id: i64,
+) -> Result<Option<String>> {
+    let durable_reaction: Option<String> = tx
+        .query_row(
+            "SELECT note FROM mailbox
+             WHERE agent=?1 AND kind='task_update' AND task_id=?2
+               AND consumed_at IS NULL
+             ORDER BY id DESC
+             LIMIT 1",
+            params![agent, id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .map(|state| state.unwrap_or_else(|| "note".into()));
+    Ok(match durable_reaction {
+        Some(state) => Some(state),
+        None => tx
+            .query_row(
+                "SELECT agent_state FROM journal
+                 WHERE agent=?1 AND role='worker' AND task_id=?2",
+                params![agent, id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten(),
+    })
+}
+
+/// Park a worker-owned task on its explicit `blocked` / `needs-info`
+/// reaction. Shared by turn-oriented runner exits and persistent workers
+/// whose turn ended on such a reaction. The caller commits.
+fn park_worker_on_reaction_tx(
+    tx: &rusqlite::Transaction<'_>,
+    id: i64,
+    agent: &str,
+    reason: &str,
+    status: &str,
+    refs_raw: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    let detail = latest_reaction_reason(tx, agent, id, reason)?
+        .map(|detail| crate::classify::truncate_for_prompt(&detail, REACT_REASON_MAX_BYTES));
+    let note_body = match &detail {
+        Some(detail) => format!("parked: {reason}\n\nworker {agent} reason:\n{detail}"),
+        None => format!("parked: {reason}"),
+    };
+    let excerpt = match &detail {
+        Some(detail) => format!(
+            "{reason}: {}",
+            crate::classify::truncate_for_prompt(detail, PARK_REASON_EXCERPT_CHARS)
+        ),
+        None => reason.to_string(),
+    };
+    // Preserve the lifecycle phase that the reacting worker owned.
+    // `task-retry` can only reopen `working`, while a rework retry
+    // must remain `rework` for its eventual `ReworkPushed` event.
+    let refs = set_parked_refs(refs_raw, reason, status, None)?;
+    tx.execute(
+        "UPDATE tasks
+         SET status='failed', assignee=NULL, refs=?2, updated_at=?3
+         WHERE id=?1",
+        params![id, refs, now],
+    )?;
+    deactivate_lease(tx, id, now)?;
+    tx.execute(
+        "INSERT INTO task_notes(task_id, ts, agent, body)
+         VALUES (?1, ?2, 'daemon', ?3)",
+        params![id, now, note_body],
+    )?;
+    crate::events::emit(tx, "task_parked", &lease_target(id), &excerpt, now)?;
+    alert_owner_of_park(tx, id, &excerpt, now)?;
+    crate::decomposition::block_graph_if_child_failed(tx, id, reason, now)?;
+    consume_pending_worker_reactions_tx(tx, agent, id, now)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistentReactionDisposition {
+    /// The task was parked on the worker's explicit reaction.
+    Parked,
+    /// No parkable reaction, a delivery outranks it, or the worker no longer
+    /// owns the working/rework phase. Nothing changed.
+    NotParked,
+}
+
+/// A persistent (stream-json) worker ended its turn after an explicit
+/// `blocked` / `needs-info` reaction. Turn-oriented runners reach the same
+/// park through `dispose_dead_turn_runner` when their process exits; a
+/// persistent child stays alive between turns, so without this the reaction
+/// would only be projected and the worker later idle-reaped as `AgentFailed`.
+/// A recorded or pending delivery always wins over the reaction.
+pub fn park_persistent_worker_reaction(
+    conn: &mut Connection,
+    id: i64,
+    agent: &str,
+    now: i64,
+) -> Result<PersistentReactionDisposition> {
+    let tx = begin_immediate(conn)?;
+    match classify_managed_exit_tx(&tx, ManagedRunRole::Worker, agent, id, None)? {
+        ManagedExitClassification::OutcomePending | ManagedExitClassification::OutcomeRecorded => {
+            tx.commit()?;
+            return Ok(PersistentReactionDisposition::NotParked);
+        }
+        ManagedExitClassification::OwnershipTransferred
+        | ManagedExitClassification::ActiveWithoutOutcome => {}
+    }
+    let task = tx
+        .query_row(
+            "SELECT status, refs, assignee FROM tasks WHERE id=?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((status, refs_raw, assignee)) = task else {
+        tx.commit()?;
+        return Ok(PersistentReactionDisposition::NotParked);
+    };
+    let owns_worker_phase = assignee.as_deref() == Some(agent)
+        || crate::capabilities::active_for_agent_task(&tx, agent, id, "worker")?.is_some();
+    if (status != "working" && status != "rework") || !owns_worker_phase {
+        tx.commit()?;
+        return Ok(PersistentReactionDisposition::NotParked);
+    }
+    let reaction = latest_worker_reaction_tx(&tx, agent, id)?;
+    let Some(reason @ ("blocked" | "needs-info")) = reaction.as_deref() else {
+        tx.commit()?;
+        return Ok(PersistentReactionDisposition::NotParked);
+    };
+    park_worker_on_reaction_tx(&tx, id, agent, reason, &status, refs_raw.as_deref(), now)?;
+    tx.commit()?;
+    Ok(PersistentReactionDisposition::Parked)
 }
 
 /// A turn-exit classifier may run after Phase 1 captured its mailbox batch.
@@ -5516,19 +6377,58 @@ pub fn cancelled_dep_ids(conn: &Connection, id: i64) -> Result<Vec<i64>> {
     Ok(ids)
 }
 
+/// Why the lifetime reviewer-run cap forbids resuming parked task `id`, or
+/// `None` when the cap is not what decides this retry.
+///
+/// Both reviewer-cap park sites resume to `in-review`, where the next provision
+/// pass would re-park a task at the cap, so restoring one reports success for
+/// nothing. Parks that [`retry_parked`] settles before this gate (a merged
+/// publication, a classifier policy park, or any park under a decomposition
+/// freeze) return `None` so their outcomes stay unchanged. Side-effect free:
+/// the CLI uses it to name the reason and `retry_parked` to enforce it.
+pub fn reviewer_cap_retry_refusal(conn: &Connection, id: i64) -> Result<Option<String>> {
+    let cap_decides: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM tasks
+             WHERE id=?1 AND status='failed' AND json_valid(refs)
+               AND json_extract(refs, '$.daemon_parked')=1
+               AND json_extract(refs, '$.daemon_resume_status')='in-review'
+               AND COALESCE(json_extract(refs, '$.classifier_policy_parked'), 0)<>1
+               AND COALESCE(json_extract(refs, '$.daemon_publication_failure_kind'), '')<>?2
+         ) AND NOT EXISTS(SELECT 1 FROM task_decompositions WHERE freeze_active=1)",
+        params![id, PUBLICATION_FAILURE_KIND_PR_MERGED],
+        |row| row.get(0),
+    )?;
+    if !cap_decides {
+        return Ok(None);
+    }
+    let total = crate::provision_attempts::total_reviewer_runs(conn, id)?;
+    let cap = crate::provision_attempts::MAX_TOTAL_REVIEWER_RUNS;
+    Ok((total >= cap).then(|| {
+        format!(
+            "reviewer run cap exhausted ({total}/{cap}); task-retry does not renew this cap — \
+             inspect the review history and close or rescope the task"
+        )
+    }))
+}
+
 /// Explicitly resume the same task after an automatic park. PR, branch,
 /// dependency, approval, author, and rework context remain untouched.
 ///
 /// `reset_recovery_budget`: true for an explicit owner `task-retry` (fresh
-/// budget); false for daemon-initiated auto-retries, whose respawns must
-/// stay bounded by the recovery budget spent at park time.
+/// budget, including one more reviewer strike budget for each provider failure
+/// recorded against this task); false for daemon-initiated auto-retries, whose
+/// respawns must stay bounded by the budget spent at park time. Neither resets
+/// the lifetime reviewer-run count.
 ///
 /// Refuses to restore when `depends_on` contains a cancelled task — that
 /// dependency is terminal-terminal, so the sweep would just re-park the
 /// dependent on the next tick while the operator sees a "restored" outcome
 /// and no signal that disposition (dep edit or close) is required. Callers
 /// see `Ok(None)`; [`cancelled_dep_ids`] surfaces the specific ids so the
-/// CLI can name them in the exit-1 payload.
+/// CLI can name them in the exit-1 payload. A task the lifetime reviewer-run
+/// cap would immediately re-park is refused the same way, with
+/// [`reviewer_cap_retry_refusal`] supplying the reason.
 pub fn retry_parked(
     conn: &mut Connection,
     id: i64,
@@ -5668,6 +6568,12 @@ pub fn retry_parked(
         task.ready = compute_ready(&tx, &task.depends_on)?;
         tx.commit()?;
         return Ok(Some(task));
+    }
+    // Checked under the write lock: the cap is not an owner-renewable budget,
+    // so a restore here would only be re-parked by the next provision pass.
+    if reviewer_cap_retry_refusal(&tx, id)?.is_some() {
+        tx.commit()?;
+        return Ok(None);
     }
     if !matches!(
         resume_status.as_str(),
@@ -5848,6 +6754,16 @@ pub fn retry_parked(
         tx.commit()?;
         return Ok(None);
     }
+    // Provider-failure strikes say nothing about this PR head, so an owner
+    // retry grants them one fresh bounded budget. Strikes without a provider
+    // error keep their row, and the daemon's own retries never extend the bound.
+    if reset_recovery_budget {
+        tx.execute(
+            "DELETE FROM reviewer_provision_attempts
+             WHERE task_id=?1 AND last_provider_error IS NOT NULL",
+            params![id],
+        )?;
+    }
     if reset_publication {
         tx.execute("DELETE FROM task_branches WHERE task_id=?1", params![id])?;
     }
@@ -5922,7 +6838,7 @@ pub fn retry_parked(
     Ok(Some(task))
 }
 
-/// Atomically consume at most one owner-authorized merge replay intent.
+/// Atomically consume at most one durable merge replay intent.
 ///
 /// The transition to `attempting` commits before any network call. If the
 /// daemon crashes after this point, startup parks the uncertain attempt and
@@ -5959,7 +6875,7 @@ pub fn claim_merge_retry(conn: &mut Connection, now: i64) -> Result<Option<Task>
         &tx,
         "merge_retry_started",
         &lease_target(id),
-        "owner-authorized merge replay claimed by daemon",
+        "durable merge replay claimed by daemon",
         now,
     )?;
     let mut task = tx.query_row(
@@ -6350,6 +7266,21 @@ pub fn close_manual(
 
 // ── list / get / notes ────────────────────────────────────────────────────────
 
+/// The `WHERE` clause shared by every task listing, over named parameters.
+fn list_filter_sql(status: bool, label: bool, assignee: bool) -> String {
+    let mut sql = String::from(" WHERE 1=1");
+    if status {
+        sql.push_str(" AND status=:status");
+    }
+    if label {
+        sql.push_str(" AND labels LIKE :label");
+    }
+    if assignee {
+        sql.push_str(" AND assignee=:assignee");
+    }
+    sql
+}
+
 pub fn list(
     conn: &Connection,
     status: Option<&str>,
@@ -6357,16 +7288,12 @@ pub fn list(
     assignee: Option<&str>,
 ) -> Result<Vec<Task>> {
     let label_pat = label.map(|l| format!("%\"{l}\"%"));
-    let mut sql = format!("SELECT {COLS} FROM tasks WHERE 1=1");
-    if status.is_some() {
-        sql.push_str(" AND status=:status");
-    }
-    if label_pat.is_some() {
-        sql.push_str(" AND labels LIKE :label");
-    }
-    if assignee.is_some() {
-        sql.push_str(" AND assignee=:assignee");
-    }
+    let mut sql = format!("SELECT {COLS} FROM tasks");
+    sql.push_str(&list_filter_sql(
+        status.is_some(),
+        label_pat.is_some(),
+        assignee.is_some(),
+    ));
     sql.push_str(" ORDER BY priority DESC, id ASC");
 
     let mut stmt = conn.prepare(&sql)?;
@@ -6392,20 +7319,94 @@ pub fn list(
     Ok(tasks)
 }
 
+/// One page of [`list`] as summary rows, in the same order and under the same
+/// filters, plus the number of tasks the filters match. Task bodies are never
+/// read. Both statements run in one read transaction so the page and the
+/// count describe the same snapshot; successive pages do not.
+pub fn list_brief_page(
+    conn: &Connection,
+    status: Option<&str>,
+    label: Option<&str>,
+    assignee: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<TaskBrief>, i64)> {
+    let label_pat = label.map(|l| format!("%\"{l}\"%"));
+    let filter = list_filter_sql(status.is_some(), label_pat.is_some(), assignee.is_some());
+    let mut params: Vec<(&str, &dyn rusqlite::ToSql)> = Vec::new();
+    if let Some(s) = &status {
+        params.push((":status", s));
+    }
+    if let Some(p) = &label_pat {
+        params.push((":label", p));
+    }
+    if let Some(a) = &assignee {
+        params.push((":assignee", a));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let total: i64 = tx.query_row(
+        &format!("SELECT COUNT(*) FROM tasks{filter}"),
+        &params[..],
+        |row| row.get(0),
+    )?;
+    params.push((":limit", &limit));
+    params.push((":offset", &offset));
+    let mut rows: Vec<TaskBrief> = tx
+        .prepare(&format!(
+            "SELECT id, title, labels, priority, status, assignee, depends_on, author, \
+                    reviewer, rework_round, recovery_attempts, continue_pr, target_branch \
+             FROM tasks{filter} ORDER BY priority DESC, id ASC LIMIT :limit OFFSET :offset"
+        ))?
+        .query_map(&params[..], |r| {
+            Ok(TaskBrief {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                labels: r.get(2)?,
+                priority: r.get(3)?,
+                status: r.get(4)?,
+                assignee: r.get(5)?,
+                ready: false,
+                depends_on: r.get(6)?,
+                author: r.get(7)?,
+                reviewer: r.get(8)?,
+                rework_round: r.get(9)?,
+                recovery_attempts: r.get(10)?,
+                continue_pr: r.get(11)?,
+                target_branch: r.get(12)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for row in &mut rows {
+        row.ready = compute_ready(&tx, &row.depends_on)?;
+    }
+    Ok((rows, total))
+}
+
 /// List open implementation candidates whose dependencies and decomposition
 /// authority currently permit a claim. The claim transaction repeats these
 /// predicates authoritatively; this read prevents stable graph holds from
 /// becoming a repeated select/claim-reject loop.
 pub fn list_implementation_ready_open(conn: &Connection) -> Result<Vec<Task>> {
+    list_implementation_ready_open_with_graph_limit(conn, DEFAULT_GRAPH_CHILDREN_WORKING_LIMIT)
+}
+
+/// [`list_implementation_ready_open`] with the same explicit per-graph
+/// working-children limit the caller passes to [`claim_with_graph_limit`].
+pub fn list_implementation_ready_open_with_graph_limit(
+    conn: &Connection,
+    graph_children_limit: i64,
+) -> Result<Vec<Task>> {
+    validate_graph_children_working_limit(graph_children_limit)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLS} FROM tasks
          WHERE status='open'
            AND {DEP_READY_CLAUSE}
-           AND {GRAPH_IMPLEMENTATION_READY_CLAUSE}
-         ORDER BY priority DESC, id ASC"
+           AND {graph_ready}
+         ORDER BY priority DESC, id ASC",
+        graph_ready = graph_implementation_ready_clause!("?1"),
     ))?;
     let mut tasks: Vec<Task> = stmt
-        .query_map([], row_to_task)?
+        .query_map(params![graph_children_limit], row_to_task)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for task in &mut tasks {
         task.ready = true;
@@ -6420,17 +7421,26 @@ pub fn list_implementation_ready_open(conn: &Connection) -> Result<Vec<Task>> {
 /// task before applying its display bound. The daemon scheduler intentionally
 /// uses the unbounded candidate projection above because it must continue past
 /// temporarily inadmissible candidates when selecting work.
-pub fn list_implementation_ready_open_limited(conn: &Connection, limit: i64) -> Result<Vec<Task>> {
+///
+/// `graph_children_limit` must be the daemon's effective per-graph
+/// working-children limit (resolved from `max_graph_children_working`, default
+/// worker `cap`) so the projection agrees with dispatch.
+pub fn list_implementation_ready_open_limited(
+    conn: &Connection,
+    limit: i64,
+    graph_children_limit: i64,
+) -> Result<Vec<Task>> {
     if limit < 0 {
         return Err(QuorumError::Usage(
             "implementation-ready task limit must not be negative".into(),
         ));
     }
+    validate_graph_children_working_limit(graph_children_limit)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {COLS} FROM tasks
          WHERE status='open'
            AND {DEP_READY_CLAUSE}
-           AND {GRAPH_IMPLEMENTATION_READY_CLAUSE}
+           AND {graph_ready}
            AND review_only=0
            AND CASE WHEN json_valid(refs) THEN
                json_type(refs, '$.cx_est')='integer'
@@ -6442,10 +7452,11 @@ pub fn list_implementation_ready_open_limited(conn: &Connection, limit: i64) -> 
                AND json_type(refs, '$.cx_not_ready_reason')='null'
            ELSE 0 END
          ORDER BY priority DESC, id ASC
-         LIMIT ?1"
+         LIMIT ?1",
+        graph_ready = graph_implementation_ready_clause!("?2"),
     ))?;
     let mut tasks: Vec<Task> = stmt
-        .query_map(params![limit], row_to_task)?
+        .query_map(params![limit, graph_children_limit], row_to_task)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for task in &mut tasks {
         task.ready = true;
@@ -6699,6 +7710,58 @@ mod tests {
         assert_eq!(transition.task.status, "open");
         assert_eq!(transition.task.recovery_attempts, 1);
         assert_eq!(get(&conn, task_id).unwrap().unwrap(), transition.task);
+    }
+
+    /// `quorum kill` reaches a retained worker through this path. Demoting a
+    /// queued replay must not strand its marker on an `in-review` task.
+    #[test]
+    fn fail_worker_assignment_clears_requested_merge_replay_on_demotion() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 1_000,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks
+             SET status='merging', refs='{\"pr\":7,\"daemon_merge_retry\":\"requested\"}'
+             WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+
+        let outcome =
+            fail_worker_assignment(&mut conn, "worker", task_id, "killed", 1_001).unwrap();
+
+        let WorkerFailureOutcome::Applied(transition) = outcome else {
+            panic!("a merging task must apply AgentFailed");
+        };
+        assert_eq!(transition.task.status, "in-review");
+        let task = get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(MERGE_RETRY_REF).is_none());
+        assert_eq!(refs["pr"], 7);
+    }
+
+    #[test]
+    fn fail_worker_assignment_keeps_uncertain_merge_attempt_marker() {
+        let (_dir, mut conn) = open_tmp();
+        let task_id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 1_000,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks
+             SET status='merging', refs='{\"pr\":7,\"daemon_merge_retry\":\"attempting\"}'
+             WHERE id=?1",
+            params![task_id],
+        )
+        .unwrap();
+
+        fail_worker_assignment(&mut conn, "worker", task_id, "killed", 1_001).unwrap();
+
+        let task = get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[MERGE_RETRY_REF], MERGE_RETRY_ATTEMPTING);
     }
 
     #[test]
@@ -7833,6 +8896,340 @@ mod tests {
         assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
     }
 
+    fn persistent_worker_task(c: &mut Connection) -> i64 {
+        let id = create(
+            c,
+            "boss",
+            "t",
+            None,
+            0,
+            None,
+            Some(r#"{"branch":"daemon/worker-t1"}"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(c, "worker", Some(id), &[], TTL, 1000).unwrap();
+        id
+    }
+
+    #[test]
+    fn persistent_worker_reaction_parks_like_dead_turn_runner() {
+        for (state, durable) in [
+            ("blocked", false),
+            ("needs-info", false),
+            ("needs-info", true),
+        ] {
+            let (_d, mut c) = open_tmp();
+            let id = persistent_worker_task(&mut c);
+            if durable {
+                // Committed after the daemon's mailbox snapshot: not yet
+                // projected into the journal.
+                late_worker_identity(&mut c, id, "worker", None);
+                append_worker_reaction(&mut c, id, state);
+            } else {
+                worker_reacts(&mut c, id, state);
+            }
+            let attempts_before = get(&c, id).unwrap().unwrap().recovery_attempts;
+
+            let disposition = park_persistent_worker_reaction(&mut c, id, "worker", 1001).unwrap();
+
+            assert_eq!(
+                disposition,
+                PersistentReactionDisposition::Parked,
+                "{state}"
+            );
+            let task = get(&c, id).unwrap().unwrap();
+            assert_eq!(task.status, "failed");
+            assert!(task.assignee.is_none());
+            assert_eq!(
+                task.recovery_attempts, attempts_before,
+                "a park is not an AgentFailed recovery attempt"
+            );
+            let refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            assert_eq!(refs[PARKED_REASON_REF], state);
+            assert_eq!(refs[PARKED_RESUME_STATUS_REF], "working");
+            let parked_events: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE kind='task_parked'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(parked_events, 1);
+            let unconsumed: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM mailbox
+                     WHERE kind='task_update' AND task_id=?1 AND consumed_at IS NULL",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(unconsumed, 0, "reactions are consumed with the park");
+        }
+    }
+
+    #[test]
+    fn persistent_worker_without_parkable_reaction_is_untouched() {
+        for state in [None, Some("note"), Some("failed")] {
+            let (_d, mut c) = open_tmp();
+            let id = persistent_worker_task(&mut c);
+            if let Some(state) = state {
+                worker_reacts(&mut c, id, state);
+            }
+            let disposition = park_persistent_worker_reaction(&mut c, id, "worker", 1001).unwrap();
+            assert_eq!(disposition, PersistentReactionDisposition::NotParked);
+            let task = get(&c, id).unwrap().unwrap();
+            assert_eq!(task.status, "working", "{state:?}");
+            assert_eq!(task.assignee.as_deref(), Some("worker"));
+        }
+    }
+
+    #[test]
+    fn persistent_worker_pending_delivery_outranks_reaction() {
+        let (_d, mut c) = open_tmp();
+        let id = persistent_worker_task(&mut c);
+        worker_reacts(&mut c, id, "needs-info");
+        crate::mailbox::append(
+            &mut c,
+            &crate::mailbox::MailboxRow {
+                agent: "worker".into(),
+                kind: crate::mailbox::MailboxKind::Done,
+                task_id: Some(id),
+                pr: Some(7),
+                verdict: None,
+                feedback: None,
+                note: None,
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap();
+        let disposition = park_persistent_worker_reaction(&mut c, id, "worker", 1001).unwrap();
+        assert_eq!(disposition, PersistentReactionDisposition::NotParked);
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "working");
+    }
+
+    #[test]
+    fn persistent_worker_reaction_from_non_owner_is_ignored() {
+        let (_d, mut c) = open_tmp();
+        let id = persistent_worker_task(&mut c);
+        worker_reacts(&mut c, id, "blocked");
+        let disposition = park_persistent_worker_reaction(&mut c, id, "intruder", 1001).unwrap();
+        assert_eq!(disposition, PersistentReactionDisposition::NotParked);
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "working");
+    }
+
+    #[test]
+    fn validate_react_reason_requires_bounded_text_for_blocked_and_needs_info() {
+        for state in ["blocked", "needs-info"] {
+            assert_eq!(
+                validate_react_reason(state, None).unwrap_err().exit_code(),
+                2
+            );
+            assert_eq!(
+                validate_react_reason(state, Some("  \n"))
+                    .unwrap_err()
+                    .exit_code(),
+                2
+            );
+            let too_big = "x".repeat(REACT_REASON_MAX_BYTES + 1);
+            assert_eq!(
+                validate_react_reason(state, Some(&too_big))
+                    .unwrap_err()
+                    .exit_code(),
+                2
+            );
+            assert!(validate_react_reason(state, Some("a\0b")).is_err());
+            assert_eq!(
+                validate_react_reason(state, Some(" why \n")).unwrap(),
+                Some("why".to_string())
+            );
+        }
+        assert_eq!(validate_react_reason("failed", None).unwrap(), None);
+        assert_eq!(validate_react_reason("note", None).unwrap(), None);
+    }
+
+    #[test]
+    fn dead_turn_runner_park_persists_reaction_reason_in_note_alert_and_event() {
+        for state in ["blocked", "needs-info"] {
+            let (_d, mut c) = open_tmp();
+            let id = create(
+                &mut c,
+                "boss",
+                "t",
+                None,
+                0,
+                None,
+                Some(r#"{"branch":"daemon/worker-t1"}"#),
+                None,
+                None,
+                1000,
+            )
+            .unwrap();
+            claim(&mut c, "worker", Some(id), &[], TTL, 1000).unwrap();
+            let question = format!(
+                "QUESTION-{state}: which schema should {}?",
+                "x".repeat(2000)
+            );
+            crate::mailbox::append(
+                &mut c,
+                &crate::mailbox::MailboxRow {
+                    agent: "worker".into(),
+                    kind: crate::mailbox::MailboxKind::TaskUpdate,
+                    task_id: Some(id),
+                    pr: None,
+                    verdict: None,
+                    feedback: Some(question.clone()),
+                    note: Some(state.into()),
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            // Phase 2 consumed the row and projected only the state.
+            worker_reacts(&mut c, id, state);
+            c.execute("UPDATE mailbox SET consumed_at=1000", [])
+                .unwrap();
+
+            let disposition = dispose_dead_turn_runner(
+                &mut c,
+                id,
+                "worker",
+                &ProviderBlock {
+                    provider: "codex".into(),
+                    reason: "process exited".into(),
+                },
+                &dead_turn_retry(),
+                1001,
+            )
+            .unwrap();
+            assert_eq!(disposition, DeadTurnRunnerDisposition::ReactionParked);
+
+            let note: String = c
+                .query_row(
+                    "SELECT body FROM task_notes WHERE task_id=?1 AND body LIKE 'parked:%'",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                note,
+                format!("parked: {state}\n\nworker worker reason:\n{question}")
+            );
+            let alert: String = c
+                .query_row(
+                    "SELECT body FROM messages WHERE kind='alert' AND refs=?1",
+                    [format!("task:{id}")],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(alert.contains(&format!("QUESTION-{state}")), "{alert}");
+            assert!(
+                alert.len() < 700,
+                "alert excerpt must be bounded: {}",
+                alert.len()
+            );
+            let event: String = c
+                .query_row(
+                    "SELECT body FROM events WHERE kind='task_parked' AND subject=?1",
+                    [lease_target(id)],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                event.starts_with(&format!("{state}: QUESTION-{state}")),
+                "{event}"
+            );
+            assert!(event.chars().count() < 400);
+        }
+    }
+
+    #[test]
+    fn dead_turn_runner_park_ignores_a_reason_from_a_different_reaction_state() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "t",
+            None,
+            0,
+            None,
+            Some(r#"{"branch":"daemon/worker-t1"}"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "worker", Some(id), &[], TTL, 1000).unwrap();
+        crate::mailbox::append(
+            &mut c,
+            &crate::mailbox::MailboxRow {
+                agent: "worker".into(),
+                kind: crate::mailbox::MailboxKind::TaskUpdate,
+                task_id: Some(id),
+                pr: None,
+                verdict: None,
+                feedback: Some("STALE needs-info question".into()),
+                note: Some("needs-info".into()),
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap();
+        append_worker_reaction(&mut c, id, "blocked");
+        let disposition = dispose_dead_turn_runner(
+            &mut c,
+            id,
+            "worker",
+            &ProviderBlock {
+                provider: "codex".into(),
+                reason: "process exited".into(),
+            },
+            &dead_turn_retry(),
+            1001,
+        )
+        .unwrap();
+        assert_eq!(disposition, DeadTurnRunnerDisposition::ReactionParked);
+        let note: String = c
+            .query_row(
+                "SELECT body FROM task_notes WHERE body LIKE 'parked:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(note, "parked: blocked");
+    }
+
+    #[test]
+    fn agent_failed_records_a_durable_bounded_failure_note() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c, "boss", "t", None, 0, None,
+            Some(r#"{"branch":"daemon/worker-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None, None, 1000,
+        )
+        .unwrap();
+        claim(&mut c, "worker", Some(id), &[], TTL, 1000).unwrap();
+        let reason = format!(
+            "worker idle 900s - zombie reaped {}TAIL_HIDDEN",
+            "z".repeat(3000)
+        );
+        apply_event(&mut c, "worker", id, &Event::AgentFailed { reason }, 1001).unwrap();
+        let note: String = c
+            .query_row(
+                "SELECT body FROM task_notes WHERE task_id=?1 AND body LIKE ?2",
+                params![id, format!("{WORKER_FAILURE_NOTE_PREFIX}%")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(note.starts_with("worker failure, recovery attempt 1\nworker idle 900s"));
+        assert!(!note.contains("TAIL_HIDDEN"));
+        assert!(note.chars().count() < 1200);
+    }
+
     #[test]
     fn dead_turn_runner_blocked_reactions_park_without_provider_block() {
         for state in ["blocked", "needs-info"] {
@@ -8100,6 +9497,29 @@ mod tests {
             runner_state::provider_block(&refs).unwrap().reason,
             "process exited"
         );
+        let notes = notes_for(&c, id).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].agent, "daemon");
+        assert!(notes[0].body.starts_with("provider-blocked: worker worker"));
+        assert!(notes[0].body.contains(&format!("quorum task-retry {id}")));
+
+        // Replaying the identical block is idempotent: no duplicate note.
+        assert_eq!(
+            dispose_dead_turn_runner(
+                &mut c,
+                id,
+                "worker",
+                &ProviderBlock {
+                    provider: "codex".into(),
+                    reason: "process exited".into(),
+                },
+                &dead_turn_retry(),
+                1002,
+            )
+            .unwrap(),
+            DeadTurnRunnerDisposition::ProviderBlocked
+        );
+        assert_eq!(notes_for(&c, id).unwrap().len(), 1);
     }
 
     #[test]
@@ -10150,6 +11570,513 @@ mod tests {
         assert!(r.effects.contains(&Effect::ResumeWorker));
     }
 
+    // ── review-only / no-rework (`task-create --review-only`) ──────────────
+
+    const CLASSIFIED_REFS: &str = r#"{"cx_est":3,"cx_size":"M","cx_size_reason":"bounded test classification rationale","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#;
+
+    fn create_no_rework(c: &mut Connection, pr: i64) -> i64 {
+        create_review_only_no_rework(
+            c,
+            "boss",
+            "review-only PR",
+            None,
+            100,
+            None,
+            Some(CLASSIFIED_REFS),
+            None,
+            pr,
+            Some("main"),
+            1000,
+        )
+        .unwrap()
+    }
+
+    fn refs_json(task: &Task) -> serde_json::Value {
+        serde_json::from_str(task.refs.as_deref().unwrap()).unwrap()
+    }
+
+    fn active_claim_count(c: &Connection, id: i64) -> i64 {
+        c.query_row(
+            "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+            params![lease_target(id)],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn assert_no_rework_closed(c: &mut Connection, id: i64, result: &TransitionResult, kind: &str) {
+        assert_eq!(result.task.status, "done", "no-rework {kind} must close");
+        assert_eq!(result.task.rework_round, 0, "no rework round is consumed");
+        assert!(result.task.assignee.is_none());
+        assert!(!result.effects.contains(&Effect::ResumeWorker));
+        assert!(!result.effects.contains(&Effect::IncrementReworkRound));
+        assert!(result.effects.contains(&Effect::PostFindingsNote));
+        let refs = refs_json(&result.task);
+        assert_eq!(refs[REVIEW_OUTCOME_REF], kind);
+        assert_eq!(refs[REVIEW_OUTCOME_GITHUB_REF], "pending");
+        assert!(refs[REVIEW_OUTCOME_AT_REF].is_i64());
+        assert!(
+            refs.get("remediation_feedback").is_none()
+                && refs.get(CI_REMEDIATION_REQUESTED_REF).is_none(),
+            "a closed no-rework task carries no remediation intent: {refs}"
+        );
+        assert_eq!(active_claim_count(c, id), 0, "lease released");
+        let alerts = crate::feed::peek(c, None, None, 10, 5000).unwrap();
+        assert!(
+            alerts.iter().any(|m| m.kind == "alert"
+                && m.recipient.as_deref() == Some("owner")
+                && m.body.contains("closed without rework")),
+            "owner must be notified: {alerts:?}"
+        );
+        // Defense in depth: the remediation claim refuses the closed task.
+        assert!(claim_remediation_rework(c, "Remediator", id, TTL, 5000)
+            .unwrap()
+            .is_none());
+    }
+
+    fn no_rework_notes(c: &Connection, id: i64) -> Vec<String> {
+        let mut stmt = c
+            .prepare("SELECT body FROM task_notes WHERE task_id=?1 ORDER BY id")
+            .unwrap();
+        let notes = stmt
+            .query_map(params![id], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        notes
+    }
+
+    #[test]
+    fn create_review_only_no_rework_sets_review_only_and_no_rework() {
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 55);
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert!(task.review_only && task.no_rework);
+        assert_eq!(refs_json(&task)["pr"], 55);
+        assert_eq!(task.target_branch.as_deref(), Some("main"));
+
+        // `--review-pr` keeps the remediation mode.
+        let review_pr = create(
+            &mut c,
+            "boss",
+            "review pr",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(56),
+            1000,
+        )
+        .unwrap();
+        let task = get(&c, review_pr).unwrap().unwrap();
+        assert!(task.review_only && !task.no_rework);
+    }
+
+    #[test]
+    fn create_review_only_no_rework_rejects_bad_or_owned_pr() {
+        let (_d, mut c) = open_tmp();
+        for pr in [0, -3] {
+            let err = create_review_only_no_rework(
+                &mut c, "boss", "bad", None, 0, None, None, None, pr, None, 1000,
+            )
+            .unwrap_err();
+            assert!(matches!(err, QuorumError::Usage(_)), "{err:?}");
+        }
+        create_no_rework(&mut c, 57);
+        let err = create_review_only_no_rework(
+            &mut c, "boss", "dupe", None, 0, None, None, None, 57, None, 1000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, QuorumError::Usage(_)), "{err:?}");
+        let rows: i64 = c
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "rejected creates leave no row");
+    }
+
+    #[test]
+    fn no_rework_changes_verdict_closes_done_with_durable_outcome() {
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 60);
+        claim(&mut c, "R", Some(id), &[], TTL, 1001)
+            .unwrap()
+            .unwrap();
+        let r = apply_actionable_rework_event(
+            &mut c,
+            "R",
+            id,
+            &Event::VerdictChanges,
+            "BLOCKING: the parser drops NUL checks",
+            1002,
+        )
+        .unwrap();
+        assert_no_rework_closed(&mut c, id, &r, "changes_requested");
+        let refs = refs_json(&r.task);
+        assert_eq!(
+            refs[REVIEW_OUTCOME_FINDINGS_REF],
+            "BLOCKING: the parser drops NUL checks"
+        );
+        assert!(refs.get(REVIEW_OUTCOME_CHECKS_REF).is_none());
+        let notes = no_rework_notes(&c, id);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("reviewer requested changes"), "{notes:?}");
+        assert!(
+            notes[0].contains("the parser drops NUL checks"),
+            "{notes:?}"
+        );
+        let provenance: Option<String> = c
+            .query_row(
+                "SELECT completion_provenance FROM tasks WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            provenance, None,
+            "a closed review verdict is not merge provenance"
+        );
+    }
+
+    #[test]
+    fn no_rework_failed_checks_close_done_with_check_names() {
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 61);
+        let r = apply_checks_failed_with_remediation(
+            &mut c,
+            id,
+            61,
+            "abc123",
+            &["ci-lint".into(), "ci-test".into()],
+            "CI checks failed before review for PR #61: ci-lint, ci-test",
+            1002,
+        )
+        .unwrap();
+        assert_no_rework_closed(&mut c, id, &r, "ci_failed");
+        let refs = refs_json(&r.task);
+        assert_eq!(
+            refs[REVIEW_OUTCOME_CHECKS_REF],
+            serde_json::json!(["ci-lint", "ci-test"])
+        );
+        assert!(no_rework_notes(&c, id)[0].contains("Failing checks: ci-lint, ci-test"));
+    }
+
+    #[test]
+    fn no_rework_merge_conflict_closes_done() {
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 62);
+        claim(&mut c, "R", Some(id), &[], TTL, 1001)
+            .unwrap()
+            .unwrap();
+        let approved = apply_event(&mut c, "R", id, &Event::VerdictApprove, 1002).unwrap();
+        assert_eq!(
+            approved.task.status, "merging",
+            "approve still merges normally"
+        );
+        let r = apply_actionable_rework_event(
+            &mut c,
+            "system",
+            id,
+            &Event::MergeConflict,
+            "PR #62 has conflicts with main",
+            1003,
+        )
+        .unwrap();
+        assert_no_rework_closed(&mut c, id, &r, "merge_conflict");
+    }
+
+    #[test]
+    fn no_rework_approval_merges_with_merged_provenance() {
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 63);
+        claim(&mut c, "R", Some(id), &[], TTL, 1001)
+            .unwrap()
+            .unwrap();
+        apply_event(&mut c, "R", id, &Event::VerdictApprove, 1002).unwrap();
+        let r = apply_event(&mut c, "system", id, &Event::MergeSucceeded, 1003).unwrap();
+        assert_eq!(r.task.status, "done");
+        assert!(refs_json(&r.task).get(REVIEW_OUTCOME_REF).is_none());
+        assert!(pending_no_rework_review_posts(&c, 10).unwrap().is_empty());
+    }
+
+    fn create_dependent_of(c: &mut Connection, dep: i64) -> i64 {
+        create(
+            c,
+            "boss",
+            "dependent",
+            None,
+            0,
+            None,
+            Some(CLASSIFIED_REFS),
+            Some(&format!("[{dep}]")),
+            None,
+            2000,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn review_only_closed_without_merge_never_satisfies_dependents() {
+        for (pr, outcome) in [
+            (90, "changes_requested"),
+            (91, "ci_failed"),
+            (92, "merge_conflict"),
+        ] {
+            let (_d, mut c) = open_tmp();
+            let dep = create_no_rework(&mut c, pr);
+            let closed = match outcome {
+                "ci_failed" => apply_checks_failed_with_remediation(
+                    &mut c,
+                    dep,
+                    pr,
+                    "abc123",
+                    &["ci-test".into()],
+                    "CI checks failed",
+                    1002,
+                )
+                .unwrap(),
+                _ => {
+                    claim(&mut c, "R", Some(dep), &[], TTL, 1001)
+                        .unwrap()
+                        .unwrap();
+                    let event = if outcome == "merge_conflict" {
+                        apply_event(&mut c, "R", dep, &Event::VerdictApprove, 1002).unwrap();
+                        Event::MergeConflict
+                    } else {
+                        Event::VerdictChanges
+                    };
+                    apply_actionable_rework_event(&mut c, "R", dep, &event, "BLOCKING: x", 1003)
+                        .unwrap()
+                }
+            };
+            assert_eq!(closed.task.status, "done");
+            assert_eq!(refs_json(&closed.task)[REVIEW_OUTCOME_REF], outcome);
+
+            let child = create_dependent_of(&mut c, dep);
+            assert!(!get(&c, child).unwrap().unwrap().ready, "{outcome}");
+            assert!(
+                claim(&mut c, "A", Some(child), &[], TTL, 2001)
+                    .unwrap()
+                    .is_none(),
+                "{outcome}: dependent must not be claimable by id"
+            );
+            assert!(
+                claim(&mut c, "A", None, &[], TTL, 2002).unwrap().is_none(),
+                "{outcome}: dependent must not be selected"
+            );
+            match dependency_merge_commits(&c, Some(&format!("[{dep}]"))).unwrap() {
+                DependencyMergeCommitResolution::Unresolved { reason } => assert_eq!(
+                    reason,
+                    format!("dependency #{dep} is review-only closed without merge ({outcome})")
+                ),
+                other => panic!("{outcome}: expected unresolved, got {other:?}"),
+            }
+
+            // Not parked, not failed, no cascade: sweeps leave it open as-is.
+            crate::sweep::sweep_all(&c, 999_999).unwrap();
+            crate::sweep::cascade_dead_deps(&c, 999_999, 100).unwrap();
+            let after = get(&c, child).unwrap().unwrap();
+            assert_eq!(after.status, "open", "{outcome}: dependent stays open");
+            assert!(after.assignee.is_none());
+            let refs = refs_json(&after);
+            assert!(
+                refs.get(PARKED_REF).is_none() && refs.get(PARKED_REASON_REF).is_none(),
+                "{outcome}: dependent must not be parked: {refs}"
+            );
+            assert!(!after.ready);
+        }
+    }
+
+    #[test]
+    fn review_only_merged_satisfies_dependents() {
+        let (_d, mut c) = open_tmp();
+        let dep = create_no_rework(&mut c, 93);
+        claim(&mut c, "R", Some(dep), &[], TTL, 1001)
+            .unwrap()
+            .unwrap();
+        apply_event(&mut c, "R", dep, &Event::VerdictApprove, 1002).unwrap();
+        let merged = apply_event(&mut c, "system", dep, &Event::MergeSucceeded, 1003).unwrap();
+        assert_eq!(merged.task.status, "done");
+        assert!(refs_json(&merged.task).get(REVIEW_OUTCOME_REF).is_none());
+
+        let child = create_dependent_of(&mut c, dep);
+        assert!(get(&c, child).unwrap().unwrap().ready);
+        let claimed = claim(&mut c, "A", None, &[], TTL, 2001)
+            .unwrap()
+            .expect("dependent of a merged review-only task is selectable");
+        assert_eq!(claimed.id, child);
+        assert_eq!(claimed.status, "working");
+    }
+
+    #[test]
+    fn no_rework_findings_are_bounded() {
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 64);
+        claim(&mut c, "R", Some(id), &[], TTL, 1001)
+            .unwrap()
+            .unwrap();
+        let huge = "é".repeat(NO_REWORK_FINDINGS_MAX_BYTES);
+        let r = apply_actionable_rework_event(&mut c, "R", id, &Event::VerdictChanges, &huge, 1002)
+            .unwrap();
+        let stored = refs_json(&r.task)[REVIEW_OUTCOME_FINDINGS_REF]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            stored.len() <= NO_REWORK_FINDINGS_MAX_BYTES,
+            "{}",
+            stored.len()
+        );
+        assert!(stored.ends_with('…'));
+        assert!(no_rework_notes(&c, id)[0].len() <= NO_REWORK_FINDINGS_MAX_BYTES + 512);
+    }
+
+    #[test]
+    fn no_rework_request_changes_outbox_is_consumed_once() {
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 65);
+        claim(&mut c, "R", Some(id), &[], TTL, 1001)
+            .unwrap()
+            .unwrap();
+        apply_actionable_rework_event(&mut c, "R", id, &Event::VerdictChanges, "fix X", 1002)
+            .unwrap();
+        let posts = pending_no_rework_review_posts(&c, 10).unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!((posts[0].task_id, posts[0].pr), (id, 65));
+        assert!(posts[0].body.contains("reviewer requested changes"));
+        assert!(posts[0].body.contains("fix X"));
+        assert!(mark_no_rework_review_posted(&mut c, id, 1003).unwrap());
+        assert!(
+            !mark_no_rework_review_posted(&mut c, id, 1004).unwrap(),
+            "a consumed outbox entry is a clean negative"
+        );
+        assert!(pending_no_rework_review_posts(&c, 10).unwrap().is_empty());
+        assert_eq!(
+            refs_json(&get(&c, id).unwrap().unwrap())[REVIEW_OUTCOME_GITHUB_REF],
+            "posted"
+        );
+    }
+
+    #[test]
+    fn creators_cannot_forge_review_outcome_refs() {
+        for refs in [
+            r#"{"review_outcome":"changes_requested"}"#,
+            r#"{"review_outcome_github":"pending"}"#,
+            r#"{"review_outcome_findings":"x"}"#,
+        ] {
+            let err = validate_creator_refs(Some(refs)).unwrap_err();
+            assert!(matches!(err, QuorumError::Usage(_)), "{refs}: {err:?}");
+        }
+        // Defense in depth: the core create path strips forged keys.
+        let (_d, mut c) = open_tmp();
+        let id = create_review_only_no_rework(
+            &mut c,
+            "boss",
+            "forged",
+            None,
+            0,
+            None,
+            Some(
+                r#"{"note":"keep","review_outcome":"ci_failed","review_outcome_github":"pending"}"#,
+            ),
+            None,
+            68,
+            None,
+            1000,
+        )
+        .unwrap();
+        let refs = refs_json(&get(&c, id).unwrap().unwrap());
+        assert_eq!(refs["note"], "keep");
+        assert!(refs.get(REVIEW_OUTCOME_REF).is_none());
+        assert!(refs.get(REVIEW_OUTCOME_GITHUB_REF).is_none());
+    }
+
+    #[test]
+    fn refs_replacement_cannot_set_or_erase_review_outcome() {
+        // Forged keys are stripped from a replacement, and established
+        // daemon outcome keys survive a replacement that omits them.
+        let forged = preserve_creator_protected_refs(
+            &Some(r#"{"pr":69}"#.into()),
+            Some(r#"{"review_outcome_github":"pending","x":1}"#),
+        )
+        .unwrap();
+        let forged: serde_json::Value = serde_json::from_str(&forged).unwrap();
+        assert!(forged.get(REVIEW_OUTCOME_GITHUB_REF).is_none(), "{forged}");
+        assert_eq!(forged["x"], 1);
+
+        let kept = preserve_creator_protected_refs(
+            &Some(
+                r#"{"pr":69,"review_outcome":"changes_requested","review_outcome_github":"posted"}"#
+                    .into(),
+            ),
+            Some(r#"{"review_outcome_github":"pending"}"#),
+        )
+        .unwrap();
+        let kept: serde_json::Value = serde_json::from_str(&kept).unwrap();
+        assert_eq!(kept[REVIEW_OUTCOME_REF], "changes_requested");
+        assert_eq!(kept[REVIEW_OUTCOME_GITHUB_REF], "posted");
+    }
+
+    #[test]
+    fn no_rework_task_forced_into_rework_is_never_remediated() {
+        // Defense in depth against a corrupted/legacy row: the remediation
+        // claims refuse it and worker recovery fails it instead of resuming.
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 66);
+        c.execute(
+            "UPDATE tasks SET status='rework', rework_round=1, assignee=NULL,
+                 refs=json_set(refs, '$.daemon_rework_retry_requested', json('true'))
+             WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        assert!(
+            claim_remediation_rework(&mut c, "Remediator", id, TTL, 2000)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            claim_provider_retry_rework(&mut c, "Remediator", id, TTL, 2000)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(active_claim_count(&c, id), 0);
+        let r = apply_event(&mut c, "system", id, &Event::LeaseExpired, 2001).unwrap();
+        assert_eq!(r.task.status, "failed");
+        assert!(!r.effects.contains(&Effect::ResumeWorker));
+        let refs = refs_json(&r.task);
+        assert!(
+            refs.get(PARKED_REF).is_none() && refs.get(RECOVERED_REMEDIATION_RETRY_REF).is_none(),
+            "no rework resume marker may be written for a no-rework task: {refs}"
+        );
+    }
+
+    #[test]
+    fn review_pr_task_still_enters_rework_after_no_rework_feature() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "review PR",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(67),
+            1000,
+        )
+        .unwrap();
+        claim(&mut c, "R", Some(id), &[], TTL, 1001)
+            .unwrap()
+            .unwrap();
+        let r = apply_actionable_rework_event(&mut c, "R", id, &Event::VerdictChanges, "fix", 1002)
+            .unwrap();
+        assert_eq!(r.task.status, "rework");
+        assert!(refs_json(&r.task).get(REVIEW_OUTCOME_REF).is_none());
+    }
+
     /// Walk a review-only task into `rework` (claim + changes verdict) and
     /// return its id. rework_round is 1 afterwards.
     fn review_only_task_in_rework(c: &mut Connection) -> i64 {
@@ -11554,6 +13481,7 @@ mod tests {
             rework_cap: crate::lifecycle::REWORK_CAP,
             pr: Some("343".into()),
             review_only: false,
+            no_rework: false,
         };
         let (new_status, _effects) = crate::lifecycle::transition(
             &view,
@@ -12357,7 +14285,10 @@ mod tests {
     }
 
     #[test]
-    fn daemon_push_rejection_park_blocks_parent_graph() {
+    /// Owner policy: a retryable daemon park (here a push-rejection park) never
+    /// holds its decomposition graph; siblings keep reviewer and dispatch
+    /// authority and `task-retry` resumes the child under the active graph.
+    fn daemon_push_rejection_park_keeps_parent_graph_active() {
         let (_dir, mut conn) = open_tmp();
         conn.execute(
             "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
@@ -12413,71 +14344,50 @@ mod tests {
             .unwrap()
             .expect("child must park");
 
-        let (state, hold_code, hold_summary): (String, String, String) = conn
-            .query_row(
-                "SELECT state,hold_code,hold_summary
-                 FROM task_decompositions WHERE id=?1",
-                [graph],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(state, "blocked");
-        assert_eq!(hold_code, "generated-child-failed");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&hold_summary).unwrap(),
-            serde_json::json!({"affected_task": ids[0], "reason": reason})
-        );
-
-        let event_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE kind='task_graph_blocked'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(event_count, 1);
-
-        let graph_alert: String = conn
-            .query_row(
-                "SELECT body FROM messages
-                 WHERE kind='alert' AND recipient='owner'
-                   AND body LIKE '%task graph blocked%'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("graph-blocked alert must exist");
-        assert!(graph_alert.contains("task graph blocked"));
-        assert!(graph_alert.contains(reason));
-
-        assert!(
-            !crate::decomposition_review::is_reviewable_graph_member(&conn, ids[1]).unwrap(),
-            "a blocked graph must withhold sibling reviewer authority"
-        );
-        let retried = retry_parked(&mut conn, ids[0], "operator", true, 11)
-            .unwrap()
-            .expect("parked child must resume");
-        assert_eq!(retried.status, "open");
-        let graph_state: (String, Option<String>, Option<String>) = conn
-            .query_row(
+        let graph_state = |conn: &Connection| -> (String, Option<String>, Option<String>) {
+            conn.query_row(
                 "SELECT state,hold_code,hold_summary FROM task_decompositions WHERE id=?1",
                 [graph],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
+            .unwrap()
+        };
+        assert_eq!(graph_state(&conn), ("active".into(), None, None));
+        let graph_side_effects: (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM events WHERE kind='task_graph_blocked'),
+                        (SELECT COUNT(*) FROM messages
+                         WHERE kind='alert' AND body LIKE '%task graph blocked%')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .unwrap();
-        assert_eq!(graph_state, ("active".into(), None, None));
+        assert_eq!(graph_side_effects, (0, 0));
+        assert!(
+            crate::decomposition_review::is_reviewable_graph_member(&conn, ids[1]).unwrap(),
+            "a parked sibling must not withhold reviewer authority"
+        );
+        assert!(
+            list_implementation_ready_open(&conn)
+                .unwrap()
+                .iter()
+                .any(|task| task.id == ids[1]),
+            "a parked sibling must not withhold dispatch"
+        );
+
+        let retried = retry_parked(&mut conn, ids[0], "operator", true, 11)
+            .unwrap()
+            .expect("parked child must resume");
+        assert_eq!(retried.status, "open");
+        assert_eq!(graph_state(&conn), ("active".into(), None, None));
         let unblocked: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM events
-                 WHERE kind='task_graph_unblocked' AND subject=?1",
-                [lease_target(ids[0])],
+                "SELECT COUNT(*) FROM events WHERE kind='task_graph_unblocked'",
+                [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(unblocked, 1);
-        assert!(
-            crate::decomposition_review::is_reviewable_graph_member(&conn, ids[1]).unwrap(),
-            "reactivating the graph must restore sibling reviewer authority"
-        );
+        assert_eq!(unblocked, 0, "a graph that was never held is not unblocked");
     }
 
     fn blocked_graph_with_parked_children(
@@ -14282,7 +16192,9 @@ mod tests {
             );
         }
 
-        let listed = list_implementation_ready_open_limited(&conn, 20).unwrap();
+        let listed =
+            list_implementation_ready_open_limited(&conn, 20, DEFAULT_GRAPH_CHILDREN_WORKING_LIMIT)
+                .unwrap();
         assert_eq!(listed.len(), 20);
         assert_eq!(
             listed.iter().map(|task| task.id).collect::<Vec<_>>(),
@@ -14291,7 +16203,7 @@ mod tests {
         assert!(listed.iter().all(|task| task.ready));
         assert!(listed.iter().all(|task| task.id != ids[0]));
         assert!(matches!(
-            list_implementation_ready_open_limited(&conn, -1),
+            list_implementation_ready_open_limited(&conn, -1, DEFAULT_GRAPH_CHILDREN_WORKING_LIMIT),
             Err(QuorumError::Usage(_))
         ));
     }
@@ -14339,11 +16251,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            list_implementation_ready_open_limited(&conn, DASHBOARD_LIMIT)
-                .unwrap()
-                .into_iter()
-                .map(|task| task.id)
-                .collect::<Vec<_>>(),
+            list_implementation_ready_open_limited(
+                &conn,
+                DASHBOARD_LIMIT,
+                DEFAULT_GRAPH_CHILDREN_WORKING_LIMIT
+            )
+            .unwrap()
+            .into_iter()
+            .map(|task| task.id)
+            .collect::<Vec<_>>(),
             [dispatchable],
         );
     }
@@ -14783,6 +16699,69 @@ mod tests {
             None,
             "successful rework submission must consume durable CI intent"
         );
+        // The refs are gone, but the rework event still records the cause.
+        let body: String = c
+            .query_row(
+                "SELECT body FROM events WHERE subject=?1 AND kind='task_rework'",
+                [format!("task#{id}")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, "by system: ci checks failed: fmt, test");
+    }
+
+    #[test]
+    fn rework_event_cause_is_bounded_and_covers_merge_conflict() {
+        let long = "x".repeat(500);
+        let many: Vec<String> = (0..9).map(|i| format!("job{i}")).collect();
+        let suffix = event_cause_suffix(&Event::ChecksFailed { checks: many });
+        assert_eq!(
+            suffix,
+            ": ci checks failed: job0, job1, job2, job3, job4, +4 more"
+        );
+        let suffix = event_cause_suffix(&Event::ChecksFailed {
+            checks: vec![format!("{long}\nz")],
+        });
+        assert!(suffix.len() < 120 && !suffix.contains('\n'), "{suffix}");
+        assert_eq!(
+            event_cause_suffix(&Event::MergeConflict),
+            ": merge conflict"
+        );
+        assert_eq!(event_cause_suffix(&Event::VerdictApprove), "");
+
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c, "boss", "conflict", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "W1",
+            id,
+            &Event::SignaledDone { pr: "9".into() },
+            1100,
+        )
+        .unwrap();
+        apply_event(
+            &mut c,
+            "R1",
+            id,
+            &Event::ReviewerAttached { agent: "R1".into() },
+            1110,
+        )
+        .unwrap();
+        apply_event(&mut c, "R1", id, &Event::VerdictApprove, 1120).unwrap();
+        apply_actionable_rework_event(&mut c, "system", id, &Event::MergeConflict, "rebase", 1130)
+            .unwrap();
+        let body: String = c
+            .query_row(
+                "SELECT body FROM events WHERE subject=?1 AND kind='task_rework'",
+                [format!("task#{id}")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, "by system: merge conflict");
     }
 
     #[test]
@@ -15381,7 +17360,29 @@ mod tests {
             },
             20,
         );
-        assert!(matches!(replay, Err(QuorumError::NotHolder)));
+        match replay {
+            Err(QuorumError::EditRejected(m)) => {
+                assert!(m.contains("stale --expected-revision"), "{m}");
+                assert!(m.contains("revision 4") && m.contains("expected 3"), "{m}");
+            }
+            other => panic!("stale revision must be EditRejected, got {other:?}"),
+        }
+        let noop = update(
+            &mut c,
+            "owner",
+            id,
+            &TaskUpdate {
+                body: Some("three"),
+                expected_revision: Some(4),
+                ..Default::default()
+            },
+            20,
+        );
+        // At the cap the limit is reported before the no-op check.
+        assert!(
+            matches!(&noop, Err(QuorumError::EditRejected(m)) if m.contains("edit limit")),
+            "{noop:?}"
+        );
         let fourth = update(
             &mut c,
             "owner",
@@ -15393,10 +17394,62 @@ mod tests {
             },
             21,
         );
-        assert!(matches!(fourth, Err(QuorumError::NotHolder)));
+        match fourth {
+            Err(QuorumError::EditRejected(m)) => assert!(m.contains("edit limit"), "{m}"),
+            other => panic!("edit cap must be EditRejected, got {other:?}"),
+        }
         let task = get(&c, id).unwrap().unwrap();
         assert_eq!(task.body.as_deref(), Some("three"));
         assert_eq!((task.revision, task.edit_count), (4, 3));
+    }
+
+    #[test]
+    fn noop_edit_is_reported_as_no_change_not_authority_failure() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "owner",
+            "t",
+            Some("same"),
+            0,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let err = update(
+            &mut c,
+            "owner",
+            id,
+            &TaskUpdate {
+                body: Some("same"),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            2,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, QuorumError::EditRejected(m) if m.contains("no change")),
+            "{err:?}"
+        );
+        assert_eq!(err.exit_code(), 1);
+        // A genuine authority failure stays NotHolder.
+        let other = update(
+            &mut c,
+            "stranger",
+            id,
+            &TaskUpdate {
+                body: Some("different"),
+                expected_revision: Some(1),
+                ..Default::default()
+            },
+            3,
+        )
+        .unwrap_err();
+        assert!(matches!(other, QuorumError::NotHolder), "{other:?}");
     }
 
     #[test]
@@ -15742,18 +17795,26 @@ mod tests {
             )
             .unwrap();
         }
+        c.execute(
+            "UPDATE tasks SET refs=json_set(
+                 COALESCE(refs, '{}'), '$.daemon_merge_retry', 'requested'
+             ) WHERE id=?1",
+            params![merging],
+        )
+        .unwrap();
 
-        // working+in-review+rework block; source, open, merging, and terminals do not.
-        assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 3);
+        // Every started non-terminal phase blocks, including an orphan marked
+        // merge handoff; source, open, and terminals do not.
+        assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 4);
 
         // Excluding an actual started task drops its count.
         assert_eq!(
             count_started_non_terminal_excluding(&c, in_review).unwrap(),
-            2
+            3
         );
 
         // Move the last blocker to done → predicate releases (returns 0).
-        for id in [working, rework] {
+        for id in [working, rework, merging] {
             c.execute("UPDATE tasks SET status='done' WHERE id=?1", params![id])
                 .unwrap();
         }
@@ -15826,6 +17887,265 @@ mod tests {
             })
             .unwrap();
         assert_eq!(status, "failed");
+    }
+
+    fn park_for_retry(c: &mut Connection, resume_status: &str) -> i64 {
+        let id = create(c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        c.execute(
+            "UPDATE tasks SET status='failed',refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_reason', 'test park',
+                 'daemon_resume_status', ?2
+             ) WHERE id=?1",
+            params![id, resume_status],
+        )
+        .unwrap();
+        id
+    }
+
+    fn add_reviewer_runs(c: &Connection, task_id: i64, count: i64) {
+        for n in 0..count {
+            crate::agent_runs::insert(
+                c,
+                task_id,
+                &format!("rev-{task_id}-{n}"),
+                "reviewer",
+                "model",
+                "high",
+                "claude",
+                100 + n,
+            )
+            .unwrap();
+        }
+    }
+
+    fn task_retry_events(c: &Connection, id: i64) -> i64 {
+        c.query_row(
+            "SELECT COUNT(*) FROM events WHERE kind='task_retry' AND subject=?1",
+            params![lease_target(id)],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn strike_rows(c: &Connection, task_id: i64) -> Vec<String> {
+        let mut stmt = c
+            .prepare(
+                "SELECT role FROM reviewer_provision_attempts
+                 WHERE task_id=?1 ORDER BY role",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(params![task_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap();
+        rows
+    }
+
+    /// The lifetime cap is not owner-renewable: a restore would be re-parked by
+    /// the next provision pass, so retry refuses inside the transaction and
+    /// leaves the park, its strikes, and the audit log exactly as they were.
+    #[test]
+    fn retry_parked_refuses_a_reviewer_cap_exhausted_review_park() {
+        use crate::provision_attempts::{self, MAX_TOTAL_REVIEWER_RUNS};
+        let (_d, mut c) = open_tmp();
+        let id = park_for_retry(&mut c, "in-review");
+        provision_attempts::record_provider_failure(&mut c, id, 42, "r1", "sha", "boom").unwrap();
+        add_reviewer_runs(&c, id, MAX_TOTAL_REVIEWER_RUNS - 1);
+
+        assert_eq!(reviewer_cap_retry_refusal(&c, id).unwrap(), None);
+        add_reviewer_runs(&c, id, 1);
+        let reason = reviewer_cap_retry_refusal(&c, id)
+            .unwrap()
+            .expect("the cap decides this park");
+        assert!(
+            reason.starts_with(&format!(
+                "reviewer run cap exhausted ({MAX_TOTAL_REVIEWER_RUNS}/{MAX_TOTAL_REVIEWER_RUNS})"
+            )),
+            "unexpected reason: {reason}"
+        );
+
+        for reset_recovery_budget in [true, false] {
+            let out = retry_parked(&mut c, id, "operator", reset_recovery_budget, 1001).unwrap();
+            assert!(out.is_none(), "cap-exhausted retry must be refused");
+        }
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        let refs: serde_json::Value =
+            serde_json::from_str(task.refs.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(refs["daemon_parked"], serde_json::json!(true));
+        assert_eq!(refs["daemon_resume_status"], "in-review");
+        assert!(
+            refs.get(POISON_RETRY_GENERATION_REF).is_none(),
+            "a refused retry must not advance the retry generation: {refs}"
+        );
+        assert_eq!(task_retry_events(&c, id), 0);
+        assert_eq!(strike_rows(&c, id), vec!["r1".to_string()]);
+    }
+
+    /// The refusal counts exactly what the daemon counts: instant provider
+    /// failures that did no review work leave a provider park retryable.
+    #[test]
+    fn retry_parked_cap_refusal_uses_the_lifetime_run_definition() {
+        use crate::provision_attempts::MAX_TOTAL_REVIEWER_RUNS;
+        let (_d, mut c) = open_tmp();
+        let id = park_for_retry(&mut c, "in-review");
+        add_reviewer_runs(&c, id, MAX_TOTAL_REVIEWER_RUNS);
+        c.execute(
+            "UPDATE agent_runs SET end_reason='turn-error-unclassified',
+                 ended_at=spawned_at+1, review_pr=42, review_head_sha='sha'
+             WHERE task_id=?1",
+            params![id],
+        )
+        .unwrap();
+        assert_eq!(reviewer_cap_retry_refusal(&c, id).unwrap(), None);
+        let restored = retry_parked(&mut c, id, "operator", true, 1001)
+            .unwrap()
+            .expect("no-work runs do not consume the cap");
+        assert_eq!(restored.status, "in-review");
+    }
+
+    /// Only the review stage the cap park sites resume is refused; a parked
+    /// worker at the cap still has real work to do before the next review.
+    #[test]
+    fn retry_parked_cap_refusal_ignores_other_resume_stages_and_unparked_tasks() {
+        use crate::provision_attempts::MAX_TOTAL_REVIEWER_RUNS;
+        let (_d, mut c) = open_tmp();
+        for (resume, restored) in [("open", "open"), ("working", "open"), ("rework", "rework")] {
+            let id = park_for_retry(&mut c, resume);
+            add_reviewer_runs(&c, id, MAX_TOTAL_REVIEWER_RUNS);
+            assert_eq!(reviewer_cap_retry_refusal(&c, id).unwrap(), None);
+            let task = retry_parked(&mut c, id, "operator", true, 1001)
+                .unwrap()
+                .expect("non-review park restores at the cap");
+            assert_eq!(task.status, restored);
+        }
+        let unparked = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        add_reviewer_runs(&c, unparked, MAX_TOTAL_REVIEWER_RUNS);
+        assert_eq!(reviewer_cap_retry_refusal(&c, unparked).unwrap(), None);
+    }
+
+    /// The existing refusals keep their own outcomes for a task that is also at
+    /// the cap: the predicate stays silent, so the CLI cannot mask them.
+    #[test]
+    fn retry_parked_earlier_refusals_win_over_the_reviewer_cap() {
+        use crate::provision_attempts::MAX_TOTAL_REVIEWER_RUNS;
+        let (_d, mut c) = open_tmp();
+
+        let merged = park_for_retry(&mut c, "in-review");
+        add_reviewer_runs(&c, merged, MAX_TOTAL_REVIEWER_RUNS);
+        c.execute(
+            "UPDATE tasks SET refs=json_set(refs,'$.daemon_publication_failure_kind',?2)
+             WHERE id=?1",
+            params![merged, PUBLICATION_FAILURE_KIND_PR_MERGED],
+        )
+        .unwrap();
+        assert_eq!(reviewer_cap_retry_refusal(&c, merged).unwrap(), None);
+        assert!(retry_parked(&mut c, merged, "operator", true, 1001)
+            .unwrap()
+            .is_none());
+
+        let policy = park_for_retry(&mut c, "in-review");
+        add_reviewer_runs(&c, policy, MAX_TOTAL_REVIEWER_RUNS);
+        c.execute(
+            "UPDATE tasks SET refs=json_set(refs,'$.classifier_policy_parked',json('true'))
+             WHERE id=?1",
+            params![policy],
+        )
+        .unwrap();
+        assert_eq!(reviewer_cap_retry_refusal(&c, policy).unwrap(), None);
+        let reclassified = retry_parked(&mut c, policy, "operator", true, 1001)
+            .unwrap()
+            .expect("a policy park is reclassified, not restored");
+        assert_eq!(reclassified.status, "failed");
+        assert_eq!(task_retry_events(&c, policy), 1);
+
+        let frozen = park_for_retry(&mut c, "in-review");
+        add_reviewer_runs(&c, frozen, MAX_TOTAL_REVIEWER_RUNS);
+        assert!(reviewer_cap_retry_refusal(&c, frozen).unwrap().is_some());
+        let source = create(&mut c, "boss", "src", None, 0, None, None, None, None, 1000).unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+             VALUES (?1,'draining',0,1,1,1000,1000)",
+            params![source],
+        )
+        .unwrap();
+        assert_eq!(reviewer_cap_retry_refusal(&c, frozen).unwrap(), None);
+        assert!(matches!(
+            retry_parked(&mut c, frozen, "operator", true, 1002),
+            Err(QuorumError::Usage(_))
+        ));
+    }
+
+    /// An owner retry deletes this task's provider-failure strikes in the
+    /// restoring transaction and nothing else: generic strikes and other tasks
+    /// keep their rows.
+    #[test]
+    fn retry_parked_owner_retry_clears_only_this_tasks_provider_strikes() {
+        use crate::provision_attempts::{self, MAX_REVIEWER_PROVISION_STRIKES};
+        let (_d, mut c) = open_tmp();
+        let id = park_for_retry(&mut c, "in-review");
+        let other = park_for_retry(&mut c, "in-review");
+        for _ in 0..MAX_REVIEWER_PROVISION_STRIKES {
+            provision_attempts::record_provider_failure(&mut c, id, 42, "r1", "sha", "boom")
+                .unwrap();
+        }
+        provision_attempts::record_attempt(&mut c, id, 42, "r2", "sha").unwrap();
+        provision_attempts::record_provider_failure(&mut c, other, 43, "r1", "sha", "boom")
+            .unwrap();
+
+        let restored = retry_parked(&mut c, id, "operator", true, 1001)
+            .unwrap()
+            .expect("provider park restores");
+        assert_eq!(restored.status, "in-review");
+        assert_eq!(task_retry_events(&c, id), 1);
+        assert_eq!(strike_rows(&c, id), vec!["r2".to_string()]);
+        assert_eq!(
+            provision_attempts::get_attempts(&c, id, 42, "r1", "sha").unwrap(),
+            0
+        );
+        assert_eq!(strike_rows(&c, other), vec!["r1".to_string()]);
+    }
+
+    /// A daemon-initiated retry must not be able to extend the strike bound.
+    #[test]
+    fn retry_parked_daemon_retry_keeps_provider_strikes() {
+        use crate::provision_attempts::{self, MAX_REVIEWER_PROVISION_STRIKES};
+        let (_d, mut c) = open_tmp();
+        let id = park_for_retry(&mut c, "in-review");
+        for _ in 0..MAX_REVIEWER_PROVISION_STRIKES {
+            provision_attempts::record_provider_failure(&mut c, id, 42, "r1", "sha", "boom")
+                .unwrap();
+        }
+        let restored = retry_parked(&mut c, id, "daemon", false, 1001)
+            .unwrap()
+            .expect("daemon retry restores");
+        assert_eq!(restored.status, "in-review");
+        assert_eq!(
+            provision_attempts::get_attempts(&c, id, 42, "r1", "sha").unwrap(),
+            i64::from(MAX_REVIEWER_PROVISION_STRIKES)
+        );
+    }
+
+    /// A policy park stays `failed`, so no strike budget is granted for it.
+    #[test]
+    fn retry_parked_policy_branch_keeps_provider_strikes() {
+        use crate::provision_attempts;
+        let (_d, mut c) = open_tmp();
+        let id = park_for_retry(&mut c, "in-review");
+        c.execute(
+            "UPDATE tasks SET refs=json_set(refs,'$.classifier_policy_parked',json('true'))
+             WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        provision_attempts::record_provider_failure(&mut c, id, 42, "r1", "sha", "boom").unwrap();
+        retry_parked(&mut c, id, "operator", true, 1001)
+            .unwrap()
+            .expect("policy retry reclassifies");
+        assert_eq!(strike_rows(&c, id), vec!["r1".to_string()]);
     }
 
     /// Task #473: a parked task whose depends_on contains a cancelled id

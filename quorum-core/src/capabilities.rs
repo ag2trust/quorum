@@ -618,6 +618,34 @@ pub fn issue_tx(
     Ok(())
 }
 
+/// Bind one live worker capability to its exact persisted agent run inside a
+/// caller-owned transaction.
+///
+/// The immutable capability identity and NULL-only binding guard prevent a
+/// stale, mismatched, revoked, or already-bound capability from being attached
+/// to a different process row.
+pub fn bind_worker_run_tx(
+    tx: &Transaction<'_>,
+    run_id: &str,
+    agent_run_id: i64,
+    task_id: i64,
+    agent: &str,
+) -> Result<()> {
+    let changed = tx.execute(
+        "UPDATE run_capabilities
+         SET agent_run_id=?2
+         WHERE run_id=?1 AND task_id=?3 AND agent=?4 AND role='worker'
+           AND revoked_at IS NULL AND agent_run_id IS NULL",
+        params![run_id, agent_run_id, task_id, agent],
+    )?;
+    if changed != 1 {
+        return Err(QuorumError::Io(
+            "worker capability could not bind its immutable run".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Issue and bind a capability for one already-attributed fallback run.
 ///
 /// The capability is not merely named after the same agent: its immutable
@@ -1250,6 +1278,15 @@ mod tests {
         assert_eq!(mailbox_count(conn), before);
     }
 
+    fn bound_agent_run_id(conn: &Connection, run_id: &str) -> Option<i64> {
+        conn.query_row(
+            "SELECT agent_run_id FROM run_capabilities WHERE run_id=?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn resolve_live_worker_derives_initial_and_rework_context() {
         let (_d, mut c) = open_tmp();
@@ -1435,6 +1472,95 @@ mod tests {
         assert_eq!(cap.agent, "Worker-1");
         assert_eq!(cap.role, "worker");
         assert!(cap.revoked_at.is_none());
+    }
+
+    #[test]
+    fn bind_worker_run_requires_exact_live_unbound_capability() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", Some("Worker"), None, None, None);
+        insert_authority_task(&c, 2, "working", Some("Worker"), None, None, None);
+        let agent_run_id =
+            crate::agent_runs::insert(&c, 1, "Worker", "worker", "model", "high", "codex", 10)
+                .unwrap();
+        let other_agent_run_id =
+            crate::agent_runs::insert(&c, 1, "Worker", "worker", "model", "high", "codex", 11)
+                .unwrap();
+
+        let tx = begin_immediate(&mut c).unwrap();
+        issue_tx(&tx, "revoked", 1, "Worker", "worker", 10).unwrap();
+        revoke_tx(&tx, "revoked", 12).unwrap();
+        issue_tx(&tx, "wrong-task", 1, "Worker", "worker", 10).unwrap();
+        issue_tx(&tx, "wrong-agent", 1, "Worker", "worker", 10).unwrap();
+        issue_tx(&tx, "wrong-role", 1, "Worker", "reviewer", 10).unwrap();
+        issue_tx(&tx, "bound", 1, "Worker", "worker", 10).unwrap();
+
+        assert!(bind_worker_run_tx(&tx, "revoked", agent_run_id, 1, "Worker").is_err());
+        assert_eq!(bound_agent_run_id(&tx, "revoked"), None);
+
+        assert!(bind_worker_run_tx(&tx, "wrong-task", agent_run_id, 2, "Worker").is_err());
+        assert_eq!(bound_agent_run_id(&tx, "wrong-task"), None);
+
+        assert!(bind_worker_run_tx(&tx, "wrong-agent", agent_run_id, 1, "Other").is_err());
+        assert_eq!(bound_agent_run_id(&tx, "wrong-agent"), None);
+
+        assert!(bind_worker_run_tx(&tx, "wrong-role", agent_run_id, 1, "Worker").is_err());
+        assert_eq!(bound_agent_run_id(&tx, "wrong-role"), None);
+
+        bind_worker_run_tx(&tx, "bound", agent_run_id, 1, "Worker").unwrap();
+        assert_eq!(bound_agent_run_id(&tx, "bound"), Some(agent_run_id));
+
+        assert!(bind_worker_run_tx(&tx, "bound", other_agent_run_id, 1, "Worker").is_err());
+        assert_eq!(bound_agent_run_id(&tx, "bound"), Some(agent_run_id));
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn attributed_retirement_rejects_unbound_worker_capability() {
+        let (_d, mut c) = open_tmp();
+        insert_authority_task(&c, 1, "working", Some("Worker"), None, None, None);
+        let responsibility_key = "worker:task:1:revision:1";
+        c.execute(
+            "INSERT INTO role_assignments(
+                 id,responsibility_key,task_id,role,profile_id,provider,runner,model,effort,
+                 pool_key,policy_generation,created_at)
+             VALUES (42,?1,1,'worker','sol','codex','codex','model','high',
+                     'worker:M','g1',10)",
+            [responsibility_key],
+        )
+        .unwrap();
+        let agent_run_id = crate::agent_runs::insert_worker_with_assignment(
+            &c,
+            1,
+            "Worker",
+            responsibility_key,
+            "model",
+            "high",
+            "codex",
+            "codex",
+            Some(42),
+            10,
+        )
+        .unwrap();
+        issue(&mut c, "unbound", 1, "Worker", "worker", 10).unwrap();
+        let assignment = crate::role_assignments::get(&c, 42).unwrap().unwrap();
+        let failed_route = assignment.profile_snapshot();
+
+        let tx = begin_immediate(&mut c).unwrap();
+        assert!(!attributed_retirement_target_tx(
+            &tx,
+            &AttributedRetirementTarget {
+                capability_run_id: "unbound",
+                agent_run_id,
+                agent: "Worker",
+                assignment: &assignment,
+                failed_route: &failed_route,
+                ended_at: 20,
+                end_reason: "provider-failed",
+            },
+        )
+        .unwrap());
+        assert_eq!(bound_agent_run_id(&tx, "unbound"), None);
+        tx.commit().unwrap();
     }
 
     #[test]

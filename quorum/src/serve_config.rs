@@ -198,6 +198,7 @@ declare_serve_file_config! {
     max_task_cost_usd: Option<f64>,
     max_turn_wall_secs: Option<u64>,
     max_idle_secs: Option<u64>,
+    max_busy_idle_secs: Option<u64>,
     max_task_wall_secs: Option<u64>,
     idle_timeout_secs: Option<u64>,
     allowed_tools: Option<String>,
@@ -233,6 +234,9 @@ declare_serve_file_config! {
     /// Maximum rework rounds before a task fails. Stamped onto each task at
     /// adoption, immutable thereafter; unset falls back to the compiled default.
     max_rework: Option<u32>,
+    /// Children of one decomposition graph that may be `working` at once.
+    /// Unset defaults to `cap`; values above `cap` are bounded by `cap`.
+    max_graph_children_working: Option<i64>,
     /// Runner-specific Codex configuration.
     codex: Option<CodexFileConfig>,
     /// Grok adapter configuration for managed worker roles.
@@ -287,6 +291,7 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("max_task_cost_usd", ConfigKeyDisposition::Runtime),
     ("max_turn_wall_secs", ConfigKeyDisposition::Runtime),
     ("max_idle_secs", ConfigKeyDisposition::Runtime),
+    ("max_busy_idle_secs", ConfigKeyDisposition::Runtime),
     ("max_task_wall_secs", ConfigKeyDisposition::Runtime),
     ("idle_timeout_secs", ConfigKeyDisposition::Runtime),
     ("allowed_tools", ConfigKeyDisposition::Runtime),
@@ -317,6 +322,7 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("r2_target_per_stratum", ConfigKeyDisposition::Runtime),
     ("r2_steady_state_p", ConfigKeyDisposition::Runtime),
     ("max_rework", ConfigKeyDisposition::Runtime),
+    ("max_graph_children_working", ConfigKeyDisposition::Runtime),
     ("codex", ConfigKeyDisposition::Runtime),
     ("grok", ConfigKeyDisposition::Runtime),
     #[cfg(test)]
@@ -968,6 +974,34 @@ pub fn validate_max_rework(max_rework: u32) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the per-graph working-children limit. Unset defaults to the worker
+/// `cap`; zero or negative values are bad config. Values above `cap` are kept
+/// as configured: the worker cap already bounds concurrent claims.
+pub fn resolve_max_graph_children_working(configured: Option<i64>, cap: usize) -> Result<usize> {
+    match configured {
+        None => Ok(cap.max(1)),
+        Some(limit) if limit < 1 => Err(QuorumError::Usage(format!(
+            "max_graph_children_working must be >= 1 (got {limit})"
+        ))),
+        Some(limit) => Ok(usize::try_from(limit).unwrap_or(usize::MAX)),
+    }
+}
+
+/// Worker `cap` used when neither `--cap` nor the serve config sets one.
+pub const DEFAULT_CAP: usize = 4;
+
+/// Effective per-graph working-children limit as resolved from a serve config
+/// file alone, for read-only consumers (`quorum web`) that must agree with the
+/// daemon's dispatch predicate. A `--cap` passed only on the `serve` command
+/// line is not visible here.
+pub fn file_graph_children_working_limit(cfg: &ServeFileConfig) -> Result<i64> {
+    let limit = resolve_max_graph_children_working(
+        cfg.max_graph_children_working,
+        cfg.cap.unwrap_or(DEFAULT_CAP),
+    )?;
+    Ok(i64::try_from(limit).unwrap_or(i64::MAX))
+}
+
 /// Validate the owner-configured directed branch-sync pairs. The same branch
 /// rules as task targets apply, and self-sync is never meaningful.
 pub fn validate_sync_pairs(sync_pairs: &[[String; 2]]) -> Result<()> {
@@ -1104,6 +1138,22 @@ impl<T: std::fmt::Display> std::fmt::Display for Sourced<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ({})", self.value, self.source)
     }
+}
+
+/// Idle ceiling applied instead of `max_idle_secs` while a managed agent has
+/// an outstanding tool call or background task (long test suites run by the
+/// provider in the background). Always finite: a hung tool is still reaped.
+pub const DEFAULT_MAX_BUSY_IDLE_SECS: u64 = 3600;
+/// Upper bound for `max_busy_idle_secs`; "busy" must never mean "immortal".
+pub const MAX_BUSY_IDLE_SECS_CEILING: u64 = 86_400;
+
+pub fn validate_busy_idle_secs(seconds: u64) -> std::result::Result<(), String> {
+    if seconds == 0 || seconds > MAX_BUSY_IDLE_SECS_CEILING {
+        return Err(format!(
+            "max_busy_idle_secs must be between 1 and {MAX_BUSY_IDLE_SECS_CEILING} seconds"
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve: flag > file > default.
@@ -1276,6 +1326,7 @@ pub struct BannerData<'a> {
     pub self_update_drain: &'a Sourced<bool>,
     pub drain_timeout_secs: &'a Sourced<u64>,
     pub max_idle_secs: &'a Sourced<Option<u64>>,
+    pub max_busy_idle_secs: &'a Sourced<u64>,
     pub max_task_wall_secs: &'a Sourced<Option<u64>>,
     pub idle_timeout_secs: &'a Sourced<Option<u64>>,
     pub max_turn_tokens: &'a Sourced<Option<i64>>,
@@ -1296,6 +1347,19 @@ pub struct BannerData<'a> {
 }
 
 /// Format the startup banner showing resolved config + sources.
+/// Idle limit as the runtime resolves it (serve/mod.rs): `max_idle_secs`, then
+/// the legacy `idle_timeout_secs`, then 900. Returns the value and its origin.
+fn effective_idle_limit(
+    max_idle_secs: Option<u64>,
+    idle_timeout_secs: Option<u64>,
+) -> (u64, &'static str) {
+    match (max_idle_secs, idle_timeout_secs) {
+        (Some(v), _) => (v, "max_idle_secs"),
+        (None, Some(v)) => (v, "idle_timeout_secs"),
+        (None, None) => (900, "default"),
+    }
+}
+
 pub fn banner(d: &BannerData<'_>) -> String {
     let mut lines = Vec::new();
     lines.push("─── resolved serve config ───".to_string());
@@ -1368,15 +1432,24 @@ pub fn banner(d: &BannerData<'_>) -> String {
         }
     ));
     lines.push(format!(
+        "  max_busy_idle_secs:        {} ({})",
+        d.max_busy_idle_secs.value, d.max_busy_idle_secs.source
+    ));
+    lines.push(format!(
         "  max_task_wall_secs:        {}",
         opt_u64(d.max_task_wall_secs)
     ));
     lines.push(format!(
         "  idle_timeout_secs:         {}",
         match d.idle_timeout_secs.value {
-            Some(v) => format!("{v} ({src})", src = d.idle_timeout_secs.source),
-            None => format!("300 ({src}, default)", src = d.idle_timeout_secs.source),
+            Some(v) => format!("{v} ({src}, legacy)", src = d.idle_timeout_secs.source),
+            None => format!("unset ({src}, legacy)", src = d.idle_timeout_secs.source),
         }
+    ));
+    let (effective_idle, effective_origin) =
+        effective_idle_limit(d.max_idle_secs.value, d.idle_timeout_secs.value);
+    lines.push(format!(
+        "  effective idle limit:      {effective_idle} ({effective_origin}; max_idle_secs overrides idle_timeout_secs, default 900)"
     ));
     lines.push(format!(
         "  max_turn_tokens:           {}",
@@ -1812,6 +1885,7 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
         );
         assert_eq!(cfg.max_turn_wall_secs, Some(2700));
         assert_eq!(cfg.max_idle_secs, Some(900));
+        assert_eq!(cfg.max_busy_idle_secs, None);
         assert!(cfg.doctor_enabled.is_none());
     }
 
@@ -1891,7 +1965,7 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
             assert_eq!(roles.worker_model, "grok-4.5");
         }
 
-        for model in ["grok-4.5", "grok-4.6"] {
+        for model in ["grok-4.5", "grok-4.6", "grok-4.7"] {
             let worker: ServeFileConfig =
                 toml::from_str(&format!("worker_model = \"{model}\"\n")).unwrap();
             assert_eq!(
@@ -2322,7 +2396,7 @@ worktree_base = "/tmp/wt"
             cfg
         }
 
-        for model in ["grok-4.5", "grok-4.6"] {
+        for model in ["grok-4.5", "grok-4.6", "grok-4.7"] {
             validate_model_routing(&config_with_grok_worker(model)).unwrap();
 
             for role in [
@@ -2357,7 +2431,7 @@ worktree_base = "/tmp/wt"
             "grok-unknown".into(),
             ModelProfile {
                 runner: "grok".into(),
-                model: "grok-4.7".into(),
+                model: "grok-4.7-build-fast".into(),
                 effort: "high".into(),
             },
         );
@@ -2603,6 +2677,58 @@ worktree_base = "/tmp/wt"
     }
 
     #[test]
+    fn file_graph_children_working_limit_matches_daemon_resolution() {
+        let parse = |src: &str| toml::from_str::<ServeFileConfig>(src).unwrap();
+        // Absent cap and key → the daemon's default cap, not the legacy 2.
+        assert_eq!(
+            file_graph_children_working_limit(&parse("")).unwrap(),
+            DEFAULT_CAP as i64
+        );
+        assert_eq!(
+            file_graph_children_working_limit(&parse("cap = 6\n")).unwrap(),
+            6
+        );
+        assert_eq!(
+            file_graph_children_working_limit(&parse("cap = 6\nmax_graph_children_working = 1\n"))
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            file_graph_children_working_limit(&parse("max_graph_children_working = 0\n")),
+            Err(QuorumError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn max_graph_children_working_defaults_to_cap_and_rejects_non_positive() {
+        let parse = |toml: &str| -> Option<i64> {
+            toml::from_str::<ServeFileConfig>(toml)
+                .unwrap()
+                .max_graph_children_working
+        };
+        // Absent key → worker cap.
+        assert_eq!(resolve_max_graph_children_working(parse(""), 4).unwrap(), 4);
+        assert_eq!(resolve_max_graph_children_working(parse(""), 7).unwrap(), 7);
+        // Explicit values, including above cap, are kept.
+        let one = parse("max_graph_children_working = 1\n");
+        assert_eq!(resolve_max_graph_children_working(one, 4).unwrap(), 1);
+        let above = parse("max_graph_children_working = 9\n");
+        assert_eq!(resolve_max_graph_children_working(above, 4).unwrap(), 9);
+        // Zero and negative are bad config → exit 2.
+        for bad in [
+            "max_graph_children_working = 0\n",
+            "max_graph_children_working = -3\n",
+        ] {
+            let err = resolve_max_graph_children_working(parse(bad), 4).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{err}");
+            assert!(
+                err.to_string().contains("max_graph_children_working"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
     fn resolve_max_rework_at_missing_file_returns_compiled_default() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("absent.toml");
@@ -2647,6 +2773,19 @@ worktree_base = "/tmp/wt"
         std::fs::write(&path, "not = valid = toml\n").unwrap();
         let err = resolve_max_rework_at(&path).unwrap_err();
         assert_eq!(err.exit_code(), 2, "{err}");
+    }
+
+    #[test]
+    fn effective_idle_limit_prefers_max_idle_then_legacy_then_900() {
+        assert_eq!(
+            effective_idle_limit(Some(60), Some(300)),
+            (60, "max_idle_secs")
+        );
+        assert_eq!(
+            effective_idle_limit(None, Some(300)),
+            (300, "idle_timeout_secs")
+        );
+        assert_eq!(effective_idle_limit(None, None), (900, "default"));
     }
 
     #[test]
@@ -2702,6 +2841,10 @@ worktree_base = "/tmp/wt"
             },
             max_idle_secs: &Sourced {
                 value: None,
+                source: Source::Default,
+            },
+            max_busy_idle_secs: &Sourced {
+                value: DEFAULT_MAX_BUSY_IDLE_SECS,
                 source: Source::Default,
             },
             max_task_wall_secs: &Sourced {
@@ -2788,6 +2931,19 @@ worktree_base = "/tmp/wt"
             b.contains("max_idle_secs:             900 (default)"),
             "max_idle_secs should default to 900: {b}"
         );
+        assert!(
+            b.contains("max_busy_idle_secs:        3600 (default)"),
+            "max_busy_idle_secs should default to 3600: {b}"
+        );
         assert!(b.contains("(default)"), "defaults should be labeled: {b}");
+        assert!(
+            b.contains("idle_timeout_secs:         unset (default, legacy)"),
+            "unset legacy idle timeout must not claim a 300s default: {b}"
+        );
+        assert!(!b.contains("300 (default, default)"), "{b}");
+        assert!(
+            b.contains("effective idle limit:      900 (default; max_idle_secs overrides"),
+            "effective idle limit should be 900 by default: {b}"
+        );
     }
 }

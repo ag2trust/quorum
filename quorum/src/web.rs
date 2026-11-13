@@ -53,6 +53,8 @@ struct AppState {
     db_path: PathBuf,
     logs_root: PathBuf,
     online_window: i64,
+    /// Daemon's effective per-graph working-children limit for the Ready band.
+    graph_children_limit: i64,
 }
 
 pub fn serve(
@@ -61,6 +63,7 @@ pub fn serve(
     bind: &str,
     port: u16,
     online_window: i64,
+    graph_children_limit: i64,
 ) -> quorum_core::error::Result<()> {
     let ip: IpAddr = bind.parse().map_err(|e| {
         quorum_core::error::QuorumError::Usage(format!("invalid --bind/--port: {e}"))
@@ -71,6 +74,7 @@ pub fn serve(
         db_path,
         logs_root,
         online_window,
+        graph_children_limit,
     };
     let app = Router::new()
         .route("/", get(index))
@@ -193,8 +197,11 @@ fn state_payload(state: &AppState) -> quorum_core::error::Result<Value> {
     // This task-core projection applies the dependency, graph, and persisted
     // classification admission predicates before its SQL display bound. Do not
     // substitute a recent/open task page or filter it after the limit.
-    let ready_all =
-        quorum_core::tasks::list_implementation_ready_open_limited(&conn, STATE_BAND_LIMIT as i64)?;
+    let ready_all = quorum_core::tasks::list_implementation_ready_open_limited(
+        &conn,
+        STATE_BAND_LIMIT as i64,
+        state.graph_children_limit,
+    )?;
     let ready_count = ready_all.len();
     let ready = ready_all
         .into_iter()
@@ -344,7 +351,10 @@ fn blocked_task_summaries(
     // failed-but-parked rows with a cancelled prerequisite are retained as disposition work.
     state_band(
         conn,
-        "depends_on IS NOT NULL AND ((status='open' AND EXISTS (SELECT 1 FROM json_each(depends_on) dependency WHERE NOT EXISTS (SELECT 1 FROM tasks prerequisite WHERE prerequisite.id=dependency.value AND prerequisite.status='done'))) OR (status='failed' AND json_valid(refs) AND json_extract(refs, '$.daemon_parked')=1 AND EXISTS (SELECT 1 FROM json_each(depends_on) dependency JOIN tasks prerequisite ON prerequisite.id=dependency.value WHERE prerequisite.status='cancelled')))",
+        &format!(
+            "depends_on IS NOT NULL AND ((status='open' AND EXISTS (SELECT 1 FROM json_each(depends_on) dependency WHERE NOT EXISTS (SELECT 1 FROM tasks d WHERE d.id=dependency.value AND {}))) OR (status='failed' AND json_valid(refs) AND json_extract(refs, '$.daemon_parked')=1 AND EXISTS (SELECT 1 FROM json_each(depends_on) dependency JOIN tasks prerequisite ON prerequisite.id=dependency.value WHERE prerequisite.status='cancelled')))",
+            quorum_core::tasks::DEP_SATISFIED_PREDICATE
+        ),
         now,
     )
 }
@@ -1320,6 +1330,7 @@ mod tests {
             db_path: db.clone(),
             logs_root: temp.path().join("logs"),
             online_window: 900,
+            graph_children_limit: 4,
         };
         let payload = state_payload(&state).unwrap();
         assert!(payload.get("tasks").is_some());
@@ -1344,6 +1355,7 @@ mod tests {
             db_path: temp.path().join("q.db"),
             logs_root: temp.path().join("logs"),
             online_window: 900,
+            graph_children_limit: 4,
         }
     }
 

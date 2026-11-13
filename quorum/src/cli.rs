@@ -60,8 +60,8 @@ pub enum Command {
         /// JSON array of labels, e.g. '["ui","p1"]'.
         #[arg(long)]
         labels: Option<String>,
-        /// JSON of non-authoritative external refs. PR association requires --review-pr or
-        /// --continue-pr; refs.pr is rejected.
+        /// JSON of non-authoritative external refs. PR association requires --review-pr,
+        /// --review-only, or --continue-pr; refs.pr is rejected.
         #[arg(long)]
         refs: Option<String>,
         /// JSON array of task ids this task depends on, e.g. '[1,3]'. Claim (auto-pick AND
@@ -69,12 +69,20 @@ pub enum Command {
         /// + finalized). Validated as a JSON array of ints at create — malformed exits 2.
         #[arg(long = "depends-on")]
         depends_on: Option<String>,
-        /// Create as a review-only task (starts in in-review). The PR number is stored in refs.pr.
-        #[arg(long = "review-pr", conflicts_with = "continue_pr")]
+        /// Create a review + remediate task (starts in in-review). The PR number is stored in
+        /// refs.pr. Blocking findings, failed CI, or merge conflicts enter bounded rework with a
+        /// daemon-managed remediation worker on the same PR.
+        #[arg(long = "review-pr", conflicts_with_all = ["continue_pr", "review_only"])]
         review_pr: Option<i64>,
+        /// Create a reviewer-only task for PR N (starts in in-review). Reviewers review the PR;
+        /// Quorum never reworks it. Approval merges normally. Requested changes, failed CI, or a
+        /// merge conflict close the task as `done` with refs.review_outcome, a findings note, a
+        /// daemon-owned GitHub REQUEST_CHANGES review, and an owner alert — no remediation worker.
+        #[arg(long = "review-only", value_name = "N", conflicts_with_all = ["continue_pr", "review_pr"])]
+        review_only: Option<i64>,
         /// Continue implementation from an existing PR. Starts as an open implementation task;
         /// the daemon provisions the worker from this PR rather than the configured base.
-        #[arg(long = "continue-pr", conflicts_with = "review_pr")]
+        #[arg(long = "continue-pr", conflicts_with_all = ["review_pr", "review_only"])]
         continue_pr: Option<i64>,
         /// Local branch to target. Defaults to this repository's configured daemon base branch.
         #[arg(long = "base-branch")]
@@ -114,6 +122,8 @@ pub enum Command {
         #[arg(long = "task-id")]
         task_id: i64,
         /// Current task revision. Required when changing body, refs, or dependencies.
+        /// A stale revision, a no-op edit, or the 3-edit limit is refused (exit 1) with
+        /// a message naming the cause.
         #[arg(long = "expected-revision")]
         expected_revision: Option<i64>,
         #[arg(long)]
@@ -132,7 +142,7 @@ pub enum Command {
         note_file: Option<PathBuf>,
         /// Replace this task's dependency list. JSON array of task ids, e.g. '[1,3]'.
         /// Pass '[]' to clear all dependencies. Creator or assignee guard; blocked on
-        /// terminal tasks (done/failed).
+        /// done and cancelled tasks, and on failed tasks unless the daemon parked them.
         #[arg(long = "depends-on")]
         depends_on: Option<String>,
     },
@@ -377,13 +387,72 @@ pub enum Command {
         /// One of: blocked, failed, needs-info, note.
         #[arg(long)]
         state: String,
+        /// Read the reason from stdin. REQUIRED for `blocked` and `needs-info`:
+        /// state the blocker or the full question; it is stored on the parked task.
+        #[arg(long = "reason-stdin")]
+        reason_stdin: bool,
+        /// Read the reason from a file (alternative to --reason-stdin).
+        #[arg(long = "reason-file")]
+        reason_file: Option<PathBuf>,
         /// Daemon-issued run capability token. Falls back to QUORUM_RUN_ID env var.
         #[arg(long = "run-id")]
         run_id: Option<String>,
     },
-    /// Run the credentialless, tools-only managed-agent MCP server over stdio.
+    /// Run the credentialless, tools-only managed-agent MCP server over stdio,
+    /// or over loopback Streamable HTTP with `--listen`.
     #[command(name = "agent-mcp")]
-    AgentMcp,
+    AgentMcp {
+        /// Serve Streamable HTTP MCP at `http://<addr>/mcp` instead of stdio.
+        /// Loopback addresses only; plain HTTP. Each request carries its run
+        /// capability as `Authorization: Bearer <run id>`.
+        #[arg(long, value_name = "SOCKETADDR")]
+        listen: Option<std::net::SocketAddr>,
+    },
+    /// Serve the coordinator MCP tools for one repository over Streamable HTTP
+    /// at `http://<addr>/mcp`: create, list, inspect, cancel, and retry tasks,
+    /// and message a managed agent, all as the one `--identity`. Plain HTTP.
+    /// Every request must carry the operator's token as
+    /// `Authorization: Bearer <token>`; the token is read only from
+    /// `--token-file`, never from an argument value or the environment.
+    #[command(name = "orchestrator-mcp")]
+    OrchestratorMcp {
+        /// Address to bind. A non-loopback address also requires `--allowed-host`.
+        #[arg(long, value_name = "SOCKETADDR")]
+        listen: std::net::SocketAddr,
+        /// File holding the bearer token (32 to 512 printable ASCII
+        /// characters). It must be owned by the current user and not readable
+        /// by group or others.
+        #[arg(long = "token-file", value_name = "PATH")]
+        token_file: PathBuf,
+        /// The coordinator identity every tool acts as: the creator of tasks
+        /// it creates, the sender of its messages, and the identity whose
+        /// creator-or-assignee standing decides what it may cancel.
+        #[arg(long, value_name = "NAME")]
+        identity: String,
+        /// A `Host` (or `host:port`) clients may address. Repeatable. The
+        /// loopback names are always accepted on a loopback bind.
+        #[arg(long = "allowed-host", value_name = "HOST")]
+        allowed_host: Vec<String>,
+        /// Target repo as owner/name, which must already have a database.
+        /// Defaults to `QUORUM_REPO`, then the current checkout.
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Forward Messages API requests from managed runs to a model upstream,
+    /// so a sandboxed run gets model access without the upstream credential.
+    /// Each request presents its run capability as `x-api-key` (or
+    /// `Authorization: Bearer`); limits are read from `QUORUM_INFERENCE_*` in
+    /// this process's environment. The upstream credential is read at startup
+    /// from the file named by `QUORUM_INFERENCE_UPSTREAM_API_KEY_FILE`
+    /// (recommended: it keeps the credential out of the environment) or from
+    /// `QUORUM_INFERENCE_UPSTREAM_API_KEY`; set exactly one.
+    #[command(name = "inference-forwarder")]
+    InferenceForwarder {
+        /// Serve at `http://<addr>/v1/messages`. Loopback addresses only;
+        /// plain HTTP.
+        #[arg(long, value_name = "SOCKETADDR")]
+        listen: std::net::SocketAddr,
+    },
     /// Signal task completion (worker) or emit a review verdict (reviewer).
     /// The daemon endpoint writes the mailbox row after deriving authority from
     /// the run capability; CLI task, PR, and identity flags are compatibility inputs.
@@ -515,6 +584,10 @@ pub enum Command {
         /// Max seconds an active worker/reviewer may go without emitting an event.
         #[arg(long)]
         max_idle_secs: Option<u64>,
+        /// Idle limit while an agent has an outstanding tool call or background
+        /// task (default: 3600, max: 86400; never below max_idle_secs).
+        #[arg(long)]
+        max_busy_idle_secs: Option<u64>,
         /// Max wall-clock seconds per task (across all turns).
         #[arg(long)]
         max_task_wall_secs: Option<u64>,
@@ -571,7 +644,8 @@ pub enum Command {
         doctor_enabled: bool,
     },
     /// Stream rendered events from an agent's session log. Resolves the agent's
-    /// latest session log directory via the journal. Default: print events so far
+    /// in-flight session log via the journal, else the newest retained session
+    /// directory (`<log_dir>/<agent>-<start>`, kept ~7 days). Default: print events so far
     /// and exit. `--follow` keeps tailing until Ctrl-C.
     Tail {
         /// Agent name whose session log to tail.

@@ -15,6 +15,78 @@ pub enum WaitState<T> {
 
 pub const TEST_TICK_PACING_MS: &str = "25";
 
+/// Short SHA compiled into the `quorum` binary (`quorum <ver> (<sha_short>)`).
+///
+/// Self-update drain compares origin to this identity, not to worktree HEAD.
+pub fn compiled_build_sha_short() -> String {
+    let output = Command::new(assert_cmd::cargo::cargo_bin("quorum"))
+        .arg("--version")
+        .output()
+        .expect("run quorum --version");
+    assert!(
+        output.status.success(),
+        "quorum --version failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_quorum_version_build_sha(
+        String::from_utf8(output.stdout)
+            .expect("quorum --version stdout")
+            .trim(),
+    )
+}
+
+/// Parse the parenthesized short SHA from `quorum --version` text.
+pub fn parse_quorum_version_build_sha(version: &str) -> String {
+    let open = version
+        .rfind('(')
+        .unwrap_or_else(|| panic!("quorum --version missing SHA: {version:?}"));
+    let close_rel = version[open + 1..]
+        .find(')')
+        .unwrap_or_else(|| panic!("quorum --version missing SHA: {version:?}"));
+    let sha = version[open + 1..open + 1 + close_rel].trim();
+    assert!(
+        sha.len() >= 7 && sha.len() <= 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+        "quorum --version SHA is not a commit: {version:?}"
+    );
+    sha.to_string()
+}
+
+/// Full object id of the compiled build SHA in the source repository.
+///
+/// `git fetch <url> <short-sha>` looks up a ref name, so callers that need a
+/// real origin/main object must fetch this expanded id.
+pub fn compiled_build_object_id() -> String {
+    let short = compiled_build_sha_short();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("quorum crate has repository parent");
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &source.to_string_lossy(),
+            "rev-parse",
+            "--verify",
+            &format!("{}^{{commit}}", short),
+        ])
+        .output()
+        .expect("git rev-parse compiled SHA");
+    assert!(
+        output.status.success(),
+        "compiled SHA {short} is not a commit in {}: {}",
+        source.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let full = String::from_utf8(output.stdout).expect("git rev-parse stdout");
+    let full = full.trim();
+    assert!(
+        (full.len() == 40 || full.len() == 64)
+            && full.bytes().all(|b| b.is_ascii_hexdigit())
+            && full.starts_with(&short),
+        "compiled SHA expanded unexpectedly: {short} -> {full}"
+    );
+    full.to_string()
+}
+
 /// Construct a daemon command with the debug-build test pacing override.
 pub fn test_daemon_command(program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);

@@ -122,7 +122,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- `max_rework` config at first ownership; immutable once populated. NULL
     -- means unstamped and falls back to the compiled REWORK_CAP, preserving
     -- historic behaviour for existing rows.
-    rework_cap INTEGER
+    rework_cap INTEGER,
+    -- v80: `task-create --review-only`. Reviewers review the PR; Quorum never reworks it.
+    -- Always set together with review_only=1. Actionable-rework triggers close the task as
+    -- `done` with refs.review_outcome instead of entering `rework`.
+    no_rework INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS tasks_status_priority ON tasks(status, priority DESC);
 -- Bounded REVIEWING projection: each status is read newest-first, then at most two
@@ -502,6 +506,9 @@ CREATE TABLE IF NOT EXISTS reviewer_provision_attempts (
     head_sha        TEXT NOT NULL DEFAULT '',
     attempts        INTEGER NOT NULL DEFAULT 0,
     last_attempt_at INTEGER NOT NULL DEFAULT 0,
+    -- v83: bounded provider error from the most recent strike; NULL when that
+    -- strike had none.
+    last_provider_error TEXT,
     PRIMARY KEY (task_id, pr_number, role)
 );
 
@@ -1111,6 +1118,23 @@ CREATE TABLE IF NOT EXISTS planner_submissions (
 -- submissions for unrelated graphs.
 CREATE INDEX IF NOT EXISTS planner_submissions_graph_id
     ON planner_submissions(graph_id);
+-- v82: append-only ledger with one row per `submit_plan` call, accepted or
+-- refused. No foreign key to `planner_submissions`: a refused call may have no
+-- row there. Only fixed-vocabulary outcomes are stored; plan text, validation
+-- messages, and other provider payload strings have no column here.
+CREATE TABLE IF NOT EXISTS planner_submission_calls (
+    run_id             TEXT NOT NULL,
+    seq                INTEGER NOT NULL,
+    received_at        INTEGER NOT NULL,
+    accepted           INTEGER NOT NULL DEFAULT 0 CHECK(accepted IN (0,1)),
+    rejection_category TEXT CHECK(rejection_category IN (
+        'validation','budget_exhausted','already_submitted','unauthorized',
+        'unsupported_version','timeout','internal'
+    )),
+    PRIMARY KEY(run_id, seq),
+    CHECK((accepted = 1 AND rejection_category IS NULL)
+       OR (accepted = 0 AND rejection_category IS NOT NULL))
+);
 
 -- v61: durable storage for GitHub collaboration attempts, their agent operation outbox, and
 -- pending-review publication ownership. Runtime claiming/execution is deliberately separate.
@@ -1242,3 +1266,23 @@ BEFORE UPDATE OF operation_id, client_request_id, attempt_id, created_by_run_id,
 BEGIN
     SELECT RAISE(ABORT, 'github operation request is immutable after enqueue');
 END;
+
+-- Daemon-created worker-work recover refs (`refs/quorum-recover/t<task>/...`).
+-- Workers share the repository's ref store, so a ref alone is not authority:
+-- the daemon resumes only from a ref whose exact name and SHA it recorded here
+-- for the same task. Rows are retired with their refs (bounded retention and
+-- done/cancelled housekeeping).
+CREATE TABLE IF NOT EXISTS recover_refs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    refname      TEXT NOT NULL UNIQUE,
+    task_id      INTEGER NOT NULL,
+    sha          TEXT NOT NULL,
+    kind         TEXT NOT NULL CHECK (kind IN ('snapshot', 'commits')),
+    parent_sha   TEXT,
+    tracked_only INTEGER NOT NULL DEFAULT 0 CHECK (tracked_only IN (0, 1)),
+    agent        TEXT NOT NULL,
+    reason       TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    CHECK ((kind = 'snapshot') = (parent_sha IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS recover_refs_task ON recover_refs(task_id, id);
