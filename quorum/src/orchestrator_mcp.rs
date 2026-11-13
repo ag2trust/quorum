@@ -45,7 +45,6 @@ pub(crate) const TOKEN_ENV: &str = "QUORUM_ORCHESTRATOR_TOKEN";
 /// guarding task intake, possibly on a non-loopback address.
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_TOKEN_BYTES: usize = 512;
-const MAX_TOKEN_FILE_BYTES: u64 = 4096;
 const MAX_ALLOWED_HOSTS: usize = 16;
 
 /// Requests the gate admitted that may be in flight at once, and so also the
@@ -946,40 +945,15 @@ fn valid_token(token: &str) -> bool {
 /// permission bits, so no other user can read it. That does not hide it from
 /// processes of the same user; see the design record's trust model.
 fn load_token(token_file: &Path) -> Result<Vec<u8>> {
-    use std::io::Read as _;
-    use std::os::unix::fs::MetadataExt as _;
-    let unreadable =
-        |error: std::io::Error| QuorumError::Usage(format!("cannot read --token-file: {error}"));
-    let file = std::fs::File::open(token_file).map_err(unreadable)?;
-    // Checked on the open descriptor, so the file read is the file checked.
-    let metadata = file.metadata().map_err(unreadable)?;
-    if !metadata.is_file() {
-        return Err(QuorumError::Usage(
-            "--token-file must be a regular file".into(),
-        ));
-    }
-    if metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(QuorumError::Usage(
-            "--token-file must be owned by the user running orchestrator-mcp".into(),
-        ));
-    }
-    if metadata.mode() & 0o077 != 0 {
-        return Err(QuorumError::Usage(
-            "--token-file must not be readable by group or others (chmod 600)".into(),
-        ));
-    }
-    let mut contents = String::new();
-    file.take(MAX_TOKEN_FILE_BYTES)
-        .read_to_string(&mut contents)
-        .map_err(unreadable)?;
-    let token = contents.trim_end_matches(['\r', '\n']);
-    if !valid_token(token) {
+    let token = crate::secret_file::read_owner_only(token_file, unsafe { libc::geteuid() })
+        .map_err(|reason| QuorumError::Usage(format!("--token-file {reason}")))?;
+    if !valid_token(&token) {
         return Err(QuorumError::Usage(format!(
             "the orchestrator token must be {MIN_TOKEN_BYTES} to {MAX_TOKEN_BYTES} printable \
              ASCII characters with no spaces"
         )));
     }
-    Ok(token.as_bytes().to_vec())
+    Ok(token.into_bytes())
 }
 
 /// The `Host` names a request may carry. A loopback bind accepts the loopback
