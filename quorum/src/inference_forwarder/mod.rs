@@ -5,8 +5,8 @@
 //! points its model client at it and presents its run capability where the
 //! API key would go. Each request is authorized by the daemon endpoint,
 //! checked against the request policy, and re-sent upstream with the
-//! operator's credential, which is read from this process's environment and
-//! never sent to the caller or written to a log.
+//! operator's credential, which is read at startup from a file or from this
+//! process's environment and never sent to the caller or written to a log.
 //!
 //! Like `agent-mcp --listen`, this process has no database path: run
 //! authority comes only from the daemon endpoint, on every request.
@@ -1119,6 +1119,52 @@ fn seconds_env(name: &str, default: u64) -> Result<u64> {
     }
 }
 
+const CREDENTIAL_ENV: &str = "QUORUM_INFERENCE_UPSTREAM_API_KEY";
+const CREDENTIAL_FILE_ENV: &str = "QUORUM_INFERENCE_UPSTREAM_API_KEY_FILE";
+
+/// The upstream credential, from exactly one of a file named by
+/// `QUORUM_INFERENCE_UPSTREAM_API_KEY_FILE` or the value of
+/// `QUORUM_INFERENCE_UPSTREAM_API_KEY`. An empty variable is not a source,
+/// as with every optional setting, though an empty file variable on its own
+/// is refused rather than reported as missing.
+///
+/// A credential read from a file is never placed in this process's
+/// environment; the forwarder starts no child process in any case. The
+/// file's path is no secret, so its variable may stay set.
+fn upstream_credential() -> Result<HeaderValue> {
+    let file = std::env::var_os(CREDENTIAL_FILE_ENV);
+    let from_file = file.as_ref().is_some_and(|path| !path.is_empty());
+    let from_env = std::env::var_os(CREDENTIAL_ENV).is_some_and(|value| !value.is_empty());
+    let (name, value) = match (from_file, from_env) {
+        (true, true) => {
+            return Err(QuorumError::Usage(format!(
+                "inference-forwarder received both {CREDENTIAL_FILE_ENV} and {CREDENTIAL_ENV}; \
+                 set only one"
+            )))
+        }
+        (false, false) if file.is_some() => return Err(invalid_env(CREDENTIAL_FILE_ENV)),
+        (false, false) => {
+            return Err(QuorumError::Usage(format!(
+                "inference-forwarder requires {CREDENTIAL_FILE_ENV} or {CREDENTIAL_ENV}"
+            )))
+        }
+        (true, false) => {
+            // Any path the platform accepts, UTF-8 or not.
+            let path = file.unwrap_or_default();
+            if path.len() > MAX_ENV_BYTES {
+                return Err(invalid_env(CREDENTIAL_FILE_ENV));
+            }
+            let value = crate::secret_file::read(std::path::Path::new(&path))
+                .map_err(|reason| QuorumError::Usage(format!("{CREDENTIAL_FILE_ENV} {reason}")))?;
+            (CREDENTIAL_FILE_ENV, value)
+        }
+        (false, true) => (CREDENTIAL_ENV, required_env(CREDENTIAL_ENV, MAX_ENV_BYTES)?),
+    };
+    let mut credential = HeaderValue::from_str(&value).map_err(|_| invalid_env(name))?;
+    credential.set_sensitive(true);
+    Ok(credential)
+}
+
 /// Server certificates are verified against the bundled public web roots
 /// only; an upstream behind a private certificate authority is not reachable.
 fn tls_connector() -> Result<tokio_rustls::TlsConnector> {
@@ -1138,10 +1184,7 @@ impl Forwarder {
     fn from_env() -> Result<Self> {
         let endpoint = required_env("QUORUM_AGENT_ENDPOINT", MAX_ENV_BYTES)?;
         let repository = required_env("QUORUM_REPO", 255)?;
-        let credential_name = "QUORUM_INFERENCE_UPSTREAM_API_KEY";
-        let mut credential = HeaderValue::from_str(&required_env(credential_name, MAX_ENV_BYTES)?)
-            .map_err(|_| invalid_env(credential_name))?;
-        credential.set_sensitive(true);
+        let credential = upstream_credential()?;
         let url_name = "QUORUM_INFERENCE_UPSTREAM_URL";
         let url = optional_env(url_name, MAX_ENV_BYTES)?;
         let upstream = Upstream::parse(url.as_deref().unwrap_or(DEFAULT_UPSTREAM))
