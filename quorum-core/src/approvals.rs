@@ -165,14 +165,11 @@ pub fn r2_required_for_head(
         Ok(None) => {}
         Err(_) => return true,
     }
-    if matches!(
+    !matches!(
         crate::tasks::get(conn, task_id),
         Ok(Some(task))
             if task.rework_round >= i64::from(task.effective_rework_cap())
-    ) {
-        return false;
-    }
-    true
+    )
 }
 
 /// The next review role still needed for `head_sha` on `pr_number`, or `None`
