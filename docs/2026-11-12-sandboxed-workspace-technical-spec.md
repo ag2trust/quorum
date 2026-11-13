@@ -169,8 +169,9 @@ must enforce the same checks in CI.
 Once this repository's pre-push checks run in CI, the shared `git_command` gains, in both modes,
 an empty `core.hooksPath`, the protocol allowlist, `GIT_ATTR_SOURCE` for commands that do not
 check out files, signature programs set to `false`, and a push URL taken from configuration (or
-derived once at startup) instead of from the worktree. The planner view's `archive` gains
-`--worktree-attributes` (audit row M25). Teardown also stops snapshotting worktrees with
+derived once at startup) instead of from the worktree. The planner view's `archive` already
+runs from a daemon-owned git directory that borrows only `repo_dir`'s object store (audit row
+M25, fixed ahead of this slice). Teardown also stops snapshotting worktrees with
 `git add -A` and retires their directories instead. The container image moves to a current git
 in the same change: its git 2.39 predates `GIT_ATTR_SOURCE` (2.41), so attribute isolation
 would otherwise be inactive in the image. This closes highest-risk findings 1 and 3, and the
@@ -954,8 +955,9 @@ until that prompt work has landed.
 The planner's frozen view is the exported tree of `refs/remotes/origin/<base>` at the frozen SHA
 in the private repository. That is today's view with two differences: the source is the private
 repository, not `repo_dir`'s `HEAD` (`quorum/src/serve/mod.rs:6493,6752`), and the export is
-verbatim. Today's archive applies `export-ignore`, `export-subst`, and `eol` from the tree (audit
-row M25), so files can differ from what the planner sees today.
+verbatim. Before the M25 fix the archive applied `export-ignore`, `export-subst`, and `eol` from the
+tree, so files could differ from what the planner saw then; since that fix the planner view is
+already verbatim.
 
 In this design the planner's inputs directory is created but empty: it has no PR range, and
 today's planner view carries no history either. If the read-only prompt work gives the planner
@@ -1292,7 +1294,7 @@ linked worktree.
 | M22 | `recover.rs:315,865` | Recover snapshot `update-ref`, `commit-tree` | Store only; the tree source is removed (R13). |
 | M23 | `recover.rs:470-547` (`520`) | `resume_branch_from_recover` | |
 | M24 | `recover.rs:446,454,742,933,961,992,1051` | Recover-ref listing, trust check, uniqueness, ancestry, pruning, deletion | |
-| M25 | `quorum/src/serve/mod.rs:6493,6516` | Planner view: `rev-parse HEAD` and `git archive` in `repo_dir` | Reads the operator checkout's `HEAD`. Becomes the frozen SHA in the private repository. **Current exposure on `develop`:** `archive` applies the tree's own attributes, so `export-subst` with `$Format:%G?$` on a commit with a forged `gpgsig` header makes the daemon run the signature program, either `gpg` from `PATH` or a `gpg.program` in `repo_dir`'s agent-writable config (both verified with git 2.53). Fixed by `--worktree-attributes` and `gpg.program=false` in the early hardening. |
+| M25 | `quorum/src/serve/mod.rs:6493,6516` | Planner view: `rev-parse HEAD` and `git archive` in `repo_dir` | Reads the operator checkout's `HEAD`. Becomes the frozen SHA in the private repository. **Current exposure on `develop`:** `archive` applies the tree's own attributes, so `export-subst` with `$Format:%G?$` on a commit with a forged `gpgsig` header makes the daemon run the signature program, either `gpg` from `PATH` or a `gpg.program` in `repo_dir`'s agent-writable config (both verified with git 2.53). Repository config can also name a `filter.<driver>.smudge` program that `archive` runs for any path the agent-writable `info/attributes` marks, and `--worktree-attributes` alone does not stop it (verified with git 2.53). **Fixed ahead of the early hardening:** `archive` runs with `--git-dir` set to a daemon-owned temporary directory and `GIT_OBJECT_DIRECTORY` set to `repo_dir`'s object store. It reads no system, global, or repository config, uses `core.attributesFile=/dev/null` and `--worktree-attributes` (so no attribute file and none of the tree's attributes apply), and sets the signature programs to `false`. |
 | M26 | `quorum/src/serve/mod.rs:6752` | `repository_head_sha` (frozen-base capture from `repo_dir` `HEAD`) | As M25. |
 | M27 | `quorum/src/serve/mod.rs:24585-24625` | Sync-branch cleanup: `ls-remote origin`, `push origin --delete` in `repo_dir` | |
 | M28 | `quorum-core/src/decomposition.rs:130-200` (via `quorum/src/serve/planner.rs:286-301`, from `mod.rs:9329` and `agent_endpoint.rs:1201`) | Planner deliverable paths canonicalized against `repo_dir`'s working tree | Stale in clone mode and agent-writable in linked mode. Becomes an `ls-tree` walk of the frozen tree. |

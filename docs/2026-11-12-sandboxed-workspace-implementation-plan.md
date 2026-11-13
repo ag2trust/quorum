@@ -165,8 +165,9 @@ command-line set in both modes:
 
 - an empty `core.hooksPath`, the protocol allowlist, signature programs set to `false`, and
   `GIT_ATTR_SOURCE` for commands that do not check out files;
-- `--worktree-attributes` on the planner view's `archive` in `repo_dir` (audit row M25, a
-  current exposure on `develop`);
+- the planner view's `archive` already isolated (audit row M25, fixed ahead of this slice:
+  a daemon-owned git directory over `repo_dir`'s object store, no repository config or
+  attributes, signature programs set to `false`);
 - the container image moved to a current git (`Dockerfile:32` pins 2.39, which predates
   `GIT_ATTR_SOURCE`), with the image smoke test asserting that its git is at least the floor;
 - a push URL from `remote_url` (or derived once at startup), replacing R1, with the rewrite

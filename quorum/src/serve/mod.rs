@@ -6507,6 +6507,49 @@ async fn frozen_planner_view_with_options(
             )));
         }
 
+        let mut objects_command =
+            tokio::process::Command::from(quorum_core::git::git_command(&git_bin));
+        objects_command
+            .args([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+            ])
+            .current_dir(&repo);
+        let objects = run_publication_gh_command_with_limit(
+            objects_command,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            4096,
+            "planner object directory lookup",
+        )
+        .await
+        .map_err(QuorumError::Io)?;
+        let objects = String::from_utf8(objects.stdout)
+            .ok()
+            .filter(|_| objects.status.success())
+            .and_then(|stdout| stdout.strip_suffix('\n').map(PathBuf::from))
+            .filter(|path| path.is_absolute())
+            .ok_or_else(|| QuorumError::Io("planner object directory lookup failed".into()))?;
+
+        // Archive from a daemon-owned git directory that borrows only the
+        // object store. The repository's config, info/attributes, and refs are
+        // writable by agents in linked mode: through them `git archive` would
+        // run filter drivers and signature programs as the daemon (audit row
+        // M25). In this directory no repository config is read, and
+        // --worktree-attributes with no work tree also skips the archived
+        // tree's own attributes (export-subst, export-ignore, filters).
+        let isolated = tempfile::Builder::new()
+            .prefix("quorum-planner-git-")
+            .tempdir()
+            .map_err(|error| QuorumError::Io(format!("planner view failed: {error}")))?;
+        for directory in ["objects", "refs"] {
+            std::fs::create_dir(isolated.path().join(directory))
+                .map_err(|error| QuorumError::Io(format!("planner view failed: {error}")))?;
+        }
+        std::fs::write(isolated.path().join("HEAD"), "ref: refs/heads/main\n")
+            .map_err(|error| QuorumError::Io(format!("planner view failed: {error}")))?;
+
         let view = tempfile::Builder::new()
             .prefix("quorum-planner-")
             .tempdir()
@@ -6515,8 +6558,32 @@ async fn frozen_planner_view_with_options(
         let mut archive_command =
             tokio::process::Command::from(quorum_core::git::git_command(&git_bin));
         archive_command
-            .args(["archive", "--format=tar", &frozen_sha])
-            .current_dir(&repo)
+            .arg("--git-dir")
+            .arg(isolated.path())
+            .args([
+                "-c",
+                "core.attributesFile=/dev/null",
+                "-c",
+                "gpg.program=false",
+                "-c",
+                "gpg.openpgp.program=false",
+                "-c",
+                "gpg.ssh.program=false",
+                "-c",
+                "gpg.x509.program=false",
+                "archive",
+                "--worktree-attributes",
+                "--format=tar",
+                &frozen_sha,
+            ])
+            .env("GIT_OBJECT_DIRECTORY", &objects)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .current_dir(isolated.path())
             .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -65097,6 +65164,75 @@ exec /bin/cat '{stdout}'
 
         let not_a_repo = tempfile::tempdir().unwrap();
         assert!(repository_head_sha(not_a_repo.path()).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_view_ignores_repository_attributes_and_filter_drivers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?} failed", args);
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(
+            repo.path().join(".gitattributes"),
+            "subst.txt export-subst\nignored.txt export-ignore\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join("subst.txt"), "$Format:%H %G?$\n").unwrap();
+        std::fs::write(repo.path().join("ignored.txt"), "kept").unwrap();
+        std::fs::write(repo.path().join("state.txt"), "frozen").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "frozen"]);
+        let frozen = git(&["rev-parse", "HEAD"]);
+
+        // Repository config and info/attributes are writable by agents in
+        // linked mode. Neither may make the daemon run a program.
+        let tools = tempfile::tempdir().unwrap();
+        let marker = tools.path().join("ran");
+        let program = tools.path().join("program");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\ntouch '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program = program.to_str().unwrap();
+        git(&["config", "filter.evil.smudge", program]);
+        git(&["config", "gpg.program", program]);
+        git(&["config", "gpg.ssh.program", program]);
+        let info = repo.path().join(".git/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("attributes"), "* filter=evil\n").unwrap();
+
+        let view = frozen_planner_view(repo.path(), &frozen).await.unwrap();
+        assert!(
+            !marker.exists(),
+            "the planner archive ran a repository program"
+        );
+        assert_eq!(
+            std::fs::read_to_string(view.path().join("subst.txt")).unwrap(),
+            "$Format:%H %G?$\n",
+            "the planner archive applied export-subst"
+        );
+        assert_eq!(
+            std::fs::read_to_string(view.path().join("ignored.txt")).unwrap(),
+            "kept"
+        );
+        assert_eq!(
+            std::fs::read_to_string(view.path().join("state.txt")).unwrap(),
+            "frozen"
+        );
     }
 
     #[tokio::test]
