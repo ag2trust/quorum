@@ -65339,7 +65339,11 @@ exec /bin/cat '{stdout}'
         git(&["config", "user.email", "test@example.com"]);
         git(&["config", "user.name", "test"]);
         let placeholder = "sig=$Format:%G?$ head=$Format:%H$\n";
-        std::fs::write(repo.path().join(".gitattributes"), "subst.txt export-subst\n").unwrap();
+        std::fs::write(
+            repo.path().join(".gitattributes"),
+            "subst.txt export-subst\n",
+        )
+        .unwrap();
         std::fs::write(repo.path().join("subst.txt"), placeholder).unwrap();
         git(&["add", ".gitattributes", "subst.txt"]);
         git(&["commit", "-qm", "export-subst"]);
