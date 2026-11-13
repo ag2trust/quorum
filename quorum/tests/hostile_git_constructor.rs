@@ -376,10 +376,7 @@ fn sanitized_attribute_tree_drops_states_hidden_by_invalid_quoting() {
     );
     assert_eq!(
         check(attrs.sha()),
-        [
-            "\"\\\"uq\": merge: set",
-            "\"\\\"u08\": merge: union",
-        ]
+        ["\"\\\"uq\": merge: set", "\"\\\"u08\": merge: union",]
     );
     fixture.tripwire.assert_empty();
 }
