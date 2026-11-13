@@ -30,6 +30,11 @@ fi
   printf 'forced cargo test diagnostic\n' >&2
   exit 17
 }
+# A raw `cargo test --message-format=json` stream replaces the built-in one.
+if [ -n "${PREFLIGHT_CARGO_TEST_JSONL:-}" ] && [ "$1" = test ]; then
+  cat "$PREFLIGHT_CARGO_TEST_JSONL"
+  exit 0
+fi
 if [ "${PREFLIGHT_CARGO_TEST_BINARIES:-0}" = 1 ] && [ "$1" = test ]; then
   printf '{"reason":"compiler-artifact","package_id":"path+file:///fixture#fixture@0.1.0","manifest_path":"/fixture/Cargo.toml","target":{"name":"first_binary","kind":["test"]},"profile":{"test":true},"executable":"%s","fresh":false}\n' \
     "$PREFLIGHT_FIRST_TEST_BINARY"
@@ -782,6 +787,132 @@ if PREFLIGHT_TEST_JOBS=invalid PATH="$BIN:$PATH" \
   exit 1
 fi
 grep -q 'invalid int value' "$TMP/invalid-test-jobs-env.out"
+
+# Directly executed test binaries get the runtime env `cargo test` provides:
+# integration tests and benches see CARGO_BIN_EXE_<name> for their own
+# package's bins; unit tests and other packages' tests do not. Since Cargo's
+# build-dir layout separated test executables from bins, assert_cmd's
+# cargo_bin() can only find a bin through this variable.
+BIN_ENV="$TMP/bin-env"
+mkdir -p "$BIN_ENV"
+printf 'app v1\n' >"$BIN_ENV/app"
+printf 'tool v1\n' >"$BIN_ENV/app_tool"
+printf 'helper v1\n' >"$BIN_ENV/other-helper"
+cat >"$BIN_ENV/env-test" <<'EOF'
+#!/bin/sh
+# Each fixture test binary is a copy of this script; its name selects the
+# environment it must (not) see.
+name=$(basename "$0")
+printf '%s\n' "$name" >>"$PREFLIGHT_TEST_LAUNCH_LOG"
+case "$name" in
+  app-it|app-bench)
+    [ "${CARGO_BIN_EXE_app:-}" = "$BIN_ENV_DIR/app" ] || exit 31
+    [ "${CARGO_BIN_EXE_app_tool:-}" = "$BIN_ENV_DIR/app_tool" ] || exit 32
+    [ -z "${CARGO_BIN_EXE_other_helper:-}" ] || exit 33
+    ;;
+  app-lib|app-bin-unit)
+    [ -z "${CARGO_BIN_EXE_app:-}" ] || exit 34
+    ;;
+  other-it)
+    [ "${CARGO_BIN_EXE_other_helper:-}" = "$BIN_ENV_DIR/other-helper" ] \
+      || exit 35
+    [ -z "${CARGO_BIN_EXE_app:-}" ] || exit 36
+    ;;
+  *) exit 37 ;;
+esac
+exit 0
+EOF
+for name in app-it app-bench app-lib app-bin-unit other-it; do
+  # Distinct contents keep every test binary's executable hash distinct.
+  { cat "$BIN_ENV/env-test"; printf '# %s\n' "$name"; } >"$BIN_ENV/$name"
+  chmod +x "$BIN_ENV/$name"
+done
+APP_ID='path+file:///fixture/app#app@0.1.0'
+OTHER_ID='path+file:///fixture/other#other@0.1.0'
+artifact() {
+  printf '{"reason":"compiler-artifact","package_id":"%s","manifest_path":"/fixture/%s/Cargo.toml","target":{"name":"%s","kind":["%s"]},"profile":{"test":%s},"executable":"%s","fresh":false}\n' \
+    "$1" "$2" "$3" "$4" "$5" "$6"
+}
+{
+  # Test units may precede the bins they need in Cargo's stream.
+  artifact "$APP_ID" app app_it test true "$BIN_ENV/app-it"
+  artifact "$APP_ID" app app_bench bench true "$BIN_ENV/app-bench"
+  artifact "$APP_ID" app app lib true "$BIN_ENV/app-lib"
+  artifact "$APP_ID" app app bin true "$BIN_ENV/app-bin-unit"
+  artifact "$APP_ID" app app bin false "$BIN_ENV/app"
+  artifact "$APP_ID" app app_tool bin false "$BIN_ENV/app_tool"
+  artifact "$OTHER_ID" other other_it test true "$BIN_ENV/other-it"
+  artifact "$OTHER_ID" other other_helper bin false "$BIN_ENV/other-helper"
+} >"$BIN_ENV/cargo.jsonl"
+run_bin_env_timing() {
+  : >"$TMP/bin-env-launches.log"
+  BIN_ENV_DIR="$BIN_ENV" PREFLIGHT_CARGO_TEST_JSONL="$BIN_ENV/cargo.jsonl" \
+    PREFLIGHT_TEST_LAUNCH_LOG="$TMP/bin-env-launches.log" \
+    PATH="$BIN:$PATH" scripts/preflight/timing.sh \
+      --skip-fmt --skip-clippy --test-jobs 1 --out "$BIN_ENV/out" \
+      >"$TMP/bin-env-$1.out" 2>&1 || {
+    cat "$TMP/bin-env-$1.out" >&2
+    echo "expected bin-env timing run '$1' to pass" >&2
+    exit 1
+  }
+  sort "$TMP/bin-env-launches.log" >"$TMP/bin-env-launches.sorted"
+}
+run_bin_env_timing first
+printf '%s\n' app-bench app-bin-unit app-it app-lib other-it \
+  >"$TMP/bin-env-launches.expected"
+cmp "$TMP/bin-env-launches.expected" "$TMP/bin-env-launches.sorted"
+python3 - "$BIN_ENV/out/timing.json" "$BIN_ENV" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1]))
+envs = {
+    b["executable"].rsplit("/", 1)[-1]: b.get("cargo_env")
+    for b in data["test_binaries"]
+}
+app_env = {
+    "CARGO_BIN_EXE_app": f"{sys.argv[2]}/app",
+    "CARGO_BIN_EXE_app_tool": f"{sys.argv[2]}/app_tool",
+}
+assert envs == {
+    "app-it": app_env,
+    "app-bench": app_env,
+    "app-lib": None,
+    "app-bin-unit": None,
+    "other-it": {"CARGO_BIN_EXE_other_helper": f"{sys.argv[2]}/other-helper"},
+}, envs
+# Every test unit, unit tests included, keys its result on its package's bins.
+bins = {
+    b["executable"].rsplit("/", 1)[-1]: b.get("package_bins")
+    for b in data["test_binaries"]
+}
+app_bins = {"app": f"{sys.argv[2]}/app", "app_tool": f"{sys.argv[2]}/app_tool"}
+assert bins == {
+    "app-it": app_bins,
+    "app-bench": app_bins,
+    "app-lib": app_bins,
+    "app-bin-unit": app_bins,
+    "other-it": {"other_helper": f"{sys.argv[2]}/other-helper"},
+}, bins
+PY
+
+# Unchanged tests and bins replay the green result without executing.
+run_bin_env_timing cached
+[ ! -s "$TMP/bin-env-launches.log" ]
+grep -q '^test binaries: 0 executed, 5 cached$' "$BIN_ENV/out/summary.txt"
+
+# A changed bin re-runs every test of its package, unit tests included (they
+# may spawn the bin from the target directory), even though their own
+# executables are unchanged; other packages' tests stay cached.
+printf 'app v2\n' >"$BIN_ENV/app"
+run_bin_env_timing changed-bin
+printf '%s\n' app-bench app-bin-unit app-it app-lib \
+  >"$TMP/bin-env-launches.expected"
+cmp "$TMP/bin-env-launches.expected" "$TMP/bin-env-launches.sorted"
+printf 'helper v2\n' >"$BIN_ENV/other-helper"
+run_bin_env_timing changed-other-bin
+printf '%s\n' other-it >"$TMP/bin-env-launches.expected"
+cmp "$TMP/bin-env-launches.expected" "$TMP/bin-env-launches.sorted"
 
 # Test execution stops at the first failed binary boundary. The failed binary
 # has already completed supervisor cleanup, the next binary never launches,
