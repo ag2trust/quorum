@@ -15,8 +15,20 @@ printf 'verify: image architecture linux/amd64\n'
 "$(dirname "$0")/smoke.sh" "$image"
 "$(dirname "$0")/supervise.sh" "$image"
 "$(dirname "$0")/replace.sh" "$image"
-"$(dirname "$0")/replace-abrupt.sh" "$image"
-"$(dirname "$0")/replace-negative.sh" "$image"
+# preflight.sh sets VERIFY_SKIP_REPLACE_SUITES to a skip reason only when the
+# local Docker server is not amd64; left unset (the default, and always the
+# case for required CI) both suites run. CI refuses the variable outright so
+# a skip can never slip past the required container job.
+if [ -z "${VERIFY_SKIP_REPLACE_SUITES:-}" ]; then
+  "$(dirname "$0")/replace-abrupt.sh" "$image"
+  "$(dirname "$0")/replace-negative.sh" "$image"
+elif [ -n "${CI:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ]; then
+  printf 'verify: VERIFY_SKIP_REPLACE_SUITES is not allowed in CI\n' >&2
+  exit 2
+else
+  printf 'verify: SKIPPED replace-abrupt.sh and replace-negative.sh (%s)\n' \
+    "$VERIFY_SKIP_REPLACE_SUITES"
+fi
 "$(dirname "$0")/network-verify.sh" "$image"
 
 if docker build \
