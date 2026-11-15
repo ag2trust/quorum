@@ -89,22 +89,8 @@ same PR and provide concurrency/runtime evidence appropriate to the invariant.
   git worktree add -b <branch> ~/dev/quorum-wt/<branch> origin/main
   ```
 
-- For work explicitly scoped to the hosted Quorum initiative, create the worktree from
-  `origin/develop` and open the PR against `develop`:
-
-  ```bash
-  git worktree add -b <branch> ~/dev/quorum-wt/<branch> origin/develop
-  gh pr create --base develop
-  ```
-
-- `develop` is the integration branch and the daemon's default base: features and regular
-  tasks merge there so incomplete or untested work stays isolated from `main`. Only hotfixes
-  go to `main` directly — urgent fixes that cannot wait for the next develop→main sync, e.g.
-  push/verification gates and operating tooling (`preflight.sh`, git hooks,
-  `dev-install.sh`, `scripts/serve-supervisor.sh`, CI workflow files). Create those as a
-  Quorum task with `--base-branch main` (or cut a direct worktree from `origin/main`), then
-  sync `main` into `develop`. A gate fix merged only to `develop` is inert for main-based
-  pushes until the next sync.
+- `develop` still exists as a dormant branch; do not delete it and do not target it with
+  new work.
 - Never branch from another feature branch. Do not rebase solely to become current;
   up-to-date-before-merge is disabled, while a push dismisses prior approvals.
 - Commit, push, and open PRs with the default `ag2trust-dev` identity. Never override the
