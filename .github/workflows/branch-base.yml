@@ -1,0 +1,49 @@
+name: branch-base
+
+# The pre-push hook's branch-base gate (preflight.sh gate 1), enforced on pull
+# requests so it still applies to pushes made without hooks (--no-verify).
+# scripts/ci-branch-base.sh reproduces the hook's ref tuple:
+# `opened`/`reopened` checks the whole branch like a new-branch push;
+# `synchronize` checks only that push, continuing from the previous PR head
+# (`github.event.before`) like the daemon's continuation publication. A PR
+# into main must also be a hotfix from main or a develop -> main sync.
+#
+# Known gaps (accepted for now; see the design spec's guards list):
+# - Per-push and stateless. A failed push followed by another push is judged
+#   only on the newer push, so the check can turn green while the earlier
+#   push's commits remain in the PR.
+# - A reopened PR, or a head rewritten so the previous head is no longer an
+#   ancestor (force push, rebase update), falls back to a whole-branch check,
+#   which can fail a legitimate remediation PR that mixes sessions.
+# - Retargeting a PR (base change) does not re-run it; close and reopen the PR
+#   to re-check. An `edited` trigger would create a skipped `branch-base` run
+#   for every title/body edit, and a skipped check reads as passing.
+# - The PR controls its own gate: `pull_request` runs the PR's copy of this
+#   workflow, scripts/ci-branch-base.sh, and preflight.sh. This catches
+#   mistakes, not attacks; changes to .github/ and preflight.sh are reviewed.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+# Deliberately no `concurrency:` group (ci.yml cancels in progress). Each run
+# judges one push, so a cancelled or superseded run would leave that push's
+# commits unchecked.
+
+jobs:
+  branch-base:
+    name: branch-base
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check PR branch base
+        env:
+          PR_BASE: ${{ github.base_ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BEFORE_SHA: ${{ github.event.action == 'synchronize' && github.event.before || '' }}
+        run: scripts/ci-branch-base.sh

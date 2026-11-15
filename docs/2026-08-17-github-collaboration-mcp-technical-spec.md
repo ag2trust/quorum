@@ -49,8 +49,8 @@ credentials or allowing comment text to transition lifecycle.
 - Treating GitHub comment or review prose as a lifecycle signal.
 - Changing R1/R2 selection, exact-SHA attestation, rework limits, formal review, CI, or merge
   policy.
-- Resolving Hosted's final GitHub actor/ruleset design. The one-App author/self-approval question
-  remains a separate permission and branch-policy audit.
+- Resolving a managed deployment's final GitHub actor/ruleset design. The one-App
+  author/self-approval question remains a separate permission and branch-policy audit.
 - Claiming physical credential isolation for an unrestricted local run sharing the operator's OS
   identity and configuration.
 
@@ -76,9 +76,10 @@ container does not need the repository database merely to signal its existing li
 credentialed Repository Service and Quorum database remain across a process/container boundary
 inaccessible to the managed runner. If the daemon and runner share an OS boundary from which the
 runner can read daemon environment, files, database, or credentialed sockets, the deployment MUST
-NOT claim physical GitHub credential isolation. Hosted supplies the credentialed adapter or broker
-without making public Quorum aware of accounts, sessions, KMS, installation identity, or
-control-plane state.
+NOT claim physical GitHub credential isolation. In a managed deployment the deployment operator
+supplies the credentialed adapter or broker without making Quorum aware of the deployment's users
+and accounts, sessions, key management, GitHub App installation identity, or control-plane
+state.
 
 ## Authority model
 
@@ -149,7 +150,9 @@ from a cached old turn from being reinterpreted under a new attempt that happens
 live capability. Public CLI requests are not attempt-scoped and use the compatibility path below.
 
 The initial endpoint is a local framed-JSON IPC channel, implemented as an owner-only Unix-domain
-socket on supported runtimes. It does not listen on TCP. Each bounded request carries the run
+socket on supported runtimes. The daemon endpoint itself does not listen on TCP; the separate
+`quorum agent-mcp --listen` adapter described below is the only TCP listener in front of it,
+and it is a client of this socket. Each bounded request carries the run
 capability and one closed operation; responses use closed bounded schemas. The daemon exposes
 the existing `submit`/`react` signals, the role-scoped MCP operations, and the established public
 CLI compatibility family through this channel—no SQL, daemon filesystem path, arbitrary command,
@@ -186,6 +189,45 @@ child retains this same MCP process and connection across its stdin-fed turns; p
 respawn per turn receive a new process. The endpoint is not a Repository Service or arbitrary
 database channel. Stdout is protocol-only; bounded diagnostics go to stderr and never include
 request bodies, responses, or capabilities.
+
+`quorum agent-mcp --listen <SOCKETADDR>` runs the same adapter as a separate Streamable HTTP
+server at `/mcp` instead of stdio. It is not part of the daemon and nothing launches it
+automatically: an operator starts it with `QUORUM_AGENT_ENDPOINT` and `QUORUM_REPO`, and it
+reaches the daemon only through the endpoint socket. Its limits are:
+
+- Loopback addresses only, plain HTTP. A non-loopback address is a usage error, and a request
+  whose `Host` is not a loopback name is refused.
+- The run id is the only secret on this transport. A loopback port is reachable by every local
+  user and process, not only the run it was started for, and plain HTTP gives the bearer no
+  confidentiality on the host. Anyone on the machine who learns a live run id can act as that
+  run for as long as it stays live.
+- The run capability is the `Authorization: Bearer <run id>` header of each request. A missing or
+  malformed header is answered `401` before MCP runs. The capability is read per request, never
+  stored, and the daemon endpoint authorizes every call from it exactly as it does over stdio.
+- Stateless: no sessions, no server-initiated stream, and therefore no
+  `notifications/tools/list_changed`. A client learns a phase change by listing tools again.
+- In addition to the stdio inventory it advertises signalling tools by run phase: `submit_work`,
+  `react`, and `task_note` to a worker; `submit_review`, `task_note`, and `alert_owner` to a
+  reviewer. They proxy the endpoint's `Submit`, `React`, `AppendNote`, and `AlertOwner` operations.
+  `AlertOwner` writes one critical feed message to the owner as the reviewer capability's agent.
+  None is idempotent: each accepted call writes another row. `alert_owner`, like `quorum post`,
+  has no rate or count bound: a live reviewer capability can post any number of alerts, each up
+  to 8192 bytes.
+- Bounded resources: at most 8 connections are served at once (further ones wait in the listen
+  backlog) and at most 8 daemon endpoint exchanges are in flight, against the endpoint's 32
+  connection slots. A request head must arrive within 10 seconds on a new or idle connection (so
+  an idle keep-alive connection is closed after 10 seconds), a request must complete within
+  15 seconds (`408` otherwise), and a body is at most 256 KiB (`413` otherwise). These bounds are
+  enforced before the bearer is checked against the daemon, so a local process without any valid
+  run id can still occupy all 8 connections and delay other callers; it cannot hold them past
+  those time bounds without reconnecting. After SIGINT or SIGTERM open connections get 5 seconds
+  to finish and are then dropped; a signal already sent to the daemon is not undone.
+- The adapter keeps no per-request state between requests. The MCP library's per-service tool
+  schema cache, which never evicts, is confined to one request by building a fresh service for
+  each one.
+- The role-scoped GitHub operations remain unimplemented on this transport as on stdio.
+- Worker and reviewer prompts still instruct the shell commands, and managed launches still
+  inject the stdio server; this transport changes neither.
 
 The logical MCP server name is `quorum`, yielding client-visible names such as
 `mcp__quorum__pull_request_read`. The daemon injects only this per-run server into ordinary worker
@@ -584,9 +626,10 @@ pending result rather than blocking the agent or creating a second request.
 
 `publisher_scope` is an opaque, stable Repository Service namespace: credentials that GitHub
 treats as the same pending-review actor MUST resolve to the same scope. It is daemon-derived,
-never agent input, and contains no Hosted account, installation, session, or KMS identity. This
-contract does not choose the eventual GitHub App actor; it only requires an adapter to preserve
-the namespace equivalence needed for safe serialization and cleanup.
+never agent input, and contains no deployment user or account, GitHub App installation,
+session, or key-management identity. This contract does not choose the eventual GitHub App
+actor; it only requires an adapter to preserve the namespace equivalence needed for safe
+serialization and cleanup.
 
 Every reviewer attempt gets an unguessable daemon-owned `review_owner_marker` with at least 128
 bits of randomness that is not returned to the agent. The `create` operation initializes the
@@ -736,10 +779,11 @@ adapter may use the installed `gh` binary and its existing daemon-side authentic
 must cross stdin/JSON rather than argv. Command execution reuses the existing 30-second timeout,
 kill/reap behavior, and 1 MiB stdout/stderr caps.
 
-The interface is provider-neutral at Quorum's boundary. A Hosted adapter may send the same typed
-operation to a trusted credential broker that mints exact-repository, minimum-permission,
-short-lived GitHub App installation authority. The public runtime never receives Hosted user,
-installation, KMS, or session identity.
+The interface is provider-neutral at Quorum's boundary. In a managed deployment, an adapter
+supplied by the deployment operator may send the same typed operation to a trusted credential
+broker that mints exact-repository, minimum-permission, short-lived GitHub App installation
+authority. The Quorum runtime never receives the deployment's user or account, GitHub App
+installation, key-management, or session identity.
 
 Every mutation response uses a closed disposition: confirmed effect with exact remote evidence,
 definitely unsent with pre-handoff transport proof, or ambiguous. An adapter may additionally
@@ -952,15 +996,16 @@ Every implementation task is deliberately small or medium and independently revi
     runtime inputs contain no GitHub credential or database and remote writes require the
     daemon/broker. This slice adds no endpoint operation or per-command proxy behavior.
 
-Slices 1 and 2 are foundations. Slice 3 depends on both. Slice 4 depends on 3. Slice 5 depends on
-4. Slice 6 depends on 1 and 2; slice 7 depends on 1; and both can proceed independently after
-their prerequisites. Slice 8 depends on 1 and may finish before provider or prompt migration.
-Slice 9 depends on 1–3. Slice 10 depends on 3–9. The graph is acyclic: public-command parity is
-delivered by slice 8 before slice 10 consumes it. No task may broaden itself into the outside MCP
-or Hosted control-plane implementation. Parent terminalization remains in slice 1, generic
-retention/sweep mechanics and their race coverage remain in slice 2, and review-sequence retention
-coverage remains in slice 4; this ownership correction adds no slice or dependency edge, so all
-ten tasks remain independently reviewable and S/M-sized.
+Slices 1 and 2 are foundations. Slice 3 depends on both. Slice 4 depends on 3. Slice 5 depends
+on 4. Slice 6 depends on 1 and 2; slice 7 depends on 1; and both can proceed independently
+after their prerequisites. Slice 8 depends on 1 and may finish before provider or prompt
+migration. Slice 9 depends on 1–3. Slice 10 depends on 3–9. The graph is acyclic:
+public-command parity is delivered by slice 8 before slice 10 consumes it. No task may broaden
+itself into the outside MCP or a deployment operator's control-plane implementation. Parent
+terminalization remains in slice 1, generic retention/sweep mechanics and their race coverage
+remain in slice 2, and review-sequence retention coverage remains in slice 4; this ownership
+correction adds no slice or dependency edge, so all ten tasks remain independently reviewable
+and S/M-sized.
 
 ## Rollout
 

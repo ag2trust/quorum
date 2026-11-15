@@ -47,6 +47,7 @@ OPERATOR
   quorum serve --help             Start the manager and inspect provider/config flags.
   quorum status [--json]          Inspect daemon and queue health.
   quorum web                      Open the loopback-only dashboard.
+  quorum orchestrator-mcp --help  Serve coordinator tools to an outside agent over HTTP MCP.
   quorum task-list --brief        List the queue without task bodies.
   quorum task-get --task-id <N>   Read one task and its notes.
   quorum log --refs task#N        Read lifecycle events for a task.

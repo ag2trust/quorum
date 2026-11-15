@@ -93,19 +93,42 @@ pub fn post(
     if !KINDS.contains(&kind) {
         return Err(QuorumError::Usage(format!("invalid kind: {kind}")));
     }
+    let tx = begin_immediate(conn)?;
+    let result = post_tx(&tx, author, kind, topic, body, refs, recipient, ttl, now)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+/// [`post`] inside a caller-owned `BEGIN IMMEDIATE` transaction: the same
+/// presence bump, sweep, and insert, committed or rolled back by the caller.
+#[allow(clippy::too_many_arguments)]
+pub fn post_tx(
+    tx: &Connection,
+    author: &str,
+    kind: &str,
+    topic: Option<&str>,
+    body: &str,
+    refs: Option<&str>,
+    recipient: Option<&str>,
+    ttl: i64,
+    now: i64,
+) -> Result<PostResult> {
+    if !KINDS.contains(&kind) {
+        return Err(QuorumError::Usage(format!("invalid kind: {kind}")));
+    }
     let topic = topic.unwrap_or(DEFAULT_TOPIC);
     let expires_at = now + ttl;
-    let tx = begin_immediate(conn)?;
-    crate::agents::touch(&tx, author, now)?;
-    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    crate::agents::touch(tx, author, now)?;
+    crate::sweep::sweep_on_write(tx, now, SWEEP_LIMIT)?;
     tx.execute(
         "INSERT INTO messages(ts, author, topic, kind, body, refs, expires_at, recipient)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![now, author, topic, kind, body, refs, expires_at, recipient],
     )?;
-    let seq = tx.last_insert_rowid();
-    tx.commit()?;
-    Ok(PostResult { seq, expires_at })
+    Ok(PostResult {
+        seq: tx.last_insert_rowid(),
+        expires_at,
+    })
 }
 
 /// Post an owner alert unless an unexpired one already carries `refs`.

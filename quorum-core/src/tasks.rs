@@ -7266,6 +7266,21 @@ pub fn close_manual(
 
 // ── list / get / notes ────────────────────────────────────────────────────────
 
+/// The `WHERE` clause shared by every task listing, over named parameters.
+fn list_filter_sql(status: bool, label: bool, assignee: bool) -> String {
+    let mut sql = String::from(" WHERE 1=1");
+    if status {
+        sql.push_str(" AND status=:status");
+    }
+    if label {
+        sql.push_str(" AND labels LIKE :label");
+    }
+    if assignee {
+        sql.push_str(" AND assignee=:assignee");
+    }
+    sql
+}
+
 pub fn list(
     conn: &Connection,
     status: Option<&str>,
@@ -7273,16 +7288,12 @@ pub fn list(
     assignee: Option<&str>,
 ) -> Result<Vec<Task>> {
     let label_pat = label.map(|l| format!("%\"{l}\"%"));
-    let mut sql = format!("SELECT {COLS} FROM tasks WHERE 1=1");
-    if status.is_some() {
-        sql.push_str(" AND status=:status");
-    }
-    if label_pat.is_some() {
-        sql.push_str(" AND labels LIKE :label");
-    }
-    if assignee.is_some() {
-        sql.push_str(" AND assignee=:assignee");
-    }
+    let mut sql = format!("SELECT {COLS} FROM tasks");
+    sql.push_str(&list_filter_sql(
+        status.is_some(),
+        label_pat.is_some(),
+        assignee.is_some(),
+    ));
     sql.push_str(" ORDER BY priority DESC, id ASC");
 
     let mut stmt = conn.prepare(&sql)?;
@@ -7306,6 +7317,69 @@ pub fn list(
         t.ready = compute_ready(conn, &t.depends_on)?;
     }
     Ok(tasks)
+}
+
+/// One page of [`list`] as summary rows, in the same order and under the same
+/// filters, plus the number of tasks the filters match. Task bodies are never
+/// read. Both statements run in one read transaction so the page and the
+/// count describe the same snapshot; successive pages do not.
+pub fn list_brief_page(
+    conn: &Connection,
+    status: Option<&str>,
+    label: Option<&str>,
+    assignee: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<(Vec<TaskBrief>, i64)> {
+    let label_pat = label.map(|l| format!("%\"{l}\"%"));
+    let filter = list_filter_sql(status.is_some(), label_pat.is_some(), assignee.is_some());
+    let mut params: Vec<(&str, &dyn rusqlite::ToSql)> = Vec::new();
+    if let Some(s) = &status {
+        params.push((":status", s));
+    }
+    if let Some(p) = &label_pat {
+        params.push((":label", p));
+    }
+    if let Some(a) = &assignee {
+        params.push((":assignee", a));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let total: i64 = tx.query_row(
+        &format!("SELECT COUNT(*) FROM tasks{filter}"),
+        &params[..],
+        |row| row.get(0),
+    )?;
+    params.push((":limit", &limit));
+    params.push((":offset", &offset));
+    let mut rows: Vec<TaskBrief> = tx
+        .prepare(&format!(
+            "SELECT id, title, labels, priority, status, assignee, depends_on, author, \
+                    reviewer, rework_round, recovery_attempts, continue_pr, target_branch \
+             FROM tasks{filter} ORDER BY priority DESC, id ASC LIMIT :limit OFFSET :offset"
+        ))?
+        .query_map(&params[..], |r| {
+            Ok(TaskBrief {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                labels: r.get(2)?,
+                priority: r.get(3)?,
+                status: r.get(4)?,
+                assignee: r.get(5)?,
+                ready: false,
+                depends_on: r.get(6)?,
+                author: r.get(7)?,
+                reviewer: r.get(8)?,
+                rework_round: r.get(9)?,
+                recovery_attempts: r.get(10)?,
+                continue_pr: r.get(11)?,
+                target_branch: r.get(12)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for row in &mut rows {
+        row.ready = compute_ready(&tx, &row.depends_on)?;
+    }
+    Ok((rows, total))
 }
 
 /// List open implementation candidates whose dependencies and decomposition

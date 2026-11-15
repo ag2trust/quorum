@@ -2314,3 +2314,37 @@ fn task_update_edit_refusals_name_their_cause_and_exit_1() {
         .stderr(predicates::str::contains("edit limit"))
         .stderr(predicates::str::contains("not the current holder").not());
 }
+
+/// `task-create` reads the repository's serve configuration even when
+/// `--base-branch` makes its default unnecessary, so a malformed file fails
+/// intake loudly (exit 2) rather than only when the default is needed.
+#[test]
+fn task_create_refuses_a_malformed_serve_config_even_with_a_base_branch() {
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("serve/test__repo.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "base_branch = [broken\n").unwrap();
+    for extra in [&[][..], &["--base-branch", "main"][..]] {
+        quorum(home.path())
+            .args(["task-create", "--created-by", "owner", "--title", "t"])
+            .args(extra)
+            .assert()
+            .code(2)
+            .stderr(predicates::str::contains("bad serve config"));
+    }
+    std::fs::write(&config, "base_branch = \"develop\"\n").unwrap();
+    quorum(home.path())
+        .args(["task-create", "--created-by", "owner", "--title", "t"])
+        .args(["--base-branch", "main"])
+        .assert()
+        .success();
+    let db = quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db")).unwrap();
+    let rows: Vec<String> = db
+        .prepare("SELECT target_branch FROM tasks")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows, vec!["main".to_string()]);
+}
