@@ -275,17 +275,17 @@ at a time.
 `base_branch` for managed task and PR work: it supplies the worktree base and
 the PR validation and merge target. Set `self_update_branch` for Quorum's own
 build-staleness poll and supervised rebuild source. For example, a repository
-can send task PRs to `develop` while rebuilding its daemon from `main`:
+can send task PRs to `release` while rebuilding its daemon from `main`:
 
 ```toml
-base_branch = "develop"
+base_branch = "release"
 self_update_branch = "main"
 ```
 
 For compatibility, if neither `--self-update-branch` nor
 `self_update_branch` in the serve config is set, the self-update branch is the
 fully resolved `base_branch` (including any `--base-branch` override). Thus a
-config that only sets `base_branch = "develop"` also polls `develop` for
+config that only sets `base_branch = "release"` also polls `release` for
 self-updates; set `self_update_branch` explicitly to decouple the two.
 
 When using `scripts/serve-supervisor.sh`, `QUORUM_SELF_UPDATE_BRANCH` selects
