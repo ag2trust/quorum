@@ -11,13 +11,14 @@ on:
   push:
     branches: [main]
 
-permissions:
-  contents: write # required to push the tag and create the Release
+permissions: {}
 
 jobs:
   tag:
     name: auto-tag if version changed
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # required to push the tag
     outputs:
       tag: ${{ steps.check.outputs.tag }}
       created: ${{ steps.check.outputs.created }}
@@ -48,5 +49,13 @@ jobs:
     needs: tag
     if: needs.tag.outputs.created == 'true'
     uses: ./.github/workflows/release.yml
+    # A called workflow cannot exceed its caller's grant: this is the union of
+    # release.yml's job permissions (native Release upload, container publish
+    # with OIDC attestation, container verify/promote).
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
     with:
       tag: ${{ needs.tag.outputs.tag }}
