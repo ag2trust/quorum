@@ -24425,15 +24425,18 @@ async fn verify_dependency_base_before_allocation(
         }
     }
 
-    // A leaf still lacking a merge SHA after PR recovery is satisfied only if
-    // the owner closed it with `quorum task-close`: there is no merge to
-    // verify, so admission falls back to the fetched base head. A recovered
-    // PR merge always takes precedence because it was stamped above and the
-    // reload returned it as `Some`.
+    // A leaf with no merge SHA and no recorded PR is satisfied only if the
+    // owner closed it with `quorum task-close`: there is no merge to verify,
+    // so admission falls back to the fetched base head. A leaf with a PR is
+    // never exempt: a recovered merge was stamped above and reloaded as
+    // `Some`, and an unrecoverable one (e.g. `Unknown` from a transient `gh`
+    // failure on a still-open PR) keeps the fail-closed deferral below.
     let manually_closed = if unresolved_reason.is_none() {
         let candidates = dependencies
             .iter()
-            .filter(|dependency| dependency.merge_commit_sha.is_none())
+            .filter(|dependency| {
+                dependency.merge_commit_sha.is_none() && dependency.pr_number.is_none()
+            })
             .map(|dependency| dependency.task_id)
             .collect::<Vec<_>>();
         if candidates.is_empty() {
@@ -51024,6 +51027,71 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             )
             .unwrap();
         assert_eq!(deferred, 1);
+        drop(conn);
+
+        // Negative: a manually closed dependency whose recorded PR cannot be
+        // resolved (GitHub `Unknown`, no merge on base — e.g. a transient `gh`
+        // failure on a still-open PR) must not fall open to the base head.
+        let (unmerged, unmerged_dependent) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let unmerged = tasks::create(
+                &mut conn,
+                "owner",
+                "closed by hand, PR not merged",
+                None,
+                0,
+                None,
+                Some(r#"{"pr":704}"#),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute("UPDATE tasks SET status='failed' WHERE id=?1", [unmerged])
+                .unwrap();
+            tasks::close_manual(
+                &mut conn,
+                "owner",
+                unmerged,
+                "closed by hand",
+                None,
+                now_unix(),
+            )
+            .unwrap()
+            .unwrap();
+            let (_, task) = make_dependent(&mut conn, &[no_pr, unmerged]);
+            (unmerged, task)
+        };
+        assert!(matches!(
+            verify_dependency_base_before_allocation(
+                &config,
+                &db_path,
+                &WorktreeManager::new(),
+                &worker,
+                &unmerged_dependent,
+                "worker",
+                "main",
+            )
+            .await
+            .unwrap(),
+            DependencyBaseAdmission::Deferred
+        ));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let refs: serde_json::Value = serde_json::from_str(
+            tasks::get(&conn, unmerged_dependent.id)
+                .unwrap()
+                .unwrap()
+                .refs
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            refs[quorum_core::tasks::DEPENDENCY_BASE_WAIT_REASON_REF],
+            format!(
+                "dependency #{unmerged} is done but PR #704 has no recoverable merge commit SHA"
+            )
+        );
     }
 
     #[cfg(unix)]

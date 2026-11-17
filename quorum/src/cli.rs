@@ -714,8 +714,9 @@ pub enum Command {
     /// Sets the task to `done` but emits a `task_closed_manual` event (never
     /// `task_done`), so the audit log distinguishes manual closes from the
     /// reviewed+merged lifecycle. Dependents start from the closed task's
-    /// merged PR commit when one is recoverable, otherwise from the current
-    /// base branch head (a still-open or closed-unmerged PR keeps them parked).
+    /// recovered PR merge commit; a closed task with no PR lets them start
+    /// from the current base branch head. A PR whose merge cannot be
+    /// recovered (still open, closed unmerged, or unavailable) keeps them waiting.
     /// Reason via --reason-stdin or --reason-file.
     TaskClose {
         #[arg(long)]
