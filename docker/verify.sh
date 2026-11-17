@@ -29,6 +29,7 @@ else
   printf 'verify: SKIPPED replace-abrupt.sh and replace-negative.sh (%s)\n' \
     "$VERIFY_SKIP_REPLACE_SUITES"
 fi
+"$(dirname "$0")/health-verify.sh" "$image"
 "$(dirname "$0")/network-verify.sh" "$image"
 
 if docker build \
