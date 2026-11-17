@@ -5386,9 +5386,9 @@ fn latest_worker_reaction_tx(
     })
 }
 
-/// Park a worker-owned task on its explicit `blocked` / `needs-info`
-/// reaction. Shared by turn-oriented runner exits and persistent workers
-/// whose turn ended on such a reaction. The caller commits.
+/// Park a worker-owned task on its explicit reaction: `blocked` /
+/// `needs-info` for turn-oriented runner exits, and additionally `failed` for
+/// live persistent workers. The caller commits.
 fn park_worker_on_reaction_tx(
     tx: &rusqlite::Transaction<'_>,
     id: i64,
@@ -5443,12 +5443,23 @@ pub enum PersistentReactionDisposition {
     NotParked,
 }
 
+/// The explicit reactions that park a live persistent worker's task. A
+/// persistent child stays alive after reacting, so every terminal reaction —
+/// including `failed` — is honored as a park instead of leaving the slot to
+/// the idle reaper, whose `AgentFailed` would respawn a worker on the
+/// unchanged contract. `note` is informational and never parks.
+pub fn is_persistent_park_reaction(state: &str) -> bool {
+    matches!(state, "blocked" | "needs-info" | "failed")
+}
+
 /// A persistent (stream-json) worker ended its turn after an explicit
-/// `blocked` / `needs-info` reaction. Turn-oriented runners reach the same
-/// park through `dispose_dead_turn_runner` when their process exits; a
-/// persistent child stays alive between turns, so without this the reaction
-/// would only be projected and the worker later idle-reaped as `AgentFailed`.
-/// A recorded or pending delivery always wins over the reaction.
+/// `blocked` / `needs-info` / `failed` reaction. Turn-oriented runners reach
+/// the `blocked` / `needs-info` park through `dispose_dead_turn_runner` when
+/// their process exits (their `failed` exit keeps its `AgentFailed`
+/// classification); a persistent child stays alive between turns, so without
+/// this the reaction would only be projected and the worker later
+/// idle-reaped as `AgentFailed`. A recorded or pending delivery always wins
+/// over the reaction.
 pub fn park_persistent_worker_reaction(
     conn: &mut Connection,
     id: i64,
@@ -5488,7 +5499,10 @@ pub fn park_persistent_worker_reaction(
         return Ok(PersistentReactionDisposition::NotParked);
     }
     let reaction = latest_worker_reaction_tx(&tx, agent, id)?;
-    let Some(reason @ ("blocked" | "needs-info")) = reaction.as_deref() else {
+    let Some(reason) = reaction
+        .as_deref()
+        .filter(|state| is_persistent_park_reaction(state))
+    else {
         tx.commit()?;
         return Ok(PersistentReactionDisposition::NotParked);
     };
@@ -8920,6 +8934,10 @@ mod tests {
             ("blocked", false),
             ("needs-info", false),
             ("needs-info", true),
+            // A live persistent worker stays alive after `failed`; parking it
+            // keeps the idle reaper from respawning on the unchanged contract.
+            ("failed", false),
+            ("failed", true),
         ] {
             let (_d, mut c) = open_tmp();
             let id = persistent_worker_task(&mut c);
@@ -8973,7 +8991,7 @@ mod tests {
 
     #[test]
     fn persistent_worker_without_parkable_reaction_is_untouched() {
-        for state in [None, Some("note"), Some("failed")] {
+        for state in [None, Some("note")] {
             let (_d, mut c) = open_tmp();
             let id = persistent_worker_task(&mut c);
             if let Some(state) = state {
@@ -8989,9 +9007,15 @@ mod tests {
 
     #[test]
     fn persistent_worker_pending_delivery_outranks_reaction() {
+        for state in ["blocked", "needs-info", "failed"] {
+            persistent_worker_pending_delivery_outranks(state);
+        }
+    }
+
+    fn persistent_worker_pending_delivery_outranks(state: &str) {
         let (_d, mut c) = open_tmp();
         let id = persistent_worker_task(&mut c);
-        worker_reacts(&mut c, id, "needs-info");
+        worker_reacts(&mut c, id, state);
         crate::mailbox::append(
             &mut c,
             &crate::mailbox::MailboxRow {
@@ -9008,8 +9032,22 @@ mod tests {
         )
         .unwrap();
         let disposition = park_persistent_worker_reaction(&mut c, id, "worker", 1001).unwrap();
-        assert_eq!(disposition, PersistentReactionDisposition::NotParked);
-        assert_eq!(get(&c, id).unwrap().unwrap().status, "working");
+        assert_eq!(
+            disposition,
+            PersistentReactionDisposition::NotParked,
+            "{state}"
+        );
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "working", "{state}");
+    }
+
+    #[test]
+    fn persistent_park_reactions_are_exactly_the_terminal_reactions() {
+        for state in ["blocked", "needs-info", "failed"] {
+            assert!(is_persistent_park_reaction(state), "{state}");
+        }
+        for state in ["note", "", "done", "NEEDS-INFO"] {
+            assert!(!is_persistent_park_reaction(state), "{state}");
+        }
     }
 
     #[test]

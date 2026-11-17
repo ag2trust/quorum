@@ -16650,33 +16650,12 @@ async fn tick(
         }
     }
 
-    // ── Phase 4-react: Park persistent workers that ended on blocked/needs-info ─
+    // ── Phase 4-react: Park persistent workers that ended on blocked/needs-info/failed ─
     // Turn-oriented runners park through `dispose_dead_turn_runner` when their
     // process exits. A persistent Claude child stays alive between turns, so
-    // its explicit reaction is honored here when the turn has ended.
-    let mut parked_workers = Vec::new();
-    for (i, w) in workers.iter_mut().enumerate() {
-        if !slot_is_reaction_park_candidate(w) {
-            continue;
-        }
-        match park_worker_on_reaction(&db_path, w).await {
-            Some(tasks::PersistentReactionDisposition::Parked) => parked_workers.push(i),
-            Some(tasks::PersistentReactionDisposition::NotParked) => {
-                // A delivery or ownership change outranks the reaction; stop
-                // re-checking it every tick until the worker reacts again.
-                w.agent_state = None;
-            }
-            None => {}
-        }
-    }
-    for &i in parked_workers.iter().rev() {
-        let dead = workers.remove(i);
-        log(&format!(
-            "worker {} parked task #{} on its explicit reaction",
-            dead.agent_name, dead.task_id
-        ));
-        cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
-    }
+    // its explicit reaction is honored here when the turn has ended — before
+    // the idle watchdog below can count the slot as a zombie.
+    park_reacted_persistent_workers(config, wt_mgr, name_pool, workers).await;
 
     // ── Phase 4-idle: Kill workers idle too long between turns ─────────
     // A worker that completed a turn (draining=false) but never gets a new
@@ -20936,15 +20915,53 @@ async fn reap_idle_zombie_worker(
     cleanup_slot(config, wt_mgr, name_pool, dead, None, "idle_reaped").await;
 }
 
+/// Phase 4-react: park every live persistent worker whose turn ended on a
+/// parkable reaction and tear its slot down as `parked` — no idle breach, no
+/// `AgentFailed` recovery attempt, and no respawn on the unchanged contract.
+async fn park_reacted_persistent_workers(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+) {
+    let mut parked_workers = Vec::new();
+    for (i, w) in workers.iter_mut().enumerate() {
+        if !slot_is_reaction_park_candidate(w) {
+            continue;
+        }
+        match park_worker_on_reaction(&config.db_path, w).await {
+            Some(tasks::PersistentReactionDisposition::Parked) => parked_workers.push(i),
+            Some(tasks::PersistentReactionDisposition::NotParked) => {
+                // A delivery or ownership change outranks the reaction; stop
+                // re-checking it every tick until the worker reacts again.
+                w.agent_state = None;
+            }
+            None => {}
+        }
+    }
+    for &i in parked_workers.iter().rev() {
+        let dead = workers.remove(i);
+        log(&format!(
+            "worker {} parked task #{} on its explicit reaction",
+            dead.agent_name, dead.task_id
+        ));
+        cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
+    }
+}
+
 /// A live persistent worker whose turn ended after a `blocked` /
-/// `needs-info` reaction.
+/// `needs-info` / `failed` reaction. Must accept exactly the reactions
+/// `tasks::park_persistent_worker_reaction` parks.
 fn slot_is_reaction_park_candidate(slot: &SlotState) -> bool {
     !slot.draining
         && slot.error_turn_count == 0
         && !slot_has_pending_watchdog_outcome(slot)
         && slot.process_kind().turn_mode() == runner::TurnMode::PersistentChild
         && matches!(slot.proc, SlotProcess::Running(_))
-        && matches!(slot.agent_state.as_deref(), Some("blocked" | "needs-info"))
+        && slot
+            .agent_state
+            .as_deref()
+            .is_some_and(tasks::is_persistent_park_reaction)
 }
 
 /// Park the slot's task on the worker's latest durable reaction. `None` means
@@ -57008,6 +57025,284 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(task_event_count(&conn, 1, "task_open"), 1);
         assert_eq!(task_event_count(&conn, 1, "task_reclaimed"), 0);
         assert_eq!(errors_with_source(&conn, "lifecycle"), 0);
+    }
+
+    /// A live persistent worker slot (a long-lived child that stays alive
+    /// after its turn ends) owning task #1 with an open worker run row.
+    async fn live_persistent_worker_slot(db_path: &Path, worktree: PathBuf) -> SlotState {
+        let run_id = {
+            let conn = quorum_core::db::open(db_path).unwrap();
+            conn.execute(
+                "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, spawned_at)
+                 VALUES (1, ?1, 'worker', 'claude-sonnet-5', 'high', ?2)",
+                rusqlite::params![DRAIN_AUTHOR, now_unix()],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let mut slot =
+            drain_test_slot(DRAIN_AUTHOR, 1, worktree, DRAIN_AUTHOR_CAP, Some(run_id)).await;
+        slot.pr = None;
+        // Alive across the whole park/reap pass, like a persistent provider
+        // child between turns. Test-only `from_parts` children have no process
+        // group to kill, so teardown waits for this bounded exit.
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("2")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let short_lived = std::mem::replace(
+            &mut slot.proc,
+            SlotProcess::running(runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+                child,
+                stdin,
+                tokio::io::BufReader::new(stdout),
+            ))),
+        );
+        short_lived.kill_and_reap().await;
+        assert_eq!(
+            slot.process_kind().turn_mode(),
+            runner::TurnMode::PersistentChild
+        );
+        assert!(slot.try_wait().unwrap().is_none(), "the worker stays alive");
+        slot
+    }
+
+    fn append_worker_reaction_row(db_path: &Path, state: &str, reason: &str) -> i64 {
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        mailbox::append(
+            &mut conn,
+            &mailbox::MailboxRow {
+                agent: DRAIN_AUTHOR.into(),
+                kind: mailbox::MailboxKind::TaskUpdate,
+                task_id: Some(1),
+                pr: None,
+                verdict: None,
+                feedback: Some(reason.into()),
+                note: Some(state.into()),
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn assert_parked_without_recovery(db_path: &Path, run_id: i64, state: &str) {
+        let conn = quorum_core::db::open(db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "failed", "{state}: parked, not reopened");
+        assert!(task.assignee.is_none(), "{state}");
+        assert_eq!(
+            task.recovery_attempts, 0,
+            "{state}: a park consumes no recovery attempt"
+        );
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_parked_reason"], state, "{refs}");
+        assert_eq!(task_event_count(&conn, 1, "task_parked"), 1, "{state}");
+        assert_eq!(task_event_count(&conn, 1, "task_open"), 0, "{state}");
+        assert_eq!(task_event_count(&conn, 1, "task_reclaimed"), 0, "{state}");
+        assert_eq!(
+            agent_run_end_reason(&conn, run_id).as_deref(),
+            Some("parked"),
+            "{state}"
+        );
+        let unconsumed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mailbox WHERE kind='task_update' AND consumed_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            unconsumed, 0,
+            "{state}: reactions are consumed with the park"
+        );
+        // Nothing is left for Phase 6 to respawn on the unchanged contract.
+        let open: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE status='open'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(open, 0, "{state}: no open task to respawn");
+        assert_eq!(errors_with_source(&conn, "lifecycle"), 0, "{state}");
+    }
+
+    /// Task #222: a live Claude worker reacted `needs-info` and stayed alive;
+    /// the daemon logged the reaction and 900s later idle-reaped the worker
+    /// as a zombie, spending the recovery budget on respawns. Phase 2
+    /// projects the reaction (in-memory `agent_state`, journal, consumed
+    /// mailbox row); the very next Phase 4-react pass must park the task and
+    /// tear the slot down as `parked` — for every terminal reaction,
+    /// including `failed`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_persistent_worker_reaction_parks_within_one_tick() {
+        for state in ["needs-info", "blocked", "failed"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("persistent-react.db");
+            let worktree = dir.path().join("worker-wt");
+            std::fs::create_dir_all(&worktree).unwrap();
+            create_active_task(&db_path, DRAIN_AUTHOR, "working");
+            issue_test_run(&db_path, DRAIN_AUTHOR, DRAIN_AUTHOR_CAP);
+            let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+            let wt_mgr = WorktreeManager::new();
+            let mut name_pool = Pool::new_generated();
+            let mut slot = live_persistent_worker_slot(&db_path, worktree).await;
+            let run_id = slot.agent_run_id.unwrap();
+
+            // Phase 2 projection of the observed task_update row.
+            let row = append_worker_reaction_row(&db_path, state, "which config should I use?");
+            slot.agent_state = Some(state.into());
+            {
+                let mut conn = quorum_core::db::open(&db_path).unwrap();
+                journal::upsert(&mut conn, &slot_journal_entry(&slot, "worker", "working"))
+                    .unwrap();
+                mailbox::mark_consumed(&mut conn, row).unwrap();
+            }
+            assert!(slot_is_reaction_park_candidate(&slot), "{state}");
+
+            let mut workers = vec![slot];
+            park_reacted_persistent_workers(&config, &wt_mgr, &mut name_pool, &mut workers).await;
+
+            assert!(workers.is_empty(), "{state}: the parked slot is torn down");
+            assert_parked_without_recovery(&db_path, run_id, state);
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let note: String = conn
+                .query_row(
+                    "SELECT body FROM task_notes WHERE agent='daemon' AND body LIKE 'parked:%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(note.contains("which config should I use?"), "{note}");
+        }
+    }
+
+    /// The idle watchdog classifies a pending reaction (committed after the
+    /// tick's mailbox snapshot, so never projected) as a park, not a zombie.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_watchdog_parks_live_worker_with_pending_reaction() {
+        for state in ["needs-info", "failed"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("idle-pending-react.db");
+            let worktree = dir.path().join("worker-wt");
+            std::fs::create_dir_all(&worktree).unwrap();
+            create_active_task(&db_path, DRAIN_AUTHOR, "working");
+            issue_test_run(&db_path, DRAIN_AUTHOR, DRAIN_AUTHOR_CAP);
+            let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+            let wt_mgr = WorktreeManager::new();
+            let mut name_pool = Pool::new_generated();
+            let mut slot = live_persistent_worker_slot(&db_path, worktree).await;
+            let run_id = slot.agent_run_id.unwrap();
+            slot.turn_ended_at =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(901));
+            append_worker_reaction_row(&db_path, state, "which config should I use?");
+            assert!(slot_is_idle_zombie_candidate(&slot, 900, 3600), "{state}");
+
+            reap_idle_zombie_worker(&config, &wt_mgr, &mut name_pool, slot, 901, 900).await;
+
+            assert_parked_without_recovery(&db_path, run_id, state);
+        }
+    }
+
+    /// Negative paths: a live worker with no reaction (or only a `note`) is
+    /// not a park candidate, and the idle watchdog still reaps it as an idle
+    /// zombie with the unchanged `AgentFailed` recovery accounting.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_persistent_worker_without_parkable_reaction_is_still_idle_reaped() {
+        for state in [None, Some("note")] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("idle-no-react.db");
+            let worktree = dir.path().join("worker-wt");
+            std::fs::create_dir_all(&worktree).unwrap();
+            create_active_task(&db_path, DRAIN_AUTHOR, "working");
+            issue_test_run(&db_path, DRAIN_AUTHOR, DRAIN_AUTHOR_CAP);
+            let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+            let wt_mgr = WorktreeManager::new();
+            let mut name_pool = Pool::new_generated();
+            let mut slot = live_persistent_worker_slot(&db_path, worktree).await;
+            let run_id = slot.agent_run_id.unwrap();
+            if let Some(state) = state {
+                append_worker_reaction_row(&db_path, state, "progress");
+                slot.agent_state = Some(state.into());
+            }
+            assert!(!slot_is_reaction_park_candidate(&slot), "{state:?}");
+            let mut workers = vec![slot];
+            park_reacted_persistent_workers(&config, &wt_mgr, &mut name_pool, &mut workers).await;
+            assert_eq!(workers.len(), 1, "{state:?}: nothing to park");
+
+            let mut slot = workers.remove(0);
+            slot.turn_ended_at =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(901));
+            reap_idle_zombie_worker(&config, &wt_mgr, &mut name_pool, slot, 901, 900).await;
+
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let task = tasks::get(&conn, 1).unwrap().unwrap();
+            assert_eq!(task.status, "open", "{state:?}");
+            assert_eq!(task.recovery_attempts, 1, "{state:?}");
+            assert_eq!(task_event_count(&conn, 1, "task_open"), 1, "{state:?}");
+            assert_eq!(task_event_count(&conn, 1, "task_parked"), 0, "{state:?}");
+            assert_eq!(
+                agent_run_end_reason(&conn, run_id).as_deref(),
+                Some("idle_reaped"),
+                "{state:?}"
+            );
+        }
+    }
+
+    /// A recorded/pending delivery still outranks the reaction: the slot is
+    /// retained for mailbox delivery and the in-memory reaction is dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_delivery_outranks_live_persistent_worker_reaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("react-vs-done.db");
+        let worktree = dir.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        create_active_task(&db_path, DRAIN_AUTHOR, "working");
+        issue_test_run(&db_path, DRAIN_AUTHOR, DRAIN_AUTHOR_CAP);
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut slot = live_persistent_worker_slot(&db_path, worktree).await;
+        append_worker_reaction_row(&db_path, "failed", "gave up");
+        slot.agent_state = Some("failed".into());
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: DRAIN_AUTHOR.into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(1),
+                    pr: None,
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+        }
+        let mut workers = vec![slot];
+        park_reacted_persistent_workers(&config, &wt_mgr, &mut name_pool, &mut workers).await;
+
+        assert_eq!(workers.len(), 1, "the delivery keeps its slot");
+        assert!(workers[0].agent_state.is_none());
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "working");
+        assert_eq!(task_event_count(&conn, 1, "task_parked"), 0);
+        drop(conn);
+        workers.remove(0).kill_and_reap().await;
     }
 
     /// Negative path: a live-lease worker torn down at shutdown is still
