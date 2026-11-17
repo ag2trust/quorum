@@ -26,7 +26,26 @@ fn tail_renders_sanitized_live_fake_codex_planner_attempt() {
     let fake_codex = home.path().join("fake-codex");
     std::fs::write(&fake_codex, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
     std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut provider = ProcessCommand::new(&fake_codex).spawn().unwrap();
+    // A sibling test thread may fork while this thread still holds the
+    // script's write fd; the child keeps that fd until exec, so a spawn can
+    // transiently see ETXTBSY. Bounded retry, as in runner.rs.
+    let mut provider = {
+        const EXECUTABLE_BUSY_RETRIES: u8 = 20;
+        let mut attempt = 0;
+        loop {
+            match ProcessCommand::new(&fake_codex).spawn() {
+                Ok(child) => break child,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && attempt < EXECUTABLE_BUSY_RETRIES =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => panic!("fake codex spawn failed: {error}"),
+            }
+        }
+    };
 
     let log_dir = home.path().join("planner-log");
     std::fs::create_dir(&log_dir).unwrap();
