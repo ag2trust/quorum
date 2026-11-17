@@ -51,7 +51,7 @@ fail() {
   for container in $CONTAINERS; do
     if docker inspect "$container" >/dev/null 2>&1; then
       docker logs "$container" >&2 || true
-      docker inspect -f '{{json .State.Health}}' "$container" >&2 || true
+      docker inspect -f '{{json .State}}' "$container" >&2 || true
     fi
   done
   exit 1
@@ -128,10 +128,11 @@ wait_health() {
   container=$1 want=$2 deadline=$3
   start=$(date +%s)
   while :; do
-    state=$(docker inspect -f '{{.State.Health.Status}}' "$container" 2>/dev/null || echo missing)
-    [ "$state" = "$want" ] && return 0
+    # Running first: Docker also reports unhealthy for a stopped container.
     running=$(docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null || echo false)
     [ "$running" = true ] || return 1
+    state=$(docker inspect -f '{{.State.Health.Status}}' "$container" 2>/dev/null || echo missing)
+    [ "$state" = "$want" ] && return 0
     [ "$(elapsed_since "$start")" -lt "$deadline" ] || return 1
     sleep 2
   done
@@ -435,8 +436,18 @@ grep -F "$TITLE_SENTINEL" "$WORK/absent-after/tasks" >/dev/null \
   || fail 'sentinel task missing from the probed DB'
 wait_health "$FAKE" unhealthy "$UNHEALTHY_DEADLINE_SECS" \
   || fail "authority-absent container not Docker-unhealthy within ${UNHEALTHY_DEADLINE_SECS}s"
-health_log "$FAKE" | grep -Fx 'health: not-ready check=authority' >/dev/null \
-  || fail 'Docker health log lacks the fixed authority failure'
+# Docker can report Status=unhealthy before .State.Health.Log is populated
+# (observed in CI: FailingStreak 0, Log []), so wait for the entry in bounds.
+start=$(date +%s)
+until health_log "$FAKE" | grep -Fx 'health: not-ready check=authority' >/dev/null; do
+  [ "$(docker inspect -f '{{.State.Running}}' "$FAKE")" = true ] \
+    || fail 'authority-absent container stopped before its health log was recorded'
+  [ "$(elapsed_since "$start")" -lt "$UNHEALTHY_DEADLINE_SECS" ] \
+    || fail "Docker health log lacks the fixed authority failure after ${UNHEALTHY_DEADLINE_SECS}s"
+  sleep 2
+done
+assert_eq unhealthy "$(docker inspect -f '{{.State.Health.Status}}' "$FAKE")" \
+  'authority-absent Docker health status'
 printf 'health-verify: absent-authority negative and Docker unhealthy passed\n'
 
 # ---------------------------------------------------------------------------
