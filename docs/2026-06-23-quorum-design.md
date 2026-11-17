@@ -846,9 +846,13 @@ feeding a turn, the daemon drains and discards the stale stdout backlog. Submiss
 arrive through the agent endpoint, so a self-continued worker that submits takes the
 normal delivery path.
 
-A persistent worker whose turn ends on an explicit `blocked`/`needs-info` reaction is
-parked through the same tasks-layer park as a turn-oriented runner exit
-(`park_persistent_worker_reaction`). It is not left to the idle reaper.
+A persistent worker whose turn ends on an explicit `blocked`/`needs-info`/`failed`
+reaction is parked through the same tasks-layer park as a turn-oriented runner exit
+(`park_persistent_worker_reaction`), and its slot is torn down as `parked` without an
+`AgentFailed` recovery attempt. It is not left to the idle reaper; the reaper itself
+re-checks for a pending reaction and parks instead of reaping. A turn-oriented runner's
+`failed` exit keeps its `AgentFailed` classification. A pending or recorded delivery
+outranks any reaction.
 
 `max_task_wall_secs` remains an optional hard wall-clock cap for one live worker,
 reviewer, or remediation slot. It spans all turns and continuations handled by that
