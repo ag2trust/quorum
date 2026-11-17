@@ -2943,6 +2943,20 @@ fn resolve_dependency_merge_commits(
     outcome
 }
 
+/// Whether a dependency is `done` because the owner ran `quorum task-close`.
+/// `close_manual` is the only writer of the `manual` completion provenance,
+/// and the column is durable (unlike the swept `task_closed_manual` event), so
+/// dependency-base admission can trust it as the manual-close record when no
+/// merge commit is recoverable.
+pub fn dependency_closed_manually(conn: &Connection, task_id: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tasks
+         WHERE id=?1 AND status='done' AND completion_provenance=?2)",
+        params![task_id, COMPLETION_PROVENANCE_MANUAL],
+        |row| row.get(0),
+    )?)
+}
+
 /// Persist a merge commit recovered for a completed dependency. The PR lookup
 /// happens before this function; this short transaction only joins that
 /// external evidence to the exact still-done task. An existing value wins so
@@ -11227,6 +11241,36 @@ mod tests {
             !events.iter().any(|e| e.kind == "task_done" && e.ts == 1001),
             "must NOT emit task_done"
         );
+    }
+
+    #[test]
+    fn dependency_closed_manually_requires_done_manual_provenance() {
+        let (_d, mut c) = open_tmp();
+        let manual = create(&mut c, "boss", "m", None, 0, None, None, None, None, 1000).unwrap();
+        let merged = create(&mut c, "boss", "d", None, 0, None, None, None, None, 1000).unwrap();
+        let open = create(&mut c, "boss", "o", None, 0, None, None, None, None, 1000).unwrap();
+        assert!(!dependency_closed_manually(&c, manual).unwrap());
+        c.execute("UPDATE tasks SET status='failed' WHERE id=?1", [manual])
+            .unwrap();
+        close_manual(&mut c, "owner", manual, "landed elsewhere", None, 1001).unwrap();
+        c.execute(
+            "UPDATE tasks SET status='done',completion_provenance=?2 WHERE id=?1",
+            params![merged, COMPLETION_PROVENANCE_MERGED],
+        )
+        .unwrap();
+
+        assert!(dependency_closed_manually(&c, manual).unwrap());
+        assert!(!dependency_closed_manually(&c, merged).unwrap());
+        assert!(!dependency_closed_manually(&c, open).unwrap());
+        assert!(!dependency_closed_manually(&c, 9_999).unwrap());
+        // The record must survive event expiry: provenance, not the event, is
+        // the durable manual-close witness.
+        c.execute("DELETE FROM events", []).unwrap();
+        assert!(dependency_closed_manually(&c, manual).unwrap());
+        // A task reopened out of `done` is no longer a satisfied dependency.
+        c.execute("UPDATE tasks SET status='open' WHERE id=?1", [manual])
+            .unwrap();
+        assert!(!dependency_closed_manually(&c, manual).unwrap());
     }
 
     // ── notes ───────────────────────────────────────────────────────────────

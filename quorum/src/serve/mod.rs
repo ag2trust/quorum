@@ -24425,9 +24425,40 @@ async fn verify_dependency_base_before_allocation(
         }
     }
 
-    let missing_record = dependencies
-        .iter()
-        .find(|dependency| dependency.merge_commit_sha.is_none());
+    // A leaf still lacking a merge SHA after PR recovery is satisfied only if
+    // the owner closed it with `quorum task-close`: there is no merge to
+    // verify, so admission falls back to the fetched base head. A recovered
+    // PR merge always takes precedence because it was stamped above and the
+    // reload returned it as `Some`.
+    let manually_closed = if unresolved_reason.is_none() {
+        let candidates = dependencies
+            .iter()
+            .filter(|dependency| dependency.merge_commit_sha.is_none())
+            .map(|dependency| dependency.task_id)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            let db_path = db_path.to_path_buf();
+            tokio::task::spawn_blocking(move || -> Result<std::collections::HashSet<i64>> {
+                let conn = quorum_core::db::open(&db_path)?;
+                let mut closed = std::collections::HashSet::new();
+                for task_id in candidates {
+                    if tasks::dependency_closed_manually(&conn, task_id)? {
+                        closed.insert(task_id);
+                    }
+                }
+                Ok(closed)
+            })
+            .await
+            .map_err(|error| QuorumError::Io(format!("dependency manual-close join: {error}")))??
+        }
+    } else {
+        std::collections::HashSet::new()
+    };
+    let missing_record = dependencies.iter().find(|dependency| {
+        dependency.merge_commit_sha.is_none() && !manually_closed.contains(&dependency.task_id)
+    });
     let reason = if let Some(reason) = unresolved_reason {
         reason
     } else if let Some(dependency) = missing_record {
@@ -50735,6 +50766,264 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             claim_events, 1,
             "the regression must exercise post-claim cleanup"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manually_closed_dependency_without_merge_admits_dependent_on_current_base_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let remote = dir.path().join("remote.git");
+        let worker = dir.path().join("worker");
+        let git = |repo: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-q"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "test"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "base"]);
+        git(&source, &["branch", "-M", "main"]);
+        git(
+            &source,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&source, &["push", "-q", "origin", "main"]);
+        assert!(std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                worker.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success());
+        // The base advances after the clone (a recorded-PR merge lands), so
+        // admission must use the freshly fetched head, not the clone's tip.
+        git(&source, &["checkout", "-q", "-b", "dependency"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "dependency"]);
+        git(&source, &["checkout", "-q", "main"]);
+        git(
+            &source,
+            &[
+                "merge",
+                "--no-ff",
+                "dependency",
+                "-m",
+                "Merge pull request #703 from dependency",
+            ],
+        );
+        let pr_merge = git(&source, &["rev-parse", "HEAD"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "later work"]);
+        let base_head = git(&source, &["rev-parse", "HEAD"]);
+        git(&source, &["push", "-q", "origin", "main"]);
+
+        let db_path = dir.path().join("manual-close-dependency.db");
+        let spec = r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#;
+        let make_dependent = |conn: &mut rusqlite::Connection, depends_on: &[i64]| {
+            let id = tasks::create(
+                conn,
+                "owner",
+                "dependent",
+                None,
+                0,
+                None,
+                Some(spec),
+                Some(&serde_json::to_string(depends_on).unwrap()),
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            let task = tasks::claim(
+                conn,
+                "worker",
+                Some(id),
+                &[],
+                tasks::DEFAULT_LEASE_TTL_SECS,
+                now_unix(),
+            )
+            .unwrap()
+            .unwrap();
+            (id, task)
+        };
+        let failure_events = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM events WHERE kind IN
+                 ('task_dependency_base_deferred','task_parked','task_graph_blocked')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let (no_pr, with_pr, dependent_id, dependent) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let no_pr = tasks::create(
+                &mut conn,
+                "owner",
+                "failed, closed by hand",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            let with_pr = tasks::create(
+                &mut conn,
+                "owner",
+                "failed, PR landed by hand",
+                None,
+                0,
+                None,
+                Some(r#"{"pr":703}"#),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            for id in [no_pr, with_pr] {
+                conn.execute("UPDATE tasks SET status='failed' WHERE id=?1", [id])
+                    .unwrap();
+                tasks::close_manual(&mut conn, "owner", id, "resolved by hand", None, now_unix())
+                    .unwrap()
+                    .unwrap();
+            }
+            let (dependent_id, dependent) = make_dependent(&mut conn, &[no_pr, with_pr]);
+            (no_pr, with_pr, dependent_id, dependent)
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), worker.clone());
+        config.merge_executor = Arc::new(UnknownDependencyMergeStatusExecutor);
+
+        let admission = verify_dependency_base_before_allocation(
+            &config,
+            &db_path,
+            &WorktreeManager::new(),
+            &worker,
+            &dependent,
+            "worker",
+            "main",
+        )
+        .await
+        .unwrap();
+        match admission {
+            DependencyBaseAdmission::Verified {
+                base_sha,
+                merge_commits,
+            } => {
+                assert_eq!(base_sha, base_head, "admitted on the fetched base head");
+                assert_eq!(
+                    merge_commits,
+                    vec![pr_merge.clone()],
+                    "the recorded PR's merge is still verified; the PR-less close adds none"
+                );
+            }
+            DependencyBaseAdmission::NotRequired => panic!("dependencies require admission"),
+            DependencyBaseAdmission::Deferred => panic!("manual close must satisfy the wait"),
+        }
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            assert_eq!(failure_events(&conn), 0);
+            let dependent = tasks::get(&conn, dependent_id).unwrap().unwrap();
+            assert_eq!(dependent.status, "working");
+            let refs: serde_json::Value =
+                serde_json::from_str(dependent.refs.as_deref().unwrap_or("{}")).unwrap();
+            assert!(refs
+                .get(quorum_core::tasks::DEPENDENCY_BASE_WAIT_REASON_REF)
+                .is_none());
+            let stamped = |id: i64| -> Option<String> {
+                let refs: Option<String> = conn
+                    .query_row("SELECT refs FROM tasks WHERE id=?1", [id], |row| row.get(0))
+                    .unwrap();
+                refs.and_then(|refs| {
+                    serde_json::from_str::<serde_json::Value>(&refs).unwrap()["merge_commit_sha"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+            };
+            assert_eq!(stamped(with_pr), Some(pr_merge.clone()));
+            assert_eq!(stamped(no_pr), None, "no merge SHA is fabricated");
+        }
+
+        // Negative: a normally completed dependency without a merge SHA is not
+        // a manual close and keeps the existing fail-closed deferral.
+        let (plain, plain_dependent) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let plain = tasks::create(
+                &mut conn,
+                "owner",
+                "done without SHA",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='done',completion_provenance='merged' WHERE id=?1",
+                [plain],
+            )
+            .unwrap();
+            let (_, task) = make_dependent(&mut conn, &[no_pr, plain]);
+            (plain, task)
+        };
+        assert!(matches!(
+            verify_dependency_base_before_allocation(
+                &config,
+                &db_path,
+                &WorktreeManager::new(),
+                &worker,
+                &plain_dependent,
+                "worker",
+                "main",
+            )
+            .await
+            .unwrap(),
+            DependencyBaseAdmission::Deferred
+        ));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let refs: serde_json::Value = serde_json::from_str(
+            tasks::get(&conn, plain_dependent.id)
+                .unwrap()
+                .unwrap()
+                .refs
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            refs[quorum_core::tasks::DEPENDENCY_BASE_WAIT_REASON_REF],
+            format!("dependency #{plain} is done but has no recorded merge commit SHA")
+        );
+        let deferred: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='task_dependency_base_deferred'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deferred, 1);
     }
 
     #[cfg(unix)]
