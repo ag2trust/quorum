@@ -24,6 +24,26 @@ The build pins the Debian base digest, Rust builder, direct `git`, `gh`, and
 `CODEX_SHA256` fails before extraction. The provider and base packages are
 upgraded by rebuilding the image.
 
+The image carries OCI `source`, `version`, `revision`, `licenses`, and
+`description` labels. `version` and `revision` come from the `QUORUM_VERSION`
+and `QUORUM_REVISION` build args; a plain local build labels them `dev` and
+`unknown`.
+
+`docker/pin-check.sh` fails on mutable build inputs: a `FROM` or `# syntax=`
+reference without an `@sha256` digest, an unpinned `ca-certificates`, `git`,
+`gh`, or `tini` package, a non-exact `CODEX_VERSION`, or a missing or all-zero
+`CODEX_SHA256`. Workflow files passed as arguments must pin every `uses:` to a
+full 40-hex commit SHA. `verify.sh` runs `pin-check_test.sh` and `pin-check.sh`
+(Dockerfile mode), so the CI container job enforces both without a workflow
+change. `docker/content-verify.sh IMAGE` (also run by `verify.sh`)
+fails on a non-`linux/amd64` image, missing labels, a missing Quorum
+`LICENSE` or Codex `LICENSE`/`NOTICE`, credential-like or hosting/tenancy
+values in the image config or `docker history`, VCS metadata, Rust sources,
+Cargo output, local databases, credential files, or private keys in the image
+filesystem, and a build context that admits such inputs or exceeds 32 MiB.
+Its credential and tenancy detection matches name and value patterns, so it
+catches common shapes, not every possible secret.
+
 ## Prepare and run
 
 Use one writable volume at `/data`. Before the first run, place the managed Git
