@@ -579,16 +579,42 @@ struct PreReviewChecksEntry {
     state: PreReviewChecksState,
     consecutive_timeouts: u8,
     timeout_alerted: bool,
+    // First poll at which GitHub reported a strict ancestor of the
+    // daemon-recorded PR head (read-after-write lag after our own push).
+    head_lag_since: Option<std::time::Instant>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum PreReviewChecksGate {
     Waiting,
     Ready,
-    Failed { failing_checks: Vec<String> },
+    Failed {
+        failing_checks: Vec<String>,
+    },
+    /// GitHub kept reporting a strict ancestor of the daemon-recorded PR head
+    /// for longer than [`GITHUB_HEAD_PROPAGATION_TIMEOUT`]. The reason starts
+    /// with [`GITHUB_HEAD_PROPAGATION_TIMEOUT_CLASS`].
+    HeadPropagationTimeout {
+        reason: String,
+    },
 }
 
 const PRE_REVIEW_CHECKS_TIMEOUT_ALERT_AFTER: u8 = 3;
+
+/// Classified park/provisioning cause for GitHub PR-head read-after-write lag
+/// that outlasts its bound.
+const GITHUB_HEAD_PROPAGATION_TIMEOUT_CLASS: &str = "github_head_propagation_timeout";
+/// Bound for the pre-review CI gate: GitHub may report a strict ancestor of
+/// the daemon-recorded head (the pre-push head) for this long before the task
+/// parks. Re-polls follow the existing `merge_checks_poll_secs` cadence.
+const GITHUB_HEAD_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(600);
+/// Bound for the in-place sticky-remediation baseline re-resolve: attempts
+/// and delay between GitHub lookups while the live head lags the recorded one.
+const GITHUB_HEAD_PROPAGATION_BIND_ATTEMPTS: u32 = 6;
+#[cfg(not(test))]
+const GITHUB_HEAD_PROPAGATION_BIND_DELAY: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const GITHUB_HEAD_PROPAGATION_BIND_DELAY: Duration = Duration::from_millis(5);
 
 impl PoisonTracker {
     fn new() -> Self {
@@ -7305,11 +7331,16 @@ fn bounded_provisioning_cause(cause: &str) -> String {
 /// this prefix merely makes retry-versus-repair visible in `status`.
 fn classified_provisioning_cause(cause: &str) -> String {
     let cause = bounded_provisioning_cause(cause);
-    if cause.starts_with("structural:") || cause.starts_with("transient:") {
+    if cause.starts_with("structural:")
+        || cause.starts_with("transient:")
+        || cause.starts_with(GITHUB_HEAD_PROPAGATION_TIMEOUT_CLASS)
+    {
         return cause;
     }
     let lower = cause.to_ascii_lowercase();
-    let class = if lower.contains("branch collision")
+    let class = if lower.contains(GITHUB_HEAD_PROPAGATION_TIMEOUT_CLASS) {
+        GITHUB_HEAD_PROPAGATION_TIMEOUT_CLASS
+    } else if lower.contains("branch collision")
         || lower.contains("head-sha mismatch")
         || lower.contains("couldn't find remote ref")
         || lower.contains("not our ref")
@@ -10002,8 +10033,9 @@ async fn poll_pre_review_checks(
                 let executor = Arc::clone(&config.merge_executor);
                 let timeout = config.merge_checks_timeout_secs;
                 let poll = config.merge_checks_poll_secs;
+                let head = head_sha.to_string();
                 let handle = tokio::task::spawn_blocking(move || {
-                    executor.wait_for_checks(pr, &repo, timeout, poll)
+                    executor.wait_for_checks_at_head(pr, &repo, &head, timeout, poll)
                 });
                 waits.get_mut(&task_id).expect("retry entry present").state =
                     PreReviewChecksState::Waiting(handle);
@@ -10015,8 +10047,10 @@ async fn poll_pre_review_checks(
         let executor = Arc::clone(&config.merge_executor);
         let timeout = config.merge_checks_timeout_secs;
         let poll = config.merge_checks_poll_secs;
-        let handle =
-            tokio::task::spawn_blocking(move || executor.wait_for_checks(pr, &repo, timeout, poll));
+        let head = head_sha.to_string();
+        let handle = tokio::task::spawn_blocking(move || {
+            executor.wait_for_checks_at_head(pr, &repo, &head, timeout, poll)
+        });
         waits.insert(
             task_id,
             PreReviewChecksEntry {
@@ -10027,6 +10061,7 @@ async fn poll_pre_review_checks(
                 state: PreReviewChecksState::Waiting(handle),
                 consecutive_timeouts: 0,
                 timeout_alerted: false,
+                head_lag_since: None,
             },
         );
         log(&format!(
@@ -10046,6 +10081,7 @@ async fn poll_pre_review_checks(
         state,
         mut consecutive_timeouts,
         mut timeout_alerted,
+        head_lag_since,
     } = entry;
     let PreReviewChecksState::Waiting(handle) = state else {
         return Ok(PreReviewChecksGate::Ready);
@@ -10082,12 +10118,12 @@ async fn poll_pre_review_checks(
             let repo = config.repo_dir.clone();
             let executor = Arc::clone(&config.merge_executor);
             let jobs = config.required_jobs.clone();
-            let required =
-                tokio::task::spawn_blocking(move || executor.check_required_jobs(pr, &repo, &jobs))
-                    .await
-                    .map_err(|error| {
-                        QuorumError::Io(format!("pre-review required jobs join: {error}"))
-                    })?;
+            let head = head_sha.to_string();
+            let required = tokio::task::spawn_blocking(move || {
+                executor.check_required_jobs_at_head(pr, &repo, &head, &jobs)
+            })
+            .await
+            .map_err(|error| QuorumError::Io(format!("pre-review required jobs join: {error}")))?;
             match merge::apply_required_jobs_gate(merge::ChecksOutcome::Ready, required) {
                 merge::ChecksOutcome::Ready => PreReviewChecksGate::Ready,
                 merge::ChecksOutcome::Failed { failing_checks } => {
@@ -10130,6 +10166,7 @@ async fn poll_pre_review_checks(
                 state: PreReviewChecksState::Ready,
                 consecutive_timeouts,
                 timeout_alerted,
+                head_lag_since,
             },
         );
         log(&format!(
@@ -10146,6 +10183,7 @@ async fn poll_pre_review_checks(
                 state: PreReviewChecksState::Retry,
                 consecutive_timeouts,
                 timeout_alerted,
+                head_lag_since,
             },
         );
     }
@@ -10256,18 +10294,40 @@ async fn poll_resume_reviewer_pre_review_checks(
     if !should_poll && head_sha.is_empty() {
         return Ok((PreReviewChecksGate::Waiting, head_sha, false));
     }
+    // A GitHub-reported head that is a strict ancestor of the daemon-recorded
+    // head is read-after-write lag after our own push: neither that head nor
+    // its check results may gate the task. Hold without a checks wait.
+    if should_poll && !head_sha.is_empty() {
+        if let ReportedPrHead::Lagging { recorded } =
+            classify_reported_pr_head(config, task_id, pr, &head_sha).await?
+        {
+            let gate = hold_pre_review_for_head_propagation(
+                waits,
+                task_id,
+                pr,
+                &head_sha,
+                &recorded,
+                std::time::Instant::now(),
+            );
+            return Ok((gate, String::new(), true));
+        }
+    }
     let gate = poll_pre_review_checks(config, waits, task_id, pr, &head_sha).await?;
     if should_poll {
         if head_sha.is_empty() {
-            let (consecutive_timeouts, timeout_alerted) = waits
+            let (consecutive_timeouts, timeout_alerted, head_lag_since) = waits
                 .remove(&task_id)
                 .map(|entry| {
                     if let PreReviewChecksState::Waiting(handle) = entry.state {
                         handle.abort();
                     }
-                    (entry.consecutive_timeouts, entry.timeout_alerted)
+                    (
+                        entry.consecutive_timeouts,
+                        entry.timeout_alerted,
+                        entry.head_lag_since,
+                    )
                 })
-                .unwrap_or((0, false));
+                .unwrap_or((0, false, None));
             waits.insert(
                 task_id,
                 PreReviewChecksEntry {
@@ -10278,6 +10338,8 @@ async fn poll_resume_reviewer_pre_review_checks(
                     state: PreReviewChecksState::Retry,
                     consecutive_timeouts,
                     timeout_alerted,
+                    // An unavailable head does not reset the lag bound.
+                    head_lag_since,
                 },
             );
         } else if let Some(entry) = waits.get_mut(&task_id) {
@@ -10285,6 +10347,110 @@ async fn poll_resume_reviewer_pre_review_checks(
         }
     }
     Ok((gate, head_sha, should_poll))
+}
+
+/// How a GitHub-reported PR head relates to the daemon's durable recorded head
+/// (`pr_targets`, rotated to the published SHA on publication settlement).
+#[derive(Debug, PartialEq, Eq)]
+enum ReportedPrHead {
+    /// Equal to the recorded head, no recorded head exists, or the reported
+    /// head is not provably older. Existing exact-head checks decide; a head
+    /// that moved outside the baseline still fails loudly downstream.
+    Authoritative,
+    /// Strict ancestor of the recorded head: GitHub has not yet caught up
+    /// with the daemon's own push.
+    Lagging { recorded: String },
+}
+
+/// Classify `reported` against the recorded PR head. The DB read is a short
+/// standalone read and the ancestry probe is local git; no transaction is held
+/// across either. An ancestry failure (e.g. unknown object) is logged and
+/// treated as authoritative so it can never be silently absorbed as lag.
+async fn classify_reported_pr_head(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    reported: &str,
+) -> Result<ReportedPrHead> {
+    let recorded = load_publication_pr_baseline(&config.db_path, task_id, pr)
+        .await
+        .map_err(QuorumError::Io)?;
+    let Some(recorded) = recorded.filter(|target| !target.is_fork && target.head_sha != reported)
+    else {
+        return Ok(ReportedPrHead::Authoritative);
+    };
+    match worktree::is_strict_ancestor(&config.repo_dir, reported, &recorded.head_sha).await {
+        Ok(true) => Ok(ReportedPrHead::Lagging {
+            recorded: recorded.head_sha,
+        }),
+        Ok(false) => Ok(ReportedPrHead::Authoritative),
+        Err(error) => {
+            log(&format!(
+                "task #{task_id} PR #{pr}: GitHub head {reported} differs from recorded head {}; \
+                 ancestry unknown ({error})",
+                recorded.head_sha
+            ));
+            Ok(ReportedPrHead::Authoritative)
+        }
+    }
+}
+
+/// Hold the pre-review gate while GitHub reports a strict ancestor of the
+/// recorded head. The entry keeps the normal head-poll cadence and records
+/// when lag was first observed; once lag outlasts
+/// [`GITHUB_HEAD_PROPAGATION_TIMEOUT`] the entry is dropped and the caller
+/// parks with the classified reason.
+fn hold_pre_review_for_head_propagation(
+    waits: &mut HashMap<i64, PreReviewChecksEntry>,
+    task_id: i64,
+    pr: i64,
+    reported: &str,
+    recorded: &str,
+    now: std::time::Instant,
+) -> PreReviewChecksGate {
+    let (lag_since, consecutive_timeouts, timeout_alerted) = match waits.remove(&task_id) {
+        Some(entry) => {
+            if let PreReviewChecksState::Waiting(handle) = entry.state {
+                handle.abort();
+            }
+            let since = entry
+                .head_lag_since
+                .filter(|_| entry.pr == pr)
+                .unwrap_or(now);
+            (since, entry.consecutive_timeouts, entry.timeout_alerted)
+        }
+        None => (now, 0, false),
+    };
+    let elapsed = now.saturating_duration_since(lag_since);
+    if elapsed >= GITHUB_HEAD_PROPAGATION_TIMEOUT {
+        return PreReviewChecksGate::HeadPropagationTimeout {
+            reason: format!(
+                "{GITHUB_HEAD_PROPAGATION_TIMEOUT_CLASS}: GitHub still reports PR #{pr} head \
+                 {reported}, an ancestor of daemon-recorded head {recorded}, after {}s",
+                elapsed.as_secs()
+            ),
+        };
+    }
+    log(&format!(
+        "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} — GitHub reports head {reported}, \
+         an ancestor of daemon-recorded head {recorded}; waiting for propagation ({}s/{}s)",
+        elapsed.as_secs(),
+        GITHUB_HEAD_PROPAGATION_TIMEOUT.as_secs()
+    ));
+    waits.insert(
+        task_id,
+        PreReviewChecksEntry {
+            pr,
+            head_sha: String::new(),
+            last_head_poll: Some(now),
+            post_gate_validation_attempted: false,
+            state: PreReviewChecksState::Retry,
+            consecutive_timeouts,
+            timeout_alerted,
+            head_lag_since: Some(lag_since),
+        },
+    );
+    PreReviewChecksGate::Waiting
 }
 
 async fn notify_pre_review_checks_timeout(
@@ -10656,6 +10822,19 @@ async fn resume_reviewer_after_ci(
                 &failing_checks,
             )
             .await?;
+            return Ok(true);
+        }
+        PreReviewChecksGate::HeadPropagationTimeout { reason } => {
+            pre_review_checks.remove(&task_id);
+            log(&format!(
+                "ResumeReviewer: task #{task_id} PR #{pr} — {reason}; parking"
+            ));
+            park_task(&config.db_path, task_id, &reason, "in-review").await;
+            notify_provision_failure(&config.db_path, task_id, &reason, &format!("#{pr}")).await;
+            cleanup_stale_branch_sync_ci_fix_slots(
+                config, wt_mgr, name_pool, workers, reviewers, task_id,
+            )
+            .await;
             return Ok(true);
         }
         PreReviewChecksGate::Ready => {}
@@ -11734,20 +11913,24 @@ async fn reconcile_merge_retries(
         let executor = Arc::clone(&config.merge_executor);
         let timeout = config.merge_checks_timeout_secs;
         let poll = config.merge_checks_poll_secs;
-        tokio::task::spawn_blocking(move || executor.wait_for_checks(pr, &repo, timeout, poll))
-            .await
-            .map_err(|error| QuorumError::Io(format!("merge retry checks join: {error}")))?
+        let head = live.target.head_sha.clone();
+        tokio::task::spawn_blocking(move || {
+            executor.wait_for_checks_at_head(pr, &repo, &head, timeout, poll)
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("merge retry checks join: {error}")))?
     };
     if matches!(checks, merge::ChecksOutcome::Ready) && !config.required_jobs.is_empty() {
         let required = {
             let repo = config.repo_dir.clone();
             let executor = Arc::clone(&config.merge_executor);
             let jobs = config.required_jobs.clone();
-            tokio::task::spawn_blocking(move || executor.check_required_jobs(pr, &repo, &jobs))
-                .await
-                .map_err(|error| {
-                    QuorumError::Io(format!("merge retry required-jobs join: {error}"))
-                })?
+            let head = live.target.head_sha.clone();
+            tokio::task::spawn_blocking(move || {
+                executor.check_required_jobs_at_head(pr, &repo, &head, &jobs)
+            })
+            .await
+            .map_err(|error| QuorumError::Io(format!("merge retry required-jobs join: {error}")))?
         };
         checks = merge::apply_required_jobs_gate(checks, required);
     }
@@ -13689,7 +13872,10 @@ async fn tick(
                                             }
                                         }
                                     }
-                                    PreReviewChecksGate::Waiting => {
+                                    // The R2 gate polls the R1-approved head directly, so
+                                    // propagation lag only surfaces through Phase 5.
+                                    PreReviewChecksGate::Waiting
+                                    | PreReviewChecksGate::HeadPropagationTimeout { .. } => {
                                         log(&format!(
                                             "R2 GATE: PR #{pr_num} — CI pending for current head; \
                                              R1 approval stored and Phase 5 will retry without a reviewer"
@@ -14280,8 +14466,10 @@ async fn tick(
                         let executor = Arc::clone(&config.merge_executor);
                         let timeout = config.merge_checks_timeout_secs;
                         let poll = config.merge_checks_poll_secs;
+                        // Attribute check results to the exact reviewed head.
+                        let head = current_sha.clone().unwrap_or_default();
                         let handle = tokio::task::spawn_blocking(move || {
-                            executor.wait_for_checks(pr_num, &repo, timeout, poll)
+                            executor.wait_for_checks_at_head(pr_num, &repo, &head, timeout, poll)
                         });
                         let drain_remaining = if drain_state.draining {
                             Some(
@@ -14315,8 +14503,9 @@ async fn tick(
                             let repo = config.repo_dir.clone();
                             let executor = Arc::clone(&config.merge_executor);
                             let jobs = config.required_jobs.clone();
+                            let head = current_sha.clone().unwrap_or_default();
                             tokio::task::spawn_blocking(move || {
-                                executor.check_required_jobs(pr_num, &repo, &jobs)
+                                executor.check_required_jobs_at_head(pr_num, &repo, &head, &jobs)
                             })
                             .await
                             .map_err(|e| {
@@ -15189,8 +15378,11 @@ async fn tick(
                                 let executor = Arc::clone(&config.merge_executor);
                                 let timeout = config.merge_checks_timeout_secs;
                                 let poll = config.merge_checks_poll_secs;
+                                let head = current_sha.clone().unwrap_or_default();
                                 let handle = tokio::task::spawn_blocking(move || {
-                                    executor.wait_for_checks(pr_num, &repo, timeout, poll)
+                                    executor.wait_for_checks_at_head(
+                                        pr_num, &repo, &head, timeout, poll,
+                                    )
                                 });
                                 let drain_remaining = if drain_state.draining {
                                     Some(
@@ -17789,6 +17981,11 @@ async fn tick(
                     .await?;
             match ci_gate {
                 PreReviewChecksGate::Waiting => continue,
+                PreReviewChecksGate::HeadPropagationTimeout { reason } => {
+                    pre_review_checks.remove(task_id);
+                    parked_workers.push((*wi, reason.clone(), reason));
+                    continue;
+                }
                 PreReviewChecksGate::Failed { failing_checks } => {
                     failed_pre_review_checks.push((
                         *task_id,
@@ -18164,6 +18361,12 @@ async fn tick(
                     .await?;
             match ci_gate {
                 PreReviewChecksGate::Waiting => continue,
+                PreReviewChecksGate::HeadPropagationTimeout { reason } => {
+                    pre_review_checks.remove(task_id);
+                    park_task(&db_path, *task_id, &reason, "in-review").await;
+                    notify_provision_failure(&db_path, *task_id, &reason, &format!("#{pr}")).await;
+                    continue;
+                }
                 PreReviewChecksGate::Failed { failing_checks } => {
                     pre_review_checks.remove(task_id);
                     handle_pre_review_checks_failure(
@@ -29877,15 +30080,43 @@ async fn bind_sticky_remediation_pr_baseline(
         .pr_target_program
         .as_deref()
         .unwrap_or(Path::new("gh"));
-    let target = resolve_pr_target_with_program(
-        pr,
-        &config.repo_dir,
-        Some(&config.repo),
-        PUBLICATION_GH_TIMEOUT,
-        program,
-    )
-    .await
-    .map_err(|error| QuorumError::Usage(format!("live PR #{pr} target lookup failed: {error}")))?;
+    // GitHub can report the pre-push head for a short time after the daemon's
+    // own publication. A live head that is a strict ancestor of the recorded
+    // baseline is that lag: re-resolve with a bounded delay instead of
+    // reporting a moved head. Any other mismatch still fails loudly below.
+    let mut attempt = 1u32;
+    let target = loop {
+        let target = resolve_pr_target_with_program(
+            pr,
+            &config.repo_dir,
+            Some(&config.repo),
+            PUBLICATION_GH_TIMEOUT,
+            program,
+        )
+        .await
+        .map_err(|error| {
+            QuorumError::Usage(format!("live PR #{pr} target lookup failed: {error}"))
+        })?;
+        let ReportedPrHead::Lagging { recorded } =
+            classify_reported_pr_head(config, task_id, pr, &target.head_sha).await?
+        else {
+            break target;
+        };
+        if attempt >= GITHUB_HEAD_PROPAGATION_BIND_ATTEMPTS {
+            return Err(QuorumError::Usage(format!(
+                "{GITHUB_HEAD_PROPAGATION_TIMEOUT_CLASS}: GitHub still reports PR #{pr} head {}, \
+                 an ancestor of recorded baseline {recorded}, after {attempt} lookups",
+                target.head_sha
+            )));
+        }
+        log(&format!(
+            "sticky remediation: task #{task_id} PR #{pr} — GitHub reports head {}, an ancestor \
+             of recorded baseline {recorded}; re-resolving ({attempt}/{})",
+            target.head_sha, GITHUB_HEAD_PROPAGATION_BIND_ATTEMPTS
+        ));
+        attempt += 1;
+        tokio::time::sleep(GITHUB_HEAD_PROPAGATION_BIND_DELAY).await;
+    };
     if target.pr != pr {
         return Err(QuorumError::Usage(format!(
             "PR identity changed: expected #{pr}, got #{}",
@@ -32574,6 +32805,7 @@ mod tests {
                 state: PreReviewChecksState::Ready,
                 consecutive_timeouts: 0,
                 timeout_alerted: false,
+                head_lag_since: None,
             },
         )]);
 
@@ -32647,6 +32879,7 @@ mod tests {
                 state: PreReviewChecksState::Waiting(old_handle),
                 consecutive_timeouts: 0,
                 timeout_alerted: false,
+                head_lag_since: None,
             },
         );
 
@@ -32828,6 +33061,7 @@ mod tests {
                     state: PreReviewChecksState::Ready,
                     consecutive_timeouts: 0,
                     timeout_alerted: false,
+                    head_lag_since: None,
                 },
             );
 
@@ -52921,6 +53155,450 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
         let stored = pr_targets::get(&conn, task_id, pr).unwrap().unwrap();
         assert_eq!(stored.head_sha, baseline_sha);
+    }
+
+    /// Real repository with `old -> new` on one line of history and an
+    /// unrelated root commit. Returns (repo, old, new, unrelated).
+    fn head_propagation_repo(dir: &Path) -> (PathBuf, String, String, String) {
+        let repo = dir.join("propagation-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "old"]);
+        let old = git(&["rev-parse", "HEAD"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "new"]);
+        let new = git(&["rev-parse", "HEAD"]);
+        git(&["checkout", "-q", "--orphan", "unrelated"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "unrelated"]);
+        let unrelated = git(&["rev-parse", "HEAD"]);
+        (repo, old, new, unrelated)
+    }
+
+    /// Fake `gh` that serves `lagging_json` for the first `lag_calls`
+    /// invocations and `current_json` afterwards, counting calls in a file.
+    #[cfg(unix)]
+    fn fake_gh_lagging(
+        dir: &Path,
+        name: &str,
+        lag_calls: u32,
+        lagging_json: &str,
+        current_json: &str,
+    ) -> (PathBuf, PathBuf) {
+        let counter = dir.join(format!("{name}.count"));
+        let lagging = dir.join(format!("{name}.lagging.json"));
+        let current = dir.join(format!("{name}.current.json"));
+        std::fs::write(&lagging, lagging_json).unwrap();
+        std::fs::write(&current, current_json).unwrap();
+        let script = format!(
+            "#!/bin/sh\nn=$(cat '{c}' 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > '{c}'\n\
+             if [ $n -le {lag_calls} ]; then cat '{l}'; else cat '{r}'; fi\n",
+            c = counter.display(),
+            l = lagging.display(),
+            r = current.display(),
+        );
+        (write_fake_gh_script(dir, name, &script), counter)
+    }
+
+    fn fake_gh_calls(counter: &Path) -> u32 {
+        std::fs::read_to_string(counter)
+            .map(|count| count.trim().parse().unwrap())
+            .unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    fn seed_published_sticky_task(db_path: &Path, pr: i64, recorded: &str) -> i64 {
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        let id = seed_sticky_rework_task(&mut conn, pr, Some(recorded));
+        pr_targets::upsert(
+            &mut conn,
+            id,
+            pr,
+            &format!("daemon/live-worker-t{pr}"),
+            recorded,
+            false,
+        )
+        .unwrap();
+        id
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_waits_out_github_head_propagation_lag() {
+        // #402: GitHub serves the pre-push head (a strict ancestor of the
+        // daemon-published baseline) for two lookups, then catches up. The
+        // bind must re-resolve instead of failing as "moved outside".
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, old, new, _) = head_propagation_repo(dir.path());
+        let db_path = dir.path().join("propagation-lag.db");
+        let pr: i64 = 930;
+        let task_id = seed_published_sticky_task(&db_path, pr, &new);
+        let head_ref = format!("daemon/live-worker-t{pr}");
+        let (gh, counter) = fake_gh_lagging(
+            dir.path(),
+            "gh-propagation-lag",
+            2,
+            &open_pr_target_json(&head_ref, &old, "main"),
+            &open_pr_target_json(&head_ref, &new, "main"),
+        );
+        let mut config = sticky_baseline_test_config(db_path.clone(), repo);
+        config.pr_target_program = Some(gh);
+
+        bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect("an ancestor head is propagation lag, not a moved head");
+
+        assert_eq!(
+            fake_gh_calls(&counter),
+            3,
+            "two lagging lookups, then the new head"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            pr_targets::get(&conn, task_id, pr)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            new
+        );
+        assert_eq!(
+            load_intent_baseline(&conn, task_id).as_deref(),
+            Some(new.as_str())
+        );
+        assert_eq!(
+            tasks::get(&conn, task_id).unwrap().unwrap().status,
+            "rework"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_unrelated_live_head_still_fails_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, _, new, unrelated) = head_propagation_repo(dir.path());
+        let db_path = dir.path().join("propagation-unrelated.db");
+        let pr: i64 = 931;
+        let task_id = seed_published_sticky_task(&db_path, pr, &new);
+        let head_ref = format!("daemon/live-worker-t{pr}");
+        let json = open_pr_target_json(&head_ref, &unrelated, "main");
+        let (gh, counter) = fake_gh_lagging(dir.path(), "gh-unrelated", 0, &json, &json);
+        let mut config = sticky_baseline_test_config(db_path.clone(), repo);
+        config.pr_target_program = Some(gh);
+
+        let error = bind_sticky_remediation_pr_baseline(&config, task_id, pr)
+            .await
+            .expect_err("a non-ancestor head moved outside the baseline");
+        assert!(
+            error
+                .to_string()
+                .contains("moved outside its durable baseline"),
+            "{error}"
+        );
+        assert_eq!(
+            fake_gh_calls(&counter),
+            1,
+            "no propagation retries for a foreign head"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        assert_eq!(
+            pr_targets::get(&conn, task_id, pr)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            new
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sticky_baseline_propagation_lag_past_bound_parks_classified() {
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, old, new, _) = head_propagation_repo(dir.path());
+        let db_path = dir.path().join("propagation-timeout.db");
+        let pr: i64 = 932;
+        let task_id = seed_published_sticky_task(&db_path, pr, &new);
+        let head_ref = format!("daemon/live-worker-t{pr}");
+        let json = open_pr_target_json(&head_ref, &old, "main");
+        let (gh, counter) = fake_gh_lagging(dir.path(), "gh-lag-forever", u32::MAX, &json, &json);
+        let mut config = sticky_baseline_test_config(db_path.clone(), repo);
+        config.pr_target_program = Some(gh);
+
+        let fed = bind_claimed_sticky_remediation_baseline(
+            &config,
+            "live-worker",
+            task_id,
+            pr,
+            "fix the blocking finding",
+        )
+        .await
+        .unwrap();
+
+        assert!(!fed, "the remediation turn must not be fed");
+        assert_eq!(
+            fake_gh_calls(&counter),
+            GITHUB_HEAD_PROPAGATION_BIND_ATTEMPTS
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        let refs = task.refs.unwrap_or_default();
+        assert!(
+            refs.contains(&format!(
+                "{GITHUB_HEAD_PROPAGATION_TIMEOUT_CLASS}: sticky remediation baseline binding failed"
+            )),
+            "park reason must carry the propagation class: {refs}"
+        );
+        assert!(!refs.contains("unknown:"), "{refs}");
+        assert_eq!(
+            pr_targets::get(&conn, task_id, pr)
+                .unwrap()
+                .unwrap()
+                .head_sha,
+            new
+        );
+    }
+
+    /// GitHub serves `old` (with its failed checks) for the queued heads,
+    /// then `new` (green). Records every head a checks wait is attributed to.
+    struct PropagationLagExecutor {
+        heads: std::sync::Mutex<std::collections::VecDeque<String>>,
+        failing_head: String,
+        waited_heads: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl merge::MergeExecutor for PropagationLagExecutor {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: true,
+                message: String::new(),
+                failure_kind: None,
+            }
+        }
+
+        fn wait_for_checks(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _timeout_secs: u64,
+            _poll_interval_secs: u64,
+        ) -> merge::ChecksOutcome {
+            // An unattributed wait would apply the old head's failure.
+            merge::ChecksOutcome::Failed {
+                failing_checks: vec!["unattributed wait".into()],
+            }
+        }
+
+        fn wait_for_checks_at_head(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            expected_head: &str,
+            _timeout_secs: u64,
+            _poll_interval_secs: u64,
+        ) -> merge::ChecksOutcome {
+            self.waited_heads
+                .lock()
+                .unwrap()
+                .push(expected_head.to_string());
+            if expected_head == self.failing_head {
+                merge::ChecksOutcome::Failed {
+                    failing_checks: vec!["container".into()],
+                }
+            } else {
+                merge::ChecksOutcome::Ready
+            }
+        }
+
+        fn head_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+            let mut heads = self.heads.lock().unwrap();
+            if heads.len() > 1 {
+                heads.pop_front()
+            } else {
+                heads.front().cloned()
+            }
+        }
+    }
+
+    fn seed_recorded_pr_head(db_path: &Path, pr: i64, recorded: &str) -> i64 {
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "propagation",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now_unix(),
+        )
+        .unwrap();
+        pr_targets::upsert(&mut conn, task_id, pr, "daemon/w-t1", recorded, false).unwrap();
+        task_id
+    }
+
+    fn expire_pre_review_head_poll(waits: &mut HashMap<i64, PreReviewChecksEntry>, task_id: i64) {
+        if let Some(entry) = waits.get_mut(&task_id) {
+            entry.last_head_poll = Some(std::time::Instant::now() - Duration::from_secs(3600));
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_review_gate_waits_while_github_reports_ancestor_of_published_head() {
+        // #402 incident shape: the daemon published `new`; GitHub keeps
+        // serving `old` and its failed `container` check for three polls.
+        const PR: i64 = 930;
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, old, new, _) = head_propagation_repo(dir.path());
+        let db_path = dir.path().join("pre-review-lag.db");
+        let task_id = seed_recorded_pr_head(&db_path, PR, &new);
+        let executor = Arc::new(PropagationLagExecutor {
+            heads: std::sync::Mutex::new(
+                [old.clone(), old.clone(), old.clone(), new.clone()].into(),
+            ),
+            failing_head: old.clone(),
+            waited_heads: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut config = pre_review_checks_config(db_path, repo);
+        config.merge_executor = executor.clone();
+        let mut waits = HashMap::new();
+
+        for _ in 0..3 {
+            expire_pre_review_head_poll(&mut waits, task_id);
+            let (gate, head, polled) =
+                poll_resume_reviewer_pre_review_checks(&config, &mut waits, task_id, PR)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                gate,
+                PreReviewChecksGate::Waiting,
+                "lag must never fail the gate"
+            );
+            assert!(polled);
+            assert!(
+                head.is_empty(),
+                "a lagging head must not become the gated head"
+            );
+        }
+        assert!(
+            executor.waited_heads.lock().unwrap().is_empty(),
+            "no checks wait may run against the lagging head"
+        );
+        assert!(waits[&task_id].head_lag_since.is_some());
+
+        expire_pre_review_head_poll(&mut waits, task_id);
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (gate, head, _) =
+                    poll_resume_reviewer_pre_review_checks(&config, &mut waits, task_id, PR)
+                        .await
+                        .unwrap();
+                assert_ne!(
+                    std::mem::discriminant(&gate),
+                    std::mem::discriminant(&PreReviewChecksGate::Failed {
+                        failing_checks: Vec::new()
+                    })
+                );
+                if gate == PreReviewChecksGate::Ready {
+                    return head;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the gate proceeds once GitHub reports the published head");
+        assert_eq!(ready, new);
+        assert_eq!(*executor.waited_heads.lock().unwrap(), vec![new.clone()]);
+        assert!(waits[&task_id].head_lag_since.is_none());
+    }
+
+    #[tokio::test]
+    async fn pre_review_gate_propagation_lag_past_bound_returns_classified_timeout() {
+        const PR: i64 = 931;
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, old, new, _) = head_propagation_repo(dir.path());
+        let db_path = dir.path().join("pre-review-lag-timeout.db");
+        let task_id = seed_recorded_pr_head(&db_path, PR, &new);
+        let executor = Arc::new(PropagationLagExecutor {
+            heads: std::sync::Mutex::new([old.clone()].into()),
+            failing_head: old.clone(),
+            waited_heads: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut config = pre_review_checks_config(db_path, repo);
+        config.merge_executor = executor.clone();
+        let mut waits = HashMap::new();
+
+        let (gate, _, _) = poll_resume_reviewer_pre_review_checks(&config, &mut waits, task_id, PR)
+            .await
+            .unwrap();
+        assert_eq!(gate, PreReviewChecksGate::Waiting);
+
+        let entry = waits.get_mut(&task_id).unwrap();
+        entry.head_lag_since = Some(
+            std::time::Instant::now() - GITHUB_HEAD_PROPAGATION_TIMEOUT - Duration::from_secs(1),
+        );
+        expire_pre_review_head_poll(&mut waits, task_id);
+        let (gate, head, _) =
+            poll_resume_reviewer_pre_review_checks(&config, &mut waits, task_id, PR)
+                .await
+                .unwrap();
+        let PreReviewChecksGate::HeadPropagationTimeout { reason } = gate else {
+            panic!("expected a classified propagation timeout, got {gate:?}");
+        };
+        assert!(
+            reason.starts_with(GITHUB_HEAD_PROPAGATION_TIMEOUT_CLASS),
+            "{reason}"
+        );
+        assert!(reason.contains(&old) && reason.contains(&new), "{reason}");
+        assert!(head.is_empty());
+        assert!(
+            !waits.contains_key(&task_id),
+            "a timed-out gate leaves no retry entry"
+        );
+        assert!(executor.waited_heads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pre_review_gate_does_not_treat_unrelated_head_as_lag() {
+        const PR: i64 = 932;
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, _, new, unrelated) = head_propagation_repo(dir.path());
+        let db_path = dir.path().join("pre-review-unrelated.db");
+        let task_id = seed_recorded_pr_head(&db_path, PR, &new);
+        let executor = Arc::new(PropagationLagExecutor {
+            heads: std::sync::Mutex::new([unrelated.clone()].into()),
+            failing_head: unrelated.clone(),
+            waited_heads: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut config = pre_review_checks_config(db_path, repo);
+        config.merge_executor = executor.clone();
+        let mut waits = HashMap::new();
+
+        let (gate, head, _) =
+            poll_resume_reviewer_pre_review_checks(&config, &mut waits, task_id, PR)
+                .await
+                .unwrap();
+        assert_eq!(gate, PreReviewChecksGate::Waiting);
+        assert_eq!(
+            head, unrelated,
+            "a foreign head is gated as-is, not held as lag"
+        );
+        assert!(waits[&task_id].head_lag_since.is_none());
     }
 
     #[cfg(unix)]

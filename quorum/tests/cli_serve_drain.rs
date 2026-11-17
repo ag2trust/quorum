@@ -154,6 +154,10 @@ elif [ "$cmd" = "pr view" ]; then
   branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
   sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
   case " $* " in
+    *" --json statusCheckRollup,mergeStateStatus,headRefOid "*)
+      printf '{"mergeStateStatus":"CLEAN","statusCheckRollup":[],"headRefOid":"%s"}\n' "$sha"
+      exit 0
+      ;;
     *" --json statusCheckRollup,mergeStateStatus "*)
       printf '{"mergeStateStatus":"CLEAN","statusCheckRollup":[]}\n'
       exit 0
