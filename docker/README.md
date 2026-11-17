@@ -48,13 +48,25 @@ catches common shapes, not every possible secret.
 
 Self-hosting runs the published `linux/amd64` image, pulled only by its
 immutable manifest digest — never by a mutable tag — so what you run is
-exactly what CI verified. Each tagged release records its digest, pull
-command, and tags in the GitHub Release notes, between
-`<!-- quorum-container-image:begin -->` and `...end -->` markers:
+exactly what was verified.
+
+As of this writing, building, verifying, and promoting that image is not yet
+wired into this repository's tag-triggered release flow: pushing a `v*` tag
+runs only `release.yml` (via `auto-tag.yml`), which builds and attaches
+binary tarballs, not a container image. `container-publish.yml` and
+`container-promote.yml` (see "Publishing a release" below) define the
+build/verify/promote pipeline and are exercised by their own test suites, but
+have no caller in this repository yet, so no release's notes currently carry
+a recorded digest. Check a given release before relying on this section:
 
 ```sh
 gh release view v<version> --repo ag2trust/quorum --json body -q .body
 ```
+
+Once that pipeline is wired to a trigger, each promoted release's notes will
+record its digest, pull command, and tags between
+`<!-- quorum-container-image:begin -->` and `...end -->` markers, and this
+section describes how to consume that release from then on.
 
 Before pulling, verify the release's provenance (SLSA) and SBOM attestations
 with a current `gh`. The image's own bundled `gh 2.23` has no `attestation`
@@ -71,9 +83,15 @@ gh attestation verify "oci://ghcr.io/ag2trust/quorum@sha256:<64 hex>" \
 
 Repeat with `--predicate-type https://spdx.dev/Document/v2.3` (or `v2.2`, or
 `https://cyclonedx.org/bom` for a CycloneDX SBOM) to verify the SBOM
-attestation. Both checks, plus the manifest/label identity and bounded
-service check described in "Publishing a release" below, are exactly what
-`docker/release-verify.sh` runs in CI before a release tag is applied.
+attestation. These are the same attestation checks `docker/release-verify.sh`
+runs; that script also independently confirms, by inspecting the registry
+manifest and the pulled image, that the digest names exactly one
+`linux/amd64` image manifest (never a multi-arch index) whose config digest,
+`org.opencontainers.image.*` labels (`source`, `revision`, `version`,
+`licenses`, `description`), and architecture match the release being
+verified, and then runs a bounded service check — starting one container
+from that digest and requiring `quorum-health readiness` to report ready
+before a deadline.
 
 Then pull and run by digest, continuing with "Prepare and run" below in place
 of a locally built `quorum:local` tag:
@@ -126,7 +144,8 @@ Codex itself keeps its own config and login credentials under `$CODEX_HOME`
 (default `$HOME/.codex`, i.e. `/home/quorum/.codex` with this image's `HOME`).
 That default path is outside `/data`, so it does not survive container
 replacement unless you mount it yourself. Either bind-mount a host directory
-there directly:
+there directly — like `/data`, it must be writable by numeric UID/GID
+`10001:10001`:
 
 ```sh
 docker run --rm \
@@ -474,20 +493,29 @@ pushes it to `ghcr.io/ag2trust/quorum` by digest with no tag, and attests
 SLSA provenance and an SPDX SBOM for that exact digest.
 `.github/workflows/container-promote.yml` then verifies that digest from a
 clean runner — anonymously first, to prove public availability, exactly as
-`docker/release-verify.sh` is documented above to check — before applying the
+"Deploy a published image by digest" above describes — before applying the
 `sha-<revision>` and `<version>` tags and recording the digest in the
-release notes (see "Deploy a published image by digest" above). Both are
-reusable `workflow_call` workflows; neither builds or pushes image layers
-more than once per release, and a verification failure skips promotion, so no
-release tag is ever applied to an unverified digest.
+release notes. A verification failure skips promotion, so no release tag is
+ever applied to an unverified digest.
+
+Both are reusable `workflow_call` workflows with their own test suites, but
+as of this writing neither has a caller anywhere in this repository: tagging
+a release (`release.yml`, invoked by `auto-tag.yml`) builds and attaches
+binary tarballs only, and does not build, verify, or promote a container
+image. Wiring a caller — on the tag-push release flow, or as a separate
+manually dispatched workflow — is required before any release actually
+carries the digest markers "Deploy a published image by digest" describes;
+until then, treat the two workflows above as the pipeline's design, not as
+something that currently runs.
 
 ### First publication: making the GHCR package public (one time, irreversible)
 
 GHCR creates a new container package as **private** the first time any
 workflow pushes to it, even though the source repository is public and even
-though every later push reuses that same package. Until this is fixed,
-`container-promote.yml`'s anonymous verification step fails every release,
-with `docker/release-verify.sh` reporting that the pull "without credentials
+though every later push reuses that same package. Once the pipeline above is
+wired up and runs, `container-promote.yml`'s anonymous verification step
+will fail on every release until this is fixed, with
+`docker/release-verify.sh` reporting that the pull "without credentials
 failed ...; the GHCR package must be made public before release verification
 can pass."
 
