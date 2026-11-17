@@ -66,10 +66,12 @@ function check_from(line, text,    n, t, i, image) {
   while (i <= n && t[i] ~ /^--/) i++
   image = t[i]
   if (image == "") { fail(line, "FROM without an image"); return }
+  # Check against stages declared on earlier lines before registering the
+  # `AS name` on this line, so `FROM debian AS debian` cannot vouch for itself.
+  if (image ~ /\$/) fail(line, "FROM uses a variable image reference: " image)
+  else if (tolower(image) == "scratch" || (tolower(image) in stage && image !~ /[:@\/]/)) {}
+  else if (!digest_pinned(image)) fail(line, "FROM is not pinned by @sha256 digest: " image)
   if (i + 2 <= n && toupper(t[i + 1]) == "AS") stage[tolower(t[i + 2])] = 1
-  if (image ~ /\$/) { fail(line, "FROM uses a variable image reference: " image); return }
-  if (tolower(image) == "scratch" || (tolower(image) in stage && image !~ /[:@\/]/)) return
-  if (!digest_pinned(image)) fail(line, "FROM is not pinned by @sha256 digest: " image)
 }
 function check_arg(text,    n, t, i, eq) {
   n = split(text, t, /[ \t]+/)
@@ -86,8 +88,16 @@ function check_run(line, text,    n, t, i, j, installing, name, value, eq, var) 
     if (t[i] == "&&" || t[i] == "||" || t[i] == ";" || t[i] == "|" || t[i] == "\\") {
       installing = 0; continue
     }
-    if ((t[i] == "apt-get" || t[i] == "apt") && t[i + 1] == "install") {
-      installing = 1; i++; continue
+    if (t[i] == "apt-get" || t[i] == "apt") {
+      # Options may precede the subcommand (`apt-get -y install`); -o, -c
+      # and -t take a separate argument.
+      j = i + 1
+      while (j <= n && t[j] ~ /^-/) {
+        if (t[j] ~ /^-[oct]$/) j++
+        j++
+      }
+      if (t[j] == "install") { installing = 1; i = j }
+      continue
     }
     if (!installing || t[i] ~ /^-/) continue
     eq = index(t[i], "=")

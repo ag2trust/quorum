@@ -80,6 +80,26 @@ mutate apt-unpinned 's|tini="${TINI_VERSION}"|tini|'
 expect 1 'apt package tini is not version-pinned' \
   'unpinned apt package' -- --dockerfile "$tmp/apt-unpinned"
 
+mutate apt-opt-first '$a\
+RUN apt-get -y install tini'
+expect 1 'apt package tini is not version-pinned' \
+  'unpinned apt package after a leading option' -- --dockerfile "$tmp/apt-opt-first"
+
+mutate apt-optarg-first '$a\
+RUN apt-get --yes -o Dpkg::Options::=--force-confnew -qq install gh'
+expect 1 'apt package gh is not version-pinned' \
+  'unpinned apt package after options with arguments' -- --dockerfile "$tmp/apt-optarg-first"
+
+mutate apt-opt-pinned '$a\
+RUN apt-get -y install tini="${TINI_VERSION}"'
+expect 0 '' 'pinned apt package after a leading option passes' \
+  -- --dockerfile "$tmp/apt-opt-pinned"
+
+mutate from-self-stage '$a\
+FROM debian AS debian'
+expect 1 'FROM is not pinned by @sha256 digest: debian' \
+  'FROM naming its own stage' -- --dockerfile "$tmp/from-self-stage"
+
 mutate apt-noarg 's|^ARG GH_VERSION=.*|ARG GH_VERSION|'
 expect 1 'apt package gh pin ${GH_VERSION} has no nonempty ARG default' \
   'apt pin without ARG default' -- --dockerfile "$tmp/apt-noarg"

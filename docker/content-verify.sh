@@ -108,8 +108,8 @@ if ! docker run --rm --platform linux/amd64 --network none --user 0:0 \
       -o -name "id_rsa*" -o -name "id_dsa*" -o -name "id_ecdsa*" \
       -o -name "id_ed25519*" \
       \) -print | sed "s/^/FORBIDDEN /"
-    find / \( -path /proc -o -path /sys -o -path /dev \) -prune -o -type f -print \
-      | xargs -r grep -l -I -E -e "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----" 2>/dev/null \
+    find / \( -path /proc -o -path /sys -o -path /dev \) -prune -o -type f \
+      -exec grep -l -I -E -e "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----" {} + 2>/dev/null \
       | sed "s/^/KEY /"
     printf "SCAN-COMPLETE\n"
   ' >"$work/fs" 2>"$work/fs.err"; then
