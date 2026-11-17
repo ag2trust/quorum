@@ -245,9 +245,15 @@ cp target/release/quorum ~/.local/bin/
 quorum init
 ```
 
-For the initial self-hostable container image, including its persistence and
-provider packaging contract, see [`docker/README.md`](docker/README.md). It is
-an image/runtime foundation, not a completed hosted service.
+For the initial self-hostable container image — deployed by pulling
+`ghcr.io/ag2trust/quorum` by its exact, attestation-verified release digest
+rather than a mutable tag, with persistence and provider-credential mounting
+under one `/data` volume — see [`docker/README.md`](docker/README.md). It is
+an image/runtime foundation, not a completed hosted service. A fork that
+publishes its own image to a fresh GHCR package must also complete GHCR's
+one-time, irreversible step of making that package public before anonymous
+release verification (and therefore anonymous `docker pull`) can succeed; see
+"Publishing a release" there.
 
 State lives under `~/.quorum/repos/<owner>__<name>/`.
 

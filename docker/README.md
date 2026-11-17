@@ -44,6 +44,51 @@ filesystem, and a build context that admits such inputs or exceeds 32 MiB.
 Its credential and tenancy detection matches name and value patterns, so it
 catches common shapes, not every possible secret.
 
+## Deploy a published image by digest
+
+Self-hosting runs the published `linux/amd64` image, pulled only by its
+immutable manifest digest — never by a mutable tag — so what you run is
+exactly what CI verified. Each tagged release records its digest, pull
+command, and tags in the GitHub Release notes, between
+`<!-- quorum-container-image:begin -->` and `...end -->` markers:
+
+```sh
+gh release view v<version> --repo ag2trust/quorum --json body -q .body
+```
+
+Before pulling, verify the release's provenance (SLSA) and SBOM attestations
+with a current `gh`. The image's own bundled `gh 2.23` has no `attestation`
+command and cannot do this; run the check on the host with the digest and
+source revision from the release notes:
+
+```sh
+gh attestation verify "oci://ghcr.io/ag2trust/quorum@sha256:<64 hex>" \
+  --repo ag2trust/quorum \
+  --signer-workflow ag2trust/quorum/.github/workflows/container-publish.yml \
+  --source-digest <40-hex source revision> \
+  --predicate-type https://slsa.dev/provenance/v1
+```
+
+Repeat with `--predicate-type https://spdx.dev/Document/v2.3` (or `v2.2`, or
+`https://cyclonedx.org/bom` for a CycloneDX SBOM) to verify the SBOM
+attestation. Both checks, plus the manifest/label identity and bounded
+service check described in "Publishing a release" below, are exactly what
+`docker/release-verify.sh` runs in CI before a release tag is applied.
+
+Then pull and run by digest, continuing with "Prepare and run" below in place
+of a locally built `quorum:local` tag:
+
+```sh
+docker pull ghcr.io/ag2trust/quorum@sha256:<64 hex>
+docker run -d --name quorum-prod \
+  -e QUORUM_REPO=owner/name \
+  -v /host/quorum-data:/data \
+  ghcr.io/ag2trust/quorum@sha256:<64 hex>
+```
+
+There is no multi-arch manifest to select from: the image is `linux/amd64`
+only.
+
 ## Prepare and run
 
 Use one writable volume at `/data`. Before the first run, place the managed Git
@@ -68,6 +113,43 @@ For a fresh repository identity, the image atomically installs a Codex-only
 routing file at `/data/quorum/serve/<owner>__<name>.toml`; every managed role
 selects the bundled Codex CLI. An existing file at that path is never
 overwritten. Set `QUORUM_SERVE_CONFIG` to use another persistent file.
+
+### Credentials
+
+The image contains no provider or GitHub credentials; inject them at runtime
+as environment variables, for example `-e GH_TOKEN=... -e
+OPENAI_API_KEY=...`. `quorum serve` reads `GH_TOKEN`/`GITHUB_TOKEN` for
+GitHub access and passes provider credentials through to the Codex CLI it
+spawns.
+
+Codex itself keeps its own config and login credentials under `$CODEX_HOME`
+(default `$HOME/.codex`, i.e. `/home/quorum/.codex` with this image's `HOME`).
+That default path is outside `/data`, so it does not survive container
+replacement unless you mount it yourself. Either bind-mount a host directory
+there directly:
+
+```sh
+docker run --rm \
+  -e QUORUM_REPO=owner/name \
+  -v /host/quorum-data:/data \
+  -v /host/codex-home:/home/quorum/.codex \
+  quorum:local
+```
+
+or point `CODEX_HOME` at a path under `/data/quorum` so it persists with the
+rest of the daemon's own state:
+
+```sh
+docker run --rm \
+  -e QUORUM_REPO=owner/name \
+  -e CODEX_HOME=/data/quorum/codex \
+  -v /host/quorum-data:/data \
+  quorum:local
+```
+
+Either way, populate that path with Codex's own config/auth files on the
+host before the first run; the entrypoint does not create, seed, or rotate
+them.
 
 Startup readiness and the Docker `HEALTHCHECK` use the same probe (see
 "Health probe" below). Web always binds loopback; the image declares no
@@ -206,15 +288,21 @@ below.
 
 ### Clean replacement
 
-Stop and remove the running container, then start a replacement from the
-same image, the same `QUORUM_REPO`, and the same `/data` host mount:
+Stop and remove the running container, then start a replacement — the same
+image for an ordinary redeploy, or a newer, verified release digest (see
+"Deploy a published image by digest" above) for an upgrade — against the
+same `QUORUM_REPO` and the same `/data` host mount. Always stop the old
+container first: exactly one container may hold a repository's
+`daemon_lock` at a time, and running two containers against one `/data` tree
+at once is never a supported configuration.
 
 ```sh
 docker stop quorum-prod && docker rm quorum-prod
+docker pull ghcr.io/ag2trust/quorum@sha256:<new digest>   # upgrade only
 docker run -d --name quorum-prod \
   -e QUORUM_REPO=owner/name \
   -v /host/quorum-data:/data \
-  quorum:local
+  ghcr.io/ag2trust/quorum@sha256:<new digest>
 ```
 
 `docker/replace.sh` seeds rows through a live container, stops and removes
@@ -352,8 +440,12 @@ the end of the suite.
 
 ### Rollback limitations
 
-There is no supported downgrade path. A database already migrated to a
-newer `PRAGMA user_version` than an older image's `quorum` binary supports
+Because deployment addresses images by digest (see "Deploy a published image
+by digest" above), a rollback is just a clean replacement started from an
+older release digest against the same `/data` tree — but there is no
+supported downgrade path once that tree has been used by a newer schema. A
+database already migrated to a newer `PRAGMA user_version` than an older
+image's `quorum` binary supports
 is refused outright (exit 3, logged as `db schema version N is newer than
 this binary (M)`) rather than read or migrated backward; the refused
 database is left byte-for-byte untouched. Rolling an image back after it has
@@ -374,3 +466,40 @@ filesystem level. They do not prove that an in-flight provider (agent) turn
 in progress at the moment of replacement resumes — only that the durable
 rows, worktree contents, and config bytes a resumed turn would depend on
 survive intact.
+
+## Publishing a release (maintainers)
+
+`.github/workflows/container-publish.yml` builds the image once, tests it,
+pushes it to `ghcr.io/ag2trust/quorum` by digest with no tag, and attests
+SLSA provenance and an SPDX SBOM for that exact digest.
+`.github/workflows/container-promote.yml` then verifies that digest from a
+clean runner — anonymously first, to prove public availability, exactly as
+`docker/release-verify.sh` is documented above to check — before applying the
+`sha-<revision>` and `<version>` tags and recording the digest in the
+release notes (see "Deploy a published image by digest" above). Both are
+reusable `workflow_call` workflows; neither builds or pushes image layers
+more than once per release, and a verification failure skips promotion, so no
+release tag is ever applied to an unverified digest.
+
+### First publication: making the GHCR package public (one time, irreversible)
+
+GHCR creates a new container package as **private** the first time any
+workflow pushes to it, even though the source repository is public and even
+though every later push reuses that same package. Until this is fixed,
+`container-promote.yml`'s anonymous verification step fails every release,
+with `docker/release-verify.sh` reporting that the pull "without credentials
+failed ...; the GHCR package must be made public before release verification
+can pass."
+
+Fixing it is a one-time, two-part manual step — not something a workflow can
+do for itself:
+
+1. An organization owner allows package creation for the organization, so
+   Actions is permitted to publish and later expose packages under it.
+2. A package admin opens the `quorum` package's own settings (distinct from
+   the repository's settings) and changes its visibility to **Public**.
+
+GitHub treats that visibility change as irreversible: once a package is made
+public, it cannot be made private again. Do this once, before the first
+release this pipeline promotes; every later push to the same package keeps
+the visibility a package admin already set.
