@@ -21,6 +21,9 @@ pub const MAX_CHILDREN: usize = 8;
 /// planner's retry feedback (`MAX_REJECTION_SUMMARY_BYTES`) is derived from
 /// this bound so a complete child rejection is never dropped at persistence.
 pub const ATTEMPT_SUMMARY_MAX_BYTES: usize = 8 * 1024;
+/// Lifecycle event emitted on `task#<source>` when a planner blocker holds a
+/// graph. The body names the blocker category and a bounded summary.
+pub const PLANNER_BLOCKER_HOLD_EVENT: &str = "decomposition_planner_blocker";
 const MAX_CLEANUP_ARTIFACT_BYTES: usize = 4096;
 
 type MaterializationSource = (i64, i64, i64, i64, String, Option<String>, Option<String>);
@@ -883,6 +886,14 @@ pub fn bind_frozen_base_and_enter_planning(
     Ok(changed == 1)
 }
 
+/// Bounded, NUL-free lifecycle text for a planner blocker hold. The summary
+/// already carries the planner's evidence and required decision; the whole
+/// body is capped at [`ATTEMPT_SUMMARY_MAX_BYTES`] on a UTF-8 char boundary.
+fn planner_blocker_event_body(category: &str, summary: &str) -> String {
+    let body = format!("planner blocker {category}: {summary}").replace('\0', "\u{FFFD}");
+    crate::tasks::truncate_utf8(&body, ATTEMPT_SUMMARY_MAX_BYTES)
+}
+
 /// Record one bounded planning result. A valid blocker holds immediately and
 /// consumes neither retry budget. Returns the new ordinal for retry attempts.
 pub fn record_attempt(
@@ -950,6 +961,13 @@ pub fn record_attempt(
                 summary,
                 now
             ],
+        )?;
+        crate::events::emit(
+            &tx,
+            PLANNER_BLOCKER_HOLD_EVENT,
+            &format!("task#{source_id}"),
+            &planner_blocker_event_body(reason_code, summary),
+            now,
         )?;
         tx.commit().map_err(map_sql_err)?;
         return Ok(Some(ordinal));
@@ -5343,6 +5361,106 @@ mod tests {
             "SELECT state,freeze_active,proposal_attempts,provider_failures FROM task_decompositions WHERE id=?1",
             [graph], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
         assert_eq!(state, ("held".into(), 0, 0, 0));
+    }
+
+    fn planner_blocker_events(conn: &Connection, source: i64) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT body FROM events WHERE kind=?1 AND subject=?2 ORDER BY seq")
+            .unwrap();
+        stmt.query_map(
+            params![PLANNER_BLOCKER_HOLD_EVENT, format!("task#{source}")],
+            |r| r.get(0),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn planner_blocker_hold_logs_one_bounded_event_and_surfaces_in_task_get() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        assert!(crate::tasks::get_with_notes(&conn, 1)
+            .unwrap()
+            .unwrap()
+            .planner_hold
+            .is_none());
+        // Multi-byte summary exactly at the cap: the prefixed event body must
+        // be truncated on a char boundary and stay within the shared bound.
+        let summary = format!("{}\0", "é".repeat((ATTEMPT_SUMMARY_MAX_BYTES - 1) / 2));
+        assert!(summary.len() <= ATTEMPT_SUMMARY_MAX_BYTES);
+        assert_eq!(
+            record_attempt(
+                &mut conn,
+                graph,
+                "blocker",
+                "external_constraint",
+                &summary,
+                4
+            )
+            .unwrap(),
+            Some(1)
+        );
+        let events = planner_blocker_events(&conn, 1);
+        assert_eq!(events.len(), 1, "exactly one hold event");
+        let body = &events[0];
+        assert!(body.starts_with("planner blocker external_constraint: éé"));
+        assert!(body.len() <= ATTEMPT_SUMMARY_MAX_BYTES, "{}", body.len());
+        assert!(!body.contains('\0'));
+        let state: (String, String) = conn
+            .query_row(
+                "SELECT d.state,t.status FROM task_decompositions d
+                 JOIN tasks t ON t.id=d.source_task_id WHERE d.id=?1",
+                [graph],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state.0, "held");
+        let hold = crate::tasks::get_with_notes(&conn, 1)
+            .unwrap()
+            .unwrap()
+            .planner_hold
+            .expect("planner hold surfaced");
+        assert_eq!(hold.graph_id, graph);
+        assert_eq!(hold.category, "external_constraint");
+        assert_eq!(hold.summary, summary);
+        // A replay against the held graph is a clean loss and logs nothing.
+        assert_eq!(
+            record_attempt(&mut conn, graph, "blocker", "external_constraint", "x", 5).unwrap(),
+            None
+        );
+        assert_eq!(planner_blocker_events(&conn, 1).len(), 1);
+    }
+
+    #[test]
+    fn exhaustion_hold_is_not_reported_as_planner_blocker() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        for now in [4, 5] {
+            record_attempt(
+                &mut conn,
+                graph,
+                "provider",
+                "planner-provider",
+                "boom",
+                now,
+            )
+            .unwrap();
+        }
+        let code: String = conn
+            .query_row(
+                "SELECT hold_code FROM task_decompositions WHERE id=?1 AND state='held'",
+                [graph],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(code, "provider-attempts-exhausted");
+        assert!(planner_blocker_events(&conn, 1).is_empty());
+        assert!(crate::tasks::get_with_notes(&conn, 1)
+            .unwrap()
+            .unwrap()
+            .planner_hold
+            .is_none());
     }
 
     fn accepted_columns(conn: &Connection, graph: i64) -> (String, Option<String>, Option<String>) {
