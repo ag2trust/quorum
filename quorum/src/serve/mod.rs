@@ -5431,6 +5431,27 @@ fn runner_retry_turn(refs: Option<&str>) -> Option<PendingTurn> {
     (turn.provider == resolved.to_string()).then_some(turn)
 }
 
+/// Whether a stored requested retry turn may resume its exact provider
+/// session under the current durable worker assignment. A configured profile
+/// must still carry the turn's runner/model/effort, and the assignment must
+/// name that same provider, model, and effort. Anything else would splice the
+/// stored provider's session into a different route.
+fn retry_turn_resumable(
+    config: &ServeConfig,
+    assignment: &quorum_core::role_assignments::RoleAssignment,
+    turn: &PendingTurn,
+) -> bool {
+    let configured = config.model_profiles.values().any(|profile| {
+        profile.runner == turn.provider
+            && profile.model == turn.model
+            && profile.effort == turn.effort
+    });
+    configured
+        && assignment.provider == turn.provider
+        && assignment.model == turn.model
+        && assignment.effort == turn.effort
+}
+
 /// A Grok provider block is durable authority that its exact pending turn
 /// must be retried. A Done row written before its worker was reaped cannot
 /// override that authority during late-completion recovery: doing so would
@@ -25798,7 +25819,9 @@ async fn spawn_worker(
 /// A parked task is excluded from dispatch, so a refusal that recurs on every
 /// launch attempt parks once instead of looping each tick. A failed park is a
 /// DB failure: the claim may still be held, so runtime state is retained for
-/// lease/restart recovery and the error is returned.
+/// lease/restart recovery and the error is returned. A clean-negative refusal
+/// (`record_error = false`, e.g. a lost race) settles identically but writes
+/// no `errors` row.
 #[allow(clippy::too_many_arguments)]
 async fn refuse_claimed_worker_launch(
     config: &ServeConfig,
@@ -25812,10 +25835,13 @@ async fn refuse_claimed_worker_launch(
     worker_session_log: &mut Option<session_log::SessionLog>,
     reason: &str,
     resume_status: &str,
+    record_error: bool,
 ) -> Result<bool> {
     let db_path = &config.db_path;
     log(&format!("task #{task_id}: {reason}"));
-    persist_provisioning_failure(db_path, task_id, reason).await;
+    if record_error {
+        persist_provisioning_failure(db_path, task_id, reason).await;
+    }
     if let Err(error) = park_task_result(db_path, task_id, reason, resume_status).await {
         log(&format!(
             "FATAL: failed to park task #{task_id} after refused worker launch: {error}"
@@ -26718,7 +26744,7 @@ async fn spawn_admitted_worker(
     // the checkout and the name. Each one settles through the same park +
     // release path; none may escape as a tick error with the claim held.
     macro_rules! refuse_launch {
-        ($reason:expr) => {
+        (@settle $record_error:expr, $reason:expr) => {
             return refuse_claimed_worker_launch(
                 config,
                 wt_mgr,
@@ -26731,8 +26757,15 @@ async fn spawn_admitted_worker(
                 &mut worker_session_log,
                 &$reason,
                 if retrying_rework { "rework" } else { "open" },
+                $record_error,
             )
             .await
+        };
+        (clean $reason:expr) => {
+            refuse_launch!(@settle false, $reason)
+        };
+        ($reason:expr) => {
+            refuse_launch!(@settle true, $reason)
         };
     }
 
@@ -26772,14 +26805,62 @@ async fn spawn_admitted_worker(
         "model routing: task #{} complexity {} -> profile {} ({}/{})",
         task.id, complexity, assignment.profile_id, resolved_model, resolved_effort
     ));
-    let retry_turn = runner_retry_turn(task.refs.as_deref());
-    if let Some(retry) = &retry_turn {
-        if retry.model != resolved_model || retry.effort != resolved_effort {
-            refuse_launch!(format!(
-                "worker launch refused: runner retry identity {}/{} does not match durable \
-                 role assignment {}/{}",
-                retry.model, retry.effort, resolved_model, resolved_effort
-            ));
+    let mut retry_turn = runner_retry_turn(task.refs.as_deref());
+    if let Some(retry) = retry_turn
+        .as_ref()
+        .filter(|retry| !retry_turn_resumable(config, &assignment, retry))
+        .cloned()
+    {
+        // The stored exact turn names a provider/model/effort the current
+        // durable assignment cannot resume. Drop that turn (and its provider
+        // continuation) atomically, then launch a fresh initial worker turn
+        // on the current assignment from the already-resumed task branch.
+        let dropped = format!("{}/{}/{}", retry.provider, retry.model, retry.effort);
+        let p = db_path.clone();
+        let holder = agent_name.clone();
+        let profile_id = assignment.profile_id.clone();
+        let task_id = task.id;
+        let discarded = tokio::task::spawn_blocking(
+            move || -> Result<(tasks::RunnerRetryDiscard, Option<String>)> {
+                let mut conn = quorum_core::db::open(&p)?;
+                let outcome = tasks::discard_unresumable_runner_retry(
+                    &mut conn,
+                    task_id,
+                    &holder,
+                    &retry,
+                    &profile_id,
+                    now_unix(),
+                )?;
+                let refs = tasks::get(&conn, task_id)?.and_then(|task| task.refs);
+                Ok((outcome, refs))
+            },
+        )
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))
+        .and_then(|result| result);
+        match discarded {
+            Ok((tasks::RunnerRetryDiscard::Discarded, refs)) => {
+                log(&format!(
+                    "task #{}: discarded unresumable runner retry {dropped} for worker profile \
+                     {}; launching a fresh worker",
+                    task.id, assignment.profile_id
+                ));
+                retry_turn = None;
+                task.refs = refs;
+            }
+            Ok((tasks::RunnerRetryDiscard::NoLongerMatching, _)) => {
+                // Clean negative: the stored turn changed under this claim.
+                // Settle the claim without recording an internal error.
+                refuse_launch!(clean String::from(
+                    "worker launch refused: unresumable runner retry turn changed \
+                     concurrently before it could be discarded"
+                ));
+            }
+            Err(error) => {
+                refuse_launch!(format!(
+                    "worker launch refused: unresumable runner retry discard failed: {error}"
+                ));
+            }
         }
     }
 
@@ -38443,29 +38524,26 @@ mod tests {
         let _ = workers.pop().unwrap().kill_and_reap().await;
     }
 
-    /// Real git checkout and DB: a worker launch refused after the atomic
-    /// claim (here, a stored runner retry whose identity no longer matches the
-    /// durable role assignment) parks the task with that specific reason and
-    /// releases the claim, checkout, journal row and name, instead of
-    /// escaping as a tick error that leaves a phantom claimed task.
     #[cfg(unix)]
-    async fn assert_post_claim_launch_refusal_parks(status: &str) {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        let remote = dir.path().join("remote.git");
-        let git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8_lossy(&output.stdout).into_owned()
-        };
+    fn launch_test_git(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// A real repo with a bare `origin` holding one `main` commit.
+    #[cfg(unix)]
+    fn launch_test_repo(root: &Path) -> PathBuf {
+        let repo = root.join("repo");
+        let remote = root.join("remote.git");
         assert!(std::process::Command::new("git")
             .args(["init", "--bare", "-q", "--initial-branch=main"])
             .arg(&remote)
@@ -38473,6 +38551,7 @@ mod tests {
             .unwrap()
             .success());
         std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| launch_test_git(&repo, args);
         git(&["init", "-q"]);
         git(&["config", "user.email", "test@example.com"]);
         git(&["config", "user.name", "test"]);
@@ -38483,6 +38562,19 @@ mod tests {
         git(&["remote", "add", "origin", remote.to_str().unwrap()]);
         git(&["push", "-q", "origin", "main"]);
         git(&["fetch", "-q", "origin"]);
+        repo
+    }
+
+    /// Real git checkout and DB: a worker launch refused after the atomic
+    /// claim (here, a worker role assignment that cannot be resolved) parks
+    /// the task with that specific reason and releases the claim, checkout,
+    /// journal row and name, instead of escaping as a tick error that leaves
+    /// a phantom claimed task.
+    #[cfg(unix)]
+    async fn assert_post_claim_launch_refusal_parks(status: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = launch_test_repo(dir.path());
+        let git = |args: &[&str]| launch_test_git(&repo, args);
 
         let runner_program = live_fallback_runner(dir.path());
         let mut config = live_fallback_test_config(
@@ -38492,8 +38584,9 @@ mod tests {
             Arc::new(TimedOutPreReviewChecks),
         );
         config.worktree_base = dir.path().join("worktrees");
-        // No configured profile uses this model, so the retry identity can
-        // never match the durable worker assignment.
+        // Without a worker pool for the task's complexity the durable role
+        // assignment fails only after the claim succeeded.
+        config.routing.worker.remove("3");
         let refs = serde_json::json!({
             "cx_est": 3,
             "cx_size": "M",
@@ -38568,7 +38661,7 @@ mod tests {
             .as_str()
             .unwrap_or_default();
         assert!(
-            reason.contains("runner retry identity gpt-5.6-retired/low does not match durable"),
+            reason.contains("worker role assignment failed"),
             "the park reason names the specific refusal: {parked}"
         );
         assert_eq!(parked[tasks::PARKED_RESUME_STATUS_REF], status);
@@ -38579,7 +38672,7 @@ mod tests {
                         (SELECT count(*) FROM agent_runs WHERE task_id=?2),
                         (SELECT count(*) FROM journal WHERE task_id=?2),
                         (SELECT count(*) FROM errors WHERE source='provisioning'
-                           AND detail LIKE '%runner retry identity%')",
+                           AND detail LIKE '%worker role assignment failed%')",
                 rusqlite::params![tasks::lease_target(task_id), task_id],
                 |row| {
                     Ok((
@@ -38619,6 +38712,376 @@ mod tests {
     #[tokio::test]
     async fn rework_worker_launch_refused_after_claim_parks_resuming_rework() {
         assert_post_claim_launch_refusal_parks("rework").await;
+    }
+
+    const RETRY_TEST_CLAUDE_MODEL: &str = "claude-sonnet-4-6";
+    const RETRY_TEST_STORED_PROMPT: &str = "continue the exact stored turn";
+
+    /// A fake Claude runner that records its argv, then stays alive.
+    #[cfg(unix)]
+    fn retry_test_claude_runner(root: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let program = root.join("fake-claude");
+        let args = root.join("claude-args");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}.tmp'\nmv '{0}.tmp' '{0}'\nexec sleep 30\n",
+                args.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (program, args)
+    }
+
+    #[cfg(unix)]
+    async fn retry_test_wait_for_args(args: &Path) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(args) {
+                return text;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake Claude runner never recorded its arguments"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Claude-only routing: a single `c-claude` profile serves every role.
+    #[cfg(unix)]
+    fn claude_only_retry_test_config(root: &Path, repo: &Path, runner: &Path) -> ServeConfig {
+        let mut config = live_fallback_test_config(
+            root.join("retry-discard.db"),
+            repo,
+            runner,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        config.worktree_base = root.join("worktrees");
+        config.model_profiles = std::collections::BTreeMap::from([(
+            "c-claude".into(),
+            crate::serve_config::ModelProfile {
+                runner: "claude".into(),
+                model: RETRY_TEST_CLAUDE_MODEL.into(),
+                effort: "high".into(),
+            },
+        )]);
+        let pool = std::collections::BTreeMap::from([("c-claude".to_string(), 100)]);
+        config.routing = crate::serve_config::RoutingPolicy {
+            classifier: pool.clone(),
+            planner: pool.clone(),
+            arbiter: pool.clone(),
+            collector: pool.clone(),
+            worker: (1..=5)
+                .map(|level| (level.to_string(), pool.clone()))
+                .collect(),
+            reviewer: (1..=5)
+                .map(|level| (level.to_string(), pool.clone()))
+                .collect(),
+        };
+        config
+    }
+
+    #[cfg(unix)]
+    fn seed_retry_test_task(config: &ServeConfig, status: &str, retry: serde_json::Value) -> i64 {
+        let refs = serde_json::json!({
+            "cx_est": 3,
+            "cx_size": "M",
+            "cx_ready": true,
+            "cx_not_ready_reason": null,
+            "cx_by": "test:v2",
+            "runner_retry": retry,
+        })
+        .to_string();
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "retry dispatch task",
+            Some("dispatch the stored retry"),
+            0,
+            None,
+            Some(&refs),
+            None,
+            None,
+            now_unix(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status=?2 WHERE id=?1",
+            rusqlite::params![task_id, status],
+        )
+        .unwrap();
+        task_id
+    }
+
+    #[cfg(unix)]
+    async fn dispatch_retry_test_worker(config: &ServeConfig) -> (Vec<SlotState>, bool) {
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+        let spawned = spawn_worker(
+            config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut poison,
+            &mut skips,
+            &mut roster,
+        )
+        .await
+        .expect("dispatch must not escape as a tick error");
+        (workers, spawned)
+    }
+
+    /// Task #367 shape: a requested Codex retry carrying a provider thread
+    /// while only Claude profiles are configured. Dispatch drops the exact
+    /// turn and its continuation atomically and launches a fresh Claude worker
+    /// on the current assignment instead of refusing the launch.
+    #[cfg(unix)]
+    async fn assert_unresumable_codex_retry_launches_fresh_claude_worker(status: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = launch_test_repo(dir.path());
+        let (runner, args_path) = retry_test_claude_runner(dir.path());
+        let config = claude_only_retry_test_config(dir.path(), &repo, &runner);
+        let turn_kind = if status == "rework" {
+            "rework"
+        } else {
+            "initial"
+        };
+        let task_id = seed_retry_test_task(
+            &config,
+            status,
+            serde_json::json!({
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "medium",
+                "prompt": RETRY_TEST_STORED_PROMPT,
+                "turn_kind": turn_kind,
+                "continuation_id": "thread-stored",
+                "requested": true
+            }),
+        );
+        {
+            let conn = quorum_core::db::open(&config.db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET refs=json_set(refs, '$.runner_continuation',
+                     json_object('provider','codex','id','thread-stored'))
+                 WHERE id=?1",
+                [task_id],
+            )
+            .unwrap();
+        }
+
+        let (mut workers, spawned) = dispatch_retry_test_worker(&config).await;
+        assert!(spawned, "the unresumable retry launches a fresh worker");
+        assert_eq!(workers.len(), 1);
+        let slot = &workers[0];
+        assert!(matches!(slot.proc, SlotProcess::Running(_)));
+        assert_eq!(slot.model, RETRY_TEST_CLAUDE_MODEL);
+        assert_eq!(slot.process_kind(), runner::AgentKind::Claude);
+        assert_eq!(
+            slot.continuation_id, None,
+            "no stored continuation is spliced"
+        );
+        assert_eq!(slot.pending_turn_kind, "initial");
+        assert_ne!(slot.pending_prompt, RETRY_TEST_STORED_PROMPT);
+        assert!(
+            slot.pending_prompt.contains("retry dispatch task"),
+            "the fresh worker prompt is built on the current task: {}",
+            slot.pending_prompt
+        );
+        let args = retry_test_wait_for_args(&args_path).await;
+        assert!(
+            !args.contains("thread-stored"),
+            "the discarded Codex thread must never reach the Claude spawn: {args}"
+        );
+        assert!(
+            args.contains(&slot.session_id),
+            "fresh Claude session: {args}"
+        );
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        // A provider-retry rework claim keeps `rework`; an open claim works.
+        let held_status = if status == "rework" {
+            "rework"
+        } else {
+            "working"
+        };
+        assert_eq!(task.status, held_status);
+        assert_eq!(task.assignee.as_deref(), Some(slot.agent_name.as_str()));
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(runner_state::RETRY_REF).is_none(), "{refs}");
+        assert!(refs.get(runner_state::CONTINUATION_REF).is_none(), "{refs}");
+        assert_eq!(
+            daemon_rework_retry_requested(task.refs.as_deref()),
+            status == "rework",
+            "a rework discard stays a parked rework retry: {refs}"
+        );
+        let notes: Vec<String> = conn
+            .prepare("SELECT body FROM task_notes WHERE task_id=?1 AND agent='daemon'")
+            .unwrap()
+            .query_map([task_id], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("codex/gpt-5.6-sol") && notes[0].contains("c-claude"),
+            "{notes:?}"
+        );
+        let errors: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM errors WHERE detail LIKE '%runner retry%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(errors, 0);
+        drop(conn);
+        let _ = workers.pop().unwrap().kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_unresumable_codex_retry_launches_fresh_claude_worker() {
+        assert_unresumable_codex_retry_launches_fresh_claude_worker("open").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rework_unresumable_codex_retry_launches_fresh_claude_worker() {
+        assert_unresumable_codex_retry_launches_fresh_claude_worker("rework").await;
+    }
+
+    /// A stored Claude retry matching the assignment and a configured profile
+    /// still resumes its exact turn: same prompt, same continuation id, and
+    /// the stored retry is not discarded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn matching_claude_retry_resumes_exact_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = launch_test_repo(dir.path());
+        let (runner, _) = retry_test_claude_runner(dir.path());
+        let config = claude_only_retry_test_config(dir.path(), &repo, &runner);
+        let task_id = seed_retry_test_task(
+            &config,
+            "rework",
+            serde_json::json!({
+                "provider": "claude",
+                "model": RETRY_TEST_CLAUDE_MODEL,
+                "effort": "high",
+                "prompt": RETRY_TEST_STORED_PROMPT,
+                "turn_kind": "rework",
+                "continuation_id": "claude-session-stored",
+                "requested": true
+            }),
+        );
+
+        let (mut workers, spawned) = dispatch_retry_test_worker(&config).await;
+        assert!(spawned);
+        assert_eq!(workers.len(), 1);
+        let slot = &workers[0];
+        assert_eq!(slot.pending_prompt, RETRY_TEST_STORED_PROMPT);
+        assert_eq!(
+            slot.continuation_id.as_deref(),
+            Some("claude-session-stored")
+        );
+        assert_eq!(slot.pending_turn_kind, "rework");
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(runner_state::RETRY_REF).is_some(), "{refs}");
+        let discard_notes: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM task_notes WHERE task_id=?1
+                   AND body LIKE 'runner retry discarded%'",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(discard_notes, 0);
+        drop(conn);
+        let _ = workers.pop().unwrap().kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retry_turn_resumable_requires_configured_profile_and_assignment_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = claude_only_retry_test_config(dir.path(), dir.path(), dir.path());
+        let assignment = quorum_core::role_assignments::RoleAssignment {
+            id: 1,
+            responsibility_key: "worker:1:r0".into(),
+            task_id: Some(1),
+            pr_number: None,
+            role: "worker".into(),
+            review_stage: None,
+            complexity: Some("3".into()),
+            profile_id: "c-claude".into(),
+            provider: "claude".into(),
+            runner: "claude".into(),
+            model: RETRY_TEST_CLAUDE_MODEL.into(),
+            effort: "high".into(),
+            pool_key: "worker.3".into(),
+            policy_generation: "g".into(),
+            created_at: 0,
+        };
+        let turn = |provider: &str, model: &str, effort: &str| PendingTurn {
+            provider: provider.into(),
+            model: model.into(),
+            effort: effort.into(),
+            prompt: "p".into(),
+            turn_kind: "rework".into(),
+            continuation_id: Some("c".into()),
+            requested: true,
+        };
+        assert!(retry_turn_resumable(
+            &config,
+            &assignment,
+            &turn("claude", RETRY_TEST_CLAUDE_MODEL, "high")
+        ));
+        // No configured profile carries the stored identity.
+        assert!(!retry_turn_resumable(
+            &config,
+            &assignment,
+            &turn("codex", "gpt-5.6-sol", "medium")
+        ));
+        // Effort mismatch with the assignment and every configured profile.
+        assert!(!retry_turn_resumable(
+            &config,
+            &assignment,
+            &turn("claude", RETRY_TEST_CLAUDE_MODEL, "low")
+        ));
+        // A configured profile matches, but the assignment's provider differs.
+        let mut config = config;
+        config.model_profiles.insert(
+            "x-codex".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.6-sol".into(),
+                effort: "medium".into(),
+            },
+        );
+        assert!(!retry_turn_resumable(
+            &config,
+            &assignment,
+            &turn("codex", "gpt-5.6-sol", "medium")
+        ));
+        // The assignment matches, but no configured profile does any more.
+        config.model_profiles.clear();
+        assert!(!retry_turn_resumable(
+            &config,
+            &assignment,
+            &turn("claude", RETRY_TEST_CLAUDE_MODEL, "high")
+        ));
     }
 
     #[cfg(unix)]
