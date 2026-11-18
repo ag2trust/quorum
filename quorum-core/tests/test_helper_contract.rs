@@ -5,8 +5,9 @@ use std::time::Duration;
 use support::protocol::{
     AcquireDaemonLockInput, AllocateRoleInput, ApplyGraphEventInput, Barrier,
     CancelSourceGraphInput, ClaimCleanupInput, ClaimProviderRetryReworkInput, ClaimTaskInput,
-    GraphEvent, MaterializeAssessmentInput, Operation, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS,
-    EXIT_USAGE, MAX_INPUT_BYTES,
+    DiscardRunnerRetryInput, GraphEvent, MaterializeAssessmentInput, Operation, PendingTurnInput,
+    RetryProviderBlockedInput, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE,
+    MAX_INPUT_BYTES,
 };
 
 fn file_db() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -99,6 +100,44 @@ fn every_scaffolded_operation_runs_in_the_dedicated_executable() {
                     ttl: 60,
                     now: 10,
                     barrier: open_barrier(dir.path(), "provider-retry"),
+                },
+            )
+            .unwrap(),
+            EXIT_NEGATIVE,
+        ),
+        (
+            support::run(
+                Operation::RetryProviderBlocked,
+                &RetryProviderBlockedInput {
+                    db_path: db_path.clone(),
+                    task_id: 999,
+                    by: "operator".into(),
+                    now: 10,
+                    barrier: open_barrier(dir.path(), "task-retry"),
+                },
+            )
+            .unwrap(),
+            EXIT_NEGATIVE,
+        ),
+        (
+            support::run(
+                Operation::DiscardRunnerRetry,
+                &DiscardRunnerRetryInput {
+                    db_path: db_path.clone(),
+                    task_id: 999,
+                    holder: "worker".into(),
+                    expected_turn: PendingTurnInput {
+                        provider: "codex".into(),
+                        model: "gpt-5".into(),
+                        effort: "high".into(),
+                        prompt: "finish".into(),
+                        turn_kind: "rework".into(),
+                        continuation_id: Some("thread".into()),
+                        requested: true,
+                    },
+                    new_profile_id: "profile-b".into(),
+                    now: 10,
+                    barrier: open_barrier(dir.path(), "discard-retry"),
                 },
             )
             .unwrap(),

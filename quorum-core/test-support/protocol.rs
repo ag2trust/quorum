@@ -28,10 +28,12 @@ pub enum Operation {
     MaterializeAssessment,
     AcquireDaemonLock,
     AdmitGraph,
+    RetryProviderBlocked,
+    DiscardRunnerRetry,
 }
 
 impl Operation {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::AllocateRole,
         Self::ClaimTask,
         Self::ClaimProviderRetryRework,
@@ -41,6 +43,8 @@ impl Operation {
         Self::MaterializeAssessment,
         Self::AcquireDaemonLock,
         Self::AdmitGraph,
+        Self::RetryProviderBlocked,
+        Self::DiscardRunnerRetry,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -54,6 +58,8 @@ impl Operation {
             Self::MaterializeAssessment => "materialize-assessment",
             Self::AcquireDaemonLock => "acquire-daemon-lock",
             Self::AdmitGraph => "admit-graph",
+            Self::RetryProviderBlocked => "retry-provider-blocked",
+            Self::DiscardRunnerRetry => "discard-runner-retry",
         }
     }
 }
@@ -108,6 +114,42 @@ pub struct ClaimProviderRetryReworkInput {
     pub task_id: i64,
     pub agent: String,
     pub ttl: i64,
+    pub now: i64,
+    pub barrier: Barrier,
+}
+
+/// The core `task-retry` path: activate a provider-blocked pending turn.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryProviderBlockedInput {
+    pub db_path: PathBuf,
+    pub task_id: i64,
+    pub by: String,
+    pub now: i64,
+    pub barrier: Barrier,
+}
+
+/// Exact pending turn identity, mirroring `quorum_core::runner_state::PendingTurn`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingTurnInput {
+    pub provider: String,
+    pub model: String,
+    pub effort: String,
+    pub prompt: String,
+    pub turn_kind: String,
+    pub continuation_id: Option<String>,
+    pub requested: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscardRunnerRetryInput {
+    pub db_path: PathBuf,
+    pub task_id: i64,
+    pub holder: String,
+    pub expected_turn: PendingTurnInput,
+    pub new_profile_id: String,
     pub now: i64,
     pub barrier: Barrier,
 }

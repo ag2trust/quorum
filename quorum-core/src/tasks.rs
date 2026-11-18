@@ -7237,6 +7237,128 @@ pub fn retry_provider_blocked(
     Ok(Some(task))
 }
 
+/// Outcome of [`discard_unresumable_runner_retry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerRetryDiscard {
+    /// The exact pending turn was dropped and one daemon note was appended.
+    Discarded,
+    /// Clean negative: the task, holder, or stored turn no longer matches
+    /// (for example a concurrent `task-retry` won, or the turn was already
+    /// discarded). Nothing was written.
+    NoLongerMatching,
+}
+
+/// Upper bound for the holder and profile identities echoed into the note.
+const RUNNER_RETRY_DISCARD_IDENT_MAX_BYTES: usize = 256;
+
+fn validate_runner_retry_discard_ident(label: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > RUNNER_RETRY_DISCARD_IDENT_MAX_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(QuorumError::BadInput(format!(
+            "{label} must be 1..={RUNNER_RETRY_DISCARD_IDENT_MAX_BYTES} bytes without \
+             NUL or control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Atomically drop a requested runner retry turn that the task's current
+/// worker profile cannot resume.
+///
+/// In one `BEGIN IMMEDIATE` transaction this re-reads the task refs and
+/// requires the stored requested turn (neutral `runner_retry` or historical
+/// `codex_retry_*`) to equal `expected_turn` exactly. The guarded
+/// `UPDATE … RETURNING` then compares the whole refs text that was read, the
+/// status, and that `holder` is still the assignee or the live lease holder,
+/// so any concurrent change to the turn is a zero-row clean negative.
+///
+/// On success the retry, its provider block, and the worker continuation are
+/// removed in both representations (see
+/// [`runner_state::discard_provider_retry`]), and one daemon note names the
+/// dropped provider/model/effort and `new_profile_id`. A `rework` task also
+/// gains [`PARKED_REWORK_RETRY_REF`], which every predicate that admitted the
+/// requested `runner_retry` (`claim_provider_retry_rework`, the lapsed-lease
+/// sweep exemption) also admits, so the task stays claimable by a fresh worker
+/// after a daemon restart. A second call on the cleared turn no longer
+/// matches, so the discard happens at most once per stored turn.
+pub fn discard_unresumable_runner_retry(
+    conn: &mut Connection,
+    task_id: i64,
+    holder: &str,
+    expected_turn: &PendingTurn,
+    new_profile_id: &str,
+    now: i64,
+) -> Result<RunnerRetryDiscard> {
+    validate_runner_retry_discard_ident("holder", holder)?;
+    validate_runner_retry_discard_ident("new profile id", new_profile_id)?;
+    let tx = begin_immediate(conn)?;
+    let current = tx
+        .query_row(
+            "SELECT status, refs FROM tasks WHERE id=?1",
+            params![task_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let Some((status, Some(refs_raw))) = current else {
+        return Ok(RunnerRetryDiscard::NoLongerMatching);
+    };
+    let Ok(mut refs) = serde_json::from_str::<serde_json::Value>(&refs_raw) else {
+        return Ok(RunnerRetryDiscard::NoLongerMatching);
+    };
+    if !refs.is_object() || runner_state::requested_retry_any(&refs).as_ref() != Some(expected_turn)
+    {
+        return Ok(RunnerRetryDiscard::NoLongerMatching);
+    }
+    runner_state::discard_provider_retry(&mut refs);
+    if status == "rework" {
+        refs[PARKED_REWORK_RETRY_REF] = serde_json::Value::Bool(true);
+    }
+    let discarded = tx
+        .query_row(
+            "UPDATE tasks SET refs=?2, updated_at=?3
+             WHERE id=?1 AND status=?4 AND refs=?5
+               AND (
+                   assignee=?6
+                   OR EXISTS (
+                       SELECT 1 FROM claims c
+                       WHERE c.target=?7 AND c.holder=?6
+                         AND c.active=1 AND c.expires_at > ?3
+                   )
+               )
+             RETURNING id",
+            params![
+                task_id,
+                refs.to_string(),
+                now,
+                status,
+                refs_raw,
+                holder,
+                lease_target(task_id),
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if discarded.is_none() {
+        return Ok(RunnerRetryDiscard::NoLongerMatching);
+    }
+    let turn = expected_turn;
+    add_note_tx(
+        &tx,
+        "daemon",
+        task_id,
+        &format!(
+            "runner retry discarded: pending {} turn on {}/{} (effort {}) is not resumable \
+             by worker profile {new_profile_id}; the next worker turn starts fresh",
+            turn.turn_kind, turn.provider, turn.model, turn.effort,
+        ),
+        now,
+    )?;
+    tx.commit()?;
+    Ok(RunnerRetryDiscard::Discarded)
+}
+
 // ── target branch ────────────────────────────────────────────────────────────
 
 /// One-time resolution of a task's target branch. Succeeds only when the
@@ -16405,6 +16527,341 @@ mod tests {
         assert!(retry_provider_blocked(&mut conn, id, "operator", 14)
             .unwrap()
             .is_none());
+    }
+
+    fn requested_codex_retry() -> PendingTurn {
+        PendingTurn {
+            provider: "codex".into(),
+            model: "gpt-5".into(),
+            effort: "high".into(),
+            prompt: "finish exact turn".into(),
+            turn_kind: "rework".into(),
+            continuation_id: Some("thread-neutral".into()),
+            requested: true,
+        }
+    }
+
+    fn discard_notes(conn: &Connection, id: i64) -> Vec<(String, String)> {
+        conn.prepare("SELECT agent, body FROM task_notes WHERE task_id=?1 ORDER BY id")
+            .unwrap()
+            .query_map(params![id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn error_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM errors", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn discard_refs(conn: &Connection, id: i64) -> serde_json::Value {
+        serde_json::from_str(get(conn, id).unwrap().unwrap().refs.as_deref().unwrap()).unwrap()
+    }
+
+    /// A claimed `working` task whose requested neutral Codex retry also left
+    /// historical Codex keys and a worker continuation behind.
+    fn claimed_task_with_requested_retry(conn: &mut Connection) -> i64 {
+        let id = create(conn, "owner", "task", None, 0, None, None, None, None, 10).unwrap();
+        claim(conn, "worker", Some(id), &[], TTL, 11).unwrap();
+        let mut refs = serde_json::json!({
+            "pr": 420,
+            crate::runner_state::CONTINUATION_REF: {"provider": "codex", "id": "thread-neutral"},
+            "codex_thread_id": "thread-old",
+            "codex_retry_requested": true,
+            "codex_retry_model": "gpt-5",
+            "codex_retry_effort": "high",
+            "codex_retry_prompt": "finish exact turn",
+            "codex_retry_turn_kind": "rework",
+            "codex_retry_thread_id": "thread-old"
+        });
+        refs[crate::runner_state::RETRY_REF] =
+            serde_json::to_value(requested_codex_retry()).unwrap();
+        update_refs_daemon(conn, id, &refs.to_string(), 12).unwrap();
+        id
+    }
+
+    fn assert_runner_retry_absent(refs: &serde_json::Value) {
+        for key in [
+            crate::runner_state::RETRY_REF,
+            crate::runner_state::CONTINUATION_REF,
+            crate::runner_state::PROVIDER_BLOCK_REF,
+            "codex_thread_id",
+            "codex_provider_blocked",
+            "codex_provider_error",
+            "codex_retry_requested",
+            "codex_retry_model",
+            "codex_retry_effort",
+            "codex_retry_prompt",
+            "codex_retry_turn_kind",
+            "codex_retry_thread_id",
+        ] {
+            assert!(refs.get(key).is_none(), "{key} survived discard: {refs}");
+        }
+    }
+
+    #[test]
+    fn unresumable_runner_retry_discard_clears_turn_and_notes_once() {
+        let (_dir, mut conn) = open_tmp();
+        let id = claimed_task_with_requested_retry(&mut conn);
+
+        let outcome = discard_unresumable_runner_retry(
+            &mut conn,
+            id,
+            "worker",
+            &requested_codex_retry(),
+            "worker.M.claude-opus",
+            13,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, RunnerRetryDiscard::Discarded);
+        let task = get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.status, "working");
+        assert_eq!(task.assignee.as_deref(), Some("worker"));
+        let refs = discard_refs(&conn, id);
+        assert_runner_retry_absent(&refs);
+        assert_eq!(refs["pr"], 420);
+        assert!(refs.get(PARKED_REWORK_RETRY_REF).is_none());
+        let notes = discard_notes(&conn, id);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].0, "daemon");
+        for fragment in ["codex/gpt-5", "effort high", "worker.M.claude-opus"] {
+            assert!(notes[0].1.contains(fragment), "note {:?}", notes[0].1);
+        }
+
+        // Bounded: the cleared turn can never be discarded (or noted) again.
+        let again = discard_unresumable_runner_retry(
+            &mut conn,
+            id,
+            "worker",
+            &requested_codex_retry(),
+            "worker.M.claude-opus",
+            14,
+        )
+        .unwrap();
+        assert_eq!(again, RunnerRetryDiscard::NoLongerMatching);
+        assert_eq!(discard_notes(&conn, id).len(), 1);
+        assert_eq!(discard_refs(&conn, id), refs);
+        assert_eq!(error_rows(&conn), 0);
+    }
+
+    #[test]
+    fn unresumable_runner_retry_discard_mismatch_is_clean_negative() {
+        let (_dir, mut conn) = open_tmp();
+        let id = claimed_task_with_requested_retry(&mut conn);
+        let before = get(&conn, id).unwrap().unwrap();
+
+        let mut mismatches = Vec::new();
+        for (field, edit) in [
+            (
+                "provider",
+                (|t: &mut PendingTurn| t.provider = "claude".into()) as fn(&mut _),
+            ),
+            ("model", |t| t.model = "gpt-4".into()),
+            ("effort", |t| t.effort = "low".into()),
+            ("prompt", |t| t.prompt = "other".into()),
+            ("turn_kind", |t| t.turn_kind = "initial".into()),
+            ("continuation", |t| {
+                t.continuation_id = Some("thread-x".into())
+            }),
+            ("no continuation", |t| t.continuation_id = None),
+            ("not requested", |t| t.requested = false),
+        ] {
+            let mut turn = requested_codex_retry();
+            edit(&mut turn);
+            mismatches.push((field.to_string(), "worker", turn));
+        }
+        mismatches.push(("holder".into(), "other-worker", requested_codex_retry()));
+        for (label, holder, turn) in &mismatches {
+            let outcome =
+                discard_unresumable_runner_retry(&mut conn, id, holder, turn, "profile-b", 13)
+                    .unwrap();
+            assert_eq!(outcome, RunnerRetryDiscard::NoLongerMatching, "{label}");
+        }
+        assert_eq!(
+            discard_unresumable_runner_retry(
+                &mut conn,
+                id + 100,
+                "worker",
+                &requested_codex_retry(),
+                "profile-b",
+                13
+            )
+            .unwrap(),
+            RunnerRetryDiscard::NoLongerMatching
+        );
+
+        let after = get(&conn, id).unwrap().unwrap();
+        assert_eq!(after.refs, before.refs);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert!(discard_notes(&conn, id).is_empty());
+        assert_eq!(error_rows(&conn), 0);
+    }
+
+    #[test]
+    fn unresumable_runner_retry_discard_loses_to_prior_task_retry() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 10,
+        )
+        .unwrap();
+        claim(&mut conn, "worker", Some(id), &[], TTL, 11).unwrap();
+        // A provider block that coexists with a requested turn: both the
+        // operator retry and the discard are individually admissible.
+        let mut refs = serde_json::json!({
+            crate::runner_state::PROVIDER_BLOCK_REF: {"provider": "codex", "reason": "quota"},
+        });
+        refs[crate::runner_state::RETRY_REF] =
+            serde_json::to_value(requested_codex_retry()).unwrap();
+        update_refs_daemon(&mut conn, id, &refs.to_string(), 12).unwrap();
+
+        retry_provider_blocked(&mut conn, id, "operator", 13)
+            .unwrap()
+            .expect("task-retry wins first");
+        let after_retry = get(&conn, id).unwrap().unwrap();
+
+        let outcome = discard_unresumable_runner_retry(
+            &mut conn,
+            id,
+            "worker",
+            &requested_codex_retry(),
+            "profile-b",
+            14,
+        )
+        .unwrap();
+        assert_eq!(outcome, RunnerRetryDiscard::NoLongerMatching);
+        assert_eq!(get(&conn, id).unwrap().unwrap().refs, after_retry.refs);
+        assert!(discard_notes(&conn, id).is_empty());
+        assert_eq!(error_rows(&conn), 0);
+    }
+
+    #[test]
+    fn unresumable_runner_retry_discard_clears_legacy_only_codex_record() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 10,
+        )
+        .unwrap();
+        claim(&mut conn, "worker", Some(id), &[], TTL, 11).unwrap();
+        let legacy = serde_json::json!({
+            "codex_thread_id": "thread-old",
+            "codex_retry_requested": true,
+            "codex_retry_model": "gpt-5",
+            "codex_retry_effort": "medium",
+            "codex_retry_prompt": "finish",
+            "codex_retry_turn_kind": "rework",
+            "codex_retry_thread_id": "thread-old"
+        });
+        update_refs_daemon(&mut conn, id, &legacy.to_string(), 12).unwrap();
+        let turn = crate::runner_state::requested_retry_any(&legacy).unwrap();
+
+        let outcome =
+            discard_unresumable_runner_retry(&mut conn, id, "worker", &turn, "profile-b", 13)
+                .unwrap();
+
+        assert_eq!(outcome, RunnerRetryDiscard::Discarded);
+        let refs = discard_refs(&conn, id);
+        assert_runner_retry_absent(&refs);
+        assert!(
+            crate::runner_state::continuation(&refs, ContinuationSlot::Worker, "codex").is_none()
+        );
+        let notes = discard_notes(&conn, id);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].1.contains("codex/gpt-5 (effort medium)"));
+        assert!(notes[0].1.contains("profile-b"));
+    }
+
+    #[test]
+    fn unresumable_rework_retry_discard_stays_claimable_after_restart() {
+        let (_dir, mut conn) = open_tmp();
+        let mut refs = serde_json::json!({
+            "pr": 77,
+            "cx_est": 3, "cx_size": "M", "cx_ready": true,
+            "cx_not_ready_reason": null, "cx_by": "test:v2"
+        });
+        refs[crate::runner_state::RETRY_REF] =
+            serde_json::to_value(requested_codex_retry()).unwrap();
+        let id = create(
+            &mut conn,
+            "owner",
+            "rework retry",
+            None,
+            0,
+            None,
+            Some(&refs.to_string()),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='rework', assignee=NULL WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        claim_provider_retry_rework(&mut conn, "worker", id, TTL, 11)
+            .unwrap()
+            .expect("requested runner retry admits the first worker");
+
+        let outcome = discard_unresumable_runner_retry(
+            &mut conn,
+            id,
+            "worker",
+            &requested_codex_retry(),
+            "profile-b",
+            12,
+        )
+        .unwrap();
+        assert_eq!(outcome, RunnerRetryDiscard::Discarded);
+        let refs = discard_refs(&conn, id);
+        assert_runner_retry_absent(&refs);
+        assert_eq!(refs[PARKED_REWORK_RETRY_REF], true);
+
+        // Daemon restart: the dead worker's lease lapses and recovery drops
+        // its assignment. The sweep must not reap the task out of `rework`,
+        // and a fresh worker must still be admitted.
+        conn.execute("UPDATE tasks SET assignee=NULL WHERE id=?1", params![id])
+            .unwrap();
+        let later = 12 + TTL + crate::sweep::REWORK_PROVISIONING_GRACE_SECS;
+        {
+            let tx = begin_immediate(&mut conn).unwrap();
+            crate::sweep::sweep_on_write(&tx, later, SWEEP_LIMIT).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(get(&conn, id).unwrap().unwrap().status, "rework");
+        let fresh = claim_provider_retry_rework(&mut conn, "fresh-worker", id, TTL, later + 1)
+            .unwrap()
+            .expect("discarded rework retry must stay claimable by a fresh worker");
+        assert_eq!(fresh.status, "rework");
+        assert_eq!(fresh.assignee.as_deref(), Some("fresh-worker"));
+        assert_eq!(error_rows(&conn), 0);
+    }
+
+    #[test]
+    fn unresumable_runner_retry_discard_rejects_unsafe_identities() {
+        let (_dir, mut conn) = open_tmp();
+        let id = claimed_task_with_requested_retry(&mut conn);
+        for (holder, profile) in [
+            ("worker", "bad\0profile"),
+            ("worker", ""),
+            ("bad\nholder", "profile-b"),
+        ] {
+            let error = discard_unresumable_runner_retry(
+                &mut conn,
+                id,
+                holder,
+                &requested_codex_retry(),
+                profile,
+                13,
+            )
+            .unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+        }
+        assert!(discard_notes(&conn, id).is_empty());
+        assert!(discard_refs(&conn, id)
+            .get(crate::runner_state::RETRY_REF)
+            .is_some());
     }
 
     #[test]
