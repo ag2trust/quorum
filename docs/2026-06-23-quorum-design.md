@@ -2974,8 +2974,10 @@ graph's activation: the transaction rolls back every child insert, and the daemo
 graph and fails its source like any other materialization blocker, under the distinct hold code
 `max-active-graphs-reached` (lost graph/source authority stays `materialization-authority-lost`).
 The Arbiter-approved plan is not kept; the operator raises the limit or lets graphs complete,
-then re-files or rescopes the source. The exhaustion-path terminal-leaf fallback, when refused the
-same way, parks the graph exactly as when no fallback applies. The daemon's
+then re-files or rescopes the source. Materialization checks the counted limit under the write
+lock before inserting any child, so a refusal never leaves partial children or member rows; the
+exhaustion-path terminal-leaf fallback, when refused the same way, therefore parks the graph as
+`proposal-attempts-exhausted` exactly as when no fallback applies. The daemon's
 `planning_candidate` selects sources by `priority DESC, id ASC` only while fewer than the limit
 are counted; the core guard remains the authority. `max_active_graphs` is daemon configuration
 threaded into each call, not stored in the database.

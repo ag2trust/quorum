@@ -1734,6 +1734,23 @@ fn materialize_terminal_children_in_tx(
     if existing_active {
         return Ok(None);
     }
+    // Counted-limit admission runs before any child insert. The exhaustion
+    // fallback shares the caller's rejection transaction and commits it on a
+    // refusal (to park the graph), so a refusal discovered only after the
+    // inserts would commit orphan children and members. Under the held write
+    // lock this read and the guarded activation UPDATE below see the same
+    // counted set; the UPDATE remains the authority.
+    let admitted: bool = tx.query_row(
+        &format!(
+            "SELECT (SELECT COUNT(*) FROM task_decompositions other
+                     WHERE other.id!=?1 AND {COUNTED_GRAPH_PREDICATE}) < ?2"
+        ),
+        params![graph_id, graph_limit(max_active_graphs)?],
+        |r| r.get(0),
+    )?;
+    if !admitted {
+        return Ok(None);
+    }
     let source_dependencies: HashSet<i64> = source_depends_on
         .as_deref()
         .map(serde_json::from_str::<Vec<i64>>)
@@ -1822,7 +1839,10 @@ fn materialize_terminal_children_in_tx(
     }
     // Activation converts this graph's planning authority into `active`, so it
     // is already counted: the guard counts only the *other* counted graphs and
-    // never double-counts this one. Zero rows is a clean lost race.
+    // never double-counts this one. The aggregate read and admission check
+    // above ran under this same write lock, so zero rows here would mean the
+    // children were inserted without authority: fail loudly so every caller
+    // rolls the whole transaction back instead of committing orphans.
     let activated = tx
         .query_row(
             &format!(
@@ -1839,7 +1859,9 @@ fn materialize_terminal_children_in_tx(
         )
         .optional()?;
     if activated.is_none() {
-        return Ok(None);
+        return Err(QuorumError::Io(
+            "graph activation refused after admission under the write lock".into(),
+        ));
     }
     tx.execute(
         "UPDATE tasks SET status='decomposed',updated_at=?2
@@ -6316,6 +6338,115 @@ mod tests {
             )
             .unwrap();
         assert_eq!(audit_count, 0);
+    }
+
+    /// Negative (PR #952 review): the exhaustion fallback shares the rejection
+    /// transaction, which commits on a refused activation to park the graph. A
+    /// limit lowered below the counted set must refuse *before* any child
+    /// insert, so the park commits zero children and zero members and the
+    /// graph holds as `proposal-attempts-exhausted` like a no-fallback park.
+    #[test]
+    fn limit_refused_exhaustion_fallback_parks_without_orphan_children() {
+        let (_dir, mut conn, source2) = active_graph_and_second_source();
+        let graph = begin_second(&mut conn, source2, 2).expect("admitted under limit 2");
+        assert!(set_frozen_phase(
+            &mut conn,
+            graph,
+            "freeze-requested",
+            "preclassifying",
+            None,
+            5
+        )
+        .unwrap());
+        let tasks_before: i64 = conn
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+
+        for (index, phase) in ["preclassifying", "validating"].iter().enumerate() {
+            let ordinal = (index as i64) + 1;
+            if index > 0 {
+                assert!(set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "planning",
+                    "validating",
+                    None,
+                    100 + ordinal,
+                )
+                .unwrap());
+            }
+            conn.execute(
+                "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+                [graph],
+            )
+            .unwrap();
+            let snapshot = vec![
+                sized_snapshot_child("x-a", "L", 4),
+                sized_snapshot_child("x-b", "L", 4),
+            ];
+            // Limit lowered to 1 while the first graph is still active.
+            assert!(reject_frozen_proposal(
+                &mut conn,
+                graph,
+                phase,
+                "child-preclassification",
+                "size-only rejection",
+                AttemptEligibility {
+                    eligible: true,
+                    oversized_count: Some(2),
+                    max_oversized_cx: Some(4),
+                    total_children: Some(2),
+                },
+                Some(&snapshot),
+                1,
+                200 + ordinal
+            )
+            .unwrap());
+        }
+
+        let state: (String, i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT state,active,freeze_active,hold_code FROM task_decompositions
+                 WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (
+                "held".into(),
+                0,
+                0,
+                Some("proposal-attempts-exhausted".into())
+            )
+        );
+        assert_eq!(source_status(&conn, source2), "failed");
+        let members: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM task_graph_members WHERE graph_id=?1",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(members, 0, "a refused fallback commits no member rows");
+        let tasks_after: i64 = conn
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            tasks_after, tasks_before,
+            "a refused fallback commits no child"
+        );
+        let audit_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind=?1",
+                [TERMINAL_LEAF_FALLBACK_EVENT],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 0);
+        assert_eq!(counted_graphs(&conn), 1);
+        assert_eq!(error_rows(&conn), 0);
     }
 
     /// Replay-safety: once materialization has landed, a repeated rejection
