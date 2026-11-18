@@ -25585,6 +25585,67 @@ async fn spawn_worker(
     .await
 }
 
+/// Settle a worker launch refused after the atomic claim succeeded.
+///
+/// The refusal never escapes as a tick error while the claim is held: the
+/// specific reason is recorded in `errors`, then `tasks::park` clears the
+/// assignee, deactivates the lease and stores the parked reason in one
+/// transaction. Only after that durable settlement are the checkout (the
+/// branch is kept), the working journal row and the worker name released.
+/// A parked task is excluded from dispatch, so a refusal that recurs on every
+/// launch attempt parks once instead of looping each tick. A failed park is a
+/// DB failure: the claim may still be held, so runtime state is retained for
+/// lease/restart recovery and the error is returned.
+#[allow(clippy::too_many_arguments)]
+async fn refuse_claimed_worker_launch(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    task_id: i64,
+    agent_name: &str,
+    wt_path: &Path,
+    branch: &str,
+    release_checkout: bool,
+    worker_session_log: &mut Option<session_log::SessionLog>,
+    reason: &str,
+    resume_status: &str,
+) -> Result<bool> {
+    let db_path = &config.db_path;
+    log(&format!("task #{task_id}: {reason}"));
+    persist_provisioning_failure(db_path, task_id, reason).await;
+    if let Err(error) = park_task_result(db_path, task_id, reason, resume_status).await {
+        log(&format!(
+            "FATAL: failed to park task #{task_id} after refused worker launch: {error}"
+        ));
+        return Err(error);
+    }
+    if release_checkout {
+        let _ = release_worker_worktree(
+            config,
+            wt_mgr,
+            wt_path,
+            branch,
+            false,
+            &worktree::RecoverIdentity::new(task_id, agent_name, "launch_refused"),
+        )
+        .await;
+    }
+    if let Some(log) = worker_session_log.as_mut() {
+        log.finalize(None);
+    }
+    let journal_db = db_path.clone();
+    let journal_agent = agent_name.to_string();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&journal_db)?;
+        journal::delete(&mut conn, &journal_agent).map(|_| ())
+    })
+    .await
+    .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+    .ok();
+    guarded_worker_name_release(db_path, name_pool, agent_name, task_id).await;
+    Ok(false)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spawn_admitted_worker(
     config: &ServeConfig,
@@ -26450,13 +26511,34 @@ async fn spawn_admitted_worker(
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
     .ok();
 
-    let complexity = classifier_complexity(&task.refs).ok_or_else(|| {
-        QuorumError::Usage(format!(
-            "task #{} cannot dispatch without classifier-owned complexity",
-            task.id
-        ))
-    })?;
-    let assignment = assign_role(
+    // Every launch refusal from here until the run exists holds the claim,
+    // the checkout and the name. Each one settles through the same park +
+    // release path; none may escape as a tick error with the claim held.
+    macro_rules! refuse_launch {
+        ($reason:expr) => {
+            return refuse_claimed_worker_launch(
+                config,
+                wt_mgr,
+                name_pool,
+                task.id,
+                &agent_name,
+                &wt_path,
+                &branch,
+                sync_adoption.is_none(),
+                &mut worker_session_log,
+                &$reason,
+                if retrying_rework { "rework" } else { "open" },
+            )
+            .await
+        };
+    }
+
+    let Some(complexity) = classifier_complexity(&task.refs) else {
+        refuse_launch!(String::from(
+            "worker launch refused: task has no classifier-owned complexity"
+        ));
+    };
+    let assignment = match assign_role(
         config,
         quorum_core::role_assignments::AssignmentRequest {
             responsibility_key: worker_responsibility_key(task.id, task.revision),
@@ -26467,7 +26549,14 @@ async fn spawn_admitted_worker(
             complexity: Some(complexity.to_string()),
         },
         Some(complexity),
-    )?;
+    ) {
+        Ok(assignment) => assignment,
+        Err(error) => {
+            refuse_launch!(format!(
+                "worker launch refused: worker role assignment failed: {error}"
+            ));
+        }
+    };
     // The pre-claim gate proved an eligible alternate exists when the assigned
     // profile is cooling. Retire the assignment as a classified launch failure
     // without contacting the provider, so the existing worker fallback install
@@ -26483,10 +26572,11 @@ async fn spawn_admitted_worker(
     let retry_turn = runner_retry_turn(task.refs.as_deref());
     if let Some(retry) = &retry_turn {
         if retry.model != resolved_model || retry.effort != resolved_effort {
-            return Err(QuorumError::Io(format!(
-                "task #{} retry identity {}/{} does not match durable role assignment {}/{}",
-                task.id, retry.model, retry.effort, resolved_model, resolved_effort
-            )));
+            refuse_launch!(format!(
+                "worker launch refused: runner retry identity {}/{} does not match durable \
+                 role assignment {}/{}",
+                retry.model, retry.effort, resolved_model, resolved_effort
+            ));
         }
     }
 
@@ -26498,7 +26588,14 @@ async fn spawn_admitted_worker(
 
     let body = task.body.as_deref().unwrap_or(&task.title);
     let worker_task_context = if retry_turn.is_none() {
-        load_worker_task_context(&config.db_path, task.id).await?
+        match load_worker_task_context(&config.db_path, task.id).await {
+            Ok(context) => context,
+            Err(error) => {
+                refuse_launch!(format!(
+                    "worker launch refused: worker task context failed to load: {error}"
+                ));
+            }
+        }
     } else {
         String::new()
     };
@@ -26524,7 +26621,15 @@ async fn spawn_admitted_worker(
         prompt_text.push_str(context);
     }
 
-    let resolved_kind = resolve_worker_provider(&resolved_model)?;
+    let resolved_kind = match resolve_worker_provider(&resolved_model) {
+        Ok(kind) => kind,
+        Err(error) => {
+            refuse_launch!(format!(
+                "worker launch refused: worker provider resolution failed for model \
+                 {resolved_model}: {error}"
+            ));
+        }
+    };
 
     // Codex cannot fabricate USD cost — reject rather than silently spawn
     // with no cost enforcement.
@@ -38102,6 +38207,184 @@ mod tests {
         assert_eq!(status, "working");
         drop(conn);
         let _ = workers.pop().unwrap().kill_and_reap().await;
+    }
+
+    /// Real git checkout and DB: a worker launch refused after the atomic
+    /// claim (here, a stored runner retry whose identity no longer matches the
+    /// durable role assignment) parks the task with that specific reason and
+    /// releases the claim, checkout, journal row and name, instead of
+    /// escaping as a tick error that leaves a phantom claimed task.
+    #[cfg(unix)]
+    async fn assert_post_claim_launch_refusal_parks(status: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("state.txt"), "base\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["branch", "-M", "main"]);
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "main"]);
+        git(&["fetch", "-q", "origin"]);
+
+        let runner_program = live_fallback_runner(dir.path());
+        let mut config = live_fallback_test_config(
+            dir.path().join("launch-refusal.db"),
+            &repo,
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        config.worktree_base = dir.path().join("worktrees");
+        // No configured profile uses this model, so the retry identity can
+        // never match the durable worker assignment.
+        let refs = serde_json::json!({
+            "cx_est": 3,
+            "cx_size": "M",
+            "cx_ready": true,
+            "cx_not_ready_reason": null,
+            "cx_by": "test:v2",
+            "runner_retry": {
+                "provider": "codex",
+                "model": "gpt-5.6-retired",
+                "effort": "low",
+                "prompt": "continue the exact stored turn",
+                "turn_kind": if status == "rework" { "rework" } else { "initial" },
+                "continuation_id": "thread-stored",
+                "requested": true
+            }
+        })
+        .to_string();
+        let task_id = {
+            let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "refused worker launch",
+                Some("the stored retry no longer matches its assignment"),
+                0,
+                None,
+                Some(&refs),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status=?2 WHERE id=?1",
+                rusqlite::params![task_id, status],
+            )
+            .unwrap();
+            task_id
+        };
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+
+        // A second tick must not re-claim or loop on the refused assignment.
+        for _ in 0..2 {
+            assert!(!spawn_worker(
+                &config,
+                &wt_mgr,
+                &mut names,
+                &mut workers,
+                &mut poison,
+                &mut skips,
+                &mut roster,
+            )
+            .await
+            .expect("a post-claim launch refusal must not escape as a tick error"));
+        }
+        assert!(workers.is_empty(), "a refused launch holds no worker slot");
+        assert_eq!(names.in_use_count(), 0, "the worker name is released");
+
+        // Fresh connection: the durable state a restarted daemon observes.
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "failed", "the refused launch parks the task");
+        assert_eq!(task.assignee, None, "the claim's assignee is cleared");
+        let parked: serde_json::Value =
+            serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        let reason = parked[tasks::PARKED_REASON_REF]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            reason.contains("runner retry identity gpt-5.6-retired/low does not match durable"),
+            "the park reason names the specific refusal: {parked}"
+        );
+        assert_eq!(parked[tasks::PARKED_RESUME_STATUS_REF], status);
+        let counts: (i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM claims WHERE target=?1 AND active=1),
+                        (SELECT count(*) FROM events WHERE subject=?1 AND kind='task_claimed'),
+                        (SELECT count(*) FROM agent_runs WHERE task_id=?2),
+                        (SELECT count(*) FROM journal WHERE task_id=?2),
+                        (SELECT count(*) FROM errors WHERE source='provisioning'
+                           AND detail LIKE '%runner retry identity%')",
+                rusqlite::params![tasks::lease_target(task_id), task_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            counts,
+            (0, 1, 0, 0, 1),
+            "(active claims, claims, runs, journal rows, logged refusals)"
+        );
+        let checkouts = std::fs::read_dir(&config.worktree_base)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(checkouts, 0, "the provisioned checkout is released");
+        assert!(
+            !git(&["branch", "--list", &format!("daemon/*-t{task_id}")])
+                .trim()
+                .is_empty(),
+            "the task branch is retained for the operator's retry"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_worker_launch_refused_after_claim_parks_resuming_open() {
+        assert_post_claim_launch_refusal_parks("open").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rework_worker_launch_refused_after_claim_parks_resuming_rework() {
+        assert_post_claim_launch_refusal_parks("rework").await;
     }
 
     #[cfg(unix)]
