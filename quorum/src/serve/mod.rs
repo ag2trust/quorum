@@ -66265,7 +66265,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 ),
             );
             assert!(!harness.classifier_queue_ids(true).contains(&unclassified));
-            assert!(harness.claim_task(classified).is_none(), "{phase} freezes");
+            // Storage claims are no longer freeze-gated for unrelated tasks
+            // (source-only freeze, covered in quorum-core tasks tests); this
+            // test leaves `classified` unclaimed so the drain set is only the
+            // provider-blocked task.
 
             let mut coordinator = DecompositionCoordinator::default();
             assert!(harness.tick(&mut coordinator).await, "{phase}");

@@ -5082,23 +5082,42 @@ mod tests {
             });
 
             let retry_result = retry.join().unwrap();
-            let _bind_result = bind.join().unwrap();
+            let bind_result = bind.join().unwrap();
 
-            // The freeze guard in `retry_parked` fires under an active freeze,
-            // so retry must fail regardless of scheduling. The parked task must
-            // still be `failed`; bind may or may not have committed the base,
-            // but it cannot have done so over restored non-terminal work.
-            assert!(
-                retry_result.is_err(),
-                "iteration {iteration}: retry_parked succeeded under an active freeze"
-            );
+            // The freeze guards only its own source, so retry of this
+            // unrelated parked task restores it regardless of scheduling
+            // (owner decision 2026-11-09). Both writers serialize under
+            // BEGIN IMMEDIATE and bind rechecks quiescence atomically: either
+            // bind committed first (base captured before any restored work)
+            // or retry committed first and bind refused over the restored
+            // in-review task. Never a captured base after a lost recheck.
+            let restored = retry_result
+                .unwrap()
+                .unwrap_or_else(|| panic!("iteration {iteration}: unrelated retry refused"));
+            assert_eq!(restored.status, "in-review", "iteration {iteration}");
             let conn = crate::db::open(&path).unwrap();
-            let restored_status: String = conn
-                .query_row("SELECT status FROM tasks WHERE id=?1", [parked], |r| {
-                    r.get(0)
-                })
+            let (state, base): (String, Option<String>) = conn
+                .query_row(
+                    "SELECT state,frozen_base_sha FROM task_decompositions WHERE id=?1",
+                    [graph],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
                 .unwrap();
-            assert_eq!(restored_status, "failed", "iteration {iteration}");
+            if bind_result {
+                assert_eq!(state, "planning", "iteration {iteration}");
+                assert!(base.is_some(), "iteration {iteration}");
+            } else {
+                assert_eq!(state, "draining", "iteration {iteration}");
+                assert_eq!(base, None, "iteration {iteration}");
+                // The retry won first; the restored task keeps holding bind.
+                let sha = "0123456789abcdef0123456789abcdef01234567";
+                let mut conn = crate::db::open(&path).unwrap();
+                assert!(!bind_frozen_base_and_enter_planning(&mut conn, graph, sha, 5).unwrap());
+            }
+            let errors: i64 = conn
+                .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(errors, 0, "iteration {iteration}");
         }
     }
 

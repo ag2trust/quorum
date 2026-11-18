@@ -1364,7 +1364,7 @@ differently:
   row) with JSON naming the cap; the task stays parked and no `task_retry` event or strike
   deletion is written. `reviewer_cap_retry_refusal` is the one side-effect-free predicate
   behind both the enforcement and the CLI reason. It is silent for the earlier merged-publication,
-  policy-park, and decomposition-freeze outcomes, so those keep their existing results, and for
+  policy-park, and planning-source decomposition-freeze outcomes, so those keep their existing results, and for
   other resume stages, which still have worker or merge work before any next review.
 
 Daemon startup also reconciles bounded batches of legacy/corrupt terminal rows carrying
@@ -2949,6 +2949,17 @@ to publish to the bound PR. Every review-only task dispatches directly to review
 any classified size because it has no implementation work to decompose. A non-continuation XL task
 with `cx_est` 1–3 violates the classification rubric and is parked with an explicit
 reclassify-or-rescope reason.
+
+The planning freeze (`freeze_active=1`, unique through `one_planning_freeze`) remains the
+one-planner-run-at-a-time sentinel, but its claim and retry authority is scoped to its own source
+task (owner decision 2026-11-09). Inside the claim's `BEGIN IMMEDIATE` transaction, the
+`status='open'` branch of both the by-id claim and the selector excludes only a task that is the
+`source_task_id` of a graph with `freeze_active=1`; the source is additionally in `planning`, so
+it is never claimed as an implementation task. Unrelated open standalone tasks and another graph's
+ready children stay claimable while a graph plans, and lost races remain clean negatives with no `errors` row. Likewise
+`task-retry` (`retry_parked`) refuses with a usage error only when restoring that planning source
+to a non-terminal status; unrelated parked tasks retry normally. Reviewer attachment, rework, and
+remediation continuation are never gated by the freeze.
 
 Accepted plans materialize generated children as durable terminal leaves (`tasks.terminal_leaf=1`).
 The child admission policy intentionally differs from the root policy: a complete S, M, or L child
