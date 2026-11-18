@@ -131,6 +131,10 @@ primary = 100
 ## Decomposition: children of one graph that may be working at once. Unset
 ## defaults to cap; must be >= 1; values above cap are bounded by cap.
 # max_graph_children_working = 4
+
+## Concurrent reviewer processes (R1 + R2 + review-only). Unset defaults to
+## max(cap, 2); must be 1..=32. Excess review work waits for a free slot.
+# reviewer_cap = 4
 ";
 
 fn run() -> Result<i32> {
@@ -1665,6 +1669,14 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 file_cfg.max_graph_children_working,
                 r_cap.value,
             )?;
+            let r_reviewer_cap = serve_config::Sourced {
+                value: serve_config::resolve_reviewer_cap(file_cfg.reviewer_cap, r_cap.value)?,
+                source: if file_cfg.reviewer_cap.is_some() {
+                    serve_config::Source::File
+                } else {
+                    serve_config::Source::Default
+                },
+            };
 
             let model_profiles = file_cfg.model_profiles.clone().ok_or_else(|| {
                 QuorumError::Usage("serve config requires [model_profiles]".into())
@@ -1693,6 +1705,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 base_branch: &r_base_branch,
                 self_update_branch: &r_self_update_branch,
                 cap: &r_cap,
+                reviewer_cap: &r_reviewer_cap,
                 model_profiles: &model_profiles,
                 routing: &routing,
                 log_dir: &r_log_dir,
@@ -1807,6 +1820,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 r2_steady_state_p: r_r2_steady_state_p,
                 max_rework: r_max_rework,
                 max_graph_children_working: Some(r_max_graph_children_working),
+                reviewer_cap: r_reviewer_cap.value,
             };
             Ok(serve::run_serve(config)?)
         }

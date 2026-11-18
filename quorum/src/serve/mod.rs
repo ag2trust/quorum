@@ -786,6 +786,131 @@ impl ReviewerRespawnBackoff {
     }
 }
 
+/// Free reviewer-process slots under `reviewer_cap`. Modeled on
+/// `available_worker_slots`; every live entry in `reviewers` occupies a slot.
+fn available_reviewer_slots(reviewer_cap: usize, active_reviewers: usize) -> usize {
+    reviewer_cap.saturating_sub(active_reviewers)
+}
+
+/// How one reviewer provision is counted against `reviewer_cap`.
+///
+/// R2 policy (deadlock freedom): an R2 started by the R1-approval handoff
+/// inherits the approving R1's slot, because that R1 is still in `reviewers`
+/// at the call and is torn down immediately afterwards. An R2 therefore never
+/// waits behind the R1 it replaces. An R2 that is re-dispatched later (after a
+/// failed handoff, a restart, or an overshoot) shares the bound and is queued
+/// ahead of every R1 by `ReviewerSlotQueue`, so R1 work cannot starve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewerSlotClaim {
+    /// A new reviewer process: needs one free slot.
+    Fresh,
+    /// R1→R2 handoff: the approving R1's slot transfers to the R2.
+    InheritR1,
+}
+
+/// Free slots for a provision of kind `claim` given the live reviewer set.
+fn reviewer_slots_free(
+    reviewer_cap: usize,
+    reviewers: &[SlotState],
+    claim: ReviewerSlotClaim,
+) -> usize {
+    let occupied = match claim {
+        ReviewerSlotClaim::Fresh => reviewers.len(),
+        ReviewerSlotClaim::InheritR1 => reviewers.len().saturating_sub(1),
+    };
+    available_reviewer_slots(reviewer_cap, occupied)
+}
+
+/// Outcome of asking `ReviewerSlotQueue` for a reviewer slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewerSlotAdmission {
+    Admitted,
+    /// Admitted after at least one deferred pass.
+    AdmittedAfterDeferral,
+    /// No slot: retry on a later tick. `entered` is true only on the pass the
+    /// task joined the queue, which is the only pass that logs.
+    Deferred {
+        entered: bool,
+    },
+}
+
+impl ReviewerSlotAdmission {
+    fn admitted(self) -> bool {
+        !matches!(self, Self::Deferred { .. })
+    }
+}
+
+/// In-memory admission queue for review work that is ready to dispatch while
+/// every reviewer slot is busy. Deferral is purely in memory: no DB write, no
+/// lifecycle change, no reservation, no strike, no recovery attempt.
+///
+/// Ordering is (R2 first, then oldest task id). A waiting entry reserves its
+/// place across ticks: a task is admitted only when the free slots exceed the
+/// number of waiting entries ahead of it, so a slot freed for an older task is
+/// not taken by a younger one evaluated earlier in the same tick. Entries that
+/// stop reaching the gate (merged, closed, held, backed off) are pruned at the
+/// next `begin_pass`, so a stale entry can hold a slot idle for at most one
+/// tick. Size is bounded by the number of in-review tasks.
+#[derive(Debug, Default)]
+struct ReviewerSlotQueue {
+    /// (priority: 0 = R2, 1 = R1; task id) → reached the gate this pass.
+    waiting: std::collections::BTreeMap<(u8, i64), bool>,
+}
+
+impl ReviewerSlotQueue {
+    /// Start a dispatch pass: drop entries that did not reach the gate during
+    /// the previous pass, and mark the survivors unseen.
+    fn begin_pass(&mut self) {
+        self.waiting
+            .retain(|_, seen| std::mem::replace(seen, false));
+    }
+
+    /// Admit `task_id` when a slot is free for it, else defer it. Logs once on
+    /// entering the queue and once on dispatch after deferral.
+    fn admit(
+        &mut self,
+        task_id: i64,
+        pr: i64,
+        r2: bool,
+        free: usize,
+        reviewer_cap: usize,
+    ) -> ReviewerSlotAdmission {
+        let key = (u8::from(!r2), task_id);
+        // A role change while queued (R1 approved during a restart window)
+        // moves the entry; it is still the same deferral.
+        let was_waiting = self.waiting.remove(&key).is_some()
+            | self.waiting.remove(&(u8::from(r2), task_id)).is_some();
+        let ahead = self.waiting.range(..key).count();
+        if free > ahead {
+            if was_waiting {
+                log(&format!(
+                    "task #{task_id} PR #{pr}: reviewer slot available — dispatching deferred {}",
+                    if r2 { "R2" } else { "R1" }
+                ));
+                return ReviewerSlotAdmission::AdmittedAfterDeferral;
+            }
+            return ReviewerSlotAdmission::Admitted;
+        }
+        self.waiting.insert(key, true);
+        if !was_waiting {
+            log(&format!(
+                "task #{task_id} PR #{pr}: all {reviewer_cap} reviewer slot(s) busy — {} review \
+                 deferred (queue position {}); no lifecycle change",
+                if r2 { "R2" } else { "R1" },
+                ahead + 1
+            ));
+        }
+        ReviewerSlotAdmission::Deferred {
+            entered: !was_waiting,
+        }
+    }
+
+    #[cfg(test)]
+    fn waiting_task_ids(&self) -> Vec<i64> {
+        self.waiting.keys().map(|(_, task_id)| *task_id).collect()
+    }
+}
+
 impl ClaimSkipLogLimiter {
     fn new() -> Self {
         Self {
@@ -842,6 +967,9 @@ enum ReviewerProvisionOutcome {
         fetched: String,
     },
     Failed(String),
+    /// Every reviewer slot under `reviewer_cap` is busy. Checked before the
+    /// reservation, so nothing durable changed; retry on a later tick.
+    Deferred,
 }
 
 /// The R1 terminal telemetry for an attempted mandatory-R2 handoff. These
@@ -873,9 +1001,11 @@ fn r2_provision_disposition(
     }
     match result {
         Ok(ReviewerProvisionOutcome::Attached) => R2ProvisionDisposition::Attached,
-        Ok(ReviewerProvisionOutcome::Unavailable | ReviewerProvisionOutcome::HeadMoved { .. }) => {
-            R2ProvisionDisposition::Unavailable
-        }
+        Ok(
+            ReviewerProvisionOutcome::Unavailable
+            | ReviewerProvisionOutcome::HeadMoved { .. }
+            | ReviewerProvisionOutcome::Deferred,
+        ) => R2ProvisionDisposition::Unavailable,
         Ok(ReviewerProvisionOutcome::Failed(_)) => R2ProvisionDisposition::Error,
         Err(_) => R2ProvisionDisposition::Error,
     }
@@ -4494,6 +4624,9 @@ pub struct ServeConfig {
     /// decomposition graph may be `working` at once. `None` means the worker
     /// `cap`; values above `cap` are effectively bounded by `cap`.
     pub max_graph_children_working: Option<usize>,
+    /// Validated `reviewer_cap`: concurrent reviewer processes (R1, R2, and
+    /// review-only) the daemon may run. See `available_reviewer_slots`.
+    pub reviewer_cap: usize,
     /// Codex sandbox mode (default: "danger-full-access").
     pub codex_sandbox: String,
     /// Validated Grok adapter settings used by every managed worker launch.
@@ -12318,6 +12451,7 @@ async fn tick_loop_owning_doctor(
     let mut graph_skip_logs = ClaimSkipLogLimiter::new();
     let mut unrecordable_strikes = UnrecordableStrikes::new();
     let mut reviewer_respawn_backoff = ReviewerRespawnBackoff::new();
+    let mut reviewer_slot_queue = ReviewerSlotQueue::default();
     let mut drain_state = DrainState::new();
     let mut lifetime_roster = LifetimeRoster::new();
     let mut last_drift_check: Option<std::time::Instant> = None;
@@ -12925,6 +13059,7 @@ async fn tick_loop_owning_doctor(
             &mut graph_skip_logs,
             &mut unrecordable_strikes,
             &mut reviewer_respawn_backoff,
+            &mut reviewer_slot_queue,
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
@@ -13052,6 +13187,8 @@ async fn tick(
     unrecordable: &mut UnrecordableStrikes,
     // Bounded pause after a reviewer's no-verdict exit before re-provisioning.
     reviewer_respawn_backoff: &mut ReviewerRespawnBackoff,
+    // Ready review work deferred because every reviewer slot is busy.
+    reviewer_slot_queue: &mut ReviewerSlotQueue,
     drain_state: &mut DrainState,
     lifetime_roster: &mut LifetimeRoster,
     classifier_slot: &mut Option<classifier::ClassifierSlot>,
@@ -13694,6 +13831,10 @@ async fn tick(
                                             &role,
                                             &head_sha,
                                             false,
+                                            // The approving R1 is still at
+                                            // `reviewers[ri]` and is torn down
+                                            // below: R2 takes over its slot.
+                                            ReviewerSlotClaim::InheritR1,
                                         )
                                         .await;
                                         if matches!(
@@ -13725,6 +13866,25 @@ async fn tick(
                                                 (
                                                     true,
                                                     R2ProvisionDisposition::Attached.end_reason(),
+                                                )
+                                            }
+                                            R2ProvisionDisposition::Unavailable
+                                                if matches!(
+                                                    &r2_provision,
+                                                    Ok(ReviewerProvisionOutcome::Deferred)
+                                                ) =>
+                                            {
+                                                log(&format!(
+                                                    "R2 GATE: PR #{pr_num} — reviewer_cap {} is \
+                                                     still exceeded without the approving R1; \
+                                                     R1 approval stored, Phase 5 will dispatch R2 \
+                                                     ahead of queued R1 work",
+                                                    config.reviewer_cap
+                                                ));
+                                                (
+                                                    false,
+                                                    R2ProvisionDisposition::Unavailable
+                                                        .end_reason(),
                                                 )
                                             }
                                             R2ProvisionDisposition::Unavailable => {
@@ -17757,6 +17917,8 @@ async fn tick(
     // drives every started task toward a terminal state, which is exactly what
     // the frozen-base capture waits for.
     if !drain_state.draining {
+        // Reviewer-slot admission spans Phases 5 and 5b: one queue, one pass.
+        reviewer_slot_queue.begin_pass();
         let active_in_review = {
             let p = db_path.clone();
             tokio::task::spawn_blocking(move || -> Result<HashSet<i64>> {
@@ -17798,6 +17960,8 @@ async fn tick(
             .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))??;
             needs_reviewer_from_workers.retain(|(_, task_id, _)| reviewable.contains(task_id));
         }
+        // Oldest first, so reviewer slots go to the longest-waiting task.
+        needs_reviewer_from_workers.sort_by_key(|(_, task_id, _)| *task_id);
         let mut parked_workers: Vec<(usize, String, String)> = Vec::new();
         let mut repo_mismatch_workers: Vec<(usize, String)> = Vec::new();
         let mut pr_closed_workers: Vec<usize> = Vec::new();
@@ -17923,6 +18087,24 @@ async fn tick(
                     if reviewer_respawn_backoff.blocks(*task_id, *pr, std::time::Instant::now()) {
                         continue;
                     }
+                    // Before any reservation or CI-gate bookkeeping: a
+                    // deferral changes nothing and retries next tick.
+                    if !reviewer_slot_queue
+                        .admit(
+                            *task_id,
+                            *pr,
+                            role_str == "r2",
+                            reviewer_slots_free(
+                                config.reviewer_cap,
+                                reviewers,
+                                ReviewerSlotClaim::Fresh,
+                            ),
+                            config.reviewer_cap,
+                        )
+                        .admitted()
+                    {
+                        continue;
+                    }
                     let role = if role_str == "r2" {
                         // Look up R1 reviewer info from durable approval
                         let r1_info = {
@@ -17971,6 +18153,7 @@ async fn tick(
                         &role,
                         &head_sha,
                         false,
+                        ReviewerSlotClaim::Fresh,
                     )
                     .await
                     {
@@ -18001,7 +18184,8 @@ async fn tick(
                             defer_pre_review_after_head_move(pre_review_checks, *task_id, *pr);
                         }
                         ReviewerProvisionOutcome::Unavailable
-                        | ReviewerProvisionOutcome::Failed(_) => {}
+                        | ReviewerProvisionOutcome::Failed(_)
+                        | ReviewerProvisionOutcome::Deferred => {}
                     }
                 }
                 Err(e) => {
@@ -18011,6 +18195,10 @@ async fn tick(
                 }
             }
         }
+        // Candidates were visited by task id, not slot index: restore index
+        // order so the reverse-order removals below stay valid.
+        pr_closed_workers.sort_unstable();
+        parked_workers.sort_by_key(|(wi, _, _)| *wi);
         for &wi in pr_closed_workers.iter().rev() {
             let w = workers.remove(wi);
             cleanup_slot(config, wt_mgr, name_pool, w, None, "pr_closed").await;
@@ -18083,7 +18271,7 @@ async fn tick(
             Option<String>,
             Option<String>,
         );
-        let orphan_in_review: Vec<OrphanRow> = {
+        let mut orphan_in_review: Vec<OrphanRow> = {
             let p = db_path.clone();
             tokio::task::spawn_blocking(move || -> Result<Vec<OrphanRow>> {
                 let conn = quorum_core::db::open(&p)?;
@@ -18111,6 +18299,8 @@ async fn tick(
             .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
             .unwrap_or_default()
         };
+        // Oldest first, matching Phase 5 and the reviewer-slot queue order.
+        orphan_in_review.sort_by_key(|row| row.0);
         for (
             task_id,
             pr,
@@ -18319,6 +18509,24 @@ async fn tick(
                         ));
                         continue;
                     }
+                    // Same reviewer-slot gate as Phase 5; review-only and
+                    // restart-orphaned reviews queue with worker reviews.
+                    if !reviewer_slot_queue
+                        .admit(
+                            *task_id,
+                            *pr,
+                            role_str == "r2",
+                            reviewer_slots_free(
+                                config.reviewer_cap,
+                                reviewers,
+                                ReviewerSlotClaim::Fresh,
+                            ),
+                            config.reviewer_cap,
+                        )
+                        .admitted()
+                    {
+                        continue;
+                    }
                     let role = if role_str == "r2" {
                         let r1_info = {
                             let p = db_path.clone();
@@ -18398,6 +18606,7 @@ async fn tick(
                         &role,
                         &head_sha,
                         true,
+                        ReviewerSlotClaim::Fresh,
                     )
                     .await
                     {
@@ -18426,7 +18635,8 @@ async fn tick(
                             defer_pre_review_after_head_move(pre_review_checks, *task_id, *pr);
                         }
                         ReviewerProvisionOutcome::Unavailable
-                        | ReviewerProvisionOutcome::Failed(_) => {}
+                        | ReviewerProvisionOutcome::Failed(_)
+                        | ReviewerProvisionOutcome::Deferred => {}
                     }
                 }
                 Err(e) => {
@@ -23212,7 +23422,13 @@ async fn provision_reviewer(
     role: &ReviewRole,
     head_sha: &str,
     recover_interrupted: bool,
+    slot_claim: ReviewerSlotClaim,
 ) -> Result<ReviewerProvisionOutcome> {
+    // The reviewer-process bound shared by every spawn path. Checked before
+    // the reservation so a deferral leaves no durable trace.
+    if reviewer_slots_free(config.reviewer_cap, reviewers, slot_claim) == 0 {
+        return Ok(ReviewerProvisionOutcome::Deferred);
+    }
     let reservation = uuid::Uuid::new_v4().to_string();
     let reserved = {
         let path = config.db_path.clone();
@@ -31850,6 +32066,106 @@ mod tests {
         assert_eq!(config.graph_children_working_limit(), 6);
     }
 
+    #[test]
+    fn reviewer_slots_bound_fresh_claims_and_r2_inherits_the_r1_slot() {
+        assert_eq!(available_reviewer_slots(2, 0), 2);
+        assert_eq!(available_reviewer_slots(2, 2), 0);
+        assert_eq!(available_reviewer_slots(1, 3), 0, "overshoot saturates");
+
+        let none: Vec<SlotState> = Vec::new();
+        assert_eq!(reviewer_slots_free(1, &none, ReviewerSlotClaim::Fresh), 1);
+        let one_r1 = vec![make_dummy_slot()];
+        // reviewer_cap=1 with an R1 running: a new review must wait, but the
+        // R2 handoff from that R1 must not (it inherits the slot).
+        assert_eq!(reviewer_slots_free(1, &one_r1, ReviewerSlotClaim::Fresh), 0);
+        assert_eq!(
+            reviewer_slots_free(1, &one_r1, ReviewerSlotClaim::InheritR1),
+            1
+        );
+        let two = vec![make_dummy_slot(), make_dummy_slot()];
+        assert_eq!(
+            reviewer_slots_free(1, &two, ReviewerSlotClaim::InheritR1),
+            0,
+            "handoff still respects an overshoot beyond the replaced R1"
+        );
+    }
+
+    #[test]
+    fn reviewer_slot_queue_defers_without_spam_and_dispatches_oldest_r2_first() {
+        let mut queue = ReviewerSlotQueue::default();
+        queue.begin_pass();
+        // No free slot: three R1 reviews defer, each entering exactly once.
+        for task_id in [30, 10, 20] {
+            assert_eq!(
+                queue.admit(task_id, 100 + task_id, false, 0, 1),
+                ReviewerSlotAdmission::Deferred { entered: true }
+            );
+        }
+        assert_eq!(queue.waiting_task_ids(), vec![10, 20, 30]);
+
+        // A later tick with still no slot: deferred again, but not re-entered
+        // (so no second log line).
+        queue.begin_pass();
+        for task_id in [30, 10, 20] {
+            assert_eq!(
+                queue.admit(task_id, 100 + task_id, false, 0, 1),
+                ReviewerSlotAdmission::Deferred { entered: false }
+            );
+        }
+
+        // One slot frees. A younger task evaluated first must not take the
+        // slot reserved for the oldest waiter.
+        queue.begin_pass();
+        assert_eq!(
+            queue.admit(30, 130, false, 1, 1),
+            ReviewerSlotAdmission::Deferred { entered: false }
+        );
+        assert_eq!(
+            queue.admit(20, 120, false, 1, 1),
+            ReviewerSlotAdmission::Deferred { entered: false }
+        );
+        assert_eq!(
+            queue.admit(10, 110, false, 1, 1),
+            ReviewerSlotAdmission::AdmittedAfterDeferral
+        );
+        assert_eq!(queue.waiting_task_ids(), vec![20, 30]);
+
+        // An R2 of an already-reviewing task jumps every queued R1.
+        queue.begin_pass();
+        assert_eq!(
+            queue.admit(99, 199, true, 0, 1),
+            ReviewerSlotAdmission::Deferred { entered: true }
+        );
+        assert_eq!(
+            queue.admit(20, 120, false, 0, 1),
+            ReviewerSlotAdmission::Deferred { entered: false }
+        );
+        queue.begin_pass();
+        assert_eq!(
+            queue.admit(20, 120, false, 1, 1),
+            ReviewerSlotAdmission::Deferred { entered: false },
+            "the queued R2 is ahead of the oldest R1"
+        );
+        assert_eq!(
+            queue.admit(99, 199, true, 1, 1),
+            ReviewerSlotAdmission::AdmittedAfterDeferral
+        );
+
+        // Task 30 stopped reaching the gate (e.g. merged): it is pruned after
+        // one pass and no longer holds a slot for younger work.
+        queue.begin_pass();
+        assert_eq!(queue.waiting_task_ids(), vec![20]);
+        assert_eq!(
+            queue.admit(20, 120, false, 1, 1),
+            ReviewerSlotAdmission::AdmittedAfterDeferral
+        );
+        assert_eq!(
+            queue.admit(40, 140, false, 1, 1),
+            ReviewerSlotAdmission::Admitted
+        );
+        assert!(queue.waiting_task_ids().is_empty());
+    }
+
     fn pre_review_checks_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
         let profile = crate::serve_config::ModelProfile {
             runner: "codex".into(),
@@ -31902,6 +32218,7 @@ mod tests {
             r2_steady_state_p: 0.0,
             max_rework: quorum_core::lifecycle::REWORK_CAP,
             max_graph_children_working: None,
+            reviewer_cap: 32,
             codex_sandbox: "danger-full-access".into(),
             grok: Default::default(),
             pr_target_program: None,
@@ -34948,6 +35265,7 @@ mod tests {
             r2_steady_state_p: 0.0,
             max_rework: quorum_core::lifecycle::REWORK_CAP,
             max_graph_children_working: None,
+            reviewer_cap: 32,
             codex_sandbox: "danger-full-access".into(),
             grok: Default::default(),
             pr_target_program: None,
@@ -37355,6 +37673,7 @@ mod tests {
             &mut graph_skip_logs,
             &mut unrecordable,
             &mut reviewer_respawn_backoff,
+            &mut ReviewerSlotQueue::default(),
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
@@ -37887,6 +38206,7 @@ mod tests {
             &mut graph_skip_logs,
             &mut unrecordable,
             &mut reviewer_respawn_backoff,
+            &mut ReviewerSlotQueue::default(),
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
@@ -40290,6 +40610,7 @@ mod tests {
                         &mut graph_skip_logs,
                         &mut unrecordable,
                         &mut reviewer_respawn_backoff,
+                        &mut ReviewerSlotQueue::default(),
                         &mut drain_state,
                         &mut lifetime_roster,
                         &mut classifier_slot,
@@ -42952,6 +43273,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &mut graph_skip_logs,
             &mut unrecordable,
             &mut reviewer_respawn_backoff,
+            &mut ReviewerSlotQueue::default(),
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
@@ -43984,6 +44306,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             r2_steady_state_p: 0.0,
             max_rework: quorum_core::lifecycle::REWORK_CAP,
             max_graph_children_working: None,
+            reviewer_cap: 32,
             codex_sandbox: "danger-full-access".into(),
             grok: Default::default(),
             pr_target_program: None,
@@ -45134,6 +45457,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         &mut graph_skip_logs,
                         &mut unrecordable_strikes,
                         &mut reviewer_respawn_backoff,
+                        &mut ReviewerSlotQueue::default(),
                         &mut drain_state,
                         &mut lifetime_roster,
                         &mut classifier_slot,
@@ -45223,6 +45547,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         &mut graph_skip_logs,
                         &mut unrecordable_strikes,
                         &mut reviewer_respawn_backoff,
+                        &mut ReviewerSlotQueue::default(),
                         &mut drain_state,
                         &mut lifetime_roster,
                         &mut classifier_slot,
@@ -63702,6 +64027,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 &mut graph_skip_logs,
                 &mut unrecordable,
                 &mut reviewer_respawn_backoff,
+                &mut ReviewerSlotQueue::default(),
                 &mut drain_state,
                 &mut self.roster,
                 &mut classifier_slot,

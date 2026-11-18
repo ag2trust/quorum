@@ -237,6 +237,9 @@ declare_serve_file_config! {
     /// Children of one decomposition graph that may be `working` at once.
     /// Unset defaults to `cap`; values above `cap` are bounded by `cap`.
     max_graph_children_working: Option<i64>,
+    /// Concurrent reviewer processes the daemon may run. Unset defaults to
+    /// `max(cap, 2)`; values outside `1..=32` are bad config.
+    reviewer_cap: Option<i64>,
     /// Runner-specific Codex configuration.
     codex: Option<CodexFileConfig>,
     /// Grok adapter configuration for managed worker roles.
@@ -323,6 +326,7 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("r2_steady_state_p", ConfigKeyDisposition::Runtime),
     ("max_rework", ConfigKeyDisposition::Runtime),
     ("max_graph_children_working", ConfigKeyDisposition::Runtime),
+    ("reviewer_cap", ConfigKeyDisposition::Runtime),
     ("codex", ConfigKeyDisposition::Runtime),
     ("grok", ConfigKeyDisposition::Runtime),
     #[cfg(test)]
@@ -1002,6 +1006,35 @@ pub fn file_graph_children_working_limit(cfg: &ServeFileConfig) -> Result<i64> {
     Ok(i64::try_from(limit).unwrap_or(i64::MAX))
 }
 
+/// Inclusive bounds for `reviewer_cap`.
+pub const REVIEWER_CAP_MIN: i64 = 1;
+pub const REVIEWER_CAP_MAX: i64 = 32;
+
+/// Resolve the daemon-wide concurrent reviewer-process bound. Unset defaults
+/// to `max(cap, 2)` so a single-worker daemon can still run an R1 and an R2
+/// side by side; values outside `1..=32` are bad config.
+pub fn resolve_reviewer_cap(configured: Option<i64>, cap: usize) -> Result<usize> {
+    match configured {
+        None => Ok(cap.max(2)),
+        Some(limit) if !(REVIEWER_CAP_MIN..=REVIEWER_CAP_MAX).contains(&limit) => {
+            Err(QuorumError::Usage(format!(
+                "reviewer_cap must be between {REVIEWER_CAP_MIN} and {REVIEWER_CAP_MAX} (got {limit})"
+            )))
+        }
+        // In range 1..=32, so the conversion cannot fail.
+        Some(limit) => Ok(usize::try_from(limit).unwrap_or(1)),
+    }
+}
+
+/// Effective reviewer cap as resolved from a serve config file alone, for
+/// read-only consumers that must agree with the daemon's dispatch gate. A
+/// `--cap` passed only on the `serve` command line is not visible here.
+#[allow(dead_code)] // Exposed for read-only status consumers added independently.
+pub fn file_reviewer_cap(cfg: &ServeFileConfig) -> Result<i64> {
+    let limit = resolve_reviewer_cap(cfg.reviewer_cap, cfg.cap.unwrap_or(DEFAULT_CAP))?;
+    Ok(i64::try_from(limit).unwrap_or(i64::MAX))
+}
+
 /// Validate the owner-configured directed branch-sync pairs. The same branch
 /// rules as task targets apply, and self-sync is never meaningful.
 pub fn validate_sync_pairs(sync_pairs: &[[String; 2]]) -> Result<()> {
@@ -1319,6 +1352,7 @@ pub struct BannerData<'a> {
     pub base_branch: &'a Sourced<String>,
     pub self_update_branch: &'a Sourced<String>,
     pub cap: &'a Sourced<usize>,
+    pub reviewer_cap: &'a Sourced<usize>,
     pub model_profiles: &'a BTreeMap<String, ModelProfile>,
     pub routing: &'a RoutingPolicy,
     pub log_dir: &'a Sourced<Option<String>>,
@@ -1377,6 +1411,7 @@ pub fn banner(d: &BannerData<'_>) -> String {
         d.self_update_branch
     ));
     lines.push(format!("  cap:                       {}", d.cap));
+    lines.push(format!("  reviewer_cap:              {}", d.reviewer_cap));
     lines.push(format!(
         "  model_profiles:            {}",
         d.model_profiles.len()
@@ -2700,6 +2735,49 @@ worktree_base = "/tmp/wt"
     }
 
     #[test]
+    fn reviewer_cap_defaults_to_max_cap_two_and_rejects_out_of_range() {
+        let parse = |toml: &str| -> Option<i64> {
+            toml::from_str::<ServeFileConfig>(toml)
+                .unwrap()
+                .reviewer_cap
+        };
+        assert_eq!(resolve_reviewer_cap(None, 1).unwrap(), 2);
+        assert_eq!(resolve_reviewer_cap(None, 4).unwrap(), 4);
+        assert_eq!(resolve_reviewer_cap(parse(""), 0).unwrap(), 2);
+        assert_eq!(
+            resolve_reviewer_cap(parse("reviewer_cap = 1\n"), 4).unwrap(),
+            1
+        );
+        assert_eq!(
+            resolve_reviewer_cap(parse("reviewer_cap = 32\n"), 4).unwrap(),
+            32
+        );
+        for bad in [0, -1, 33] {
+            let err = resolve_reviewer_cap(Some(bad), 4).unwrap_err();
+            assert!(matches!(err, QuorumError::Usage(_)), "{err}");
+            assert_eq!(err.exit_code(), 2, "{err}");
+            assert!(err.to_string().contains("reviewer_cap"), "{err}");
+        }
+        assert_eq!(
+            file_reviewer_cap(&parse_cfg("")).unwrap(),
+            DEFAULT_CAP as i64
+        );
+        assert_eq!(file_reviewer_cap(&parse_cfg("cap = 1\n")).unwrap(), 2);
+        assert_eq!(
+            file_reviewer_cap(&parse_cfg("cap = 1\nreviewer_cap = 5\n")).unwrap(),
+            5
+        );
+        assert!(matches!(
+            file_reviewer_cap(&parse_cfg("reviewer_cap = 33\n")),
+            Err(QuorumError::Usage(_))
+        ));
+    }
+
+    fn parse_cfg(src: &str) -> ServeFileConfig {
+        toml::from_str::<ServeFileConfig>(src).unwrap()
+    }
+
+    #[test]
     fn max_graph_children_working_defaults_to_cap_and_rejects_non_positive() {
         let parse = |toml: &str| -> Option<i64> {
             toml::from_str::<ServeFileConfig>(toml)
@@ -2821,6 +2899,10 @@ worktree_base = "/tmp/wt"
                 value: 8,
                 source: Source::File,
             },
+            reviewer_cap: &Sourced {
+                value: 8,
+                source: Source::Default,
+            },
             model_profiles: routing_cfg.model_profiles.as_ref().unwrap(),
             routing: routing_cfg.routing.as_ref().unwrap(),
             log_dir: &Sourced {
@@ -2915,6 +2997,10 @@ worktree_base = "/tmp/wt"
             "{b}"
         );
         assert!(b.contains("8 (file)"), "cap should show file source: {b}");
+        assert!(
+            b.contains("reviewer_cap:              8 (default)"),
+            "reviewer_cap should be shown with its source: {b}"
+        );
         assert!(
             b.contains("self_update_branch:        main (default)"),
             "self-update branch should be shown with its source: {b}"

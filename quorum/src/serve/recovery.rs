@@ -1445,6 +1445,7 @@ mod tests {
             r2_steady_state_p: 0.0,
             max_rework: quorum_core::lifecycle::REWORK_CAP,
             max_graph_children_working: None,
+            reviewer_cap: 32,
             codex_sandbox: "danger-full-access".into(),
             grok: Default::default(),
             pr_target_program: None,
