@@ -1,10 +1,11 @@
 mod protocol;
 
 use protocol::{
-    AcquireDaemonLockInput, AllocateRoleInput, ApplyGraphEventInput, Barrier,
+    AcquireDaemonLockInput, AdmitGraphInput, AllocateRoleInput, ApplyGraphEventInput, Barrier,
     CancelSourceGraphInput, ClaimCleanupInput, ClaimProviderRetryReworkInput, ClaimTaskInput,
-    GraphEvent, MaterializeAssessmentInput, Operation, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS,
-    EXIT_USAGE, MAX_BARRIER_WAIT_MS, MAX_INPUT_BYTES, MAX_PATH_BYTES, MAX_TEXT_BYTES,
+    GraphAdmission, GraphEvent, MaterializeAssessmentInput, Operation, EXIT_INTERNAL,
+    EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE, MAX_BARRIER_WAIT_MS, MAX_INPUT_BYTES, MAX_PATH_BYTES,
+    MAX_TEXT_BYTES,
 };
 use quorum_core::decomposition::SourceCancellation;
 use quorum_core::error::QuorumError;
@@ -74,6 +75,7 @@ fn run() -> Result<i32, HelperError> {
         Operation::ClaimCleanup => claim_cleanup(parse(&input)?)?,
         Operation::MaterializeAssessment => materialize_assessment(parse(&input)?)?,
         Operation::AcquireDaemonLock => acquire_daemon_lock(parse(&input)?)?,
+        Operation::AdmitGraph => admit_graph(parse(&input)?)?,
     };
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -372,6 +374,61 @@ fn acquire_daemon_lock(input: AcquireDaemonLockInput) -> Result<OperationResult,
             false,
         ),
     })
+}
+
+fn admit_graph(input: AdmitGraphInput) -> Result<OperationResult, HelperError> {
+    use quorum_core::decomposition::{self, BeginPlanning, PlannedChild};
+    validate_path("database", &input.db_path)?;
+    validate_positive("target id", input.target_id)?;
+    if !(1..=100).contains(&input.max_active_graphs) {
+        return Err(HelperError::usage("max_active_graphs must be 1..=100"));
+    }
+    let mut conn = quorum_core::db::open(&input.db_path)?;
+    wait_at_barrier(&input.barrier)?;
+    let won = match input.admission {
+        GraphAdmission::BeginPlanning => decomposition::begin_planning(
+            &mut conn,
+            &BeginPlanning {
+                source_task_id: input.target_id,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: input.now,
+                max_active_graphs: input.max_active_graphs,
+            },
+        )?
+        .is_some(),
+        GraphAdmission::ReacquireFreeze => decomposition::reacquire_freeze(
+            &mut conn,
+            input.target_id,
+            input.max_active_graphs,
+            input.now,
+        )?,
+        GraphAdmission::Activate => {
+            let child = |key: &str| {
+                PlannedChild {
+                local_key: key.into(),
+                title: key.into(),
+                body: format!("deliver {key}"),
+                labels: None,
+                classification_refs: r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#.into(),
+                prerequisite_keys: Vec::new(),
+                source_dependency_ids: Vec::new(),
+            }
+            };
+            decomposition::materialize_terminal_children(
+                &mut conn,
+                input.target_id,
+                1,
+                &[child("a"), child("b")],
+                input.max_active_graphs,
+                input.now,
+            )?
+            .is_some()
+        }
+    };
+    Ok(OperationResult::race(json!({"won": won}), won))
 }
 
 fn wait_at_barrier(barrier: &Barrier) -> Result<(), HelperError> {

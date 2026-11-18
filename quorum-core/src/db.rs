@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Schema version this binary understands. Bump when adding a migration.
-pub const SCHEMA_VERSION: i64 = 83;
+pub const SCHEMA_VERSION: i64 = 84;
 
 /// SQLite per-connection busy timeout: how long the engine sleeps on a held lock before
 /// returning `SQLITE_BUSY`. 5s comfortably absorbs the BUSY window of any single in-process
@@ -1580,6 +1580,15 @@ fn migrate_txn(conn: &Connection, current: i64, fk_prior: bool) -> Result<Migrat
                 [],
             )?;
         }
+        // v84 replaces global decomposition uniqueness with counted admission
+        // (`max_active_graphs`, guarded inside BEGIN IMMEDIATE). Dropping the two
+        // partial unique indexes is idempotent and keeps every graph row.
+        if current < 84 {
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS one_active_task_graph;
+                 DROP INDEX IF EXISTS one_planning_freeze;",
+            )?;
+        }
         conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         // Integrity safety net, run while the transaction is still rollback-capable. The v57
         // rebuild preserves ids/data via INSERT…SELECT, so no reference should dangle; if one
@@ -1974,6 +1983,80 @@ mod tests {
             .unwrap();
         assert_eq!(ledger_row, (1, 200, 0, "validation".to_string()));
         assert_eq!(seeded(&reopened), expected);
+        assert_eq!(
+            migrate(&reopened).unwrap().migrated_from,
+            SCHEMA_VERSION,
+            "a current database re-enters migrate as a no-op"
+        );
+    }
+
+    /// A v83 database carries the global `one_active_task_graph` and
+    /// `one_planning_freeze` unique indexes. Upgrading with a live active graph
+    /// must drop both, keep the graph row, and a forced rerun must be a no-op.
+    #[test]
+    fn v83_to_v84_drops_global_graph_uniqueness_and_keeps_active_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v83-graph-uniqueness.db");
+        {
+            let raw = Connection::open(&path).unwrap();
+            apply_pragmas(&raw).unwrap();
+            migrate(&raw).unwrap();
+            raw.execute_batch(
+                "CREATE UNIQUE INDEX one_active_task_graph
+                     ON task_decompositions(active) WHERE active = 1;
+                 CREATE UNIQUE INDEX one_planning_freeze
+                     ON task_decompositions(freeze_active) WHERE freeze_active = 1;
+                 INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                     VALUES (1,'source','decomposed','owner',1,1);
+                 INSERT INTO task_decompositions(id,source_task_id,state,active,freeze_active,
+                     planned_source_revision,accepted_plan_revision,created_at,updated_at)
+                     VALUES (9,1,'active',1,0,1,1,1,2);
+                 PRAGMA user_version=83;",
+            )
+            .unwrap();
+        }
+        let indexes = |conn: &Connection| -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type='index'
+                     AND name IN ('one_active_task_graph','one_planning_freeze') ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let graph = |conn: &Connection| -> (i64, String, i64, i64) {
+            conn.query_row(
+                "SELECT source_task_id,state,active,accepted_plan_revision
+                 FROM task_decompositions WHERE id=9",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+        };
+        {
+            let raw = Connection::open(&path).unwrap();
+            assert_eq!(indexes(&raw).len(), 2, "fixture carries the v83 indexes");
+        }
+
+        let migrated = open(&path).unwrap();
+        assert!(indexes(&migrated).is_empty());
+        assert_eq!(graph(&migrated), (1, "active".into(), 1, 1));
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+
+        // Force the v84 branch to run again over the already-dropped indexes.
+        migrated.execute_batch("PRAGMA user_version=83;").unwrap();
+        drop(migrated);
+        let reopened = open(&path).unwrap();
+        assert!(indexes(&reopened).is_empty());
+        assert_eq!(graph(&reopened), (1, "active".into(), 1, 1));
         assert_eq!(
             migrate(&reopened).unwrap().migrated_from,
             SCHEMA_VERSION,

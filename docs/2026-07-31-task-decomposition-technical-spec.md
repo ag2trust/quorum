@@ -39,7 +39,7 @@ cannot be decomposed.
 - **Planning cycle:** durable pre-materialization state for one source revision.
 - **Task graph:** the one atomically materialized set of generated tasks and prerequisite edges.
 - **Active graph:** a materialized graph not completed or cancelled. A blocked graph remains
-  active and prevents another repository graph.
+  active and counts toward the repository's `max_active_graphs` limit.
 
 ## Lifecycle
 
@@ -186,10 +186,8 @@ CREATE TABLE task_decompositions (
   updated_at             INTEGER NOT NULL
 );
 
-CREATE UNIQUE INDEX one_active_task_graph
-  ON task_decompositions(active) WHERE active = 1;
-CREATE UNIQUE INDEX one_planning_freeze
-  ON task_decompositions(freeze_active) WHERE freeze_active = 1;
+-- v84 dropped the v35 `one_active_task_graph` / `one_planning_freeze`
+-- partial unique indexes; admission is a guarded count (below).
 ```
 
 States are `freeze-requested`, `draining`, `planning`, `validating`, `preclassifying`,
@@ -199,8 +197,16 @@ order is `planning` -> `preclassifying` (closed-book classifier) -> `validating`
 `preclassifying` into `validating` and materialization. `active=1` is set
 only for a materialized `active` or `blocked` graph. `freeze_active=1` covers the stable-repo
 planning window. `planned_source_revision` is only the captured task revision for compare-and-swap
-validation; `tasks.revision` and `tasks.edit_count` remain authoritative. Partial unique indexes
-are the race authority.
+validation; `tasks.revision` and `tasks.edit_count` remain authoritative.
+
+The race authority is a guarded count under the `BEGIN IMMEDIATE` write lock, not a unique
+index. A graph is counted while `state IN ('active','blocked') OR active=1 OR freeze_active=1`
+(`decomposition::COUNTED_GRAPH_PREDICATE`). Planning admission (`begin_planning`,
+`begin_routed_planning`) requires `(SELECT COUNT(*) … counted) < max_active_graphs` and no other
+`freeze_active=1` graph (one planner at a time); `reacquire_freeze` and the materialization
+activation `UPDATE … RETURNING` require fewer than `max_active_graphs` *other* counted graphs, so
+activation never double-counts the planning graph it converts. A lost race is a zero-row guarded
+write or false admission check → `Ok(None)`/`Ok(false)`, a clean negative with no `errors` row.
 
 ### Members, attempts, and cleanup
 

@@ -2,7 +2,8 @@
 //!
 //! Provider execution and semantic proposal validation live above this module.
 //! These functions defensively enforce the invariants that must survive races:
-//! one freeze, one active graph, source revision stability, complete all-at-once
+//! one planning freeze, at most `max_active_graphs` counted graphs, source
+//! revision stability, complete all-at-once
 //! materialization, bounded attempt ledgers, and top-down cancellation.
 
 use crate::db::{begin_immediate, map_sql_err};
@@ -203,6 +204,20 @@ fn resolve_with_nearest_existing_ancestor_inner(
     }
 }
 
+/// Graphs counted against `max_active_graphs`: materialized (`active`/`blocked`,
+/// or the `active=1` sentinel) or currently holding planning authority
+/// (`freeze_active=1`). A blocked graph counts. Unqualified columns so it binds
+/// to the innermost `task_decompositions` scope it is embedded in.
+pub const COUNTED_GRAPH_PREDICATE: &str =
+    "(state IN ('active','blocked') OR active=1 OR freeze_active=1)";
+
+/// Bind a validated `max_active_graphs` as an SQL integer. A limit that does
+/// not fit is a caller bug, not a lost race.
+fn graph_limit(max_active_graphs: usize) -> Result<i64> {
+    i64::try_from(max_active_graphs)
+        .map_err(|_| QuorumError::Usage("max_active_graphs is out of range".into()))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeginPlanning<'a> {
     pub source_task_id: i64,
@@ -211,6 +226,8 @@ pub struct BeginPlanning<'a> {
     pub model: &'a str,
     pub frozen_base_sha: &'a str,
     pub now: i64,
+    /// Admission limit: planning starts only while fewer graphs are counted.
+    pub max_active_graphs: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +238,8 @@ pub struct BeginRoutedPlanning<'a> {
     pub pool: &'a crate::role_assignments::ValidatedPool,
     pub seed: u64,
     pub now: i64,
+    /// Admission limit: planning starts only while fewer graphs are counted.
+    pub max_active_graphs: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,8 +331,13 @@ pub enum PlanningRetryOutcome {
 /// in `draining`; clear only that impossible retry state so the guarded bind
 /// can capture a fresh base. Incomplete materialized graphs with no delivery
 /// evidence reset safely; once evidence exists, inconsistency is held for
-/// owner intervention.
-pub fn reconcile_startup_graphs(conn: &mut Connection, now: i64) -> Result<StartupReconcileResult> {
+/// owner intervention. A reset graph re-enters planning through the counted
+/// `max_active_graphs` admission guard of [`reacquire_freeze`].
+pub fn reconcile_startup_graphs(
+    conn: &mut Connection,
+    max_active_graphs: usize,
+    now: i64,
+) -> Result<StartupReconcileResult> {
     let tx = begin_immediate(conn)?;
     tx.execute(
         "UPDATE task_decompositions SET frozen_base_sha=NULL,updated_at=?1
@@ -361,7 +385,7 @@ pub fn reconcile_startup_graphs(conn: &mut Connection, now: i64) -> Result<Start
             "startup found an inconsistent task graph",
             now,
         )? {
-            reacquire_freeze(conn, graph_id, now)?;
+            reacquire_freeze(conn, graph_id, max_active_graphs, now)?;
             result.reset += 1;
             continue;
         }
@@ -648,23 +672,49 @@ pub fn retry_exhausted_planning(
     })
 }
 
-/// Acquire the repository planning freeze and move one stable source revision
-/// to `planning`. `Ok(None)` is the expected result of a stale/racing request.
-pub fn begin_planning(conn: &mut Connection, input: &BeginPlanning<'_>) -> Result<Option<i64>> {
-    let tx = begin_immediate(conn)?;
+/// Admission guard shared by both planning entry points, evaluated inside the
+/// caller's `BEGIN IMMEDIATE`: the source is an eligible open revision, no
+/// reviewer provisioning is reserved, no other graph holds planning authority
+/// (the coordinator's single planning slot), and fewer than `?3` graphs are
+/// counted. A false result is a clean `Ok(None)`.
+fn planning_admissible(
+    tx: &Transaction<'_>,
+    source_task_id: i64,
+    expected_revision: i64,
+    max_active_graphs: usize,
+) -> Result<bool> {
     let branch_sync_ref = crate::tasks::BRANCH_SYNC_REF_PRESENT_SQL;
-    let eligible: bool = tx.query_row(
+    Ok(tx.query_row(
         &format!(
             "SELECT EXISTS(SELECT 1 FROM tasks
          WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
            AND review_only=0 AND continue_pr IS NULL AND terminal_leaf=0
            AND NOT {branch_sync_ref}
            AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations)
-           AND NOT EXISTS (SELECT 1 FROM task_decompositions
-                           WHERE state IN ('active','blocked') OR active=1))"
+           AND NOT EXISTS (SELECT 1 FROM task_decompositions WHERE freeze_active=1)
+           AND (SELECT COUNT(*) FROM task_decompositions
+                WHERE {COUNTED_GRAPH_PREDICATE}) < ?3)"
         ),
-        params![input.source_task_id, input.expected_revision],
+        params![
+            source_task_id,
+            expected_revision,
+            graph_limit(max_active_graphs)?
+        ],
         |row| row.get(0),
+    )?)
+}
+
+/// Acquire planning authority and move one stable source revision to
+/// `planning`, admitted only while fewer than `max_active_graphs` graphs are
+/// counted. `Ok(None)` is the expected result of a stale/racing request.
+pub fn begin_planning(conn: &mut Connection, input: &BeginPlanning<'_>) -> Result<Option<i64>> {
+    let tx = begin_immediate(conn)?;
+    let branch_sync_ref = crate::tasks::BRANCH_SYNC_REF_PRESENT_SQL;
+    let eligible = planning_admissible(
+        &tx,
+        input.source_task_id,
+        input.expected_revision,
+        input.max_active_graphs,
     )?;
     if !eligible {
         return Ok(None);
@@ -726,18 +776,11 @@ pub fn begin_routed_planning(
     }
     let tx = begin_immediate(conn)?;
     let branch_sync_ref = crate::tasks::BRANCH_SYNC_REF_PRESENT_SQL;
-    let eligible: bool = tx.query_row(
-        &format!(
-            "SELECT EXISTS(SELECT 1 FROM tasks
-         WHERE id=?1 AND status='open' AND revision=?2 AND assignee IS NULL
-           AND review_only=0 AND continue_pr IS NULL AND terminal_leaf=0
-           AND NOT {branch_sync_ref}
-           AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations)
-           AND NOT EXISTS (SELECT 1 FROM task_decompositions
-                           WHERE state IN ('active','blocked') OR active=1))"
-        ),
-        params![input.source_task_id, input.expected_revision],
-        |row| row.get(0),
+    let eligible = planning_admissible(
+        &tx,
+        input.source_task_id,
+        input.expected_revision,
+        input.max_active_graphs,
     )?;
     if !eligible {
         return Ok(None);
@@ -1040,6 +1083,7 @@ pub fn reject_frozen_proposal(
     summary: &str,
     eligibility: AttemptEligibility,
     plan_snapshot: Option<&[PlannedChild]>,
+    max_active_graphs: usize,
     now: i64,
 ) -> Result<bool> {
     if !matches!(expected_phase, "validating" | "preclassifying") {
@@ -1138,7 +1182,14 @@ pub fn reject_frozen_proposal(
              WHERE id=?1",
             params![graph_id, next_count, now],
         )?;
-        if try_terminal_leaf_fallback(&tx, graph_id, source_revision, source_id, now)? {
+        if try_terminal_leaf_fallback(
+            &tx,
+            graph_id,
+            source_revision,
+            source_id,
+            max_active_graphs,
+            now,
+        )? {
             tx.commit().map_err(map_sql_err)?;
             return Ok(true);
         }
@@ -1190,6 +1241,7 @@ fn try_terminal_leaf_fallback(
     graph_id: i64,
     source_revision: i64,
     source_id: i64,
+    max_active_graphs: usize,
     now: i64,
 ) -> Result<bool> {
     let candidate: Option<(i64, i64, i64, i64, i64, String)> = tx
@@ -1233,8 +1285,14 @@ fn try_terminal_leaf_fallback(
         QuorumError::Io(format!("stored plan snapshot did not deserialize: {error}"))
     })?;
     validate_planned_children(&children)?;
-    let materialized =
-        materialize_terminal_children_in_tx(tx, graph_id, source_revision, &children, now)?;
+    let materialized = materialize_terminal_children_in_tx(
+        tx,
+        graph_id,
+        source_revision,
+        &children,
+        max_active_graphs,
+        now,
+    )?;
     if materialized.is_none() {
         return Ok(false);
     }
@@ -1285,28 +1343,40 @@ fn try_terminal_leaf_fallback(
     Ok(true)
 }
 
-/// Reacquire the freeze before retrying a provider failure or resuming a
-/// recovery-reset aggregate. The partial unique index is the repository-wide
-/// race authority. `Ok(false)` is a normal loss.
-pub fn reacquire_freeze(conn: &mut Connection, graph_id: i64, now: i64) -> Result<bool> {
+/// Reacquire planning authority before retrying a provider failure or resuming
+/// a recovery-reset aggregate. The guarded write admits the graph only while no
+/// other graph holds planning authority and fewer than `max_active_graphs`
+/// other graphs are counted, all under the `BEGIN IMMEDIATE` write lock.
+/// `Ok(false)` is a normal loss.
+pub fn reacquire_freeze(
+    conn: &mut Connection,
+    graph_id: i64,
+    max_active_graphs: usize,
+    now: i64,
+) -> Result<bool> {
+    let limit = graph_limit(max_active_graphs)?;
     let tx = begin_immediate(conn)?;
-    let changed = tx.execute(
-        "UPDATE task_decompositions SET state='freeze-requested',freeze_active=1,updated_at=?2
+    let changed = tx
+        .query_row(
+            &format!(
+                "UPDATE task_decompositions SET state='freeze-requested',freeze_active=1,updated_at=?2
          WHERE id=?1 AND state IN ('provider-backoff','freeze-requested')
            AND active=0 AND freeze_active=0
            AND NOT EXISTS (SELECT 1 FROM reviewer_provision_reservations)
            AND NOT EXISTS (
                SELECT 1 FROM task_decompositions other
-               WHERE other.id!=?1 AND (other.state IN ('active','blocked') OR other.active=1)
-           )",
-        params![graph_id, now],
-    );
-    if matches!(&changed, Err(error) if is_unique_constraint(error)) {
-        return Ok(false);
-    }
-    let changed = changed.map_err(map_sql_err)?;
+               WHERE other.id!=?1 AND other.freeze_active=1
+           )
+           AND (SELECT COUNT(*) FROM task_decompositions other
+                WHERE other.id!=?1 AND {COUNTED_GRAPH_PREDICATE}) < ?3
+         RETURNING id"
+            ),
+            params![graph_id, now, limit],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
     tx.commit().map_err(map_sql_err)?;
-    Ok(changed == 1)
+    Ok(changed.is_some())
 }
 
 /// Advance a freeze-owning aggregate through its daemon phases. This is a
@@ -1526,6 +1596,7 @@ pub fn materialize_terminal_children(
     graph_id: i64,
     expected_source_revision: i64,
     children: &[PlannedChild],
+    max_active_graphs: usize,
     now: i64,
 ) -> Result<Option<Vec<i64>>> {
     validate_planned_children(children)?;
@@ -1535,6 +1606,7 @@ pub fn materialize_terminal_children(
         graph_id,
         expected_source_revision,
         children,
+        max_active_graphs,
         now,
     )? {
         Some(ids) => ids,
@@ -1614,6 +1686,7 @@ fn materialize_terminal_children_in_tx(
     graph_id: i64,
     expected_source_revision: i64,
     children: &[PlannedChild],
+    max_active_graphs: usize,
     now: i64,
 ) -> Result<Option<Vec<i64>>> {
     let aggregate: Option<MaterializationSource> = tx
@@ -1659,6 +1732,23 @@ fn materialize_terminal_children_in_tx(
         |r| r.get(0),
     )?;
     if existing_active {
+        return Ok(None);
+    }
+    // Counted-limit admission runs before any child insert. The exhaustion
+    // fallback shares the caller's rejection transaction and commits it on a
+    // refusal (to park the graph), so a refusal discovered only after the
+    // inserts would commit orphan children and members. Under the held write
+    // lock this read and the guarded activation UPDATE below see the same
+    // counted set; the UPDATE remains the authority.
+    let admitted: bool = tx.query_row(
+        &format!(
+            "SELECT (SELECT COUNT(*) FROM task_decompositions other
+                     WHERE other.id!=?1 AND {COUNTED_GRAPH_PREDICATE}) < ?2"
+        ),
+        params![graph_id, graph_limit(max_active_graphs)?],
+        |r| r.get(0),
+    )?;
+    if !admitted {
         return Ok(None);
     }
     let source_dependencies: HashSet<i64> = source_depends_on
@@ -1747,18 +1837,31 @@ fn materialize_terminal_children_in_tx(
             params![id, serde_json::to_string(&dependencies).unwrap()],
         )?;
     }
-    let changed = tx.execute(
-        "UPDATE task_decompositions SET state='active',active=1,freeze_active=0,
+    // Activation converts this graph's planning authority into `active`, so it
+    // is already counted: the guard counts only the *other* counted graphs and
+    // never double-counts this one. The aggregate read and admission check
+    // above ran under this same write lock, so zero rows here would mean the
+    // children were inserted without authority: fail loudly so every caller
+    // rolls the whole transaction back instead of committing orphans.
+    let activated = tx
+        .query_row(
+            &format!(
+                "UPDATE task_decompositions SET state='active',active=1,freeze_active=0,
              accepted_plan_revision=plan_revision,accepted_proposal_json=NULL,
              accepted_classifications_json=NULL,updated_at=?2
-         WHERE id=?1 AND active=0 AND freeze_active=1",
-        params![graph_id, now],
-    );
-    if matches!(&changed, Err(error) if is_unique_constraint(error)) {
-        return Ok(None);
-    }
-    if changed.map_err(map_sql_err)? != 1 {
-        return Ok(None);
+         WHERE id=?1 AND active=0 AND freeze_active=1
+           AND (SELECT COUNT(*) FROM task_decompositions other
+                WHERE other.id!=?1 AND {COUNTED_GRAPH_PREDICATE}) < ?3
+         RETURNING id"
+            ),
+            params![graph_id, now, graph_limit(max_active_graphs)?],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if activated.is_none() {
+        return Err(QuorumError::Io(
+            "graph activation refused after admission under the write lock".into(),
+        ));
     }
     tx.execute(
         "UPDATE tasks SET status='decomposed',updated_at=?2
@@ -1776,9 +1879,41 @@ pub fn materialize_graph(
     graph_id: i64,
     expected_source_revision: i64,
     children: &[PlannedChild],
+    max_active_graphs: usize,
     now: i64,
 ) -> Result<Option<Vec<i64>>> {
-    materialize_terminal_children(conn, graph_id, expected_source_revision, children, now)
+    materialize_terminal_children(
+        conn,
+        graph_id,
+        expected_source_revision,
+        children,
+        max_active_graphs,
+        now,
+    )
+}
+
+/// Classify a refused activation after the fact. Returns `true` when the
+/// graph still holds planning authority (so authority was not lost) but at
+/// least `max_active_graphs` other graphs are counted: the activation guard
+/// refused it because the limit was lowered below the counted set. This is a
+/// diagnostic read used to pick the hold reason code; the guarded activation
+/// write remains the authority.
+pub fn activation_limit_reached(
+    conn: &Connection,
+    graph_id: i64,
+    max_active_graphs: usize,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM task_decompositions
+             WHERE id=?1 AND active=0 AND freeze_active=1
+               AND state IN ('planning','validating','preclassifying')
+               AND (SELECT COUNT(*) FROM task_decompositions other
+                    WHERE other.id!=?1 AND {COUNTED_GRAPH_PREDICATE}) >= ?2)"
+        ),
+        params![graph_id, graph_limit(max_active_graphs)?],
+        |row| row.get(0),
+    )?)
 }
 
 /// Cancel a source graph and revoke all unfinished generated execution
@@ -3687,6 +3822,7 @@ mod tests {
         let graph = begin_planning(
             conn,
             &BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 provider: "codex",
@@ -3713,6 +3849,7 @@ mod tests {
         let graph = begin_planning(
             &mut conn,
             &BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 provider: "codex",
@@ -3779,7 +3916,7 @@ mod tests {
     fn exhaust_planning(conn: &mut Connection, graph: i64, kind: &str, start: i64) {
         for index in 0..MAX_PROVIDER_FAILURES {
             if index > 0 {
-                assert!(reacquire_freeze(conn, graph, start + index * 3).unwrap());
+                assert!(reacquire_freeze(conn, graph, 1, start + index * 3).unwrap());
                 assert!(set_frozen_phase(
                     conn,
                     graph,
@@ -3891,6 +4028,261 @@ mod tests {
         }
     }
 
+    /// Source 1 as a materialized `active` graph plus an eligible open source 2.
+    fn active_graph_and_second_source() -> (tempfile::TempDir, Connection, i64) {
+        let (dir, mut conn) = file_setup();
+        let graph = begin(&mut conn);
+        materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('second large','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let source2: i64 = conn
+            .query_row(
+                "SELECT max(id) FROM tasks WHERE title='second large'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (dir, conn, source2)
+    }
+
+    fn counted_graphs(conn: &Connection) -> i64 {
+        conn.query_row(
+            &format!("SELECT count(*) FROM task_decompositions WHERE {COUNTED_GRAPH_PREDICATE}"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn error_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn source_status(conn: &Connection, task: i64) -> String {
+        conn.query_row("SELECT status FROM tasks WHERE id=?1", [task], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn begin_second(conn: &mut Connection, source: i64, limit: usize) -> Option<i64> {
+        begin_planning(
+            conn,
+            &BeginPlanning {
+                max_active_graphs: limit,
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 5,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn routed_planning_admits_second_source_only_below_max_active_graphs() {
+        let (_dir, mut conn, source2) = active_graph_and_second_source();
+        let request = crate::role_assignments::AssignmentRequest {
+            responsibility_key: format!("planner:task:{source2}:revision:1"),
+            task_id: Some(source2),
+            ..planner_request()
+        };
+        let pool = planner_pool();
+        let routed = |conn: &mut Connection, limit: usize| {
+            begin_routed_planning(
+                conn,
+                &BeginRoutedPlanning {
+                    max_active_graphs: limit,
+                    source_task_id: source2,
+                    expected_revision: 1,
+                    assignment: &request,
+                    pool: &pool,
+                    seed: 7,
+                    now: 5,
+                },
+            )
+            .unwrap()
+        };
+
+        // One active graph fills a limit of 1: a clean negative that touches
+        // neither the source, the aggregate table, routing, nor `errors`.
+        assert!(routed(&mut conn, 1).is_none());
+        assert_eq!(source_status(&conn, source2), "open");
+        assert_eq!(counted_graphs(&conn), 1);
+        let assignments: i64 = conn
+            .query_row("SELECT count(*) FROM role_assignments", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            assignments, 0,
+            "a refused admission consumes no routing turn"
+        );
+        assert_eq!(error_rows(&conn), 0);
+
+        // The same source enters planning once the limit admits a second graph.
+        let (graph, _) = routed(&mut conn, 2).expect("limit 2 admits the second source");
+        assert_eq!(source_status(&conn, source2), "planning");
+        assert_eq!(counted_graphs(&conn), 2);
+        let freeze: i64 = conn
+            .query_row(
+                "SELECT freeze_active FROM task_decompositions WHERE id=?1",
+                [graph],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(freeze, 1);
+        assert_eq!(error_rows(&conn), 0);
+    }
+
+    #[test]
+    fn blocked_graph_counts_toward_max_active_graphs() {
+        let (_dir, mut conn, source2) = active_graph_and_second_source();
+        // Both blocked encodings count: the daemon's `active=1` blocked graph
+        // and a text-only `blocked` row.
+        for active in [1, 0] {
+            conn.execute(
+                "UPDATE task_decompositions SET state='blocked',active=?1 WHERE source_task_id=1",
+                [active],
+            )
+            .unwrap();
+            assert_eq!(counted_graphs(&conn), 1);
+            assert!(begin_second(&mut conn, source2, 1).is_none());
+            assert_eq!(source_status(&conn, source2), "open");
+        }
+        assert!(begin_second(&mut conn, source2, 2).is_some());
+        assert_eq!(error_rows(&conn), 0);
+    }
+
+    #[test]
+    fn planning_authority_is_single_even_below_the_limit() {
+        let (_dir, mut conn) = file_setup();
+        let first = begin_second(&mut conn, 1, 5).expect("first source plans");
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('second','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        // The coordinator has one planning slot: a second planning graph is
+        // refused even though the counted limit has room.
+        assert!(begin_second(&mut conn, 2, 5).is_none());
+        assert_eq!(source_status(&conn, 2), "open");
+        let holders: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM task_decompositions WHERE freeze_active=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(holders, 1);
+        // The same holds for a provider-backoff graph reacquiring authority.
+        conn.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+             VALUES (2,'provider-backoff',0,0,1,1,1)",
+            [],
+        )
+        .unwrap();
+        let backoff = conn.last_insert_rowid();
+        assert!(!reacquire_freeze(&mut conn, backoff, 5, 6).unwrap());
+        conn.execute(
+            "UPDATE task_decompositions SET state='cancelled',freeze_active=0 WHERE id=?1",
+            [first],
+        )
+        .unwrap();
+        assert!(reacquire_freeze(&mut conn, backoff, 5, 6).unwrap());
+        assert_eq!(error_rows(&conn), 0);
+    }
+
+    #[test]
+    fn reacquire_freeze_is_admitted_only_below_max_active_graphs() {
+        let (_dir, mut conn, source2) = active_graph_and_second_source();
+        conn.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+             VALUES (?1,'provider-backoff',0,0,1,1,1)",
+            [source2],
+        )
+        .unwrap();
+        let backoff = conn.last_insert_rowid();
+        assert!(!reacquire_freeze(&mut conn, backoff, 1, 6).unwrap());
+        let state: (String, i64) = conn
+            .query_row(
+                "SELECT state,freeze_active FROM task_decompositions WHERE id=?1",
+                [backoff],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("provider-backoff".into(), 0));
+        assert!(reacquire_freeze(&mut conn, backoff, 2, 6).unwrap());
+        assert_eq!(counted_graphs(&conn), 2);
+        assert_eq!(error_rows(&conn), 0);
+    }
+
+    #[test]
+    fn activation_does_not_double_count_and_refuses_above_the_limit() {
+        let (_dir, mut conn, source2) = active_graph_and_second_source();
+        let planning = begin_second(&mut conn, source2, 2).expect("admitted under limit 2");
+        assert!(set_frozen_phase(
+            &mut conn,
+            planning,
+            "freeze-requested",
+            "preclassifying",
+            None,
+            5
+        )
+        .unwrap());
+        let tasks_before: i64 = conn
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+
+        // A limit lowered below the counted set refuses activation cleanly and
+        // rolls back every child insert.
+        let children = [child("c", &[]), child("d", &[])];
+        assert!(materialize_graph(&mut conn, planning, 1, &children, 1, 6)
+            .unwrap()
+            .is_none());
+        let tasks_after: i64 = conn
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            tasks_after, tasks_before,
+            "a refused activation leaves no child"
+        );
+        assert_eq!(source_status(&conn, source2), "planning");
+
+        // At the limit that admitted it, activation converts the graph's own
+        // planning authority into `active` without counting itself twice.
+        assert_eq!(counted_graphs(&conn), 2);
+        assert!(materialize_graph(&mut conn, planning, 1, &children, 2, 6)
+            .unwrap()
+            .is_some());
+        assert_eq!(counted_graphs(&conn), 2);
+        let active: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM task_decompositions WHERE state='active' AND active=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 2);
+        assert_eq!(source_status(&conn, source2), "decomposed");
+        assert_eq!(error_rows(&conn), 0);
+    }
+
     #[test]
     fn routed_planning_binds_assignment_in_authority_transaction() {
         let (_dir, mut conn) = file_setup();
@@ -3899,6 +4291,7 @@ mod tests {
         let (graph, assignment) = begin_routed_planning(
             &mut conn,
             &BeginRoutedPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 assignment: &request,
@@ -3939,6 +4332,7 @@ mod tests {
                     begin_routed_planning(
                         &mut conn,
                         &BeginRoutedPlanning {
+                            max_active_graphs: 1,
                             source_task_id: 1,
                             expected_revision: 1,
                             assignment: &request,
@@ -3953,6 +4347,7 @@ mod tests {
                     begin_planning(
                         &mut conn,
                         &BeginPlanning {
+                            max_active_graphs: 1,
                             source_task_id: 1,
                             expected_revision: 1,
                             provider: "codex",
@@ -3996,6 +4391,7 @@ mod tests {
         let request = planner_request();
         let pool = planner_pool();
         let input = BeginRoutedPlanning {
+            max_active_graphs: 1,
             source_task_id: 1,
             expected_revision: 1,
             assignment: &request,
@@ -4033,6 +4429,7 @@ mod tests {
         assert!(begin_routed_planning(
             &mut conn,
             &BeginRoutedPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 assignment: &request,
@@ -4084,6 +4481,7 @@ mod tests {
                 graph,
                 1,
                 &[child("a", &[]), sized_child("b", size, cx_est)],
+                1,
                 4,
             )
             .unwrap_err();
@@ -4108,6 +4506,7 @@ mod tests {
             graph,
             1,
             &[child("a", &[]), sized_child("b", "L", 5)],
+            1,
             4,
         )
         .unwrap()
@@ -4135,6 +4534,7 @@ mod tests {
             main_graph,
             1,
             &[child("one", &[]), child("two", &[])],
+            1,
             4,
         )
         .unwrap()
@@ -4160,6 +4560,7 @@ mod tests {
             legacy_graph,
             1,
             &[child("one", &[]), child("two", &[])],
+            1,
             4,
         )
         .unwrap()
@@ -4215,7 +4616,7 @@ mod tests {
 
     fn make_reviewable_graph(conn: &mut Connection) -> (i64, Vec<i64>) {
         let graph = begin(conn);
-        let ids = materialize_graph(conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+        let ids = materialize_graph(conn, graph, 1, &[child("a", &[]), child("b", &[])], 1, 4)
             .unwrap()
             .unwrap();
         conn.execute(
@@ -4294,7 +4695,7 @@ mod tests {
                 child("three", &[]),
                 child("failed", &[]),
             ];
-            let ids = materialize_graph(&mut conn, graph, 1, &children, 4)
+            let ids = materialize_graph(&mut conn, graph, 1, &children, 1, 4)
                 .unwrap()
                 .unwrap();
             let original = ids[3];
@@ -4788,6 +5189,7 @@ mod tests {
         assert!(begin_planning(
             &mut conn,
             &BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 provider: "codex",
@@ -4803,16 +5205,22 @@ mod tests {
             graph,
             1,
             &[child("a", &[]), child("b", &["a"])],
+            1,
             4,
         )
         .unwrap()
         .unwrap();
         assert_eq!(ids.len(), 2);
-        assert!(
-            materialize_graph(&mut conn, graph, 1, &[child("c", &[]), child("d", &[])], 5)
-                .unwrap()
-                .is_none()
-        );
+        assert!(materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("c", &[]), child("d", &[])],
+            1,
+            5
+        )
+        .unwrap()
+        .is_none());
         let source: String = conn
             .query_row("SELECT status FROM tasks WHERE id=1", [], |r| r.get(0))
             .unwrap();
@@ -4834,6 +5242,7 @@ mod tests {
         let graph = begin_planning(
             &mut conn,
             &BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 provider: "codex",
@@ -4882,6 +5291,7 @@ mod tests {
         let graph = begin_planning(
             &mut conn,
             &BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 provider: "codex",
@@ -4933,6 +5343,7 @@ mod tests {
         let graph = begin_planning(
             &mut conn,
             &BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 provider: "codex",
@@ -5012,6 +5423,7 @@ mod tests {
             let graph = begin_planning(
                 &mut conn,
                 &BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id: source,
                     expected_revision: 1,
                     provider: "codex",
@@ -5104,6 +5516,7 @@ mod tests {
                     begin_planning(
                         &mut conn,
                         &BeginPlanning {
+                            max_active_graphs: 1,
                             source_task_id,
                             expected_revision: 1,
                             provider: "codex",
@@ -5173,6 +5586,7 @@ mod tests {
                 begin_planning(
                     &mut conn,
                     &BeginPlanning {
+                        max_active_graphs: 1,
                         source_task_id: source,
                         expected_revision: 1,
                         provider: "codex",
@@ -5198,6 +5612,7 @@ mod tests {
                 assert!(begin_planning(
                     &mut conn,
                     &BeginPlanning {
+                        max_active_graphs: 1,
                         source_task_id: source,
                         expected_revision: 1,
                         provider: "codex",
@@ -5221,6 +5636,7 @@ mod tests {
             graph,
             1,
             &[child("a", &["b"]), child("b", &["a"])],
+            1,
             4
         )
         .is_err());
@@ -5243,7 +5659,7 @@ mod tests {
         let mut first = child("a", &[]);
         first.source_dependency_ids = vec![2];
 
-        assert!(materialize_graph(&mut conn, graph, 1, &[first, child("b", &[])], 4).is_err());
+        assert!(materialize_graph(&mut conn, graph, 1, &[first, child("b", &[])], 1, 4).is_err());
         let children: i64 = conn
             .query_row("SELECT count(*) FROM task_graph_members", [], |r| r.get(0))
             .unwrap();
@@ -5269,7 +5685,7 @@ mod tests {
         let mut first = child("a", &[]);
         first.source_dependency_ids = vec![2];
 
-        let ids = materialize_graph(&mut conn, graph, 1, &[first, child("b", &[])], 4)
+        let ids = materialize_graph(&mut conn, graph, 1, &[first, child("b", &[])], 1, 4)
             .unwrap()
             .unwrap();
         let dependencies: String = conn
@@ -5295,7 +5711,7 @@ mod tests {
         let mut first = child("a", &[]);
         first.source_dependency_ids = vec![2];
 
-        assert!(materialize_graph(&mut conn, graph, 1, &[first, child("b", &[])], 4).is_err());
+        assert!(materialize_graph(&mut conn, graph, 1, &[first, child("b", &[])], 1, 4).is_err());
         let children: i64 = conn
             .query_row("SELECT count(*) FROM task_graph_members", [], |r| r.get(0))
             .unwrap();
@@ -5338,6 +5754,7 @@ mod tests {
         let graph = begin_planning(
             conn,
             &BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 provider: "codex",
@@ -5398,7 +5815,8 @@ mod tests {
             "blocking finding",
             AttemptEligibility::structural(),
             None,
-            7,
+            1,
+            7
         )
         .unwrap());
         assert_eq!(
@@ -5451,7 +5869,8 @@ mod tests {
             "child a rejected by preclassification: size L",
             AttemptEligibility::structural(),
             None,
-            4,
+            1,
+            4
         )
         .unwrap());
         assert_eq!(
@@ -5493,7 +5912,8 @@ mod tests {
             "two L/cx=4 children",
             eligible,
             None,
-            4,
+            1,
+            4
         )
         .unwrap());
 
@@ -5528,7 +5948,8 @@ mod tests {
             "invalid classification pairing",
             AttemptEligibility::structural(),
             None,
-            6,
+            1,
+            6
         )
         .unwrap());
         let row: (i64, Option<i64>, Option<i64>, Option<i64>) = conn
@@ -5611,7 +6032,8 @@ mod tests {
                 "size-only rejection",
                 eligibility,
                 Some(&snapshot),
-                200 + ordinal,
+                1,
+                200 + ordinal
             )
             .unwrap());
         }
@@ -5698,7 +6120,8 @@ mod tests {
                 total_children: Some(2),
             },
             Some(&best),
-            10,
+            1,
+            10
         )
         .unwrap());
 
@@ -5727,7 +6150,8 @@ mod tests {
                 total_children: Some(2),
             },
             Some(&worst),
-            21,
+            1,
+            21
         )
         .unwrap());
 
@@ -5791,7 +6215,8 @@ mod tests {
                 total_children: Some(2),
             },
             Some(&higher_cx),
-            10,
+            1,
+            10
         )
         .unwrap());
 
@@ -5819,7 +6244,8 @@ mod tests {
                 total_children: Some(2),
             },
             Some(&lower_cx),
-            21,
+            1,
+            21
         )
         .unwrap());
 
@@ -5872,7 +6298,8 @@ mod tests {
                 "XL child or structural failure",
                 AttemptEligibility::structural(),
                 None,
-                200 + ordinal,
+                1,
+                200 + ordinal
             )
             .unwrap());
         }
@@ -5911,6 +6338,115 @@ mod tests {
             )
             .unwrap();
         assert_eq!(audit_count, 0);
+    }
+
+    /// Negative (PR #952 review): the exhaustion fallback shares the rejection
+    /// transaction, which commits on a refused activation to park the graph. A
+    /// limit lowered below the counted set must refuse *before* any child
+    /// insert, so the park commits zero children and zero members and the
+    /// graph holds as `proposal-attempts-exhausted` like a no-fallback park.
+    #[test]
+    fn limit_refused_exhaustion_fallback_parks_without_orphan_children() {
+        let (_dir, mut conn, source2) = active_graph_and_second_source();
+        let graph = begin_second(&mut conn, source2, 2).expect("admitted under limit 2");
+        assert!(set_frozen_phase(
+            &mut conn,
+            graph,
+            "freeze-requested",
+            "preclassifying",
+            None,
+            5
+        )
+        .unwrap());
+        let tasks_before: i64 = conn
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+
+        for (index, phase) in ["preclassifying", "validating"].iter().enumerate() {
+            let ordinal = (index as i64) + 1;
+            if index > 0 {
+                assert!(set_frozen_phase(
+                    &mut conn,
+                    graph,
+                    "planning",
+                    "validating",
+                    None,
+                    100 + ordinal,
+                )
+                .unwrap());
+            }
+            conn.execute(
+                "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+                [graph],
+            )
+            .unwrap();
+            let snapshot = vec![
+                sized_snapshot_child("x-a", "L", 4),
+                sized_snapshot_child("x-b", "L", 4),
+            ];
+            // Limit lowered to 1 while the first graph is still active.
+            assert!(reject_frozen_proposal(
+                &mut conn,
+                graph,
+                phase,
+                "child-preclassification",
+                "size-only rejection",
+                AttemptEligibility {
+                    eligible: true,
+                    oversized_count: Some(2),
+                    max_oversized_cx: Some(4),
+                    total_children: Some(2),
+                },
+                Some(&snapshot),
+                1,
+                200 + ordinal
+            )
+            .unwrap());
+        }
+
+        let state: (String, i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT state,active,freeze_active,hold_code FROM task_decompositions
+                 WHERE id=?1",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (
+                "held".into(),
+                0,
+                0,
+                Some("proposal-attempts-exhausted".into())
+            )
+        );
+        assert_eq!(source_status(&conn, source2), "failed");
+        let members: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM task_graph_members WHERE graph_id=?1",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(members, 0, "a refused fallback commits no member rows");
+        let tasks_after: i64 = conn
+            .query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            tasks_after, tasks_before,
+            "a refused fallback commits no child"
+        );
+        let audit_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind=?1",
+                [TERMINAL_LEAF_FALLBACK_EVENT],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 0);
+        assert_eq!(counted_graphs(&conn), 1);
+        assert_eq!(error_rows(&conn), 0);
     }
 
     /// Replay-safety: once materialization has landed, a repeated rejection
@@ -5958,7 +6494,8 @@ mod tests {
                     total_children: Some(2),
                 },
                 Some(&snapshot),
-                200 + ordinal,
+                1,
+                200 + ordinal
             )
             .unwrap());
         }
@@ -5992,7 +6529,8 @@ mod tests {
                 total_children: Some(2),
             },
             Some(&snapshot),
-            999,
+            1,
+            999
         )
         .unwrap());
 
@@ -6028,9 +6566,16 @@ mod tests {
 
         assert!(accept_proposal(&mut conn, graph, "[]", 6).unwrap());
         assert!(accept_classifications(&mut conn, graph, "[]", 7).unwrap());
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 8)
-            .unwrap()
-            .unwrap();
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            8,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(ids.len(), 2);
         assert_eq!(
             accepted_columns(&conn, graph),
@@ -6077,7 +6622,8 @@ mod tests {
                 &summary,
                 AttemptEligibility::structural(),
                 None,
-                ordinal * 10 + 1,
+                1,
+                ordinal * 10 + 1
             )
             .unwrap());
 
@@ -6160,7 +6706,7 @@ mod tests {
         // Drive the remaining budget; the MAX_PROVIDER_FAILURES-th failure holds.
         for ordinal in 2..=MAX_PROVIDER_FAILURES {
             let now = 2 + ordinal * 3;
-            assert!(reacquire_freeze(&mut conn, graph, now).unwrap());
+            assert!(reacquire_freeze(&mut conn, graph, 1, now).unwrap());
             assert!(set_frozen_phase(
                 &mut conn,
                 graph,
@@ -6210,7 +6756,7 @@ mod tests {
         )
         .unwrap()
         .is_some());
-        assert!(reacquire_freeze(&mut conn, graph, 4).unwrap());
+        assert!(reacquire_freeze(&mut conn, graph, 1, 4).unwrap());
         assert!(
             set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 5,).unwrap()
         );
@@ -6226,7 +6772,8 @@ mod tests {
             "proposal exceeds its allowed size",
             AttemptEligibility::structural(),
             None,
-            7,
+            1,
+            7
         )
         .unwrap());
 
@@ -6234,7 +6781,7 @@ mod tests {
         // MAX_PROVIDER_FAILURES-th holds, leaving the proposal budget untouched.
         for ordinal in 2..=MAX_PROVIDER_FAILURES {
             if ordinal > 2 {
-                assert!(reacquire_freeze(&mut conn, graph, 6 + ordinal * 3).unwrap());
+                assert!(reacquire_freeze(&mut conn, graph, 1, 6 + ordinal * 3).unwrap());
                 assert!(set_frozen_phase(
                     &mut conn,
                     graph,
@@ -6327,7 +6874,7 @@ mod tests {
             restored,
             ("provider-backoff".into(), 0, 0, 1, None, "planning".into())
         );
-        assert!(reacquire_freeze(&mut conn, graph, 31).unwrap());
+        assert!(reacquire_freeze(&mut conn, graph, 1, 31).unwrap());
         assert!(
             set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 32,).unwrap()
         );
@@ -6397,14 +6944,14 @@ mod tests {
             [competing_source],
         )
         .unwrap();
-        assert!(!reacquire_freeze(&mut conn, graph, 32).unwrap());
+        assert!(!reacquire_freeze(&mut conn, graph, 1, 32).unwrap());
         conn.execute(
             "UPDATE task_decompositions SET state='cancelled',freeze_active=0
              WHERE source_task_id=?1",
             [competing_source],
         )
         .unwrap();
-        assert!(reacquire_freeze(&mut conn, graph, 33).unwrap());
+        assert!(reacquire_freeze(&mut conn, graph, 1, 33).unwrap());
         assert!(
             set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 34,).unwrap()
         );
@@ -6418,6 +6965,7 @@ mod tests {
             graph,
             1,
             &[child("a", &[]), child("b", &["a"])],
+            1,
             36,
         )
         .unwrap()
@@ -6449,7 +6997,7 @@ mod tests {
         )
         .unwrap()
         .is_some());
-        assert!(reacquire_freeze(&mut conn, graph, 4).unwrap());
+        assert!(reacquire_freeze(&mut conn, graph, 1, 4).unwrap());
         assert!(set_frozen_phase(
             &mut conn,
             graph,
@@ -6489,7 +7037,8 @@ mod tests {
                 "proposal rejected",
                 AttemptEligibility::structural(),
                 None,
-                ordinal * 10 + 1,
+                1,
+                ordinal * 10 + 1
             )
             .unwrap());
         }
@@ -6506,7 +7055,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(budgets, (0, 1, "provider-backoff".into()));
-        assert!(reacquire_freeze(&mut conn, graph, 41).unwrap());
+        assert!(reacquire_freeze(&mut conn, graph, 1, 41).unwrap());
         assert!(
             set_frozen_phase(&mut conn, graph, "freeze-requested", "validating", None, 42,)
                 .unwrap()
@@ -6524,7 +7073,8 @@ mod tests {
             "new rejection",
             AttemptEligibility::structural(),
             None,
-            43,
+            1,
+            43
         )
         .unwrap());
         let latest: (i64, i64) = conn
@@ -6567,7 +7117,8 @@ mod tests {
                 "carried proposal rejection",
                 AttemptEligibility::structural(),
                 None,
-                11 + attempt,
+                1,
+                11 + attempt
             )
             .unwrap());
         }
@@ -6577,7 +7128,7 @@ mod tests {
             PlanningRetryOutcome::Retried { generation: 1, .. }
         ));
 
-        assert!(reacquire_freeze(&mut conn, graph, 41).unwrap());
+        assert!(reacquire_freeze(&mut conn, graph, 1, 41).unwrap());
         assert!(
             set_frozen_phase(&mut conn, graph, "freeze-requested", "validating", None, 42,)
                 .unwrap()
@@ -6595,7 +7146,8 @@ mod tests {
             "exhaust carried proposal budget",
             AttemptEligibility::structural(),
             None,
-            43,
+            1,
+            43
         )
         .unwrap());
         let held: (String, i64, i64, i64) = conn
@@ -6632,7 +7184,7 @@ mod tests {
         for ordinal in 1..MAX_PROVIDER_FAILURES {
             let now = 7 + ordinal * 3;
             if ordinal > 1 {
-                assert!(reacquire_freeze(&mut conn, graph, now).unwrap());
+                assert!(reacquire_freeze(&mut conn, graph, 1, now).unwrap());
                 assert!(set_frozen_phase(
                     &mut conn,
                     graph,
@@ -6654,7 +7206,7 @@ mod tests {
             .unwrap()
             .is_some());
         }
-        assert!(reacquire_freeze(&mut conn, graph, 16).unwrap());
+        assert!(reacquire_freeze(&mut conn, graph, 1, 16).unwrap());
         assert!(set_frozen_phase(
             &mut conn,
             graph,
@@ -6692,7 +7244,8 @@ mod tests {
                 "proposal rejection before carried provider exhaustion",
                 AttemptEligibility::structural(),
                 None,
-                30 + attempt,
+                1,
+                30 + attempt
             )
             .unwrap());
         }
@@ -6701,7 +7254,7 @@ mod tests {
             PlanningRetryOutcome::Retried { generation: 1, .. }
         ));
 
-        assert!(reacquire_freeze(&mut conn, graph, 41).unwrap());
+        assert!(reacquire_freeze(&mut conn, graph, 1, 41).unwrap());
         assert!(
             set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 42,).unwrap()
         );
@@ -6748,7 +7301,7 @@ mod tests {
                 retry_exhausted_planning(&mut conn, 1, "operator", generation * 100).unwrap(),
                 PlanningRetryOutcome::Retried { generation: actual, .. } if actual == generation
             ));
-            assert!(reacquire_freeze(&mut conn, graph, generation * 100 + 1).unwrap());
+            assert!(reacquire_freeze(&mut conn, graph, 1, generation * 100 + 1).unwrap());
             assert!(set_frozen_phase(
                 &mut conn,
                 graph,
@@ -6919,6 +7472,7 @@ mod tests {
             begin_planning(
                 &mut conn,
                 &BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id: 1,
                     expected_revision: 1,
                     provider: "codex",
@@ -6968,7 +7522,7 @@ mod tests {
         }
         {
             let mut conn = crate::db::open(&path).unwrap();
-            assert!(reacquire_freeze(&mut conn, graph, 6).unwrap());
+            assert!(reacquire_freeze(&mut conn, graph, 1, 6).unwrap());
             assert!(
                 set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 7,)
                     .unwrap()
@@ -7011,6 +7565,7 @@ mod tests {
         let graph = begin_planning(
             &mut conn,
             &BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 provider: "codex",
@@ -7048,7 +7603,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let mut conn = crate::db::open(&path).unwrap();
                     barrier.wait();
-                    reacquire_freeze(&mut conn, graph, 6).unwrap()
+                    reacquire_freeze(&mut conn, graph, 1, 6).unwrap()
                 })
             })
             .collect();
@@ -7074,9 +7629,16 @@ mod tests {
     fn cancellation_preserves_done_member_and_revokes_unfinished() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
             .unwrap();
         conn.execute(
@@ -7105,9 +7667,16 @@ mod tests {
     fn graph_cancellation_clears_merging_member_merge_checks() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         conn.execute(
             "UPDATE tasks SET status='merging',refs='{\"pr\":7}' WHERE id=?1",
             [ids[0]],
@@ -7136,9 +7705,16 @@ mod tests {
     fn authorized_source_cancellation_derives_only_owned_unfinished_artifacts() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         conn.execute(
             "UPDATE tasks SET status='done',refs='{\"pr\":41}' WHERE id=?1",
             [ids[0]],
@@ -7243,9 +7819,16 @@ mod tests {
     fn prepublication_allocation_creates_worktree_and_discovery_intents() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         let provenance = "b".repeat(40);
         assert!(crate::branches::record_exact_allocation(
             &mut conn,
@@ -7311,9 +7894,16 @@ mod tests {
     fn source_cancellation_rejects_wrong_creator_stale_revision_and_replay() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             cancel_source_graph(&mut conn, "stranger", 1, Some(1), 5).unwrap(),
             SourceCancellation::Rejected
@@ -7340,9 +7930,16 @@ mod tests {
     fn current_source_assignee_can_cancel_but_stranger_cannot() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         conn.execute("UPDATE tasks SET assignee='delegate' WHERE id=1", [])
             .unwrap();
         assert_eq!(
@@ -7365,9 +7962,16 @@ mod tests {
     fn source_cancellation_requires_expected_revision() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         assert!(matches!(
             cancel_source_graph(&mut conn, "owner", 1, None, 5),
             Err(QuorumError::Usage(_))
@@ -7484,6 +8088,7 @@ mod tests {
         let (graph, assignment) = begin_routed_planning(
             &mut conn,
             &BeginRoutedPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 assignment: &request,
@@ -7566,6 +8171,7 @@ mod tests {
         let graph = begin_planning(
             &mut conn,
             &BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 provider: "codex",
@@ -7640,10 +8246,16 @@ mod tests {
         ] {
             let mut conn = setup();
             let graph = begin(&mut conn);
-            let ids =
-                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-                    .unwrap()
-                    .unwrap();
+            let ids = materialize_graph(
+                &mut conn,
+                graph,
+                1,
+                &[child("a", &[]), child("b", &[])],
+                1,
+                4,
+            )
+            .unwrap()
+            .unwrap();
             let result = cancel_graph(
                 &mut conn,
                 1,
@@ -7672,9 +8284,16 @@ mod tests {
     fn recovery_reset_is_refused_after_delivery_evidence() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         conn.execute("UPDATE tasks SET status='working' WHERE id=?1", [ids[0]])
             .unwrap();
         assert!(!recovery_reset(&mut conn, graph, "inconsistent", 5).unwrap());
@@ -7701,6 +8320,7 @@ mod tests {
                 graph,
                 1,
                 &[child("a", &[]), child("b", &["a"])],
+                1,
                 4,
             )
             .unwrap()
@@ -7714,7 +8334,7 @@ mod tests {
                 conn.execute("UPDATE tasks SET status='failed' WHERE id=?1", [ids[0]])
                     .unwrap();
             }
-            let result = reconcile_startup_graphs(&mut conn, 5).unwrap();
+            let result = reconcile_startup_graphs(&mut conn, 1, 5).unwrap();
             assert_eq!(result.healthy, 1);
             assert_eq!(result.reset, 0);
             assert_eq!(result.held, 0);
@@ -7736,6 +8356,7 @@ mod tests {
             let graph = begin_planning(
                 &mut conn,
                 &BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id: 1,
                     expected_revision: 1,
                     provider: "claude",
@@ -7763,7 +8384,7 @@ mod tests {
                 5,
             )
             .unwrap();
-            reacquire_freeze(&mut conn, graph, 6).unwrap();
+            reacquire_freeze(&mut conn, graph, 1, 6).unwrap();
             set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 7).unwrap();
             conn.execute(
                 "UPDATE task_decompositions SET frozen_base_sha=?2 WHERE id=?1",
@@ -7774,7 +8395,7 @@ mod tests {
         };
 
         let mut conn = crate::db::open(&path).unwrap();
-        reconcile_startup_graphs(&mut conn, 8).unwrap();
+        reconcile_startup_graphs(&mut conn, 1, 8).unwrap();
         assert!(bind_frozen_base_and_enter_planning(
             &mut conn,
             graph,
@@ -7809,6 +8430,7 @@ mod tests {
             graph,
             1,
             &[child("a", &[]), child("b", &["a"])],
+            1,
             4,
         )
         .unwrap()
@@ -7820,7 +8442,7 @@ mod tests {
         .unwrap();
         conn.execute("UPDATE tasks SET status='working' WHERE id=?1", [ids[0]])
             .unwrap();
-        let result = reconcile_startup_graphs(&mut conn, 5).unwrap();
+        let result = reconcile_startup_graphs(&mut conn, 1, 5).unwrap();
         assert_eq!(result.held, 1);
         let state: (String, i64) = conn
             .query_row(
@@ -7836,20 +8458,33 @@ mod tests {
     fn recovery_reset_reacquires_freeze_and_can_materialize_again() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
 
         assert!(recovery_reset(&mut conn, graph, "inconsistent", 5).unwrap());
-        assert!(reacquire_freeze(&mut conn, graph, 6).unwrap());
+        assert!(reacquire_freeze(&mut conn, graph, 1, 6).unwrap());
         assert!(
             set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 7).unwrap()
         );
         assert!(set_frozen_phase(&mut conn, graph, "planning", "preclassifying", None, 8).unwrap());
-        let replacement =
-            materialize_graph(&mut conn, graph, 1, &[child("c", &[]), child("d", &[])], 9)
-                .unwrap()
-                .unwrap();
+        let replacement = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("c", &[]), child("d", &[])],
+            1,
+            9,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(replacement.len(), 2);
         let retained_history: i64 = conn
             .query_row(
@@ -7869,7 +8504,7 @@ mod tests {
             .unwrap();
         assert_eq!(state, ("active".into(), 1, 0));
 
-        let before_delivery = reconcile_startup_graphs(&mut conn, 10).unwrap();
+        let before_delivery = reconcile_startup_graphs(&mut conn, 1, 10).unwrap();
         assert_eq!(
             before_delivery,
             StartupReconcileResult {
@@ -7884,7 +8519,7 @@ mod tests {
             [replacement[0]],
         )
         .unwrap();
-        let after_delivery = reconcile_startup_graphs(&mut conn, 11).unwrap();
+        let after_delivery = reconcile_startup_graphs(&mut conn, 1, 11).unwrap();
         assert_eq!(
             after_delivery,
             StartupReconcileResult {
@@ -7920,6 +8555,7 @@ mod tests {
             graph,
             1,
             &[child("a", &[]), child("b", &[]), child("c", &[])],
+            1,
             4,
         )
         .unwrap()
@@ -7964,6 +8600,7 @@ mod tests {
                 child("prerequisite", &[]),
                 child("ready", &["prerequisite"]),
             ],
+            1,
             4,
         )
         .unwrap()
@@ -8011,6 +8648,7 @@ mod tests {
             graph,
             1,
             &[child("a", &[]), child("b", &[]), child("c", &[])],
+            1,
             4,
         )
         .unwrap()
@@ -8038,9 +8676,16 @@ mod tests {
     fn failed_child_blocks_active_graph_and_alerts_owner_atomically() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         let reason = "worker reported failed";
         let tx = begin_immediate(&mut conn).unwrap();
         // A hard failure carries no retryable daemon-park marker.
@@ -8123,6 +8768,7 @@ mod tests {
             graph,
             1,
             &[child("a", &[]), child("b", &[]), child("c", &["a"])],
+            1,
             4,
         )
         .unwrap()
@@ -8207,10 +8853,16 @@ mod tests {
         ] {
             let mut conn = setup();
             let graph = begin(&mut conn);
-            let ids =
-                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-                    .unwrap()
-                    .unwrap();
+            let ids = materialize_graph(
+                &mut conn,
+                graph,
+                1,
+                &[child("a", &[]), child("b", &[])],
+                1,
+                4,
+            )
+            .unwrap()
+            .unwrap();
             conn.execute(
                 "UPDATE tasks SET status='failed',refs=?2,updated_at=5 WHERE id=?1",
                 params![ids[0], refs.to_string()],
@@ -8245,9 +8897,16 @@ mod tests {
     fn graph_does_not_complete_while_a_parked_child_is_unresolved() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         crate::tasks::park(&mut conn, ids[0], "needs-info", "open", 5)
             .unwrap()
             .expect("child must park");
@@ -8293,10 +8952,16 @@ mod tests {
         ] {
             let mut conn = setup();
             let graph = begin(&mut conn);
-            let ids =
-                materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-                    .unwrap()
-                    .unwrap();
+            let ids = materialize_graph(
+                &mut conn,
+                graph,
+                1,
+                &[child("a", &[]), child("b", &[])],
+                1,
+                4,
+            )
+            .unwrap()
+            .unwrap();
             let tx = begin_immediate(&mut conn).unwrap();
             tx.execute(
                 "UPDATE tasks SET status='failed',refs=?2,updated_at=5 WHERE id=?1",
@@ -8333,9 +8998,16 @@ mod tests {
     fn failed_child_graph_block_is_idempotent() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         conn.execute(
             "UPDATE tasks SET status='failed',refs='{}',updated_at=5 WHERE id=?1",
             [ids[0]],
@@ -8642,9 +9314,16 @@ mod tests {
     fn final_child_merge_completes_graph_and_source_atomically() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         assert!(crate::tasks::close_after_merge(&mut conn, ids[0], "merged", 5).unwrap());
         let midway: (String, String) = conn
             .query_row(
@@ -10764,9 +11443,16 @@ mod tests {
     fn merge_succeeded_event_completes_graph_and_source_atomically() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
             .unwrap();
         conn.execute("UPDATE tasks SET status='merging' WHERE id=?1", [ids[1]])
@@ -10788,9 +11474,16 @@ mod tests {
     fn pr_found_merged_event_completes_graph_and_source_atomically() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
             .unwrap();
         conn.execute("UPDATE tasks SET status='in-review' WHERE id=?1", [ids[1]])
@@ -10812,9 +11505,16 @@ mod tests {
     fn merge_succeeded_rolls_back_when_graph_source_authority_is_lost() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         conn.execute("UPDATE tasks SET status='done' WHERE id=?1", [ids[0]])
             .unwrap();
         conn.execute("UPDATE tasks SET status='merging' WHERE id=?1", [ids[1]])
@@ -10848,9 +11548,16 @@ mod tests {
     fn manual_close_rejects_active_source_without_mutation() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
 
         let error =
             crate::tasks::close_manual(&mut conn, "owner", 1, "obsolete", None, 5).unwrap_err();
@@ -10876,9 +11583,16 @@ mod tests {
     fn manual_final_child_close_completes_graph_and_source_atomically() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
 
         crate::tasks::close_manual(&mut conn, "owner", ids[0], "fixed elsewhere", None, 5)
             .unwrap()
@@ -10919,6 +11633,7 @@ mod tests {
                 graph,
                 1,
                 &[child("a", &[]), child("b", &[]), child("c", &[])],
+                1,
                 4,
             )
             .unwrap()
@@ -10973,7 +11688,7 @@ mod tests {
         let graph = begin(conn);
         let keys: Vec<String> = (0..children).map(|i| format!("c{i}")).collect();
         let planned: Vec<PlannedChild> = keys.iter().map(|key| child(key, &[])).collect();
-        materialize_graph(conn, graph, 1, &planned, 4)
+        materialize_graph(conn, graph, 1, &planned, 1, 4)
             .unwrap()
             .unwrap()
     }
@@ -11184,9 +11899,16 @@ mod tests {
     fn graph_member_cancellation_converges_parked_dependents() {
         let mut conn = setup();
         let graph = begin(&mut conn);
-        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        let ids = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         // Create an external dependent parked recoverably on member a.
         let dependent: i64 = conn
             .query_row(
@@ -11216,9 +11938,16 @@ mod tests {
         let mut conn = setup();
         let graph = begin(&mut conn);
         // Materialize so cancel_graph reaches the source-cancel path.
-        let _ = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
-            .unwrap()
-            .unwrap();
+        let _ = materialize_graph(
+            &mut conn,
+            graph,
+            1,
+            &[child("a", &[]), child("b", &[])],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
         // A dependent parked recoverably on the graph source (task#1).
         let dependent: i64 = conn
             .query_row(

@@ -5,8 +5,8 @@ use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use support::protocol::{
-    ApplyGraphEventInput, Barrier, CancelSourceGraphInput, ClaimTaskInput, GraphEvent, Operation,
-    EXIT_NEGATIVE, EXIT_SUCCESS,
+    AdmitGraphInput, ApplyGraphEventInput, Barrier, CancelSourceGraphInput, ClaimTaskInput,
+    GraphAdmission, GraphEvent, Operation, EXIT_NEGATIVE, EXIT_SUCCESS,
 };
 
 const CHILD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -28,6 +28,7 @@ fn begin_graph(conn: &mut Connection) -> i64 {
     let graph = decomposition::begin_planning(
         conn,
         &BeginPlanning {
+            max_active_graphs: 1,
             source_task_id: 1,
             expected_revision: 1,
             provider: "codex",
@@ -64,7 +65,7 @@ fn graph_with_children(dir: &tempfile::TempDir, child_keys: &[&str]) -> (PathBuf
         .iter()
         .map(|key| planned_child(key))
         .collect::<Vec<_>>();
-    let ids = decomposition::materialize_graph(&mut conn, graph, 1, &children, 4)
+    let ids = decomposition::materialize_graph(&mut conn, graph, 1, &children, 1, 4)
         .unwrap()
         .unwrap();
     drop(conn);
@@ -463,6 +464,174 @@ fn real_process_child_claims_never_exceed_two() {
     assert_eq!(winners, 2);
 }
 
+const COUNTED: &str = "SELECT count(*) FROM task_decompositions WHERE (state IN ('active','blocked') OR active=1 OR freeze_active=1)";
+
+fn scalar(conn: &Connection, sql: &str) -> i64 {
+    conn.query_row(sql, [], |row| row.get(0)).unwrap()
+}
+
+/// Race every counted-graph admission path in separate processes against one
+/// real DB file: one planning graph activating (already counted), three open
+/// sources entering planning, and two provider-backoff graphs reacquiring
+/// planning authority, with one graph already active. The counted set must
+/// never exceed `limit`, planning authority stays single, the activation
+/// always wins, and every loser is a clean exit 1 with no `errors` row.
+fn concurrent_admission_never_exceeds_max_active_graphs(rounds: usize) {
+    for limit in [2_usize, 3] {
+        for round in 0..rounds {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("quorum.db");
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            for title in [
+                "active",
+                "planning",
+                "open-a",
+                "open-b",
+                "open-c",
+                "backoff-a",
+                "backoff-b",
+            ] {
+                conn.execute(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES (?1,'open','owner',1,1)",
+                    [title],
+                )
+                .unwrap();
+            }
+            let admit = |conn: &mut Connection, source: i64| {
+                let graph = decomposition::begin_planning(
+                    conn,
+                    &BeginPlanning {
+                        max_active_graphs: limit,
+                        source_task_id: source,
+                        expected_revision: 1,
+                        provider: "codex",
+                        model: "sol",
+                        frozen_base_sha: "abc",
+                        now: 2,
+                    },
+                )
+                .unwrap()
+                .unwrap();
+                assert!(decomposition::set_frozen_phase(
+                    conn,
+                    graph,
+                    "freeze-requested",
+                    "preclassifying",
+                    None,
+                    2,
+                )
+                .unwrap());
+                graph
+            };
+            let active = admit(&mut conn, 1);
+            decomposition::materialize_graph(
+                &mut conn,
+                active,
+                1,
+                &[planned_child("x"), planned_child("y")],
+                limit,
+                3,
+            )
+            .unwrap()
+            .unwrap();
+            let planning = admit(&mut conn, 2);
+            let mut backoff = Vec::new();
+            for source in [6_i64, 7] {
+                conn.execute("UPDATE tasks SET status='planning' WHERE id=?1", [source])
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                         planned_source_revision,created_at,updated_at)
+                     VALUES (?1,'provider-backoff',0,0,1,1,1)",
+                    [source],
+                )
+                .unwrap();
+                backoff.push(conn.last_insert_rowid());
+            }
+            assert_eq!(scalar(&conn, COUNTED), 2);
+            drop(conn);
+
+            let go_path = dir.path().join("go");
+            let racers = [(GraphAdmission::Activate, planning)]
+                .into_iter()
+                .chain([3_i64, 4, 5].map(|source| (GraphAdmission::BeginPlanning, source)))
+                .chain(
+                    backoff
+                        .iter()
+                        .map(|graph| (GraphAdmission::ReacquireFreeze, *graph)),
+                )
+                .collect::<Vec<_>>();
+            let mut ready_paths = Vec::new();
+            let children = racers
+                .iter()
+                .enumerate()
+                .map(|(index, (admission, target_id))| {
+                    let admit_barrier = barrier(dir.path(), &format!("admit-{index}"), &go_path);
+                    ready_paths.push(admit_barrier.ready_path.clone());
+                    let child = support::spawn(
+                        Operation::AdmitGraph,
+                        &AdmitGraphInput {
+                            db_path: db_path.clone(),
+                            admission: *admission,
+                            target_id: *target_id,
+                            max_active_graphs: limit,
+                            now: 10,
+                            barrier: admit_barrier,
+                        },
+                    )
+                    .unwrap_or_else(|error| panic!("spawn admit helper {index}: {error}"));
+                    (index, *admission, child)
+                })
+                .collect::<Vec<_>>();
+            release_when_ready(&ready_paths, &go_path);
+            let mut activated = false;
+            let mut admitted = 0;
+            for (index, admission, child) in children {
+                let label = format!("limit {limit} round {round} admit {index} {admission:?}");
+                let won = bool_race_outcome(&label, wait_for_child(&label, child));
+                match admission {
+                    GraphAdmission::Activate => activated = won,
+                    _ => admitted += usize::from(won),
+                }
+            }
+
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let counted = usize::try_from(scalar(&conn, COUNTED)).unwrap();
+            assert!(
+                counted <= limit,
+                "limit {limit} round {round}: {counted} counted graphs exceed the limit"
+            );
+            assert!(
+                activated,
+                "limit {limit} round {round}: the counted planning graph activates"
+            );
+            assert!(
+                admitted <= limit - 2,
+                "limit {limit} round {round}: {admitted} admissions beyond the free slots"
+            );
+            assert_eq!(counted, 2 + admitted, "limit {limit} round {round}");
+            assert!(
+                scalar(
+                    &conn,
+                    "SELECT count(*) FROM task_decompositions WHERE freeze_active=1"
+                ) <= 1,
+                "limit {limit} round {round}: planning authority stays single"
+            );
+            assert_eq!(
+                scalar(&conn, "SELECT count(*) FROM errors"),
+                0,
+                "limit {limit} round {round}: lost races log no errors row"
+            );
+        }
+    }
+}
+
+#[test]
+fn real_process_graph_admission_smoke_never_exceeds_max_active_graphs() {
+    concurrent_admission_never_exceeds_max_active_graphs(3);
+}
+
 #[test]
 fn real_process_cancel_racing_child_claim_smoke_leaves_no_authority() {
     cancel_racing_child_claim_leaves_no_authority(1);
@@ -490,4 +659,5 @@ fn stress_repeats_real_process_decomposition_races() {
     cancel_racing_submit_revokes_winner_and_stale_submit_is_inert(8);
     cancel_racing_review_revokes_authority_and_stale_review_is_inert(8);
     cancel_racing_final_merge_has_mutually_exclusive_terminal_outcomes(16);
+    concurrent_admission_never_exceeds_max_active_graphs(40);
 }

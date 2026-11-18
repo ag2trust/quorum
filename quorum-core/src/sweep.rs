@@ -967,6 +967,7 @@ mod tests {
         let graph = crate::decomposition::begin_planning(
             c,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "codex",
@@ -995,7 +996,7 @@ mod tests {
             prerequisite_keys: vec![],
             source_dependency_ids: vec![],
         });
-        let child = crate::decomposition::materialize_graph(c, graph, 1, &children, 1000)
+        let child = crate::decomposition::materialize_graph(c, graph, 1, &children, 1, 1000)
             .unwrap()
             .unwrap()[0];
         c.execute(

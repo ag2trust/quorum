@@ -3331,8 +3331,10 @@ pub fn arbiter_verdict(conn: &Connection, source_task_id: i64) -> Result<Option<
     }))
 }
 
-/// The schema guarantees at most one active graph/freeze. A held planning result is
-/// also useful owner-facing state, so fall back to the newest non-completed aggregate.
+/// Several graphs may be counted (up to `max_active_graphs`), with at most one
+/// planning freeze; this view shows the most relevant one (live first). A held
+/// planning result is also useful owner-facing state, so fall back to the newest
+/// non-completed aggregate.
 fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<DecompositionStatusView>> {
     let graph = conn
         .query_row(

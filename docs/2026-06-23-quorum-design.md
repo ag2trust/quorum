@@ -2939,7 +2939,9 @@ filename. Runner-specific process options remain scoped under `[claude]`, `[code
 
 A non-continuation, admission-ready, non-terminal-leaf implementation task is a decomposition
 source only when it is L at `cx_est` 5 or XL at `cx_est` 4 or 5. After its dependencies are done,
-the daemon serializes decomposition per repository: one graph plans at a time. There is no drain
+the daemon serializes planning per repository: one graph plans at a time, and at most the
+configured `max_active_graphs` (default 2) graphs are counted at once (see the admission limit
+below). There is no drain
 precondition: unrelated started work keeps running and merging while a graph plans. When the graph
 moves from `draining` to `planning`, the daemon reads the current base-branch head (outside any DB
 transaction) and binds it as `frozen_base_sha` in one guarded `BEGIN IMMEDIATE` update (state
@@ -2954,8 +2956,35 @@ any classified size because it has no implementation work to decompose. A non-co
 with `cx_est` 1–3 violates the classification rubric and is parked with an explicit
 reclassify-or-rescope reason.
 
-The planning freeze (`freeze_active=1`, unique through `one_planning_freeze`) remains the
-one-planner-run-at-a-time sentinel, but its claim and retry authority is scoped to its own source
+**Counted admission limit (v84).** A graph is *counted* while it is `active` or `blocked` (or
+carries `active=1`) or holds planning authority (`freeze_active=1`); a blocked graph counts. The
+v35 global partial unique indexes `one_active_task_graph` and `one_planning_freeze` are dropped
+by the forward-only, idempotent v84 migration (`DROP INDEX IF EXISTS`, no table rebuild, every
+graph row preserved). In their place, every path that adds a graph to the counted set evaluates a
+guarded count inside its own `BEGIN IMMEDIATE` transaction: `begin_planning` /
+`begin_routed_planning` admit a source only while `(SELECT COUNT(*) … counted) < max_active_graphs`
+and no other graph holds planning authority; `reacquire_freeze` applies the same guard counting
+only *other* graphs; the materialization activation `UPDATE … RETURNING` counts only the other
+counted graphs, so activating an already-counted planning graph never double-counts it. A lost
+admission or activation race is zero guarded rows (or a false admission check) and maps to
+`Ok(None)`/`Ok(false)`: a clean negative with no `errors` row; post-timeout `SQLITE_BUSY` stays an
+internal failure. A limit lowered below the current counted set (for example across a restart
+while a graph plans) admits nothing new until the count falls. It also refuses that planning
+graph's activation: the transaction rolls back every child insert, and the daemon then holds the
+graph and fails its source like any other materialization blocker, under the distinct hold code
+`max-active-graphs-reached` (lost graph/source authority stays `materialization-authority-lost`).
+The Arbiter-approved plan is not kept; the operator raises the limit or lets graphs complete,
+then re-files or rescopes the source. Materialization checks the counted limit under the write
+lock before inserting any child, so a refusal never leaves partial children or member rows; the
+exhaustion-path terminal-leaf fallback, when refused the same way, therefore parks the graph as
+`proposal-attempts-exhausted` exactly as when no fallback applies. The daemon's
+`planning_candidate` selects sources by `priority DESC, id ASC` only while fewer than the limit
+are counted; the core guard remains the authority. `max_active_graphs` is daemon configuration
+threaded into each call, not stored in the database.
+
+The planning freeze (`freeze_active=1`) remains the one-planner-run-at-a-time sentinel, now
+enforced by the guarded `NOT EXISTS (… freeze_active=1)` admission check rather than a unique
+index, but its claim and retry authority is scoped to its own source
 task (owner decision 2026-11-09). Inside the claim's `BEGIN IMMEDIATE` transaction, the
 `status='open'` branch of both the by-id claim and the selector excludes only a task that is the
 `source_task_id` of a graph with `freeze_active=1`; the source is additionally in `planning`, so
@@ -3170,11 +3199,11 @@ is held without active/freeze authority, the hold code and exhausted counter agr
 neither review-only nor a continuation, and no accepted plan, member/child, process, run, PR, or
 delivery/merge evidence exists. The winner restores the source to `planning`, clears only the
 retryable hold/session/base fields, resets the exhausted current-generation counter, and places the
-graph in provider backoff so the coordinator must reacquire `one_planning_freeze` through the
-ordinary guarded path. Semantic blockers, inconsistent holds, stale authority, materialization,
+graph in provider backoff so the coordinator must reacquire planning authority through the
+ordinary guarded, counted `reacquire_freeze` path. Semantic blockers, inconsistent holds, stale authority, materialization,
 delivery evidence, and racing callers are clean negatives.
 
-Coordinator snapshot selection always prioritizes the unique `freeze_active=1` aggregate before
+Coordinator snapshot selection always prioritizes the single `freeze_active=1` aggregate before
 older provider-backoff aggregates. An explicitly retried graph therefore cannot shadow, stall, or
 consume output from a later graph that already owns the planning freeze; backoff graphs resume in
 ID order only when no freeze owner remains. A live planner or classifier slot also pins its
@@ -3209,8 +3238,11 @@ aggregate changes.
 One `BEGIN IMMEDIATE` transaction creates the entire graph: every generated task with
 `terminal_leaf=1`, classification, edge, membership/provenance row, source `planning ->
 decomposed` transition, and active-graph record. It then releases the freeze. Partial
-materialization is never visible. A partial unique index permits one materialized active or
-blocked graph per repository, and source uniqueness permits only one graph aggregate per source.
+materialization is never visible. The activation write's guarded count keeps materialized plus
+planning graphs within `max_active_graphs` per repository, and source uniqueness permits only one
+graph aggregate per source. A startup recovery reset re-enters planning through the same counted
+`reacquire_freeze`; when that loses, the graph waits in `freeze-requested` without authority and
+the coordinator retries the guarded reacquire each tick until a slot frees.
 Generated work is one level only and is immutable after materialization.
 
 Generated tasks inherit the source task's immutable `target_branch` at materialization; a NULL
