@@ -2909,6 +2909,7 @@ exec sleep 30
             &WorktreeManager::new(),
             &mut names,
             &mut workers,
+            &mut super::super::ProfileCooldown::new(),
         )
         .await
         .expect("the next restart launches the preserved exact turn once");
