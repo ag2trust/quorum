@@ -4,11 +4,13 @@
 //! destructive process/GitHub/git/filesystem work happen between them.
 
 use super::{names::Pool, ServeConfig, SlotState};
+use crate::github_credentials::GithubCredentialSource;
 use crate::serve::worktree::WorktreeManager;
 use quorum_core::decomposition_cleanup::{self, CleanupWork};
 use quorum_core::error::{QuorumError, Result};
 use serde::Deserialize;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const CLEANUP_DRAIN_LIMIT: usize = 8;
@@ -396,13 +398,21 @@ fn validate_cleanup_pr_target(
 }
 
 async fn close_cleanup_pr(config: &ServeConfig, pr: i64) -> std::result::Result<(), String> {
-    close_cleanup_pr_with_program(&config.repo_dir, &config.repo, pr, Path::new("gh")).await
+    close_cleanup_pr_with_program(
+        &config.repo_dir,
+        &config.repo,
+        pr,
+        &config.merge_executor.github_credentials(),
+        Path::new("gh"),
+    )
+    .await
 }
 
 async fn close_cleanup_pr_with_program(
     repo_dir: &Path,
     repo: &str,
     pr: i64,
+    credentials: &Arc<dyn GithubCredentialSource>,
     program: &Path,
 ) -> std::result::Result<(), String> {
     let args = vec![
@@ -414,8 +424,9 @@ async fn close_cleanup_pr_with_program(
     ];
     let mut command = tokio::process::Command::new(program);
     command.args(&args).current_dir(repo_dir);
-    let out = super::run_publication_gh_command(
+    let out = super::run_credentialed_gh_command(
         command,
+        credentials,
         super::PUBLICATION_GH_TIMEOUT,
         "gh pr close cleanup",
     )
@@ -471,7 +482,13 @@ async fn resolve_cleanup_pr(
 ) -> std::result::Result<Option<CleanupPrTarget>, String> {
     let endpoint = format!("repos/{}/pulls/{pr}", config.repo);
     let args = vec!["api".to_string(), "--include".to_string(), endpoint];
-    let out = super::run_publication_gh(&args, &config.repo_dir, "gh api cleanup PR").await?;
+    let out = super::run_publication_gh(
+        &args,
+        &config.repo_dir,
+        &config.merge_executor.github_credentials(),
+        "gh api cleanup PR",
+    )
+    .await?;
     parse_cleanup_pr_response(&out)
 }
 
@@ -1167,18 +1184,65 @@ mod tests {
         let log = dir.path().join("args");
         std::fs::write(
             &program,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", log.display()),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' \"$GH_TOKEN\" > '{}'\n",
+                log.display(),
+                dir.path().join("token").display()
+            ),
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&program).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&program, permissions).unwrap();
-        close_cleanup_pr_with_program(dir.path(), "owner/repo", 42, &program)
+        let source = Arc::new(crate::github_credentials::FakeCredentialSource::token(
+            "cleanup-secret",
+        ));
+        let credentials: Arc<dyn GithubCredentialSource> = source.clone();
+        close_cleanup_pr_with_program(dir.path(), "owner/repo", 42, &credentials, &program)
             .await
             .unwrap();
         assert_eq!(
             std::fs::read_to_string(log).unwrap(),
             "pr\nclose\n42\n--repo\nowner/repo\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("token")).unwrap(),
+            "cleanup-secret"
+        );
+        assert_eq!(source.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_pr_close_credential_failure_spawns_no_gh() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("fake-gh");
+        let marker = dir.path().join("invoked");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&program).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&program, permissions).unwrap();
+        let credentials: Arc<dyn GithubCredentialSource> =
+            Arc::new(crate::github_credentials::FakeCredentialSource::failing(
+                crate::github_credentials::GithubCredentialError::LookupFailed {
+                    reason: "not logged in".into(),
+                },
+            ));
+        let error =
+            close_cleanup_pr_with_program(dir.path(), "owner/repo", 42, &credentials, &program)
+                .await
+                .unwrap_err();
+        assert!(
+            error.contains("GitHub credential unavailable (gh not run)"),
+            "{error}"
+        );
+        assert!(
+            !marker.exists(),
+            "gh must not be spawned on credential failure"
         );
     }
 

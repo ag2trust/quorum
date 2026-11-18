@@ -62,6 +62,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Mutex};
+
+use crate::github_credentials::{GithubCredentialSource, GithubToken};
 use std::time::Duration;
 
 fn load_graph_review_context(db_path: &Path, task_id: i64) -> Result<Option<String>> {
@@ -1662,44 +1664,97 @@ async fn run_publication_gh_command_with_limit(
     })
 }
 
+/// Fetch one GitHub token from the daemon credential source for one `gh`
+/// child. The fetch runs off the async runtime (it may run a bounded
+/// `gh auth token`) and callers invoke it only outside DB transactions. A
+/// source failure is a classified error that names the source, never the
+/// token, and the caller spawns no `gh` child.
+async fn publication_github_token(
+    credentials: &Arc<dyn GithubCredentialSource>,
+    label: &str,
+) -> std::result::Result<GithubToken, String> {
+    let source = Arc::clone(credentials);
+    tokio::task::spawn_blocking(move || source.token())
+        .await
+        .map_err(|error| format!("{label}: GitHub credential lookup join: {error}"))?
+        .map_err(|error| format!("{label}: GitHub credential unavailable (gh not run): {error}"))
+}
+
+/// Run one publication-owned `gh` child with `GH_TOKEN` from the daemon
+/// credential source set on that child only. A source failure returns before
+/// the child is spawned; there is no fallback to ambient `gh` auth.
+async fn run_credentialed_gh_command(
+    mut command: tokio::process::Command,
+    credentials: &Arc<dyn GithubCredentialSource>,
+    timeout: Duration,
+    label: &str,
+) -> std::result::Result<std::process::Output, String> {
+    let token = publication_github_token(credentials, label).await?;
+    token.apply_to_tokio_command(&mut command);
+    run_publication_gh_command(command, timeout, label).await
+}
+
 async fn run_publication_gh(
     args: &[String],
     repo_dir: &Path,
+    credentials: &Arc<dyn GithubCredentialSource>,
     label: &str,
 ) -> std::result::Result<std::process::Output, String> {
-    let mut command = tokio::process::Command::new("gh");
+    run_publication_gh_with_program(args, repo_dir, credentials, Path::new("gh"), label).await
+}
+
+async fn run_publication_gh_with_program(
+    args: &[String],
+    repo_dir: &Path,
+    credentials: &Arc<dyn GithubCredentialSource>,
+    program: &Path,
+    label: &str,
+) -> std::result::Result<std::process::Output, String> {
+    let mut command = tokio::process::Command::new(program);
     command.args(args).current_dir(repo_dir);
-    run_publication_gh_command(command, PUBLICATION_GH_TIMEOUT, label).await
+    run_credentialed_gh_command(command, credentials, PUBLICATION_GH_TIMEOUT, label).await
 }
 
 async fn resolve_publication_pr_target(
     pr: i64,
     repo_dir: &Path,
     gh_repo: Option<&str>,
+    credentials: &Arc<dyn GithubCredentialSource>,
 ) -> std::result::Result<PrTarget, String> {
-    resolve_publication_pr_target_with_program(pr, repo_dir, gh_repo, Path::new("gh")).await
+    resolve_publication_pr_target_with_program(pr, repo_dir, gh_repo, credentials, Path::new("gh"))
+        .await
 }
 
 async fn resolve_publication_pr_target_with_program(
     pr: i64,
     repo_dir: &Path,
     gh_repo: Option<&str>,
+    credentials: &Arc<dyn GithubCredentialSource>,
     program: &Path,
 ) -> std::result::Result<PrTarget, String> {
-    resolve_pr_target_with_program(pr, repo_dir, gh_repo, PUBLICATION_GH_TIMEOUT, program).await
+    resolve_pr_target_with_program(
+        pr,
+        repo_dir,
+        gh_repo,
+        credentials,
+        PUBLICATION_GH_TIMEOUT,
+        program,
+    )
+    .await
 }
 
 async fn resolve_pr_target_with_program(
     pr: i64,
     repo_dir: &Path,
     gh_repo: Option<&str>,
+    credentials: &Arc<dyn GithubCredentialSource>,
     timeout: Duration,
     program: &Path,
 ) -> std::result::Result<PrTarget, String> {
     let args = pr_target_args(pr, gh_repo);
     let mut command = tokio::process::Command::new(program);
     command.args(&args).current_dir(repo_dir);
-    let output = run_publication_gh_command(command, timeout, "gh pr view").await?;
+    let output = run_credentialed_gh_command(command, credentials, timeout, "gh pr view").await?;
     if !output.status.success() {
         return Err(format!(
             "gh pr view failed: {}",
@@ -1727,9 +1782,10 @@ async fn create_initial_pr(
     branch: &str,
     task_id: i64,
     title: &str,
+    credentials: &Arc<dyn GithubCredentialSource>,
 ) -> std::result::Result<i64, String> {
     let args = initial_pr_args(repo, base_branch, branch, task_id, title);
-    let output = run_publication_gh(&args, repo_dir, "gh pr create").await?;
+    let output = run_publication_gh(&args, repo_dir, credentials, "gh pr create").await?;
     if !output.status.success() {
         return Err(format!(
             "gh pr create failed: {}",
@@ -2020,6 +2076,7 @@ async fn find_initial_pr(
     repo_dir: &Path,
     repo: &str,
     branch: &str,
+    credentials: &Arc<dyn GithubCredentialSource>,
 ) -> std::result::Result<Option<i64>, String> {
     let mut args = vec![
         "pr".to_string(),
@@ -2037,7 +2094,7 @@ async fn find_initial_pr(
         args.push("--repo".to_string());
         args.push(repo.to_string());
     }
-    let output = run_publication_gh(&args, repo_dir, "gh pr list").await?;
+    let output = run_publication_gh(&args, repo_dir, credentials, "gh pr list").await?;
     if !output.status.success() {
         return Err(format!(
             "gh pr list failed: {}",
@@ -2347,6 +2404,7 @@ async fn publish_worker_completion(
             pr,
             &config.repo_dir,
             Some(&config.repo),
+            &config.merge_executor.github_credentials(),
             config
                 .pr_target_program
                 .as_deref()
@@ -2390,7 +2448,8 @@ async fn publish_worker_completion(
     intent.stage = "pushed".into();
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
 
-    let pr = match find_initial_pr(&config.repo_dir, &config.repo, branch).await? {
+    let credentials = config.merge_executor.github_credentials();
+    let pr = match find_initial_pr(&config.repo_dir, &config.repo, branch, &credentials).await? {
         Some(pr) => pr,
         None => {
             create_initial_pr(
@@ -2400,6 +2459,7 @@ async fn publish_worker_completion(
                 branch,
                 task_id,
                 &format!("task {task_id}"),
+                &credentials,
             )
             .await?
         }
@@ -2408,7 +2468,13 @@ async fn publish_worker_completion(
     intent.stage = "pr_created".into();
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
 
-    let target = resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await?;
+    let target = resolve_publication_pr_target(
+        pr,
+        &config.repo_dir,
+        Some(&config.repo),
+        &config.merge_executor.github_credentials(),
+    )
+    .await?;
     validate_initial_pr_target(&target, branch, &pushed_sha, &publication_base_branch)?;
     intent.stage = "verified".into();
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
@@ -2709,8 +2775,9 @@ async fn resolve_or_load_reviewer_pr_target(
     db_path: &Path,
     repo_dir: &Path,
     gh_repo: Option<&str>,
+    credentials: &Arc<dyn GithubCredentialSource>,
 ) -> Result<Option<ResolvedReviewerPrTarget>> {
-    match resolve_publication_pr_target(pr, repo_dir, gh_repo).await {
+    match resolve_publication_pr_target(pr, repo_dir, gh_repo, credentials).await {
         Ok(target) => Ok(Some(ResolvedReviewerPrTarget {
             target,
             source: ReviewerPrTargetSource::Live,
@@ -3058,8 +3125,9 @@ async fn resolve_or_load_remediation_pr_target(
     db_path: &Path,
     repo_dir: &Path,
     gh_repo: Option<&str>,
+    credentials: &Arc<dyn GithubCredentialSource>,
 ) -> Result<Option<PrTarget>> {
-    match resolve_publication_pr_target(pr, repo_dir, gh_repo).await {
+    match resolve_publication_pr_target(pr, repo_dir, gh_repo, credentials).await {
         Ok(target) => {
             let p = db_path.to_path_buf();
             let persisted = target.clone();
@@ -3255,6 +3323,7 @@ async fn resolve_and_persist_continue_pr_target(
         pr,
         &config.repo_dir,
         Some(&config.repo),
+        &config.merge_executor.github_credentials(),
         config
             .pr_target_program
             .as_deref()
@@ -3310,6 +3379,7 @@ async fn resolve_and_persist_reclaimed_reserved_pr_target(
         pr,
         &config.repo_dir,
         Some(&config.repo),
+        &config.merge_executor.github_credentials(),
         config
             .pr_target_program
             .as_deref()
@@ -3351,6 +3421,7 @@ async fn resolve_and_persist_parked_rework_target(
         pr,
         &config.repo_dir,
         Some(&config.repo),
+        &config.merge_executor.github_credentials(),
         config
             .pr_target_program
             .as_deref()
@@ -5777,8 +5848,31 @@ fn poll_origin_self_update_sha(
 /// Run unbacked/twin PR drift detection. Shells out to `gh pr list`,
 /// compares against task refs.pr, and emits one-time events. Fail-open on
 /// any error (API unavailable, parse failure, etc.).
-fn run_drift_check(db_path: &std::path::Path, repo: &str) -> Result<()> {
-    let output = std::process::Command::new("gh")
+///
+/// The credential is fetched before the DB is opened; a source failure
+/// returns before `gh` spawns and takes the same fail-open path.
+fn run_drift_check(
+    db_path: &std::path::Path,
+    repo: &str,
+    credentials: &dyn GithubCredentialSource,
+) -> Result<()> {
+    run_drift_check_with_program(db_path, repo, credentials, Path::new("gh"))
+}
+
+fn run_drift_check_with_program(
+    db_path: &std::path::Path,
+    repo: &str,
+    credentials: &dyn GithubCredentialSource,
+    program: &Path,
+) -> Result<()> {
+    let token = credentials.token().map_err(|error| {
+        QuorumError::Io(format!(
+            "gh pr list: GitHub credential unavailable (gh not run): {error}"
+        ))
+    })?;
+    let mut command = std::process::Command::new(program);
+    token.apply_to_command(&mut command);
+    let output = command
         .args([
             "pr",
             "list",
@@ -11041,19 +11135,25 @@ async fn resume_reviewer_after_ci(
     // CI result or persisted target can never authorize review of the wrong
     // base. Lookup outages defer the feed; task-target storage failures remain
     // abnormal daemon errors.
-    let live_target =
-        match resolve_publication_pr_target(pr, &config.repo_dir, Some(&config.repo)).await {
-            Ok(target) => ResolvedReviewerPrTarget {
-                target,
-                source: ReviewerPrTargetSource::Live,
-            },
-            Err(error) => {
-                log(&format!(
-                    "ResumeReviewer: live PR #{pr} target unavailable ({error}); reviewer not fed"
-                ));
-                return Ok(false);
-            }
-        };
+    let live_target = match resolve_publication_pr_target(
+        pr,
+        &config.repo_dir,
+        Some(&config.repo),
+        &config.merge_executor.github_credentials(),
+    )
+    .await
+    {
+        Ok(target) => ResolvedReviewerPrTarget {
+            target,
+            source: ReviewerPrTargetSource::Live,
+        },
+        Err(error) => {
+            log(&format!(
+                "ResumeReviewer: live PR #{pr} target unavailable ({error}); reviewer not fed"
+            ));
+            return Ok(false);
+        }
+    };
     if let Err(reason) = validate_reviewer_pr_target_for_task(
         &live_target,
         pr,
@@ -11975,6 +12075,7 @@ async fn reconcile_merge_retries(
             pr,
             &config.repo_dir,
             Some(&config.repo),
+            &config.merge_executor.github_credentials(),
             PUBLICATION_GH_TIMEOUT,
             config
                 .pr_target_program
@@ -13152,8 +13253,9 @@ async fn tick_loop_owning_doctor(
             last_drift_check = Some(std::time::Instant::now());
             let db = config.db_path.clone();
             let repo = config.repo.clone();
+            let credentials = config.merge_executor.github_credentials();
             tokio::task::spawn_blocking(move || {
-                if let Err(e) = run_drift_check(&db, &repo) {
+                if let Err(e) = run_drift_check(&db, &repo, credentials.as_ref()) {
                     log(&format!("drift check failed (fail-open): {e}"));
                 }
             })
@@ -13918,6 +14020,7 @@ async fn tick(
                                         &config.db_path,
                                         &config.repo_dir,
                                         Some(&config.repo),
+                                        &config.merge_executor.github_credentials(),
                                     )
                                     .await
                                     .ok()
@@ -18669,6 +18772,7 @@ async fn tick(
                                 &config.db_path,
                                 &config.repo_dir,
                                 Some(&config.repo),
+                                &config.merge_executor.github_credentials(),
                             )
                             .await
                             .ok()
@@ -23592,6 +23696,7 @@ async fn provision_reviewer_reserved(
         &config.db_path,
         &config.repo_dir,
         Some(&config.repo),
+        &config.merge_executor.github_credentials(),
     )
     .await?;
     if let Some(resolved) = &resolved_target {
@@ -30301,6 +30406,7 @@ async fn bind_sticky_remediation_pr_baseline(
             pr,
             &config.repo_dir,
             Some(&config.repo),
+            &config.merge_executor.github_credentials(),
             PUBLICATION_GH_TIMEOUT,
             program,
         )
@@ -30681,6 +30787,7 @@ async fn spawn_remediation_worker(
         db_path,
         &config.repo_dir,
         Some(&config.repo),
+        &config.merge_executor.github_credentials(),
     )
     .await
     {
@@ -31494,6 +31601,124 @@ mod tests {
     use super::*;
 
     const REVIEW_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// Test executor that delegates every merge operation to `inner` but
+    /// supplies an injected credential source, so unit fixtures never depend
+    /// on ambient `gh auth` on the test host.
+    pub(crate) struct CredentialedExecutor {
+        pub(crate) inner: Arc<dyn merge::MergeExecutor>,
+        pub(crate) credentials: Arc<dyn GithubCredentialSource>,
+    }
+
+    /// `CommandMergeExecutor { command: "true" }` with a fixed fake token.
+    pub(crate) fn hermetic_command_executor() -> Arc<dyn merge::MergeExecutor> {
+        Arc::new(CredentialedExecutor {
+            inner: Arc::new(merge::CommandMergeExecutor {
+                command: "true".into(),
+                checks_cmd: None,
+                mergeability_cmd: None,
+            }),
+            credentials: Arc::new(crate::github_credentials::FakeCredentialSource::token(
+                "fixture-token",
+            )),
+        })
+    }
+
+    impl merge::MergeExecutor for CredentialedExecutor {
+        fn merge(&self, pr: i64, repo_dir: &Path, ctx: &merge::MergeContext) -> merge::MergeResult {
+            self.inner.merge(pr, repo_dir, ctx)
+        }
+        fn merge_without_approval(
+            &self,
+            pr: i64,
+            repo_dir: &Path,
+            ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            self.inner.merge_without_approval(pr, repo_dir, ctx)
+        }
+        fn merge_commit_sha(&self, pr: i64, repo_dir: &Path) -> Option<String> {
+            self.inner.merge_commit_sha(pr, repo_dir)
+        }
+        fn merge_commit_status(&self, pr: i64, repo_dir: &Path) -> merge::MergeCommitStatus {
+            self.inner.merge_commit_status(pr, repo_dir)
+        }
+        fn wait_for_checks(
+            &self,
+            pr: i64,
+            repo_dir: &Path,
+            timeout_secs: u64,
+            poll_interval_secs: u64,
+        ) -> merge::ChecksOutcome {
+            self.inner
+                .wait_for_checks(pr, repo_dir, timeout_secs, poll_interval_secs)
+        }
+        fn wait_for_checks_at_head(
+            &self,
+            pr: i64,
+            repo_dir: &Path,
+            expected_head: &str,
+            timeout_secs: u64,
+            poll_interval_secs: u64,
+        ) -> merge::ChecksOutcome {
+            self.inner.wait_for_checks_at_head(
+                pr,
+                repo_dir,
+                expected_head,
+                timeout_secs,
+                poll_interval_secs,
+            )
+        }
+        fn wait_for_branch_sync_checks(
+            &self,
+            pr: i64,
+            repo_dir: &Path,
+            timeout_secs: u64,
+            poll_interval_secs: u64,
+        ) -> merge::ChecksOutcome {
+            self.inner
+                .wait_for_branch_sync_checks(pr, repo_dir, timeout_secs, poll_interval_secs)
+        }
+        fn pending_check_names(&self, pr: i64, repo_dir: &Path) -> Vec<String> {
+            self.inner.pending_check_names(pr, repo_dir)
+        }
+        fn check_mergeability(&self, pr: i64, repo_dir: &Path) -> merge::MergeabilityState {
+            self.inner.check_mergeability(pr, repo_dir)
+        }
+        fn head_sha(&self, pr: i64, repo_dir: &Path) -> Option<String> {
+            self.inner.head_sha(pr, repo_dir)
+        }
+        fn check_required_jobs(
+            &self,
+            pr: i64,
+            repo_dir: &Path,
+            required_jobs: &[String],
+        ) -> merge::RequiredJobsOutcome {
+            self.inner.check_required_jobs(pr, repo_dir, required_jobs)
+        }
+        fn check_required_jobs_at_head(
+            &self,
+            pr: i64,
+            repo_dir: &Path,
+            expected_head: &str,
+            required_jobs: &[String],
+        ) -> merge::RequiredJobsOutcome {
+            self.inner
+                .check_required_jobs_at_head(pr, repo_dir, expected_head, required_jobs)
+        }
+        fn check_default_branch_ci(
+            &self,
+            repo_dir: &Path,
+            branch: &str,
+        ) -> merge::DefaultBranchStatus {
+            self.inner.check_default_branch_ci(repo_dir, branch)
+        }
+        fn ensure_changes_requested(&self, pr: i64, repo_dir: &Path, body: &str) -> bool {
+            self.inner.ensure_changes_requested(pr, repo_dir, body)
+        }
+        fn github_credentials(&self) -> Arc<dyn GithubCredentialSource> {
+            Arc::clone(&self.credentials)
+        }
+    }
 
     #[test]
     fn task_review_contract_preserves_recovery_context_beyond_twelve_hundred_chars() {
@@ -33835,10 +34060,14 @@ mod tests {
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let started = std::time::Instant::now();
+        let credentials: Arc<dyn GithubCredentialSource> = Arc::new(
+            crate::github_credentials::FakeCredentialSource::token("timeout-secret"),
+        );
         let error = resolve_pr_target_with_program(
             496,
             dir.path(),
             Some("test/repo"),
+            &credentials,
             Duration::from_millis(100),
             &program,
         )
@@ -53081,6 +53310,176 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         std::fs::write(&path, body).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    // ── GitHub credential source on publication/PR-target/drift gh ──────
+
+    #[cfg(unix)]
+    fn token_recording_gh(dir: &Path, stdout: &str) -> (PathBuf, PathBuf) {
+        let token = dir.join("gh-token-seen");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s' \"$GH_TOKEN\" > '{}'\ncat <<'JSON'\n{stdout}\nJSON\n",
+            token.display()
+        );
+        (write_fake_gh_script(dir, "token-gh", &script), token)
+    }
+
+    #[cfg(unix)]
+    fn marker_gh(dir: &Path) -> (PathBuf, PathBuf) {
+        let marker = dir.join("gh-invoked");
+        let script = format!("#!/bin/sh\ntouch '{}'\n", marker.display());
+        (write_fake_gh_script(dir, "marker-gh", &script), marker)
+    }
+
+    fn failing_credentials() -> Arc<dyn GithubCredentialSource> {
+        Arc::new(crate::github_credentials::FakeCredentialSource::failing(
+            crate::github_credentials::GithubCredentialError::LookupFailed {
+                reason: "not logged in".into(),
+            },
+        ))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pr_target_lookup_sets_gh_token_from_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gh, seen) = token_recording_gh(
+            dir.path(),
+            r#"{"headRefName":"daemon/x","headRefOid":"abc123","isCrossRepository":false}"#,
+        );
+        let source = Arc::new(crate::github_credentials::FakeCredentialSource::token(
+            "pr-target-secret",
+        ));
+        let credentials: Arc<dyn GithubCredentialSource> = source.clone();
+        let target = resolve_publication_pr_target_with_program(
+            7,
+            dir.path(),
+            Some("o/r"),
+            &credentials,
+            &gh,
+        )
+        .await
+        .unwrap();
+        assert_eq!(target.head_sha, "abc123");
+        assert_eq!(std::fs::read_to_string(seen).unwrap(), "pr-target-secret");
+        assert_eq!(source.calls(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pr_target_lookup_credential_failure_spawns_no_gh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gh, marker) = marker_gh(dir.path());
+        let error = resolve_pr_target_with_program(
+            7,
+            dir.path(),
+            Some("o/r"),
+            &failing_credentials(),
+            PUBLICATION_GH_TIMEOUT,
+            &gh,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("gh pr view: GitHub credential unavailable (gh not run)"),
+            "{error}"
+        );
+        assert!(
+            !marker.exists(),
+            "gh must not be spawned on credential failure"
+        );
+        assert_eq!(
+            publication_failure_kind_from_error(&error),
+            tasks::PublicationFailureKind::Other
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_gh_sets_gh_token_and_keeps_it_out_of_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials: Arc<dyn GithubCredentialSource> = Arc::new(
+            crate::github_credentials::FakeCredentialSource::token("publication-secret"),
+        );
+        let (gh, seen) = token_recording_gh(dir.path(), "https://github.com/o/r/pull/9");
+        let args = vec!["pr".to_string(), "create".to_string()];
+        let output =
+            run_publication_gh_with_program(&args, dir.path(), &credentials, &gh, "gh pr create")
+                .await
+                .unwrap();
+        assert_eq!(parse_created_pr_number(&output.stdout), Some(9));
+        assert_eq!(
+            std::fs::read_to_string(&seen).unwrap(),
+            "publication-secret"
+        );
+
+        // A failing gh child: the error quotes stderr, never the token.
+        let failing = fake_gh_failing(dir.path(), "failing-gh", "HTTP 502");
+        let error = resolve_pr_target_with_program(
+            9,
+            dir.path(),
+            Some("o/r"),
+            &credentials,
+            PUBLICATION_GH_TIMEOUT,
+            &failing,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("HTTP 502"), "{error}");
+        assert!(!error.contains("publication-secret"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_gh_credential_failure_spawns_no_gh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gh, marker) = marker_gh(dir.path());
+        let args = vec!["pr".to_string(), "list".to_string()];
+        let error = run_publication_gh_with_program(
+            &args,
+            dir.path(),
+            &failing_credentials(),
+            &gh,
+            "gh pr list",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("gh pr list: GitHub credential unavailable (gh not run)"),
+            "{error}"
+        );
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drift_check_sets_gh_token_from_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("drift.db");
+        drop(quorum_core::db::open(&db).unwrap());
+        let (gh, seen) = token_recording_gh(dir.path(), "[]");
+        let source = crate::github_credentials::FakeCredentialSource::token("drift-secret");
+        run_drift_check_with_program(&db, "o/r", &source, &gh).unwrap();
+        assert_eq!(std::fs::read_to_string(seen).unwrap(), "drift-secret");
+        assert_eq!(source.calls(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drift_check_credential_failure_spawns_no_gh() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("drift.db");
+        let (gh, marker) = marker_gh(dir.path());
+        let credentials = failing_credentials();
+        let error = run_drift_check_with_program(&db, "o/r", credentials.as_ref(), &gh)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("GitHub credential unavailable (gh not run)"),
+            "{error}"
+        );
+        assert!(!marker.exists());
+        assert!(!db.exists(), "credential failure precedes any DB open");
     }
 
     #[cfg(unix)]

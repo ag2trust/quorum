@@ -1416,11 +1416,7 @@ mod tests {
             worktree_base,
             names_file: None,
             agent_bin: None,
-            merge_executor: std::sync::Arc::new(super::super::merge::CommandMergeExecutor {
-                command: "true".into(),
-                checks_cmd: None,
-                mergeability_cmd: None,
-            }),
+            merge_executor: super::super::tests::hermetic_command_executor(),
             bare_agent: true,
             limits: super::super::CostLimits::default(),
             log_dir: None,
