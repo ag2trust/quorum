@@ -1450,6 +1450,7 @@ mod tests {
             codex_sandbox: "danger-full-access".into(),
             grok: Default::default(),
             pr_target_program: None,
+            max_active_graphs: 2,
         }
     }
 

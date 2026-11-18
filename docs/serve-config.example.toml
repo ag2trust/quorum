@@ -21,6 +21,10 @@ cap = 4
 # defaults to cap; must be >= 1 (0 or negative is bad config, exit 2); values
 # above cap are effectively bounded by cap.
 # max_graph_children_working = 4
+# Graphs that may be active or planning at once across the daemon. Unset
+# defaults to 2; must be >= 1 (0 or negative is bad config, exit 2). Parsed
+# and validated only — not yet enforced by dispatch or planning admission.
+# max_active_graphs = 2
 # names_file = "/home/user/.quorum/serve/names.txt"
 # agent_bin  = "claude"
 

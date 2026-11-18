@@ -135,6 +135,11 @@ primary = 100
 ## Concurrent reviewer processes (R1 + R2 + review-only). Unset defaults to
 ## max(cap, 2); must be 1..=32. Excess review work waits for a free slot.
 # reviewer_cap = 4
+
+## Graphs that may be active or planning at once across the daemon. Unset
+## defaults to 2; must be >= 1. Parsed and validated only — not yet enforced
+## by dispatch or planning admission.
+# max_active_graphs = 2
 ";
 
 fn run() -> Result<i32> {
@@ -1699,6 +1704,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     serve_config::Source::Default
                 },
             };
+            let r_max_active_graphs =
+                serve_config::resolve_max_active_graphs(file_cfg.max_active_graphs)?;
 
             let model_profiles = file_cfg.model_profiles.clone().ok_or_else(|| {
                 QuorumError::Usage("serve config requires [model_profiles]".into())
@@ -1843,6 +1850,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 max_rework: r_max_rework,
                 max_graph_children_working: Some(r_max_graph_children_working),
                 reviewer_cap: r_reviewer_cap.value,
+                max_active_graphs: r_max_active_graphs,
             };
             Ok(serve::run_serve(config)?)
         }
