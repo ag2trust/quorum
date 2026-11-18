@@ -213,10 +213,16 @@ fn command_source(cmd: &cli::Command) -> &'static str {
 fn status_snapshot(online_window: i64) -> Result<quorum_core::stats::Stats> {
     let now = quorum_core::clock::now();
     let db_path = paths::db_path()?;
+    let reviewer_cap = status_reviewer_cap();
     assemble_status_snapshot(
         || {
             let conn = quorum_core::db::open(&db_path)?;
-            let mut stats = quorum_core::stats::stats(&conn, now, online_window)?;
+            let mut stats = quorum_core::stats::stats_with_reviewer_cap(
+                &conn,
+                now,
+                online_window,
+                reviewer_cap,
+            )?;
             stats.daemon =
                 quorum_core::daemon_lock::liveness(&conn, now, DAEMON_STALE_SECS, pid_is_alive)?;
             drop(conn); // load-bearing: close the short DB read before returning
@@ -224,6 +230,18 @@ fn status_snapshot(online_window: i64) -> Result<quorum_core::stats::Stats> {
         },
         || status_resources(&db_path, now),
     )
+}
+
+/// Best-effort reviewer cap for the read-only status path. `None` when no repo/serve
+/// config is resolvable or the file is missing/malformed, so `quorum status` keeps
+/// working before the daemon is configured (issue #415); the daemon itself is the
+/// authority that validates and enforces `reviewer_cap` at `quorum serve` startup.
+fn status_reviewer_cap() -> Option<i64> {
+    let repo = paths::try_resolve_repo()?;
+    let path = serve_config::default_config_path(&repo).ok()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let file_cfg: serve_config::ServeFileConfig = toml::from_str(&contents).ok()?;
+    serve_config::file_reviewer_cap(&file_cfg).ok()
 }
 
 fn assemble_status_snapshot<Read, Sample>(
@@ -1002,6 +1020,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let serve_config_path = serve_config::default_config_path(&repo)?;
             let file_cfg = serve_config::load(&serve_config_path, false)?;
             let graph_children_limit = serve_config::file_graph_children_working_limit(&file_cfg)?;
+            let reviewer_cap = serve_config::file_reviewer_cap(&file_cfg)?;
             web::serve(
                 paths::db_path()?,
                 resolve_web_log_dir(log_dir, file_cfg.log_dir, paths::home_dir()?),
@@ -1009,6 +1028,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 port,
                 load_cfg()?.online_window_secs,
                 graph_children_limit,
+                reviewer_cap,
             )?;
             Ok(0)
         }
