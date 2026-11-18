@@ -4784,6 +4784,10 @@ pub struct ServeConfig {
     /// Test-only override for the `gh` binary used by live PR target
     /// resolution. None → look up "gh" on PATH.
     pub pr_target_program: Option<PathBuf>,
+    /// Validated `max_active_graphs`: graphs that may be active or planning
+    /// at once across the daemon. Default 2, minimum 1. Not yet enforced by
+    /// planning admission or activation (owned by a later change).
+    pub max_active_graphs: usize,
 }
 
 impl ServeConfig {
@@ -4810,8 +4814,8 @@ const PUBLICATION_REF_RECONCILE_BATCH_SIZE: i64 = 64;
 pub fn run_serve(config: ServeConfig) -> Result<i32> {
     configure_daemon_log(config.log_dir.as_deref());
     log(&format!(
-        "starting (cap={}, repo={})",
-        config.cap, config.repo
+        "starting (cap={}, repo={}, max_active_graphs={})",
+        config.cap, config.repo, config.max_active_graphs
     ));
 
     let daemon_pid = std::process::id() as i64;
@@ -32738,6 +32742,7 @@ mod tests {
             codex_sandbox: "danger-full-access".into(),
             grok: Default::default(),
             pr_target_program: None,
+            max_active_graphs: 2,
         }
     }
 
@@ -35789,6 +35794,7 @@ mod tests {
             codex_sandbox: "danger-full-access".into(),
             grok: Default::default(),
             pr_target_program: None,
+            max_active_graphs: 2,
         }
     }
 
@@ -46141,6 +46147,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             codex_sandbox: "danger-full-access".into(),
             grok: Default::default(),
             pr_target_program: None,
+            max_active_graphs: 2,
         }
     }
 

@@ -240,6 +240,9 @@ declare_serve_file_config! {
     /// Concurrent reviewer processes the daemon may run. Unset defaults to
     /// `max(cap, 2)`; values outside `1..=32` are bad config.
     reviewer_cap: Option<i64>,
+    /// Graphs that may be active or planning at once across the daemon.
+    /// Unset defaults to 2; values below 1 are bad config.
+    max_active_graphs: Option<i64>,
     /// Runner-specific Codex configuration.
     codex: Option<CodexFileConfig>,
     /// Grok adapter configuration for managed worker roles.
@@ -327,6 +330,7 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("max_rework", ConfigKeyDisposition::Runtime),
     ("max_graph_children_working", ConfigKeyDisposition::Runtime),
     ("reviewer_cap", ConfigKeyDisposition::Runtime),
+    ("max_active_graphs", ConfigKeyDisposition::Runtime),
     ("codex", ConfigKeyDisposition::Runtime),
     ("grok", ConfigKeyDisposition::Runtime),
     #[cfg(test)]
@@ -1032,6 +1036,21 @@ pub fn resolve_reviewer_cap(configured: Option<i64>, cap: usize) -> Result<usize
 pub fn file_reviewer_cap(cfg: &ServeFileConfig) -> Result<i64> {
     let limit = resolve_reviewer_cap(cfg.reviewer_cap, cfg.cap.unwrap_or(DEFAULT_CAP))?;
     Ok(i64::try_from(limit).unwrap_or(i64::MAX))
+}
+
+/// Default `max_active_graphs` when the key is absent.
+pub const DEFAULT_MAX_ACTIVE_GRAPHS: i64 = 2;
+
+/// Resolve the daemon-wide cap on graphs that may be active or planning at
+/// once. Unset defaults to 2; zero or negative values are bad config.
+pub fn resolve_max_active_graphs(configured: Option<i64>) -> Result<usize> {
+    match configured {
+        None => Ok(DEFAULT_MAX_ACTIVE_GRAPHS as usize),
+        Some(limit) if limit < 1 => Err(QuorumError::Usage(format!(
+            "max_active_graphs must be >= 1 (got {limit})"
+        ))),
+        Some(limit) => Ok(usize::try_from(limit).unwrap_or(usize::MAX)),
+    }
 }
 
 /// Validate the owner-configured directed branch-sync pairs. The same branch
@@ -2803,6 +2822,37 @@ worktree_base = "/tmp/wt"
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn max_active_graphs_defaults_to_two_and_rejects_non_positive_or_non_integer() {
+        let parse = |toml: &str| -> Option<i64> {
+            toml::from_str::<ServeFileConfig>(toml)
+                .unwrap()
+                .max_active_graphs
+        };
+        // Absent key → default of 2.
+        assert_eq!(resolve_max_active_graphs(parse("")).unwrap(), 2);
+        // Minimum accepted value.
+        assert_eq!(
+            resolve_max_active_graphs(parse("max_active_graphs = 1\n")).unwrap(),
+            1
+        );
+        // A valid larger value is kept as configured.
+        assert_eq!(
+            resolve_max_active_graphs(parse("max_active_graphs = 5\n")).unwrap(),
+            5
+        );
+        // Zero and negative are bad config → exit 2.
+        for bad in ["max_active_graphs = 0\n", "max_active_graphs = -1\n"] {
+            let err = resolve_max_active_graphs(parse(bad)).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{err}");
+            assert!(err.to_string().contains("max_active_graphs"), "{err}");
+        }
+        // A non-integer value fails TOML deserialization itself (wrong type),
+        // which `load` maps to a usage error before resolution runs.
+        let err = toml::from_str::<ServeFileConfig>("max_active_graphs = \"two\"\n").unwrap_err();
+        assert!(err.to_string().contains("max_active_graphs"), "{err}");
     }
 
     #[test]
