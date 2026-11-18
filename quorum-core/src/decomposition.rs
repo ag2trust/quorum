@@ -333,6 +333,11 @@ pub enum PlanningRetryOutcome {
 /// evidence reset safely; once evidence exists, inconsistency is held for
 /// owner intervention. A reset graph re-enters planning through the counted
 /// `max_active_graphs` admission guard of [`reacquire_freeze`].
+///
+/// Several materialized graphs may be counted at once. Each `active`/`blocked`
+/// graph is evaluated independently by its own `graph_id`, in `id ASC` order,
+/// each in its own short transaction: one graph's reset or hold never touches
+/// another graph's members or source.
 pub fn reconcile_startup_graphs(
     conn: &mut Connection,
     max_active_graphs: usize,
@@ -2342,8 +2347,10 @@ fn cancel_unfinished_members(tx: &Transaction<'_>, graph_id: i64, now: i64) -> R
 }
 
 /// Record a reviewer-confirmed decomposition defect and revoke only the
-/// affected review authority. The graph remains active-but-blocked so the
-/// repository-wide active-graph exclusion remains authoritative.
+/// affected review authority. Only the graph that owns the affected child is
+/// blocked (it is resolved through that child's membership row); other
+/// counted graphs keep their own dispatch and completion authority. The
+/// blocked graph stays counted against `max_active_graphs`.
 pub fn block_graph(conn: &mut Connection, blocker: &GraphBlocker<'_>) -> Result<bool> {
     if [
         blocker.reviewer,
@@ -8737,6 +8744,186 @@ mod tests {
         assert_eq!(alert.2, format!("task:{}", ids[0]));
         assert!(alert.3.contains("task graph blocked"));
         assert!(alert.3.contains(reason));
+    }
+
+    /// Materialize a second counted graph beside the one `begin` created.
+    fn second_materialized_graph(conn: &mut Connection, keys: &[&str]) -> (i64, i64, Vec<i64>) {
+        conn.execute(
+            "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+             VALUES ('second large','open','owner',1,1)",
+            [],
+        )
+        .unwrap();
+        let source = conn.last_insert_rowid();
+        let graph = begin_planning(
+            conn,
+            &BeginPlanning {
+                max_active_graphs: 2,
+                source_task_id: source,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: 3,
+            },
+        )
+        .unwrap()
+        .expect("a limit of 2 admits the second graph");
+        assert!(
+            set_frozen_phase(conn, graph, "freeze-requested", "preclassifying", None, 3).unwrap()
+        );
+        let children: Vec<_> = keys.iter().map(|key| child(key, &[])).collect();
+        let ids = materialize_graph(conn, graph, 1, &children, 2, 4)
+            .unwrap()
+            .expect("the second graph activates within the limit");
+        (graph, source, ids)
+    }
+
+    /// Two counted graphs execute independently: a hard-failed child holds
+    /// only its own graph, while the other graph keeps dispatching and can
+    /// complete. The held graph's in-flight sibling finishing neither
+    /// completes nor unblocks it.
+    #[test]
+    fn hard_failed_child_holds_only_its_own_graph_among_active_graphs() {
+        let (_dir, mut conn) = file_setup();
+        let graph_a = begin(&mut conn);
+        let a = materialize_graph(
+            &mut conn,
+            graph_a,
+            1,
+            &[child("a1", &[]), child("a2", &[])],
+            2,
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        let (graph_b, source_b, b) = second_materialized_graph(&mut conn, &["b1", "b2"]);
+        assert_eq!(counted_graphs(&conn), 2);
+        let mut both: Vec<i64> = a.iter().chain(&b).copied().collect();
+        both.sort_unstable();
+        assert_eq!(
+            implementation_ready_ids(&conn),
+            both,
+            "every active graph's ready children are dispatchable"
+        );
+        crate::tasks::claim(&mut conn, "wa", Some(a[0]), &[], 60, 5)
+            .unwrap()
+            .unwrap();
+
+        let tx = begin_immediate(&mut conn).unwrap();
+        tx.execute(
+            "UPDATE tasks SET status='failed',refs='{}',updated_at=5 WHERE id=?1",
+            [a[1]],
+        )
+        .unwrap();
+        assert!(block_graph_if_child_failed(&tx, a[1], "worker reported failed", 5).unwrap());
+        tx.commit().unwrap();
+        let blocked_a = (
+            "blocked".to_string(),
+            1,
+            Some("generated-child-failed".to_string()),
+        );
+        assert_eq!(graph_state_and_hold(&conn, graph_a), blocked_a);
+        assert_eq!(
+            graph_state_and_hold(&conn, graph_b),
+            ("active".to_string(), 1, None),
+            "a hold in graph A never touches graph B"
+        );
+
+        // Negative path: graph A withholds its children; graph B dispatches.
+        assert_eq!(implementation_ready_ids(&conn), b);
+        let mut claimed = vec![
+            crate::tasks::claim(&mut conn, "wb1", None, &[], 60, 6)
+                .unwrap()
+                .unwrap()
+                .id,
+            crate::tasks::claim(&mut conn, "wb2", None, &[], 60, 6)
+                .unwrap()
+                .unwrap()
+                .id,
+        ];
+        claimed.sort_unstable();
+        assert_eq!(claimed, b, "the selector claims only graph B's children");
+        assert!(crate::tasks::claim(&mut conn, "wx", None, &[], 60, 6)
+            .unwrap()
+            .is_none());
+
+        let tx = begin_immediate(&mut conn).unwrap();
+        let done = |tx: &Transaction<'_>, id: i64| {
+            tx.execute("UPDATE tasks SET status='done' WHERE id=?1", [id])
+                .unwrap();
+            complete_graph_if_final_child(tx, id, 7).unwrap()
+        };
+        assert!(!done(&tx, b[0]), "graph B still has an unfinished child");
+        assert!(done(&tx, b[1]), "graph B completes on its own final child");
+        assert!(
+            !done(&tx, a[0]),
+            "graph A's surviving sibling cannot complete a held graph"
+        );
+        tx.commit().unwrap();
+        assert_eq!(
+            graph_state_and_hold(&conn, graph_b),
+            ("completed".to_string(), 0, None)
+        );
+        assert_eq!(source_status(&conn, source_b), "done");
+        assert_eq!(graph_state_and_hold(&conn, graph_a), blocked_a);
+        assert_eq!(source_status(&conn, 1), "decomposed");
+        assert_eq!(
+            counted_graphs(&conn),
+            1,
+            "only the held graph stays counted"
+        );
+        assert_eq!(error_rows(&conn), 0);
+    }
+
+    /// Startup reconciliation evaluates each counted graph by its own id: an
+    /// inconsistent graph with delivery evidence is held without disturbing a
+    /// healthy sibling graph, whose children stay dispatchable.
+    #[test]
+    fn startup_reconcile_evaluates_each_active_graph_by_its_own_id() {
+        let (_dir, mut conn) = file_setup();
+        let graph_a = begin(&mut conn);
+        let a = materialize_graph(
+            &mut conn,
+            graph_a,
+            1,
+            &[child("a1", &[]), child("a2", &[])],
+            2,
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        let (graph_b, source_b, b) = second_materialized_graph(&mut conn, &["b1", "b2"]);
+        crate::tasks::claim(&mut conn, "wb", Some(b[0]), &[], 60, 5)
+            .unwrap()
+            .unwrap();
+        conn.execute(
+            "UPDATE task_graph_members SET active=0 WHERE task_id=?1",
+            [b[1]],
+        )
+        .unwrap();
+
+        let result = reconcile_startup_graphs(&mut conn, 2, 10).unwrap();
+        assert_eq!(
+            result,
+            StartupReconcileResult {
+                healthy: 1,
+                reset: 0,
+                held: 1
+            }
+        );
+        assert_eq!(
+            graph_state_and_hold(&conn, graph_a),
+            ("active".to_string(), 1, None)
+        );
+        assert_eq!(source_status(&conn, 1), "decomposed");
+        assert_eq!(implementation_ready_ids(&conn), a);
+        let (state, active, hold) = graph_state_and_hold(&conn, graph_b);
+        assert_eq!(
+            (state.as_str(), active, hold.as_deref()),
+            ("held", 0, Some("inconsistent-graph-with-delivery-evidence"))
+        );
+        assert_eq!(source_status(&conn, source_b), "failed");
     }
 
     fn graph_state_and_hold(conn: &Connection, graph: i64) -> (String, i64, Option<String>) {

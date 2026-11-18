@@ -6160,6 +6160,13 @@ struct DrainState {
     last_sha_poll: Option<std::time::Instant>,
 }
 
+/// Owns the one *planning* graph's provider slots and caches. Planning is
+/// serialized per repository (one `freeze_active` graph), so `graph_id` names
+/// at most that graph. Materialized graphs are never selected or cached here:
+/// every active graph's children are dispatched, held, and completed through
+/// SQL scoped by that child's own `graph_id` (the claim's graph-ready clause,
+/// `block_graph_if_child_failed`, `complete_graph_if_final_child`), so any
+/// number of counted graphs execute side by side within the shared worker cap.
 #[derive(Default)]
 struct DecompositionCoordinator {
     graph_id: Option<i64>,
@@ -6186,7 +6193,7 @@ struct DecompositionCoordinator {
     /// classifier slots.
     arbiter_slot: Option<arbiter::ArbiterSlot>,
     arbiter_source_task_id: Option<i64>,
-    /// One extracted frozen tree per active graph. The cache key includes the
+    /// One extracted frozen tree for the planning graph. The cache key includes the
     /// repository path as well as the frozen SHA, so planner retries and the
     /// later Arbiter share an exact immutable tree without cross-repository
     /// reuse.
@@ -6584,22 +6591,23 @@ impl StartupDecompositionState {
     }
 }
 
+/// Classify the repository's decomposition state at startup across every
+/// non-terminal graph rather than one selected row: several materialized
+/// graphs may be counted at once, and each is evaluated by its own `graph_id`.
+/// Any graph in a proposal phase must carry a valid accepted proposal. Planning
+/// authority wins (`Frozen`), then any executing graph (`Active`), then any
+/// held-active graph (`Blocked`).
 fn inspect_startup_decomposition(conn: &rusqlite::Connection) -> Result<StartupDecompositionState> {
-    use rusqlite::OptionalExtension;
-    let row: Option<(String, bool, Option<String>)> = conn
-        .query_row(
-            "SELECT state,freeze_active,accepted_proposal_json
-             FROM task_decompositions
-             WHERE state NOT IN ('held','completed','cancelled')
-             ORDER BY freeze_active DESC,id LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    let Some((state, freeze, proposal)) = row else {
-        return Ok(StartupDecompositionState::None);
-    };
-    if matches!(state.as_str(), "validating" | "preclassifying") {
+    let mut statement = conn.prepare(
+        "SELECT state,accepted_proposal_json FROM task_decompositions
+         WHERE state IN ('validating','preclassifying') ORDER BY id",
+    )?;
+    let proposals = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (state, proposal) in proposals {
         let raw = proposal.ok_or_else(|| {
             QuorumError::Io(format!("{state} decomposition lacks accepted proposal"))
         })?;
@@ -6609,11 +6617,20 @@ fn inspect_startup_decomposition(conn: &rusqlite::Connection) -> Result<StartupD
             ))
         })?;
     }
-    Ok(if freeze {
+    let (frozen, active, blocked): (bool, bool, bool) = conn.query_row(
+        "SELECT
+             EXISTS(SELECT 1 FROM task_decompositions
+                    WHERE freeze_active=1 AND state NOT IN ('held','completed','cancelled')),
+             EXISTS(SELECT 1 FROM task_decompositions WHERE state='active'),
+             EXISTS(SELECT 1 FROM task_decompositions WHERE state='blocked')",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok(if frozen {
         StartupDecompositionState::Frozen
-    } else if state == "active" {
+    } else if active {
         StartupDecompositionState::Active
-    } else if state == "blocked" {
+    } else if blocked {
         StartupDecompositionState::Blocked
     } else {
         StartupDecompositionState::None
@@ -6698,7 +6715,7 @@ async fn frozen_planner_view(repo: &Path, frozen_sha: &str) -> Result<tempfile::
 }
 
 /// Return this coordinator's frozen archive for `(repo, frozen_sha)`, creating
-/// it only when that immutable source has changed. A coordinator advances one
+/// it only when that immutable source has changed. A coordinator plans one
 /// graph at a time, which bounds this cache to one temporary archive.
 async fn cached_frozen_planner_view(
     coordinator: &mut DecompositionCoordinator,
@@ -25507,6 +25524,14 @@ async fn resolve_branch_sync_adoption(
 /// source task, which is in `planning` status and is also excluded by the
 /// claim SQL's source-scoped freeze clause, so unrelated open tasks and other
 /// graphs' ready children keep dispatching while a graph plans.
+///
+/// Every active graph advances in this same pass. Each admission re-reads the
+/// candidate listing on its own short connection (`priority DESC, id ASC`),
+/// and the listing and the claim both evaluate holds, hard-failed siblings,
+/// and the `max_graph_children_working` limit per child's own `graph_id`. A
+/// held graph therefore withholds only its own children, while children of
+/// every graph share — and never exceed in aggregate — the worker `cap`, which
+/// also bounds the pass to at most `cap` admissions per tick.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_workers(
     config: &ServeConfig,
@@ -46369,6 +46394,216 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         drop(conn);
 
         workers.pop().unwrap().kill_and_reap().await;
+    }
+
+    /// Every active graph advances in one dispatch pass: children of two
+    /// graphs share the worker `cap` without exceeding it, and each graph's
+    /// `max_graph_children_working` limit still applies. A hard-failed child
+    /// then holds only its own graph: with spare capacity, the other graph's
+    /// remaining child dispatches and the held graph's ready child does not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_workers_advances_every_active_graph_within_the_shared_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("state.txt"), "base\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["branch", "-M", "main"]);
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "main"]);
+
+        const READY: &str = r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#;
+        let db_path = dir.path().join("quorum.db");
+        let seed_graph = |conn: &mut rusqlite::Connection, name: &str, children: usize| {
+            let source = tasks::create(
+                conn,
+                "owner",
+                &format!("{name} source"),
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute("UPDATE tasks SET status='decomposed' WHERE id=?1", [source])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                     planned_source_revision,plan_revision,accepted_plan_revision,
+                     created_at,updated_at)
+                 VALUES (?1,'active',1,0,1,1,1,1,1)",
+                [source],
+            )
+            .unwrap();
+            let graph = conn.last_insert_rowid();
+            let ids = (0..children)
+                .map(|index| {
+                    let id = tasks::create(
+                        conn,
+                        "owner",
+                        &format!("{name} child {index}"),
+                        None,
+                        0,
+                        None,
+                        Some(READY),
+                        None,
+                        None,
+                        now_unix(),
+                    )
+                    .unwrap();
+                    conn.execute("UPDATE tasks SET terminal_leaf=1 WHERE id=?1", [id])
+                        .unwrap();
+                    conn.execute(
+                        "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+                         VALUES (?1,?2,?3,1,1)",
+                        rusqlite::params![graph, id, format!("{name}{index}")],
+                    )
+                    .unwrap();
+                    id
+                })
+                .collect::<Vec<i64>>();
+            (graph, ids)
+        };
+        // Graph A has the lower ids, so a dispatcher that served one graph
+        // until it ran dry would fill the cap from A alone.
+        let ((graph_a, a), (graph_b, b)) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            (seed_graph(&mut conn, "a", 3), seed_graph(&mut conn, "b", 2))
+        };
+
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo.clone());
+        config.worktree_base = dir.path().join("worktrees");
+        config.cap = 3;
+        config.max_graph_children_working = Some(2);
+        config.agent_bin = Some(
+            fake_stdin_holding_agent(dir.path(), "hold-worker")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+        let mut cooldown = ProfileCooldown::new();
+
+        dispatch_workers(
+            &config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut poison,
+            &mut skips,
+            &mut roster,
+            &mut cooldown,
+        )
+        .await
+        .unwrap();
+
+        let working = |ids: &[i64]| {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            ids.iter()
+                .copied()
+                .filter(|id| tasks::get(&conn, *id).unwrap().unwrap().status == "working")
+                .collect::<Vec<i64>>()
+        };
+        let dispatched: Vec<i64> = workers.iter().map(|w| w.task_id).collect();
+        assert_eq!(dispatched.len(), 3, "the shared cap is filled exactly");
+        assert_eq!(
+            working(&a),
+            vec![a[0], a[1]],
+            "graph A stops at its working limit"
+        );
+        assert_eq!(
+            working(&b),
+            vec![b[0]],
+            "graph B dispatches in the same pass"
+        );
+
+        // Hard-fail A's first child: the claim/listing SQL holds graph A only.
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='failed',assignee=NULL,refs='{}' WHERE id=?1",
+                [a[0]],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE task_decompositions SET state='blocked',hold_code='generated-child-failed'
+                 WHERE id=?1",
+                [graph_a],
+            )
+            .unwrap();
+        }
+        config.cap = 6;
+        dispatch_workers(
+            &config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut poison,
+            &mut skips,
+            &mut roster,
+            &mut cooldown,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            workers.len(),
+            4,
+            "only graph B's remaining child is admitted despite spare capacity"
+        );
+        assert_eq!(working(&b), b, "graph B keeps dispatching");
+        assert_eq!(
+            working(&a[2..]),
+            Vec::<i64>::new(),
+            "the held graph's ready child never starts"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let state = |graph: i64| -> String {
+            conn.query_row(
+                "SELECT state FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(state(graph_a), "blocked");
+        assert_eq!(state(graph_b), "active", "graph B's state is unaffected");
+        drop(conn);
+
+        for worker in workers.drain(..) {
+            worker.kill_and_reap().await;
+        }
     }
 
     #[cfg(unix)]
@@ -67616,6 +67851,38 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 StartupDecompositionState::Frozen
             );
         }
+    }
+
+    /// Startup inspection evaluates every non-terminal graph instead of the
+    /// lowest-id row: an unadmitted `freeze-requested` graph ahead of an
+    /// active graph must not hide the active one, and a planning freeze on a
+    /// later graph still defers lifecycle recovery.
+    #[test]
+    fn startup_inspection_considers_every_counted_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("graphs.db")).unwrap();
+        fn graph(conn: &mut rusqlite::Connection, state: &str, active: i64, freeze: i64) {
+            let source =
+                tasks::create(conn, "owner", state, None, 1, None, None, None, None, 1).unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at) VALUES (?1,?2,?3,?4,1,2,2)",
+                rusqlite::params![source, state, active, freeze],
+            )
+            .unwrap();
+        }
+        graph(&mut conn, "freeze-requested", 0, 0);
+        graph(&mut conn, "blocked", 1, 0);
+        graph(&mut conn, "active", 1, 0);
+        assert_eq!(
+            inspect_startup_decomposition(&conn).unwrap(),
+            StartupDecompositionState::Active
+        );
+        graph(&mut conn, "draining", 0, 1);
+        assert_eq!(
+            inspect_startup_decomposition(&conn).unwrap(),
+            StartupDecompositionState::Frozen
+        );
     }
 
     #[test]
