@@ -366,6 +366,40 @@ async fn run_git_with_input(
     }).await.map_err(|e| format!("{label}: owner join: {e}"))?
 }
 
+/// Read-only ancestry probe for GitHub head-propagation lag: `Ok(true)` only
+/// when `ancestor` is a strict ancestor of `descendant` in `repo_dir`. Exit 1
+/// (not an ancestor) is `Ok(false)`; a missing object or any other git failure
+/// is a loud `Err`, so callers never classify an unknown head as lag.
+pub(crate) async fn is_strict_ancestor(
+    repo_dir: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool, String> {
+    if ancestor == descendant {
+        return Ok(false);
+    }
+    let mut cmd = Command::from(git_command(Path::new("git")));
+    cmd.arg("-C")
+        .arg(repo_dir)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant]);
+    let out = run_git(
+        cmd,
+        DEFAULT_LOCAL_TIMEOUT,
+        "git merge-base head propagation",
+    )
+    .await?;
+    if out.status.success() {
+        Ok(true)
+    } else if out.status.code() == Some(1) {
+        Ok(false)
+    } else {
+        Err(format!(
+            "git merge-base --is-ancestor {ancestor} {descendant} failed: {}",
+            git_diagnostic(&out.stderr)
+        ))
+    }
+}
+
 impl WorktreeManager {
     pub fn new() -> Self {
         Self {

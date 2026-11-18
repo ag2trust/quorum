@@ -417,12 +417,14 @@ async fn merge_approved(
         let exec = Arc::clone(merge_executor);
         let timeout = checks_timeout_secs;
         let poll = checks_poll_secs;
-        let checks =
-            tokio::task::spawn_blocking(move || exec.wait_for_checks(pr, &repo, timeout, poll))
-                .await
-                .map_err(|e| {
-                    QuorumError::Io(format!("wait_for_checks spawn_blocking join: {e}"))
-                })?;
+        // Attribute check results to the exact approved head, never to a
+        // different head GitHub may still report.
+        let head = appr.approved_head_sha.clone();
+        let checks = tokio::task::spawn_blocking(move || {
+            exec.wait_for_checks_at_head(pr, &repo, &head, timeout, poll)
+        })
+        .await
+        .map_err(|e| QuorumError::Io(format!("wait_for_checks spawn_blocking join: {e}")))?;
         match checks {
             merge::ChecksOutcome::Ready => {}
             merge::ChecksOutcome::Failed { failing_checks } => {

@@ -210,6 +210,22 @@ pub trait MergeExecutor: Send + Sync {
         ChecksOutcome::Ready
     }
 
+    /// Exact-head variant of [`MergeExecutor::wait_for_checks`]. A check
+    /// snapshot GitHub reports for any PR head other than `expected_head`
+    /// (read-after-write lag right after a push) counts as pending, never as
+    /// failed or ready. The default delegates so lightweight test executors
+    /// stay source-compatible; the GitHub executor overrides it.
+    fn wait_for_checks_at_head(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        _expected_head: &str,
+        timeout_secs: u64,
+        poll_interval_secs: u64,
+    ) -> ChecksOutcome {
+        self.wait_for_checks(pr, repo_dir, timeout_secs, poll_interval_secs)
+    }
+
     /// CI wait for a branch sync. Unlike ordinary task merges, an empty
     /// status-check rollup never establishes readiness: the sync path has a
     /// mandatory non-empty required-jobs gate. The production executor
@@ -257,6 +273,18 @@ pub trait MergeExecutor: Send + Sync {
         _required_jobs: &[String],
     ) -> RequiredJobsOutcome {
         RequiredJobsOutcome::AllSucceeded
+    }
+
+    /// Exact-head variant of [`MergeExecutor::check_required_jobs`]: a rollup
+    /// for another PR head is pending, never `NotReady`.
+    fn check_required_jobs_at_head(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        _expected_head: &str,
+        required_jobs: &[String],
+    ) -> RequiredJobsOutcome {
+        self.check_required_jobs(pr, repo_dir, required_jobs)
     }
 
     /// Check the CI status of the default branch's latest workflow run.
@@ -352,6 +380,59 @@ fn parse_checks_json(json_str: &str) -> (Option<String>, Option<Vec<(String, Sin
         });
 
     (merge_state, checks)
+}
+
+/// Attribute a `gh pr view --json headRefOid,...` snapshot to an exact head.
+/// Returns `None` when the snapshot's `headRefOid` is `expected_head`, or a
+/// pending reason when GitHub reports another (or no) head: check results in
+/// that snapshot belong to a different commit and must not gate this one.
+fn checks_snapshot_head_mismatch(json_str: &str, expected_head: &str) -> Option<String> {
+    let reported = serde_json::from_str::<serde_json::Value>(json_str)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("headRefOid")
+                .and_then(|head| head.as_str())
+                .map(str::to_owned)
+        });
+    match reported.as_deref() {
+        Some(head) if head == expected_head => None,
+        Some(head) => Some(format!(
+            "GitHub reports PR head {head}, not expected head {expected_head}"
+        )),
+        None => Some(format!(
+            "GitHub reported no PR head while waiting for expected head {expected_head}"
+        )),
+    }
+}
+
+/// Interpret one `gh pr view` checks snapshot. With `expected_head`, a
+/// snapshot attributed to any other PR head is pending, never failed or ready.
+fn checks_query_for_head(json_str: &str, expected_head: Option<&str>) -> ChecksQueryResult {
+    if expected_head
+        .is_some_and(|expected| checks_snapshot_head_mismatch(json_str, expected).is_some())
+    {
+        return ChecksQueryResult::Pending;
+    }
+    let (merge_state, checks) = parse_checks_json(json_str);
+    checks_query_from_parsed(&merge_state, &checks)
+}
+
+/// Required-jobs counterpart of [`checks_query_for_head`]: a rollup for
+/// another head is `Pending`, never `NotReady`.
+fn required_jobs_for_head(
+    json_str: &str,
+    expected_head: Option<&str>,
+    required_jobs: &[String],
+) -> RequiredJobsOutcome {
+    if let Some(reason) =
+        expected_head.and_then(|expected| checks_snapshot_head_mismatch(json_str, expected))
+    {
+        return RequiredJobsOutcome::Pending {
+            pending_jobs: vec![reason],
+        };
+    }
+    validate_required_jobs(json_str, required_jobs)
 }
 
 fn pending_check_names_from_json(json_str: &str) -> Vec<String> {
@@ -750,27 +831,105 @@ impl GhMergeExecutor {
         gh_pr_state_is_merged(&stdout)
     }
 
-    fn query_checks(&self, pr: i64, repo_dir: &Path) -> ChecksQueryResult {
+    /// Poll one PR's check rollup until it settles or `timeout_secs` passes.
+    /// With `expected_head`, a snapshot for another PR head is pending.
+    fn poll_checks(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        expected_head: Option<&str>,
+        timeout_secs: u64,
+        poll_interval_secs: u64,
+    ) -> ChecksOutcome {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        // #181: after a push, GitHub transiently returns statusCheckRollup: []
+        // before CI registers. Require 2 consecutive empty polls to distinguish
+        // "no CI configured" from "checks haven't registered yet."
+        let mut consecutive_no_checks = 0u32;
+        loop {
+            match self.query_checks(pr, repo_dir, expected_head) {
+                ChecksQueryResult::AllPassed => return ChecksOutcome::Ready,
+                ChecksQueryResult::SomeFailed(names) => {
+                    return ChecksOutcome::Failed {
+                        failing_checks: names,
+                    }
+                }
+                ChecksQueryResult::NoChecksConfigured => {
+                    consecutive_no_checks += 1;
+                    if consecutive_no_checks >= 2 {
+                        return ChecksOutcome::Ready;
+                    }
+                }
+                ChecksQueryResult::Pending => {
+                    consecutive_no_checks = 0;
+                }
+            }
+            if Instant::now() + Duration::from_secs(poll_interval_secs) > deadline {
+                return ChecksOutcome::TimedOut;
+            }
+            std::thread::sleep(Duration::from_secs(poll_interval_secs));
+        }
+    }
+
+    /// Required-jobs snapshot. With `expected_head`, the same `gh` call reads
+    /// `headRefOid`; a rollup for another head is pending, never `NotReady`.
+    fn query_required_jobs(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        expected_head: Option<&str>,
+        required_jobs: &[String],
+    ) -> RequiredJobsOutcome {
+        if required_jobs.is_empty() {
+            return RequiredJobsOutcome::AllSucceeded;
+        }
         let pr_str = pr.to_string();
-        let mut cmd = self.build_gh_cmd(
-            &[
-                "pr",
-                "view",
-                &pr_str,
-                "--json",
-                "statusCheckRollup,mergeStateStatus",
-            ],
-            repo_dir,
-        );
+        let fields = if expected_head.is_some() {
+            "statusCheckRollup,headRefOid"
+        } else {
+            "statusCheckRollup"
+        };
+        let mut cmd = self.build_gh_cmd(&["pr", "view", &pr_str, "--json", fields], repo_dir);
+        let output = match cmd.output() {
+            Ok(o) if o.status.success() => o,
+            _ => {
+                let issues = required_jobs
+                    .iter()
+                    .map(|j| (j.clone(), "query failed".into()))
+                    .collect();
+                return RequiredJobsOutcome::NotReady { issues };
+            }
+        };
+        required_jobs_for_head(
+            &String::from_utf8_lossy(&output.stdout),
+            expected_head,
+            required_jobs,
+        )
+    }
+
+    /// One rollup snapshot. With `expected_head`, the same `gh` call also reads
+    /// `headRefOid` so the rollup is attributed to that exact head; a snapshot
+    /// for any other head is pending.
+    fn query_checks(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        expected_head: Option<&str>,
+    ) -> ChecksQueryResult {
+        let pr_str = pr.to_string();
+        let fields = if expected_head.is_some() {
+            "statusCheckRollup,mergeStateStatus,headRefOid"
+        } else {
+            "statusCheckRollup,mergeStateStatus"
+        };
+        let mut cmd = self.build_gh_cmd(&["pr", "view", &pr_str, "--json", fields], repo_dir);
         let output = match cmd.output() {
             Ok(o) if o.status.success() => o,
             _ => {
                 return ChecksQueryResult::Pending;
             }
         };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let (merge_state, checks) = parse_checks_json(&stdout);
-        checks_query_from_parsed(&merge_state, &checks)
+        checks_query_for_head(&String::from_utf8_lossy(&output.stdout), expected_head)
     }
 
     /// Branch sync has a stricter interpretation than an ordinary task merge:
@@ -1252,34 +1411,24 @@ impl MergeExecutor for GhMergeExecutor {
         timeout_secs: u64,
         poll_interval_secs: u64,
     ) -> ChecksOutcome {
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-        // #181: after a push, GitHub transiently returns statusCheckRollup: []
-        // before CI registers. Require 2 consecutive empty polls to distinguish
-        // "no CI configured" from "checks haven't registered yet."
-        let mut consecutive_no_checks = 0u32;
-        loop {
-            match self.query_checks(pr, repo_dir) {
-                ChecksQueryResult::AllPassed => return ChecksOutcome::Ready,
-                ChecksQueryResult::SomeFailed(names) => {
-                    return ChecksOutcome::Failed {
-                        failing_checks: names,
-                    }
-                }
-                ChecksQueryResult::NoChecksConfigured => {
-                    consecutive_no_checks += 1;
-                    if consecutive_no_checks >= 2 {
-                        return ChecksOutcome::Ready;
-                    }
-                }
-                ChecksQueryResult::Pending => {
-                    consecutive_no_checks = 0;
-                }
-            }
-            if Instant::now() + Duration::from_secs(poll_interval_secs) > deadline {
-                return ChecksOutcome::TimedOut;
-            }
-            std::thread::sleep(Duration::from_secs(poll_interval_secs));
-        }
+        self.poll_checks(pr, repo_dir, None, timeout_secs, poll_interval_secs)
+    }
+
+    fn wait_for_checks_at_head(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        expected_head: &str,
+        timeout_secs: u64,
+        poll_interval_secs: u64,
+    ) -> ChecksOutcome {
+        self.poll_checks(
+            pr,
+            repo_dir,
+            Some(expected_head),
+            timeout_secs,
+            poll_interval_secs,
+        )
     }
 
     fn wait_for_branch_sync_checks(
@@ -1362,26 +1511,17 @@ impl MergeExecutor for GhMergeExecutor {
         repo_dir: &Path,
         required_jobs: &[String],
     ) -> RequiredJobsOutcome {
-        if required_jobs.is_empty() {
-            return RequiredJobsOutcome::AllSucceeded;
-        }
-        let pr_str = pr.to_string();
-        let mut cmd = self.build_gh_cmd(
-            &["pr", "view", &pr_str, "--json", "statusCheckRollup"],
-            repo_dir,
-        );
-        let output = match cmd.output() {
-            Ok(o) if o.status.success() => o,
-            _ => {
-                let issues = required_jobs
-                    .iter()
-                    .map(|j| (j.clone(), "query failed".into()))
-                    .collect();
-                return RequiredJobsOutcome::NotReady { issues };
-            }
-        };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        validate_required_jobs(&stdout, required_jobs)
+        self.query_required_jobs(pr, repo_dir, None, required_jobs)
+    }
+
+    fn check_required_jobs_at_head(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        expected_head: &str,
+        required_jobs: &[String],
+    ) -> RequiredJobsOutcome {
+        self.query_required_jobs(pr, repo_dir, Some(expected_head), required_jobs)
     }
 
     fn check_default_branch_ci(&self, repo_dir: &Path, branch: &str) -> DefaultBranchStatus {
@@ -1592,6 +1732,57 @@ impl MergeExecutor for CommandMergeExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn checks_snapshot(head: &str, conclusion: &str) -> String {
+        format!(
+            r#"{{"headRefOid":"{head}","mergeStateStatus":"BLOCKED","statusCheckRollup":[{{"__typename":"CheckRun","name":"container","status":"COMPLETED","conclusion":"{conclusion}"}}]}}"#
+        )
+    }
+
+    #[test]
+    fn exact_head_checks_treat_another_heads_failure_as_pending() {
+        // #402: right after the daemon's push GitHub can still serve the old
+        // head's failed rollup. It must never fail the newly published head.
+        let stale = checks_snapshot("old-head", "FAILURE");
+        assert_eq!(
+            checks_query_for_head(&stale, Some("new-head")),
+            ChecksQueryResult::Pending
+        );
+        assert_eq!(
+            checks_query_for_head(&stale, Some("old-head")),
+            ChecksQueryResult::SomeFailed(vec!["container".into()])
+        );
+        // A snapshot without any head attribution is not evidence either.
+        let unattributed = r#"{"mergeStateStatus":"CLEAN","statusCheckRollup":[]}"#;
+        assert_eq!(
+            checks_query_for_head(unattributed, Some("new-head")),
+            ChecksQueryResult::Pending
+        );
+        // Unattributed waits keep their established meaning.
+        assert_eq!(
+            checks_query_for_head(&stale, None),
+            ChecksQueryResult::SomeFailed(vec!["container".into()])
+        );
+    }
+
+    #[test]
+    fn exact_head_required_jobs_treat_another_heads_rollup_as_pending() {
+        let jobs = vec!["container".to_string()];
+        let stale = checks_snapshot("old-head", "FAILURE");
+        assert!(matches!(
+            required_jobs_for_head(&stale, Some("new-head"), &jobs),
+            RequiredJobsOutcome::Pending { .. }
+        ));
+        assert!(matches!(
+            required_jobs_for_head(&stale, Some("old-head"), &jobs),
+            RequiredJobsOutcome::NotReady { .. }
+        ));
+        let current = checks_snapshot("new-head", "SUCCESS");
+        assert_eq!(
+            required_jobs_for_head(&current, Some("new-head"), &jobs),
+            RequiredJobsOutcome::AllSucceeded
+        );
+    }
 
     fn test_ctx() -> MergeContext {
         MergeContext {

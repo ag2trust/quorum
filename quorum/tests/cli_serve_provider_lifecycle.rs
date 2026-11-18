@@ -246,7 +246,11 @@ impl ServeHandle {
     }
 
     fn wait_for(&mut self, needle: &str) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        self.wait_for_within(needle, Duration::from_secs(20));
+    }
+
+    fn wait_for_within(&mut self, needle: &str, within: Duration) {
+        let deadline = std::time::Instant::now() + within;
         while std::time::Instant::now() < deadline {
             match self.rx.recv_timeout(deadline - std::time::Instant::now()) {
                 Ok(line) => {
@@ -900,6 +904,10 @@ elif [ "$cmd" = "pr view" ]; then
     state="$(cat "$QUORUM_TEST_GH_STATE/state-$pr")"
   fi
   case " $* " in
+    *" --json statusCheckRollup,mergeStateStatus,headRefOid "*)
+      printf '{"mergeStateStatus":"CLEAN","statusCheckRollup":[],"headRefOid":"%s"}\n' "$sha"
+      exit 0
+      ;;
     *" --json statusCheckRollup,mergeStateStatus "*)
       printf '{"mergeStateStatus":"CLEAN","statusCheckRollup":[]}\n'
       exit 0
@@ -3389,8 +3397,28 @@ fn consecutive_reviewer_and_ci_rework_publications_rotate_pr_head_authority() {
         );
     }
     std::fs::write(gh_state.join("release-pr-view"), "release").unwrap();
+    // The CommandMergeExecutor head (repo-dir HEAD) still reports the prior
+    // published head: GitHub read-after-write lag. #402: the gate must hold,
+    // never apply that head's check results, then proceed once it catches up.
+    case.handle.wait_for(&format!(
+        "GitHub reports head {first_rework_sha}, an ancestor of daemon-recorded head \
+         {second_rework_sha}; waiting for propagation"
+    ));
     case.handle.wait_for("PR #1 ready for review");
-    case.handle.wait_for("checks ready");
+    assert!(Command::new("git")
+        .args([
+            "-C",
+            &case._repo.path().to_string_lossy(),
+            "update-ref",
+            "HEAD",
+            &second_rework_sha
+        ])
+        .status()
+        .unwrap()
+        .success());
+    // The held gate re-polls on the 30 s merge-checks cadence.
+    case.handle
+        .wait_for_within("checks ready", Duration::from_secs(45));
 
     let conn = case.db();
     let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
