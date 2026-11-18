@@ -10380,7 +10380,8 @@ mod tests {
     fn every_exit_from_merging_clears_merge_checks_in_the_transition() {
         let (_d, mut c) = open_tmp();
         let names = vec!["ci".to_string()];
-        let exits: Vec<(&str, Box<dyn Fn(&mut Connection, i64, i64)>)> = vec![
+        type Exit = Box<dyn Fn(&mut Connection, i64, i64)>;
+        let exits: Vec<(&str, Exit)> = vec![
             (
                 "done",
                 Box::new(|c, id, now| {
