@@ -8339,7 +8339,17 @@ async fn materialize_validated_proposal(
     };
     let path = config.db_path.clone();
     let max_active_graphs = config.max_active_graphs;
-    let materialized = tokio::task::spawn_blocking(move || -> Result<Option<bool>> {
+    enum Materialized {
+        Activated,
+        /// The guarded write bound zero rows; `true` when a lowered
+        /// `max_active_graphs` refused it rather than lost authority.
+        Refused {
+            limit_reached: bool,
+        },
+        /// Durable-input usage error.
+        Unusable,
+    }
+    let materialized = tokio::task::spawn_blocking(move || -> Result<Materialized> {
         let mut conn = quorum_core::db::open(&path)?;
         match quorum_core::decomposition::materialize_terminal_children(
             &mut conn,
@@ -8349,19 +8359,45 @@ async fn materialize_validated_proposal(
             max_active_graphs,
             now_unix(),
         ) {
-            Ok(ids) => Ok(Some(ids.is_some())),
+            Ok(Some(_)) => Ok(Materialized::Activated),
+            Ok(None) => Ok(Materialized::Refused {
+                limit_reached: quorum_core::decomposition::activation_limit_reached(
+                    &conn,
+                    graph_id,
+                    max_active_graphs,
+                )?,
+            }),
             // A usage error is a durable-input problem (unclassified child,
             // cycle, source dependency not done): bounded rejection, not a
             // tick error that would re-spawn the Arbiter every tick.
-            Err(QuorumError::Usage(_)) => Ok(None),
+            Err(QuorumError::Usage(_)) => Ok(Materialized::Unusable),
             Err(error) => Err(error),
         }
     })
     .await
     .map_err(|error| QuorumError::Io(format!("materialization join: {error}")))??;
     match materialized {
-        Some(true) => Ok(true),
-        Some(false) => {
+        Materialized::Activated => Ok(true),
+        // A `max_active_graphs` lowered below the counted set (e.g. across a
+        // restart while this graph planned) refuses activation. Like lost
+        // authority this holds the graph and fails the source, but under its
+        // own reason code so the operator sees the configuration cause.
+        Materialized::Refused {
+            limit_reached: true,
+        } => {
+            record_decomposition_attempt(
+                config,
+                graph_id,
+                "blocker",
+                "max-active-graphs-reached",
+                "activation refused: max_active_graphs other graphs are already counted",
+            )
+            .await?;
+            Ok(false)
+        }
+        Materialized::Refused {
+            limit_reached: false,
+        } => {
             record_decomposition_attempt(
                 config,
                 graph_id,
@@ -8372,7 +8408,7 @@ async fn materialize_validated_proposal(
             .await?;
             Ok(false)
         }
-        None => {
+        Materialized::Unusable => {
             reject_decomposition_proposal(
                 config,
                 graph_id,
@@ -64448,6 +64484,78 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         .unwrap()
     }
 
+    /// A `max_active_graphs` lowered below the counted set (across a restart
+    /// while this graph planned) refuses activation. The outcome is the
+    /// documented hold-and-fail under its own reason code, with no child row.
+    #[tokio::test]
+    async fn arbiter_approve_above_lowered_limit_holds_with_distinct_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("approve-limit.db");
+        let proposal = arbiter_gate_proposal();
+        let classifications = arbiter_gate_classifications();
+        let (source, graph) =
+            arbiter_validating_graph(&db_path, "large", Some("split me"), &proposal);
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            for title in ["other-a", "other-b"] {
+                conn.execute(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES (?1,'decomposed','owner',1,1)",
+                    [title],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                         planned_source_revision,accepted_plan_revision,created_at,updated_at)
+                     VALUES (?1,'active',1,0,1,1,1,1)",
+                    [conn.last_insert_rowid()],
+                )
+                .unwrap();
+            }
+        }
+        let mut config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
+        config.max_active_graphs = 2;
+
+        let materialized = apply_arbiter_verdict(
+            &config,
+            graph,
+            arbiter_done(arbiter::ArbiterVerdict::Approve),
+            &proposal,
+            &classifications,
+        )
+        .await
+        .unwrap();
+        assert!(!materialized);
+        let (state, _, hold, status) = arbiter_gate_state(&db_path, graph);
+        assert_eq!(state, "held");
+        assert_eq!(hold.as_deref(), Some("max-active-graphs-reached"));
+        assert_eq!(status, "failed");
+        assert_eq!(
+            arbiter_gate_attempts(&db_path, graph),
+            vec![
+                ("verdict".to_string(), "arbiter-approve".to_string()),
+                (
+                    "blocker".to_string(),
+                    "max-active-graphs-reached".to_string()
+                ),
+            ]
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let (members, errors): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM task_graph_members WHERE graph_id=?1),
+                        (SELECT count(*) FROM errors)",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (members, errors),
+            (0, 0),
+            "source {source}: no child, no errors row"
+        );
+    }
+
     #[tokio::test]
     async fn arbiter_approve_materializes_the_classified_proposal_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -64517,7 +64625,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
         // A restart that re-polls a fresh Arbiter cannot double-materialize:
         // the guarded materialization is keyed on the frozen planning phase
-        // and the one-active-graph index, and no budget-bearing row is
+        // and the counted activation guard, and no budget-bearing row is
         // recorded against an active graph.
         let again = apply_arbiter_verdict(
             &config,

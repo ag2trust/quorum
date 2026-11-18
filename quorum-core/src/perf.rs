@@ -2066,7 +2066,9 @@ fn load_non_managed_invocation_facts(
                 "blocker"
                     if !matches!(
                         reason_code.as_str(),
-                        "arbiter-reject-source" | "materialization-authority-lost"
+                        "arbiter-reject-source"
+                            | "materialization-authority-lost"
+                            | "max-active-graphs-reached"
                     ) =>
                 {
                     note_non_managed_invocation(snapshot, task_id, "planner")

@@ -2968,8 +2968,14 @@ only *other* graphs; the materialization activation `UPDATE … RETURNING` count
 counted graphs, so activating an already-counted planning graph never double-counts it. A lost
 admission or activation race is zero guarded rows (or a false admission check) and maps to
 `Ok(None)`/`Ok(false)`: a clean negative with no `errors` row; post-timeout `SQLITE_BUSY` stays an
-internal failure. A limit lowered below the current counted set admits nothing new and refuses
-activation (the transaction rolls back every child insert) until the count falls. The daemon's
+internal failure. A limit lowered below the current counted set (for example across a restart
+while a graph plans) admits nothing new until the count falls. It also refuses that planning
+graph's activation: the transaction rolls back every child insert, and the daemon then holds the
+graph and fails its source like any other materialization blocker, under the distinct hold code
+`max-active-graphs-reached` (lost graph/source authority stays `materialization-authority-lost`).
+The Arbiter-approved plan is not kept; the operator raises the limit or lets graphs complete,
+then re-files or rescopes the source. The exhaustion-path terminal-leaf fallback, when refused the
+same way, parks the graph exactly as when no fallback applies. The daemon's
 `planning_candidate` selects sources by `priority DESC, id ASC` only while fewer than the limit
 are counted; the core guard remains the authority. `max_active_graphs` is daemon configuration
 threaded into each call, not stored in the database.

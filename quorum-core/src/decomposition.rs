@@ -2,7 +2,8 @@
 //!
 //! Provider execution and semantic proposal validation live above this module.
 //! These functions defensively enforce the invariants that must survive races:
-//! one freeze, one active graph, source revision stability, complete all-at-once
+//! one planning freeze, at most `max_active_graphs` counted graphs, source
+//! revision stability, complete all-at-once
 //! materialization, bounded attempt ledgers, and top-down cancellation.
 
 use crate::db::{begin_immediate, map_sql_err};
@@ -1867,6 +1868,30 @@ pub fn materialize_graph(
         max_active_graphs,
         now,
     )
+}
+
+/// Classify a refused activation after the fact. Returns `true` when the
+/// graph still holds planning authority (so authority was not lost) but at
+/// least `max_active_graphs` other graphs are counted: the activation guard
+/// refused it because the limit was lowered below the counted set. This is a
+/// diagnostic read used to pick the hold reason code; the guarded activation
+/// write remains the authority.
+pub fn activation_limit_reached(
+    conn: &Connection,
+    graph_id: i64,
+    max_active_graphs: usize,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM task_decompositions
+             WHERE id=?1 AND active=0 AND freeze_active=1
+               AND state IN ('planning','validating','preclassifying')
+               AND (SELECT COUNT(*) FROM task_decompositions other
+                    WHERE other.id!=?1 AND {COUNTED_GRAPH_PREDICATE}) >= ?2)"
+        ),
+        params![graph_id, graph_limit(max_active_graphs)?],
+        |row| row.get(0),
+    )?)
 }
 
 /// Cancel a source graph and revoke all unfinished generated execution

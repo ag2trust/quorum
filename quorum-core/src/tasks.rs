@@ -697,10 +697,10 @@ pub const BRANCH_SYNC_REF_PRESENT_SQL: &str = branch_sync_ref_present_sql!();
 /// review-only, terminal leaf, continuation, a branch-sync ref, and an
 /// existing decomposition or graph membership. `id` is qualified because the
 /// membership subqueries shadow it; the other `refs` checks stay unqualified
-/// and resolve to that same aliased row. The repository-wide one-active-graph
-/// exclusion is not part of this predicate. `planning_candidate` keeps that
-/// clause, and status uses this predicate only to explain a queued task that
-/// the clause is holding.
+/// and resolve to that same aliased row. The repository-wide counted
+/// `max_active_graphs` limit is not part of this predicate. `planning_candidate`
+/// applies that limit, and status uses this predicate only to explain a queued
+/// task that the limit is holding.
 ///
 /// A branch-sync judgment task bypasses planning exactly like continuation
 /// and review-only work. Selecting it would let routed planning reject it
