@@ -3,9 +3,9 @@ mod protocol;
 use protocol::{
     AcquireDaemonLockInput, AdmitGraphInput, AllocateRoleInput, ApplyGraphEventInput, Barrier,
     CancelSourceGraphInput, ClaimCleanupInput, ClaimProviderRetryReworkInput, ClaimTaskInput,
-    GraphAdmission, GraphEvent, MaterializeAssessmentInput, Operation, EXIT_INTERNAL,
-    EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE, MAX_BARRIER_WAIT_MS, MAX_INPUT_BYTES, MAX_PATH_BYTES,
-    MAX_TEXT_BYTES,
+    DiscardRunnerRetryInput, GraphAdmission, GraphEvent, MaterializeAssessmentInput, Operation,
+    RetryProviderBlockedInput, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE,
+    MAX_BARRIER_WAIT_MS, MAX_INPUT_BYTES, MAX_PATH_BYTES, MAX_TEXT_BYTES,
 };
 use quorum_core::decomposition::SourceCancellation;
 use quorum_core::error::QuorumError;
@@ -76,6 +76,8 @@ fn run() -> Result<i32, HelperError> {
         Operation::MaterializeAssessment => materialize_assessment(parse(&input)?)?,
         Operation::AcquireDaemonLock => acquire_daemon_lock(parse(&input)?)?,
         Operation::AdmitGraph => admit_graph(parse(&input)?)?,
+        Operation::RetryProviderBlocked => retry_provider_blocked(parse(&input)?)?,
+        Operation::DiscardRunnerRetry => discard_runner_retry(parse(&input)?)?,
     };
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -239,6 +241,64 @@ fn claim_provider_retry_rework(
     .is_some();
     Ok(OperationResult::race(
         json!({"ok": won, "agent": input.agent}),
+        won,
+    ))
+}
+
+fn retry_provider_blocked(
+    input: RetryProviderBlockedInput,
+) -> Result<OperationResult, HelperError> {
+    validate_path("database", &input.db_path)?;
+    validate_positive("task id", input.task_id)?;
+    validate_text("retry requester", &input.by)?;
+    wait_at_barrier(&input.barrier)?;
+    let mut conn = quorum_core::db::open(&input.db_path)?;
+    let won =
+        quorum_core::tasks::retry_provider_blocked(&mut conn, input.task_id, &input.by, input.now)?
+            .is_some();
+    Ok(OperationResult::race(
+        json!({"ok": won, "by": input.by}),
+        won,
+    ))
+}
+
+fn discard_runner_retry(input: DiscardRunnerRetryInput) -> Result<OperationResult, HelperError> {
+    validate_path("database", &input.db_path)?;
+    validate_positive("task id", input.task_id)?;
+    let turn = input.expected_turn;
+    for (label, value) in [
+        ("turn provider", &turn.provider),
+        ("turn model", &turn.model),
+        ("turn effort", &turn.effort),
+        ("turn prompt", &turn.prompt),
+        ("turn kind", &turn.turn_kind),
+    ] {
+        validate_text(label, value)?;
+    }
+    if let Some(id) = &turn.continuation_id {
+        validate_text("turn continuation id", id)?;
+    }
+    wait_at_barrier(&input.barrier)?;
+    let mut conn = quorum_core::db::open(&input.db_path)?;
+    let outcome = quorum_core::tasks::discard_unresumable_runner_retry(
+        &mut conn,
+        input.task_id,
+        &input.holder,
+        &quorum_core::runner_state::PendingTurn {
+            provider: turn.provider,
+            model: turn.model,
+            effort: turn.effort,
+            prompt: turn.prompt,
+            turn_kind: turn.turn_kind,
+            continuation_id: turn.continuation_id,
+            requested: turn.requested,
+        },
+        &input.new_profile_id,
+        input.now,
+    )?;
+    let won = outcome == quorum_core::tasks::RunnerRetryDiscard::Discarded;
+    Ok(OperationResult::race(
+        json!({"ok": won, "holder": input.holder}),
         won,
     ))
 }

@@ -318,22 +318,45 @@ pub fn clear_provider_retry(refs: &mut Value) {
             set_continuation(refs, ContinuationSlot::Worker, &identity);
         }
     }
+    remove_keys(refs, RETRY_STATE_REFS);
+}
+
+/// Neutral and historical Codex keys that together hold one blocked or
+/// requested pending turn.
+const RETRY_STATE_REFS: &[&str] = &[
+    PROVIDER_BLOCK_REF,
+    RETRY_REF,
+    "codex_provider_blocked",
+    "codex_provider_error",
+    "codex_retry_requested",
+    "codex_retry_model",
+    "codex_retry_effort",
+    "codex_retry_prompt",
+    "codex_retry_turn_kind",
+    "codex_retry_thread_id",
+];
+
+/// Drop a pending turn that the selected runner cannot resume. Unlike
+/// [`clear_provider_retry`], the worker continuation is discarded too, in both
+/// its neutral and historical Codex forms: the next worker turn must start
+/// fresh rather than resume a conversation owned by the dropped provider.
+pub fn discard_provider_retry(refs: &mut Value) {
+    remove_keys(refs, RETRY_STATE_REFS);
+    remove_keys(
+        refs,
+        &[
+            ContinuationSlot::Worker.ref_key(),
+            ContinuationSlot::Worker.legacy_codex_ref_key(),
+        ],
+    );
+}
+
+fn remove_keys(refs: &mut Value, keys: &[&str]) {
     let Some(object) = refs.as_object_mut() else {
         return;
     };
-    for key in [
-        PROVIDER_BLOCK_REF,
-        RETRY_REF,
-        "codex_provider_blocked",
-        "codex_provider_error",
-        "codex_retry_requested",
-        "codex_retry_model",
-        "codex_retry_effort",
-        "codex_retry_prompt",
-        "codex_retry_turn_kind",
-        "codex_retry_thread_id",
-    ] {
-        object.remove(key);
+    for key in keys {
+        object.remove(*key);
     }
 }
 
@@ -388,6 +411,43 @@ mod tests {
         assert!(refs.get("codex_retry_requested").is_none());
         assert_eq!(requested_retry(&refs, "codex").unwrap().prompt, "finish");
         assert_eq!(refs["codex_thread_id"], "thread-old");
+    }
+
+    #[test]
+    fn discard_drops_both_retry_representations_and_worker_continuation() {
+        let mut refs = serde_json::json!({
+            "pr": 7,
+            RETRY_REF: {
+                "provider": "codex", "model": "gpt-5", "effort": "high",
+                "prompt": "finish", "turn_kind": "rework",
+                "continuation_id": "thread-new", "requested": true
+            },
+            CONTINUATION_REF: {"provider": "codex", "id": "thread-new"},
+            REVIEWER_R1_CONTINUATION_REF: {"provider": "claude", "id": "r1"},
+            PROVIDER_BLOCK_REF: {"provider": "codex", "reason": "quota"},
+            "codex_thread_id": "thread-old",
+            "codex_reviewer_r1_thread_id": "r1-old",
+            "codex_provider_blocked": true,
+            "codex_provider_error": "quota",
+            "codex_retry_requested": true,
+            "codex_retry_model": "gpt-5",
+            "codex_retry_effort": "high",
+            "codex_retry_prompt": "finish",
+            "codex_retry_turn_kind": "rework",
+            "codex_retry_thread_id": "thread-old"
+        });
+        discard_provider_retry(&mut refs);
+        assert_eq!(
+            refs,
+            serde_json::json!({
+                "pr": 7,
+                REVIEWER_R1_CONTINUATION_REF: {"provider": "claude", "id": "r1"},
+                "codex_reviewer_r1_thread_id": "r1-old"
+            })
+        );
+        assert!(requested_retry_any(&refs).is_none());
+        assert!(!retry_requested(&refs));
+        assert!(continuation(&refs, ContinuationSlot::Worker, "codex").is_none());
     }
 
     #[test]
