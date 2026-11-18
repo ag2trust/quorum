@@ -3192,10 +3192,13 @@ retry count/cap without exposing planner transcripts.
 Reviewer provisioning reserves task authority in `BEGIN IMMEDIATE` before external resolution or
 process creation. The same transaction checks task phase, classification, and planning freeze;
 planning freeze acquisition excludes live reservations. The daemon releases the reservation only
-after reviewer attachment or complete failed-provision cleanup. In-flight work continues under a
-freeze, so the ordinary classifier keeps running for the started set (`working`, `in-review`,
-`rework` — e.g. a review-only task created during the freeze, whose reviewer cannot dispatch
-unclassified); `open` tasks wait for the freeze to clear. Planning never waits on that work, on
+after reviewer attachment or complete failed-provision cleanup. A planning freeze pauses no
+daemon phase: worker dispatch admits every implementation-ready open task and retried rework,
+the ordinary classifier classifies every unclassified task (new `open` tasks included), and the
+doctor and the post-merge collector retry queue keep running. Only the self-update drain pauses
+those phases. The planning source stays non-dispatchable throughout: it is in `planning`, which
+neither the open-task selector nor the classifier queue selects, and the claim SQL's
+source-scoped freeze clause excludes it as defense in depth. Planning never waits on in-flight work, on
 blocked, parked, or provider-blocked tasks, or on live-agent journal rows. There is no automatic
 provider retry for a provider-blocked task; progress requires an operator `task-retry`. Status
 reports no repository-wide drain: it has no drain-stall projection, health does not count a

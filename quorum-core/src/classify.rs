@@ -183,34 +183,15 @@ const INCOMPLETE_CLASSIFICATION_PREDICATE: &str = r#"
 
 /// Query active tasks and policy-parked tasks whose v2 classification is
 /// incomplete. Malformed legacy refs are candidates rather than a query error.
+/// A planning source (`planning` status) is never selected, so classifying
+/// while a graph plans cannot make that source dispatchable.
 pub fn unclassified_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>> {
-    unclassified_tasks_where(
-        conn,
-        "(status IN ('open', 'working', 'in-review', 'rework', 'merging')
-                OR CASE WHEN status='failed' AND json_valid(refs)
-                        THEN json_extract(refs, '$.classifier_policy_parked')=1
-                        ELSE 0 END)",
-    )
-}
-
-/// Unclassified tasks that have already started (`working`, `in-review`,
-/// `rework`). A review-only task is created directly `in-review` and
-/// unclassified, and its reviewer cannot dispatch until it is classified. A
-/// decomposition freeze therefore admits the classifier for this set only:
-/// these tasks can never become a planning source or claim new implementation
-/// work, and gating them would strand in-flight work for the whole planning
-/// attempt.
-pub fn unclassified_started_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>> {
-    unclassified_tasks_where(conn, "status IN ('working', 'in-review', 'rework')")
-}
-
-fn unclassified_tasks_where(
-    conn: &Connection,
-    status_predicate: &str,
-) -> Result<Vec<TaskForClassification>> {
     let query = format!(
         "SELECT id, revision, substr(title, 1, ?1), substr(body, 1, ?2) FROM tasks
-         WHERE {status_predicate}
+         WHERE (status IN ('open', 'working', 'in-review', 'rework', 'merging')
+                OR CASE WHEN status='failed' AND json_valid(refs)
+                        THEN json_extract(refs, '$.classifier_policy_parked')=1
+                        ELSE 0 END)
          AND {INCOMPLETE_CLASSIFICATION_PREDICATE}
          ORDER BY priority DESC, id
          LIMIT ?3"

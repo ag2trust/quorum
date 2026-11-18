@@ -6352,25 +6352,18 @@ const FROZEN_BASE_CAPTURE_PIPE_BYTES: usize = 4096;
 
 /// Select the ordinary classifier's next queue and its duplicate context.
 ///
-/// Outside a decomposition freeze every unclassified task is eligible. Under
-/// a freeze only already-started work is: an `open` task's classification
-/// would only feed a claim (or a planning source selection) the freeze
-/// already forbids. Started work — chiefly a review-only task created
-/// `in-review` during the freeze — is the opposite case: its reviewer cannot
-/// dispatch unclassified, so gating it would strand in-flight work for the
-/// whole planning attempt.
+/// Every unclassified task is eligible, including while a graph plans: a
+/// planning freeze blocks only its own source task, and that source is in
+/// `planning` status, which `unclassified_tasks` never selects. Even a
+/// classified source stays unclaimable while its freeze is held, because the
+/// claim SQL's source-scoped freeze clause excludes it.
 fn classifier_queue(
     conn: &rusqlite::Connection,
-    decomposition_freeze: bool,
 ) -> Result<(
     Vec<quorum_core::classify::TaskForClassification>,
     Vec<quorum_core::classify::TaskForClassification>,
 )> {
-    let tasks = if decomposition_freeze {
-        quorum_core::classify::unclassified_started_tasks(conn)?
-    } else {
-        quorum_core::classify::unclassified_tasks(conn)?
-    };
+    let tasks = quorum_core::classify::unclassified_tasks(conn)?;
     if tasks.is_empty() {
         return Ok((vec![], vec![]));
     }
@@ -9853,7 +9846,6 @@ async fn tick_classifier(
     classifier_consec_errors: &mut u32,
     classifier_backoff_until: &mut Option<std::time::Instant>,
     draining: bool,
-    decomposition_freeze: bool,
     provider_bin: &(dyn Fn(runner::AgentKind) -> Option<String> + Sync),
 ) -> Result<()> {
     let db_path = config.db_path.clone();
@@ -9954,16 +9946,13 @@ async fn tick_classifier(
             *classifier_backoff_until = None;
         }
     }
-    // A decomposition freeze does not stop the classifier outright: already
-    // started work (notably a review-only task, created `in-review` and
-    // unclassified) must classify before its reviewer can dispatch, and the
-    // freeze's own drain waits for that work to finish. `classifier_queue`
-    // narrows the freeze-time queue to that started set.
+    // A planning graph does not pause the classifier: the freeze guards only
+    // its own source task, which `classifier_queue` never selects.
     if classifier_slot.is_none() && !draining && classifier_backoff_until.is_none() {
         let p = db_path.clone();
         let unclassified = tokio::task::spawn_blocking(move || -> Result<(Vec<quorum_core::classify::TaskForClassification>, Vec<quorum_core::classify::TaskForClassification>)> {
             let conn = quorum_core::db::open(&p)?;
-            classifier_queue(&conn, decomposition_freeze)
+            classifier_queue(&conn)
         })
         .await
         .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
@@ -13263,7 +13252,9 @@ async fn tick(
     branch_sync::intake_ci_failure_fix_task(config).await?;
     branch_sync::reconcile_failed_ci_fix_comment(config).await?;
 
-    let decomposition_freeze = tick_decomposition(config, decomposition_coordinator).await?;
+    // The returned freeze flag is not a dispatch gate: a planning graph blocks
+    // only its own source task (claim SQL), never unrelated work this tick.
+    tick_decomposition(config, decomposition_coordinator).await?;
 
     // Graph consistency authority runs first. Exact merged-continuation
     // adoption is then settled before any ordinary recovery or provisioning
@@ -18816,7 +18807,6 @@ async fn tick(
             claim_skip_logs,
             lifetime_roster,
             profile_cooldown,
-            decomposition_freeze,
         )
         .await?;
     }
@@ -18828,7 +18818,6 @@ async fn tick(
         classifier_consec_errors,
         classifier_backoff_until,
         drain_state.draining,
-        decomposition_freeze,
         &|kind| agent_bin_for_kind(config, kind).map(str::to_owned),
     )
     .await?;
@@ -18841,7 +18830,8 @@ async fn tick(
     // priority ready job (attempts asc, past backoff, under cap), and (c)
     // log dead-lettered rows so operators see poison PRs instead of silent
     // starvation. Never touches task lifecycle: analytics-only, retry-only.
-    if !drain_state.draining && !decomposition_freeze {
+    // A planning graph does not pause it; only the self-update drain does.
+    if !drain_state.draining {
         let p = db_path.clone();
         let now_ts = now_unix();
         let outcome = tokio::task::spawn_blocking(move || -> Result<InterpretTickOutcome> {
@@ -18970,11 +18960,8 @@ async fn tick(
     }
 
     // 8b: Spawn doctor if enabled, idle, not draining, and a stalled task exists.
-    if config.doctor_enabled
-        && doctor_slot.is_none()
-        && !drain_state.draining
-        && !decomposition_freeze
-    {
+    // A planning graph does not pause the doctor; only the self-update drain does.
+    if config.doctor_enabled && doctor_slot.is_none() && !drain_state.draining {
         let p = db_path.clone();
         let active_worker_task_ids: Vec<i64> = workers.iter().map(|w| w.task_id).collect();
         let active_reviewer_task_ids: Vec<i64> = reviewers.iter().map(|r| r.task_id).collect();
@@ -25442,24 +25429,13 @@ async fn resolve_branch_sync_adoption(
     }))
 }
 
-/// Which ready tasks one worker dispatch may start.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WorkerAdmission {
-    /// Implementation-ready open tasks, then retried rework.
-    AllReady,
-    /// Retried rework only, for a decomposition freeze. No new task starts.
-    RetriedRework,
-}
-
-/// Start workers up to the cap.
+/// Start workers up to the cap: implementation-ready open tasks, then
+/// retried rework.
 ///
-/// A decomposition freeze stops new implementation, not started work. The drain
-/// counts a retried rework task, and only this dispatch can give it a worker:
-/// `reconcile_remediation_retries` needs retry feedback or a recovery marker,
-/// and the sweep leaves it alone. Skipping it under a freeze would stall the
-/// drain against itself, as `tasks::claim` and `classifier_queue` also note.
-/// The pass admits only rows the drain already counts, so it adds no started
-/// work, and the base is still captured only after those rows finish.
+/// A planning graph does not narrow this pass. Its freeze blocks only its own
+/// source task, which is in `planning` status and is also excluded by the
+/// claim SQL's source-scoped freeze clause, so unrelated open tasks and other
+/// graphs' ready children keep dispatching while a graph plans.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_workers(
     config: &ServeConfig,
@@ -25470,13 +25446,7 @@ async fn dispatch_workers(
     claim_skip_logs: &mut ClaimSkipLogLimiter,
     lifetime_roster: &mut LifetimeRoster,
     profile_cooldown: &mut ProfileCooldown,
-    decomposition_freeze: bool,
 ) -> Result<()> {
-    let admission = if decomposition_freeze {
-        WorkerAdmission::RetriedRework
-    } else {
-        WorkerAdmission::AllReady
-    };
     while workers.len() < config.cap {
         if !spawn_admitted_worker(
             config,
@@ -25487,7 +25457,6 @@ async fn dispatch_workers(
             claim_skip_logs,
             lifetime_roster,
             profile_cooldown,
-            admission,
         )
         .await?
         {
@@ -25516,7 +25485,6 @@ async fn spawn_worker(
         claim_skip_logs,
         lifetime_roster,
         &mut ProfileCooldown::new(),
-        WorkerAdmission::AllReady,
     )
     .await
 }
@@ -25531,7 +25499,6 @@ async fn spawn_admitted_worker(
     claim_skip_logs: &mut ClaimSkipLogLimiter,
     lifetime_roster: &mut LifetimeRoster,
     profile_cooldown: &mut ProfileCooldown,
-    admission: WorkerAdmission,
 ) -> Result<bool> {
     let db_path = config.db_path.clone();
     let p = db_path.clone();
@@ -25540,15 +25507,8 @@ async fn spawn_admitted_worker(
     let graph_children_limit = config.graph_children_working_limit();
     let available = tokio::task::spawn_blocking(move || -> Result<Vec<tasks::Task>> {
         let conn = quorum_core::db::open(&p)?;
-        // Open tasks must stay out of a frozen selection, not merely lose their
-        // claim: they sort first, and a refused claim would end the pass before
-        // it reached any retried rework.
-        let mut available = match admission {
-            WorkerAdmission::AllReady => {
-                tasks::list_implementation_ready_open_with_graph_limit(&conn, graph_children_limit)?
-            }
-            WorkerAdmission::RetriedRework => Vec::new(),
-        };
+        let mut available =
+            tasks::list_implementation_ready_open_with_graph_limit(&conn, graph_children_limit)?;
         available.extend(
             tasks::list(&conn, Some("rework"), None, None)?
                 .into_iter()
@@ -37951,7 +37911,6 @@ mod tests {
                 &mut skips,
                 &mut roster,
                 &mut all_cooling,
-                WorkerAdmission::AllReady,
             )
             .await
             .unwrap());
@@ -38007,7 +37966,6 @@ mod tests {
             &mut skips,
             &mut roster,
             &mut cooldown,
-            WorkerAdmission::AllReady,
         )
         .await
         .unwrap());
@@ -46184,6 +46142,159 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             grok: Default::default(),
             pr_target_program: None,
         }
+    }
+
+    /// A planning graph does not pause Phase 6 dispatch: an unrelated open,
+    /// classified task gets a worker while the graph holds the freeze, and the
+    /// planning source itself — classified and ready, with spare capacity — is
+    /// never dispatched as an implementation task.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_workers_starts_unrelated_work_while_a_graph_plans() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("state.txt"), "base\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["branch", "-M", "main"]);
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "main"]);
+
+        const READY: &str = r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#;
+        let db_path = dir.path().join("quorum.db");
+        let (source_id, unrelated_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            // The source outranks the unrelated task, so a dispatch that could
+            // select it would pick it first.
+            let source_id = tasks::create(
+                &mut conn,
+                "owner",
+                "planning source",
+                None,
+                10,
+                None,
+                Some(READY),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='planning' WHERE id=?1",
+                [source_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(
+                     source_task_id,state,active,freeze_active,planned_source_revision,
+                     created_at,updated_at)
+                 VALUES (?1,'planning',0,1,1,1,1)",
+                [source_id],
+            )
+            .unwrap();
+            let unrelated_id = tasks::create(
+                &mut conn,
+                "owner",
+                "unrelated work",
+                None,
+                0,
+                None,
+                Some(READY),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            (source_id, unrelated_id)
+        };
+
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo.clone());
+        config.worktree_base = dir.path().join("worktrees");
+        config.cap = 2;
+        config.agent_bin = Some(
+            fake_stdin_holding_agent(dir.path(), "hold-worker")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+        let mut cooldown = ProfileCooldown::new();
+
+        dispatch_workers(
+            &config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut poison,
+            &mut skips,
+            &mut roster,
+            &mut cooldown,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            workers.iter().map(|w| w.task_id).collect::<Vec<_>>(),
+            vec![unrelated_id],
+            "only the unrelated task may get a worker while the graph plans"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let unrelated = tasks::get(&conn, unrelated_id).unwrap().unwrap();
+        assert_eq!(unrelated.status, "working");
+        assert_eq!(
+            unrelated.assignee.as_deref(),
+            Some(workers[0].agent_name.as_str())
+        );
+        let source = tasks::get(&conn, source_id).unwrap().unwrap();
+        assert_eq!(source.status, "planning");
+        assert_eq!(source.assignee, None);
+        assert!(
+            quorum_core::agent_runs::runs_for_task(&conn, source_id)
+                .unwrap()
+                .is_empty(),
+            "the planning source must never get an implementation worker run"
+        );
+        let freeze_active: i64 = conn
+            .query_row(
+                "SELECT freeze_active FROM task_decompositions WHERE source_task_id=?1",
+                [source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            freeze_active, 1,
+            "dispatch must not disturb the planning graph"
+        );
+        drop(conn);
+
+        workers.pop().unwrap().kill_and_reap().await;
     }
 
     #[cfg(unix)]
@@ -57559,13 +57670,12 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
     }
 
-    /// Deadlock regression (task 410 / review-only 417): a review-only task
-    /// created while an unrelated decomposition freeze is held is `in-review`
-    /// and unclassified. Its reviewer cannot dispatch until it is classified,
-    /// so the freeze-time classifier queue must admit it — while still
-    /// withholding `open` work the freeze exists to hold back.
+    /// A planning graph does not pause the classifier: an unrelated `open`
+    /// task created while a graph plans is classified in priority order, a
+    /// started review-only task (deadlock regression, task 410 / review-only
+    /// 417) still classifies, and the planning source itself is never queued.
     #[test]
-    fn freeze_time_classifier_queue_admits_started_review_only_task_only() {
+    fn classifier_queue_classifies_unrelated_work_while_a_graph_plans() {
         let dir = tempfile::tempdir().unwrap();
         let mut conn = open_test_db(dir.path());
         conn.execute(
@@ -57579,7 +57689,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "INSERT INTO task_decompositions(
                  source_task_id,state,active,freeze_active,planned_source_revision,
                  created_at,updated_at)
-             VALUES (?1,'draining',0,1,1,1,1)",
+             VALUES (?1,'planning',0,1,1,1,1)",
             [source_task_id],
         )
         .unwrap();
@@ -57602,50 +57712,33 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         .unwrap();
         let task = tasks::get(&conn, review_only).unwrap().unwrap();
         assert_eq!(task.status, "in-review");
-        assert!(
-            !tasks::classification_is_dispatchable_for_status(
-                &task.refs,
-                true,
-                None,
-                false,
-                "in-review"
-            ),
-            "an unclassified review-only task cannot dispatch its reviewer"
-        );
-        let (frozen, dup_context) = classifier_queue(&conn, true).unwrap();
+
+        let (queue, dup_context) = classifier_queue(&conn).unwrap();
         assert_eq!(
-            frozen.iter().map(|task| task.id).collect::<Vec<_>>(),
-            vec![review_only],
-            "under a freeze only started work may be classified"
+            queue.iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec![open_task, review_only],
+            "a planning graph must not withhold unrelated open or started work"
         );
+        assert!(
+            queue
+                .iter()
+                .chain(dup_context.iter())
+                .all(|task| task.id != source_task_id),
+            "the planning source must never be queued for classification"
+        );
+        assert!(dup_context.iter().all(|task| task.id != open_task));
         assert!(dup_context.iter().all(|task| task.id != review_only));
 
-        let (unfrozen, _) = classifier_queue(&conn, false).unwrap();
-        assert_eq!(
-            unfrozen.first().map(|task| task.id),
-            Some(open_task),
-            "without a freeze the full queue keeps priority order"
-        );
-
-        // Once classified, the review-only task becomes reviewer-dispatchable,
-        // so the drain can make progress.
+        // Once classified, both leave the queue, and the source stays out.
         conn.execute(
             "UPDATE tasks SET refs=json_set(COALESCE(refs,'{}'),
                  '$.cx_est',3,'$.cx_size','M','$.cx_ready',json('true'),
                  '$.cx_not_ready_reason',json('null'),'$.cx_by','test:v2')
-             WHERE id=?1",
-            [review_only],
+             WHERE id IN (?1,?2)",
+            [open_task, review_only],
         )
         .unwrap();
-        let task = tasks::get(&conn, review_only).unwrap().unwrap();
-        assert!(tasks::classification_is_dispatchable_for_status(
-            &task.refs,
-            true,
-            None,
-            false,
-            "in-review"
-        ));
-        assert!(classifier_queue(&conn, true).unwrap().0.is_empty());
+        assert!(classifier_queue(&conn).unwrap().0.is_empty());
     }
 
     #[test]
@@ -64965,7 +65058,6 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 &mut state.errors,
                 &mut state.backoff,
                 false,
-                false,
                 &move |kind| match kind {
                     runner::AgentKind::Codex => Some(codex.to_string_lossy().into_owned()),
                     runner::AgentKind::Claude => Some(claude.to_string_lossy().into_owned()),
@@ -65777,8 +65869,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             }
         }
 
-        /// Run one whole production tick, so `tick_decomposition`'s freeze result
-        /// reaches the real Phase 6 gate instead of a value the test passes in.
+        /// Run one whole production tick, so Phase 6 runs exactly as the daemon
+        /// runs it while a graph holds the freeze.
         async fn production_tick(
             &mut self,
             harness: &LifecycleHarness,
@@ -65882,7 +65974,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         }
     }
 
-    /// A frozen pass still attaches the worker for already-started work: a
+    /// Dispatch under a held freeze still attaches the worker for started work: a
     /// retried provider-blocked rework gets its worker under the freeze, and
     /// planning starts on the next tick while that rework and unrelated work
     /// are still in flight. There is no drain.
@@ -65911,8 +66003,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         });
     }
 
-    /// A frozen pass is for work already in flight. Rework with no retry stays
-    /// with its own recovery path and gets no worker here.
+    /// Rework with no retry stays with its own recovery path and gets no
+    /// worker from dispatch, freeze or not.
     #[cfg(unix)]
     #[test]
     fn frozen_dispatch_leaves_rework_without_a_retry_unclaimed() {
@@ -65929,6 +66021,186 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             let conn = quorum_core::db::open(&harness.db_path).unwrap();
             let task = tasks::get(&conn, fixture.task).unwrap().unwrap();
             assert_eq!((task.status.as_str(), task.assignee), ("rework", None));
+        });
+    }
+
+    /// A production tick under a held planning freeze does not pause unrelated
+    /// daemon work: the classifier takes a new open task, the collector retry
+    /// queue reserves its next attempt, and the doctor spawns for a stalled
+    /// task, while the planning source stays `planning` with no worker.
+    #[cfg(unix)]
+    #[test]
+    fn planning_freeze_keeps_classifier_collector_and_doctor_running() {
+        run_on_tick_stack("planning-keeps-work-", || async {
+            let mut harness = lifecycle_harness("planning-keeps-work");
+            harness.enter_freeze_phase("freeze-requested");
+            let dir = harness._dir.path().to_path_buf();
+            // One Claude profile backed by a stdin-holding fake, so the
+            // classifier and doctor processes stay observable after the tick.
+            for profile in harness.config.model_profiles.values_mut() {
+                *profile = crate::serve_config::ModelProfile {
+                    runner: "claude".into(),
+                    model: "claude-sonnet-5".into(),
+                    effort: "high".into(),
+                };
+            }
+            harness.config.agent_bin = Some(
+                fake_stdin_holding_agent(&dir, "hold-daemon-work")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            harness.config.doctor_enabled = true;
+            harness.config.cap = 2;
+            harness.config.worktree_base = dir.join("worktrees");
+            let remote = dir.join("remote.git");
+            assert!(std::process::Command::new("git")
+                .args(["init", "--bare", "-q", "--initial-branch=main"])
+                .arg(&remote)
+                .status()
+                .unwrap()
+                .success());
+            for args in [
+                vec!["branch", "-M", "main"],
+                vec!["remote", "add", "origin", remote.to_str().unwrap()],
+                vec!["push", "-q", "origin", "main"],
+            ] {
+                let output = std::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(&harness.config.repo_dir)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "git {args:?} failed");
+            }
+
+            let ready_task = harness.add_task(
+                "open",
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+            );
+            let open_task = harness.add_task("open", None);
+            let stalled = harness.add_task("in-review", None);
+            const PR: i64 = 9421;
+            {
+                let mut conn = quorum_core::db::open(&harness.db_path).unwrap();
+                quorum_core::review_interpret_jobs::enqueue(
+                    &mut conn,
+                    PR,
+                    stalled,
+                    None,
+                    collector::COLLECTOR_VERSION,
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE review_interpret_jobs SET created_at=?2 WHERE pr_number=?1",
+                    rusqlite::params![
+                        PR,
+                        now_unix() - quorum_core::review_interpret_jobs::INITIAL_GRACE_SECS - 60
+                    ],
+                )
+                .unwrap();
+            }
+            // A closed tracker keeps the retry from launching a real `gh`
+            // fetch; the durable reservation still proves the queue ran.
+            let collectors = collector::CollectorTracker::default();
+            collectors.drain(&harness.db_path).await;
+
+            let wt_mgr = WorktreeManager::new();
+            let mut names = Pool::new_generated();
+            let mut workers = Vec::new();
+            let mut reviewers = Vec::new();
+            let mut drain_state = DrainState::new();
+            let mut roster = LifetimeRoster::new();
+            let mut classifier_slot = None;
+            let mut coordinator = DecompositionCoordinator::default();
+            let mut classifier_consec_errors = 0;
+            let mut classifier_backoff_until = None;
+            let mut doctor_slot = None;
+            let mut doctored_tasks = std::collections::HashSet::new();
+            let signal_count = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+            tick(
+                &harness.config,
+                &wt_mgr,
+                &mut names,
+                &mut workers,
+                &mut reviewers,
+                &mut branch_sync::BranchSyncChecks::default(),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut PoisonTracker::new(),
+                &mut ClaimSkipLogLimiter::new(),
+                &mut ClaimSkipLogLimiter::new(),
+                &mut UnrecordableStrikes::new(),
+                &mut ReviewerRespawnBackoff::new(),
+                &mut ProfileCooldown::new(),
+                &mut ReviewerSlotQueue::default(),
+                &mut drain_state,
+                &mut roster,
+                &mut classifier_slot,
+                &mut coordinator,
+                &mut classifier_consec_errors,
+                &mut classifier_backoff_until,
+                &mut doctor_slot,
+                &mut doctored_tasks,
+                &collectors,
+                &signal_count,
+            )
+            .await
+            .unwrap();
+
+            let row = harness.freeze_row();
+            assert_eq!(row.state, "draining");
+            assert!(row.freeze_active, "the graph still holds its freeze");
+            assert_eq!(
+                workers.iter().map(|w| w.task_id).collect::<Vec<_>>(),
+                vec![ready_task],
+                "an unrelated classified open task must get a worker while a graph plans"
+            );
+            assert_eq!(
+                classifier_slot
+                    .as_ref()
+                    .map(|slot: &classifier::ClassifierSlot| slot.pending_task_ids.clone()),
+                Some(vec![open_task]),
+                "a new open task must be classified while a graph plans"
+            );
+            assert_eq!(
+                doctor_slot.as_ref().map(|slot| slot.task_id),
+                Some(stalled),
+                "the doctor must not pause while a graph plans"
+            );
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            let job = quorum_core::review_interpret_jobs::get(&conn, PR)
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.attempts, 1, "the collector retry queue must run");
+            let collector_assignments: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM role_assignments
+                     WHERE role='collector' AND pr_number=?1",
+                    [PR],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(collector_assignments, 1);
+            assert_eq!(
+                tasks::get(&conn, ready_task).unwrap().unwrap().status,
+                "working"
+            );
+            let source = tasks::get(&conn, harness.source).unwrap().unwrap();
+            assert_eq!(
+                (source.status.as_str(), source.assignee),
+                ("planning", None)
+            );
+            assert!(workers.iter().all(|w| w.task_id != harness.source));
+            drop(conn);
+
+            if let Some(slot) = classifier_slot.take() {
+                reap_classifier_with_usage(&harness.db_path, slot, None).await;
+            }
+            doctor::reap_doctor_slot(&harness.db_path, &mut doctor_slot).await;
+            for worker in workers {
+                worker.kill_and_reap().await;
+            }
         });
     }
 
