@@ -1006,7 +1006,13 @@ fn provider_blocked_reviewer_strikes_backs_off_and_parks_after_budget() {
         "true",
         &[],
         &blocked_reviewer,
-        &[("QUORUM_TEST_REVIEWER_RESPAWN_BACKOFF_MS", "1000")],
+        // The per-profile cooldown (default 120s) also defers the blocked
+        // profile; shrink it to its floor so the per-(task, PR) respawn
+        // backoff under test is the delay that gates each respawn.
+        &[
+            ("QUORUM_TEST_REVIEWER_RESPAWN_BACKOFF_MS", "1000"),
+            ("QUORUM_TEST_PROFILE_COOLDOWN_MS", "10"),
+        ],
     );
 
     let strike_line = "ended provider_blocked for task #1 PR #42";
