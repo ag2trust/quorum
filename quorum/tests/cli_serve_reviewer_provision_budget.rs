@@ -1401,11 +1401,34 @@ fn task_retry_refuses_cap_exhausted_task_with_reason() {
         [source],
     )
     .unwrap();
+    // The freeze guards only its own source: an unrelated graph's freeze leaves
+    // the cap refusal (clean exit 1) in charge for this task.
+    let unrelated = task_retry(home.path(), task_id, "Owner");
+    assert_eq!(
+        unrelated.status.code(),
+        Some(1),
+        "an unrelated freeze must not mask the cap refusal: {unrelated:?}"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&unrelated.stdout).unwrap();
+    assert!(
+        payload["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("reviewer run cap exhausted"),
+        "payload must still name the cap: {payload}"
+    );
+    // When this task is itself the planning source, the freeze keeps its usage
+    // refusal at the cap.
+    conn.execute(
+        "UPDATE task_decompositions SET source_task_id=?1 WHERE source_task_id=?2",
+        [task_id, source],
+    )
+    .unwrap();
     drop(conn);
     assert_eq!(
         task_retry(home.path(), task_id, "Owner").status.code(),
         Some(2),
-        "a decomposition freeze must keep its usage refusal at the cap"
+        "the planning source's own freeze must keep its usage refusal at the cap"
     );
 }
 
