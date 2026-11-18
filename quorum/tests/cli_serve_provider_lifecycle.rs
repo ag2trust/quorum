@@ -862,6 +862,7 @@ impl Case {
 set -eu
 printf '%s\n' "$*" >> "$QUORUM_TEST_GH_STATE/calls"
 cmd="${1:-} ${2:-}"
+if [ "$cmd" = "auth token" ]; then printf 'shim-token\n'; exit 0; fi
 if [ "$cmd" = "pr create" ]; then
   shift 2
   head=""
