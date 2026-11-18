@@ -2481,6 +2481,7 @@ mod tests {
         quorum_core::decomposition::begin_planning(
             conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "claude",
@@ -3976,6 +3977,7 @@ exec sleep 30
         let graph_id = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 provider: "claude",

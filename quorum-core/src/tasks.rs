@@ -14822,6 +14822,7 @@ mod tests {
         let graph = crate::decomposition::begin_planning(
             &mut conn,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 provider: "codex",
@@ -14857,6 +14858,7 @@ mod tests {
             graph,
             1,
             &[child("a"), child("b")],
+            1,
             4,
         )
         .unwrap()
@@ -15046,6 +15048,7 @@ mod tests {
         let graph = crate::decomposition::begin_planning(
             &mut conn,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 provider: "codex",
@@ -15081,6 +15084,7 @@ mod tests {
             graph,
             1,
             &[child("a"), child("b")],
+            1,
             4,
         )
         .unwrap()
@@ -17672,6 +17676,7 @@ mod tests {
         crate::decomposition::begin_planning(
             &mut c,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "codex",
@@ -17981,6 +17986,7 @@ mod tests {
         let graph = crate::decomposition::begin_planning(
             &mut c,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: id,
                 expected_revision: 1,
                 provider: "codex",
@@ -18035,6 +18041,7 @@ mod tests {
         let graph = crate::decomposition::begin_planning(
             &mut c,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "codex",
@@ -18065,10 +18072,16 @@ mod tests {
             source_dependency_ids: vec![],
         }
         };
-        let ids =
-            crate::decomposition::materialize_graph(&mut c, graph, 1, &[child("a"), child("b")], 4)
-                .unwrap()
-                .unwrap();
+        let ids = crate::decomposition::materialize_graph(
+            &mut c,
+            graph,
+            1,
+            &[child("a"), child("b")],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
 
         assert!(update(
             &mut c,
@@ -18103,6 +18116,7 @@ mod tests {
         let graph = crate::decomposition::begin_planning(
             &mut c,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "codex",
@@ -18133,10 +18147,16 @@ mod tests {
             source_dependency_ids: vec![],
         }
         };
-        let ids =
-            crate::decomposition::materialize_graph(&mut c, graph, 1, &[child("a"), child("b")], 4)
-                .unwrap()
-                .unwrap();
+        let ids = crate::decomposition::materialize_graph(
+            &mut c,
+            graph,
+            1,
+            &[child("a"), child("b")],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
 
         let cancelled = update(
             &mut c,
@@ -18188,6 +18208,7 @@ mod tests {
         crate::decomposition::begin_planning(
             &mut c,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "codex",

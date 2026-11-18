@@ -216,8 +216,10 @@ Provider retries and an optional doctor turn can add further calls. A decomposed
 parent can also produce several child implementation and review paths. At most
 `max_graph_children_working` children of one graph implement at once; the key
 defaults to `cap`, must be at least 1, and is effectively bounded by `cap`.
-`max_active_graphs` is parsed and validated (defaults to 2, must be at least
-1) but is not yet enforced anywhere in dispatch or planning admission.
+`max_active_graphs` (defaults to 2, must be at least 1) caps the graphs counted
+at once: active or blocked graphs plus the one graph holding planning
+authority. A new source enters planning, and a planned graph activates, only
+while fewer graphs are counted; one graph still plans at a time.
 
 Set token, USD, and wall-clock ceilings in the
 [serve configuration](docs/serve-config.example.toml); the exact flags are also

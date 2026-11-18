@@ -27,10 +27,11 @@ pub enum Operation {
     ClaimCleanup,
     MaterializeAssessment,
     AcquireDaemonLock,
+    AdmitGraph,
 }
 
 impl Operation {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::AllocateRole,
         Self::ClaimTask,
         Self::ClaimProviderRetryRework,
@@ -39,6 +40,7 @@ impl Operation {
         Self::ClaimCleanup,
         Self::MaterializeAssessment,
         Self::AcquireDaemonLock,
+        Self::AdmitGraph,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -51,6 +53,7 @@ impl Operation {
             Self::ClaimCleanup => "claim-cleanup",
             Self::MaterializeAssessment => "materialize-assessment",
             Self::AcquireDaemonLock => "acquire-daemon-lock",
+            Self::AdmitGraph => "admit-graph",
         }
     }
 }
@@ -164,6 +167,29 @@ pub struct MaterializeAssessmentInput {
     pub scope_id: i64,
     pub source_task_id: i64,
     pub artifact_ids: Vec<i64>,
+    pub now: i64,
+    pub barrier: Barrier,
+}
+
+/// One counted-graph admission path raced by `admit-graph`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GraphAdmission {
+    /// `begin_planning` for an open source task (`target_id` = source task id).
+    BeginPlanning,
+    /// `reacquire_freeze` for a provider-backoff graph (`target_id` = graph id).
+    ReacquireFreeze,
+    /// Two-child materialization activating a planning graph (`target_id` = graph id).
+    Activate,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmitGraphInput {
+    pub db_path: PathBuf,
+    pub admission: GraphAdmission,
+    pub target_id: i64,
+    pub max_active_graphs: usize,
     pub now: i64,
     pub barrier: Barrier,
 }

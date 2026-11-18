@@ -4784,9 +4784,10 @@ pub struct ServeConfig {
     /// Test-only override for the `gh` binary used by live PR target
     /// resolution. None → look up "gh" on PATH.
     pub pr_target_program: Option<PathBuf>,
-    /// Validated `max_active_graphs`: graphs that may be active or planning
-    /// at once across the daemon. Default 2, minimum 1. Not yet enforced by
-    /// planning admission or activation (owned by a later change).
+    /// Validated `max_active_graphs`: graphs that may be counted (active,
+    /// blocked, or holding planning authority) at once across the daemon.
+    /// Default 2, minimum 1. Enforced by the guarded counts in planning
+    /// admission, freeze reacquisition, and activation.
     pub max_active_graphs: usize,
 }
 
@@ -6624,10 +6625,15 @@ async fn reconcile_decomposition_startup(
     coordinator: &mut DecompositionCoordinator,
 ) -> Result<StartupDecompositionState> {
     let path = config.db_path.clone();
+    let max_active_graphs = config.max_active_graphs;
     let (state, snapshot) = tokio::task::spawn_blocking(move || {
         let mut conn = quorum_core::db::open(&path)?;
         tasks::clear_reviewer_provision_reservations(&mut conn)?;
-        quorum_core::decomposition::reconcile_startup_graphs(&mut conn, now_unix())?;
+        quorum_core::decomposition::reconcile_startup_graphs(
+            &mut conn,
+            max_active_graphs,
+            now_unix(),
+        )?;
         Ok::<_, QuorumError>((
             inspect_startup_decomposition(&conn)?,
             load_planning_snapshot(&conn)?,
@@ -6644,21 +6650,27 @@ async fn reconcile_decomposition_startup(
     Ok(state)
 }
 
-fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>> {
+fn planning_candidate(
+    conn: &rusqlite::Connection,
+    max_active_graphs: usize,
+) -> Result<Option<(i64, i64)>> {
     use rusqlite::OptionalExtension;
     // Route and per-task exclusions come from the shared predicate. The
-    // one-active-graph rule stays here: status names that graph instead of
-    // folding the exclusion into eligibility.
+    // counted `max_active_graphs` admission check stays here (status names the
+    // counted graphs instead of folding the limit into eligibility); the
+    // guarded count in `begin_routed_planning` remains the atomic authority.
     let eligible = quorum_core::tasks::PLANNER_ELIGIBILITY_PREDICATE;
+    let counted = quorum_core::decomposition::COUNTED_GRAPH_PREDICATE;
+    let limit = i64::try_from(max_active_graphs)
+        .map_err(|_| QuorumError::Usage("max_active_graphs is out of range".into()))?;
     let dep_satisfied = quorum_core::tasks::DEP_SATISFIED_PREDICATE;
     Ok(conn
         .query_row(
             &format!(
                 "SELECT t.id,t.revision FROM tasks t
          WHERE t.status='open' AND t.assignee IS NULL
-           AND NOT EXISTS (SELECT 1 FROM task_decompositions repository_graph
-                           WHERE repository_graph.state IN ('active','blocked')
-                              OR repository_graph.active=1)
+           AND (SELECT COUNT(*) FROM task_decompositions
+                WHERE {counted}) < ?1
            AND {eligible}
            AND (t.depends_on IS NULL OR NOT EXISTS (
                SELECT 1 FROM json_each(t.depends_on) dep
@@ -6667,7 +6679,7 @@ fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>>
            ))
          ORDER BY t.priority DESC,t.id ASC LIMIT 1"
             ),
-            [],
+            [limit],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?)
@@ -7821,6 +7833,7 @@ async fn reject_decomposition_proposal(
     let path = config.db_path.clone();
     let code = code.to_string();
     let summary = truncate_utf8_bytes(summary, DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES).to_string();
+    let max_active_graphs = config.max_active_graphs;
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&path)?;
         quorum_core::decomposition::reject_frozen_proposal(
@@ -7831,6 +7844,7 @@ async fn reject_decomposition_proposal(
             &summary,
             eligibility,
             plan_snapshot.as_deref(),
+            max_active_graphs,
             now_unix(),
         )?;
         Ok(())
@@ -8252,7 +8266,7 @@ fn summarize_arbiter_findings(findings: &[arbiter::ArbiterFinding]) -> String {
 /// Materialize the Arbiter-approved proposal from `validating` using the
 /// classifier batch that was durably accepted before the Arbiter ran. The
 /// guarded `materialize_graph` write (state/freeze/active/source-revision
-/// checks plus the one-active-graph index) is the exactly-once authority: a
+/// checks plus the counted `max_active_graphs` guard) is the exactly-once authority: a
 /// restart that re-polls a fresh Arbiter, or a concurrent block/cancel, binds
 /// zero rows and is a clean no-op (invariant #3). Returns whether children were
 /// created.
@@ -8324,6 +8338,7 @@ async fn materialize_validated_proposal(
         return Ok(false);
     };
     let path = config.db_path.clone();
+    let max_active_graphs = config.max_active_graphs;
     let materialized = tokio::task::spawn_blocking(move || -> Result<Option<bool>> {
         let mut conn = quorum_core::db::open(&path)?;
         match quorum_core::decomposition::materialize_terminal_children(
@@ -8331,6 +8346,7 @@ async fn materialize_validated_proposal(
             graph_id,
             snapshot.source_revision,
             &children,
+            max_active_graphs,
             now_unix(),
         ) {
             Ok(ids) => Ok(Some(ids.is_some())),
@@ -9262,7 +9278,7 @@ async fn tick_decomposition(
         if coordinator.planner_slot.is_none() && coordinator.classifier_slot.is_none() {
             let candidate = {
                 let conn = quorum_core::db::open(&config.db_path)?;
-                planning_candidate(&conn)?
+                planning_candidate(&conn, config.max_active_graphs)?
             };
             if let Some((source_task_id, expected_revision)) = candidate {
                 let assignment_request = quorum_core::role_assignments::AssignmentRequest {
@@ -9277,6 +9293,7 @@ async fn tick_decomposition(
                 };
                 let pool = configured_routing_pool(config, "planner", None, None)?;
                 let path = config.db_path.clone();
+                let max_active_graphs = config.max_active_graphs;
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&path)?;
                     let seed =
@@ -9290,6 +9307,7 @@ async fn tick_decomposition(
                             pool: &pool,
                             seed,
                             now: now_unix(),
+                            max_active_graphs,
                         },
                     )?;
                     Ok(())
@@ -9408,8 +9426,15 @@ async fn tick_decomposition(
         return Ok(stepped_back);
     }
 
-    if snapshot.state == "provider-backoff" {
-        if now_unix() - snapshot.updated_at >= DECOMPOSITION_PROVIDER_BACKOFF_SECS {
+    // A startup recovery reset leaves a graph in `freeze-requested` without
+    // planning authority when its immediate reacquire lost the counted
+    // admission guard (another graph held planning authority, or the limit was
+    // reached). Retry the same guarded reacquire each tick so it is not stranded.
+    let reset_unadmitted = snapshot.state == "freeze-requested" && !snapshot.freeze_active;
+    if snapshot.state == "provider-backoff" || reset_unadmitted {
+        if reset_unadmitted
+            || now_unix() - snapshot.updated_at >= DECOMPOSITION_PROVIDER_BACKOFF_SECS
+        {
             // A provider failure released this graph's freeze and cleared its
             // SHA. The cached archive can no longer be reused: the next
             // attempt records the then-current base head and archives that.
@@ -9417,9 +9442,15 @@ async fn tick_decomposition(
             delete_decomposition_process(config, snapshot.graph_id, "frozen-view").await?;
             let path = config.db_path.clone();
             let graph_id = snapshot.graph_id;
+            let max_active_graphs = config.max_active_graphs;
             let reacquired = tokio::task::spawn_blocking(move || -> Result<bool> {
                 let mut conn = quorum_core::db::open(&path)?;
-                quorum_core::decomposition::reacquire_freeze(&mut conn, graph_id, now_unix())
+                quorum_core::decomposition::reacquire_freeze(
+                    &mut conn,
+                    graph_id,
+                    max_active_graphs,
+                    now_unix(),
+                )
             })
             .await
             .map_err(|error| QuorumError::Io(format!("freeze reacquire join: {error}")))??;
@@ -62314,13 +62345,53 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
              VALUES ('review-large','open',99,'owner',1,1,
                '{\"cx_est\":4,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',1);"
         ).unwrap();
-        assert_eq!(planning_candidate(&conn).unwrap(), Some((4, 1)));
+        assert_eq!(planning_candidate(&conn, 1).unwrap(), Some((4, 1)));
         conn.execute("UPDATE tasks SET status='done' WHERE id=4", [])
             .unwrap();
-        assert_eq!(planning_candidate(&conn).unwrap(), Some((3, 1)));
+        assert_eq!(planning_candidate(&conn, 1).unwrap(), Some((3, 1)));
         conn.execute("UPDATE tasks SET status='done' WHERE id=3", [])
             .unwrap();
-        assert_eq!(planning_candidate(&conn).unwrap(), None);
+        assert_eq!(planning_candidate(&conn, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn planning_candidate_admits_by_priority_only_while_counted_graphs_below_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = quorum_core::db::open(&dir.path().join("counted.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('materialized source','decomposed',100,'owner',1,1,
+               '{\"cx_est\":5,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+             INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,accepted_plan_revision,created_at,updated_at)
+             VALUES (1,'active',1,0,1,1,1,1);
+             INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('large-low','open',1,'owner',1,1,
+               '{\"cx_est\":5,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+             INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('large-high','open',9,'owner',1,1,
+               '{\"cx_est\":5,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);",
+        )
+        .unwrap();
+        // One active graph fills a limit of 1; a limit of 2 admits the
+        // highest-priority eligible source.
+        assert_eq!(planning_candidate(&conn, 1).unwrap(), None);
+        assert_eq!(planning_candidate(&conn, 2).unwrap(), Some((3, 1)));
+        // A blocked graph still counts toward the limit.
+        conn.execute("UPDATE task_decompositions SET state='blocked'", [])
+            .unwrap();
+        assert_eq!(planning_candidate(&conn, 1).unwrap(), None);
+        assert_eq!(planning_candidate(&conn, 2).unwrap(), Some((3, 1)));
+        // A second counted graph fills a limit of 2.
+        conn.execute_batch(
+            "UPDATE tasks SET status='decomposed' WHERE id=3;
+             INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,accepted_plan_revision,created_at,updated_at)
+             VALUES (3,'active',1,0,1,1,1,1);",
+        )
+        .unwrap();
+        assert_eq!(planning_candidate(&conn, 2).unwrap(), None);
+        assert_eq!(planning_candidate(&conn, 3).unwrap(), Some((2, 1)));
     }
 
     #[test]
@@ -62347,12 +62418,12 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         // — the assertion is the entire regression: the ordinary task plans
         // while the branch-sync judgment task waits for the direct-dispatch
         // path.
-        assert_eq!(planning_candidate(&conn).unwrap(), Some((2, 1)));
+        assert_eq!(planning_candidate(&conn, 1).unwrap(), Some((2, 1)));
 
         conn.execute("UPDATE tasks SET status='done' WHERE id=2", [])
             .unwrap();
         assert_eq!(
-            planning_candidate(&conn).unwrap(),
+            planning_candidate(&conn, 1).unwrap(),
             None,
             "the branch-sync judgment task must never appear as a planner candidate"
         );
@@ -62372,7 +62443,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         )
         .unwrap();
 
-        assert_eq!(planning_candidate(&conn).unwrap(), Some((2, 1)));
+        assert_eq!(planning_candidate(&conn, 1).unwrap(), Some((2, 1)));
         let claimed = tasks::claim(&mut conn, "worker", Some(1), &[], 60, 2)
             .unwrap()
             .expect("continuation must dispatch directly");
@@ -62395,7 +62466,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         .unwrap();
 
         assert_eq!(
-            planning_candidate(&conn).unwrap(),
+            planning_candidate(&conn, 1).unwrap(),
             Some((2, 1)),
             "the terminal leaf must be excluded while the equivalent ordinary task plans"
         );
@@ -62439,7 +62510,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         .unwrap();
                         tasks::park_classified_complexity_five(&mut conn, 2).unwrap();
 
-                        let planned = planning_candidate(&conn).unwrap().is_some();
+                        let planned = planning_candidate(&conn, 1).unwrap().is_some();
                         let claimed = tasks::claim(&mut conn, "worker", Some(1), &[], 60, 3)
                             .unwrap()
                             .is_some();
@@ -62500,6 +62571,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let graph = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "codex",
@@ -62555,6 +62627,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let older_graph = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: older_source,
                 expected_revision: 1,
                 provider: "codex",
@@ -62590,7 +62663,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 assert!(quorum_core::decomposition::reacquire_freeze(
                     &mut conn,
                     older_graph,
-                    5 + attempt * 3,
+                    1,
+                    5 + attempt * 3
                 )
                 .unwrap());
                 assert!(quorum_core::decomposition::set_frozen_phase(
@@ -62621,6 +62695,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let newer_graph = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: newer_source,
                 expected_revision: 1,
                 provider: "codex",
@@ -62684,6 +62759,54 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
     }
 
+    /// A startup recovery reset whose immediate reacquire lost the counted
+    /// admission guard sits in `freeze-requested` without planning authority.
+    /// The coordinator retries the guarded reacquire: refused while the limit
+    /// is full, admitted once a slot frees, never stranded.
+    #[tokio::test]
+    async fn unadmitted_reset_graph_reacquires_planning_authority_when_a_slot_frees() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reset-reacquire.db");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (1,'a','decomposed','owner',1,1),(2,'b','decomposed','owner',1,1),
+                        (3,'reset','planning','owner',1,1);
+             INSERT INTO task_decompositions(id,source_task_id,state,active,freeze_active,
+                 planned_source_revision,accepted_plan_revision,created_at,updated_at)
+                 VALUES (10,1,'active',1,0,1,1,1,1),(11,2,'active',1,0,1,1,1,1);
+             INSERT INTO task_decompositions(id,source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+                 VALUES (12,3,'freeze-requested',0,0,1,1,1);",
+        )
+        .unwrap();
+        drop(conn);
+        let mut config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
+        config.max_active_graphs = 2;
+        let mut coordinator = DecompositionCoordinator::default();
+        let reset_row = || {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.query_row(
+                "SELECT state,freeze_active FROM task_decompositions WHERE id=12",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+        };
+
+        assert!(!tick_decomposition(&config, &mut coordinator).await.unwrap());
+        assert_eq!(reset_row(), ("freeze-requested".into(), 0), "limit full");
+
+        config.max_active_graphs = 3;
+        assert!(tick_decomposition(&config, &mut coordinator).await.unwrap());
+        assert_eq!(reset_row(), ("freeze-requested".into(), 1));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let errors: i64 = conn
+            .query_row("SELECT count(*) FROM errors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(errors, 0);
+    }
+
     #[test]
     fn oversized_planning_source_materializes_only_its_byte_count_and_cannot_build_prompt() {
         let dir = tempfile::tempdir().unwrap();
@@ -62705,6 +62828,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let graph = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "claude",
@@ -63631,6 +63755,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let graph = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "claude",
@@ -63773,6 +63898,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let graph = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "claude",
@@ -63885,6 +64011,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let graph = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "claude",
@@ -63974,6 +64101,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             let graph_id = quorum_core::decomposition::begin_planning(
                 &mut conn,
                 &quorum_core::decomposition::BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id: source_id,
                     expected_revision: 1,
                     provider: "claude",
@@ -64153,6 +64281,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let graph = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "codex",
@@ -65419,6 +65548,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             let graph = quorum_core::decomposition::begin_planning(
                 &mut conn,
                 &quorum_core::decomposition::BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id: source,
                     expected_revision: 1,
                     provider: "codex",
@@ -66412,6 +66542,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             quorum_core::decomposition::begin_planning(
                 &mut conn,
                 &quorum_core::decomposition::BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id: source_b,
                     expected_revision: 1,
                     provider: "codex",
@@ -67127,6 +67258,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             let graph = quorum_core::decomposition::begin_planning(
                 &mut conn,
                 &quorum_core::decomposition::BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id: source,
                     expected_revision: 1,
                     provider: "claude",
@@ -67239,6 +67371,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             let graph = quorum_core::decomposition::begin_planning(
                 &mut conn,
                 &quorum_core::decomposition::BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id: source,
                     expected_revision: 1,
                     provider: "claude",
@@ -67293,7 +67426,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     "proposal rejected by the prior binary",
                     quorum_core::decomposition::AttemptEligibility::structural(),
                     None,
-                    5 + attempt * 2,
+                    1,
+                    5 + attempt * 2
                 )
                 .unwrap());
             }
@@ -67367,7 +67501,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             )
             .unwrap();
             let outcome =
-                quorum_core::decomposition::reconcile_startup_graphs(&mut conn, 3).unwrap();
+                quorum_core::decomposition::reconcile_startup_graphs(&mut conn, 1, 3).unwrap();
             assert_eq!(outcome.reset, 1);
             assert_eq!(
                 inspect_startup_decomposition(&conn).unwrap(),
@@ -67759,6 +67893,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             let graph_id = quorum_core::decomposition::begin_planning(
                 &mut conn,
                 &quorum_core::decomposition::BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id,
                     expected_revision: 1,
                     provider: "codex",
@@ -68084,6 +68219,7 @@ exec /bin/cat '{stdout}'
             let graph_id = quorum_core::decomposition::begin_planning(
                 &mut conn,
                 &quorum_core::decomposition::BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id,
                     expected_revision: 1,
                     provider: "codex",
@@ -68269,6 +68405,7 @@ exec /bin/cat '{stdout}'
             let graph_id = quorum_core::decomposition::begin_planning(
                 &mut conn,
                 &quorum_core::decomposition::BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id,
                     expected_revision: 1,
                     provider: "codex",

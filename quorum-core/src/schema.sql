@@ -215,8 +215,8 @@ CREATE INDEX IF NOT EXISTS tasks_terminal_retry_recent
       );
 
 -- v35: one bounded decomposition aggregate per source task. `active` and
--- `freeze_active` are explicit partial-index sentinels, never inferred from
--- text state, so racing writers lose at SQLite's uniqueness boundary.
+-- `freeze_active` are explicit sentinels, never inferred from text state;
+-- admission guards count them under the write lock.
 CREATE TABLE IF NOT EXISTS task_decompositions (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     source_task_id          INTEGER NOT NULL UNIQUE REFERENCES tasks(id),
@@ -245,10 +245,9 @@ CREATE TABLE IF NOT EXISTS task_decompositions (
     created_at              INTEGER NOT NULL,
     updated_at              INTEGER NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS one_active_task_graph
-    ON task_decompositions(active) WHERE active = 1;
-CREATE UNIQUE INDEX IF NOT EXISTS one_planning_freeze
-    ON task_decompositions(freeze_active) WHERE freeze_active = 1;
+-- v84 dropped the v35 `one_active_task_graph` / `one_planning_freeze` unique
+-- indexes: admission is a guarded count against `max_active_graphs` inside
+-- BEGIN IMMEDIATE (see decomposition::COUNTED_GRAPH_PREDICATE).
 
 -- v37: short-lived daemon reviewer reservations serialize external reviewer
 -- provisioning against acquisition of the repository planning freeze.

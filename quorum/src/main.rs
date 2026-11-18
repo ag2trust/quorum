@@ -136,9 +136,9 @@ primary = 100
 ## max(cap, 2); must be 1..=32. Excess review work waits for a free slot.
 # reviewer_cap = 4
 
-## Graphs that may be active or planning at once across the daemon. Unset
-## defaults to 2; must be >= 1. Parsed and validated only — not yet enforced
-## by dispatch or planning admission.
+## Graphs that may be counted (active, blocked, or planning) at once across
+## the daemon. Unset defaults to 2; must be >= 1. Enforced atomically at
+## planning admission and activation; one graph still plans at a time.
 # max_active_graphs = 2
 ";
 
