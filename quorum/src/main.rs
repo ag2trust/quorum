@@ -219,14 +219,16 @@ fn status_snapshot(online_window: i64) -> Result<quorum_core::stats::Stats> {
     let now = quorum_core::clock::now();
     let db_path = paths::db_path()?;
     let reviewer_cap = status_reviewer_cap();
+    let max_active_graphs = status_max_active_graphs();
     assemble_status_snapshot(
         || {
             let conn = quorum_core::db::open(&db_path)?;
-            let mut stats = quorum_core::stats::stats_with_reviewer_cap(
+            let mut stats = quorum_core::stats::stats_with_options(
                 &conn,
                 now,
                 online_window,
                 reviewer_cap,
+                max_active_graphs,
             )?;
             stats.daemon =
                 quorum_core::daemon_lock::liveness(&conn, now, DAEMON_STALE_SECS, pid_is_alive)?;
@@ -249,6 +251,22 @@ fn status_reviewer_cap() -> Option<i64> {
     let path = serve_config::default_config_path(&repo).ok()?;
     let file_cfg = serve_config::load(&path, false).ok()?;
     serve_config::file_reviewer_cap(&file_cfg).ok()
+}
+
+/// Best-effort `max_active_graphs` for the read-only status path, mirroring
+/// `status_reviewer_cap`. `None` when no repo is resolvable or the file is
+/// unreadable/malformed (the same supported-but-unconfigured cases as the
+/// reviewer cap), so `quorum status` keeps working before the daemon is
+/// fully configured; a planner-routed hold reason is simply omitted rather
+/// than guessed. Falls back to `serve_config::DEFAULT_MAX_ACTIVE_GRAPHS` when
+/// the repo's config omits the key, exactly like daemon startup resolution.
+fn status_max_active_graphs() -> Option<i64> {
+    let repo = paths::try_resolve_repo()?;
+    let path = serve_config::default_config_path(&repo).ok()?;
+    let file_cfg = serve_config::load(&path, false).ok()?;
+    serve_config::resolve_max_active_graphs(file_cfg.max_active_graphs)
+        .ok()
+        .and_then(|limit| i64::try_from(limit).ok())
 }
 
 fn assemble_status_snapshot<Read, Sample>(
