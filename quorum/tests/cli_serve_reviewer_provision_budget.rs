@@ -960,6 +960,159 @@ exit 0
     drop(handle);
 }
 
+/// A reviewer whose provider is unavailable with no eligible alternate settles
+/// as `provider_blocked`. Each such teardown must burn one durable per-head
+/// strike and defer the next provision by the exponential respawn backoff, so
+/// the task parks only after the strike budget is spent across that schedule
+/// instead of re-provisioning the blocked provider every tick.
+#[test]
+fn provider_blocked_reviewer_strikes_backs_off_and_parks_after_budget() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+
+    let author = "Worker";
+    let task_id = seed_in_review_task(home.path(), author, 42);
+    create_author_branch(repo_dir.path(), author, task_id);
+    record_closed_run(home.path(), task_id, author, "worker");
+    let names = write_named_pool(home.path(), &["Reviewer".into()]);
+
+    // A Claude stream-json reviewer that reports a provider outage status,
+    // which classifies as ProviderUnavailable; the default single-profile pool
+    // has no eligible alternate, so the fallback settles as provider_blocked.
+    let blocked_reviewer = home.path().join("blocked-reviewer.sh");
+    std::fs::write(
+        &blocked_reviewer,
+        "#!/bin/sh\nIFS= read -r _line\nprintf '{\"type\":\"result\",\"result\":\"overloaded\",\"is_error\":true,\"api_error_status\":529}\\n'\nexit 1\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    std::fs::set_permissions(&blocked_reviewer, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let base = Duration::from_millis(1_000);
+    let mut handle = ServeHandle::start_with_agent_bin_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+        &blocked_reviewer,
+        &[("QUORUM_TEST_REVIEWER_RESPAWN_BACKOFF_MS", "1000")],
+    );
+
+    let strike_line = "ended provider_blocked for task #1 PR #42";
+    let mut strike_seen_at = Vec::new();
+    for strike in 1..=3 {
+        assert!(
+            handle.wait_for(strike_line, 90),
+            "provider_blocked teardown {strike} recorded no strike: {:?}",
+            handle.lines
+        );
+        strike_seen_at.push(std::time::Instant::now());
+        let last = handle.lines.last().unwrap();
+        assert!(
+            last.contains("recorded a R1 provider-failure strike"),
+            "strike {strike} was not durable: {last}"
+        );
+        let expected_delay = base * (1 << (strike - 1));
+        assert!(
+            last.contains(&format!(
+                "deferring the next provision by {:.1}s",
+                expected_delay.as_secs_f64()
+            )),
+            "strike {strike} did not schedule the exponential backoff: {last}"
+        );
+        if strike < 3 {
+            // Durable strikes advance by exactly one per teardown.
+            let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+            let attempts: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(attempts), 0) FROM reviewer_provision_attempts \
+                     WHERE task_id=?1",
+                    rusqlite::params![task_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(attempts, strike, "strikes must advance by one per teardown");
+        }
+    }
+    // Each successive failure waited out the previous strike's backoff
+    // (1s, then 2s) instead of respawning on the next tick.
+    for (gap, expected) in [
+        (strike_seen_at[1] - strike_seen_at[0], base),
+        (strike_seen_at[2] - strike_seen_at[1], base * 2),
+    ] {
+        assert!(
+            gap >= expected.mul_f64(0.9),
+            "reviewer respawned after {gap:?}, before its {expected:?} backoff elapsed: {:?}",
+            handle.lines
+        );
+    }
+    assert!(
+        handle.wait_for("orphan in-review task #1 PR #42: provision exhausted", 60),
+        "provider_blocked strikes did not exhaust and park: {:?}",
+        handle.lines
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    handle.drain_pending_lines();
+
+    assert_eq!(
+        handle
+            .lines
+            .iter()
+            .filter(|line| line.contains(strike_line))
+            .count(),
+        3,
+        "each provider_blocked teardown must burn exactly one strike: {:?}",
+        handle.lines
+    );
+    let conn = quorum_core::db::open(&db_path(home.path())).unwrap();
+    let attempts: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(attempts), 0) FROM reviewer_provision_attempts WHERE task_id=?1",
+            rusqlite::params![task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        attempts, 3,
+        "provider_blocked teardowns must record strikes"
+    );
+    let blocked_runs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM agent_runs \
+             WHERE task_id=?1 AND role='reviewer' AND end_reason='provider_blocked'",
+            rusqlite::params![task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        blocked_runs, 3,
+        "the per-head budget must park before a fourth reviewer is spawned"
+    );
+    let parked = get_task(home.path(), task_id);
+    assert_eq!(parked.status, "failed", "task was not parked");
+    assert!(
+        parked
+            .refs
+            .as_deref()
+            .unwrap_or_default()
+            .contains("reviewer provision exhausted for orphan PR #42"),
+        "park reason missing from refs: {:?}",
+        parked.refs
+    );
+    drop(handle);
+}
+
 /// A terminal provider error is durable strike evidence, so the exhausted park
 /// reason remains actionable even though the daemon only decides to park on a
 /// later tick after the failed reviewer has been reaped.
