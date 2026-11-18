@@ -63378,6 +63378,100 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         }
     }
 
+    /// An `external_constraint` planner blocker is operator-retryable: after
+    /// origin advances, the retried graph re-drains, binds the newer fetched
+    /// origin head instead of the blocked attempt's base, and starts a new
+    /// planner attempt under a fresh session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_constraint_retry_rebinds_advanced_origin_and_replans() {
+        let harness = lifecycle_harness("external-constraint-retry");
+        let blocked_base = harness
+            .freeze_row()
+            .frozen_base_sha
+            .expect("the blocked attempt bound a base");
+        {
+            let mut conn = quorum_core::db::open(&harness.db_path).unwrap();
+            conn.execute(
+                "UPDATE task_decompositions SET planner_session_id='blocked-session'
+                 WHERE id=?1",
+                [harness.graph],
+            )
+            .unwrap();
+            assert!(quorum_core::decomposition::record_attempt(
+                &mut conn,
+                harness.graph,
+                "blocker",
+                quorum_core::decomposition::RETRYABLE_PLANNER_BLOCKER,
+                "the named dependency is not merged into the frozen base",
+                5,
+            )
+            .unwrap()
+            .is_some());
+        }
+        let held = harness.freeze_row();
+        assert_eq!((held.state.as_str(), held.freeze_active), ("held", false));
+        let advanced = push_remote_only_commit(&harness.config.repo_dir);
+        assert_ne!(advanced, blocked_base);
+
+        {
+            let mut conn = quorum_core::db::open(&harness.db_path).unwrap();
+            assert_eq!(
+                quorum_core::decomposition::retry_exhausted_planning(
+                    &mut conn,
+                    harness.source,
+                    "operator",
+                    now_unix(),
+                )
+                .unwrap(),
+                quorum_core::decomposition::PlanningRetryOutcome::Retried {
+                    graph_id: harness.graph,
+                    generation: 1,
+                }
+            );
+        }
+        harness.expire_backoff();
+        let retried = harness.freeze_row();
+        assert_eq!(
+            (retried.state.as_str(), retried.frozen_base_sha),
+            ("provider-backoff", None)
+        );
+
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        harness
+            .assert_real_drain_reaches_planning(&mut coordinator)
+            .await;
+        assert_eq!(
+            harness.freeze_row().frozen_base_sha.as_deref(),
+            Some(advanced.as_str())
+        );
+
+        harness.tick(&mut coordinator).await;
+        assert!(
+            coordinator.planner_slot.is_some(),
+            "the retried graph starts a new planner attempt"
+        );
+        let session: Option<String> = {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            conn.query_row(
+                "SELECT planner_session_id FROM task_decompositions WHERE id=?1",
+                [harness.graph],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(session.is_some());
+        assert_ne!(session.as_deref(), Some("blocked-session"));
+        assert_eq!(session, coordinator.planner_run_id);
+        // The new attempt keeps the base it bound for its whole life.
+        assert_eq!(
+            harness.freeze_row().frozen_base_sha.as_deref(),
+            Some(advanced.as_str())
+        );
+        harness.settle(&mut coordinator).await;
+    }
+
     /// The daemon clone's HEAD lags origin: the handoff binds the fetched
     /// remote head, and the planner view contains the remote-only file.
     #[cfg(unix)]

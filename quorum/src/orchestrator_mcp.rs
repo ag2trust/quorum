@@ -216,7 +216,8 @@ fn tools() -> Vec<Tool> {
         tool(
             TASK_RETRY,
             "Resume a task the daemon parked after a bounded failure or that is provider-blocked, \
-             or retry an eligible exhausted decomposition plan (`quorum task-retry`). It keeps \
+             or retry an eligible exhausted decomposition plan or external_constraint planner hold \
+             (`quorum task-retry`). It keeps \
              the task's PR, branch, dependencies, and rework context. It is not a general retry \
              for terminal failures: any other task is refused with code `rejected`, carrying the \
              command's own `outcome`, `reason`, and any `cancelled_deps` or `retry_count`.",

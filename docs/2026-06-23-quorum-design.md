@@ -3110,8 +3110,18 @@ neither review-only nor a continuation, and no accepted plan, member/child, proc
 delivery/merge evidence exists. The winner restores the source to `planning`, clears only the
 retryable hold/session/base fields, resets the exhausted current-generation counter, and places the
 graph in provider backoff so the coordinator must reacquire `one_planning_freeze` through the
-ordinary guarded path. Semantic blockers, inconsistent holds, stale authority, materialization,
-delivery evidence, and racing callers are clean negatives.
+ordinary guarded path. A planner blocker of category `external_constraint` (the frozen base has
+since moved, or the source names work not merged yet) is resumable the same way and under the
+same negative-evidence checks and operator retry cap: the replayed attempt history must end the
+current generation in exactly one matching blocker recorded after that generation's
+budget-bearing attempts. Because a blocker consumes neither budget, its retry resets no counter;
+it clears the hold, frozen base, and planner session so the re-drain binds a fresh base and a new
+attempt starts with its own immutable frozen view. The same transaction returns to `open` every
+dependent the cascade parked only because this source was terminal-not-done (`open` resumes only;
+a `rework` resume would add started work to the source's own drain); a resumed dependent stays
+unready until the source is `done`, and a renewed hold parks it again. The `ambiguous_scope`,
+`missing_decision`, and `no_safe_split` blockers, inconsistent holds, stale authority,
+materialization, delivery evidence, and racing callers are clean negatives.
 
 Coordinator snapshot selection always prioritizes the unique `freeze_active=1` aggregate before
 older provider-backoff aggregates. An explicitly retried graph therefore cannot shadow, stall, or

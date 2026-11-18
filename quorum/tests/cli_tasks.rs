@@ -1207,6 +1207,110 @@ fn exhausted_decomposition_retry_cap_has_actionable_json() {
         .stdout(predicates::str::contains("\"retry_cap\":2"));
 }
 
+#[test]
+fn task_retry_accepts_only_the_external_constraint_planner_blocker() {
+    for (category, accepted) in [
+        ("external_constraint", true),
+        ("ambiguous_scope", false),
+        ("missing_decision", false),
+        ("no_safe_split", false),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        quorum(home.path())
+            .args([
+                "task-create",
+                "--created-by",
+                "boss",
+                "--title",
+                "blocked plan",
+            ])
+            .assert()
+            .success();
+        let db = home.path().join("repos/test__repo/quorum.db");
+        let conn = quorum_core::db::open(&db).unwrap();
+        conn.execute("UPDATE tasks SET status='failed' WHERE id=1", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,planned_source_revision,frozen_base_sha,
+                 planner_session_id,hold_code,hold_summary,created_at,updated_at)
+             VALUES (1,'held',1,'0123456789abcdef0123456789abcdef01234567',
+                     'planner-session',?1,'blocked',1,1)",
+            [category],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO decomposition_attempts(
+                 graph_id,source_revision,kind,ordinal,reason_code,summary,created_at)
+             VALUES (1,1,'blocker',1,?1,'blocked',1)",
+            [category],
+        )
+        .unwrap();
+        drop(conn);
+
+        let assert = quorum(home.path())
+            .args(["task-retry", "--task-id", "1", "--by", "operator"])
+            .assert();
+        if accepted {
+            assert.success().stdout(predicates::str::contains(
+                "\"outcome\":\"decomposition-planning-retried\"",
+            ));
+        } else {
+            assert
+                .code(1)
+                .stdout(predicates::str::contains(
+                    "\"outcome\":\"task-retry-rejected\"",
+                ))
+                .stdout(predicates::str::contains("external_constraint-held"));
+        }
+        let conn = quorum_core::db::open(&db).unwrap();
+        let state: (String, String, Option<String>, Option<String>, i64, i64) = conn
+            .query_row(
+                "SELECT d.state,t.status,d.frozen_base_sha,d.hold_code,d.operator_retry_count,
+                        (SELECT count(*) FROM errors)
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        if accepted {
+            assert_eq!(
+                state,
+                (
+                    "provider-backoff".into(),
+                    "planning".into(),
+                    None,
+                    None,
+                    1,
+                    0
+                )
+            );
+        } else {
+            assert_eq!(
+                state,
+                (
+                    "held".into(),
+                    "failed".into(),
+                    Some("0123456789abcdef0123456789abcdef01234567".into()),
+                    Some(category.into()),
+                    0,
+                    0
+                ),
+                "{category}"
+            );
+        }
+    }
+}
+
 /// Task #473: `task-retry` on a dependent whose depends_on contains a
 /// cancelled task must exit 1 naming the cancelled dep and NOT restore the
 /// dependent (the sweep would just re-park it and give the operator no
