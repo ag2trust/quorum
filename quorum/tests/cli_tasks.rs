@@ -2348,3 +2348,89 @@ fn task_create_refuses_a_malformed_serve_config_even_with_a_base_branch() {
         .unwrap();
     assert_eq!(rows, vec!["main".to_string()]);
 }
+
+#[test]
+fn planner_blocker_hold_is_logged_and_shown_in_task_get() {
+    let home = tempfile::tempdir().unwrap();
+    for title in ["blocked plan", "plain task"] {
+        quorum(home.path())
+            .args(["task-create", "--created-by", "boss", "--title", title])
+            .assert()
+            .success();
+    }
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let summary = serde_json::json!({
+        "evidence": ["upstream API is not yet released"],
+        "required_decision": "wait for the vendor release or drop the feature",
+        "why_no_safe_split": "every slice depends on the API",
+    })
+    .to_string();
+    {
+        let mut conn = quorum_core::db::open(&db).unwrap();
+        conn.execute("UPDATE tasks SET status='planning' WHERE id=1", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 created_at,updated_at)
+             VALUES (1,'planning',0,0,1,1,1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            quorum_core::decomposition::record_attempt(
+                &mut conn,
+                1,
+                "blocker",
+                "external_constraint",
+                &summary,
+                quorum_core::clock::now(),
+            )
+            .unwrap(),
+            Some(1)
+        );
+    }
+
+    let log = quorum(home.path())
+        .args(["log", "--refs", "task#1"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let log = String::from_utf8(log).unwrap();
+    let all: Vec<serde_json::Value> = serde_json::from_str(&log).unwrap();
+    let events: Vec<&serde_json::Value> = all
+        .iter()
+        .filter(|event| event["kind"] == quorum_core::decomposition::PLANNER_BLOCKER_HOLD_EVENT)
+        .collect();
+    assert_eq!(events.len(), 1, "{log}");
+    let body = events[0]["body"].as_str().unwrap();
+    assert!(body.contains("external_constraint"), "{body}");
+    assert!(body.contains("wait for the vendor release"), "{body}");
+    assert!(body.contains("upstream API is not yet released"), "{body}");
+    assert!(body.len() <= quorum_core::decomposition::ATTEMPT_SUMMARY_MAX_BYTES);
+
+    let out = quorum(home.path())
+        .args(["task-get", "--task-id", "1"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let task: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(task["status"], "failed");
+    assert_eq!(task["planner_hold"]["category"], "external_constraint");
+    assert_eq!(task["planner_hold"]["summary"], summary.as_str());
+    assert_eq!(task["planner_hold"]["graph_id"], 1);
+
+    let out = quorum(home.path())
+        .args(["task-get", "--task-id", "2"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let task: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert!(task.get("planner_hold").is_none(), "{task}");
+}
