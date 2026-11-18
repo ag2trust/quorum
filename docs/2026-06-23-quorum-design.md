@@ -36,6 +36,16 @@ non-persistent and fail-open; partial values and bounded sampling errors remain 
 warning or critical resource sample promotes only `OnTrack` to `Attention`, never replaces
 `Stalled`, and never throttles, kills, or transitions managed work.
 
+`merge_blockers` rows for `merging` tasks read the daemon-owned `refs.merge_checks`
+snapshot when one exists. `blocker_kind` becomes `ci_pending`, `ci_failing`, or
+`ci_passed` (passed, awaiting the merge call), with additive `ci_state`, `ci_checks`
+(sanitized, at most 20 names), `ci_since`, `ci_observed_at`, and a bounded `ci_summary`
+such as `awaiting CI: unit, clippy (pending 6m)`. The text cockpit prints that summary
+under the MERGE WAIT row, and task progress uses it as the merge-stage condition. With
+no snapshot, or one that does not parse, the row keeps the inferred `ci_pending` with
+none of the `ci_*` fields. Conflict-blocked rows do not change. Status only reads the
+snapshot; it never writes it.
+
 ### Product boundary: opinionated Git delivery
 
 Quorum is an opinionated local **agentic Git/GitHub coding pipeline**. It provisions

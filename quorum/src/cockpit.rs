@@ -868,6 +868,13 @@ fn render_merge_wait(blockers: &[MergeBlockerView], sty: &Style, w: &mut dyn Wri
                     "[!]".to_string()
                 }
             }
+            "ci_failing" => {
+                if sty.color {
+                    sty.red("✗")
+                } else {
+                    "[x]".to_string()
+                }
+            }
             _ => {
                 if sty.color {
                     "⏳".to_string()
@@ -887,6 +894,15 @@ fn render_merge_wait(blockers: &[MergeBlockerView], sty: &Style, w: &mut dyn Wri
             b.retry_count,
             pr_str,
         );
+        if let Some(summary) = &b.ci_summary {
+            let line = truncate(summary, width.saturating_sub(6));
+            let rendered = if sty.color && b.blocker_kind == "ci_failing" {
+                sty.red(&line)
+            } else {
+                line
+            };
+            let _ = writeln!(w, "      {rendered}");
+        }
     }
 }
 
@@ -1618,6 +1634,23 @@ mod tests {
 
     // ── #177: MERGE WAIT section ────────────────────────────────────
 
+    fn ci_none() -> MergeBlockerView {
+        MergeBlockerView {
+            task_id: 0,
+            title: String::new(),
+            pr: None,
+            blocker_kind: String::new(),
+            status: String::new(),
+            waiting_secs: 0,
+            retry_count: 0,
+            ci_state: None,
+            ci_checks: Vec::new(),
+            ci_since: None,
+            ci_observed_at: None,
+            ci_summary: None,
+        }
+    }
+
     #[test]
     fn merge_wait_section_renders_when_present() {
         let mut s = default_stats();
@@ -1629,6 +1662,7 @@ mod tests {
             status: "in-review".into(),
             waiting_secs: 1800,
             retry_count: 1,
+            ..ci_none()
         });
         s.merge_blockers.push(MergeBlockerView {
             task_id: 50,
@@ -1638,6 +1672,7 @@ mod tests {
             status: "merging".into(),
             waiting_secs: 120,
             retry_count: 0,
+            ..ci_none()
         });
         let sty = Style::plain();
         let mut buf = Vec::new();
@@ -1657,6 +1692,53 @@ mod tests {
         );
         assert!(output.contains("#367"), "PR number visible: {output}");
         assert!(output.contains("#400"), "PR number visible: {output}");
+    }
+
+    #[test]
+    fn merge_wait_renders_snapshot_ci_state_and_check_names() {
+        let mut s = default_stats();
+        s.merge_blockers.push(MergeBlockerView {
+            task_id: 61,
+            title: "pending ci".into(),
+            pr: Some(610),
+            blocker_kind: "ci_pending".into(),
+            status: "merging".into(),
+            waiting_secs: 400,
+            retry_count: 0,
+            ci_state: Some("pending".into()),
+            ci_checks: vec!["unit".into(), "clippy".into()],
+            ci_since: Some(600),
+            ci_observed_at: Some(990),
+            ci_summary: Some("awaiting CI: unit, clippy (pending 6m)".into()),
+        });
+        s.merge_blockers.push(MergeBlockerView {
+            task_id: 62,
+            title: "failing ci".into(),
+            pr: Some(620),
+            blocker_kind: "ci_failing".into(),
+            status: "merging".into(),
+            waiting_secs: 400,
+            retry_count: 0,
+            ci_state: Some("failing".into()),
+            ci_checks: vec!["unit".into()],
+            ci_since: Some(900),
+            ci_observed_at: Some(990),
+            ci_summary: Some("CI failing: unit (failing 1m)".into()),
+        });
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("      awaiting CI: unit, clippy (pending 6m)"),
+            "{output}"
+        );
+        assert!(
+            output.contains("      CI failing: unit (failing 1m)"),
+            "{output}"
+        );
+        let failing_row = output.lines().find(|l| l.contains("#62")).unwrap();
+        assert!(failing_row.contains("[x]") && failing_row.contains("ci_failing"));
     }
 
     #[test]
@@ -1683,6 +1765,7 @@ mod tests {
             status: "in-review".into(),
             waiting_secs: 600,
             retry_count: 2,
+            ..ci_none()
         });
         let sty = Style::plain();
         let mut buf = Vec::new();
@@ -1706,6 +1789,7 @@ mod tests {
             status: "in-review".into(),
             waiting_secs: 60,
             retry_count: 3,
+            ..ci_none()
         });
         let sty = Style::plain();
         let mut buf = Vec::new();

@@ -502,7 +502,9 @@ pub struct MergeBlockerView {
     pub task_id: i64,
     pub title: String,
     pub pr: Option<i64>,
-    /// "conflict", "ci_pending", "policy"
+    /// "conflict", "ci_pending", "ci_failing", "ci_passed", "policy".
+    /// A `merging` task without a daemon `refs.merge_checks` snapshot keeps
+    /// the inferred "ci_pending".
     pub blocker_kind: String,
     /// Current task status (e.g. "in-review", "merging").
     pub status: String,
@@ -510,6 +512,105 @@ pub struct MergeBlockerView {
     pub waiting_secs: i64,
     /// Rework rounds accumulated on this task.
     pub retry_count: i32,
+    /// Snapshot CI state (`pending`/`failing`/`passed`); absent without a snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_state: Option<String>,
+    /// Snapshot check names, sanitized and bounded to
+    /// [`crate::tasks::MERGE_CHECKS_MAX_NAMES`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ci_checks: Vec<String>,
+    /// When the current `ci_state` was first observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_since: Option<i64>,
+    /// When the daemon last observed the checks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_observed_at: Option<i64>,
+    /// Bounded one-line summary, e.g. `awaiting CI: unit, clippy (pending 6m)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_summary: Option<String>,
+}
+
+/// Check names shown inline in a CI summary before collapsing to `+N more`.
+const MERGE_CI_SUMMARY_NAMES: usize = 3;
+
+/// Read the daemon-owned merge-gate snapshot from task refs, re-bounding the
+/// check names for display (the reader must not trust stored length/content).
+fn merge_ci_snapshot(refs: Option<&str>) -> Option<crate::tasks::MergeChecksSnapshot> {
+    let mut snap = crate::tasks::merge_checks_of(refs)?;
+    snap.checks = snap
+        .checks
+        .iter()
+        .filter_map(|name| {
+            let clean: String = name
+                .chars()
+                .filter(|ch| *ch != '\0')
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .take(crate::tasks::MERGE_CHECKS_MAX_NAME_CHARS)
+                .collect();
+            let trimmed = clean.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .take(crate::tasks::MERGE_CHECKS_MAX_NAMES)
+        .collect();
+    Some(snap)
+}
+
+fn fmt_elapsed(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
+}
+
+/// Bounded human summary of a merge-gate snapshot. At most
+/// [`MERGE_CI_SUMMARY_NAMES`] names are listed inline; the text is capped at
+/// the task-progress text limit.
+fn merge_ci_summary(snap: &crate::tasks::MergeChecksSnapshot, now: i64) -> String {
+    use crate::tasks::MergeChecksState;
+    let elapsed = fmt_elapsed(now - snap.since);
+    let mut names = snap
+        .checks
+        .iter()
+        .take(MERGE_CI_SUMMARY_NAMES)
+        .map(|name| truncate_chars(name, 40))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if snap.checks.len() > MERGE_CI_SUMMARY_NAMES {
+        names.push_str(&format!(
+            " +{} more",
+            snap.checks.len() - MERGE_CI_SUMMARY_NAMES
+        ));
+    }
+    let names = if names.is_empty() {
+        String::new()
+    } else {
+        format!(": {names}")
+    };
+    let text = match snap.state {
+        MergeChecksState::Pending => format!("awaiting CI{names} (pending {elapsed})"),
+        MergeChecksState::Failing => format!("CI failing{names} (failing {elapsed})"),
+        MergeChecksState::Passed => format!("CI passed, awaiting merge ({elapsed})"),
+    };
+    bounded_progress_text(&text)
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        format!(
+            "{}…",
+            head.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
+    } else {
+        head
+    }
 }
 
 /// True when `count` is 0 or a power of two — controls merge-wait alert dedup.
@@ -930,7 +1031,15 @@ pub fn task_progress(conn: &Connection, task_id: i64, now: i64) -> Result<Option
                 decomposition_current_progress(&task, graph.as_ref(), &attempts, &live)
             }
             TaskJourney::DirectImplementation | TaskJourney::ReviewOnly => {
-                execution_current_progress(&task, journey, r2_required, &runs, &live, &dependencies)
+                execution_current_progress(
+                    &task,
+                    journey,
+                    r2_required,
+                    &runs,
+                    &live,
+                    &dependencies,
+                    now,
+                )
             }
         }
     };
@@ -949,7 +1058,6 @@ pub fn task_progress(conn: &Connection, task_id: i64, now: i64) -> Result<Option
     milestones.extend(future);
     milestones.truncate(TASK_PROGRESS_MILESTONE_LIMIT);
 
-    let _ = now; // Kept request-scoped for a stable public projection signature.
     Ok(Some(TaskProgress {
         task_id,
         journey,
@@ -1313,6 +1421,7 @@ fn execution_current_progress(
     runs: &[crate::agent_runs::AgentRun],
     live: &[ProgressLiveRun],
     dependencies: &DependencyProgress,
+    now: i64,
 ) -> (
     TaskProgressStage,
     Option<String>,
@@ -1424,14 +1533,13 @@ fn execution_current_progress(
                     role: None,
                     activity: "Merge is in progress".into(),
                 },
-                Some(
-                    if waiting_conflict {
-                        "Waiting for merge conflict resolution"
-                    } else {
-                        "Waiting for CI"
-                    }
-                    .into(),
-                ),
+                Some(if waiting_conflict {
+                    "Waiting for merge conflict resolution".into()
+                } else {
+                    merge_ci_snapshot(task.refs.as_deref())
+                        .map(|snap| merge_ci_summary(&snap, now))
+                        .unwrap_or_else(|| "Waiting for CI".into())
+                }),
                 Some(possible_next("CI and merge policy may permit completion")),
             )
         }
@@ -3630,6 +3738,11 @@ fn merge_blockers(conn: &Connection, now: i64) -> Result<Vec<MergeBlockerView>> 
             status,
             waiting_secs: (now - updated_at).max(0),
             retry_count: rework_round,
+            ci_state: None,
+            ci_checks: Vec::new(),
+            ci_since: None,
+            ci_observed_at: None,
+            ci_summary: None,
         });
     }
 
@@ -3655,14 +3768,26 @@ fn merge_blockers(conn: &Connection, now: i64) -> Result<Vec<MergeBlockerView>> 
         if result.iter().any(|b| b.task_id == id) {
             continue;
         }
+        let snap = merge_ci_snapshot(refs.as_deref());
+        let blocker_kind = match snap.as_ref().map(|s| s.state) {
+            Some(crate::tasks::MergeChecksState::Failing) => "ci_failing",
+            Some(crate::tasks::MergeChecksState::Passed) => "ci_passed",
+            Some(crate::tasks::MergeChecksState::Pending) | None => "ci_pending",
+        };
+        let ci_summary = snap.as_ref().map(|s| merge_ci_summary(s, now));
         result.push(MergeBlockerView {
             task_id: id,
             title,
             pr: extract_pr_from_refs(refs.as_deref()),
-            blocker_kind: "ci_pending".into(),
+            blocker_kind: blocker_kind.into(),
             status: "merging".into(),
             waiting_secs: (now - updated_at).max(0),
             retry_count: rework_round,
+            ci_state: snap.as_ref().map(|s| s.state.as_str().to_string()),
+            ci_since: snap.as_ref().map(|s| s.since),
+            ci_observed_at: snap.as_ref().map(|s| s.observed_at),
+            ci_checks: snap.map(|s| s.checks).unwrap_or_default(),
+            ci_summary,
         });
     }
 
@@ -6905,6 +7030,171 @@ mod tests {
         assert_eq!(b.pr, Some(99));
     }
 
+    fn merging_task(c: &mut Connection, pr: i64) -> i64 {
+        let t = crate::tasks::create(
+            c,
+            "boss",
+            "merge me",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(pr),
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status = 'merging', updated_at = 800 WHERE id = ?1",
+            rusqlite::params![t],
+        )
+        .unwrap();
+        t
+    }
+
+    #[test]
+    fn merge_blocker_pending_snapshot_surfaces_state_names_and_since() {
+        use crate::tasks::{set_merge_checks_snapshot, MergeChecksState};
+        let (_d, mut c) = open_tmp();
+        let t = merging_task(&mut c, 99);
+        let names: Vec<String> = ["unit", "clippy"].iter().map(|n| n.to_string()).collect();
+        assert!(
+            set_merge_checks_snapshot(&mut c, t, MergeChecksState::Pending, &names, 640).unwrap()
+        );
+        // A later observation keeps `since` and advances `observed_at`.
+        assert!(
+            set_merge_checks_snapshot(&mut c, t, MergeChecksState::Pending, &names, 900).unwrap()
+        );
+
+        let s = stats(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(s.merge_blockers.len(), 1);
+        let b = &s.merge_blockers[0];
+        assert_eq!(b.blocker_kind, "ci_pending");
+        assert_eq!(b.ci_state.as_deref(), Some("pending"));
+        assert_eq!(b.ci_checks, names);
+        assert_eq!(b.ci_since, Some(640));
+        assert_eq!(b.ci_observed_at, Some(900));
+        assert_eq!(
+            b.ci_summary.as_deref(),
+            Some("awaiting CI: unit, clippy (pending 6m)")
+        );
+
+        let json = serde_json::to_value(&s).unwrap();
+        let jb = &json["merge_blockers"][0];
+        assert_eq!(jb["blocker_kind"], "ci_pending");
+        assert_eq!(jb["ci_state"], "pending");
+        assert_eq!(jb["ci_checks"], serde_json::json!(["unit", "clippy"]));
+        assert_eq!(jb["ci_since"], 640);
+        assert_eq!(jb["ci_observed_at"], 900);
+        assert_eq!(jb["ci_summary"], "awaiting CI: unit, clippy (pending 6m)");
+    }
+
+    #[test]
+    fn merge_blocker_failing_and_passed_snapshots_render_distinctly() {
+        use crate::tasks::{set_merge_checks_snapshot, MergeChecksState};
+        let (_d, mut c) = open_tmp();
+        let failing = merging_task(&mut c, 10);
+        let passed = merging_task(&mut c, 11);
+        let names: Vec<String> = (0..25).map(|i| format!("check-{i}")).collect();
+        assert!(
+            set_merge_checks_snapshot(&mut c, failing, MergeChecksState::Failing, &names, 880)
+                .unwrap()
+        );
+        assert!(
+            set_merge_checks_snapshot(&mut c, passed, MergeChecksState::Passed, &[], 970).unwrap()
+        );
+
+        let s = stats(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let f = s
+            .merge_blockers
+            .iter()
+            .find(|b| b.task_id == failing)
+            .unwrap();
+        assert_eq!(f.blocker_kind, "ci_failing");
+        assert_eq!(f.ci_state.as_deref(), Some("failing"));
+        assert_eq!(f.ci_checks.len(), crate::tasks::MERGE_CHECKS_MAX_NAMES);
+        assert_eq!(
+            f.ci_summary.as_deref(),
+            Some("CI failing: check-0, check-1, check-2 +17 more (failing 2m)")
+        );
+        let p = s
+            .merge_blockers
+            .iter()
+            .find(|b| b.task_id == passed)
+            .unwrap();
+        assert_eq!(p.blocker_kind, "ci_passed");
+        assert_eq!(p.ci_state.as_deref(), Some("passed"));
+        assert!(p.ci_checks.is_empty());
+        assert_eq!(
+            p.ci_summary.as_deref(),
+            Some("CI passed, awaiting merge (30s)")
+        );
+    }
+
+    #[test]
+    fn merge_blocker_malformed_or_missing_snapshot_keeps_inferred_ci_pending() {
+        let (_d, mut c) = open_tmp();
+        let missing = merging_task(&mut c, 20);
+        let malformed = merging_task(&mut c, 21);
+        c.execute(
+            "UPDATE tasks SET refs = json_object('pr', 21, 'merge_checks', json_object('state', 'bogus')) WHERE id = ?1",
+            [malformed],
+        )
+        .unwrap();
+        let s = stats(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        for id in [missing, malformed] {
+            let b = s.merge_blockers.iter().find(|b| b.task_id == id).unwrap();
+            assert_eq!(b.blocker_kind, "ci_pending");
+            assert_eq!(b.ci_state, None);
+            assert!(b.ci_checks.is_empty());
+            assert_eq!(b.ci_since, None);
+            assert_eq!(b.ci_observed_at, None);
+            assert_eq!(b.ci_summary, None);
+        }
+        let json = serde_json::to_value(&s).unwrap();
+        let jb = json["merge_blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["task_id"] == missing)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        let mut keys: Vec<_> = jb.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "blocker_kind",
+                "pr",
+                "retry_count",
+                "status",
+                "task_id",
+                "title",
+                "waiting_secs"
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_blocker_snapshot_names_are_sanitized_on_read() {
+        let (_d, mut c) = open_tmp();
+        let t = merging_task(&mut c, 30);
+        // Bypass the bounded writer: a hostile/legacy snapshot with control chars.
+        c.execute(
+            "UPDATE tasks SET refs = json_object('pr', 30, 'merge_checks', json_object(
+                'state', 'pending', 'checks', json_array('evil' || char(27) || '[31m', '   '),
+                'since', 990, 'observed_at', 995)) WHERE id = ?1",
+            [t],
+        )
+        .unwrap();
+        let s = stats(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let b = &s.merge_blockers[0];
+        assert_eq!(b.ci_checks, vec!["evil [31m".to_string()]);
+        assert!(!b.ci_summary.as_deref().unwrap().contains('\u{1b}'));
+    }
+
     #[test]
     fn merge_blocker_not_counted_as_terminal_or_active_agent_work() {
         let (_d, mut c) = open_tmp();
@@ -7243,6 +7533,31 @@ mod tests {
         assert_eq!(
             merge_progress.next_action.as_ref().unwrap().label,
             "Possible next"
+        );
+        let names = vec!["unit".to_string(), "clippy".to_string()];
+        assert!(crate::tasks::set_merge_checks_snapshot(
+            &mut c,
+            merge,
+            crate::tasks::MergeChecksState::Pending,
+            &names,
+            140,
+        )
+        .unwrap());
+        assert_eq!(
+            projection(&c, merge).condition.as_deref(),
+            Some("awaiting CI: unit, clippy (pending 1m)")
+        );
+        assert!(crate::tasks::set_merge_checks_snapshot(
+            &mut c,
+            merge,
+            crate::tasks::MergeChecksState::Failing,
+            &names[..1],
+            170,
+        )
+        .unwrap());
+        assert_eq!(
+            projection(&c, merge).condition.as_deref(),
+            Some("CI failing: unit (failing 30s)")
         );
 
         let failed = progress_task(&mut c, "failed after review");
