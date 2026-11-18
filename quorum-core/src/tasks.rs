@@ -1197,25 +1197,6 @@ pub fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<b
     Ok(unmet == 0)
 }
 
-/// Count tasks that have already started but not yet reached a terminal
-/// state, excluding one task id (the planning source itself, which sits in
-/// `planning` while draining and is not "started work" for this predicate).
-///
-/// Used by the decomposition drain-readiness gate: draining must wait for
-/// every already-started task to run through review/rework/remediation/merge
-/// to `done`/`failed`/`cancelled` before capturing the frozen base and
-/// entering `planning`. `open` tasks never started; the freeze blocks new
-/// claims, so the counted set can only shrink under drain.
-pub fn count_started_non_terminal_excluding(conn: &Connection, exclude_id: i64) -> Result<i64> {
-    Ok(conn.query_row(
-        "SELECT count(*) FROM tasks
-         WHERE status IN ('working','in-review','rework','merging')
-           AND id != ?1",
-        params![exclude_id],
-        |r| r.get(0),
-    )?)
-}
-
 fn merge_pr_into_refs(existing: &Option<String>, pr: &str) -> String {
     let pr_val: serde_json::Value = pr
         .parse::<i64>()
@@ -2539,12 +2520,10 @@ pub fn claim_remediation_rework_with_feedback(
 /// inside the status='open' branch); existing in-flight
 /// continuation — reviewer attachment, rework, and remediation — must still
 /// complete. An already-published PR still needs its reviewer to finish. The
-/// freeze's
-/// quiescence contract is enforced by `decomposition_drain_ready`, which waits
-/// for workers==0 && reviewers==0 before capturing the frozen base — a state
-/// only reachable if in-flight reviews are allowed to run. Gating reservation
-/// on the freeze would strand a retained worker awaiting review and deadlock the
-/// freeze against its own drain.
+/// planner never waits on that work: its base is the base-branch head recorded
+/// when planning starts, read through a read-only snapshot archive. Gating
+/// reservation on the freeze would strand a retained worker awaiting review for
+/// the whole planning attempt.
 pub fn reserve_reviewer_provision(
     conn: &mut Connection,
     task_id: i64,
@@ -17705,10 +17684,9 @@ mod tests {
         .expect("planning source must acquire the freeze");
 
         // Deadlock regression: an in-flight PR's reviewer MUST still provision
-        // under an active decomposition freeze. The freeze's drain predicate
-        // (decomposition_drain_ready) waits for reviewers==0; blocking this
-        // reservation would strand the retained worker awaiting review and the
-        // freeze would never drain to capture its frozen base.
+        // under an active decomposition freeze; blocking this reservation would
+        // strand the retained worker awaiting review for the whole planning
+        // attempt.
         assert!(reserve_reviewer_provision(&mut c, frozen_review, "frozen", "r1", 1023,).unwrap());
         // Attaching that reviewer to the in-review PR is likewise allowed under
         // the freeze — reviewer attachment is in-flight continuation.
@@ -17724,7 +17702,7 @@ mod tests {
         .unwrap());
         // Existing rework/remediation, by contrast, MUST finish under the freeze
         // (same deadlock class as review): the retained worker's rework turn is
-        // in-flight work the drain waits on, not a new start.
+        // in-flight work, not a new start.
         apply_event(
             &mut c,
             "frozen",
@@ -18473,67 +18451,6 @@ mod tests {
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
         // No claim was ever taken (e.g., worker died before insert).
         assert!(!worker_lease_active_for(&mut c, "W1", id, 1001).unwrap());
-    }
-
-    #[test]
-    fn count_started_non_terminal_excludes_source_open_and_terminals() {
-        let (_d, mut c) = open_tmp();
-        let source = create(&mut c, "boss", "src", None, 0, None, None, None, None, 1000).unwrap();
-        let working = create(&mut c, "boss", "w", None, 0, None, None, None, None, 1000).unwrap();
-        let in_review = create(&mut c, "boss", "r", None, 0, None, None, None, None, 1000).unwrap();
-        let rework = create(&mut c, "boss", "k", None, 0, None, None, None, None, 1000).unwrap();
-        let open_task = create(&mut c, "boss", "o", None, 0, None, None, None, None, 1000).unwrap();
-        let merging = create(&mut c, "boss", "m", None, 0, None, None, None, None, 1000).unwrap();
-        let done = create(&mut c, "boss", "d", None, 0, None, None, None, None, 1000).unwrap();
-        let failed = create(&mut c, "boss", "f", None, 0, None, None, None, None, 1000).unwrap();
-        let cancelled = create(&mut c, "boss", "x", None, 0, None, None, None, None, 1000).unwrap();
-
-        for (id, status) in [
-            (working, "working"),
-            (in_review, "in-review"),
-            (rework, "rework"),
-            (merging, "merging"),
-            (done, "done"),
-            (failed, "failed"),
-            (cancelled, "cancelled"),
-        ] {
-            c.execute(
-                "UPDATE tasks SET status=?2 WHERE id=?1",
-                params![id, status],
-            )
-            .unwrap();
-        }
-        c.execute(
-            "UPDATE tasks SET refs=json_set(
-                 COALESCE(refs, '{}'), '$.daemon_merge_retry', 'requested'
-             ) WHERE id=?1",
-            params![merging],
-        )
-        .unwrap();
-
-        // Every started non-terminal phase blocks, including an orphan marked
-        // merge handoff; source, open, and terminals do not.
-        assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 4);
-
-        // Excluding an actual started task drops its count.
-        assert_eq!(
-            count_started_non_terminal_excluding(&c, in_review).unwrap(),
-            3
-        );
-
-        // Move the last blocker to done → predicate releases (returns 0).
-        for id in [working, rework, merging] {
-            c.execute("UPDATE tasks SET status='done' WHERE id=?1", params![id])
-                .unwrap();
-        }
-        c.execute(
-            "UPDATE tasks SET status='done' WHERE id=?1",
-            params![in_review],
-        )
-        .unwrap();
-        assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 0);
-
-        let _ = open_task; // silence "unused" — open row also present in DB
     }
 
     #[test]
