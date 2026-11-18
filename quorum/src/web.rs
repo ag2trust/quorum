@@ -55,6 +55,9 @@ struct AppState {
     online_window: i64,
     /// Daemon's effective per-graph working-children limit for the Ready band.
     graph_children_limit: i64,
+    /// Daemon's effective reviewer cap, used to report "awaiting reviewer slot" in the
+    /// REVIEWING band the same way `quorum status` does (issue #415).
+    reviewer_cap: i64,
 }
 
 pub fn serve(
@@ -64,6 +67,7 @@ pub fn serve(
     port: u16,
     online_window: i64,
     graph_children_limit: i64,
+    reviewer_cap: i64,
 ) -> quorum_core::error::Result<()> {
     let ip: IpAddr = bind.parse().map_err(|e| {
         quorum_core::error::QuorumError::Usage(format!("invalid --bind/--port: {e}"))
@@ -75,6 +79,7 @@ pub fn serve(
         logs_root,
         online_window,
         graph_children_limit,
+        reviewer_cap,
     };
     let app = Router::new()
         .route("/", get(index))
@@ -209,7 +214,7 @@ fn state_payload(state: &AppState) -> quorum_core::error::Result<Value> {
         .collect::<quorum_core::error::Result<Vec<_>>>()?;
     let planning = state_band(&conn, "status IN ('planning', 'decomposed')", now)?;
     let working = state_band(&conn, "status IN ('working', 'rework')", now)?;
-    let reviewing = state_band(&conn, "status='in-review'", now)?;
+    let reviewing = reviewing_band(&conn, now, &live_agents, state.reviewer_cap)?;
     let merging = state_band(&conn, "status='merging'", now)?;
     let blocked = blocked_task_summaries(&conn, now)?;
     let planning_holds = state_band(
@@ -334,6 +339,67 @@ fn state_band(
             quorum_core::tasks::get(conn, id)?
                 .map(|task| task_summary(conn, &task, now))
                 .transpose()
+        })
+        .collect::<quorum_core::error::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    Ok(json!({"count": count, "tasks": tasks}))
+}
+
+/// Like `state_band`, but for the REVIEWING band: attaches the specific awaiting-reviewer
+/// reason `quorum status` shows in its REVIEWING section for a task with no live reviewer
+/// agent, including "awaiting reviewer slot" once live reviewers meet `reviewer_cap`
+/// (issue #415).
+fn reviewing_band(
+    conn: &rusqlite::Connection,
+    now: i64,
+    live_agents: &[Value],
+    reviewer_cap: i64,
+) -> quorum_core::error::Result<Value> {
+    let count: i64 = conn.query_row(
+        "SELECT count(*) FROM tasks WHERE status='in-review'",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT id FROM tasks WHERE status='in-review' \
+         ORDER BY priority DESC, updated_at DESC, id DESC LIMIT ?1",
+    )?;
+    let ids = stmt
+        .query_map([STATE_BAND_LIMIT as i64], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let live_reviewer_task_ids: std::collections::HashSet<i64> = live_agents
+        .iter()
+        .filter(|agent| agent["role"] == "reviewer")
+        .filter_map(|agent| agent["task_id"].as_i64())
+        .collect();
+    let live_reviewer_count = live_agents
+        .iter()
+        .filter(|agent| agent["role"] == "reviewer")
+        .count() as i64;
+    // Computed once for the whole band rather than once per task below.
+    let freeze_active = quorum_core::stats::decomposition_freeze_active(conn)?;
+    let tasks = ids
+        .into_iter()
+        .map(|id| {
+            let Some(task) = quorum_core::tasks::get(conn, id)? else {
+                return Ok(None);
+            };
+            let mut summary = task_summary(conn, &task, now)?;
+            if !live_reviewer_task_ids.contains(&id) {
+                if let Some(reason) = quorum_core::stats::task_awaiting_reviewer_reason(
+                    conn,
+                    id,
+                    task.refs.as_deref(),
+                    freeze_active,
+                    live_reviewer_count,
+                    Some(reviewer_cap),
+                )? {
+                    summary["reason"] = json!(bounded_text(&reason, MAX_DETAIL_TEXT_CHARS));
+                }
+            }
+            Ok(Some(summary))
         })
         .collect::<quorum_core::error::Result<Vec<_>>>()?
         .into_iter()
@@ -1331,6 +1397,7 @@ mod tests {
             logs_root: temp.path().join("logs"),
             online_window: 900,
             graph_children_limit: 4,
+            reviewer_cap: 2,
         };
         let payload = state_payload(&state).unwrap();
         assert!(payload.get("tasks").is_some());
@@ -1356,6 +1423,7 @@ mod tests {
             logs_root: temp.path().join("logs"),
             online_window: 900,
             graph_children_limit: 4,
+            reviewer_cap: 2,
         }
     }
 
@@ -1427,6 +1495,147 @@ mod tests {
         assert_eq!(
             payload["needs_attention"]["blocked_tasks"]["count"],
             json!(1)
+        );
+        assert_checkpoint_released(&state.db_path);
+    }
+
+    #[test]
+    fn state_reviewing_band_reports_awaiting_reviewer_slot() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&temp);
+        state.reviewer_cap = 1;
+        let mut conn = quorum_core::db::open(&state.db_path).unwrap();
+        let live = create_test_task(&mut conn, "live reviewer", None, None);
+        let waiting = create_test_task(&mut conn, "waiting for a slot", None, None);
+        for (id, pr) in [(live, 1), (waiting, 2)] {
+            conn.execute(
+                "UPDATE tasks SET status='in-review', refs=?1 WHERE id=?2",
+                rusqlite::params![
+                    format!(
+                        r#"{{"pr":{pr},"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null}}"#
+                    ),
+                    id
+                ],
+            )
+            .unwrap();
+        }
+        quorum_core::journal::upsert(
+            &mut conn,
+            &quorum_core::journal::JournalEntry {
+                agent: "R1".into(),
+                role: "reviewer".into(),
+                task_id: Some(live),
+                session_id: "reviewer-session".into(),
+                worktree: None,
+                branch: None,
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(1),
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let payload = state_payload(&state).unwrap();
+        let reviewing_tasks = payload["queue_bands"]["reviewing"]["tasks"]
+            .as_array()
+            .unwrap();
+        let waiting_row = reviewing_tasks
+            .iter()
+            .find(|task| task["id"] == waiting)
+            .unwrap();
+        assert_eq!(waiting_row["reason"], json!("awaiting reviewer slot"));
+        let live_row = reviewing_tasks
+            .iter()
+            .find(|task| task["id"] == live)
+            .unwrap();
+        assert!(live_row.get("reason").is_none());
+        assert_checkpoint_released(&state.db_path);
+    }
+
+    #[test]
+    fn state_reviewing_band_prefers_approved_reason_over_reviewer_slot() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&temp);
+        state.reviewer_cap = 1;
+        let mut conn = quorum_core::db::open(&state.db_path).unwrap();
+        let live = create_test_task(&mut conn, "live reviewer", None, None);
+        let approved = create_test_task(&mut conn, "approved, merge pending", None, None);
+        for (id, pr) in [(live, 1), (approved, 2)] {
+            conn.execute(
+                "UPDATE tasks SET status='in-review', refs=?1 WHERE id=?2",
+                rusqlite::params![
+                    format!(
+                        r#"{{"pr":{pr},"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null}}"#
+                    ),
+                    id
+                ],
+            )
+            .unwrap();
+        }
+        quorum_core::journal::upsert(
+            &mut conn,
+            &quorum_core::journal::JournalEntry {
+                agent: "R1".into(),
+                role: "reviewer".into(),
+                task_id: Some(live),
+                session_id: "reviewer-session".into(),
+                worktree: None,
+                branch: None,
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(1),
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+        for role in ["r1", "r2"] {
+            quorum_core::approvals::record(
+                &mut conn,
+                &quorum_core::approvals::Approval {
+                    pr_number: 2,
+                    review_role: role.into(),
+                    task_id: approved,
+                    author: "W".into(),
+                    reviewer: format!("Rev-{role}"),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "head-a".into(),
+                },
+            )
+            .unwrap();
+        }
+        quorum_core::pr_targets::upsert(&mut conn, approved, 2, "daemon/x", "head-a", false)
+            .unwrap();
+        drop(conn);
+
+        let payload = state_payload(&state).unwrap();
+        let reviewing_tasks = payload["queue_bands"]["reviewing"]["tasks"]
+            .as_array()
+            .unwrap();
+        let approved_row = reviewing_tasks
+            .iter()
+            .find(|task| task["id"] == approved)
+            .unwrap();
+        assert_eq!(
+            approved_row["reason"],
+            json!("all required reviews approved at head head-a"),
+            "a fully-approved task must not be mislabeled awaiting reviewer slot: {approved_row}"
         );
         assert_checkpoint_released(&state.db_path);
     }

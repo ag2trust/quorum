@@ -276,11 +276,11 @@ pub struct ReviewingTask {
     /// durably recorded PR head; the daemon still owns the merge (and any CI wait).
     pub state: String,
     /// Why an `awaiting reviewer` task has no live reviewer, when that is derivable from
-    /// durable DB state alone (classification pending, reviewer cap exhausted, provisioning
-    /// strikes exhausted, or an approval whose current head is not durably known). For
-    /// `approved, merge pending` it names the approved head. Absent means the cause is not
-    /// visible to a read-only status process (for example live CI state, which only the
-    /// daemon queries from GitHub).
+    /// durable DB state alone (classification pending, reviewer run cap exhausted,
+    /// provisioning strikes exhausted, awaiting reviewer slot, or an approval whose current
+    /// head is not durably known). For `approved, merge pending` it names the approved head.
+    /// Absent means the cause is not visible to a read-only status process (for example live
+    /// CI state, which only the daemon queries from GitHub).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -802,6 +802,28 @@ pub struct Stats {
 
 /// Gather a snapshot. Read-only.
 pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
+    stats_impl(conn, now, online_window, None)
+}
+
+/// Reviewer-cap-aware variant of [`stats`]. When `reviewer_cap` is supplied, an in-review
+/// task with no live reviewer and no more specific reason reports "awaiting reviewer slot"
+/// once live reviewer `daemon_agents` meet or exceed the cap (issue #415). `None` behaves
+/// exactly like [`stats`].
+pub fn stats_with_reviewer_cap(
+    conn: &Connection,
+    now: i64,
+    online_window: i64,
+    reviewer_cap: Option<i64>,
+) -> Result<Stats> {
+    stats_impl(conn, now, online_window, reviewer_cap)
+}
+
+fn stats_impl(
+    conn: &Connection,
+    now: i64,
+    online_window: i64,
+    reviewer_cap: Option<i64>,
+) -> Result<Stats> {
     let one = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<i64> {
         Ok(conn.query_row(sql, p, |r| r.get(0))?)
     };
@@ -866,7 +888,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     let activity = crate::activity::activity_summary(conn, now)?;
     let daemon_agents = daemon_agents_view(conn, now)?;
     let queue_tasks_list = queue_tasks(conn)?;
-    let reviewing = reviewing_tasks(conn, &daemon_agents)?;
+    let reviewing = reviewing_tasks(conn, &daemon_agents, reviewer_cap)?;
     let pipeline = pipeline_tasks(conn, now)?;
     let decomposition = decomposition_status(conn, now)?;
     let (recent_errors, older_errors_silenced) = deduped_errors(conn, now)?;
@@ -2976,6 +2998,7 @@ fn extract_pr_from_refs(refs_json: Option<&str>) -> Option<i64> {
 fn reviewing_tasks(
     conn: &Connection,
     daemon_agents: &[DaemonAgentView],
+    reviewer_cap: Option<i64>,
 ) -> Result<Vec<ReviewingTask>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, status, refs FROM (
@@ -3007,11 +3030,12 @@ fn reviewing_tasks(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let freeze_active: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM task_decompositions WHERE freeze_active=1)",
-        [],
-        |r| r.get(0),
-    )?;
+    let freeze_active = decomposition_freeze_active(conn)?;
+    let live_reviewer_count = daemon_agents
+        .iter()
+        .filter(|agent| agent.role == "reviewer")
+        .count() as i64;
+    let slot_full = reviewer_cap.is_some_and(|cap| live_reviewer_count >= cap);
     let mut out = Vec::with_capacity(rows.len());
     for (id, title, status, refs) in rows {
         let reviewer = daemon_agents
@@ -3032,15 +3056,14 @@ fn reviewing_tasks(
                     )),
                 ),
                 view => {
-                    let reason =
-                        awaiting_reviewer_reason(conn, id, refs.as_deref(), freeze_active)?
-                            .or_else(|| {
-                                (view == ApprovalView::HeadUnknown).then(|| {
-                                    "approval recorded but the current PR head is not \
-                                     durably known"
-                                        .to_string()
-                                })
-                            });
+                    let reason = awaiting_reviewer_reason_for_view(
+                        conn,
+                        id,
+                        refs.as_deref(),
+                        freeze_active,
+                        &view,
+                        slot_full,
+                    )?;
                     ("awaiting reviewer".to_string(), reason)
                 }
             }
@@ -3140,6 +3163,10 @@ fn classification_complete(refs: Option<&str>) -> bool {
 }
 
 /// Specific, DB-visible reason an in-review task has no live reviewer; `None` when unknown.
+/// `slot_full` is true when live reviewer `daemon_agents` meet or exceed a configured
+/// reviewer cap (issue #415); it is the lowest-precedence reason, checked last so the more
+/// specific durable reasons above still win; `reviewing_tasks` applies that lower
+/// precedence itself, below its own `ApprovalView::HeadUnknown` fallback.
 fn awaiting_reviewer_reason(
     conn: &Connection,
     task_id: i64,
@@ -3169,6 +3196,73 @@ fn awaiting_reviewer_reason(
         )));
     }
     Ok(None)
+}
+
+/// Precedence applied once an in-review task's [`ApprovalView`] is known to be `HeadUnknown`
+/// or `NotApproved` (an `Approved` view is never passed here; its caller reports the approved
+/// reason itself, since that view means `awaiting reviewer` is not the task's state at all):
+/// the specific durable reasons from [`awaiting_reviewer_reason`] first, then an unknown
+/// approval head, then a full reviewer cap last as the lowest-precedence reason. Shared by
+/// `reviewing_tasks` and `task_awaiting_reviewer_reason` so the two surfaces cannot drift out
+/// of sync on this precedence (#415).
+fn awaiting_reviewer_reason_for_view(
+    conn: &Connection,
+    task_id: i64,
+    refs: Option<&str>,
+    freeze_active: bool,
+    view: &ApprovalView,
+    slot_full: bool,
+) -> Result<Option<String>> {
+    Ok(
+        awaiting_reviewer_reason(conn, task_id, refs, freeze_active)?
+            .or_else(|| {
+                (*view == ApprovalView::HeadUnknown).then(|| {
+                    "approval recorded but the current PR head is not durably known".to_string()
+                })
+            })
+            .or_else(|| slot_full.then(|| "awaiting reviewer slot".to_string())),
+    )
+}
+
+/// Whether a decomposition freeze is active, for callers that need it as context on a
+/// classification-pending reason. Cheap and short; callers computing it once per batch
+/// (rather than once per task) avoid redundant round-trips on a polled path.
+pub fn decomposition_freeze_active(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_decompositions WHERE freeze_active=1)",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+/// Reviewer-cap-aware reason an in-review task has no live reviewer, for read-only status
+/// surfaces that do not otherwise compute [`Stats`] (for example the web dashboard's
+/// lighter per-band query). Consults the same [`review_approval_view`] `reviewing_tasks`
+/// does: a fully-approved task reports its approval reason (the caller's task is
+/// `approved, merge pending`, not `awaiting reviewer`, matching `quorum status`/cockpit),
+/// an unknown approval head wins next, then the specific durable reasons from
+/// [`awaiting_reviewer_reason`], with "awaiting reviewer slot" as the lowest-precedence
+/// reason; `None` when the cause (if any) is not DB-visible. `freeze_active` is
+/// [`decomposition_freeze_active`]'s result, computed once per batch by the caller rather
+/// than once per task here.
+pub fn task_awaiting_reviewer_reason(
+    conn: &Connection,
+    task_id: i64,
+    refs: Option<&str>,
+    freeze_active: bool,
+    live_reviewer_count: i64,
+    reviewer_cap: Option<i64>,
+) -> Result<Option<String>> {
+    let slot_full = reviewer_cap.is_some_and(|cap| live_reviewer_count >= cap);
+    match review_approval_view(conn, task_id, extract_pr_from_refs(refs))? {
+        ApprovalView::Approved(head) => Ok(Some(format!(
+            "all required reviews approved at head {}",
+            short_sha(&head)
+        ))),
+        view => {
+            awaiting_reviewer_reason_for_view(conn, task_id, refs, freeze_active, &view, slot_full)
+        }
+    }
 }
 
 /// Task pipeline view: daemon-owned source stages + recently done/closed (#204).
@@ -6561,6 +6655,258 @@ mod tests {
             "classification pending (a decomposition freeze is active)"
         );
         assert!(reason(unknown).is_null());
+    }
+
+    #[test]
+    fn awaiting_reviewer_reports_slot_full_only_at_or_above_reviewer_cap() {
+        let (_d, mut c) = open_tmp();
+        let classified = r#""cx_est":2,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null"#;
+        let mut mk = |title: &str, pr: i64| {
+            let id = crate::tasks::create(&mut c, "A", title, None, 0, None, None, None, None, 100)
+                .unwrap();
+            c.execute(
+                "UPDATE tasks SET status='in-review', refs=?1 WHERE id=?2",
+                params![format!(r#"{{"pr":{pr},{classified}}}"#), id],
+            )
+            .unwrap();
+            id
+        };
+        let live = mk("live reviewer", 1);
+        let waiting = mk("waiting for a slot", 2);
+        let row = |json: &serde_json::Value, id: i64| {
+            json["reviewing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap()
+                .clone()
+        };
+
+        // Zero live reviewers never reports "awaiting reviewer slot", no matter the cap.
+        let json = serde_json::to_value(
+            stats_with_reviewer_cap(&c, 200, crate::agents::ONLINE_WINDOW_SECS, Some(1)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            row(&json, waiting).get("reason").is_none(),
+            "zero live reviewers: unknown cause keeps the generic label"
+        );
+
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "R1".into(),
+                role: "reviewer".into(),
+                task_id: Some(live),
+                session_id: "reviewer-session".into(),
+                worktree: None,
+                branch: None,
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(1),
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+
+        // Below the cap: one live reviewer against a cap of 2 still leaves a free slot.
+        let json = serde_json::to_value(
+            stats_with_reviewer_cap(&c, 200, crate::agents::ONLINE_WINDOW_SECS, Some(2)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            row(&json, waiting).get("reason").is_none(),
+            "below the cap: no slot-full reason"
+        );
+
+        // At the cap: the one live reviewer fills the single slot.
+        let json = serde_json::to_value(
+            stats_with_reviewer_cap(&c, 200, crate::agents::ONLINE_WINDOW_SECS, Some(1)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(row(&json, live)["state"], "reviewing");
+        assert_eq!(row(&json, waiting)["state"], "awaiting reviewer");
+        assert_eq!(row(&json, waiting)["reason"], "awaiting reviewer slot");
+
+        // No reviewer_cap supplied (plain `stats`) never reports the slot-full reason.
+        let json = serde_json::to_value(stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap())
+            .unwrap();
+        assert!(
+            row(&json, waiting).get("reason").is_none(),
+            "no cap supplied: unknown cause keeps the generic label"
+        );
+    }
+
+    #[test]
+    fn classification_pending_outranks_reviewer_slot_full() {
+        let (_d, mut c) = open_tmp();
+        let classified = r#""cx_est":2,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null"#;
+        let live = {
+            let id = crate::tasks::create(
+                &mut c,
+                "A",
+                "live reviewer",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                100,
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE tasks SET status='in-review', refs=?1 WHERE id=?2",
+                params![format!(r#"{{"pr":1,{classified}}}"#), id],
+            )
+            .unwrap();
+            id
+        };
+        let unclassified = {
+            let id = crate::tasks::create(
+                &mut c,
+                "A",
+                "unclassified",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                100,
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE tasks SET status='in-review', refs=?1 WHERE id=?2",
+                params![r#"{"pr":2}"#, id],
+            )
+            .unwrap();
+            id
+        };
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "R1".into(),
+                role: "reviewer".into(),
+                task_id: Some(live),
+                session_id: "reviewer-session".into(),
+                worktree: None,
+                branch: None,
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(1),
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+
+        let json = serde_json::to_value(
+            stats_with_reviewer_cap(&c, 200, crate::agents::ONLINE_WINDOW_SECS, Some(1)).unwrap(),
+        )
+        .unwrap();
+        let reason = json["reviewing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == unclassified)
+            .unwrap()["reason"]
+            .clone();
+        assert_eq!(
+            reason, "classification pending",
+            "classification pending keeps precedence over a full reviewer slot"
+        );
+    }
+
+    #[test]
+    fn approval_head_unknown_outranks_reviewer_slot_full() {
+        let (_d, mut c) = open_tmp();
+        let classified = r#""cx_est":2,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null"#;
+        let mut mk = |title: &str, pr: i64| {
+            let id = crate::tasks::create(&mut c, "A", title, None, 0, None, None, None, None, 100)
+                .unwrap();
+            c.execute(
+                "UPDATE tasks SET status='in-review', refs=?1 WHERE id=?2",
+                params![format!(r#"{{"pr":{pr},{classified}}}"#), id],
+            )
+            .unwrap();
+            id
+        };
+        let live = mk("live reviewer", 1);
+        let unknown = mk("head unknown", 2);
+
+        // Both required roles are approved, but no pr_targets/agent_runs row records a
+        // durable head, so `review_approval_view` reports `HeadUnknown`.
+        for role in ["r1", "r2"] {
+            crate::approvals::record(
+                &mut c,
+                &crate::approvals::Approval {
+                    pr_number: 2,
+                    review_role: role.into(),
+                    task_id: unknown,
+                    author: "W".into(),
+                    reviewer: format!("Rev-{role}"),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "head-a".into(),
+                },
+            )
+            .unwrap();
+        }
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "R1".into(),
+                role: "reviewer".into(),
+                task_id: Some(live),
+                session_id: "reviewer-session".into(),
+                worktree: None,
+                branch: None,
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(1),
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+
+        let json = serde_json::to_value(
+            stats_with_reviewer_cap(&c, 200, crate::agents::ONLINE_WINDOW_SECS, Some(1)).unwrap(),
+        )
+        .unwrap();
+        let row = json["reviewing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == unknown)
+            .unwrap()
+            .clone();
+        assert_eq!(row["state"], "awaiting reviewer");
+        assert_eq!(
+            row["reason"], "approval recorded but the current PR head is not durably known",
+            "an unknown approval head keeps precedence over a full reviewer slot"
+        );
     }
 
     #[test]
