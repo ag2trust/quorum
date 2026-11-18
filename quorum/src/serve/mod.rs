@@ -25,6 +25,7 @@ pub mod merge;
 pub mod merged_continuation;
 pub mod names;
 pub mod planner;
+mod profile_cooldown;
 pub mod recovery;
 pub mod render;
 pub mod rereview_builder;
@@ -46,6 +47,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 
 use names::Pool;
+use profile_cooldown::{CooldownPlan, ProfileCooldown};
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::journal::{self, JournalEntry};
 use quorum_core::lifecycle::{self, Effect, Event};
@@ -792,6 +794,48 @@ fn available_reviewer_slots(reviewer_cap: usize, active_reviewers: usize) -> usi
     reviewer_cap.saturating_sub(active_reviewers)
 }
 
+/// Classified, provider-free stand-in for launching a cooling profile. It is
+/// profile-scoped on purpose: the skip adds only this profile to the
+/// responsibility's durable exclusions, never its whole provider.
+fn cooling_profile_failure(profile_id: &str) -> runner::RunnerFailure {
+    runner::RunnerFailure::classified(
+        runner::FailureDisposition::ProfileUnavailable,
+        format!(
+            "profile {profile_id} skipped: cooling down after a recent provider/profile-unavailable \
+             classification"
+        ),
+        std::io::ErrorKind::Other,
+    )
+}
+
+/// Route decision for one reviewer provision against the profile cooldown.
+/// The pool and durable exclusions are read only when the assigned profile is
+/// actually cooling, so the common path adds no I/O.
+async fn reviewer_cooldown_plan(
+    config: &ServeConfig,
+    profile_cooldown: &ProfileCooldown,
+    assignment: &quorum_core::role_assignments::RoleAssignment,
+    complexity: u8,
+    role: &ReviewRole,
+    now: std::time::Instant,
+) -> Result<CooldownPlan> {
+    if !profile_cooldown.is_cooling(&assignment.profile_id, now) {
+        return Ok(CooldownPlan::Run);
+    }
+    let pool = configured_routing_pool(config, "reviewer", Some(complexity), Some(role.as_str()))?;
+    let exclusions = {
+        let path = config.db_path.clone();
+        let key = assignment.responsibility_key.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = quorum_core::db::open(&path)?;
+            quorum_core::routing_attempts::exclusions(&conn, &key)
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("reviewer cooldown exclusions join: {error}")))??
+    };
+    Ok(profile_cooldown.plan(&assignment.profile_snapshot(), &pool, &exclusions, now))
+}
+
 /// How one reviewer provision is counted against `reviewer_cap`.
 ///
 /// R2 policy (deadlock freedom): an R2 started by the R1-approval handoff
@@ -970,6 +1014,10 @@ enum ReviewerProvisionOutcome {
     /// Every reviewer slot under `reviewer_cap` is busy. Checked before the
     /// reservation, so nothing durable changed; retry on a later tick.
     Deferred,
+    /// Every eligible reviewer profile is cooling down after a recent
+    /// provider/profile-unavailable classification. No reviewer name,
+    /// worktree, run, or process was created; retry once a cooldown expires.
+    ProfilesCoolingDown,
 }
 
 /// The R1 terminal telemetry for an attempted mandatory-R2 handoff. These
@@ -1004,7 +1052,8 @@ fn r2_provision_disposition(
         Ok(
             ReviewerProvisionOutcome::Unavailable
             | ReviewerProvisionOutcome::HeadMoved { .. }
-            | ReviewerProvisionOutcome::Deferred,
+            | ReviewerProvisionOutcome::Deferred
+            | ReviewerProvisionOutcome::ProfilesCoolingDown,
         ) => R2ProvisionDisposition::Unavailable,
         Ok(ReviewerProvisionOutcome::Failed(_)) => R2ProvisionDisposition::Error,
         Err(_) => R2ProvisionDisposition::Error,
@@ -12451,6 +12500,9 @@ async fn tick_loop_owning_doctor(
     let mut graph_skip_logs = ClaimSkipLogLimiter::new();
     let mut unrecordable_strikes = UnrecordableStrikes::new();
     let mut reviewer_respawn_backoff = ReviewerRespawnBackoff::new();
+    // In-memory skip window for reviewer profiles recently classified
+    // provider- or profile-unavailable.
+    let mut profile_cooldown = ProfileCooldown::new();
     let mut reviewer_slot_queue = ReviewerSlotQueue::default();
     let mut drain_state = DrainState::new();
     let mut lifetime_roster = LifetimeRoster::new();
@@ -12603,6 +12655,7 @@ async fn tick_loop_owning_doctor(
         &mut lifetime_roster,
         &mut unrecordable_strikes,
         &mut reviewer_respawn_backoff,
+        &mut profile_cooldown,
     )
     .await?;
     match reconcile_publication_source_refs(config, &wt_mgr, publication_ref_reconcile_cursor).await
@@ -13061,6 +13114,7 @@ async fn tick_loop_owning_doctor(
             &mut graph_skip_logs,
             &mut unrecordable_strikes,
             &mut reviewer_respawn_backoff,
+            &mut profile_cooldown,
             &mut reviewer_slot_queue,
             &mut drain_state,
             &mut lifetime_roster,
@@ -13189,6 +13243,8 @@ async fn tick(
     unrecordable: &mut UnrecordableStrikes,
     // Bounded pause after a reviewer's no-verdict exit before re-provisioning.
     reviewer_respawn_backoff: &mut ReviewerRespawnBackoff,
+    // Bounded skip window for recently unavailable reviewer profiles.
+    profile_cooldown: &mut ProfileCooldown,
     // Ready review work deferred because every reviewer slot is busy.
     reviewer_slot_queue: &mut ReviewerSlotQueue,
     drain_state: &mut DrainState,
@@ -13829,6 +13885,7 @@ async fn tick(
                                             lifetime_roster,
                                             unrecordable,
                                             reviewer_respawn_backoff,
+                                            profile_cooldown,
                                             pr_num,
                                             worker_cp,
                                             &role,
@@ -16729,7 +16786,9 @@ async fn tick(
                 continue;
             }
         };
-        match activate_reviewer_fallback(config, reviewer, &failure, &currency).await {
+        match activate_reviewer_fallback(config, reviewer, &failure, &currency, profile_cooldown)
+            .await
+        {
             Ok(ReviewerFallbackActivation::Activated) => {}
             Ok(ReviewerFallbackActivation::Settled) => {
                 reviewer_fallback_teardowns.push((i, "provider_blocked"))
@@ -17637,7 +17696,14 @@ async fn tick(
                 runner::FailureDisposition::ProviderUnavailable
                     | runner::FailureDisposition::ProfileUnavailable
             ) {
-                match activate_reviewer_fallback(config, &mut reviewers[i], failure, currency).await
+                match activate_reviewer_fallback(
+                    config,
+                    &mut reviewers[i],
+                    failure,
+                    currency,
+                    profile_cooldown,
+                )
+                .await
                 {
                     Ok(ReviewerFallbackActivation::Activated) => continue,
                     Ok(ReviewerFallbackActivation::Settled) => {
@@ -18159,6 +18225,7 @@ async fn tick(
                         lifetime_roster,
                         unrecordable,
                         reviewer_respawn_backoff,
+                        profile_cooldown,
                         *pr,
                         counterpart,
                         &role,
@@ -18196,7 +18263,8 @@ async fn tick(
                         }
                         ReviewerProvisionOutcome::Unavailable
                         | ReviewerProvisionOutcome::Failed(_)
-                        | ReviewerProvisionOutcome::Deferred => {}
+                        | ReviewerProvisionOutcome::Deferred
+                        | ReviewerProvisionOutcome::ProfilesCoolingDown => {}
                     }
                 }
                 Err(e) => {
@@ -18613,6 +18681,7 @@ async fn tick(
                         lifetime_roster,
                         unrecordable,
                         reviewer_respawn_backoff,
+                        profile_cooldown,
                         *pr,
                         counterpart,
                         &role,
@@ -18648,7 +18717,8 @@ async fn tick(
                         }
                         ReviewerProvisionOutcome::Unavailable
                         | ReviewerProvisionOutcome::Failed(_)
-                        | ReviewerProvisionOutcome::Deferred => {}
+                        | ReviewerProvisionOutcome::Deferred
+                        | ReviewerProvisionOutcome::ProfilesCoolingDown => {}
                     }
                 }
                 Err(e) => {
@@ -23446,6 +23516,7 @@ async fn provision_reviewer(
     lifetime_roster: &mut LifetimeRoster,
     unrecordable: &mut UnrecordableStrikes,
     respawn_backoff: &mut ReviewerRespawnBackoff,
+    profile_cooldown: &mut ProfileCooldown,
     pr: i64,
     worker: ReviewCounterpart<'_>,
     role: &ReviewRole,
@@ -23494,6 +23565,7 @@ async fn provision_reviewer(
         lifetime_roster,
         unrecordable,
         respawn_backoff,
+        profile_cooldown,
         pr,
         worker,
         role,
@@ -23526,6 +23598,7 @@ async fn provision_reviewer_reserved(
     lifetime_roster: &mut LifetimeRoster,
     unrecordable: &mut UnrecordableStrikes,
     respawn_backoff: &mut ReviewerRespawnBackoff,
+    profile_cooldown: &mut ProfileCooldown,
     pr: i64,
     worker: ReviewCounterpart<'_>,
     role: &ReviewRole,
@@ -23685,6 +23758,38 @@ async fn provision_reviewer_reserved(
             )));
         }
     }
+    // A profile another reviewer just proved unavailable is skipped before any
+    // reviewer resource exists. An eligible alternate is reached through the
+    // ordinary classified-launch-failure fallback below, so the alternate's
+    // routing evidence and verdict attribution are the existing ones.
+    let skip_cooling_assignment = match reviewer_cooldown_plan(
+        config,
+        profile_cooldown,
+        &assignment,
+        complexity,
+        role,
+        std::time::Instant::now(),
+    )
+    .await?
+    {
+        CooldownPlan::Run => false,
+        CooldownPlan::SkipAssigned => true,
+        CooldownPlan::Defer { until } => {
+            let now = std::time::Instant::now();
+            if profile_cooldown.take_deferral_log_slot(now) {
+                log(&format!(
+                    "{}: task #{} PR #{pr} reviewer deferred — profile {} and every eligible \
+                     alternate are cooling down for another {:.1}s (further deferrals are \
+                     rate-limited)",
+                    role.as_str().to_uppercase(),
+                    worker.task_id,
+                    assignment.profile_id,
+                    until.saturating_duration_since(now).as_secs_f64(),
+                ));
+            }
+            return Ok(ReviewerProvisionOutcome::ProfilesCoolingDown);
+        }
+    };
     let reviewer_name = if let Some(recovery) = &recovery {
         // Restart recovery deliberately reuses the interrupted reviewer's
         // durable identity. Normal provisioning below excludes every prior
@@ -24326,19 +24431,26 @@ async fn provision_reviewer_reserved(
         &session_id,
         reviewer_continuation_id.as_deref(),
     );
-    let spawn_result = runner::RunnerProc::launch(
-        &runner::LaunchRequest {
-            model: &reviewer_model,
-            effort: &reviewer_effort,
-            worktree: &wt_path,
-            prompt: &prompt,
-            environment: &reviewer_env,
-            mode: runner::LaunchMode::Normal,
-            continuation_id,
-        },
-        &runner_adapter_config(config, reviewer_agent_bin),
-    )
-    .await;
+    let spawn_result = if skip_cooling_assignment {
+        // No provider call: the cooling profile is retired as a classified
+        // profile-unavailable launch, which hands this exact persisted run to
+        // `activate_reviewer_fallback` for the alternate route.
+        Err(cooling_profile_failure(&assignment.profile_id))
+    } else {
+        runner::RunnerProc::launch(
+            &runner::LaunchRequest {
+                model: &reviewer_model,
+                effort: &reviewer_effort,
+                worktree: &wt_path,
+                prompt: &prompt,
+                environment: &reviewer_env,
+                mode: runner::LaunchMode::Normal,
+                continuation_id,
+            },
+            &runner_adapter_config(config, reviewer_agent_bin),
+        )
+        .await
+    };
     match spawn_result {
         Ok(proc) => {
             // M7: persist PID immediately so crash recovery can clean up
@@ -24571,7 +24683,15 @@ async fn provision_reviewer_reserved(
                 let currency = quorum_core::db::open(&config.db_path).and_then(|conn| {
                     load_reviewer_fallback_currency(&conn, &failed_slot, observed_at)
                 })?;
-                match activate_reviewer_fallback(config, &mut failed_slot, &e, &currency).await? {
+                match activate_reviewer_fallback(
+                    config,
+                    &mut failed_slot,
+                    &e,
+                    &currency,
+                    profile_cooldown,
+                )
+                .await?
+                {
                     ReviewerFallbackActivation::Activated => {
                         // Same as the direct launch above: activation is not a
                         // verdict, so the per-head budget stays as it is.
@@ -27648,6 +27768,7 @@ async fn activate_reviewer_fallback(
     slot: &mut SlotState,
     failure: &runner::RunnerFailure,
     expected_currency: &fallback_preflight::ManagedTurnCurrency,
+    profile_cooldown: &mut ProfileCooldown,
 ) -> Result<ReviewerFallbackActivation> {
     let agent_run_id = slot
         .agent_run_id
@@ -27665,23 +27786,6 @@ async fn activate_reviewer_fallback(
         .ok_or_else(|| QuorumError::Io("reviewer fallback is missing its reviewed head".into()))?;
     let pending_turn = reviewer_fallback_pending_turn(slot);
     let installed_at = now_unix();
-    let current_head = {
-        let repo = config.repo_dir.clone();
-        let executor = Arc::clone(&config.merge_executor);
-        tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
-            .await
-            .map_err(|error| QuorumError::Io(format!("reviewer fallback head join: {error}")))?
-    };
-    if current_head.as_deref() != Some(reviewed_head.as_str()) {
-        log(&format!(
-            "reviewer {} fallback rejected because PR #{} head moved from {} to {}",
-            slot.agent_name,
-            pr,
-            reviewed_head,
-            current_head.as_deref().unwrap_or("<unavailable>")
-        ));
-        return Ok(ReviewerFallbackActivation::NotInstalled);
-    }
     let same_agent = slot.agent_name.clone();
     let worktree = slot.worktree_path.to_string_lossy().into_owned();
     let disposition = failure.disposition();
@@ -27757,6 +27861,33 @@ async fn activate_reviewer_fallback(
             ))
         }
     };
+    // Every classified reviewer unavailability funnels through here, so this
+    // is the single place the failing profile starts its cooldown. It is
+    // recorded before any rejection below so a later provision still skips it.
+    if matches!(
+        disposition,
+        runner::FailureDisposition::ProviderUnavailable
+            | runner::FailureDisposition::ProfileUnavailable
+    ) {
+        profile_cooldown.record(&failed_route.id, std::time::Instant::now());
+    }
+    let current_head = {
+        let repo = config.repo_dir.clone();
+        let executor = Arc::clone(&config.merge_executor);
+        tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+            .await
+            .map_err(|error| QuorumError::Io(format!("reviewer fallback head join: {error}")))?
+    };
+    if current_head.as_deref() != Some(reviewed_head.as_str()) {
+        log(&format!(
+            "reviewer {} fallback rejected because PR #{} head moved from {} to {}",
+            slot.agent_name,
+            pr,
+            reviewed_head,
+            current_head.as_deref().unwrap_or("<unavailable>")
+        ));
+        return Ok(ReviewerFallbackActivation::NotInstalled);
+    }
     let responsibility = quorum_core::role_assignments::AssignmentIdentity {
         task_id: assignment.task_id,
         responsibility_key: &assignment.responsibility_key,
@@ -27861,6 +27992,49 @@ async fn activate_reviewer_fallback(
                 .await;
             }
         };
+    // The selected alternate may itself be cooling down. Retire it as a
+    // classified profile-unavailable launch without contacting the provider;
+    // each skip adds one durable profile exclusion, so this walk is bounded by
+    // the pool and ends on a non-cooling route or the existing provider block.
+    let alternate_profile_id: Option<String> = {
+        let conn = quorum_core::db::open(&config.db_path)?;
+        conn.query_row(
+            "SELECT configured_profile_id FROM agent_runs WHERE id=?1",
+            [intent.agent_run_id],
+            |row| row.get(0),
+        )?
+    };
+    if let Some(alternate_profile_id) = alternate_profile_id
+        .as_deref()
+        .filter(|id| profile_cooldown.is_cooling(id, std::time::Instant::now()))
+    {
+        log(&format!(
+            "reviewer {} fallback skips cooling profile {alternate_profile_id} for task #{} PR #{}",
+            slot.agent_name, slot.task_id, pr
+        ));
+        let skipped = cooling_profile_failure(alternate_profile_id);
+        let old = std::mem::replace(
+            &mut slot.proc,
+            SlotProcess::Failed {
+                kind: alternate_kind,
+            },
+        );
+        let old_output = old.kill_and_reap().await;
+        persist_terminal_output(&mut slot.session_log, old_output);
+        slot.model = intent.pending_turn.model;
+        slot.effort = intent.pending_turn.effort;
+        slot.agent_run_id = Some(intent.agent_run_id);
+        slot.cap_run_id = Some(intent.capability_run_id);
+        slot.continuation_id = None;
+        return Box::pin(activate_reviewer_fallback(
+            config,
+            slot,
+            &skipped,
+            expected_currency,
+            profile_cooldown,
+        ))
+        .await;
+    }
     let environment = managed_run_environment(
         config,
         &slot.agent_name,
@@ -27944,6 +28118,7 @@ async fn activate_reviewer_fallback(
                     slot,
                     &error,
                     expected_currency,
+                    profile_cooldown,
                 ))
                 .await;
             }
@@ -28606,6 +28781,7 @@ async fn resume_pending_fallbacks(
     lifetime_roster: &mut LifetimeRoster,
     unrecordable: &mut UnrecordableStrikes,
     respawn_backoff: &mut ReviewerRespawnBackoff,
+    profile_cooldown: &mut ProfileCooldown,
 ) -> Result<()> {
     let recoveries = {
         let conn = quorum_core::db::open(&config.db_path)?;
@@ -28847,7 +29023,15 @@ async fn resume_pending_fallbacks(
                         let conn = quorum_core::db::open(&config.db_path)?;
                         load_reviewer_fallback_currency(&conn, &slot, now_unix())?
                     };
-                    match activate_reviewer_fallback(config, &mut slot, &error, &currency).await? {
+                    match activate_reviewer_fallback(
+                        config,
+                        &mut slot,
+                        &error,
+                        &currency,
+                        profile_cooldown,
+                    )
+                    .await?
+                    {
                         ReviewerFallbackActivation::Activated => reviewers.push(slot),
                         ReviewerFallbackActivation::Settled => {
                             let close_reason = strike_reviewer_provider_failure_teardown(
@@ -37130,6 +37314,397 @@ mod tests {
         }
     }
 
+    /// A live R1 reviewer on `a-primary` in a three-profile pool
+    /// (`a-primary` 25, `b-alternate` 50, `c-tertiary` 25) with a provider
+    /// script that records each launch in the returned marker file.
+    #[cfg(unix)]
+    struct CoolingReviewerFixture {
+        config: ServeConfig,
+        slot: SlotState,
+        currency: fallback_preflight::ManagedTurnCurrency,
+        started: PathBuf,
+        responsibility: String,
+    }
+
+    #[cfg(unix)]
+    fn cooling_reviewer_fallback_fixture(root: &Path) -> CoolingReviewerFixture {
+        use std::os::unix::fs::PermissionsExt;
+
+        let worktree = root.join("reviewer-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let started = root.join("reviewer-provider-started");
+        let runner_program = root.join("fallback-codex");
+        std::fs::write(
+            &runner_program,
+            format!(
+                "#!/bin/sh\nprintf started >> '{}'\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"fallback-thread\"}}'\nexec sleep 30\n",
+                started.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let head_sha = "a".repeat(40);
+        let mut config = live_fallback_test_config(
+            root.join("reviewer.db"),
+            root,
+            &runner_program,
+            Arc::new(FallbackHeadExecutor(head_sha.clone())),
+        );
+        config.model_profiles.insert(
+            "c-tertiary".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.5".into(),
+                effort: "medium".into(),
+            },
+        );
+        for pool in config.routing.reviewer.values_mut() {
+            pool.insert("a-primary".into(), 25);
+            pool.insert("c-tertiary".into(), 25);
+        }
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "reviewer cooldown",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let observed_at = now_unix();
+        quorum_core::tasks::claim(
+            &mut conn,
+            "Author",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at - 2,
+        )
+        .unwrap()
+        .unwrap();
+        quorum_core::tasks::apply_event(
+            &mut conn,
+            "Author",
+            task_id,
+            &Event::SignaledDone { pr: "77".into() },
+            observed_at - 1,
+        )
+        .unwrap();
+        quorum_core::tasks::reserve_reviewer_provision(
+            &mut conn,
+            task_id,
+            "cooldown-review-reservation",
+            "r1",
+            observed_at,
+        )
+        .unwrap();
+        assert!(quorum_core::tasks::attach_reserved_reviewer(
+            &mut conn,
+            task_id,
+            "cooldown-review-reservation",
+            "r1",
+            "Fallback-Reviewer",
+            3600,
+            observed_at,
+        )
+        .unwrap());
+        let responsibility = format!("reviewer:task:{task_id}:r1");
+        let (assignment, initial_run, agent_name) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "reviewer",
+            Some(77),
+            Some("r1"),
+        );
+        assert_eq!(assignment.profile_id, "a-primary");
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent_name.clone(),
+                role: "reviewer".into(),
+                task_id: Some(task_id),
+                session_id: "initial-review-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("review/pr-77".into()),
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(77),
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("review/pr-77".into()),
+            },
+        )
+        .unwrap();
+        let now = std::time::Instant::now();
+        let slot = SlotState {
+            agent_name,
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "initial-review-session".into(),
+            model: assignment.model.clone(),
+            effort: assignment.effort.clone(),
+            worktree_path: worktree,
+            branch: "review/pr-77".into(),
+            remote_branch: "review/pr-77".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: Some(77),
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            last_provider_activity_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            fallback_install_error_count: 0,
+            last_error_text: None,
+            agent_run_id: Some(initial_run),
+            cap_run_id: Some("initial-cap".into()),
+            r2_origin: false,
+            reviewed_head_sha: Some(head_sha),
+            continuation_id: None,
+            pending_prompt: "exact reviewer prompt".into(),
+            pending_turn_kind: "review".into(),
+        };
+        let currency = load_reviewer_fallback_currency(&conn, &slot, observed_at).unwrap();
+        CoolingReviewerFixture {
+            config,
+            slot,
+            currency,
+            started,
+            responsibility,
+        }
+    }
+
+    #[cfg(unix)]
+    fn routing_attempt_profiles(config: &ServeConfig, responsibility: &str) -> Vec<String> {
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        quorum_core::routing_attempts::list(&conn, responsibility)
+            .unwrap()
+            .into_iter()
+            .map(|attempt| attempt.profile.id)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewer_fallback_skips_a_cooling_alternate_and_cools_the_failed_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let mut fixture = cooling_reviewer_fallback_fixture(root.path());
+        // `b-alternate` is the highest-weight alternate, so without the
+        // cooldown it is the route the installer selects.
+        let mut cooldown = ProfileCooldown::new();
+        cooldown.record("b-alternate", std::time::Instant::now());
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "primary reviewer profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+        assert_eq!(
+            activate_reviewer_fallback(
+                &fixture.config,
+                &mut fixture.slot,
+                &failure,
+                &fixture.currency,
+                &mut cooldown,
+            )
+            .await
+            .unwrap(),
+            ReviewerFallbackActivation::Activated
+        );
+        assert_eq!(fixture.slot.model, "gpt-5.5", "c-tertiary runs");
+        assert!(
+            cooldown.is_cooling("a-primary", std::time::Instant::now()),
+            "the classified failure starts the failed profile's cooldown"
+        );
+        assert_eq!(
+            routing_attempt_profiles(&fixture.config, &fixture.responsibility),
+            vec!["a-primary".to_string(), "b-alternate".to_string()],
+            "the skip is ordinary routing evidence"
+        );
+        // Verdict authority stays with the existing attribution: the live run
+        // is the attributed alternate for the same assignment and participant.
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let (profile, agent, active_runs): (String, String, i64) = conn
+            .query_row(
+                "SELECT configured_profile_id,agent_name,
+                        (SELECT count(*) FROM agent_runs
+                         WHERE task_id=?2 AND role='reviewer' AND ended_at IS NULL)
+                 FROM agent_runs WHERE id=?1",
+                rusqlite::params![fixture.slot.agent_run_id, fixture.slot.task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (profile.as_str(), agent.as_str(), active_runs),
+            ("c-tertiary", "Fallback-Reviewer", 1)
+        );
+        drop(conn);
+        assert_provider_started_once(&fixture.started).await;
+        let _ = fixture.slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewer_fallback_spawns_nothing_when_every_alternate_is_cooling() {
+        let root = tempfile::tempdir().unwrap();
+        let mut fixture = cooling_reviewer_fallback_fixture(root.path());
+        let mut cooldown = ProfileCooldown::new();
+        let now = std::time::Instant::now();
+        cooldown.record("b-alternate", now);
+        cooldown.record("c-tertiary", now);
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "primary reviewer profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+        assert_eq!(
+            activate_reviewer_fallback(
+                &fixture.config,
+                &mut fixture.slot,
+                &failure,
+                &fixture.currency,
+                &mut cooldown,
+            )
+            .await
+            .unwrap(),
+            ReviewerFallbackActivation::Settled
+        );
+        assert!(
+            !fixture.started.exists(),
+            "no provider process may launch onto a cooling profile"
+        );
+        assert_eq!(
+            routing_attempt_profiles(&fixture.config, &fixture.responsibility).len(),
+            3,
+            "the walk is bounded by the pool"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewer_provision_plan_skips_cooling_assignment_or_defers_until_expiry() {
+        let root = tempfile::tempdir().unwrap();
+        let config = live_fallback_test_config(
+            root.path().join("plan.db"),
+            root.path(),
+            &root.path().join("unused-runner"),
+            Arc::new(FallbackHeadExecutor("a".repeat(40))),
+        );
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn, "owner", "plan", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let responsibility = format!("reviewer:task:{task_id}:r1");
+        let (assignment, _, _) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "reviewer",
+            Some(77),
+            Some("r1"),
+        );
+        assert_eq!(assignment.profile_id, "a-primary");
+        async fn plan_at(
+            config: &ServeConfig,
+            assignment: &quorum_core::role_assignments::RoleAssignment,
+            cooldown: &ProfileCooldown,
+            now: std::time::Instant,
+        ) -> CooldownPlan {
+            reviewer_cooldown_plan(config, cooldown, assignment, 3, &ReviewRole::R1, now)
+                .await
+                .unwrap()
+        }
+        let now = std::time::Instant::now();
+        let mut cooldown = ProfileCooldown::new();
+        assert_eq!(
+            plan_at(&config, &assignment, &cooldown, now).await,
+            CooldownPlan::Run
+        );
+
+        let a_until = cooldown.record("a-primary", now);
+        assert_eq!(
+            plan_at(&config, &assignment, &cooldown, now).await,
+            CooldownPlan::SkipAssigned
+        );
+
+        // Every eligible profile cooling: provisioning must wait, and the
+        // wait ends at the earliest relevant expiry.
+        let b_until = cooldown.record("b-alternate", now + Duration::from_millis(1));
+        assert_eq!(
+            plan_at(&config, &assignment, &cooldown, now).await,
+            CooldownPlan::Defer { until: a_until }
+        );
+        assert_eq!(
+            plan_at(&config, &assignment, &cooldown, a_until).await,
+            CooldownPlan::Run
+        );
+
+        // A non-cooling alternate excluded by this responsibility's durable
+        // routing evidence is not eligible either.
+        let pool = configured_routing_pool(&config, "reviewer", Some(3), Some("r1")).unwrap();
+        let alternate = pool
+            .profiles
+            .iter()
+            .find(|weighted| weighted.profile.id == "b-alternate")
+            .unwrap()
+            .profile
+            .clone();
+        quorum_core::routing_attempts::record(
+            &mut conn,
+            &quorum_core::routing_attempts::RecordRoutingAttempt {
+                role_assignment_id: assignment.id,
+                responsibility_key: &responsibility,
+                profile: &alternate,
+                failure_disposition: Some(
+                    quorum_core::routing_attempts::FailureDisposition::ProfileUnavailable,
+                ),
+                failed_agent_run_id: None,
+                recorded_at: 2,
+            },
+            &pool,
+        )
+        .unwrap();
+        let after_b = b_until + Duration::from_millis(1);
+        let mut only_assigned = ProfileCooldown::new();
+        let assigned_until = only_assigned.record("a-primary", after_b);
+        assert_eq!(
+            plan_at(&config, &assignment, &only_assigned, after_b).await,
+            CooldownPlan::Defer {
+                until: assigned_until
+            }
+        );
+        assert_eq!(
+            plan_at(&config, &assignment, &only_assigned, assigned_until).await,
+            CooldownPlan::Run
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn live_reviewer_fallback_gates_launch_and_settles_release_failure() {
@@ -37313,9 +37888,15 @@ mod tests {
             std::io::ErrorKind::Other,
         );
         assert_eq!(
-            activate_reviewer_fallback(&config, &mut slot, &failure, &currency)
-                .await
-                .unwrap(),
+            activate_reviewer_fallback(
+                &config,
+                &mut slot,
+                &failure,
+                &currency,
+                &mut ProfileCooldown::new(),
+            )
+            .await
+            .unwrap(),
             ReviewerFallbackActivation::Activated
         );
         assert_eq!(slot.model, "gpt-5.6-terra");
@@ -37387,9 +37968,15 @@ mod tests {
             std::io::ErrorKind::Other,
         );
         assert_eq!(
-            activate_reviewer_fallback(&config, &mut slot, &failure, &second_currency)
-                .await
-                .unwrap(),
+            activate_reviewer_fallback(
+                &config,
+                &mut slot,
+                &failure,
+                &second_currency,
+                &mut ProfileCooldown::new(),
+            )
+            .await
+            .unwrap(),
             ReviewerFallbackActivation::Settled
         );
 
@@ -37716,6 +38303,7 @@ mod tests {
             &mut graph_skip_logs,
             &mut unrecordable,
             &mut reviewer_respawn_backoff,
+            &mut ProfileCooldown::new(),
             &mut ReviewerSlotQueue::default(),
             &mut drain_state,
             &mut lifetime_roster,
@@ -38249,6 +38837,7 @@ mod tests {
             &mut graph_skip_logs,
             &mut unrecordable,
             &mut reviewer_respawn_backoff,
+            &mut ProfileCooldown::new(),
             &mut ReviewerSlotQueue::default(),
             &mut drain_state,
             &mut lifetime_roster,
@@ -38787,6 +39376,7 @@ mod tests {
             &mut roster,
             &mut UnrecordableStrikes::new(),
             &mut ReviewerRespawnBackoff::new(),
+            &mut ProfileCooldown::new(),
         )
         .await
         .unwrap();
@@ -38837,6 +39427,7 @@ mod tests {
             &mut roster,
             &mut UnrecordableStrikes::new(),
             &mut ReviewerRespawnBackoff::new(),
+            &mut ProfileCooldown::new(),
         )
         .await
         .unwrap();
@@ -40657,6 +41248,7 @@ mod tests {
                         &mut graph_skip_logs,
                         &mut unrecordable,
                         &mut reviewer_respawn_backoff,
+                        &mut ProfileCooldown::new(),
                         &mut ReviewerSlotQueue::default(),
                         &mut drain_state,
                         &mut lifetime_roster,
@@ -43320,6 +43912,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &mut graph_skip_logs,
             &mut unrecordable,
             &mut reviewer_respawn_backoff,
+            &mut ProfileCooldown::new(),
             &mut ReviewerSlotQueue::default(),
             &mut drain_state,
             &mut lifetime_roster,
@@ -45504,6 +46097,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         &mut graph_skip_logs,
                         &mut unrecordable_strikes,
                         &mut reviewer_respawn_backoff,
+                        &mut ProfileCooldown::new(),
                         &mut ReviewerSlotQueue::default(),
                         &mut drain_state,
                         &mut lifetime_roster,
@@ -45594,6 +46188,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         &mut graph_skip_logs,
                         &mut unrecordable_strikes,
                         &mut reviewer_respawn_backoff,
+                        &mut ProfileCooldown::new(),
                         &mut ReviewerSlotQueue::default(),
                         &mut drain_state,
                         &mut lifetime_roster,
@@ -64074,6 +64669,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 &mut graph_skip_logs,
                 &mut unrecordable,
                 &mut reviewer_respawn_backoff,
+                &mut ProfileCooldown::new(),
                 &mut ReviewerSlotQueue::default(),
                 &mut drain_state,
                 &mut self.roster,

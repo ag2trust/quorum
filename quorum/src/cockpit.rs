@@ -1611,6 +1611,26 @@ mod tests {
     }
 
     #[test]
+    fn reviewing_section_renders_awaiting_reviewer_slot_reason() {
+        let mut s = default_stats();
+        s.reviewing.push(ReviewingTask {
+            id: 13,
+            title: "waiting for a slot".into(),
+            pr: Some(403),
+            reviewer: None,
+            state: "awaiting reviewer".into(),
+            reason: Some("awaiting reviewer slot".into()),
+        });
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("awaiting reviewer — awaiting reviewer slot"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn reviewing_section_renders_approved_merge_pending_state() {
         let mut s = default_stats();
         s.reviewing.push(ReviewingTask {
