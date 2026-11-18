@@ -3056,18 +3056,14 @@ fn reviewing_tasks(
                     )),
                 ),
                 view => {
-                    // `slot_full` is the lowest-precedence reason: every more specific
-                    // durable reason, including an unknown approval head, still wins.
-                    let reason =
-                        awaiting_reviewer_reason(conn, id, refs.as_deref(), freeze_active)?
-                            .or_else(|| {
-                                (view == ApprovalView::HeadUnknown).then(|| {
-                                    "approval recorded but the current PR head is not \
-                                 durably known"
-                                        .to_string()
-                                })
-                            })
-                            .or_else(|| slot_full.then(|| "awaiting reviewer slot".to_string()));
+                    let reason = awaiting_reviewer_reason_for_view(
+                        conn,
+                        id,
+                        refs.as_deref(),
+                        freeze_active,
+                        &view,
+                        slot_full,
+                    )?;
                     ("awaiting reviewer".to_string(), reason)
                 }
             }
@@ -3202,6 +3198,32 @@ fn awaiting_reviewer_reason(
     Ok(None)
 }
 
+/// Precedence applied once an in-review task's [`ApprovalView`] is known to be `HeadUnknown`
+/// or `NotApproved` (an `Approved` view is never passed here; its caller reports the approved
+/// reason itself, since that view means `awaiting reviewer` is not the task's state at all):
+/// the specific durable reasons from [`awaiting_reviewer_reason`] first, then an unknown
+/// approval head, then a full reviewer cap last as the lowest-precedence reason. Shared by
+/// `reviewing_tasks` and `task_awaiting_reviewer_reason` so the two surfaces cannot drift out
+/// of sync on this precedence (#415).
+fn awaiting_reviewer_reason_for_view(
+    conn: &Connection,
+    task_id: i64,
+    refs: Option<&str>,
+    freeze_active: bool,
+    view: &ApprovalView,
+    slot_full: bool,
+) -> Result<Option<String>> {
+    Ok(
+        awaiting_reviewer_reason(conn, task_id, refs, freeze_active)?
+            .or_else(|| {
+                (*view == ApprovalView::HeadUnknown).then(|| {
+                    "approval recorded but the current PR head is not durably known".to_string()
+                })
+            })
+            .or_else(|| slot_full.then(|| "awaiting reviewer slot".to_string())),
+    )
+}
+
 /// Whether a decomposition freeze is active, for callers that need it as context on a
 /// classification-pending reason. Cheap and short; callers computing it once per batch
 /// (rather than once per task) avoid redundant round-trips on a polled path.
@@ -3215,11 +3237,14 @@ pub fn decomposition_freeze_active(conn: &Connection) -> Result<bool> {
 
 /// Reviewer-cap-aware reason an in-review task has no live reviewer, for read-only status
 /// surfaces that do not otherwise compute [`Stats`] (for example the web dashboard's
-/// lighter per-band query, which does not compute an approval view). Mirrors the
-/// precedence [`reviewing_tasks`] applies via [`awaiting_reviewer_reason`], with
-/// "awaiting reviewer slot" as the lowest-precedence reason; `None` when the cause (if
-/// any) is not DB-visible. `freeze_active` is [`decomposition_freeze_active`]'s result,
-/// computed once per batch by the caller rather than once per task here.
+/// lighter per-band query). Consults the same [`review_approval_view`] `reviewing_tasks`
+/// does: a fully-approved task reports its approval reason (the caller's task is
+/// `approved, merge pending`, not `awaiting reviewer`, matching `quorum status`/cockpit),
+/// an unknown approval head wins next, then the specific durable reasons from
+/// [`awaiting_reviewer_reason`], with "awaiting reviewer slot" as the lowest-precedence
+/// reason; `None` when the cause (if any) is not DB-visible. `freeze_active` is
+/// [`decomposition_freeze_active`]'s result, computed once per batch by the caller rather
+/// than once per task here.
 pub fn task_awaiting_reviewer_reason(
     conn: &Connection,
     task_id: i64,
@@ -3229,10 +3254,15 @@ pub fn task_awaiting_reviewer_reason(
     reviewer_cap: Option<i64>,
 ) -> Result<Option<String>> {
     let slot_full = reviewer_cap.is_some_and(|cap| live_reviewer_count >= cap);
-    Ok(
-        awaiting_reviewer_reason(conn, task_id, refs, freeze_active)?
-            .or_else(|| slot_full.then(|| "awaiting reviewer slot".to_string())),
-    )
+    match review_approval_view(conn, task_id, extract_pr_from_refs(refs))? {
+        ApprovalView::Approved(head) => Ok(Some(format!(
+            "all required reviews approved at head {}",
+            short_sha(&head)
+        ))),
+        view => {
+            awaiting_reviewer_reason_for_view(conn, task_id, refs, freeze_active, &view, slot_full)
+        }
+    }
 }
 
 /// Task pipeline view: daemon-owned source stages + recently done/closed (#204).

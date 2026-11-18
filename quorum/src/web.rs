@@ -1562,6 +1562,85 @@ mod tests {
     }
 
     #[test]
+    fn state_reviewing_band_prefers_approved_reason_over_reviewer_slot() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = test_state(&temp);
+        state.reviewer_cap = 1;
+        let mut conn = quorum_core::db::open(&state.db_path).unwrap();
+        let live = create_test_task(&mut conn, "live reviewer", None, None);
+        let approved = create_test_task(&mut conn, "approved, merge pending", None, None);
+        for (id, pr) in [(live, 1), (approved, 2)] {
+            conn.execute(
+                "UPDATE tasks SET status='in-review', refs=?1 WHERE id=?2",
+                rusqlite::params![
+                    format!(
+                        r#"{{"pr":{pr},"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null}}"#
+                    ),
+                    id
+                ],
+            )
+            .unwrap();
+        }
+        quorum_core::journal::upsert(
+            &mut conn,
+            &quorum_core::journal::JournalEntry {
+                agent: "R1".into(),
+                role: "reviewer".into(),
+                task_id: Some(live),
+                session_id: "reviewer-session".into(),
+                worktree: None,
+                branch: None,
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(1),
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+        for role in ["r1", "r2"] {
+            quorum_core::approvals::record(
+                &mut conn,
+                &quorum_core::approvals::Approval {
+                    pr_number: 2,
+                    review_role: role.into(),
+                    task_id: approved,
+                    author: "W".into(),
+                    reviewer: format!("Rev-{role}"),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "head-a".into(),
+                },
+            )
+            .unwrap();
+        }
+        quorum_core::pr_targets::upsert(&mut conn, approved, 2, "daemon/x", "head-a", false)
+            .unwrap();
+        drop(conn);
+
+        let payload = state_payload(&state).unwrap();
+        let reviewing_tasks = payload["queue_bands"]["reviewing"]["tasks"]
+            .as_array()
+            .unwrap();
+        let approved_row = reviewing_tasks
+            .iter()
+            .find(|task| task["id"] == approved)
+            .unwrap();
+        assert_eq!(
+            approved_row["reason"],
+            json!("all required reviews approved at head head-a"),
+            "a fully-approved task must not be mislabeled awaiting reviewer slot: {approved_row}"
+        );
+        assert_checkpoint_released(&state.db_path);
+    }
+
+    #[test]
     fn state_ready_band_uses_the_limited_ready_projection() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_state(&temp);
