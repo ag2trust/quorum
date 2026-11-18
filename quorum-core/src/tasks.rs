@@ -6362,6 +6362,74 @@ fn process_cancelled_dependency_reconciliation(
     Ok(candidates.len())
 }
 
+/// Return dependents that the dependency cascade parked solely because
+/// `dependency_id` was terminal-not-done to `open`, inside the caller's write
+/// transaction that just made that dependency non-terminal again (an operator
+/// decomposition-planning retry restores its source from `failed` to
+/// `planning`).
+///
+/// A resumed dependent is open but unready until the dependency reaches
+/// `done`, exactly like a dependent of any other retryable hold; if the
+/// dependency fails again the ordinary cascade re-parks it. Only `open`
+/// resumes are restored: a `rework` resume would add started work to the drain
+/// set that the retried source's own planning freeze waits on, so it keeps
+/// waiting for an explicit `task-retry`. Unsatisfiable, classifier-policy, and
+/// differently-caused parks are untouched. This runs only on an operator
+/// retry, so its scan of parked rows is not on any polling path.
+pub(crate) fn resume_dependents_parked_on(
+    tx: &Connection,
+    dependency_id: i64,
+    by: &str,
+    now: i64,
+) -> Result<usize> {
+    let reason = format!("dependency #{dependency_id} is terminal-not-done");
+    let candidates: Vec<i64> = {
+        let mut stmt = tx.prepare(
+            "SELECT t.id FROM tasks t
+             WHERE t.status='failed' AND json_valid(t.refs)
+               AND json_extract(t.refs, '$.daemon_parked')=1
+               AND json_extract(t.refs, '$.daemon_parked_reason')=?2
+               AND json_extract(t.refs, '$.daemon_resume_status')='open'
+               AND COALESCE(json_extract(t.refs, '$.daemon_parked_unsatisfiable'), 0)=0
+               AND COALESCE(json_extract(t.refs, '$.classifier_policy_parked'), 0)<>1
+               AND json_valid(t.depends_on)
+               AND EXISTS (SELECT 1 FROM json_each(t.depends_on) j WHERE j.value=?1)
+               AND NOT EXISTS (
+                   SELECT 1 FROM json_each(t.depends_on) j
+                   LEFT JOIN tasks d ON d.id=j.value
+                   WHERE d.id IS NULL OR d.status='cancelled'
+               )
+             ORDER BY t.id",
+        )?;
+        let rows = stmt.query_map(params![dependency_id, reason], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let body = format!("parked dependent resumed: dependency #{dependency_id} retried by {by}");
+    for task_id in &candidates {
+        tx.execute(
+            "UPDATE tasks
+             SET status='open',assignee=NULL,
+                 refs=json_remove(
+                     refs,
+                     '$.daemon_parked',
+                     '$.daemon_parked_reason',
+                     '$.daemon_parked_unsatisfiable',
+                     '$.daemon_resume_status'
+                 ),
+                 updated_at=?2
+             WHERE id=?1 AND status='failed'",
+            params![task_id, now],
+        )?;
+        tx.execute(
+            "INSERT INTO task_notes(task_id, ts, agent, body)
+             VALUES (?1, ?2, 'daemon', ?3)",
+            params![task_id, now, body],
+        )?;
+        crate::events::emit(tx, "task_unparked", &lease_target(*task_id), &body, now)?;
+    }
+    Ok(candidates.len())
+}
+
 /// Cancelled dep ids in a task's `depends_on`. Cancelled is terminal, so
 /// these are the ones a bare `task-retry` cannot re-satisfy; the operator
 /// must edit `depends_on` or close the dependent. Empty when `depends_on`

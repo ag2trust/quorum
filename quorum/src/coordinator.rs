@@ -120,7 +120,8 @@ fn emitted<T: serde::Serialize>(value: &T, exit: i32) -> (String, i32) {
 }
 
 /// `task-retry`: resume a daemon-parked or provider-blocked task, or retry an
-/// eligible exhausted decomposition plan. Returns the JSON the command emits
+/// eligible exhausted decomposition plan or external_constraint planner hold.
+/// Returns the JSON the command emits
 /// and its exit code (0 retried, 1 refused).
 pub fn task_retry(db: &Path, task_id: i64, by: &str, now: i64) -> Result<(String, i32)> {
     let mut conn = quorum_core::db::open(db)?;
@@ -191,7 +192,7 @@ pub fn task_retry(db: &Path, task_id: i64, by: &str, now: i64) -> Result<(String
                 &serde_json::json!({
                     "ok": false,
                     "outcome": "task-retry-rejected",
-                    "reason": "task is not daemon-parked, provider-blocked, or an eligible exhausted decomposition source",
+                    "reason": "task is not daemon-parked, provider-blocked, or an eligible exhausted or external_constraint-held decomposition source",
                 }),
                 1,
             ),
