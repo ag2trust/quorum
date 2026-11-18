@@ -6939,8 +6939,12 @@ async fn kill_and_reap_planner_view_processes(
 /// bounded fetch/verification workers use before cutting a branch; the
 /// daemon's repo-dir `HEAD` is never a planning base.
 ///
-/// `Ok(Err(reason))` is an expected deferral (fetch/resolve failure, missing
-/// dependency provenance, or a dependency merge not yet on the fetched tip):
+/// Done dependencies with a PR but no stamped SHA are first recovered through
+/// the worker path's shared `recover_missing_dependency_merge_commits`.
+///
+/// `Ok(Err(reason))` is an expected deferral (fetch/resolve failure, an open or
+/// unmerged dependency PR, unrecoverable dependency provenance, or a dependency
+/// merge not yet on the fetched tip):
 /// the caller must not bind. Only DB/join failures are `Err`. No transaction
 /// is held across the git calls.
 async fn capture_decomposition_frozen_base(
@@ -6948,19 +6952,23 @@ async fn capture_decomposition_frozen_base(
     wt_mgr: &WorktreeManager,
     source_task_id: i64,
 ) -> Result<std::result::Result<String, String>> {
-    let path = config.db_path.clone();
-    let loaded = tokio::task::spawn_blocking(
-        move || -> Result<Option<(Option<String>, tasks::DependencyMergeCommitResolution)>> {
-            let conn = quorum_core::db::open(&path)?;
-            let Some(task) = tasks::get(&conn, source_task_id)? else {
-                return Ok(None);
-            };
-            let resolution = tasks::dependency_merge_commits(&conn, task.depends_on.as_deref())?;
-            Ok(Some((task.target_branch, resolution)))
-        },
-    )
-    .await
-    .map_err(|error| QuorumError::Io(format!("frozen base source read join: {error}")))??;
+    let load_source = || {
+        let path = config.db_path.clone();
+        tokio::task::spawn_blocking(
+            move || -> Result<Option<(Option<String>, tasks::DependencyMergeCommitResolution)>> {
+                let conn = quorum_core::db::open(&path)?;
+                let Some(task) = tasks::get(&conn, source_task_id)? else {
+                    return Ok(None);
+                };
+                let resolution =
+                    tasks::dependency_merge_commits(&conn, task.depends_on.as_deref())?;
+                Ok(Some((task.target_branch, resolution)))
+            },
+        )
+    };
+    let loaded = load_source()
+        .await
+        .map_err(|error| QuorumError::Io(format!("frozen base source read join: {error}")))??;
     let Some((target_branch, resolution)) = loaded else {
         return Ok(Err(format!(
             "source task #{source_task_id} no longer exists"
@@ -6979,19 +6987,62 @@ async fn capture_decomposition_frozen_base(
         }
         None => config.base_branch.clone(),
     };
-    let dependencies = match resolution {
+    let mut dependencies = match resolution {
         tasks::DependencyMergeCommitResolution::Resolved(dependencies) => dependencies,
         tasks::DependencyMergeCommitResolution::Unresolved { reason } => return Ok(Err(reason)),
     };
+    // A manually closed dependency may be done with its PR merged but no SHA
+    // stamped. Recover it exactly as worker provisioning does; otherwise the
+    // repo-wide freeze would block the only path that stamps it. A PR that is
+    // open/closed-unmerged (the worker parks) or a failed lookup defers here.
+    if dependencies
+        .iter()
+        .any(|dependency| dependency.merge_commit_sha.is_none())
+    {
+        match recover_missing_dependency_merge_commits(
+            config,
+            &config.db_path,
+            wt_mgr,
+            &config.repo_dir,
+            &dependencies,
+            &base_branch,
+        )
+        .await?
+        {
+            DependencyMergeRecovery::Recovered => {}
+            DependencyMergeRecovery::PrNotMerged { reason }
+            | DependencyMergeRecovery::LookupFailed { reason } => return Ok(Err(reason)),
+        }
+        let reloaded = load_source().await.map_err(|error| {
+            QuorumError::Io(format!("frozen base source reload join: {error}"))
+        })??;
+        dependencies = match reloaded {
+            None => {
+                return Ok(Err(format!(
+                    "source task #{source_task_id} no longer exists"
+                )));
+            }
+            Some((_, tasks::DependencyMergeCommitResolution::Resolved(reloaded))) => reloaded,
+            Some((_, tasks::DependencyMergeCommitResolution::Unresolved { reason })) => {
+                return Ok(Err(reason));
+            }
+        };
+    }
     let mut merge_commits = Vec::with_capacity(dependencies.len());
     for dependency in dependencies {
         match dependency.merge_commit_sha {
             Some(sha) => merge_commits.push(sha),
             None => {
-                return Ok(Err(format!(
-                    "dependency #{} is done but has no recorded merge commit SHA",
-                    dependency.task_id
-                )));
+                return Ok(Err(match dependency.pr_number {
+                    Some(pr) => format!(
+                        "dependency #{} is done but PR #{pr} has no recoverable merge commit SHA",
+                        dependency.task_id
+                    ),
+                    None => format!(
+                        "dependency #{} is done but has no recorded merge commit SHA",
+                        dependency.task_id
+                    ),
+                }));
             }
         }
     }
@@ -24599,6 +24650,106 @@ async fn provision_reviewer_reserved(
     Ok(ReviewerProvisionOutcome::Attached)
 }
 
+/// Outcome of recovering merge commits for done dependencies whose PR merged
+/// but whose SHA was never stamped (for example a manual close).
+enum DependencyMergeRecovery {
+    /// Every recoverable SHA was stamped; callers reload the resolution. A
+    /// dependency may still lack a SHA when no witness could be found.
+    Recovered,
+    /// A dependency's PR is still open or closed without merging.
+    PrNotMerged { reason: String },
+    /// The GitHub/Git merge lookup itself failed.
+    LookupFailed { reason: String },
+}
+
+/// Recover and durably stamp the merge commit of every done dependency that has
+/// a PR but no recorded SHA. Shared by worker provisioning and the planner's
+/// frozen-base capture so both resolve dependency provenance identically. All
+/// GitHub/Git work runs with no transaction held; each stamp is a tiny guarded
+/// write that never overwrites an existing SHA.
+async fn recover_missing_dependency_merge_commits(
+    config: &ServeConfig,
+    db_path: &Path,
+    wt_mgr: &WorktreeManager,
+    repo_dir: &Path,
+    dependencies: &[tasks::DependencyMergeCommit],
+    base_branch: &str,
+) -> Result<DependencyMergeRecovery> {
+    for dependency in dependencies
+        .iter()
+        .filter(|dependency| dependency.merge_commit_sha.is_none())
+    {
+        let Some(pr_number) = dependency.pr_number else {
+            continue;
+        };
+        let repo = repo_dir.to_path_buf();
+        let executor = Arc::clone(&config.merge_executor);
+        let status =
+            tokio::task::spawn_blocking(move || executor.merge_commit_status(pr_number, &repo))
+                .await
+                .map_err(|error| QuorumError::Io(format!("dependency PR lookup join: {error}")))?;
+        let merge_commit_sha = match status {
+            merge::MergeCommitStatus::Merged {
+                merge_commit_sha: Some(sha),
+            } => Some(sha),
+            merge::MergeCommitStatus::Merged {
+                merge_commit_sha: None,
+            }
+            | merge::MergeCommitStatus::Unknown => {
+                match wt_mgr
+                    .find_merged_pr_commit(repo_dir, base_branch, pr_number)
+                    .await
+                {
+                    Ok(sha) => sha,
+                    Err(error) => {
+                        return Ok(DependencyMergeRecovery::LookupFailed {
+                            reason: format!(
+                                "dependency #{}, PR #{pr_number} merge lookup failed: {error}",
+                                dependency.task_id
+                            ),
+                        });
+                    }
+                }
+            }
+            merge::MergeCommitStatus::Open => {
+                return Ok(DependencyMergeRecovery::PrNotMerged {
+                    reason: format!(
+                        "dependency #{} is done but PR #{pr_number} is still open",
+                        dependency.task_id
+                    ),
+                });
+            }
+            merge::MergeCommitStatus::Closed => {
+                return Ok(DependencyMergeRecovery::PrNotMerged {
+                    reason: format!(
+                        "dependency #{} is done but PR #{pr_number} closed without merging",
+                        dependency.task_id
+                    ),
+                });
+            }
+        };
+        let Some(merge_commit_sha) = merge_commit_sha else {
+            continue;
+        };
+        let db_path = db_path.to_path_buf();
+        let task_id = dependency.task_id;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&db_path)?;
+            tasks::record_dependency_merge_commit(
+                &mut conn,
+                task_id,
+                pr_number,
+                &merge_commit_sha,
+                now_unix(),
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("dependency merge stamp join: {error}")))??;
+    }
+    Ok(DependencyMergeRecovery::Recovered)
+}
+
 /// Spawn a worker for the next highest-priority ready task.
 /// Returns true if a worker was spawned, false if no ready tasks or names available.
 enum DependencyBaseAdmission {
@@ -24646,94 +24797,35 @@ async fn verify_dependency_base_before_allocation(
     // already merged. Recover that immutable witness before allocation. All
     // GitHub/Git work completes before the tiny guarded SQLite write below.
     if unresolved_reason.is_none() {
-        for dependency in dependencies
-            .iter()
-            .filter(|dependency| dependency.merge_commit_sha.is_none())
+        match recover_missing_dependency_merge_commits(
+            config,
+            db_path,
+            wt_mgr,
+            repo_dir,
+            &dependencies,
+            base_branch,
+        )
+        .await?
         {
-            let Some(pr_number) = dependency.pr_number else {
-                continue;
-            };
-            let repo = repo_dir.to_path_buf();
-            let executor = Arc::clone(&config.merge_executor);
-            let status =
-                tokio::task::spawn_blocking(move || executor.merge_commit_status(pr_number, &repo))
-                    .await
-                    .map_err(|error| {
-                        QuorumError::Io(format!("dependency PR lookup join: {error}"))
-                    })?;
-            let merge_commit_sha = match status {
-                merge::MergeCommitStatus::Merged {
-                    merge_commit_sha: Some(sha),
-                } => Some(sha),
-                merge::MergeCommitStatus::Merged {
-                    merge_commit_sha: None,
-                }
-                | merge::MergeCommitStatus::Unknown => wt_mgr
-                    .find_merged_pr_commit(repo_dir, base_branch, pr_number)
-                    .await
-                    .map_err(|error| {
-                        QuorumError::Io(format!(
-                            "dependency #{}, PR #{pr_number} merge lookup failed: {error}",
-                            dependency.task_id
-                        ))
-                    })?,
-                merge::MergeCommitStatus::Open => {
-                    let reason = format!(
-                        "dependency #{} is done but PR #{pr_number} is still open",
-                        dependency.task_id
-                    );
-                    require_park_task(
-                        db_path,
-                        task.id,
-                        &reason,
-                        if task.status == "rework" {
-                            "rework"
-                        } else {
-                            "open"
-                        },
-                    )
-                    .await?;
-                    log(&format!("PARKED: task #{}: {reason}", task.id));
-                    return Ok(DependencyBaseAdmission::Deferred);
-                }
-                merge::MergeCommitStatus::Closed => {
-                    let reason = format!(
-                        "dependency #{} is done but PR #{pr_number} closed without merging",
-                        dependency.task_id
-                    );
-                    require_park_task(
-                        db_path,
-                        task.id,
-                        &reason,
-                        if task.status == "rework" {
-                            "rework"
-                        } else {
-                            "open"
-                        },
-                    )
-                    .await?;
-                    log(&format!("PARKED: task #{}: {reason}", task.id));
-                    return Ok(DependencyBaseAdmission::Deferred);
-                }
-            };
-            let Some(merge_commit_sha) = merge_commit_sha else {
-                continue;
-            };
-            let db_path = db_path.to_path_buf();
-            let task_id = dependency.task_id;
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                let mut conn = quorum_core::db::open(&db_path)?;
-                tasks::record_dependency_merge_commit(
-                    &mut conn,
-                    task_id,
-                    pr_number,
-                    &merge_commit_sha,
-                    now_unix(),
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| QuorumError::Io(format!("dependency merge stamp join: {error}")))??;
+            DependencyMergeRecovery::Recovered => {}
+            DependencyMergeRecovery::PrNotMerged { reason } => {
+                require_park_task(
+                    db_path,
+                    task.id,
+                    &reason,
+                    if task.status == "rework" {
+                        "rework"
+                    } else {
+                        "open"
+                    },
+                )
+                .await?;
+                log(&format!("PARKED: task #{}: {reason}", task.id));
+                return Ok(DependencyBaseAdmission::Deferred);
+            }
+            DependencyMergeRecovery::LookupFailed { reason } => {
+                return Err(QuorumError::Io(reason));
+            }
         }
         resolution = load_dependencies()
             .await
@@ -63413,6 +63505,149 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             )),
             "{events:?}"
         );
+    }
+
+    /// Push a GitHub-style `Merge pull request #<pr>` merge commit to origin's
+    /// `main`, as a PR merged on GitHub would land. Returns the merge SHA.
+    #[cfg(unix)]
+    fn push_remote_pr_merge(repo_dir: &Path, pr: i64) -> String {
+        let scratch = tempfile::tempdir().unwrap();
+        let origin = lifecycle_git(repo_dir, &["remote", "get-url", "origin"]);
+        lifecycle_git(
+            scratch.path(),
+            &["clone", "-q", "-b", "main", &origin, "clone"],
+        );
+        let clone = scratch.path().join("clone");
+        lifecycle_git(&clone, &["config", "user.email", "test@example.com"]);
+        lifecycle_git(&clone, &["config", "user.name", "test"]);
+        lifecycle_git(&clone, &["checkout", "-qb", "feature"]);
+        std::fs::write(clone.join("src/merged_dep.rs"), "pub fn dep() {}\n").unwrap();
+        lifecycle_git(&clone, &["add", "."]);
+        lifecycle_git(&clone, &["commit", "-qm", "dependency work"]);
+        lifecycle_git(&clone, &["checkout", "-q", "main"]);
+        lifecycle_git(
+            &clone,
+            &[
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                &format!("Merge pull request #{pr} from org/feature"),
+                "feature",
+            ],
+        );
+        lifecycle_git(&clone, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        lifecycle_git(&clone, &["rev-parse", "HEAD"])
+    }
+
+    /// Make `harness.source` depend on a done task whose PR is recorded but
+    /// whose merge commit SHA was never stamped (a manual close).
+    #[cfg(unix)]
+    fn add_unstamped_pr_dependency(harness: &LifecycleHarness, pr: i64) -> i64 {
+        let dependency =
+            harness.add_task("done", Some(&serde_json::json!({ "pr": pr }).to_string()));
+        let conn = quorum_core::db::open(&harness.db_path).unwrap();
+        conn.execute(
+            "UPDATE tasks SET depends_on=?2 WHERE id=?1",
+            rusqlite::params![harness.source, format!("[{dependency}]")],
+        )
+        .unwrap();
+        dependency
+    }
+
+    #[cfg(unix)]
+    fn stamped_merge_commit(harness: &LifecycleHarness, task: i64) -> Option<String> {
+        let conn = quorum_core::db::open(&harness.db_path).unwrap();
+        conn.query_row(
+            "SELECT json_extract(refs,'$.merge_commit_sha') FROM tasks WHERE id=?1",
+            [task],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A done dependency with a PR but no stamped SHA is recovered exactly as
+    /// worker provisioning recovers it: the merge commit is found on the
+    /// fetched base, stamped durably, and the drain handoff binds instead of
+    /// holding the repo-wide freeze forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_handoff_recovers_unstamped_dependency_merge_and_binds() {
+        let harness = lifecycle_harness("origin-recover-dependency");
+        let repo_dir = harness.config.repo_dir.clone();
+        let dependency = add_unstamped_pr_dependency(&harness, 41);
+        let merge_sha = push_remote_pr_merge(&repo_dir, 41);
+        assert_eq!(stamped_merge_commit(&harness, dependency), None);
+        harness.enter_unbound_drain();
+
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        let row = harness.freeze_row();
+        assert_eq!(row.state, "planning");
+        assert_eq!(row.frozen_base_sha.as_deref(), Some(merge_sha.as_str()));
+        assert_eq!(
+            stamped_merge_commit(&harness, dependency).as_deref(),
+            Some(merge_sha.as_str())
+        );
+        assert!(harness.base_deferral_events().is_empty());
+    }
+
+    /// Where worker provisioning parks on an open dependency PR, the drain
+    /// handoff defers: no bind, no stamp, one visible reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_handoff_defers_while_dependency_pr_is_open() {
+        let mut harness = lifecycle_harness("origin-open-dependency");
+        harness.config.merge_executor = Arc::new(OpenDependencyMergeStatusExecutor);
+        let dependency = add_unstamped_pr_dependency(&harness, 42);
+        harness.enter_unbound_drain();
+        let held = harness.freeze_row();
+
+        let mut coordinator = DecompositionCoordinator::default();
+        for _ in 0..2 {
+            assert!(harness.tick(&mut coordinator).await);
+            assert_eq!(harness.freeze_row(), held);
+            assert!(coordinator.planner_slot.is_none());
+        }
+        assert_eq!(stamped_merge_commit(&harness, dependency), None);
+        let events = harness.base_deferral_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            events[0].contains(&format!(
+                "dependency #{dependency} is done but PR #42 is still open"
+            )),
+            "{events:?}"
+        );
+    }
+
+    /// A PR that merged without a findable merge commit defers with the
+    /// worker's "no recoverable merge commit SHA" reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_handoff_defers_when_dependency_merge_is_unrecoverable() {
+        let harness = lifecycle_harness("origin-unrecoverable-dependency");
+        let dependency = add_unstamped_pr_dependency(&harness, 43);
+        harness.enter_unbound_drain();
+        let held = harness.freeze_row();
+
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(harness.freeze_row(), held);
+        let events = harness.base_deferral_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            events[0].contains(&format!(
+                "dependency #{dependency} is done but PR #43 has no recoverable merge commit SHA"
+            )),
+            "{events:?}"
+        );
+
+        // Once the merge lands on origin, a later tick recovers and binds.
+        let merge_sha = push_remote_pr_merge(&harness.config.repo_dir, 43);
+        assert!(harness.tick(&mut coordinator).await);
+        let row = harness.freeze_row();
+        assert_eq!(row.state, "planning");
+        assert_eq!(row.frozen_base_sha, Some(merge_sha));
     }
 
     /// A slot holding `task_id`, for live-worker and live-reviewer negatives.
