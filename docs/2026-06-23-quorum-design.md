@@ -3233,7 +3233,8 @@ provider retry for a provider-blocked task; progress requires an operator `task-
 reports no repository-wide drain: it has no drain-stall projection, health does not count a
 freeze phase as stalled, and a classification-pending reviewer wait carries no freeze context. The
 coordinator settles a previous graph's cached view, marker, and proposal whenever the selected
-aggregate changes.
+planning aggregate changes; materialized graphs are never the coordinator's selection (see
+*Multiple active graphs* below).
 
 One `BEGIN IMMEDIATE` transaction creates the entire graph: every generated task with
 `terminal_leaf=1`, classification, edge, membership/provenance row, source `planning ->
@@ -3256,6 +3257,23 @@ the worker `cap`, must be `>= 1` (otherwise bad config, exit 2), and is effectiv
 `cap`; the dispatch listing and the claim transaction bind the same value. Eligible graph children sort before unrelated new work, but
 reserve no idle capacity and never interrupt active unrelated work. Active siblings may finish
 after another child hard-fails; no later child may start.
+
+**Multiple active graphs.** Up to `max_active_graphs` materialized graphs execute side by side.
+The decomposition coordinator owns only the single planning graph (one freeze); it never selects
+or caches "the" active graph. Execution has no per-graph daemon state: every dispatch pass
+re-reads one candidate listing on a short-lived connection (`priority DESC, id ASC`), and each
+admission's claim runs in its own `BEGIN IMMEDIATE` transaction, so no read transaction spans
+ticks and no provider call runs inside one. Graph scoping is per child: the listing, the claim,
+the hard-failure hold (`block_graph_if_child_failed`), the reviewer graph blocker (`block_graph`),
+and completion (`complete_graph_if_final_child` and its explicit-recovery variants) all resolve
+the graph through the child's own active membership row and evaluate holds, hard-failed siblings,
+the per-graph working limit, and final-child completion against that `graph_id` only. A held graph
+withholds only its own children; another graph keeps dispatching and can complete. Children of
+every graph share the worker `cap` and never exceed it in aggregate, which also bounds each pass
+to at most `cap` admissions; each graph's `max_graph_children_working` limit applies on top.
+Startup reconciliation likewise evaluates every `active`/`blocked` graph by its own id in
+`id ASC` order, each in its own short transaction, and startup inspection considers every
+non-terminal graph rather than one selected row.
 
 Only a hard child failure holds the graph (`generated-child-failed`). A retryable daemon park of a
 child — `status='failed'` with `refs.daemon_parked` and a `daemon_resume_status`, e.g. a
