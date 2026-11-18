@@ -1029,7 +1029,6 @@ pub fn resolve_reviewer_cap(configured: Option<i64>, cap: usize) -> Result<usize
 /// Effective reviewer cap as resolved from a serve config file alone, for
 /// read-only consumers that must agree with the daemon's dispatch gate. A
 /// `--cap` passed only on the `serve` command line is not visible here.
-#[allow(dead_code)] // Exposed for read-only status consumers added independently.
 pub fn file_reviewer_cap(cfg: &ServeFileConfig) -> Result<i64> {
     let limit = resolve_reviewer_cap(cfg.reviewer_cap, cfg.cap.unwrap_or(DEFAULT_CAP))?;
     Ok(i64::try_from(limit).unwrap_or(i64::MAX))

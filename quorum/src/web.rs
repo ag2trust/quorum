@@ -378,6 +378,8 @@ fn reviewing_band(
         .iter()
         .filter(|agent| agent["role"] == "reviewer")
         .count() as i64;
+    // Computed once for the whole band rather than once per task below.
+    let freeze_active = quorum_core::stats::decomposition_freeze_active(conn)?;
     let tasks = ids
         .into_iter()
         .map(|id| {
@@ -390,6 +392,7 @@ fn reviewing_band(
                     conn,
                     id,
                     task.refs.as_deref(),
+                    freeze_active,
                     live_reviewer_count,
                     Some(reviewer_cap),
                 )? {

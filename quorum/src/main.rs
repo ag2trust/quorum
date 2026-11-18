@@ -232,15 +232,17 @@ fn status_snapshot(online_window: i64) -> Result<quorum_core::stats::Stats> {
     )
 }
 
-/// Best-effort reviewer cap for the read-only status path. `None` when no repo/serve
-/// config is resolvable or the file is missing/malformed, so `quorum status` keeps
-/// working before the daemon is configured (issue #415); the daemon itself is the
-/// authority that validates and enforces `reviewer_cap` at `quorum serve` startup.
+/// Best-effort reviewer cap for the read-only status path. Uses the same
+/// `serve_config::load` the `web` command relies on, so a missing `serve.toml` (the
+/// default, supported configuration) still resolves `file_reviewer_cap`'s default cap
+/// exactly like `quorum web` does, rather than silently reporting no cap (issue #415).
+/// `None` when no repo is resolvable or the file is unreadable/malformed, so `quorum
+/// status` keeps working before the daemon is fully configured; the daemon itself is
+/// the authority that validates and enforces `reviewer_cap` at `quorum serve` startup.
 fn status_reviewer_cap() -> Option<i64> {
     let repo = paths::try_resolve_repo()?;
     let path = serve_config::default_config_path(&repo).ok()?;
-    let contents = std::fs::read_to_string(path).ok()?;
-    let file_cfg: serve_config::ServeFileConfig = toml::from_str(&contents).ok()?;
+    let file_cfg = serve_config::load(&path, false).ok()?;
     serve_config::file_reviewer_cap(&file_cfg).ok()
 }
 
