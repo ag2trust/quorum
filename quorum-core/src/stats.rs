@@ -366,26 +366,6 @@ pub struct DecompositionStatusView {
     pub failed_children: Vec<i64>,
     pub reasons: Vec<String>,
     pub members: Vec<DecompositionMemberView>,
-    /// Set when the graph has sat in `freeze-requested`/`draining` longer than
-    /// [`DECOMPOSITION_DRAIN_STALL_SECS`]; counted as stalled by `stats`.
-    pub drain_stall: Option<DecompositionDrainStall>,
-}
-
-/// A graph that has been `freeze-requested` or `draining` longer than this is
-/// reported as stalled. Draining waits for already-started tasks to finish, so
-/// the bound sits well above one ordinary work + review cycle.
-pub const DECOMPOSITION_DRAIN_STALL_SECS: i64 = 2 * 3600;
-
-/// Provider-blocked tasks named in one status reason; the rest are counted.
-const PROVIDER_BLOCKED_REASON_TASKS: usize = 3;
-
-/// Durable view of which daemon drain-readiness condition is holding a graph.
-#[derive(Debug, Serialize, PartialEq, Eq)]
-pub struct DecompositionDrainStall {
-    /// Seconds since the graph last changed state.
-    pub age_secs: i64,
-    /// Human-readable false drain conditions, bounded and never empty.
-    pub blockers: Vec<String>,
 }
 
 /// The server-owned task journey. Consumers render this projection and do not
@@ -894,18 +874,11 @@ fn stats_impl(
     let (recent_errors, older_errors_silenced) = deduped_errors(conn, now)?;
     let alerts = alert_messages(conn, now)?;
     let merge_blockers = merge_blockers(conn, now)?;
-    let drain_stalled = decomposition
-        .as_ref()
-        .is_some_and(|graph| graph.drain_stall.is_some());
-    let health = if drain_stalled {
-        HealthVerdict::Stalled
-    } else {
-        compute_health(
-            &daemon_agents,
-            !recent_errors.is_empty(),
-            !alerts.is_empty(),
-        )
-    };
+    let health = compute_health(
+        &daemon_agents,
+        !recent_errors.is_empty(),
+        !alerts.is_empty(),
+    );
     let stalled_count = daemon_agents
         .iter()
         .filter(|d| is_stall_eligible(d))
@@ -913,8 +886,7 @@ fn stats_impl(
             matches!(d.last_activity_age_secs, Some(age) if age > 180)
                 || d.last_activity_age_secs.is_none()
         })
-        .count() as i64
-        + i64::from(drain_stalled);
+        .count() as i64;
     let session_cost: f64 = daemon_agents.iter().map(|d| d.cost_usd).sum();
     let unbacked_prs = crate::drift::unbacked_pr_events(conn, now).unwrap_or_default();
     let twin_prs = crate::drift::twin_pr_events(conn, now).unwrap_or_default();
@@ -3030,7 +3002,6 @@ fn reviewing_tasks(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let freeze_active = decomposition_freeze_active(conn)?;
     let live_reviewer_count = daemon_agents
         .iter()
         .filter(|agent| agent.role == "reviewer")
@@ -3060,7 +3031,6 @@ fn reviewing_tasks(
                         conn,
                         id,
                         refs.as_deref(),
-                        freeze_active,
                         &view,
                         slot_full,
                     )?;
@@ -3171,14 +3141,9 @@ fn awaiting_reviewer_reason(
     conn: &Connection,
     task_id: i64,
     refs: Option<&str>,
-    freeze_active: bool,
 ) -> Result<Option<String>> {
     if !classification_complete(refs) {
-        return Ok(Some(if freeze_active {
-            "classification pending (a decomposition freeze is active)".to_string()
-        } else {
-            "classification pending".to_string()
-        }));
+        return Ok(Some("classification pending".to_string()));
     }
     // Same count the daemon uses. The no-work exclusion lives only in
     // `total_reviewer_runs`.
@@ -3209,30 +3174,16 @@ fn awaiting_reviewer_reason_for_view(
     conn: &Connection,
     task_id: i64,
     refs: Option<&str>,
-    freeze_active: bool,
     view: &ApprovalView,
     slot_full: bool,
 ) -> Result<Option<String>> {
-    Ok(
-        awaiting_reviewer_reason(conn, task_id, refs, freeze_active)?
-            .or_else(|| {
-                (*view == ApprovalView::HeadUnknown).then(|| {
-                    "approval recorded but the current PR head is not durably known".to_string()
-                })
+    Ok(awaiting_reviewer_reason(conn, task_id, refs)?
+        .or_else(|| {
+            (*view == ApprovalView::HeadUnknown).then(|| {
+                "approval recorded but the current PR head is not durably known".to_string()
             })
-            .or_else(|| slot_full.then(|| "awaiting reviewer slot".to_string())),
-    )
-}
-
-/// Whether a decomposition freeze is active, for callers that need it as context on a
-/// classification-pending reason. Cheap and short; callers computing it once per batch
-/// (rather than once per task) avoid redundant round-trips on a polled path.
-pub fn decomposition_freeze_active(conn: &Connection) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM task_decompositions WHERE freeze_active=1)",
-        [],
-        |r| r.get(0),
-    )?)
+        })
+        .or_else(|| slot_full.then(|| "awaiting reviewer slot".to_string())))
 }
 
 /// Reviewer-cap-aware reason an in-review task has no live reviewer, for read-only status
@@ -3242,14 +3193,11 @@ pub fn decomposition_freeze_active(conn: &Connection) -> Result<bool> {
 /// `approved, merge pending`, not `awaiting reviewer`, matching `quorum status`/cockpit),
 /// an unknown approval head wins next, then the specific durable reasons from
 /// [`awaiting_reviewer_reason`], with "awaiting reviewer slot" as the lowest-precedence
-/// reason; `None` when the cause (if any) is not DB-visible. `freeze_active` is
-/// [`decomposition_freeze_active`]'s result, computed once per batch by the caller rather
-/// than once per task here.
+/// reason; `None` when the cause (if any) is not DB-visible.
 pub fn task_awaiting_reviewer_reason(
     conn: &Connection,
     task_id: i64,
     refs: Option<&str>,
-    freeze_active: bool,
     live_reviewer_count: i64,
     reviewer_cap: Option<i64>,
 ) -> Result<Option<String>> {
@@ -3259,9 +3207,7 @@ pub fn task_awaiting_reviewer_reason(
             "all required reviews approved at head {}",
             short_sha(&head)
         ))),
-        view => {
-            awaiting_reviewer_reason_for_view(conn, task_id, refs, freeze_active, &view, slot_full)
-        }
+        view => awaiting_reviewer_reason_for_view(conn, task_id, refs, &view, slot_full),
     }
 }
 
@@ -3393,7 +3339,7 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
             "SELECT d.id, d.source_task_id, t.title, t.status, d.state, d.active,
                     d.proposal_attempts, d.provider_failures, d.planner_provider,
                     d.planner_model, a.effort, d.accepted_plan_revision, d.hold_summary,
-                    d.hold_code,d.operator_retry_count,d.freeze_active,d.updated_at
+                    d.hold_code,d.operator_retry_count
              FROM task_decompositions d
              JOIN tasks t ON t.id=d.source_task_id
              LEFT JOIN role_assignments a ON a.id=d.planner_assignment_id AND a.role='planner'
@@ -3419,8 +3365,6 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
                     r.get::<_, Option<String>>(12)?,
                     r.get::<_, Option<String>>(13)?,
                     r.get::<_, i64>(14)?,
-                    r.get::<_, bool>(15)?,
-                    r.get::<_, i64>(16)?,
                 ))
             },
         )
@@ -3441,19 +3385,10 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
         hold_summary,
         hold_code,
         operator_retry_count,
-        freeze_active,
-        graph_updated_at,
     )) = graph
     else {
         return Ok(None);
     };
-    let drain_stall = decomposition_drain_stall(
-        conn,
-        source_task_id,
-        &graph_state,
-        freeze_active,
-        now - graph_updated_at,
-    )?;
     let retryable_planning_hold =
         crate::decomposition::exhausted_planning_retry_is_eligible(conn, source_task_id, now)?;
     let planner_log_dir: Option<String> = conn
@@ -3527,12 +3462,6 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
             reasons.push(reason);
         }
     }
-    // Prepended so the bound below can only drop older history, never the wait.
-    if let Some(wait) =
-        provider_blocked_wait_reason(conn, source_task_id, &graph_state, freeze_active)?
-    {
-        reasons.insert(0, wait);
-    }
     reasons.truncate(6);
 
     let dispatch_hold = if graph_state != "active" || !graph_active {
@@ -3575,91 +3504,7 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
         failed_children,
         reasons,
         members,
-        drain_stall,
     }))
-}
-
-/// Name the tasks a released `provider-backoff` graph is waiting on and the
-/// operator action that clears them. This is an expected wait, not a stalled
-/// drain, so it is reported as a reason and never through `drain_stall`. Status
-/// runs outside the daemon, so this projects the durable block; whether a task
-/// still holds an in-memory slot is not inferred.
-fn provider_blocked_wait_reason(
-    conn: &Connection,
-    source_task_id: i64,
-    graph_state: &str,
-    freeze_active: bool,
-) -> Result<Option<String>> {
-    if graph_state != "provider-backoff" || freeze_active {
-        return Ok(None);
-    }
-    let blocked = crate::decomposition::provider_blocked_started_task_ids(conn, source_task_id)?;
-    if blocked.is_empty() {
-        return Ok(None);
-    }
-    let mut named = blocked
-        .iter()
-        .take(PROVIDER_BLOCKED_REASON_TASKS)
-        .map(|id| format!("#{id}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if blocked.len() > PROVIDER_BLOCKED_REASON_TASKS {
-        let omitted = blocked.len() - PROVIDER_BLOCKED_REASON_TASKS;
-        named.push_str(&format!(" +{omitted} more"));
-    }
-    Ok(Some(format!(
-        "planning waits on provider-blocked {named}; retry with task-retry"
-    )))
-}
-
-/// Project which durable `decomposition_drain_ready` input (serve/mod.rs) is
-/// still false for a graph stuck in its freeze/drain phase. Status runs outside
-/// the daemon, so in-memory work (classifier, doctor, pre-review checks) is
-/// named only as the residual when no durable condition is false.
-fn decomposition_drain_stall(
-    conn: &Connection,
-    source_task_id: i64,
-    graph_state: &str,
-    freeze_active: bool,
-    age_secs: i64,
-) -> Result<Option<DecompositionDrainStall>> {
-    if !matches!(graph_state, "freeze-requested" | "draining")
-        || age_secs <= DECOMPOSITION_DRAIN_STALL_SECS
-    {
-        return Ok(None);
-    }
-    let mut blockers = Vec::new();
-    if !freeze_active {
-        blockers.push("repository freeze not held".to_string());
-    } else if graph_state == "freeze-requested" {
-        blockers.push("daemon has not advanced freeze-requested to draining".to_string());
-    }
-    let mut role_stmt =
-        conn.prepare("SELECT role, count(*) FROM journal GROUP BY role ORDER BY role")?;
-    let roles = role_stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let journal_rows: i64 = roles.iter().map(|(_, count)| count).sum();
-    if journal_rows > 0 {
-        let roles = roles
-            .iter()
-            .map(|(role, count)| format!("{role}={count}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        blockers.push(format!("journal rows={journal_rows} ({roles})"));
-    }
-    let started = crate::tasks::count_started_non_terminal_excluding(conn, source_task_id)?;
-    if started > 0 {
-        blockers.push(format!("started non-terminal tasks={started}"));
-    }
-    if blockers.is_empty() {
-        blockers.push(
-            "no durable blocker; waiting on daemon in-memory work \
-             (worker, reviewer, classifier, doctor, or pre-review checks)"
-                .to_string(),
-        );
-    }
-    Ok(Some(DecompositionDrainStall { age_secs, blockers }))
 }
 
 /// Resolve only an explicit task tier into a display identity. Queue/blocked status
@@ -5825,338 +5670,68 @@ mod tests {
     }
 
     #[test]
-    fn long_draining_graph_is_stalled_and_names_the_drain_blocker() {
+    fn freeze_graph_with_started_work_reports_no_repo_wide_drain() {
         let (_d, mut c) = open_tmp();
         let now = 1_000_000;
         let source =
             crate::tasks::create(&mut c, "A", "source", None, 0, None, None, None, None, 100)
                 .unwrap();
-        let other =
-            crate::tasks::create(&mut c, "A", "other", None, 0, None, None, None, None, 100)
-                .unwrap();
-        c.execute(
-            "UPDATE tasks SET status='planning' WHERE id=?1",
-            params![source],
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO task_decompositions
-             (source_task_id,state,active,freeze_active,planned_source_revision,
-              created_at,updated_at)
-             VALUES (?1,'draining',0,1,1,?2,?2)",
-            params![source, now - 60],
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO journal(agent,role,task_id,session_id,phase,updated_at)
-             VALUES ('decomposition-planner-1','planner',?1,'s','working',?2)",
-            params![source, now - 60],
-        )
-        .unwrap();
-
-        // A brief drain is ordinary progress.
-        let brief = stats(&c, now, 300).unwrap();
-        assert!(brief.decomposition.unwrap().drain_stall.is_none());
-        assert_eq!(brief.health, HealthVerdict::OnTrack);
-        assert_eq!(brief.stalled_count, 0);
-
-        // Exactly at the bound is still not stalled; one second past is.
-        c.execute(
-            "UPDATE task_decompositions SET updated_at=?1",
-            params![now - DECOMPOSITION_DRAIN_STALL_SECS],
-        )
-        .unwrap();
-        assert!(stats(&c, now, 300)
-            .unwrap()
-            .decomposition
-            .unwrap()
-            .drain_stall
-            .is_none());
-        c.execute(
-            "UPDATE task_decompositions SET updated_at=?1",
-            params![now - DECOMPOSITION_DRAIN_STALL_SECS - 1],
-        )
-        .unwrap();
-        let stalled = stats(&c, now, 300).unwrap();
-        assert_eq!(stalled.health, HealthVerdict::Stalled);
-        assert_eq!(stalled.stalled_count, 1);
-        let stall = stalled.decomposition.unwrap().drain_stall.unwrap();
-        assert_eq!(stall.age_secs, DECOMPOSITION_DRAIN_STALL_SECS + 1);
-        assert_eq!(stall.blockers, vec!["journal rows=1 (planner=1)"]);
-
-        // Started non-terminal work is named; the planning source is excluded.
-        c.execute("DELETE FROM journal", []).unwrap();
-        c.execute(
-            "UPDATE tasks SET status='in-review' WHERE id=?1",
-            params![other],
-        )
-        .unwrap();
-        let stall = stats(&c, now, 300)
-            .unwrap()
-            .decomposition
-            .unwrap()
-            .drain_stall
-            .unwrap();
-        assert_eq!(stall.blockers, vec!["started non-terminal tasks=1"]);
-
-        // With no durable blocker the residual in-memory conditions are named.
-        c.execute("UPDATE tasks SET status='done' WHERE id=?1", params![other])
-            .unwrap();
-        let stall = stats(&c, now, 300)
-            .unwrap()
-            .decomposition
-            .unwrap()
-            .drain_stall
-            .unwrap();
-        assert_eq!(stall.blockers.len(), 1);
-        assert!(stall.blockers[0].contains("classifier, doctor, or pre-review checks"));
-
-        // A graph that left the drain phase is never drain-stalled.
-        c.execute("UPDATE task_decompositions SET state='planning'", [])
-            .unwrap();
-        let planning = stats(&c, now, 300).unwrap();
-        assert!(planning.decomposition.unwrap().drain_stall.is_none());
-        assert_eq!(planning.stalled_count, 0);
-    }
-
-    const PROVIDER_BLOCKED_REFS: &str =
-        r#"{"runner_provider_block":{"provider":"codex","reason":"quota"}}"#;
-
-    /// A drain held by `blocked` provider-blocked workers, ids ascending.
-    fn provider_blocked_drain(
-        c: &mut Connection,
-        blocked: usize,
-        updated_at: i64,
-    ) -> (i64, i64, Vec<i64>) {
-        let source =
-            crate::tasks::create(c, "A", "source", None, 0, None, None, None, None, 100).unwrap();
-        c.execute(
-            "UPDATE tasks SET status='planning' WHERE id=?1",
-            params![source],
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO task_decompositions
-             (source_task_id,state,active,freeze_active,planned_source_revision,
-              created_at,updated_at)
-             VALUES (?1,'draining',0,1,1,?2,?2)",
-            params![source, updated_at],
-        )
-        .unwrap();
-        let graph = c.last_insert_rowid();
         // Created before any is started: `create` sweeps, reclaiming lease-less workers.
-        let tasks = (0..blocked)
+        let others = (0..2)
             .map(|_| {
-                crate::tasks::create(c, "A", "work", None, 0, None, None, None, None, 100).unwrap()
+                crate::tasks::create(&mut c, "A", "work", None, 0, None, None, None, None, 100)
+                    .unwrap()
             })
             .collect::<Vec<_>>();
-        for id in &tasks {
-            c.execute(
-                "UPDATE tasks SET status='working',refs=?2 WHERE id=?1",
-                params![id, PROVIDER_BLOCKED_REFS],
-            )
-            .unwrap();
-        }
-        (graph, source, tasks)
-    }
-
-    fn total_changes(c: &Connection) -> i64 {
-        c.query_row("SELECT total_changes()", [], |r| r.get(0))
-            .unwrap()
-    }
-
-    #[test]
-    fn released_graph_names_the_provider_blocked_wait_without_stalling() {
-        let (_d, mut c) = open_tmp();
-        let now = 1_000_000;
-        let released_at = now - DECOMPOSITION_DRAIN_STALL_SECS - 1;
-        let (graph, _source, tasks) = provider_blocked_drain(&mut c, 1, released_at);
-        assert!(crate::decomposition::release_freeze_for_provider_block(
-            &mut c,
-            graph,
-            &[],
-            released_at
-        )
-        .unwrap());
-
-        let writes_before = total_changes(&c);
-        let view = stats(&c, now, 300).unwrap();
-        assert_eq!(
-            total_changes(&c),
-            writes_before,
-            "the wait is computed on read"
-        );
-        assert_eq!(view.health, HealthVerdict::OnTrack);
-        assert_eq!(view.stalled_count, 0);
-        let status = view.decomposition.unwrap();
-        assert_eq!(status.graph_state, "provider-backoff");
-        assert!(status.drain_stall.is_none());
-        assert_eq!(
-            status.reasons,
-            vec![format!(
-                "planning waits on provider-blocked #{}; retry with task-retry",
-                tasks[0]
-            )]
-        );
-        assert_eq!(
-            status.dispatch_hold.as_deref(),
-            Some("implementation dispatch held: graph state=provider-backoff, active=0")
-        );
-    }
-
-    #[test]
-    fn provider_blocked_wait_survives_reason_truncation() {
-        let (_d, mut c) = open_tmp();
-        let (graph, _source, tasks) = provider_blocked_drain(&mut c, 1, 100);
-        assert!(
-            crate::decomposition::release_freeze_for_provider_block(&mut c, graph, &[], 100)
-                .unwrap()
-        );
         c.execute(
-            "UPDATE task_decompositions SET hold_summary='held' WHERE id=?1",
-            params![graph],
+            "UPDATE tasks SET status='planning' WHERE id=?1",
+            params![source],
         )
         .unwrap();
-        for ordinal in 1..=6 {
-            c.execute(
-                "INSERT INTO decomposition_attempts
-                 (graph_id,source_revision,kind,ordinal,reason_code,summary,created_at)
-                 VALUES (?1,1,'proposal',?2,'invalid',?3,100)",
-                params![graph, ordinal, format!("reason {ordinal}")],
-            )
-            .unwrap();
-        }
-
-        let reasons = decomposition_status(&c, 100).unwrap().unwrap().reasons;
-        assert_eq!(reasons.len(), 6, "owner-facing reasons stay bounded");
-        assert_eq!(
-            reasons[0],
-            format!(
-                "planning waits on provider-blocked #{}; retry with task-retry",
-                tasks[0]
-            )
-        );
-        assert_eq!(reasons[1], "held");
-    }
-
-    #[test]
-    fn provider_blocked_wait_names_three_tasks_and_counts_the_rest() {
-        let (_d, mut c) = open_tmp();
-        let (graph, _source, tasks) = provider_blocked_drain(&mut c, 5, 100);
-        assert!(
-            crate::decomposition::release_freeze_for_provider_block(&mut c, graph, &[], 100)
-                .unwrap()
-        );
-        let reason =
-            |c: &Connection| decomposition_status(c, 100).unwrap().unwrap().reasons[0].clone();
-        assert_eq!(
-            reason(&c),
-            format!(
-                "planning waits on provider-blocked #{}, #{}, #{} +2 more; \
-                 retry with task-retry",
-                tasks[0], tasks[1], tasks[2]
-            )
-        );
-
-        // Exactly three tasks are all named, so nothing is reported as omitted.
         c.execute(
-            "UPDATE tasks SET status='done' WHERE id IN (?1,?2)",
-            params![tasks[0], tasks[1]],
+            "UPDATE tasks SET status='in-review' WHERE id=?1",
+            params![others[0]],
         )
         .unwrap();
-        assert_eq!(
-            reason(&c),
-            format!(
-                "planning waits on provider-blocked #{}, #{}, #{}; retry with task-retry",
-                tasks[2], tasks[3], tasks[4]
-            )
-        );
-    }
-
-    #[test]
-    fn provider_backoff_without_a_blocked_started_task_adds_no_wait_reason() {
-        let (_d, mut c) = open_tmp();
-        let (graph, source, tasks) = provider_blocked_drain(&mut c, 1, 100);
-        assert!(
-            crate::decomposition::release_freeze_for_provider_block(&mut c, graph, &[], 100)
-                .unwrap()
-        );
-        let reasons = |c: &Connection| decomposition_status(c, 100).unwrap().unwrap().reasons;
-
-        // The task was retried: it is still started but no longer blocked.
-        c.execute("UPDATE tasks SET refs=NULL WHERE id=?1", params![tasks[0]])
-            .unwrap();
-        assert!(reasons(&c).is_empty());
-
-        // A block carried by a task that is no longer started does not hold planning.
         c.execute(
-            "UPDATE tasks SET status='done',refs=?2 WHERE id=?1",
-            params![tasks[0], PROVIDER_BLOCKED_REFS],
+            "UPDATE tasks SET status='working',
+                 refs='{\"runner_provider_block\":{\"provider\":\"codex\",\"reason\":\"quota\"}}'
+             WHERE id=?1",
+            params![others[1]],
         )
         .unwrap();
-        assert!(reasons(&c).is_empty());
-
-        // The planning source never waits on itself.
+        // Long-lived freeze phases: under the drain these reported a stall.
         c.execute(
-            "UPDATE tasks SET status='working',refs=?2 WHERE id=?1",
-            params![source, PROVIDER_BLOCKED_REFS],
+            "INSERT INTO task_decompositions
+             (source_task_id,state,active,freeze_active,planned_source_revision,
+              created_at,updated_at)
+             VALUES (?1,'draining',0,1,1,?2,?2)",
+            params![source, now - 3 * 24 * 3600],
         )
         .unwrap();
-        assert!(reasons(&c).is_empty());
-    }
 
-    #[test]
-    fn provider_blocked_wait_is_reported_only_for_a_released_backoff() {
-        let (_d, mut c) = open_tmp();
-        let now = 1_000_000;
-        let old = now - DECOMPOSITION_DRAIN_STALL_SECS - 1;
-        let (_graph, _source, _tasks) = provider_blocked_drain(&mut c, 1, old);
-
-        // A freeze-owning graph keeps today's drain_stall output and no wait reason.
-        for (state, expected_blockers) in [
-            (
-                "freeze-requested",
-                vec![
-                    "daemon has not advanced freeze-requested to draining",
-                    "started non-terminal tasks=1",
-                ],
-            ),
-            ("draining", vec!["started non-terminal tasks=1"]),
+        for (state, freeze_active) in [
+            ("freeze-requested", 1),
+            ("draining", 1),
+            ("planning", 1),
+            ("provider-backoff", 0),
         ] {
-            c.execute("UPDATE task_decompositions SET state=?1", params![state])
-                .unwrap();
-            let view = stats(&c, now, 300).unwrap();
-            assert_eq!(view.health, HealthVerdict::Stalled, "{state}");
-            assert_eq!(view.stalled_count, 1, "{state}");
-            let status = view.decomposition.unwrap();
-            assert_eq!(
-                status.drain_stall.unwrap().blockers,
-                expected_blockers,
-                "{state}"
-            );
-            assert!(status.reasons.is_empty(), "{state}");
-        }
-
-        // Still frozen in provider-backoff: the release has not happened.
-        c.execute(
-            "UPDATE task_decompositions SET state='provider-backoff'",
-            [],
-        )
-        .unwrap();
-        let status = decomposition_status(&c, now).unwrap().unwrap();
-        assert_eq!(status.graph_state, "provider-backoff");
-        assert!(status.reasons.is_empty());
-
-        // Every other unfrozen graph state stays silent despite the blocked task.
-        for state in ["planning", "blocked"] {
             c.execute(
-                "UPDATE task_decompositions SET state=?1,freeze_active=0",
-                params![state],
+                "UPDATE task_decompositions SET state=?1,freeze_active=?2",
+                params![state, freeze_active],
             )
             .unwrap();
-            let status = decomposition_status(&c, now).unwrap().unwrap();
+            let view = stats(&c, now, 300).unwrap();
+            assert_eq!(view.health, HealthVerdict::OnTrack, "{state}");
+            assert_eq!(view.stalled_count, 0, "{state}");
+            let json = serde_json::to_value(&view).unwrap();
+            assert!(
+                json["decomposition"].get("drain_stall").is_none(),
+                "{state}: no drain projection"
+            );
+            let status = view.decomposition.unwrap();
             assert_eq!(status.graph_state, state);
-            assert!(status.reasons.is_empty(), "{state}");
+            assert!(status.reasons.is_empty(), "{state}: {:?}", status.reasons);
         }
     }
 
@@ -6633,7 +6208,7 @@ mod tests {
             "unknown cause keeps the generic label with no reason"
         );
 
-        // A freeze is surfaced as context on a classification gap only.
+        // A freeze is not a drain: it adds no context to a classification gap.
         c.execute(
             "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,planned_source_revision,created_at,updated_at)
              VALUES (?1,'planning',1,1,0,100,100)",
@@ -6650,10 +6225,7 @@ mod tests {
                 .unwrap()["reason"]
                 .clone()
         };
-        assert_eq!(
-            reason(unclassified),
-            "classification pending (a decomposition freeze is active)"
-        );
+        assert_eq!(reason(unclassified), "classification pending");
         assert!(reason(unknown).is_null());
     }
 

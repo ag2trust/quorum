@@ -194,13 +194,12 @@ pub fn unclassified_tasks(conn: &Connection) -> Result<Vec<TaskForClassification
 }
 
 /// Unclassified tasks that have already started (`working`, `in-review`,
-/// `rework`) — exactly the set a decomposition drain waits on
-/// (`tasks::count_started_non_terminal_excluding`). A review-only task is
-/// created directly `in-review` and unclassified, and its reviewer cannot
-/// dispatch until it is classified. A decomposition freeze therefore admits the
-/// classifier for this set only: these tasks can never become a planning
-/// source or claim new implementation work, and the drain cannot finish until
-/// they reach a terminal state.
+/// `rework`). A review-only task is created directly `in-review` and
+/// unclassified, and its reviewer cannot dispatch until it is classified. A
+/// decomposition freeze therefore admits the classifier for this set only:
+/// these tasks can never become a planning source or claim new implementation
+/// work, and gating them would strand in-flight work for the whole planning
+/// attempt.
 pub fn unclassified_started_tasks(conn: &Connection) -> Result<Vec<TaskForClassification>> {
     unclassified_tasks_where(conn, "status IN ('working', 'in-review', 'rework')")
 }

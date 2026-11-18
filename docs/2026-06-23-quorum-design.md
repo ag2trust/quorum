@@ -1844,9 +1844,7 @@ On daemon startup, before generic crash recovery:
    retained worker without changing either field, so restart can claim the replay instead of
    stranding its marker on an `in-review` task. Killing that worker demotes the task and removes
    an unconsumed `requested` marker in one transaction, so the retained approvals can queue a new
-   handoff. A decomposition freeze counts `merging` among started non-terminal work, in both the
-   tick gate and the atomic frozen-base bind; it cannot capture its frozen base while an orphan
-   handoff still awaits Phase 4e reconciliation.
+   handoff.
    Reviewer verdict persistence uses the task's durable author when no worker is live. When a
    repaired R1 returns and an exact task/author/head-bound R2 row was retained, that R2 is reused
    rather than provisioned again. Every persisted role remains bound to the launch-validated
@@ -2941,8 +2939,14 @@ filename. Runner-specific process options remain scoped under `[claude]`, `[code
 
 A non-continuation, admission-ready, non-terminal-leaf implementation task is a decomposition
 source only when it is L at `cx_est` 5 or XL at `cx_est` 4 or 5. After its dependencies are done,
-the daemon serializes decomposition per repository: it stops new managed delivery, lets active
-delivery finish, and plans against the resulting frozen base. S/M implementation tasks dispatch
+the daemon serializes decomposition per repository: one graph plans at a time. There is no drain
+precondition: unrelated started work keeps running and merging while a graph plans. When the graph
+moves from `draining` to `planning`, the daemon reads the current base-branch head (outside any DB
+transaction) and binds it as `frozen_base_sha` in one guarded `BEGIN IMMEDIATE` update (state
+`draining`, freeze held, inactive, no base yet bound); a zero-row bind is an expected lost race.
+That recorded SHA is the planner's base for the whole attempt, served through the read-only
+snapshot archive described below, so later base movement is never visible to it. Generated
+children still branch from the latest base when they are dispatched. S/M implementation tasks dispatch
 normally regardless of complexity; non-continuation L tasks with `cx_est` 1–4 also dispatch
 directly to one worker. Every `continue_pr` task dispatches directly because only the source task carries authority
 to publish to the bound PR. Every review-only task dispatches directly to reviewer provisioning at
@@ -2980,8 +2984,11 @@ streamed-stdout backstop; no provider spend ceiling is set. The response remains
 bounded to 8 KiB per text field and 32 list items. A separate planner spawn boundary enforces
 those restrictions and accepts only one bounded, closed plan or blocker response; a provider whose
 transport cannot be separated from model-generated network or filesystem access is refused
-fail-closed. The view is an archive of the recorded frozen base SHA,
-and source drift is rejected before launch. A valid concrete blocker parks the source immediately
+fail-closed. The view is an archive of the recorded frozen base SHA, built from the object store
+regardless of the repository's current HEAD, so the base does not move during one planning attempt
+even when unrelated merges advance the base branch. Source-revision drift is still rejected: an
+accepted source edit removes the pending aggregate, so the attempt's planner run no longer resolves
+to a live graph and cannot submit or be accepted. A valid concrete blocker parks the source immediately
 with no second opinion.
 
 The planner reports its plan by calling the daemon-owned `submit_plan` tool exactly once, over
@@ -3148,13 +3155,10 @@ self-attestation nor redesigns the worker filesystem sandbox.
 
 Semantic proposal rejections and provider/protocol failures have independent caps of three per
 unchanged source revision. Semantic retries keep the repository freeze. Provider failure releases
-the freeze during backoff, and retry drains again. Separately, a `freeze-requested` or `draining`
-graph whose started non-terminal tasks other than the source are all provider-blocked, with no such
-task holding a live slot, releases through `provider-backoff` with `freeze_active=0` and its frozen
-SHA cleared. That release is a wait rather than a planning failure: it records no attempt and
-increments neither `provider_failures` nor `proposal_attempts`. When backoff expires, reacquisition
-waits while an idle provider-blocked task remains; the same guard applies when an ordinary provider
-failure put the graph into backoff. Full prompts and transcripts are not persisted; only bounded
+the freeze during backoff and clears the frozen SHA; when backoff expires the graph reacquires the
+freeze through the ordinary guarded path and binds the then-current base head at its next planning
+start. There is no provider-blocked release valve: unrelated provider-blocked work neither holds
+planning nor delays reacquisition. Full prompts and transcripts are not persisted; only bounded
 structured attempts, the accepted closed proposal and its accepted classification needed to resume
 preclassification or validation, and final reasons are durable. Restart inspection never consumes a
 semantic proposal attempt.
@@ -3188,18 +3192,15 @@ retry count/cap without exposing planner transcripts.
 Reviewer provisioning reserves task authority in `BEGIN IMMEDIATE` before external resolution or
 process creation. The same transaction checks task phase, classification, and planning freeze;
 planning freeze acquisition excludes live reservations. The daemon releases the reservation only
-after reviewer attachment or complete failed-provision cleanup. Because the freeze drain waits for
-every already-started task, the ordinary classifier keeps running under a freeze for exactly that
-started set (`working`, `in-review`, `rework` — e.g. a review-only task created during the freeze,
-whose reviewer cannot dispatch unclassified); `open` tasks wait for the freeze to clear. A
-provider-blocked task remains in the started non-terminal drain count, so the frozen base is captured
-only after a real drain with zero started non-terminal tasks other than the source. Other blocked or
-parked tasks, as well as provider-blocked tasks that still hold a live slot, keep holding the drain.
-There is no automatic provider retry;
-progress requires an operator `task-retry`. After a provider-blocked release, status names the
-blocking task in decomposition reasons and reports it as an expected wait rather than a drain stall.
-The drain counts only journal rows with live work behind them, never a cached frozen-view marker, and
-the coordinator settles a previous graph's cached view, marker, and proposal whenever the selected
+after reviewer attachment or complete failed-provision cleanup. In-flight work continues under a
+freeze, so the ordinary classifier keeps running for the started set (`working`, `in-review`,
+`rework` — e.g. a review-only task created during the freeze, whose reviewer cannot dispatch
+unclassified); `open` tasks wait for the freeze to clear. Planning never waits on that work, on
+blocked, parked, or provider-blocked tasks, or on live-agent journal rows. There is no automatic
+provider retry for a provider-blocked task; progress requires an operator `task-retry`. Status
+reports no repository-wide drain: it has no drain-stall projection, health does not count a
+freeze phase as stalled, and a classification-pending reviewer wait carries no freeze context. The
+coordinator settles a previous graph's cached view, marker, and proposal whenever the selected
 aggregate changes.
 
 One `BEGIN IMMEDIATE` transaction creates the entire graph: every generated task with
@@ -3373,7 +3374,7 @@ edited. Daemon-owned lifecycle evidence remains writable.
 Decomposition reconciliation runs before merged-continuation adoption, ordinary recovery, and
 provisioning. A durable freeze
 resumes first. Complete graphs resume without recreation. Incomplete or inconsistent graphs start
-nothing; an unstarted graph may reset and replan within budget through the normal freeze/drain
+nothing; an unstarted graph may reset and replan within budget through the normal freeze
 path, while any delivery evidence requires cancellation and replacement except for the
 evidence-complete exact-continuation case above. Its automatic daemon discovery is a bounded
 reconciliation action on a consistent live graph. On a blocked graph it may only settle that exact
