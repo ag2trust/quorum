@@ -470,6 +470,19 @@ pub struct TaskDetail {
     pub task: Task,
     pub notes: Vec<Note>,
     pub agent_runs: Vec<crate::agent_runs::AgentRun>,
+    /// The planner blocker holding this source's decomposition graph, if any.
+    /// Absent from JSON when no planner blocker holds a graph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planner_hold: Option<PlannerHold>,
+}
+
+/// Planner blocker hold reason read from `task_decompositions.hold_code` /
+/// `hold_summary` (bounded by `ATTEMPT_SUMMARY_MAX_BYTES` at write time).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct PlannerHold {
+    pub graph_id: i64,
+    pub category: String,
+    pub summary: String,
 }
 
 #[derive(Default)]
@@ -1143,7 +1156,7 @@ pub const NO_REWORK_FINDINGS_MAX_BYTES: usize = 4096;
 const NO_REWORK_MAX_CHECKS: usize = 20;
 const NO_REWORK_CHECK_NAME_MAX_BYTES: usize = 200;
 
-fn truncate_utf8(text: &str, max_bytes: usize) -> String {
+pub(crate) fn truncate_utf8(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
     }
@@ -7568,11 +7581,38 @@ pub fn get_with_notes(conn: &Connection, id: i64) -> Result<Option<TaskDetail>> 
     };
     let notes = notes_for(conn, id)?;
     let agent_runs = crate::agent_runs::runs_for_task(conn, id)?;
+    let planner_hold = planner_hold_for(conn, id)?;
     Ok(Some(TaskDetail {
         task,
         notes,
         agent_runs,
+        planner_hold,
     }))
+}
+
+/// The newest held graph for `source_id` whose hold was written by a planner
+/// blocker (a `blocker` attempt at the planned revision names the hold code).
+fn planner_hold_for(conn: &Connection, source_id: i64) -> Result<Option<PlannerHold>> {
+    Ok(conn
+        .query_row(
+            "SELECT d.id,d.hold_code,d.hold_summary FROM task_decompositions d
+             WHERE d.source_task_id=?1 AND d.state='held'
+               AND d.hold_code IS NOT NULL AND d.hold_summary IS NOT NULL
+               AND EXISTS (SELECT 1 FROM decomposition_attempts a
+                           WHERE a.graph_id=d.id AND a.kind='blocker'
+                             AND a.source_revision=d.planned_source_revision
+                             AND a.reason_code=d.hold_code)
+             ORDER BY d.id DESC LIMIT 1",
+            [source_id],
+            |r| {
+                Ok(PlannerHold {
+                    graph_id: r.get(0)?,
+                    category: r.get(1)?,
+                    summary: r.get(2)?,
+                })
+            },
+        )
+        .optional()?)
 }
 
 pub fn add_note(
