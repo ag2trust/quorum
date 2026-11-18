@@ -692,6 +692,15 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   **`--watch` opens a fresh short read per ~1–2s tick (connect→read→close), then performs the OS
   sample — never holds a transaction across ticks or resource syscalls** (else it pins the WAL;
   verified). Read-only; never blocks writers under WAL.
+  `counted_graphs` (JSON) / the DECOMPOSITION section's `graphs N/limit` line (cockpit) names
+  every graph counted toward `max_active_graphs` — materialized (`active`/`blocked`) or holding
+  planning authority — not just one, reading the same `COUNTED_GRAPH_PREDICATE` the admission
+  guard uses. A queued task on the planner route carries `hold_reason` once those counted graphs
+  reach the resolved `max_active_graphs` limit, naming every graph filling it; below the limit
+  there is room for another graph, so nothing is held. The limit is resolved the same
+  best-effort way as the reviewer cap (repo config, else `DEFAULT_MAX_ACTIVE_GRAPHS`): when it
+  cannot be resolved, `counted_graphs` still lists every counted graph but no `hold_reason` is
+  computed, mirroring the existing `reviewer_cap: None` convention.
 - `quorum sweep` → unbounded physical reclamation + `wal_checkpoint(TRUNCATE)` (optional;
   sweep-on-write covers normal use)
 - `quorum init` → create `~/.quorum/`, DB, default config; open + migrate (idempotent)
@@ -2980,7 +2989,9 @@ exhaustion-path terminal-leaf fallback, when refused the same way, therefore par
 `proposal-attempts-exhausted` exactly as when no fallback applies. The daemon's
 `planning_candidate` selects sources by `priority DESC, id ASC` only while fewer than the limit
 are counted; the core guard remains the authority. `max_active_graphs` is daemon configuration
-threaded into each call, not stored in the database.
+threaded into each call, not stored in the database. `quorum status` reads the same
+`COUNTED_GRAPH_PREDICATE` read-only to list every counted graph and, once they fill the
+resolved limit, name all of them on the planner-routed queued task they hold (Ops, above).
 
 The planning freeze (`freeze_active=1`) remains the one-planner-run-at-a-time sentinel, now
 enforced by the guarded `NOT EXISTS (… freeze_active=1)` admission check rather than a unique

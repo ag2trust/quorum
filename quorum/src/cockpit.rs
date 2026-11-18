@@ -1,8 +1,8 @@
 use quorum_core::drift::{TwinPr, UnbackedPr};
 use quorum_core::stats::{
-    AlertMessage, BlockedTask, BranchSyncSummary, DaemonAgentView, DaemonLiveness,
-    DecompositionStatusView, DedupedError, HealthVerdict, HostResourcesView, MergeBlockerView,
-    PipelineTask, QueueTask, ResourceSeverity, ReviewingTask, Stats,
+    AlertMessage, BlockedTask, BranchSyncSummary, CountedGraphView, DaemonAgentView,
+    DaemonLiveness, DecompositionStatusView, DedupedError, HealthVerdict, HostResourcesView,
+    MergeBlockerView, PipelineTask, QueueTask, ResourceSeverity, ReviewingTask, Stats,
 };
 use std::io::Write;
 
@@ -139,7 +139,14 @@ fn render_with_style_at_width(s: &Stats, sty: &Style, w: &mut dyn Write, width: 
     render_blocked(&s.blocked, sty, w, width);
     render_reviewing(&s.reviewing, sty, w, width);
     render_pipeline(&s.pipeline, sty, w, width);
-    render_decomposition(s.decomposition.as_ref(), sty, w, width);
+    render_decomposition(
+        s.decomposition.as_ref(),
+        &s.counted_graphs,
+        s.max_active_graphs,
+        sty,
+        w,
+        width,
+    );
     render_merge_wait(&s.merge_blockers, sty, w, width);
     render_branch_syncs(&s.branch_syncs, sty, w, width);
     render_unbacked_prs(&s.unbacked_prs, &s.twin_prs, sty, w, width);
@@ -624,15 +631,38 @@ fn render_pipeline(pipeline: &[PipelineTask], sty: &Style, w: &mut dyn Write, wi
 
 fn render_decomposition(
     graph: Option<&DecompositionStatusView>,
+    counted: &[CountedGraphView],
+    max_active_graphs: Option<i64>,
     sty: &Style,
     w: &mut dyn Write,
     width: usize,
 ) {
+    if graph.is_none() && counted.is_empty() {
+        return;
+    }
+    let _ = writeln!(w);
+    let _ = writeln!(w, "{}", sty.section_rule("DECOMPOSITION", width));
+    if !counted.is_empty() {
+        let limit = max_active_graphs
+            .map(|limit| limit.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let _ = writeln!(
+            w,
+            "  graphs {}/{} counted toward max_active_graphs",
+            counted.len(),
+            limit,
+        );
+        for g in counted {
+            let _ = writeln!(
+                w,
+                "      #{:<5} source #{:<5} {}",
+                g.graph_id, g.source_task_id, g.state
+            );
+        }
+    }
     let Some(graph) = graph else {
         return;
     };
-    let _ = writeln!(w);
-    let _ = writeln!(w, "{}", sty.section_rule("DECOMPOSITION", width));
     let planner = match (&graph.planner_provider, &graph.planner_model) {
         (Some(provider), Some(model)) => format!("{provider}/{model}"),
         (Some(provider), None) => provider.clone(),
@@ -1115,6 +1145,49 @@ mod tests {
         assert!(output.contains("hold: implementation dispatch held: graph state=blocked"));
         assert!(output.contains("#42") && output.contains("deps #41"));
         assert!(output.contains("blocker: child failed review"));
+    }
+
+    #[test]
+    fn decomposition_names_every_counted_graph_and_the_configured_limit() {
+        let mut s = default_stats();
+        s.counted_graphs = vec![
+            CountedGraphView {
+                graph_id: 74,
+                source_task_id: 697,
+                state: "active".into(),
+            },
+            CountedGraphView {
+                graph_id: 81,
+                source_task_id: 700,
+                state: "blocked".into(),
+            },
+        ];
+        s.max_active_graphs = Some(2);
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("DECOMPOSITION"), "{output}");
+        assert!(
+            output.contains("graphs 2/2 counted toward max_active_graphs"),
+            "{output}"
+        );
+        assert!(
+            output.contains("#74") && output.contains("source #697") && output.contains("active"),
+            "{output}"
+        );
+        assert!(
+            output.contains("#81") && output.contains("source #700") && output.contains("blocked"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn decomposition_section_hidden_when_no_graph_is_counted() {
+        let s = default_stats();
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(!output.contains("DECOMPOSITION"), "{output}");
     }
 
     #[test]

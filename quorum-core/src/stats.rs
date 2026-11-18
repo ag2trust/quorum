@@ -254,9 +254,12 @@ pub struct QueueTask {
     pub tier_eff: String,
     pub priority: i64,
     pub pr: Option<i64>,
-    /// Why a planner-routed queued task is waiting on another graph, e.g.
-    /// `waiting for graph #74 (source #697) before planning`. Absent for
-    /// non-planner tasks and when no active or blocked graph holds planning.
+    /// Why a planner-routed queued task is waiting: the counted graphs
+    /// (`CountedGraphView`, see [`Stats::counted_graphs`]) that fill the
+    /// configured `max_active_graphs` limit, e.g. `waiting for
+    /// max_active_graphs limit 2/2: graph #74 (source #697, active), graph
+    /// #81 (source #700, blocked)`. Absent for non-planner tasks, when the
+    /// limit is unknown, and when fewer graphs are counted than the limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hold_reason: Option<String>,
 }
@@ -319,6 +322,18 @@ pub struct ArbiterVerdict {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub duration_ms: Option<i64>,
+}
+
+/// One graph counted toward the `max_active_graphs` admission limit:
+/// materialized (`active`/`blocked`, or the `active=1` scheduling slot) or
+/// currently holding planning authority (`freeze_active=1`). See
+/// `decomposition::COUNTED_GRAPH_PREDICATE`, the single source of truth this
+/// projection reads.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CountedGraphView {
+    pub graph_id: i64,
+    pub source_task_id: i64,
+    pub state: String,
 }
 
 /// Bounded child projection for the repository's current decomposition graph.
@@ -752,6 +767,15 @@ pub struct Stats {
     pub pipeline: Vec<PipelineTask>,
     /// Current planning cycle or active/held decomposition graph, if any.
     pub decomposition: Option<DecompositionStatusView>,
+    /// Every graph counted toward `max_active_graphs` admission (active,
+    /// blocked, or holding planning authority) — names all of them rather
+    /// than a single graph.
+    pub counted_graphs: Vec<CountedGraphView>,
+    /// The admission limit `counted_graphs` is measured against, when the
+    /// caller supplied one. `None` for a bare [`stats`] snapshot that did
+    /// not resolve a configured `max_active_graphs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_active_graphs: Option<i64>,
     /// #204: deduped errors from last hour.
     pub recent_errors: Vec<DedupedError>,
     /// #204: count of older errors silenced (>1h).
@@ -782,7 +806,7 @@ pub struct Stats {
 
 /// Gather a snapshot. Read-only.
 pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
-    stats_impl(conn, now, online_window, None)
+    stats_impl(conn, now, online_window, None, None)
 }
 
 /// Reviewer-cap-aware variant of [`stats`]. When `reviewer_cap` is supplied, an in-review
@@ -795,7 +819,22 @@ pub fn stats_with_reviewer_cap(
     online_window: i64,
     reviewer_cap: Option<i64>,
 ) -> Result<Stats> {
-    stats_impl(conn, now, online_window, reviewer_cap)
+    stats_impl(conn, now, online_window, reviewer_cap, None)
+}
+
+/// Full-option variant of [`stats_with_reviewer_cap`] that also reports the configured
+/// `max_active_graphs` admission limit. When supplied, a planner-routed queued task that
+/// is waiting because the counted graphs (active/blocked/holding planning authority) have
+/// reached that limit names every one of them. `None` behaves exactly like
+/// [`stats_with_reviewer_cap`] — no hold reason is computed without a known limit.
+pub fn stats_with_options(
+    conn: &Connection,
+    now: i64,
+    online_window: i64,
+    reviewer_cap: Option<i64>,
+    max_active_graphs: Option<i64>,
+) -> Result<Stats> {
+    stats_impl(conn, now, online_window, reviewer_cap, max_active_graphs)
 }
 
 fn stats_impl(
@@ -803,6 +842,7 @@ fn stats_impl(
     now: i64,
     online_window: i64,
     reviewer_cap: Option<i64>,
+    max_active_graphs: Option<i64>,
 ) -> Result<Stats> {
     let one = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<i64> {
         Ok(conn.query_row(sql, p, |r| r.get(0))?)
@@ -867,7 +907,8 @@ fn stats_impl(
     // vec when no events recorded — section is suppressed in the renderer.
     let activity = crate::activity::activity_summary(conn, now)?;
     let daemon_agents = daemon_agents_view(conn, now)?;
-    let queue_tasks_list = queue_tasks(conn)?;
+    let counted_graphs = counted_graphs(conn)?;
+    let queue_tasks_list = queue_tasks(conn, &counted_graphs, max_active_graphs)?;
     let reviewing = reviewing_tasks(conn, &daemon_agents, reviewer_cap)?;
     let pipeline = pipeline_tasks(conn, now)?;
     let decomposition = decomposition_status(conn, now)?;
@@ -917,6 +958,8 @@ fn stats_impl(
         reviewing,
         pipeline,
         decomposition,
+        counted_graphs,
+        max_active_graphs,
         recent_errors,
         older_errors_silenced,
         health,
@@ -2859,7 +2902,11 @@ pub fn tier_eff_label(labels_json: Option<&str>) -> String {
 }
 
 /// Individual claimable tasks for the QUEUE section (#204).
-fn queue_tasks(conn: &Connection) -> Result<Vec<QueueTask>> {
+fn queue_tasks(
+    conn: &Connection,
+    counted: &[CountedGraphView],
+    max_active_graphs: Option<i64>,
+) -> Result<Vec<QueueTask>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, labels, priority, refs, depends_on FROM tasks WHERE status='open'
          ORDER BY priority DESC, id ASC",
@@ -2903,25 +2950,31 @@ fn queue_tasks(conn: &Connection) -> Result<Vec<QueueTask>> {
             hold_reason: None,
         });
     }
-    apply_planner_hold_reasons(conn, &mut result)?;
+    apply_planner_hold_reasons(conn, &mut result, counted, max_active_graphs)?;
     Ok(result)
 }
 
-/// The graph that withholds planner selection: `state` active or blocked, or
-/// the `active=1` scheduling slot. At most one row has `active=1`; a blocked
-/// row with `active=0` can match too, so the read picks one deterministically
-/// and prefers the scheduling slot.
-fn planner_holding_graph(conn: &Connection) -> Result<Option<(i64, i64)>> {
-    Ok(conn
-        .query_row(
-            "SELECT id, source_task_id FROM task_decompositions
-             WHERE state IN ('active','blocked') OR active=1
-             ORDER BY active DESC, id ASC
-             LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?)
+/// Every graph counted toward `max_active_graphs` admission, per
+/// `decomposition::COUNTED_GRAPH_PREDICATE`: materialized (`active`/`blocked`,
+/// or the `active=1` scheduling slot) or currently holding planning
+/// authority (`freeze_active=1`). Ordered by id for stable output.
+fn counted_graphs(conn: &Connection) -> Result<Vec<CountedGraphView>> {
+    let sql = format!(
+        "SELECT id, source_task_id, state FROM task_decompositions
+         WHERE {} ORDER BY id ASC",
+        crate::decomposition::COUNTED_GRAPH_PREDICATE
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(CountedGraphView {
+                graph_id: row.get(0)?,
+                source_task_id: row.get(1)?,
+                state: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 fn planner_eligible_task_ids(conn: &Connection) -> Result<std::collections::HashSet<i64>> {
@@ -2936,18 +2989,46 @@ fn planner_eligible_task_ids(conn: &Connection) -> Result<std::collections::Hash
     Ok(ids)
 }
 
-/// One holding-graph read per status snapshot. Only queued tasks that match
-/// the shared planner-eligibility predicate get a reason.
-fn apply_planner_hold_reasons(conn: &Connection, queue: &mut [QueueTask]) -> Result<()> {
-    if queue.is_empty() {
+/// Renders the hold reason naming every graph that fills the `max_active_graphs` limit.
+fn format_planner_hold_reason(counted: &[CountedGraphView], limit: i64) -> String {
+    let graphs = counted
+        .iter()
+        .map(|g| {
+            format!(
+                "graph #{} (source #{}, {})",
+                g.graph_id, g.source_task_id, g.state
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "waiting for max_active_graphs limit {}/{limit}: {graphs}",
+        counted.len(),
+    )
+}
+
+/// Only queued tasks that match the shared planner-eligibility predicate get a reason, and
+/// only once the counted graphs (active/blocked/holding planning authority) have reached
+/// the configured `max_active_graphs` limit — below the limit there is room to start
+/// planning a new graph, so nothing is held. `max_active_graphs: None` (the limit is
+/// unknown) never computes a reason, matching the `reviewer_cap: None` convention.
+fn apply_planner_hold_reasons(
+    conn: &Connection,
+    queue: &mut [QueueTask],
+    counted: &[CountedGraphView],
+    max_active_graphs: Option<i64>,
+) -> Result<()> {
+    if queue.is_empty() || counted.is_empty() {
         return Ok(());
     }
-    let Some((graph_id, source_task_id)) = planner_holding_graph(conn)? else {
+    let Some(limit) = max_active_graphs else {
         return Ok(());
     };
+    if (counted.len() as i64) < limit {
+        return Ok(());
+    }
     let eligible = planner_eligible_task_ids(conn)?;
-    let reason =
-        format!("waiting for graph #{graph_id} (source #{source_task_id}) before planning");
+    let reason = format_planner_hold_reason(counted, limit);
     for task in queue.iter_mut() {
         if eligible.contains(&task.id) {
             task.hold_reason = Some(reason.clone());
@@ -4584,8 +4665,10 @@ mod tests {
         );
         insert_holding_graph(&c, 74, 697, "active", 1);
 
-        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
-        let reason = "waiting for graph #74 (source #697) before planning";
+        // `max_active_graphs=1`: the single active graph already fills the limit.
+        let s =
+            stats_with_options(&c, 200, crate::agents::ONLINE_WINDOW_SECS, None, Some(1)).unwrap();
+        let reason = "waiting for max_active_graphs limit 1/1: graph #74 (source #697, active)";
         for id in [planner, flagged] {
             let task = s.queue_tasks.iter().find(|task| task.id == id).unwrap();
             assert_eq!(task.hold_reason.as_deref(), Some(reason));
@@ -4641,7 +4724,8 @@ mod tests {
         );
         insert_holding_graph(&c, 74, 697, "blocked", 0);
 
-        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let s =
+            stats_with_options(&c, 200, crate::agents::ONLINE_WINDOW_SECS, None, Some(1)).unwrap();
         let task = s
             .queue_tasks
             .iter()
@@ -4649,8 +4733,94 @@ mod tests {
             .unwrap();
         assert_eq!(
             task.hold_reason.as_deref(),
-            Some("waiting for graph #74 (source #697) before planning")
+            Some("waiting for max_active_graphs limit 1/1: graph #74 (source #697, blocked)")
         );
+    }
+
+    #[test]
+    fn queue_names_every_counted_graph_once_the_limit_is_full() {
+        let (_d, mut c) = open_tmp();
+        c.execute(
+            "INSERT INTO tasks(id, title, status, priority, created_by, created_at, updated_at)
+             VALUES (697, 'graph source', 'decomposed', 0, 'boss', 100, 100),
+                    (700, 'other source', 'decomposed', 0, 'boss', 100, 100)",
+            [],
+        )
+        .unwrap();
+        let planner = classified_open(
+            &mut c,
+            "plan me",
+            r#"{"cx_est":5,"cx_size":"L","cx_ready":true}"#,
+        );
+        insert_holding_graph(&c, 74, 697, "active", 1);
+        insert_holding_graph(&c, 81, 700, "blocked", 0);
+
+        // Below the limit: two counted graphs, but room for a third — no hold.
+        let below =
+            stats_with_options(&c, 200, crate::agents::ONLINE_WINDOW_SECS, None, Some(3)).unwrap();
+        assert_eq!(
+            below
+                .queue_tasks
+                .iter()
+                .find(|task| task.id == planner)
+                .unwrap()
+                .hold_reason,
+            None
+        );
+        assert_eq!(below.counted_graphs.len(), 2);
+
+        // At the limit: both counted graphs are named, in id order.
+        let at =
+            stats_with_options(&c, 200, crate::agents::ONLINE_WINDOW_SECS, None, Some(2)).unwrap();
+        let task = at
+            .queue_tasks
+            .iter()
+            .find(|task| task.id == planner)
+            .unwrap();
+        assert_eq!(
+            task.hold_reason.as_deref(),
+            Some(
+                "waiting for max_active_graphs limit 2/2: \
+                 graph #74 (source #697, active), graph #81 (source #700, blocked)"
+            )
+        );
+        let json = serde_json::to_value(&at).unwrap();
+        assert_eq!(json["max_active_graphs"], serde_json::json!(2));
+        assert_eq!(
+            json["counted_graphs"],
+            serde_json::json!([
+                {"graph_id": 74, "source_task_id": 697, "state": "active"},
+                {"graph_id": 81, "source_task_id": 700, "state": "blocked"},
+            ])
+        );
+    }
+
+    #[test]
+    fn counted_graphs_lists_every_active_graph_without_requiring_a_known_limit() {
+        let (_d, c) = open_tmp();
+        c.execute(
+            "INSERT INTO tasks(id, title, status, priority, created_by, created_at, updated_at)
+             VALUES (697, 'graph source', 'decomposed', 0, 'boss', 100, 100),
+                    (700, 'other source', 'decomposed', 0, 'boss', 100, 100)",
+            [],
+        )
+        .unwrap();
+        insert_holding_graph(&c, 74, 697, "active", 1);
+        insert_holding_graph(&c, 81, 700, "blocked", 0);
+
+        // Bare `stats()` has no configured limit, but still names both graphs.
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(s.max_active_graphs, None);
+        assert_eq!(
+            s.counted_graphs
+                .iter()
+                .map(|g| g.graph_id)
+                .collect::<Vec<_>>(),
+            vec![74, 81]
+        );
+        let json = serde_json::to_value(&s).unwrap();
+        assert!(json.get("max_active_graphs").is_none(), "{json}");
+        assert_eq!(json["counted_graphs"].as_array().unwrap().len(), 2);
     }
 
     #[test]
