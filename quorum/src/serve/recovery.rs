@@ -722,6 +722,7 @@ fn reconstruct_dormant_slots(
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(recovery.agent_run_id),
             cap_run_id: Some(recovery.cap_run_id.clone()),
@@ -2909,6 +2910,7 @@ exec sleep 30
             &WorktreeManager::new(),
             &mut names,
             &mut workers,
+            &mut super::super::ProfileCooldown::new(),
         )
         .await
         .expect("the next restart launches the preserved exact turn once");

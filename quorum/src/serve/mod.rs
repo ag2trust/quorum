@@ -836,6 +836,107 @@ async fn reviewer_cooldown_plan(
     Ok(profile_cooldown.plan(&assignment.profile_snapshot(), &pool, &exclusions, now))
 }
 
+/// Pre-claim worker gate against the profile cooldown. It is read-only (it
+/// never assigns or claims) and returns `Some(until)` only when every profile
+/// of the task's worker pool that the responsibility's durable routing
+/// evidence has not already excluded is cooling down. A pool with no cooling
+/// profile adds no I/O. A fully excluded pool or an unroutable task is left to
+/// the ordinary provisioning path, which owns those outcomes.
+async fn worker_cooldown_deferral(
+    config: &ServeConfig,
+    profile_cooldown: &ProfileCooldown,
+    task: &tasks::Task,
+    now: std::time::Instant,
+) -> Result<Option<std::time::Instant>> {
+    let Some(complexity) = classifier_complexity(&task.refs) else {
+        return Ok(None);
+    };
+    let Ok(pool) = configured_routing_pool(config, "worker", Some(complexity), None) else {
+        return Ok(None);
+    };
+    if !pool
+        .profiles
+        .iter()
+        .any(|weighted| profile_cooldown.is_cooling(&weighted.profile.id, now))
+    {
+        return Ok(None);
+    }
+    let exclusions = {
+        let path = config.db_path.clone();
+        let key = worker_responsibility_key(task.id, task.revision);
+        tokio::task::spawn_blocking(move || {
+            let conn = quorum_core::db::open(&path)?;
+            quorum_core::routing_attempts::exclusions(&conn, &key)
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("worker cooldown exclusions join: {error}")))??
+    };
+    let Some(first_eligible) = pool
+        .profiles
+        .iter()
+        .map(|weighted| &weighted.profile)
+        .find(|profile| !exclusions.excludes(profile))
+    else {
+        return Ok(None);
+    };
+    Ok(
+        match profile_cooldown.plan(first_eligible, &pool, &exclusions, now) {
+            CooldownPlan::Defer { until } => Some(until),
+            CooldownPlan::Run | CooldownPlan::SkipAssigned => None,
+        },
+    )
+}
+
+/// Whether every configured route a failed worker could fall back to is
+/// eligible only after a cooldown: at least one non-excluded alternate exists
+/// and all of them are cooling. The failure's own exclusion (its profile, or
+/// its whole provider for a provider-unavailable failure) is applied here
+/// because it is not yet durable. A pool with no non-excluded alternate is
+/// left to the existing provider block.
+fn worker_fallback_alternates_all_cooling(
+    profile_cooldown: &ProfileCooldown,
+    pool: &quorum_core::role_assignments::ValidatedPool,
+    exclusions: &quorum_core::routing_attempts::RouteExclusions,
+    failed_route: &quorum_core::role_assignments::ModelProfile,
+    disposition: runner::FailureDisposition,
+    now: std::time::Instant,
+) -> bool {
+    let mut cooling_alternate = false;
+    for weighted in &pool.profiles {
+        let profile = &weighted.profile;
+        if profile.id == failed_route.id
+            || exclusions.excludes(profile)
+            || (disposition == runner::FailureDisposition::ProviderUnavailable
+                && profile.provider == failed_route.provider)
+        {
+            continue;
+        }
+        if !profile_cooldown.is_cooling(&profile.id, now) {
+            return false;
+        }
+        cooling_alternate = true;
+    }
+    cooling_alternate
+}
+
+/// The profile a worker run executed: an attributed fallback run carries it
+/// explicitly; an initially assigned run uses its assignment snapshot.
+fn worker_run_profile_id(
+    conn: &quorum_core::Connection,
+    agent_run_id: i64,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT COALESCE(r.configured_profile_id, a.profile_id)
+             FROM agent_runs r LEFT JOIN role_assignments a ON a.id = r.role_assignment_id
+             WHERE r.id=?1 AND r.role='worker'",
+            [agent_run_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
 /// How one reviewer provision is counted against `reviewer_cap`.
 ///
 /// R2 policy (deadlock freedom): an R2 started by the R1-approval handoff
@@ -5029,6 +5130,12 @@ pub(crate) struct SlotState {
     /// This is intentionally separate from provider turn retries: an install
     /// is a daemon/DB operation, not another provider turn.
     fallback_install_error_count: u32,
+    /// `(agent_run_id, first_deferred_at)` of a worker fallback that deferred
+    /// because every eligible alternate was cooling. A retained slot re-enters
+    /// fallback every tick; this marker makes the failed profile's cooldown
+    /// recorded once per failure observation (not renewed on re-entry) and
+    /// caps the slot's total deferral at one cooldown window.
+    worker_fallback_deferral: Option<(i64, std::time::Instant)>,
     last_error_text: Option<String>,
     agent_run_id: Option<i64>,
     /// Daemon-issued run capability id (#130). Used for revocation on teardown.
@@ -10515,6 +10622,7 @@ async fn handle_pre_review_checks_failure(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     _lifetime_roster: &mut LifetimeRoster,
+    profile_cooldown: &mut ProfileCooldown,
     task_id: i64,
     pr: i64,
     head_sha: &str,
@@ -10648,6 +10756,7 @@ async fn handle_pre_review_checks_failure(
                             workers,
                             worker_index,
                             &error,
+                            profile_cooldown,
                         )
                         .await
                         {
@@ -10776,6 +10885,7 @@ async fn resume_reviewer_after_ci(
     workers: &mut Vec<SlotState>,
     reviewers: &mut Vec<SlotState>,
     lifetime_roster: &mut LifetimeRoster,
+    profile_cooldown: &mut ProfileCooldown,
     pre_review_checks: &mut HashMap<i64, PreReviewChecksEntry>,
     task_id: i64,
     pr: i64,
@@ -10832,6 +10942,7 @@ async fn resume_reviewer_after_ci(
                 name_pool,
                 workers,
                 lifetime_roster,
+                profile_cooldown,
                 task_id,
                 pr,
                 &gated_head_sha,
@@ -12209,9 +12320,17 @@ async fn resume_retained_merge_replay_rework(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     task_id: i64,
+    profile_cooldown: &mut ProfileCooldown,
 ) {
-    let Err(error) =
-        feed_retained_merge_replay_rework(config, wt_mgr, name_pool, workers, task_id).await
+    let Err(error) = feed_retained_merge_replay_rework(
+        config,
+        wt_mgr,
+        name_pool,
+        workers,
+        task_id,
+        profile_cooldown,
+    )
+    .await
     else {
         return;
     };
@@ -12244,6 +12363,7 @@ async fn feed_retained_merge_replay_rework(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     task_id: i64,
+    profile_cooldown: &mut ProfileCooldown,
 ) -> Result<()> {
     let Some(worker_index) = workers
         .iter()
@@ -12339,6 +12459,7 @@ async fn feed_retained_merge_replay_rework(
             workers,
             worker_index,
             &error,
+            profile_cooldown,
         )
         .await
         {
@@ -12679,8 +12800,14 @@ async fn tick_loop_owning_doctor(
     // policy. A failed durable disposition (including post-timeout BUSY) is an
     // abnormal startup failure and must exit 3 instead of repeating baseline
     // and provider subprocesses while starving mailbox processing.
-    if let Err(error) =
-        resume_recovered_dormant_reworks(config, &wt_mgr, &mut name_pool, &mut workers).await
+    if let Err(error) = resume_recovered_dormant_reworks(
+        config,
+        &wt_mgr,
+        &mut name_pool,
+        &mut workers,
+        &mut profile_cooldown,
+    )
+    .await
     {
         log(&format!(
             "FATAL: recovered dormant rework startup failed: {error}"
@@ -14018,6 +14145,7 @@ async fn tick(
                                         name_pool,
                                         workers,
                                         lifetime_roster,
+                                        profile_cooldown,
                                         reviewer_task_id,
                                         pr_num,
                                         &head_sha,
@@ -14443,7 +14571,13 @@ async fn tick(
                                                 "conflict rework feed failed: {e} — cleaning up"
                                             ));
                                                 if !handle_dormant_worker_feed_failure(
-                                                    config, wt_mgr, name_pool, workers, wi, &e,
+                                                    config,
+                                                    wt_mgr,
+                                                    name_pool,
+                                                    workers,
+                                                    wi,
+                                                    &e,
+                                                    profile_cooldown,
                                                 )
                                                 .await
                                                 {
@@ -14751,7 +14885,13 @@ async fn tick(
                                                 "checks-failure rework feed failed: {e} — cleaning up"
                                             ));
                                                 if !handle_dormant_worker_feed_failure(
-                                                    config, wt_mgr, name_pool, workers, wi, &e,
+                                                    config,
+                                                    wt_mgr,
+                                                    name_pool,
+                                                    workers,
+                                                    wi,
+                                                    &e,
+                                                    profile_cooldown,
                                                 )
                                                 .await
                                                 {
@@ -14968,7 +15108,13 @@ async fn tick(
                                                      {e} — cleaning up"
                                                     ));
                                                     if !handle_dormant_worker_feed_failure(
-                                                        config, wt_mgr, name_pool, workers, wi, &e,
+                                                        config,
+                                                        wt_mgr,
+                                                        name_pool,
+                                                        workers,
+                                                        wi,
+                                                        &e,
+                                                        profile_cooldown,
                                                     )
                                                     .await
                                                     {
@@ -15314,7 +15460,13 @@ async fn tick(
                                                  {e} — cleaning up"
                                                 ));
                                                 if !handle_dormant_worker_feed_failure(
-                                                    config, wt_mgr, name_pool, workers, wi, &e,
+                                                    config,
+                                                    wt_mgr,
+                                                    name_pool,
+                                                    workers,
+                                                    wi,
+                                                    &e,
+                                                    profile_cooldown,
                                                 )
                                                 .await
                                                 {
@@ -15872,8 +16024,13 @@ async fn tick(
                                                     "merge-failure rework feed failed: {e} — cleaning up"
                                                 ));
                                                         if !handle_dormant_worker_feed_failure(
-                                                            config, wt_mgr, name_pool, workers, wi,
+                                                            config,
+                                                            wt_mgr,
+                                                            name_pool,
+                                                            workers,
+                                                            wi,
                                                             &e,
+                                                            profile_cooldown,
                                                         )
                                                         .await
                                                         {
@@ -16155,7 +16312,13 @@ async fn tick(
                                     {
                                         log(&format!("rework feed_turn failed: {e} — cleaning up"));
                                         if !handle_dormant_worker_feed_failure(
-                                            config, wt_mgr, name_pool, workers, wi, &e,
+                                            config,
+                                            wt_mgr,
+                                            name_pool,
+                                            workers,
+                                            wi,
+                                            &e,
+                                            profile_cooldown,
                                         )
                                         .await
                                         {
@@ -16557,6 +16720,7 @@ async fn tick(
                                             workers,
                                             reviewers,
                                             lifetime_roster,
+                                            profile_cooldown,
                                             pre_review_checks,
                                             task_id,
                                             pr,
@@ -16683,6 +16847,7 @@ async fn tick(
             workers,
             reviewers,
             lifetime_roster,
+            profile_cooldown,
             pre_review_checks,
             task_id,
             pr,
@@ -17095,10 +17260,13 @@ async fn tick(
     let mut error_failed: Vec<i64> = Vec::new();
     let mut settled_worker_fallbacks = Vec::new();
     for (i, worker) in workers.iter_mut().enumerate() {
-        match route_live_worker_provider_failure(config, worker).await {
+        match route_live_worker_provider_failure(config, worker, profile_cooldown).await {
             Ok(LiveWorkerFallbackRoute::NotCandidate) => {}
             Ok(LiveWorkerFallbackRoute::Activated) => {}
             Ok(LiveWorkerFallbackRoute::Settled) => settled_worker_fallbacks.push(i),
+            // Every alternate is cooling: keep the idle slot, its lease, and
+            // its pending turn; the next tick routes it again.
+            Ok(LiveWorkerFallbackRoute::Deferred) => {}
             // A stale or fail-closed installation must not reopen the
             // same-provider refeed loop. Fall through to the established
             // terminal disposition below instead.
@@ -17183,7 +17351,15 @@ async fn tick(
                 runner::FailureDisposition::ProviderUnavailable
                     | runner::FailureDisposition::ProfileUnavailable
             ) {
-                match activate_worker_fallback(config, &mut dead, failure, currency).await {
+                match activate_worker_fallback(
+                    config,
+                    &mut dead,
+                    failure,
+                    currency,
+                    profile_cooldown,
+                )
+                .await
+                {
                     Ok(WorkerFallbackActivation::Activated) => {
                         workers.insert(i, dead);
                         continue;
@@ -17191,6 +17367,10 @@ async fn tick(
                     Ok(WorkerFallbackActivation::Settled) => {
                         cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked")
                             .await;
+                        continue;
+                    }
+                    Ok(WorkerFallbackActivation::Deferred) => {
+                        workers.insert(i, dead);
                         continue;
                     }
                     Ok(WorkerFallbackActivation::NotInstalled) => {}
@@ -17423,7 +17603,15 @@ async fn tick(
                 runner::FailureDisposition::ProviderUnavailable
                     | runner::FailureDisposition::ProfileUnavailable
             ) {
-                match activate_worker_fallback(config, &mut dead, failure, currency).await {
+                match activate_worker_fallback(
+                    config,
+                    &mut dead,
+                    failure,
+                    currency,
+                    profile_cooldown,
+                )
+                .await
+                {
                     Ok(WorkerFallbackActivation::Activated) => {
                         workers.insert(i, dead);
                         continue;
@@ -17431,6 +17619,10 @@ async fn tick(
                     Ok(WorkerFallbackActivation::Settled) => {
                         cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked")
                             .await;
+                        continue;
+                    }
+                    Ok(WorkerFallbackActivation::Deferred) => {
+                        workers.insert(i, dead);
                         continue;
                     }
                     Ok(WorkerFallbackActivation::NotInstalled) => {}
@@ -17966,7 +18158,15 @@ async fn tick(
     // tick. A valid replay never allocates a reviewer or worker.
     let replay_rework_task = reconcile_merge_retries(config, wt_mgr, drain_state.draining).await?;
     if let Some(task_id) = replay_rework_task {
-        resume_retained_merge_replay_rework(config, wt_mgr, name_pool, workers, task_id).await;
+        resume_retained_merge_replay_rework(
+            config,
+            wt_mgr,
+            name_pool,
+            workers,
+            task_id,
+            profile_cooldown,
+        )
+        .await;
     }
 
     // ── Phase 4f: GitHub REQUEST_CHANGES outbox for review-only closes ──
@@ -18326,6 +18526,7 @@ async fn tick(
                 name_pool,
                 workers,
                 lifetime_roster,
+                profile_cooldown,
                 task_id,
                 pr,
                 &head_sha,
@@ -18505,6 +18706,7 @@ async fn tick(
                         name_pool,
                         workers,
                         lifetime_roster,
+                        profile_cooldown,
                         *task_id,
                         *pr,
                         &head_sha,
@@ -18766,6 +18968,7 @@ async fn tick(
             poison_tracker,
             claim_skip_logs,
             lifetime_roster,
+            profile_cooldown,
             decomposition_freeze,
         )
         .await?;
@@ -20244,6 +20447,7 @@ async fn handle_dormant_worker_feed_failure(
     workers: &mut Vec<SlotState>,
     worker_index: usize,
     error: &std::io::Error,
+    profile_cooldown: &mut ProfileCooldown,
 ) -> bool {
     match settle_dormant_worker_feed_failure(
         config,
@@ -20252,6 +20456,7 @@ async fn handle_dormant_worker_feed_failure(
         workers,
         worker_index,
         error,
+        profile_cooldown,
     )
     .await
     {
@@ -20279,6 +20484,7 @@ async fn settle_dormant_worker_feed_failure(
     workers: &mut Vec<SlotState>,
     worker_index: usize,
     error: &std::io::Error,
+    profile_cooldown: &mut ProfileCooldown,
 ) -> Result<DormantWorkerFeedFailureDisposition> {
     let (provider, continuation_id) = match &workers[worker_index].proc {
         SlotProcess::Dormant {
@@ -20294,6 +20500,40 @@ async fn settle_dormant_worker_feed_failure(
             ));
         }
     };
+    // A dormant continuation launch carries the runner's classification. A
+    // provider- or profile-unavailable one starts the slot profile's cooldown
+    // so the next worker provision does not launch straight back onto it.
+    if let (Some(failure), Some(agent_run_id)) = (
+        runner::launch_failure(error),
+        workers[worker_index].agent_run_id,
+    ) {
+        if matches!(
+            failure.disposition(),
+            runner::FailureDisposition::ProviderUnavailable
+                | runner::FailureDisposition::ProfileUnavailable
+        ) {
+            // Best effort: recording a cooldown must never gate the durable
+            // disposition below.
+            let db_path = config.db_path.clone();
+            match tokio::task::spawn_blocking(move || {
+                let conn = quorum_core::db::open(&db_path)?;
+                worker_run_profile_id(&conn, agent_run_id)
+            })
+            .await
+            {
+                Ok(Ok(Some(profile_id))) => {
+                    profile_cooldown.record(&profile_id, std::time::Instant::now());
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => log(&format!(
+                    "worker run {agent_run_id} cooldown profile lookup failed: {error}"
+                )),
+                Err(error) => log(&format!(
+                    "worker run {agent_run_id} cooldown profile lookup join failed: {error}"
+                )),
+            }
+        }
+    }
     let pending = PendingTurn {
         provider,
         model: workers[worker_index].model.clone(),
@@ -24594,6 +24834,7 @@ async fn provision_reviewer_reserved(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: None,
                 agent_run_id: Some(reviewer_run_id),
                 cap_run_id: Some(cap_run_id),
@@ -24661,6 +24902,7 @@ async fn provision_reviewer_reserved(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: Some(e.detail().to_string()),
                 agent_run_id: Some(reviewer_run_id),
                 cap_run_id: Some(cap_run_id.clone()),
@@ -25380,6 +25622,7 @@ async fn dispatch_workers(
     poison_tracker: &mut PoisonTracker,
     claim_skip_logs: &mut ClaimSkipLogLimiter,
     lifetime_roster: &mut LifetimeRoster,
+    profile_cooldown: &mut ProfileCooldown,
     decomposition_freeze: bool,
 ) -> Result<()> {
     let admission = if decomposition_freeze {
@@ -25396,6 +25639,7 @@ async fn dispatch_workers(
             poison_tracker,
             claim_skip_logs,
             lifetime_roster,
+            profile_cooldown,
             admission,
         )
         .await?
@@ -25424,6 +25668,7 @@ async fn spawn_worker(
         poison_tracker,
         claim_skip_logs,
         lifetime_roster,
+        &mut ProfileCooldown::new(),
         WorkerAdmission::AllReady,
     )
     .await
@@ -25438,6 +25683,7 @@ async fn spawn_admitted_worker(
     poison_tracker: &mut PoisonTracker,
     claim_skip_logs: &mut ClaimSkipLogLimiter,
     lifetime_roster: &mut LifetimeRoster,
+    profile_cooldown: &mut ProfileCooldown,
     admission: WorkerAdmission,
 ) -> Result<bool> {
     let db_path = config.db_path.clone();
@@ -25484,7 +25730,7 @@ async fn spawn_admitted_worker(
         );
     }
 
-    let ready_task = available.into_iter().find(|t| {
+    let dispatchable = available.into_iter().filter(|t| {
         if !t.ready || in_flight.contains(&t.id) || poison_tracker.is_poisoned(t.id) {
             return false;
         }
@@ -25499,6 +25745,31 @@ async fn spawn_admitted_worker(
         }
         !t.review_only
     });
+    // A task whose every eligible worker profile is cooling down after a
+    // recent provider/profile-unavailable classification is passed over before
+    // any name, claim, worktree, run, or process exists; it is retried once a
+    // cooldown expires. The gate is read-only, so a passed-over task is
+    // unchanged.
+    let mut ready_task = None;
+    for candidate in dispatchable {
+        let now = std::time::Instant::now();
+        match worker_cooldown_deferral(config, profile_cooldown, &candidate, now).await? {
+            None => {
+                ready_task = Some(candidate);
+                break;
+            }
+            Some(until) => {
+                if profile_cooldown.take_deferral_log_slot(now) {
+                    log(&format!(
+                        "task #{} worker deferred — every eligible worker profile is cooling \
+                         down for another {:.1}s (further deferrals are rate-limited)",
+                        candidate.id,
+                        until.saturating_duration_since(now).as_secs_f64(),
+                    ));
+                }
+            }
+        }
+    }
 
     let mut task = match ready_task {
         Some(t) => t,
@@ -26294,6 +26565,12 @@ async fn spawn_admitted_worker(
         },
         Some(complexity),
     )?;
+    // The pre-claim gate proved an eligible alternate exists when the assigned
+    // profile is cooling. Retire the assignment as a classified launch failure
+    // without contacting the provider, so the existing worker fallback install
+    // reaches the alternate with ordinary routing evidence and attribution.
+    let skip_cooling_assignment =
+        profile_cooldown.is_cooling(&assignment.profile_id, std::time::Instant::now());
     let resolved_model = assignment.model.clone();
     let resolved_effort = assignment.effort.clone();
     log(&format!(
@@ -26487,7 +26764,9 @@ async fn spawn_admitted_worker(
         .await
         .map_err(|error| QuorumError::Io(format!("worker run persistence join: {error}")))??
     };
-    let spawn_result = if resolved_kind == runner::AgentKind::Grok && continuation_id.is_none() {
+    let spawn_result = if skip_cooling_assignment {
+        Err(cooling_profile_failure(&assignment.profile_id))
+    } else if resolved_kind == runner::AgentKind::Grok && continuation_id.is_none() {
         // Grok publishes its provider session only in terminal `end`; retain
         // the exact worker identity so that handoff is durable before success.
         runner::RunnerProc::launch_internal_worker(
@@ -26594,6 +26873,7 @@ async fn spawn_admitted_worker(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: None,
                 agent_run_id: Some(worker_run_id),
                 cap_run_id: Some(cap_run_id),
@@ -26648,6 +26928,7 @@ async fn spawn_admitted_worker(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: Some(e.detail().to_string()),
                 agent_run_id: Some(worker_run_id),
                 cap_run_id: Some(cap_run_id),
@@ -26671,7 +26952,15 @@ async fn spawn_admitted_worker(
                 let currency = quorum_core::db::open(&config.db_path).and_then(|conn| {
                     load_worker_fallback_currency(&conn, &failed_slot, observed_at)
                 })?;
-                match activate_worker_fallback(config, &mut failed_slot, &e, &currency).await? {
+                match activate_worker_fallback(
+                    config,
+                    &mut failed_slot,
+                    &e,
+                    &currency,
+                    profile_cooldown,
+                )
+                .await?
+                {
                     WorkerFallbackActivation::Activated => {
                         workers.push(failed_slot);
                         return Ok(true);
@@ -26686,6 +26975,22 @@ async fn spawn_admitted_worker(
                             "provider_blocked",
                         )
                         .await;
+                        return Ok(false);
+                    }
+                    // Every alternate is cooling, or the provider-free skip of
+                    // a cooling assignment could not install an alternate
+                    // (for example a stale pool generation). No provider
+                    // refused this task, so release it without a poison
+                    // strike; the pre-claim gate holds it until a cooldown
+                    // expires.
+                    WorkerFallbackActivation::Deferred => {
+                        release_task(&db_path, &agent_name, task.id).await;
+                        cleanup_slot(config, wt_mgr, name_pool, failed_slot, None, "failed").await;
+                        return Ok(false);
+                    }
+                    WorkerFallbackActivation::NotInstalled if skip_cooling_assignment => {
+                        release_task(&db_path, &agent_name, task.id).await;
+                        cleanup_slot(config, wt_mgr, name_pool, failed_slot, None, "failed").await;
                         return Ok(false);
                     }
                     WorkerFallbackActivation::NotInstalled => {}
@@ -27551,6 +27856,15 @@ fn routed_provider_executable_in_path(
     )))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: a classified launch failure returned for one fallback model.
+    /// Real classified launch failures depend on a provider child racing its
+    /// first stdin write, which a test cannot reproduce deterministically.
+    static FORCED_FALLBACK_LAUNCH_FAILURE: std::cell::RefCell<Option<(String, runner::RunnerFailure)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Start a fallback provider behind the daemon gate and make the process
 /// recoverable before releasing it.  The caller owns lifecycle disposition,
 /// but this helper always reaps a wrapper if either durable setup or release
@@ -27562,6 +27876,16 @@ async fn launch_and_commit_fallback(
     grok_worker_request: Option<runner::WorkerTurnRequest>,
     journal: FallbackJournalPromotion<'_>,
 ) -> std::result::Result<runner::RunnerProc, runner::RunnerFailure> {
+    #[cfg(test)]
+    if let Some(failure) = FORCED_FALLBACK_LAUNCH_FAILURE.with(|forced| {
+        forced
+            .borrow()
+            .as_ref()
+            .filter(|(model, _)| model == launch.model)
+            .map(|(_, failure)| failure.clone())
+    }) {
+        return Err(failure);
+    }
     if grok_worker_request.is_some() {
         // Same fail-closed rule as the primary spawn path: a fresh Grok
         // worker turn over a retained durable handoff can never persist its
@@ -28268,6 +28592,10 @@ enum WorkerFallbackActivation {
     NotInstalled,
     Activated,
     Settled,
+    /// Every eligible alternate is cooling down. Nothing durable changed: the
+    /// failed run, its capability, and the pending turn are untouched, so the
+    /// caller retains the slot and retries once a cooldown expires.
+    Deferred,
 }
 
 /// Result of routing an error-terminated persistent worker turn before the
@@ -28280,11 +28608,13 @@ enum LiveWorkerFallbackRoute {
     NotInstalled,
     Activated,
     Settled,
+    Deferred,
 }
 
 async fn route_live_worker_provider_failure(
     config: &ServeConfig,
     slot: &mut SlotState,
+    profile_cooldown: &mut ProfileCooldown,
 ) -> Result<LiveWorkerFallbackRoute> {
     if !slot_is_live_provider_fallback_candidate(slot) {
         return Ok(LiveWorkerFallbackRoute::NotCandidate);
@@ -28297,10 +28627,11 @@ async fn route_live_worker_provider_failure(
     let currency = load_worker_fallback_currency(&conn, slot, observed_at)?;
     drop(conn);
     Ok(
-        match activate_worker_fallback(config, slot, &failure, &currency).await? {
+        match activate_worker_fallback(config, slot, &failure, &currency, profile_cooldown).await? {
             WorkerFallbackActivation::NotInstalled => LiveWorkerFallbackRoute::NotInstalled,
             WorkerFallbackActivation::Activated => LiveWorkerFallbackRoute::Activated,
             WorkerFallbackActivation::Settled => LiveWorkerFallbackRoute::Settled,
+            WorkerFallbackActivation::Deferred => LiveWorkerFallbackRoute::Deferred,
         },
     )
 }
@@ -28434,6 +28765,39 @@ async fn activate_worker_fallback(
     slot: &mut SlotState,
     failure: &runner::RunnerFailure,
     expected_currency: &fallback_preflight::ManagedTurnCurrency,
+    profile_cooldown: &mut ProfileCooldown,
+) -> Result<WorkerFallbackActivation> {
+    activate_worker_fallback_with(
+        config,
+        slot,
+        failure,
+        expected_currency,
+        profile_cooldown,
+        true,
+        true,
+    )
+    .await
+}
+
+/// `honour_cooldown = false` still records the failing profile's cooldown but
+/// neither skips a cooling alternate nor defers. Startup fallback resumption
+/// uses it: a fresh daemon holds no pre-restart cooldown evidence, and its
+/// committed intent has no live slot that could be retained for a retry.
+///
+/// `allow_defer` is true only at the top of an activation chain, before any
+/// durable change. Once `fallback::install` has retired the failed run and
+/// created an alternate, the slot holds a failed process with no observed
+/// failure that a later tick would re-route, so a recursive step after a
+/// cooling skip or a failed alternate launch must continue or settle and
+/// never return `Deferred`.
+async fn activate_worker_fallback_with(
+    config: &ServeConfig,
+    slot: &mut SlotState,
+    failure: &runner::RunnerFailure,
+    expected_currency: &fallback_preflight::ManagedTurnCurrency,
+    profile_cooldown: &mut ProfileCooldown,
+    honour_cooldown: bool,
+    allow_defer: bool,
 ) -> Result<WorkerFallbackActivation> {
     let agent_run_id = slot
         .agent_run_id
@@ -28505,6 +28869,61 @@ async fn activate_worker_fallback(
         return Err(QuorumError::Io(
             "worker fallback slot does not match its durable route evidence".into(),
         ));
+    }
+    // Every classified worker unavailability funnels through here (launch,
+    // live, dead-turn, and resumed fallbacks), so this is the single place the
+    // failing worker profile starts its cooldown, before any rejection below.
+    if matches!(
+        failure.disposition(),
+        runner::FailureDisposition::ProviderUnavailable
+            | runner::FailureDisposition::ProfileUnavailable
+    ) {
+        let now = std::time::Instant::now();
+        // A retained Deferred slot re-enters here every tick with the same
+        // failed run. Only the first entry is a new failure observation; a
+        // re-entry must not renew the failed profile's window after it lapses,
+        // or two slots deferring on each other's profiles would keep each
+        // other cooling forever.
+        let first_deferred_at = slot
+            .worker_fallback_deferral
+            .filter(|(run_id, _)| *run_id == agent_run_id)
+            .map(|(_, at)| at);
+        if first_deferred_at.is_none() {
+            profile_cooldown.record(&failed_route.id, now);
+        }
+        // A slot defers for at most one cooldown window in total; after that
+        // it proceeds with the ordinary walk.
+        let deferral_budget_left = first_deferred_at.is_none_or(|at| {
+            now.saturating_duration_since(at) < profile_cooldown::profile_cooldown_duration()
+        });
+        // Defer instead of walking into a provider block when every route the
+        // failed one could fall back to is merely cooling. This runs before
+        // `fallback::install` retires the failed run, so no routing evidence,
+        // exclusion, intent, or provider block is written for a profile that
+        // was never contacted.
+        if honour_cooldown && allow_defer && deferral_budget_left {
+            let exclusions =
+                quorum_core::routing_attempts::exclusions(&conn, &assignment.responsibility_key)?;
+            if worker_fallback_alternates_all_cooling(
+                profile_cooldown,
+                &pool,
+                &exclusions,
+                &failed_route,
+                failure.disposition(),
+                std::time::Instant::now(),
+            ) {
+                if profile_cooldown.take_deferral_log_slot(std::time::Instant::now()) {
+                    log(&format!(
+                        "worker {} fallback for task #{} deferred — profile {} failed and every \
+                         eligible alternate is cooling down (further deferrals are rate-limited)",
+                        slot.agent_name, slot.task_id, failed_route.id
+                    ));
+                }
+                slot.worker_fallback_deferral =
+                    Some((agent_run_id, first_deferred_at.unwrap_or(now)));
+                return Ok(WorkerFallbackActivation::Deferred);
+            }
+        }
     }
     let responsibility = quorum_core::role_assignments::AssignmentIdentity {
         task_id: assignment.task_id,
@@ -28615,6 +29034,51 @@ async fn activate_worker_fallback(
         )
         .await;
     }
+    // The selected alternate may itself be cooling down. Retire it as a
+    // classified profile-unavailable launch without contacting the provider;
+    // each skip adds one durable profile exclusion, so this walk is bounded by
+    // the pool and ends on a non-cooling route or the existing provider block.
+    let alternate_profile_id: Option<String> = {
+        let conn = quorum_core::db::open(&config.db_path)?;
+        conn.query_row(
+            "SELECT configured_profile_id FROM agent_runs WHERE id=?1",
+            [intent.agent_run_id],
+            |row| row.get(0),
+        )?
+    };
+    if let Some(alternate_profile_id) = alternate_profile_id
+        .as_deref()
+        .filter(|id| honour_cooldown && profile_cooldown.is_cooling(id, std::time::Instant::now()))
+    {
+        log(&format!(
+            "worker {} fallback skips cooling profile {alternate_profile_id} for task #{}",
+            slot.agent_name, slot.task_id
+        ));
+        let skipped = cooling_profile_failure(alternate_profile_id);
+        let old = std::mem::replace(
+            &mut slot.proc,
+            SlotProcess::Failed {
+                kind: alternate_kind,
+            },
+        );
+        let old_output = old.kill_and_reap().await;
+        persist_terminal_output(&mut slot.session_log, old_output);
+        slot.model = intent.pending_turn.model;
+        slot.effort = intent.pending_turn.effort;
+        slot.agent_run_id = Some(intent.agent_run_id);
+        slot.cap_run_id = Some(intent.capability_run_id);
+        slot.continuation_id = None;
+        return Box::pin(activate_worker_fallback_with(
+            config,
+            slot,
+            &skipped,
+            expected_currency,
+            profile_cooldown,
+            honour_cooldown,
+            false,
+        ))
+        .await;
+    }
     let environment = managed_run_environment(
         config,
         &slot.agent_name,
@@ -28701,11 +29165,14 @@ async fn activate_worker_fallback(
                 slot.agent_run_id = Some(intent.agent_run_id);
                 slot.cap_run_id = Some(intent.capability_run_id);
                 slot.continuation_id = None;
-                return Box::pin(activate_worker_fallback(
+                return Box::pin(activate_worker_fallback_with(
                     config,
                     slot,
                     &error,
                     expected_currency,
+                    profile_cooldown,
+                    honour_cooldown,
+                    false,
                 ))
                 .await;
             }
@@ -28919,6 +29386,7 @@ async fn resume_pending_fallbacks(
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(intent.agent_run_id),
             cap_run_id: Some(intent.capability_run_id.clone()),
@@ -29005,14 +29473,25 @@ async fn resume_pending_fallbacks(
                         let conn = quorum_core::db::open(&config.db_path)?;
                         load_worker_fallback_currency(&conn, &slot, now_unix())?
                     };
-                    match activate_worker_fallback(config, &mut slot, &error, &currency).await? {
+                    match activate_worker_fallback_with(
+                        config,
+                        &mut slot,
+                        &error,
+                        &currency,
+                        profile_cooldown,
+                        false,
+                        false,
+                    )
+                    .await?
+                    {
                         WorkerFallbackActivation::Activated => workers.push(slot),
                         WorkerFallbackActivation::Settled => {
                             cleanup_slot(config, wt_mgr, name_pool, slot, None, "provider_blocked")
                                 .await;
                             continue;
                         }
-                        WorkerFallbackActivation::NotInstalled => {
+                        WorkerFallbackActivation::NotInstalled
+                        | WorkerFallbackActivation::Deferred => {
                             return Err(QuorumError::Io(
                                 "committed worker fallback could not advance".into(),
                             ));
@@ -30318,6 +30797,7 @@ async fn resume_recovered_dormant_reworks(
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
+    profile_cooldown: &mut ProfileCooldown,
 ) -> Result<()> {
     // A delivery can race the failed launch, in which case disposition must
     // retain the dormant slot for the mailbox phase later in this tick. Work
@@ -30371,6 +30851,7 @@ async fn resume_recovered_dormant_reworks(
                 workers,
                 worker_index,
                 &error,
+                profile_cooldown,
             )
             .await?
                 == DormantWorkerFeedFailureDisposition::LiveProcess
@@ -31572,6 +32053,7 @@ async fn spawn_remediation_worker(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: None,
                 agent_run_id: worker_run_id,
                 cap_run_id: Some(cap_run_id),
@@ -34143,6 +34625,7 @@ mod tests {
             &mut name_pool,
             &mut workers,
             &mut roster,
+            &mut ProfileCooldown::new(),
             task_id,
             pr,
             "0123456789abcdef0123456789abcdef01234567",
@@ -34385,6 +34868,7 @@ mod tests {
             &mut name_pool,
             &mut workers,
             &mut roster,
+            &mut ProfileCooldown::new(),
             task_id,
             pr,
             head_sha,
@@ -34755,6 +35239,7 @@ mod tests {
             &mut name_pool,
             &mut workers,
             &mut roster,
+            &mut ProfileCooldown::new(),
             task_id,
             553,
             "0123456789abcdef0123456789abcdef01234567",
@@ -35312,6 +35797,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: None,
             cap_run_id: None,
@@ -35988,6 +36474,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 1,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: Some("unmatched provider failure".into()),
             agent_run_id: Some(agent_run_id),
             cap_run_id: Some("initial-cap".into()),
@@ -36415,6 +36902,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -36455,7 +36943,7 @@ mod tests {
         );
         slot.pending_watchdog_breach = None;
         assert_eq!(
-            route_live_worker_provider_failure(&config, &mut slot)
+            route_live_worker_provider_failure(&config, &mut slot, &mut ProfileCooldown::new())
                 .await
                 .unwrap(),
             LiveWorkerFallbackRoute::Activated
@@ -36604,6 +37092,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -36622,9 +37111,15 @@ mod tests {
         );
 
         assert_eq!(
-            activate_worker_fallback(&config, &mut slot, &failure, &currency)
-                .await
-                .unwrap(),
+            activate_worker_fallback(
+                &config,
+                &mut slot,
+                &failure,
+                &currency,
+                &mut ProfileCooldown::new()
+            )
+            .await
+            .unwrap(),
             WorkerFallbackActivation::Settled
         );
 
@@ -36797,6 +37292,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -36809,6 +37305,7 @@ mod tests {
         let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
         drop(conn);
 
+        let mut cooldown = ProfileCooldown::new();
         for (failed, expected_next) in [
             ("primary profile unavailable", "gpt-5.6-terra"),
             ("first alternate unavailable", "gpt-5.5"),
@@ -36819,13 +37316,19 @@ mod tests {
                 std::io::ErrorKind::Other,
             );
             assert_eq!(
-                activate_worker_fallback(&config, &mut slot, &failure, &currency)
+                activate_worker_fallback(&config, &mut slot, &failure, &currency, &mut cooldown)
                     .await
                     .unwrap(),
                 WorkerFallbackActivation::Activated
             );
             assert_eq!(slot.model, expected_next);
         }
+        // Each classified worker failure starts its own profile's cooldown;
+        // the route that is now running is not cooling.
+        let checked_at = std::time::Instant::now();
+        assert!(cooldown.is_cooling("a-primary", checked_at));
+        assert!(cooldown.is_cooling("b-alternate", checked_at));
+        assert!(!cooldown.is_cooling("c-tertiary", checked_at));
 
         let conn = quorum_core::db::open(&config.db_path).unwrap();
         let evidence: (i64, i64, i64, i64) = conn
@@ -36842,6 +37345,860 @@ mod tests {
         assert_eq!(evidence, (2, 2, 1, 1));
         drop(conn);
         let _ = slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_worker_fallback_defers_without_durable_change_while_every_alternate_cools() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let runner_program = live_fallback_runner(root.path());
+        let mut config = live_fallback_test_config(
+            root.path().join("worker-cooling-defer.db"),
+            root.path(),
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        config.model_profiles.insert(
+            "c-tertiary".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.5".into(),
+                effort: "medium".into(),
+            },
+        );
+        for pool in config.routing.worker.values_mut() {
+            pool.insert("a-primary".into(), 25);
+            pool.insert("c-tertiary".into(), 25);
+        }
+
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "worker fallback chain",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let observed_at = now_unix();
+        quorum_core::tasks::claim(
+            &mut conn,
+            "Fallback-Worker",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        let responsibility = worker_responsibility_key(task_id, 1);
+        let (assignment, initial_run, agent_name) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "worker",
+            None,
+            None,
+        );
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent_name.clone(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "initial-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("daemon/fallback-worker".into()),
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("daemon/fallback-worker".into()),
+            },
+        )
+        .unwrap();
+        let now = std::time::Instant::now();
+        let mut slot = SlotState {
+            agent_name,
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "initial-session".into(),
+            model: assignment.model.clone(),
+            effort: assignment.effort.clone(),
+            worktree_path: worktree,
+            branch: "daemon/fallback-worker".into(),
+            remote_branch: "daemon/fallback-worker".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: None,
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            last_provider_activity_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
+            last_error_text: None,
+            agent_run_id: Some(initial_run),
+            cap_run_id: Some("initial-cap".into()),
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: None,
+            pending_prompt: "exact initial prompt".into(),
+            pending_turn_kind: "initial".into(),
+        };
+        let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
+        drop(conn);
+
+        let initial_model = slot.model.clone();
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "primary profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+        let evidence = |config: &ServeConfig| -> (i64, i64, i64, bool) {
+            let conn = quorum_core::db::open(&config.db_path).unwrap();
+            let (attempts, intents, open_runs, refs): (i64, i64, i64, Option<String>) = conn
+                .query_row(
+                    "SELECT
+                         (SELECT count(*) FROM routing_attempts WHERE responsibility_key=?1),
+                         (SELECT count(*) FROM fallback_launch_intents WHERE responsibility_key=?1),
+                         (SELECT count(*) FROM agent_runs WHERE task_id=?2 AND ended_at IS NULL),
+                         (SELECT refs FROM tasks WHERE id=?2)",
+                    rusqlite::params![responsibility, task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            let blocked = refs
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .is_some_and(|refs| runner_state::provider_block(&refs).is_some());
+            (attempts, intents, open_runs, blocked)
+        };
+
+        // Both alternates are cooling: defer twice with no durable change —
+        // no routing evidence, intent, retired run, provider block, or spawn.
+        let mut cooldown = ProfileCooldown::new();
+        let now = std::time::Instant::now();
+        cooldown.record("b-alternate", now);
+        cooldown.record("c-tertiary", now);
+        for _ in 0..2 {
+            assert_eq!(
+                activate_worker_fallback(&config, &mut slot, &failure, &currency, &mut cooldown)
+                    .await
+                    .unwrap(),
+                WorkerFallbackActivation::Deferred
+            );
+            assert_eq!(slot.model, initial_model);
+            assert_eq!(slot.agent_run_id, Some(initial_run));
+            assert!(matches!(slot.proc, SlotProcess::Failed { .. }));
+            assert_eq!(evidence(&config), (0, 0, 1, false));
+        }
+        assert!(
+            cooldown.is_cooling("a-primary", std::time::Instant::now()),
+            "the deferred failure still starts the failed profile's cooldown"
+        );
+        // The decision is time-bounded: once the alternates' windows lapse the
+        // failed route has an eligible alternate again.
+        let pool = configured_routing_pool(&config, "worker", Some(3), None).unwrap();
+        let expired = now + profile_cooldown::profile_cooldown_duration();
+        assert!(!worker_fallback_alternates_all_cooling(
+            &cooldown,
+            &pool,
+            &quorum_core::routing_attempts::RouteExclusions::default(),
+            &assignment.profile_snapshot(),
+            runner::FailureDisposition::ProfileUnavailable,
+            expired,
+        ));
+
+        // After b-alternate's cooldown has expired (a fresh window holding
+        // only c-tertiary), the same failure installs b-alternate.
+        let mut expired_cooldown = ProfileCooldown::new();
+        expired_cooldown.record("c-tertiary", std::time::Instant::now());
+        assert_eq!(
+            activate_worker_fallback(
+                &config,
+                &mut slot,
+                &failure,
+                &currency,
+                &mut expired_cooldown
+            )
+            .await
+            .unwrap(),
+            WorkerFallbackActivation::Activated
+        );
+        assert_eq!(slot.model, "gpt-5.6-terra");
+        let installed = evidence(&config);
+        assert_eq!((installed.0, installed.1, installed.2), (1, 1, 1));
+        assert!(!installed.3);
+        let _ = slot.kill_and_reap().await;
+    }
+
+    /// One deferring worker slot on its own DB. `failed_on_alternate` attributes
+    /// the open run to b-alternate so its fallback walks back to a-primary.
+    #[cfg(unix)]
+    fn deferring_worker_slot(
+        root: &Path,
+        name: &str,
+        failed_on_alternate: bool,
+    ) -> (
+        ServeConfig,
+        SlotState,
+        fallback_preflight::ManagedTurnCurrency,
+        String,
+    ) {
+        let dir = root.join(name);
+        let worktree = dir.join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let runner_program = live_fallback_runner(&dir);
+        let config = live_fallback_test_config(
+            dir.join("worker.db"),
+            &dir,
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "worker fallback mutual cooldown",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let observed_at = now_unix();
+        quorum_core::tasks::claim(
+            &mut conn,
+            "Fallback-Worker",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        let responsibility = worker_responsibility_key(task_id, 1);
+        let (assignment, run, agent_name) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "worker",
+            None,
+            None,
+        );
+        assert_eq!(assignment.profile_id, "a-primary");
+        let (model, effort) = if failed_on_alternate {
+            conn.execute(
+                "UPDATE agent_runs SET model='gpt-5.6-terra',effort='high',
+                     configured_profile_id='b-alternate',configured_provider='codex',
+                     configured_model='gpt-5.6-terra',configured_effort='high'
+                 WHERE id=?1",
+                [run],
+            )
+            .unwrap();
+            ("gpt-5.6-terra".to_string(), "high".to_string())
+        } else {
+            (assignment.model.clone(), assignment.effort.clone())
+        };
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent_name.clone(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "initial-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("daemon/fallback-worker".into()),
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("daemon/fallback-worker".into()),
+            },
+        )
+        .unwrap();
+        let now = std::time::Instant::now();
+        let slot = SlotState {
+            agent_name,
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "initial-session".into(),
+            model,
+            effort,
+            worktree_path: worktree,
+            branch: "daemon/fallback-worker".into(),
+            remote_branch: "daemon/fallback-worker".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: None,
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            last_provider_activity_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
+            last_error_text: None,
+            agent_run_id: Some(run),
+            cap_run_id: Some("initial-cap".into()),
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: None,
+            pending_prompt: "exact initial prompt".into(),
+            pending_turn_kind: "initial".into(),
+        };
+        let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
+        (config, slot, currency, responsibility)
+    }
+
+    /// Two deferring slots in pool {a, b}: X failed on a and waits on b, Y
+    /// failed on b and waits on a. A deferred re-entry must not renew the
+    /// failed profile's lapsed window (else they keep each other cooling
+    /// forever), and a slot's total deferral is capped at one cooldown window.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_worker_fallback_reentry_neither_renews_cooldown_nor_defers_forever() {
+        let root = tempfile::tempdir().unwrap();
+        let (x_config, mut x, x_currency, x_responsibility) =
+            deferring_worker_slot(root.path(), "x", false);
+        let (y_config, mut y, y_currency, _) = deferring_worker_slot(root.path(), "y", true);
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+        let x_run = x.agent_run_id.unwrap();
+
+        // Both profiles were just observed failing, so both windows are live
+        // and each slot's only alternate is cooling: both defer.
+        let mut cooldown = ProfileCooldown::new();
+        cooldown.record("a-primary", std::time::Instant::now());
+        cooldown.record("b-alternate", std::time::Instant::now());
+        assert_eq!(
+            activate_worker_fallback(&x_config, &mut x, &failure, &x_currency, &mut cooldown)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Deferred
+        );
+        assert_eq!(
+            activate_worker_fallback(&y_config, &mut y, &failure, &y_currency, &mut cooldown)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Deferred
+        );
+        let now = std::time::Instant::now();
+        assert!(cooldown.is_cooling("a-primary", now));
+        assert!(cooldown.is_cooling("b-alternate", now));
+        assert!(matches!(x.worker_fallback_deferral, Some((run, _)) if run == x_run));
+
+        // a's window lapses while b's is still live (modelled by a cooldown
+        // holding only b). X re-enters: still deferred on b, but it must not
+        // reopen a's window for the same failure observation.
+        let mut cooldown = ProfileCooldown::new();
+        cooldown.record("b-alternate", std::time::Instant::now());
+        assert_eq!(
+            activate_worker_fallback(&x_config, &mut x, &failure, &x_currency, &mut cooldown)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Deferred
+        );
+        assert!(
+            !cooldown.is_cooling("a-primary", std::time::Instant::now()),
+            "a deferred re-entry renewed the failed profile's cooldown"
+        );
+        // So Y, waiting on a, makes progress instead of deferring again.
+        assert_eq!(
+            activate_worker_fallback(&y_config, &mut y, &failure, &y_currency, &mut cooldown)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Activated
+        );
+        assert_eq!(y.model, "gpt-5.6-sol");
+        let _ = y.kill_and_reap().await;
+
+        // Deferral is bounded: once X has deferred for a full cooldown window
+        // it proceeds with the walk even though b is still cooling. The walk
+        // skips cooling b and ends in the existing provider block, rather
+        // than deferring again.
+        let window = profile_cooldown::profile_cooldown_duration();
+        let started = std::time::Instant::now()
+            .checked_sub(window)
+            .expect("monotonic clock is past one cooldown window");
+        x.worker_fallback_deferral = Some((x_run, started));
+        assert!(cooldown.is_cooling("b-alternate", std::time::Instant::now()));
+        assert_eq!(
+            activate_worker_fallback(&x_config, &mut x, &failure, &x_currency, &mut cooldown)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Settled
+        );
+        let conn = quorum_core::db::open(&x_config.db_path).unwrap();
+        let refs: Option<String> = conn
+            .query_row("SELECT refs FROM tasks WHERE id=?1", [x.task_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let blocked = refs
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .is_some_and(|refs| runner_state::provider_block(&refs).is_some());
+        assert!(
+            blocked,
+            "bounded deferral must settle into the provider block"
+        );
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM routing_attempts WHERE responsibility_key=?1",
+                [&x_responsibility],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(attempts >= 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_fallback_never_defers_after_an_installed_alternate_fails_to_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let runner_program = live_fallback_runner(root.path());
+        let mut config = live_fallback_test_config(
+            root.path().join("worker-cooling-no-late-defer.db"),
+            root.path(),
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        config.model_profiles.insert(
+            "c-tertiary".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.5".into(),
+                effort: "medium".into(),
+            },
+        );
+        for pool in config.routing.worker.values_mut() {
+            pool.insert("a-primary".into(), 25);
+            pool.insert("c-tertiary".into(), 25);
+        }
+
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "worker fallback chain",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let observed_at = now_unix();
+        quorum_core::tasks::claim(
+            &mut conn,
+            "Fallback-Worker",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        let responsibility = worker_responsibility_key(task_id, 1);
+        let (assignment, initial_run, agent_name) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "worker",
+            None,
+            None,
+        );
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent_name.clone(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "initial-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("daemon/fallback-worker".into()),
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("daemon/fallback-worker".into()),
+            },
+        )
+        .unwrap();
+        let now = std::time::Instant::now();
+        let mut slot = SlotState {
+            agent_name,
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "initial-session".into(),
+            model: assignment.model.clone(),
+            effort: assignment.effort.clone(),
+            worktree_path: worktree,
+            branch: "daemon/fallback-worker".into(),
+            remote_branch: "daemon/fallback-worker".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: None,
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            last_provider_activity_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
+            last_error_text: None,
+            agent_run_id: Some(initial_run),
+            cap_run_id: Some("initial-cap".into()),
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: None,
+            pending_prompt: "exact initial prompt".into(),
+            pending_turn_kind: "initial".into(),
+        };
+        let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
+        drop(conn);
+
+        // Pool [a,b,c] with only c cooling: a's failure has the eligible
+        // alternate b, so it installs b. b's real launch then fails with a
+        // classified unavailability after `fallback::install` already retired
+        // a and created b's run. The recursive step must not return Deferred
+        // (the slot would hold a failed process nobody re-routes); it
+        // continues past cooling c and settles through the provider block.
+        let mut cooldown = ProfileCooldown::new();
+        cooldown.record("c-tertiary", std::time::Instant::now());
+        FORCED_FALLBACK_LAUNCH_FAILURE.with(|forced| {
+            *forced.borrow_mut() = Some((
+                "gpt-5.6-terra".into(),
+                runner::RunnerFailure::classified(
+                    runner::FailureDisposition::ProfileUnavailable,
+                    "first alternate model unavailable at launch",
+                    std::io::ErrorKind::Other,
+                ),
+            ));
+        });
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "primary profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+        let outcome =
+            activate_worker_fallback(&config, &mut slot, &failure, &currency, &mut cooldown).await;
+        FORCED_FALLBACK_LAUNCH_FAILURE.with(|forced| forced.borrow_mut().take());
+        assert_eq!(outcome.unwrap(), WorkerFallbackActivation::Settled);
+        let checked_at = std::time::Instant::now();
+        assert!(cooldown.is_cooling("a-primary", checked_at));
+        assert!(cooldown.is_cooling("b-alternate", checked_at));
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let (open_runs, refs): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM agent_runs WHERE task_id=?1 AND ended_at IS NULL),
+                        (SELECT refs FROM tasks WHERE id=?1)",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(open_runs, 0, "no alternate run is left open on the slot");
+        let blocked = refs
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .is_some_and(|refs| runner_state::provider_block(&refs).is_some());
+        assert!(
+            blocked,
+            "the exhausted chain settles through the provider block"
+        );
+        let _ = slot.kill_and_reap().await;
+    }
+
+    /// Real git checkout, real DB, real (sleeping) Codex runner: a worker
+    /// whose every eligible profile is cooling is not claimed or launched,
+    /// and a cooling assignment is routed to the one eligible alternate —
+    /// past a second cooling alternate — through the fallback install.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_provisioning_skips_cooling_profiles_and_defers_when_none_eligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("state.txt"), "base\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["branch", "-M", "main"]);
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "main"]);
+        git(&["fetch", "-q", "origin"]);
+
+        let runner_program = live_fallback_runner(dir.path());
+        let mut config = live_fallback_test_config(
+            dir.path().join("worker-cooldown.db"),
+            &repo,
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        config.worktree_base = dir.path().join("worktrees");
+        config.model_profiles.insert(
+            "c-tertiary".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.5".into(),
+                effort: "medium".into(),
+            },
+        );
+        for pool in config.routing.worker.values_mut() {
+            pool.insert("a-primary".into(), 34);
+            pool.insert("b-alternate".into(), 33);
+            pool.insert("c-tertiary".into(), 33);
+        }
+        let task_id = {
+            let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+            tasks::create(
+                &mut conn,
+                "owner",
+                "worker cooldown routing",
+                Some("route around cooling worker profiles"),
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap()
+        };
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+        let counts = |db_path: &Path| -> (String, i64, i64) {
+            let conn = quorum_core::db::open(db_path).unwrap();
+            conn.query_row(
+                "SELECT (SELECT status FROM tasks WHERE id=?1),
+                        (SELECT count(*) FROM agent_runs WHERE task_id=?1),
+                        (SELECT count(*) FROM role_assignments WHERE task_id=?1)",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+
+        // Every eligible profile cooling: no name, claim, assignment, run, or
+        // process; the task stays open for a later tick.
+        let mut all_cooling = ProfileCooldown::new();
+        let now = std::time::Instant::now();
+        for profile in ["a-primary", "b-alternate", "c-tertiary"] {
+            all_cooling.record(profile, now);
+        }
+        for _ in 0..2 {
+            assert!(!spawn_admitted_worker(
+                &config,
+                &wt_mgr,
+                &mut names,
+                &mut workers,
+                &mut poison,
+                &mut skips,
+                &mut roster,
+                &mut all_cooling,
+                WorkerAdmission::AllReady,
+            )
+            .await
+            .unwrap());
+        }
+        assert!(workers.is_empty());
+        assert_eq!(counts(&config.db_path), ("open".to_string(), 0, 0));
+        // The deferral ends with the earliest cooldown.
+        let task = {
+            let conn = quorum_core::db::open(&config.db_path).unwrap();
+            tasks::get(&conn, task_id).unwrap().unwrap()
+        };
+        let until = worker_cooldown_deferral(&config, &all_cooling, &task, now)
+            .await
+            .unwrap()
+            .expect("every eligible profile is cooling");
+        assert_eq!(
+            worker_cooldown_deferral(&config, &all_cooling, &task, until)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Cool the profile the responsibility is assigned plus one other: the
+        // only eligible route is the third profile.
+        let assignment = assign_role(
+            &config,
+            quorum_core::role_assignments::AssignmentRequest {
+                responsibility_key: worker_responsibility_key(task_id, task.revision),
+                task_id: Some(task_id),
+                pr_number: None,
+                role: "worker".into(),
+                review_stage: None,
+                complexity: Some("3".into()),
+            },
+            Some(3),
+        )
+        .unwrap();
+        let ids = ["a-primary", "b-alternate", "c-tertiary"];
+        let assigned = assignment.profile_id.as_str();
+        let others: Vec<&str> = ids.into_iter().filter(|id| *id != assigned).collect();
+        let (cooling_alternate, eligible) = (others[0], others[1]);
+        let eligible_model = config.model_profiles[eligible].model.clone();
+        let mut cooldown = ProfileCooldown::new();
+        let now = std::time::Instant::now();
+        cooldown.record(assigned, now);
+        cooldown.record(cooling_alternate, now);
+        assert!(spawn_admitted_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut poison,
+            &mut skips,
+            &mut roster,
+            &mut cooldown,
+            WorkerAdmission::AllReady,
+        )
+        .await
+        .unwrap());
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].model, eligible_model);
+        assert!(matches!(workers[0].proc, SlotProcess::Running(_)));
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let live: (Option<String>, String) = conn
+            .query_row(
+                "SELECT configured_profile_id, model FROM agent_runs
+                 WHERE task_id=?1 AND ended_at IS NULL",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(live, (Some(eligible.to_string()), eligible_model));
+        let cooling_launches: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM agent_runs WHERE task_id=?1 AND ended_at IS NULL
+                   AND model IN (?2, ?3)",
+                rusqlite::params![
+                    task_id,
+                    config.model_profiles[assigned].model,
+                    config.model_profiles[cooling_alternate].model
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cooling_launches, 0, "no cooling profile is left running");
+        let status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id=?1", [task_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "working");
+        drop(conn);
+        let _ = workers.pop().unwrap().kill_and_reap().await;
     }
 
     #[cfg(unix)]
@@ -36887,6 +38244,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(agent_run_id),
             cap_run_id: Some(cap_run_id.into()),
@@ -36985,9 +38343,15 @@ mod tests {
             std::io::ErrorKind::Other,
         );
         assert_eq!(
-            activate_worker_fallback(config, &mut initial, &failure, &currency)
-                .await
-                .unwrap(),
+            activate_worker_fallback(
+                config,
+                &mut initial,
+                &failure,
+                &currency,
+                &mut ProfileCooldown::new()
+            )
+            .await
+            .unwrap(),
             WorkerFallbackActivation::Activated
         );
         assert_ne!(initial.model, assignment.model);
@@ -37125,9 +38489,15 @@ mod tests {
             std::io::ErrorKind::Other,
         );
         assert_eq!(
-            activate_worker_fallback(&config, &mut slot, &failure, &currency)
-                .await
-                .unwrap(),
+            activate_worker_fallback(
+                &config,
+                &mut slot,
+                &failure,
+                &currency,
+                &mut ProfileCooldown::new()
+            )
+            .await
+            .unwrap(),
             WorkerFallbackActivation::Activated
         );
         assert_ne!(slot.model, assigned_model);
@@ -37187,9 +38557,15 @@ mod tests {
             std::io::ErrorKind::Other,
         );
         assert_eq!(
-            activate_worker_fallback(&config, &mut slot, &failure, &currency)
-                .await
-                .unwrap(),
+            activate_worker_fallback(
+                &config,
+                &mut slot,
+                &failure,
+                &currency,
+                &mut ProfileCooldown::new()
+            )
+            .await
+            .unwrap(),
             WorkerFallbackActivation::Settled
         );
 
@@ -37480,6 +38856,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -37860,6 +39237,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -39265,6 +40643,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -43107,6 +44486,7 @@ printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-session-te
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: None,
                 agent_run_id: Some(old_run_id),
                 cap_run_id: Some(old_capability.clone()),
@@ -43361,6 +44741,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &mut name_pool,
             &mut workers,
             task_id,
+            &mut ProfileCooldown::new(),
         )
         .await;
 
@@ -43449,6 +44830,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &mut name_pool,
             &mut workers,
             task_id,
+            &mut ProfileCooldown::new(),
         )
         .await;
 
@@ -43520,6 +44902,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &mut name_pool,
             &mut workers,
             task_id,
+            &mut ProfileCooldown::new(),
         )
         .await;
 
@@ -44201,6 +45584,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 &mut workers,
                 0,
                 &error,
+                &mut ProfileCooldown::new(),
             )
             .await
         );
@@ -44303,6 +45687,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &mut workers,
             worker_index,
             &std::io::Error::other("provider launch failed"),
+            &mut ProfileCooldown::new(),
         )
         .await
         .unwrap();
@@ -44355,6 +45740,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &mut workers,
             0,
             &std::io::Error::other("provider launch failed"),
+            &mut ProfileCooldown::new(),
         )
         .await
         .expect_err("durable disposition failure must abort recovered startup");
@@ -45161,6 +46547,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: None,
             cap_run_id: None,
@@ -57926,6 +59313,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id,
             cap_run_id: Some(cap_run_id.into()),
