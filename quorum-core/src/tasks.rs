@@ -2037,16 +2037,19 @@ pub fn claim_with_graph_limit(
                AND (json_extract(owner.refs, '$.pr') = tasks.continue_pr
                     OR json_extract(owner.refs, '$.pr') = CAST(tasks.continue_pr AS TEXT))))
     ))";
-    // The decomposition freeze blocks only NEW implementation starts, so this
-    // clause is applied to the status='open' branch alone. Existing in-flight
-    // work — reviewer attachment (status='in-review') here, plus rework and
-    // remediation in claim_provider_retry_rework / claim_remediation_rework —
-    // must still complete under the freeze, because the freeze's drain
-    // predicate waits for workers==0 && reviewers==0 before capturing the
-    // frozen base. Gating continuation on the freeze would deadlock it against
-    // its own drain.
+    // A planning freeze blocks only its own source task: planning a
+    // decomposition must not block unrelated task starts (owner decision
+    // 2026-11-09). The clause sits on the status='open' branch alone, as
+    // defense in depth beside the source's own `planning` status, so the
+    // planning source is never claimed as an implementation task while
+    // unrelated open tasks and other graphs' ready children stay claimable.
+    // In-flight continuation — reviewer attachment (status='in-review') here,
+    // plus rework and remediation in claim_provider_retry_rework /
+    // claim_remediation_rework — is never gated by the freeze.
     const NO_PLANNING_FREEZE_CLAUSE: &str = "NOT EXISTS (
-        SELECT 1 FROM task_decompositions WHERE freeze_active=1
+        SELECT 1 FROM task_decompositions planning_freeze
+        WHERE planning_freeze.freeze_active=1
+          AND planning_freeze.source_task_id=tasks.id
     )";
     // Keep graph authority in this BEGIN IMMEDIATE transaction so sibling
     // claims, failures, and graph blockers cannot race provisioning.
@@ -2531,8 +2534,9 @@ pub fn claim_remediation_rework_with_feedback(
 /// external provision.
 ///
 /// This deliberately does NOT gate on the repository decomposition freeze. A
-/// freeze blocks only a new open-status worker start (see `claim`, where the
-/// freeze clause sits inside the status='open' branch); existing in-flight
+/// freeze blocks only a new open-status worker start of the planning graph's
+/// own source task (see `claim`, where the source-scoped freeze clause sits
+/// inside the status='open' branch); existing in-flight
 /// continuation — reviewer attachment, rework, and remediation — must still
 /// complete. An already-published PR still needs its reviewer to finish. The
 /// freeze's
@@ -6560,8 +6564,8 @@ pub fn cancelled_dep_ids(conn: &Connection, id: i64) -> Result<Vec<i64>> {
 /// Both reviewer-cap park sites resume to `in-review`, where the next provision
 /// pass would re-park a task at the cap, so restoring one reports success for
 /// nothing. Parks that [`retry_parked`] settles before this gate (a merged
-/// publication, a classifier policy park, or any park under a decomposition
-/// freeze) return `None` so their outcomes stay unchanged. Side-effect free:
+/// publication, a classifier policy park, or the source task of a graph whose
+/// decomposition freeze is active) return `None` so their outcomes stay unchanged. Side-effect free:
 /// the CLI uses it to name the reason and `retry_parked` to enforce it.
 pub fn reviewer_cap_retry_refusal(conn: &Connection, id: i64) -> Result<Option<String>> {
     let cap_decides: bool = conn.query_row(
@@ -6572,7 +6576,10 @@ pub fn reviewer_cap_retry_refusal(conn: &Connection, id: i64) -> Result<Option<S
                AND json_extract(refs, '$.daemon_resume_status')='in-review'
                AND COALESCE(json_extract(refs, '$.classifier_policy_parked'), 0)<>1
                AND COALESCE(json_extract(refs, '$.daemon_publication_failure_kind'), '')<>?2
-         ) AND NOT EXISTS(SELECT 1 FROM task_decompositions WHERE freeze_active=1)",
+         ) AND NOT EXISTS(
+             SELECT 1 FROM task_decompositions
+             WHERE freeze_active=1 AND source_task_id=?1
+         )",
         params![id, PUBLICATION_FAILURE_KIND_PR_MERGED],
         |row| row.get(0),
     )?;
@@ -6667,21 +6674,23 @@ pub fn retry_parked(
         params![id],
         |row| row.get(0),
     )?;
-    // Non-growth under a decomposition freeze: restoring a parked task to a
-    // non-terminal status while `freeze_active=1` would add started work to
-    // the drain-quiescence set that the frozen-base capture waits on. Refuse
-    // the restore; the operator can rerun once planning materializes and the
-    // freeze clears. The policy-parked branch keeps status='failed', so it
-    // does not grow the counted set and is allowed under a freeze.
+    // A planning freeze guards only its own source task: restoring the source
+    // of a graph with `freeze_active=1` to a non-terminal status would let it
+    // start as implementation work while it is being planned. Refuse that
+    // restore; the operator can rerun once planning materializes and the
+    // freeze clears. Parked tasks unrelated to the planning graph retry
+    // normally (owner decision 2026-11-09). The policy-parked branch keeps
+    // status='failed', so it is allowed even for the source.
     if !policy_parked {
         let freeze_active: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM task_decompositions WHERE freeze_active=1",
-            [],
+            "SELECT COUNT(*) FROM task_decompositions
+             WHERE freeze_active=1 AND source_task_id=?1",
+            params![id],
             |row| row.get(0),
         )?;
         if freeze_active > 0 {
             return Err(QuorumError::Usage(format!(
-                "cannot retry task #{id}: a decomposition freeze is active; \
+                "cannot retry task #{id}: its decomposition freeze is active; \
                  wait for planning to materialize before retrying"
             )));
         }
@@ -18184,7 +18193,7 @@ mod tests {
     }
 
     #[test]
-    fn planning_freeze_blocks_new_open_claims_but_allows_existing_continuation() {
+    fn planning_freeze_blocks_only_its_source_and_allows_existing_continuation() {
         let (_dir, mut c) = open_tmp();
         let source = create(&mut c, "owner", "large", None, 1, None,
             Some(r#"{"cx_est":4,"cx_size":"XL","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
@@ -18212,21 +18221,56 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        // A new open-status worker start stays blocked under the freeze — no
-        // new implementation work begins while draining.
-        assert!(claim(&mut c, "worker", Some(implementation), &[], 60, 3)
+        let freeze_active: i64 = c
+            .query_row(
+                "SELECT freeze_active FROM task_decompositions WHERE source_task_id=?1",
+                [source],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(freeze_active, 1, "planning graph must hold the freeze");
+
+        // The planning source itself is never claimed as implementation work,
+        // by id or by selector.
+        assert!(claim(&mut c, "worker", Some(source), &[], 60, 3)
             .unwrap()
             .is_none());
-        // But reviewer attachment to an existing in-review PR is allowed: review
-        // continuation is in-flight work the drain waits on, not a new start.
+        // An unrelated open standalone task is claimable while the source's
+        // graph plans: the freeze blocks only its own source (owner decision
+        // 2026-11-09). This failed against the former repo-wide clause.
+        let claimed = claim(&mut c, "worker", Some(implementation), &[], 60, 3)
+            .unwrap()
+            .expect("unrelated open task must be claimable under a planning freeze");
+        assert_eq!(claimed.status, "working");
+        assert_eq!(claimed.assignee.as_deref(), Some("worker"));
+        // Reviewer attachment to an existing in-review PR stays allowed.
         assert!(claim(&mut c, "reviewer", Some(review), &[], 60, 3)
             .unwrap()
             .is_some());
+        // The selector skips the planning source and wins the next unrelated
+        // open task.
+        let selected = claim(&mut c, "worker2", None, &[], 60, 3)
+            .unwrap()
+            .expect("selector must win an unrelated open task under a freeze");
+        assert_eq!(selected.id, remediation);
+        assert!(claim(&mut c, "worker3", None, &[], 60, 3)
+            .unwrap()
+            .is_none());
+        let source_status: String = c
+            .query_row("SELECT status FROM tasks WHERE id=?1", [source], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(source_status, "planning");
 
-        // Existing rework/remediation MUST still complete under the freeze:
-        // these are in-flight continuations the drain predicate waits on
-        // (workers==0 && reviewers==0). Blocking them would deadlock the freeze
-        // against its own drain — the incident this regression guards.
+        // Existing rework/remediation continuation is never gated by the
+        // freeze. Release the worker leases taken above, as a submit handoff
+        // would, before reattaching rework workers.
+        c.execute(
+            "UPDATE claims SET active=0 WHERE target IN (?1,?2)",
+            params![lease_target(implementation), lease_target(remediation)],
+        )
+        .unwrap();
         c.execute(
             "UPDATE tasks SET status='rework',assignee=NULL,
             refs=json_set(refs,'$.daemon_rework_retry_requested',json('true')) WHERE id=?1",
@@ -18247,6 +18291,135 @@ mod tests {
             claim_remediation_rework(&mut c, "remediation", remediation, 60, 4)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn planning_freeze_source_clause_excludes_only_the_source_and_keeps_other_graph_children() {
+        const READY: &str = r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#;
+        let (_dir, mut c) = open_tmp();
+        // An otherwise dispatchable open source whose graph holds the freeze:
+        // only the source-scoped freeze clause keeps it unclaimed.
+        let frozen_source = create(
+            &mut c,
+            "owner",
+            "frozen source",
+            None,
+            9,
+            None,
+            Some(READY),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let other_source = create(
+            &mut c,
+            "owner",
+            "active source",
+            None,
+            1,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let child = create(
+            &mut c,
+            "owner",
+            "other graph child",
+            None,
+            1,
+            None,
+            Some(READY),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let standalone = create(
+            &mut c,
+            "owner",
+            "standalone",
+            None,
+            1,
+            None,
+            Some(READY),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+             VALUES (?1,'planning',0,1,1,1,1)",
+            [frozen_source],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='decomposed' WHERE id=?1",
+            [other_source],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,plan_revision,accepted_plan_revision,
+                 created_at,updated_at)
+             VALUES (?1,'active',1,0,1,1,1,1,1)",
+            [other_source],
+        )
+        .unwrap();
+        let other_graph = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (?1,?2,'a',1,1)",
+            params![other_graph, child],
+        )
+        .unwrap();
+
+        // Negative: the frozen source is never claimable, by id or selector.
+        assert!(claim(&mut c, "w0", Some(frozen_source), &[], 60, 2)
+            .unwrap()
+            .is_none());
+        // Selector prefers active graph children, then priority; the frozen
+        // source has the highest priority but must be skipped.
+        let first = claim(&mut c, "w1", None, &[], 60, 2).unwrap().unwrap();
+        assert_eq!(
+            first.id, child,
+            "another graph's ready child stays claimable"
+        );
+        assert_eq!(first.status, "working");
+        let second = claim(&mut c, "w2", None, &[], 60, 2).unwrap().unwrap();
+        assert_eq!(
+            second.id, standalone,
+            "unrelated standalone task stays claimable"
+        );
+        assert!(claim(&mut c, "w3", None, &[], 60, 2).unwrap().is_none());
+        let (status, assignee): (String, Option<String>) = c
+            .query_row(
+                "SELECT status,assignee FROM tasks WHERE id=?1",
+                [frozen_source],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), assignee), ("open", None));
+
+        // Once the freeze clears, the same source becomes claimable again —
+        // the clause, not some other predicate, was excluding it.
+        c.execute(
+            "UPDATE task_decompositions SET freeze_active=0,state='held'
+             WHERE source_task_id=?1",
+            [frozen_source],
+        )
+        .unwrap();
+        assert_eq!(
+            claim(&mut c, "w4", Some(frozen_source), &[], 60, 3)
+                .unwrap()
+                .map(|t| t.id),
+            Some(frozen_source)
         );
     }
 
@@ -18364,7 +18537,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_parked_refuses_under_a_decomposition_freeze() {
+    fn retry_parked_refuses_only_the_planning_source_under_a_decomposition_freeze() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
         // Park the task with a non-terminal resume status so restoration would
@@ -18389,37 +18562,57 @@ mod tests {
             .expect("parked task restored when no freeze");
         assert_eq!(restored.status, "in-review");
 
-        // Re-park then start a freeze; retry must fail Usage.
-        c.execute(
-            "UPDATE tasks SET status='failed',refs=json_set(
-                refs,
-                '$.daemon_parked', json('true'),
-                '$.daemon_resume_status','in-review'
-             ) WHERE id=?1",
-            params![id],
-        )
-        .unwrap();
+        // Re-park, then start a freeze on an unrelated source; retry of the
+        // unrelated parked task still restores (owner decision 2026-11-09).
+        let repark = |c: &mut Connection, id: i64| {
+            c.execute(
+                "UPDATE tasks SET status='failed',refs=json_set(
+                    refs,
+                    '$.daemon_parked', json('true'),
+                    '$.daemon_resume_status','in-review'
+                 ) WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
+        };
+        repark(&mut c, id);
         let source = create(&mut c, "boss", "src", None, 0, None, None, None, None, 1000).unwrap();
         c.execute(
             "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
                  planned_source_revision,created_at,updated_at)
-             VALUES (?1,'draining',0,1,1,1000,1000)",
+             VALUES (?1,'planning',0,1,1,1000,1000)",
             params![source],
         )
         .unwrap();
-        let err = retry_parked(&mut c, id, "operator", true, 1002).unwrap_err();
+        assert_eq!(reviewer_cap_retry_refusal(&c, id).unwrap(), None);
+        let restored = retry_parked(&mut c, id, "operator", true, 1002)
+            .unwrap()
+            .expect("unrelated parked task restores under another graph's freeze");
+        assert_eq!(restored.status, "in-review");
+
+        // The planning graph's own source stays guarded: a parked source is
+        // refused with Usage and remains failed.
+        let source_refs = r#"{"cx_est":2,"cx_size":"S","cx_ready":true,
+            "cx_not_ready_reason":null,"cx_by":"test:v2"}"#;
+        c.execute(
+            "UPDATE tasks SET refs=?2 WHERE id=?1",
+            params![source, source_refs],
+        )
+        .unwrap();
+        repark(&mut c, source);
+        let err = retry_parked(&mut c, source, "operator", true, 1003).unwrap_err();
         match err {
             QuorumError::Usage(msg) => {
                 assert!(msg.contains("decomposition freeze"), "unexpected: {msg}")
             }
             other => panic!("unexpected error variant: {other:?}"),
         }
-
-        // Task stays failed — non-growth invariant preserved.
         let status: String = c
-            .query_row("SELECT status FROM tasks WHERE id=?1", params![id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT status FROM tasks WHERE id=?1",
+                params![source],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(status, "failed");
     }
@@ -18599,15 +18792,23 @@ mod tests {
         let frozen = park_for_retry(&mut c, "in-review");
         add_reviewer_runs(&c, frozen, MAX_TOTAL_REVIEWER_RUNS);
         assert!(reviewer_cap_retry_refusal(&c, frozen).unwrap().is_some());
-        let source = create(&mut c, "boss", "src", None, 0, None, None, None, None, 1000).unwrap();
+        let unrelated = park_for_retry(&mut c, "in-review");
+        add_reviewer_runs(&c, unrelated, MAX_TOTAL_REVIEWER_RUNS);
+        // `frozen` is the source of the planning graph holding the freeze.
         c.execute(
             "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
                  planned_source_revision,created_at,updated_at)
-             VALUES (?1,'draining',0,1,1,1000,1000)",
-            params![source],
+             VALUES (?1,'planning',0,1,1,1000,1000)",
+            params![frozen],
         )
         .unwrap();
         assert_eq!(reviewer_cap_retry_refusal(&c, frozen).unwrap(), None);
+        // The freeze guards only its source: an unrelated capped task still
+        // reports the reviewer-cap refusal.
+        assert!(reviewer_cap_retry_refusal(&c, unrelated).unwrap().is_some());
+        assert!(retry_parked(&mut c, unrelated, "operator", true, 1002)
+            .unwrap()
+            .is_none());
         assert!(matches!(
             retry_parked(&mut c, frozen, "operator", true, 1002),
             Err(QuorumError::Usage(_))
