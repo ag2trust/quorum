@@ -78,6 +78,14 @@ pub const RECOVERED_REMEDIATION_RETRY_REF: &str = "daemon_recovered_remediation_
 pub const MERGE_RETRY_REF: &str = "daemon_merge_retry";
 pub const MERGE_RETRY_REQUESTED: &str = "requested";
 pub const MERGE_RETRY_ATTEMPTING: &str = "attempting";
+/// Daemon-owned observation of a merging task's merge-gate checks. Written
+/// only while `status='merging'` and removed in the same transaction as every
+/// transition out of `merging`. Creators can neither set nor erase it.
+pub const MERGE_CHECKS_REF: &str = "merge_checks";
+/// Maximum check names retained in one merge-checks snapshot.
+pub const MERGE_CHECKS_MAX_NAMES: usize = 20;
+/// Maximum characters retained per check name in a merge-checks snapshot.
+pub const MERGE_CHECKS_MAX_NAME_CHARS: usize = 120;
 /// Maximum corrupt terminal retry rows reconciled in one daemon tick.  The
 /// bounded batch makes restart cleanup converge without turning one tick into
 /// an unbounded write transaction.
@@ -907,7 +915,132 @@ pub fn validate_creator_refs(refs_json: Option<&str>) -> Result<()> {
             "refs key '{POISON_RETRY_GENERATION_REF}' is daemon-owned; use task-retry"
         )));
     }
+    if object.contains_key(MERGE_CHECKS_REF) {
+        return Err(QuorumError::Usage(format!(
+            "refs key '{MERGE_CHECKS_REF}' is daemon-owned merge-gate state"
+        )));
+    }
     Ok(())
+}
+
+/// Merge-gate check state recorded in [`MergeChecksSnapshot::state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeChecksState {
+    /// Required checks have not all completed.
+    Pending,
+    /// At least one required check failed.
+    Failing,
+    /// Checks passed; the task is awaiting its merge call.
+    Passed,
+}
+
+impl MergeChecksState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MergeChecksState::Pending => "pending",
+            MergeChecksState::Failing => "failing",
+            MergeChecksState::Passed => "passed",
+        }
+    }
+}
+
+/// Daemon-owned `refs.merge_checks` snapshot. `since` is when the current
+/// `state` was first observed; `observed_at` is the latest observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct MergeChecksSnapshot {
+    pub state: MergeChecksState,
+    pub checks: Vec<String>,
+    pub since: i64,
+    pub observed_at: i64,
+}
+
+/// Tolerant reader for `refs.merge_checks`. Absent, malformed, or
+/// non-object refs return `None` so readers can fall back.
+pub fn merge_checks_of(refs: Option<&str>) -> Option<MergeChecksSnapshot> {
+    let mut value: serde_json::Value = serde_json::from_str(refs?).ok()?;
+    let snapshot = value.as_object_mut()?.remove(MERGE_CHECKS_REF)?;
+    serde_json::from_value(snapshot).ok()
+}
+
+/// Bound check names for durable storage: drop NUL, replace other control
+/// characters, cap each name's length, skip blanks, and keep at most
+/// [`MERGE_CHECKS_MAX_NAMES`].
+fn bound_merge_check_names(checks: &[String]) -> Vec<String> {
+    checks
+        .iter()
+        .filter_map(|name| {
+            let bounded: String = name
+                .chars()
+                .filter(|ch| *ch != '\0')
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .take(MERGE_CHECKS_MAX_NAME_CHARS)
+                .collect();
+            let trimmed = bounded.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .take(MERGE_CHECKS_MAX_NAMES)
+        .collect()
+}
+
+/// Record the daemon's latest merge-gate check observation for a merging
+/// task in one short write transaction. `since` survives repeated writes of
+/// the same state and resets when the state changes; `observed_at` always
+/// advances to `now`. Returns `Ok(false)` — a clean negative — when the task
+/// is not `merging` (or its refs are not valid JSON).
+pub fn set_merge_checks_snapshot(
+    conn: &mut Connection,
+    id: i64,
+    state: MergeChecksState,
+    checks: &[String],
+    now: i64,
+) -> Result<bool> {
+    let checks_json = serde_json::to_string(&bound_merge_check_names(checks))
+        .map_err(|e| QuorumError::Io(format!("serialize merge checks: {e}")))?;
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET refs=json_set(
+             COALESCE(refs, '{}'),
+             '$.merge_checks',
+             json_object(
+                 'state', ?2,
+                 'checks', json(?3),
+                 'since', CASE
+                     WHEN json_extract(COALESCE(refs, '{}'), '$.merge_checks.state')=?2
+                      AND json_type(COALESCE(refs, '{}'), '$.merge_checks.since')='integer'
+                     THEN json_extract(COALESCE(refs, '{}'), '$.merge_checks.since')
+                     ELSE ?4
+                 END,
+                 'observed_at', ?4
+             )
+         )
+         WHERE id=?1 AND status='merging'
+           AND (refs IS NULL OR json_valid(refs))",
+        params![id, state.as_str(), checks_json, now],
+    )?;
+    tx.commit()?;
+    Ok(changed == 1)
+}
+
+/// Remove the daemon-owned merge-checks snapshot. Returns `Ok(false)` when
+/// no snapshot was present.
+pub fn clear_merge_checks_snapshot(conn: &mut Connection, id: i64) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let changed = clear_merge_checks_tx(&tx, id)?;
+    tx.commit()?;
+    Ok(changed)
+}
+
+/// In-transaction clear used by every core transition out of `merging`.
+fn clear_merge_checks_tx(conn: &Connection, id: i64) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE tasks SET refs=json_remove(refs, '$.merge_checks')
+         WHERE id=?1 AND json_valid(refs)
+           AND json_type(refs, '$.merge_checks') IS NOT NULL",
+        params![id],
+    )?;
+    Ok(changed == 1)
 }
 
 /// The daemon-owned review-only close outcome (`changes_requested`,
@@ -969,6 +1102,7 @@ fn preserve_protected_refs(
     // below survive.
     if preserve_recovery_provenance {
         strip_review_outcome_refs(next_map);
+        next_map.remove(MERGE_CHECKS_REF);
     }
     if let Some(existing_map) = existing
         .as_deref()
@@ -996,7 +1130,10 @@ fn preserve_protected_refs(
             let recovery_provenance = preserve_recovery_provenance
                 && matches!(
                     key.as_str(),
-                    "source_task" | MERGE_COMMIT_SHA_REF | POISON_RETRY_GENERATION_REF
+                    "source_task"
+                        | MERGE_COMMIT_SHA_REF
+                        | POISON_RETRY_GENERATION_REF
+                        | MERGE_CHECKS_REF
                 );
             if classifier_or_pr
                 || runner_state
@@ -4342,6 +4479,12 @@ where
             completion_provenance,
         ],
     )?;
+    // The merge-gate observation is only meaningful while merging; every
+    // lifecycle exit (done, rework, in-review, failed, cancelled) drops it in
+    // this same transaction.
+    if status == Status::Merging && new_status != Status::Merging {
+        clear_merge_checks_tx(&tx, id)?;
+    }
 
     let event_kind = format!("task_{}", new_status_str.replace('-', "_"));
     crate::events::emit(
@@ -4666,6 +4809,9 @@ pub fn update(
                 ],
             )?;
             cancel_applied = rows > 0;
+            if cancel_applied {
+                clear_merge_checks_tx(&tx, id)?;
+            }
             rows
         }
         _ => {
@@ -5575,6 +5721,9 @@ pub(crate) fn set_parked_refs(
     object.remove(PARKED_UNSATISFIABLE_REF);
     // A terminal task cannot retain an automatic replacement-worker intent.
     object.remove(RECOVERED_REMEDIATION_RETRY_REF);
+    // Every park leaves `merging` (if it was there); the merge-gate
+    // observation belongs only to a live merging task.
+    object.remove(MERGE_CHECKS_REF);
     // Reset the publication-failure classification on every park so a prior
     // pr-closed park cannot contaminate a subsequent generic park.
     match publication_failure_kind {
@@ -7181,6 +7330,7 @@ fn close_after_merge_inner(
         tx.commit()?;
         return Ok(false);
     }
+    clear_merge_checks_tx(&tx, id)?;
     deactivate_lease(&tx, id, now)?;
     tx.execute(
         "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, 'daemon', ?3)",
@@ -7264,6 +7414,7 @@ pub fn close_manual(
         tx.commit()?;
         return Ok(None);
     }
+    clear_merge_checks_tx(&tx, id)?;
     // Mark this dependency done before the opportunistic failed-dependency
     // sweep. A recovered failed task can otherwise cause the same write to
     // park all of its dependents just before this manual resolution unblocks
@@ -10109,6 +10260,308 @@ mod tests {
         let r = apply_event(&mut c, "system", id, &Event::MergeSucceeded, 1004).unwrap();
         assert_eq!(r.task.status, "done");
         assert!(r.effects.contains(&Effect::ReleaseLease));
+    }
+
+    /// Walk a fresh task to `merging` through the real lifecycle.
+    fn merging_task(c: &mut Connection, now: i64) -> i64 {
+        let (worker, reviewer) = (format!("A{now}"), format!("R{now}"));
+        let id = create(c, "boss", "t", None, 0, None, None, None, None, now).unwrap();
+        claim(c, &worker, Some(id), &[], TTL, now + 1).unwrap();
+        apply_event(
+            c,
+            &worker,
+            id,
+            &Event::SignaledDone {
+                pr: "99".to_string(),
+            },
+            now + 2,
+        )
+        .unwrap();
+        claim(c, &reviewer, Some(id), &[], TTL, now + 3).unwrap();
+        let r = apply_event(c, &reviewer, id, &Event::VerdictApprove, now + 4).unwrap();
+        assert_eq!(r.task.status, "merging");
+        id
+    }
+
+    fn task_refs(c: &Connection, id: i64) -> Option<String> {
+        c.query_row("SELECT refs FROM tasks WHERE id=?1", [id], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn snapshot(c: &Connection, id: i64) -> Option<MergeChecksSnapshot> {
+        merge_checks_of(task_refs(c, id).as_deref())
+    }
+
+    fn has_merge_checks_key(c: &Connection, id: i64) -> bool {
+        task_refs(c, id)
+            .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+            .is_some_and(|v| v.get(MERGE_CHECKS_REF).is_some())
+    }
+
+    #[test]
+    fn merge_checks_snapshot_is_guarded_bounded_and_keeps_since_per_state() {
+        let (_d, mut c) = open_tmp();
+        let open_id = create(&mut c, "boss", "o", None, 0, None, None, None, None, 1000).unwrap();
+        let names = vec!["ci".to_string()];
+        assert!(
+            !set_merge_checks_snapshot(&mut c, open_id, MergeChecksState::Pending, &names, 1001)
+                .unwrap(),
+            "non-merging write is a clean negative"
+        );
+        assert!(!has_merge_checks_key(&c, open_id));
+        let errors: i64 = c
+            .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(errors, 0, "a guarded miss never records an errors row");
+
+        let id = merging_task(&mut c, 1100);
+        let mut many: Vec<String> = (0..25).map(|i| format!("check-{i}")).collect();
+        many[0] = "nul\0name".to_string();
+        many[1] = "x".repeat(MERGE_CHECKS_MAX_NAME_CHARS * 3);
+        many[2] = "\0\0".to_string();
+        assert!(
+            set_merge_checks_snapshot(&mut c, id, MergeChecksState::Pending, &many, 2000).unwrap()
+        );
+        let snap = snapshot(&c, id).unwrap();
+        assert_eq!(snap.state, MergeChecksState::Pending);
+        assert_eq!(snap.checks.len(), MERGE_CHECKS_MAX_NAMES);
+        assert_eq!(snap.checks[0], "nulname");
+        assert_eq!(snap.checks[1].chars().count(), MERGE_CHECKS_MAX_NAME_CHARS);
+        assert_eq!(snap.checks[2], "check-3", "blank names are skipped");
+        assert!(snap.checks.iter().all(|n| !n.contains('\0')));
+        assert_eq!((snap.since, snap.observed_at), (2000, 2000));
+        // Unrelated refs survive the json_set.
+        let refs: serde_json::Value =
+            serde_json::from_str(task_refs(&c, id).as_deref().unwrap()).unwrap();
+        assert_eq!(refs["pr"], 99);
+
+        assert!(
+            set_merge_checks_snapshot(&mut c, id, MergeChecksState::Pending, &names, 2010).unwrap()
+        );
+        let snap = snapshot(&c, id).unwrap();
+        assert_eq!((snap.since, snap.observed_at), (2000, 2010));
+        assert_eq!(snap.checks, names);
+
+        assert!(
+            set_merge_checks_snapshot(&mut c, id, MergeChecksState::Failing, &names, 2020).unwrap()
+        );
+        let snap = snapshot(&c, id).unwrap();
+        assert_eq!(snap.state, MergeChecksState::Failing);
+        assert_eq!((snap.since, snap.observed_at), (2020, 2020));
+
+        assert!(
+            set_merge_checks_snapshot(&mut c, id, MergeChecksState::Passed, &[], 2030).unwrap()
+        );
+        let snap = snapshot(&c, id).unwrap();
+        assert_eq!(snap.state, MergeChecksState::Passed);
+        assert!(snap.checks.is_empty());
+        assert_eq!((snap.since, snap.observed_at), (2030, 2030));
+
+        assert!(clear_merge_checks_snapshot(&mut c, id).unwrap());
+        assert!(!has_merge_checks_key(&c, id));
+        assert!(!clear_merge_checks_snapshot(&mut c, id).unwrap());
+    }
+
+    #[test]
+    fn merge_checks_of_tolerates_absent_and_malformed_snapshots() {
+        assert!(merge_checks_of(None).is_none());
+        assert!(merge_checks_of(Some("not json")).is_none());
+        assert!(merge_checks_of(Some("[1]")).is_none());
+        assert!(merge_checks_of(Some(r#"{"pr":1}"#)).is_none());
+        assert!(merge_checks_of(Some(r#"{"merge_checks":"pending"}"#)).is_none());
+        assert!(merge_checks_of(Some(
+            r#"{"merge_checks":{"state":"weird","checks":[],"since":1,"observed_at":1}}"#
+        ))
+        .is_none());
+        assert!(merge_checks_of(Some(
+            r#"{"merge_checks":{"state":"pending","checks":[],"since":"x","observed_at":1}}"#
+        ))
+        .is_none());
+        assert_eq!(
+            merge_checks_of(Some(
+                r#"{"merge_checks":{"state":"passed","checks":["a"],"since":3,"observed_at":4}}"#
+            )),
+            Some(MergeChecksSnapshot {
+                state: MergeChecksState::Passed,
+                checks: vec!["a".into()],
+                since: 3,
+                observed_at: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn every_exit_from_merging_clears_merge_checks_in_the_transition() {
+        let (_d, mut c) = open_tmp();
+        let names = vec!["ci".to_string()];
+        type Exit = Box<dyn Fn(&mut Connection, i64, i64)>;
+        let exits: Vec<(&str, Exit)> = vec![
+            (
+                "done",
+                Box::new(|c, id, now| {
+                    apply_event(c, "daemon", id, &Event::MergeSucceeded, now).unwrap();
+                }),
+            ),
+            (
+                "rework",
+                Box::new(|c, id, now| {
+                    apply_event(c, "daemon", id, &Event::MergeConflict, now).unwrap();
+                }),
+            ),
+            (
+                "in-review",
+                Box::new(|c, id, now| {
+                    apply_event(
+                        c,
+                        "daemon",
+                        id,
+                        &Event::MergeFailed {
+                            reason: "gh".into(),
+                        },
+                        now,
+                    )
+                    .unwrap();
+                }),
+            ),
+            (
+                "cancelled",
+                Box::new(|c, id, now| {
+                    apply_event(
+                        c,
+                        "daemon",
+                        id,
+                        &Event::Cancelled { by: "boss".into() },
+                        now,
+                    )
+                    .unwrap();
+                }),
+            ),
+            (
+                "failed",
+                Box::new(|c, id, now| {
+                    park(c, id, "uncertain merge", "in-review", now)
+                        .unwrap()
+                        .unwrap();
+                }),
+            ),
+            (
+                "done",
+                Box::new(|c, id, now| {
+                    assert!(close_after_merge(c, id, "merged externally", now).unwrap());
+                }),
+            ),
+            (
+                "cancelled",
+                Box::new(|c, id, now| {
+                    let fields = TaskUpdate {
+                        status: Some("cancelled"),
+                        ..Default::default()
+                    };
+                    update(c, "boss", id, &fields, now).unwrap();
+                }),
+            ),
+        ];
+        for (offset, (expected, exit)) in exits.into_iter().enumerate() {
+            let base = 2000 + (offset as i64) * 100;
+            let id = merging_task(&mut c, base);
+            assert!(set_merge_checks_snapshot(
+                &mut c,
+                id,
+                MergeChecksState::Failing,
+                &names,
+                base + 10
+            )
+            .unwrap());
+            assert!(has_merge_checks_key(&c, id));
+            exit(&mut c, id, base + 20);
+            let status: String = c
+                .query_row("SELECT status FROM tasks WHERE id=?1", [id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(status, expected);
+            assert!(
+                !has_merge_checks_key(&c, id),
+                "{expected} exit must clear merge_checks"
+            );
+            assert!(
+                !set_merge_checks_snapshot(
+                    &mut c,
+                    id,
+                    MergeChecksState::Pending,
+                    &names,
+                    base + 21
+                )
+                .unwrap(),
+                "{expected}: writer is guarded once the task left merging"
+            );
+            assert!(!has_merge_checks_key(&c, id));
+        }
+    }
+
+    #[test]
+    fn controlled_shutdown_keeps_merge_checks_while_still_merging() {
+        let (_d, mut c) = open_tmp();
+        let id = merging_task(&mut c, 1000);
+        let names = vec!["ci".to_string()];
+        assert!(
+            set_merge_checks_snapshot(&mut c, id, MergeChecksState::Pending, &names, 1100).unwrap()
+        );
+        let r = apply_event(&mut c, "daemon", id, &Event::ControlledShutdown, 1101).unwrap();
+        assert_eq!(r.task.status, "merging");
+        assert_eq!(snapshot(&c, id).unwrap().since, 1100);
+    }
+
+    #[test]
+    fn creators_cannot_set_or_erase_merge_checks_but_daemon_refs_can() {
+        let err = validate_creator_refs(Some(
+            r#"{"merge_checks":{"state":"passed","checks":[],"since":1,"observed_at":1}}"#,
+        ))
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(format!("{err}").contains("'merge_checks' is daemon-owned"));
+
+        let (_d, mut c) = open_tmp();
+        let established = r#"{"state":"pending","checks":["ci"],"since":5,"observed_at":6}"#;
+        let id = create(
+            &mut c,
+            "boss",
+            "t",
+            None,
+            0,
+            None,
+            Some(&format!(r#"{{"merge_checks":{established}}}"#)),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        let expected: MergeChecksSnapshot = serde_json::from_str(established).unwrap();
+        // Replacement that omits the key cannot erase it.
+        let fields = TaskUpdate {
+            refs: Some(r#"{"ticket":"ABC"}"#),
+            expected_revision: Some(1),
+            ..Default::default()
+        };
+        update(&mut c, "boss", id, &fields, 1001).unwrap();
+        assert_eq!(snapshot(&c, id), Some(expected.clone()));
+        // Replacement that forges the key cannot rewrite it.
+        let fields = TaskUpdate {
+            refs: Some(
+                r#"{"merge_checks":{"state":"passed","checks":[],"since":9,"observed_at":9}}"#,
+            ),
+            expected_revision: Some(2),
+            ..Default::default()
+        };
+        update(&mut c, "boss", id, &fields, 1002).unwrap();
+        assert_eq!(snapshot(&c, id), Some(expected.clone()));
+        // Creator replacement cannot introduce it on a task that lacks it.
+        assert!(preserve_creator_protected_refs(
+            &Some(r#"{"ticket":"ABC"}"#.into()),
+            Some(r#"{"merge_checks":{"state":"passed"}}"#)
+        )
+        .is_some_and(|refs| !refs.contains(MERGE_CHECKS_REF)));
+        // The daemon-authoritative path may clear it.
+        update_refs_daemon(&mut c, id, r#"{"ticket":"ABC"}"#, 1003).unwrap();
+        assert!(snapshot(&c, id).is_none());
     }
 
     #[test]
