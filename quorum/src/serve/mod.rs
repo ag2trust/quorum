@@ -5130,6 +5130,12 @@ pub(crate) struct SlotState {
     /// This is intentionally separate from provider turn retries: an install
     /// is a daemon/DB operation, not another provider turn.
     fallback_install_error_count: u32,
+    /// `(agent_run_id, first_deferred_at)` of a worker fallback that deferred
+    /// because every eligible alternate was cooling. A retained slot re-enters
+    /// fallback every tick; this marker makes the failed profile's cooldown
+    /// recorded once per failure observation (not renewed on re-entry) and
+    /// caps the slot's total deferral at one cooldown window.
+    worker_fallback_deferral: Option<(i64, std::time::Instant)>,
     last_error_text: Option<String>,
     agent_run_id: Option<i64>,
     /// Daemon-issued run capability id (#130). Used for revocation on teardown.
@@ -24828,6 +24834,7 @@ async fn provision_reviewer_reserved(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: None,
                 agent_run_id: Some(reviewer_run_id),
                 cap_run_id: Some(cap_run_id),
@@ -24895,6 +24902,7 @@ async fn provision_reviewer_reserved(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: Some(e.detail().to_string()),
                 agent_run_id: Some(reviewer_run_id),
                 cap_run_id: Some(cap_run_id.clone()),
@@ -26865,6 +26873,7 @@ async fn spawn_admitted_worker(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: None,
                 agent_run_id: Some(worker_run_id),
                 cap_run_id: Some(cap_run_id),
@@ -26919,6 +26928,7 @@ async fn spawn_admitted_worker(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: Some(e.detail().to_string()),
                 agent_run_id: Some(worker_run_id),
                 cap_run_id: Some(cap_run_id),
@@ -28868,13 +28878,30 @@ async fn activate_worker_fallback_with(
         runner::FailureDisposition::ProviderUnavailable
             | runner::FailureDisposition::ProfileUnavailable
     ) {
-        profile_cooldown.record(&failed_route.id, std::time::Instant::now());
+        let now = std::time::Instant::now();
+        // A retained Deferred slot re-enters here every tick with the same
+        // failed run. Only the first entry is a new failure observation; a
+        // re-entry must not renew the failed profile's window after it lapses,
+        // or two slots deferring on each other's profiles would keep each
+        // other cooling forever.
+        let first_deferred_at = slot
+            .worker_fallback_deferral
+            .filter(|(run_id, _)| *run_id == agent_run_id)
+            .map(|(_, at)| at);
+        if first_deferred_at.is_none() {
+            profile_cooldown.record(&failed_route.id, now);
+        }
+        // A slot defers for at most one cooldown window in total; after that
+        // it proceeds with the ordinary walk.
+        let deferral_budget_left = first_deferred_at.is_none_or(|at| {
+            now.saturating_duration_since(at) < profile_cooldown::profile_cooldown_duration()
+        });
         // Defer instead of walking into a provider block when every route the
         // failed one could fall back to is merely cooling. This runs before
         // `fallback::install` retires the failed run, so no routing evidence,
         // exclusion, intent, or provider block is written for a profile that
         // was never contacted.
-        if honour_cooldown && allow_defer {
+        if honour_cooldown && allow_defer && deferral_budget_left {
             let exclusions =
                 quorum_core::routing_attempts::exclusions(&conn, &assignment.responsibility_key)?;
             if worker_fallback_alternates_all_cooling(
@@ -28892,6 +28919,8 @@ async fn activate_worker_fallback_with(
                         slot.agent_name, slot.task_id, failed_route.id
                     ));
                 }
+                slot.worker_fallback_deferral =
+                    Some((agent_run_id, first_deferred_at.unwrap_or(now)));
                 return Ok(WorkerFallbackActivation::Deferred);
             }
         }
@@ -29357,6 +29386,7 @@ async fn resume_pending_fallbacks(
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(intent.agent_run_id),
             cap_run_id: Some(intent.capability_run_id.clone()),
@@ -32023,6 +32053,7 @@ async fn spawn_remediation_worker(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: None,
                 agent_run_id: worker_run_id,
                 cap_run_id: Some(cap_run_id),
@@ -35766,6 +35797,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: None,
             cap_run_id: None,
@@ -36442,6 +36474,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 1,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: Some("unmatched provider failure".into()),
             agent_run_id: Some(agent_run_id),
             cap_run_id: Some("initial-cap".into()),
@@ -36869,6 +36902,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -37058,6 +37092,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -37257,6 +37292,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -37428,6 +37464,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -37522,6 +37559,253 @@ mod tests {
         assert_eq!((installed.0, installed.1, installed.2), (1, 1, 1));
         assert!(!installed.3);
         let _ = slot.kill_and_reap().await;
+    }
+
+    /// One deferring worker slot on its own DB. `failed_on_alternate` attributes
+    /// the open run to b-alternate so its fallback walks back to a-primary.
+    #[cfg(unix)]
+    fn deferring_worker_slot(
+        root: &Path,
+        name: &str,
+        failed_on_alternate: bool,
+    ) -> (
+        ServeConfig,
+        SlotState,
+        fallback_preflight::ManagedTurnCurrency,
+        String,
+    ) {
+        let dir = root.join(name);
+        let worktree = dir.join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let runner_program = live_fallback_runner(&dir);
+        let config = live_fallback_test_config(
+            dir.join("worker.db"),
+            &dir,
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "worker fallback mutual cooldown",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let observed_at = now_unix();
+        quorum_core::tasks::claim(
+            &mut conn,
+            "Fallback-Worker",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        let responsibility = worker_responsibility_key(task_id, 1);
+        let (assignment, run, agent_name) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "worker",
+            None,
+            None,
+        );
+        assert_eq!(assignment.profile_id, "a-primary");
+        let (model, effort) = if failed_on_alternate {
+            conn.execute(
+                "UPDATE agent_runs SET model='gpt-5.6-terra',effort='high',
+                     configured_profile_id='b-alternate',configured_provider='codex',
+                     configured_model='gpt-5.6-terra',configured_effort='high'
+                 WHERE id=?1",
+                [run],
+            )
+            .unwrap();
+            ("gpt-5.6-terra".to_string(), "high".to_string())
+        } else {
+            (assignment.model.clone(), assignment.effort.clone())
+        };
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent_name.clone(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "initial-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("daemon/fallback-worker".into()),
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("daemon/fallback-worker".into()),
+            },
+        )
+        .unwrap();
+        let now = std::time::Instant::now();
+        let slot = SlotState {
+            agent_name,
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "initial-session".into(),
+            model,
+            effort,
+            worktree_path: worktree,
+            branch: "daemon/fallback-worker".into(),
+            remote_branch: "daemon/fallback-worker".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: None,
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            last_provider_activity_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
+            last_error_text: None,
+            agent_run_id: Some(run),
+            cap_run_id: Some("initial-cap".into()),
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: None,
+            pending_prompt: "exact initial prompt".into(),
+            pending_turn_kind: "initial".into(),
+        };
+        let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
+        (config, slot, currency, responsibility)
+    }
+
+    /// Two deferring slots in pool {a, b}: X failed on a and waits on b, Y
+    /// failed on b and waits on a. A deferred re-entry must not renew the
+    /// failed profile's lapsed window (else they keep each other cooling
+    /// forever), and a slot's total deferral is capped at one cooldown window.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_worker_fallback_reentry_neither_renews_cooldown_nor_defers_forever() {
+        let root = tempfile::tempdir().unwrap();
+        let (x_config, mut x, x_currency, x_responsibility) =
+            deferring_worker_slot(root.path(), "x", false);
+        let (y_config, mut y, y_currency, _) = deferring_worker_slot(root.path(), "y", true);
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+        let x_run = x.agent_run_id.unwrap();
+
+        // Both profiles were just observed failing, so both windows are live
+        // and each slot's only alternate is cooling: both defer.
+        let mut cooldown = ProfileCooldown::new();
+        cooldown.record("a-primary", std::time::Instant::now());
+        cooldown.record("b-alternate", std::time::Instant::now());
+        assert_eq!(
+            activate_worker_fallback(&x_config, &mut x, &failure, &x_currency, &mut cooldown)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Deferred
+        );
+        assert_eq!(
+            activate_worker_fallback(&y_config, &mut y, &failure, &y_currency, &mut cooldown)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Deferred
+        );
+        let now = std::time::Instant::now();
+        assert!(cooldown.is_cooling("a-primary", now));
+        assert!(cooldown.is_cooling("b-alternate", now));
+        assert!(matches!(x.worker_fallback_deferral, Some((run, _)) if run == x_run));
+
+        // a's window lapses while b's is still live (modelled by a cooldown
+        // holding only b). X re-enters: still deferred on b, but it must not
+        // reopen a's window for the same failure observation.
+        let mut cooldown = ProfileCooldown::new();
+        cooldown.record("b-alternate", std::time::Instant::now());
+        assert_eq!(
+            activate_worker_fallback(&x_config, &mut x, &failure, &x_currency, &mut cooldown)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Deferred
+        );
+        assert!(
+            !cooldown.is_cooling("a-primary", std::time::Instant::now()),
+            "a deferred re-entry renewed the failed profile's cooldown"
+        );
+        // So Y, waiting on a, makes progress instead of deferring again.
+        assert_eq!(
+            activate_worker_fallback(&y_config, &mut y, &failure, &y_currency, &mut cooldown)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Activated
+        );
+        assert_eq!(y.model, "gpt-5.6-sol");
+        let _ = y.kill_and_reap().await;
+
+        // Deferral is bounded: once X has deferred for a full cooldown window
+        // it proceeds with the walk even though b is still cooling. The walk
+        // skips cooling b and ends in the existing provider block, rather
+        // than deferring again.
+        let window = profile_cooldown::profile_cooldown_duration();
+        let started = std::time::Instant::now()
+            .checked_sub(window)
+            .expect("monotonic clock is past one cooldown window");
+        x.worker_fallback_deferral = Some((x_run, started));
+        assert!(cooldown.is_cooling("b-alternate", std::time::Instant::now()));
+        assert_eq!(
+            activate_worker_fallback(&x_config, &mut x, &failure, &x_currency, &mut cooldown)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Settled
+        );
+        let conn = quorum_core::db::open(&x_config.db_path).unwrap();
+        let refs: Option<String> = conn
+            .query_row("SELECT refs FROM tasks WHERE id=?1", [x.task_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let blocked = refs
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .is_some_and(|refs| runner_state::provider_block(&refs).is_some());
+        assert!(
+            blocked,
+            "bounded deferral must settle into the provider block"
+        );
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM routing_attempts WHERE responsibility_key=?1",
+                [&x_responsibility],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(attempts >= 1);
     }
 
     #[cfg(unix)]
@@ -37641,6 +37925,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -37959,6 +38244,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(agent_run_id),
             cap_run_id: Some(cap_run_id.into()),
@@ -38570,6 +38856,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -38950,6 +39237,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -40355,6 +40643,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -44197,6 +44486,7 @@ printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-session-te
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: None,
                 agent_run_id: Some(old_run_id),
                 cap_run_id: Some(old_capability.clone()),
@@ -46257,6 +46547,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: None,
             cap_run_id: None,
@@ -59022,6 +59313,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id,
             cap_run_id: Some(cap_run_id.into()),
