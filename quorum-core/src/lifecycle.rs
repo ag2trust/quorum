@@ -19,6 +19,9 @@ pub enum Status {
     Working,
     InReview,
     Rework,
+    /// Approved and awaiting the daemon's merge gate. The daemon-owned
+    /// `refs.merge_checks` snapshot exists only in this state: storage removes
+    /// it in the same transaction as every transition out of `Merging`.
     Merging,
     Done,
     Failed,

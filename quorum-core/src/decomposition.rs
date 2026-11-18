@@ -2278,7 +2278,10 @@ fn cancel_unfinished_members(tx: &Transaction<'_>, graph_id: i64, now: i64) -> R
     )?;
     let cancelled_ids: Vec<i64> = {
         let mut stmt = tx.prepare(
-            "UPDATE tasks SET status='cancelled',assignee=NULL,updated_at=?2
+            "UPDATE tasks SET status='cancelled',assignee=NULL,updated_at=?2,
+                 refs=CASE WHEN json_valid(refs)
+                                AND json_type(refs, '$.merge_checks') IS NOT NULL
+                           THEN json_remove(refs, '$.merge_checks') ELSE refs END
              WHERE status!='done' AND id IN (
                  SELECT task_id FROM task_graph_members WHERE graph_id=?1)
              RETURNING id",
@@ -7120,6 +7123,37 @@ mod tests {
             })
             .unwrap();
         assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn graph_cancellation_clears_merging_member_merge_checks() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        let ids = materialize_graph(&mut conn, graph, 1, &[child("a", &[]), child("b", &[])], 4)
+            .unwrap()
+            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='merging',refs='{\"pr\":7}' WHERE id=?1",
+            [ids[0]],
+        )
+        .unwrap();
+        assert!(crate::tasks::set_merge_checks_snapshot(
+            &mut conn,
+            ids[0],
+            crate::tasks::MergeChecksState::Pending,
+            &["ci".to_string()],
+            4,
+        )
+        .unwrap());
+        assert!(cancel_graph(&mut conn, 1, &[], 5).unwrap());
+        let (status, refs): (String, String) = conn
+            .query_row("SELECT status,refs FROM tasks WHERE id=?1", [ids[0]], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(status, "cancelled");
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        assert_eq!(refs, serde_json::json!({"pr": 7}));
     }
 
     #[test]
