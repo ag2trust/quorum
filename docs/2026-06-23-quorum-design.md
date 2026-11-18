@@ -1618,6 +1618,42 @@ provisioning and merge.
 The pre-merge checks wait remains as defense in depth for changes or check reruns that occur
 after reviewer provisioning.
 
+### Reviewer process bound (`reviewer_cap`)
+
+`reviewer_cap` is a runtime serve-config key that bounds the number of concurrent reviewer
+slots: R1, R2, and review-only reviews together. Unset resolves to `max(cap, 2)`. Values
+outside `1..=32` are a usage error (exit 2) and are never clamped. The startup banner prints
+the resolved value with its source. Worker `cap` and worker dispatch are unaffected.
+
+- One gate covers every reviewer spawn path. `provision_reviewer` checks
+  `available_reviewer_slots(reviewer_cap, reviewers.len())` before it takes the provisioning
+  reservation. That covers initial review of a live worker's PR (Phase 5), restart-orphaned
+  and review-only in-review tasks (Phase 5b), and the R1→R2 handoff. Phases 5 and 5b also
+  check the gate before CI-gate bookkeeping, through one admission queue.
+- Deferral writes nothing. When no slot is free, the task keeps its `in-review` status,
+  recovery attempts, provision strikes, and reservation state. Nothing is written, and the
+  task is retried on later ticks. The queue lives in daemon memory only, so a restart
+  rebuilds it from durable `in-review` rows.
+- Deferred work dispatches in a fixed order: R2 first, then oldest task id. A waiting task
+  keeps its place across ticks. A younger task is admitted only when the free slots exceed
+  the number of waiters ahead of it. An entry that stops reaching the gate (merged, closed,
+  held, or backed off) is pruned after one pass.
+- R2 policy: an R2 can never be deadlocked behind R1 slots.
+  - In the R1→R2 handoff, the R2 inherits the approving R1's slot. That R1 is still in the
+    reviewer set during the handoff and is torn down right after, so this R2 never waits
+    behind its own R1. The two processes overlap only while the R1 is torn down in that
+    same tick.
+  - An R2 re-dispatched later (after a failed handoff, a restart, or a lowered cap) shares
+    the bound. It is queued ahead of every R1, so queued R1 work cannot starve it. A held
+    reviewer slot never waits on another reviewer slot. A sticky R1 waiting through rework
+    waits only on its worker, and every slot ends through its verdict, teardown, or watchdog.
+- Logging is bounded. A task logs once when it enters deferral and once when it is
+  dispatched, never once per tick.
+- Fallback paths do not add reviewer slots. Provider fallback replaces the process inside an
+  existing slot. Startup `resume_pending_fallbacks` restores a slot that the previous daemon
+  had already admitted. If the cap was lowered across a restart, these restored slots can
+  briefly exceed it, and new admissions wait until the count falls below the cap.
+
 ### Daemon merge flow
 
 After VerdictApprove (InReview → Merging):

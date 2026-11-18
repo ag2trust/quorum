@@ -138,7 +138,9 @@ if [ "$cmd" = "pr list" ]; then
   printf '[]\n'
 elif [ "$cmd" = "pr view" ]; then
   pr="$3"
-  branch="daemon/origworker-t1"
+  # Optional per-PR head map ("<pr> <branch>" lines); default keeps task #1.
+  branch="$(sed -n "s/^$pr //p" "$QUORUM_TEST_REPO/.git/quorum-test-pr-branches" 2>/dev/null | head -n 1)"
+  if [ -z "$branch" ]; then branch="daemon/origworker-t1"; fi
   sha="$(git -C "$QUORUM_TEST_REPO" ls-remote origin "refs/heads/$branch" | awk '{print $1}')"
   if [ -z "$sha" ]; then sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"; fi
   printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
@@ -1728,4 +1730,283 @@ fn remediation_claim_race_no_errors() {
         errs, 0,
         "lost claim race must NOT produce errors rows (invariant #4)"
     );
+}
+
+/// Durable state a reviewer-slot deferral must leave untouched.
+#[derive(Debug, PartialEq, Eq)]
+struct ReviewDeferralState {
+    status: String,
+    recovery_attempts: i64,
+    provision_attempt_rows: i64,
+    reservations: i64,
+    reviewer_runs: i64,
+}
+
+fn review_deferral_state(home: &std::path::Path, task_id: i64) -> ReviewDeferralState {
+    let conn = quorum_core::db::open(&db_path(home)).unwrap();
+    let count = |sql: &str| -> i64 {
+        conn.query_row(sql, rusqlite::params![task_id], |r| r.get(0))
+            .unwrap()
+    };
+    ReviewDeferralState {
+        status: quorum_core::tasks::get(&conn, task_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        recovery_attempts: count("SELECT recovery_attempts FROM tasks WHERE id=?1"),
+        provision_attempt_rows: count(
+            "SELECT COUNT(*) FROM reviewer_provision_attempts WHERE task_id=?1",
+        ),
+        reservations: count(
+            "SELECT COUNT(*) FROM reviewer_provision_reservations WHERE task_id=?1",
+        ),
+        reviewer_runs: count(
+            "SELECT COUNT(*) FROM agent_runs WHERE task_id=?1 AND role='reviewer'",
+        ),
+    }
+}
+
+/// Tasks with an open (live) reviewer run.
+fn tasks_under_review(db: &std::path::Path) -> Vec<i64> {
+    let conn = quorum_core::db::open(db).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT task_id FROM agent_runs
+             WHERE role='reviewer' AND ended_at IS NULL ORDER BY task_id",
+        )
+        .unwrap();
+    stmt.query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<i64>>>()
+        .unwrap()
+}
+
+/// Wait for the next `spawning reviewer <name> for PR #<n>` line.
+fn wait_for_reviewer_spawn(handle: &mut ServeHandle) -> (String, i64) {
+    assert!(
+        handle.wait_for("spawning reviewer ", 60),
+        "reviewer not spawned: {:?}",
+        handle.lines
+    );
+    let line = handle.lines.last().unwrap().clone();
+    let rest = line.split("spawning reviewer ").nth(1).unwrap();
+    let name = rest.split_whitespace().next().unwrap().to_string();
+    let pr = rest
+        .split("for PR #")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("unparseable spawn line: {line}"));
+    (name, pr)
+}
+
+fn approve_after_result(handle: &mut ServeHandle, home: &std::path::Path, reviewer: &str, pr: i64) {
+    assert!(
+        handle.wait_for("result", 30),
+        "reviewer {reviewer} produced no result: {:?}",
+        handle.lines
+    );
+    quorum_done(
+        home,
+        &[
+            "--agent",
+            reviewer,
+            "--pr",
+            &pr.to_string(),
+            "--verdict",
+            "approved",
+            "--blocking",
+            "0",
+        ],
+    );
+}
+
+/// reviewer_cap=1 with three review-only tasks and one restart-orphaned
+/// in-review task: exactly one task is under review at a time, deferred work
+/// keeps every durable field unchanged, the R2 of the task already under
+/// review is not starved by the queued R1 work, and the queue dispatches
+/// oldest first as each review completes.
+#[test]
+fn reviewer_cap_one_serializes_reviews_oldest_first_without_burning_recovery() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    // Top-level key: prepend so it is not captured by a trailing table.
+    let config_path = home.path().join("serve/test__repo.toml");
+    let scaffold = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(&config_path, format!("reviewer_cap = 1\n{scaffold}")).unwrap();
+
+    let mut branch_map = String::new();
+    let mut tasks = Vec::new();
+    for pr in [41, 42, 43] {
+        let task_id = seed_review_only_task(home.path(), pr);
+        create_author_branch(repo_dir.path(), "OrigWorker", task_id);
+        branch_map.push_str(&format!("{pr} daemon/origworker-t{task_id}\n"));
+        tasks.push((task_id, pr));
+    }
+    let orphan_author = "Gone";
+    let orphan_pr = 44;
+    let orphan_task = seed_in_review_task(home.path(), orphan_author, orphan_pr);
+    create_author_branch(repo_dir.path(), orphan_author, orphan_task);
+    branch_map.push_str(&format!(
+        "{orphan_pr} daemon/{}-t{orphan_task}\n",
+        orphan_author.to_lowercase()
+    ));
+    tasks.push((orphan_task, orphan_pr));
+    std::fs::write(
+        repo_dir.path().join(".git/quorum-test-pr-branches"),
+        branch_map,
+    )
+    .unwrap();
+    let before: Vec<_> = tasks
+        .iter()
+        .map(|(task_id, _)| review_deferral_state(home.path(), *task_id))
+        .collect();
+    let names = write_names_file(home.path());
+
+    // Sample the live bound for the whole run.
+    let db = db_path(home.path());
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = {
+        let stop = stop.clone();
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let mut max_seen = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let live = tasks_under_review(&db);
+                if live.len() > max_seen.len() {
+                    max_seen = live;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            max_seen
+        })
+    };
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names,
+        "true",
+        &[],
+    );
+    let mut r1_order = Vec::new();
+    for (index, (task_id, pr)) in tasks.iter().enumerate() {
+        let (r1, r1_pr) = wait_for_reviewer_spawn(&mut handle);
+        assert_eq!(
+            r1_pr, *pr,
+            "R1 dispatch must be oldest first: {:?}",
+            handle.lines
+        );
+        r1_order.push(r1_pr);
+        if index == 0 {
+            for (waiting_task, waiting_pr) in &tasks[1..] {
+                let needle =
+                    format!("task #{waiting_task} PR #{waiting_pr}: all 1 reviewer slot(s) busy");
+                assert!(
+                    handle.wait_for(&needle, 30),
+                    "deferral not logged for task #{waiting_task}: {:?}",
+                    handle.lines
+                );
+            }
+        }
+        // Every younger task is still deferred with untouched durable state.
+        for (offset, (waiting_task, _)) in tasks.iter().enumerate().skip(index + 1) {
+            assert_eq!(
+                review_deferral_state(home.path(), *waiting_task),
+                before[offset],
+                "deferred task #{waiting_task} changed durable state"
+            );
+        }
+        if index == tasks.len() - 1 {
+            break;
+        }
+        approve_after_result(&mut handle, home.path(), &r1, *pr);
+        // The R2 for the task under review takes the R1's slot ahead of
+        // every queued R1 review.
+        let (r2, r2_pr) = wait_for_reviewer_spawn(&mut handle);
+        assert_eq!(
+            r2_pr, *pr,
+            "R2 for task #{task_id} must not be starved by queued R1 work: {:?}",
+            handle.lines
+        );
+        assert_ne!(r2, r1);
+        approve_after_result(&mut handle, home.path(), &r2, *pr);
+        assert!(
+            handle.wait_for(&format!("PR #{pr} merged"), 30),
+            "task #{task_id} did not merge: {:?}",
+            handle.lines
+        );
+    }
+    handle.drain_pending_lines();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let max_live = sampler.join().unwrap();
+
+    assert_eq!(r1_order, vec![41, 42, 43, 44]);
+    assert!(
+        max_live.len() <= 1,
+        "reviewer_cap=1 allowed concurrent reviews of tasks {max_live:?}"
+    );
+    assert!(
+        handle
+            .lines
+            .iter()
+            .any(|line| line.contains("reviewer_cap:              1 (file)")),
+        "banner must show reviewer_cap with its source: {:?}",
+        handle.lines
+    );
+    for (task_id, pr) in &tasks {
+        let entered = handle
+            .lines
+            .iter()
+            .filter(|line| line.contains(&format!("task #{task_id} PR #{pr}: all 1 reviewer slot")))
+            .count();
+        let expected = usize::from(*task_id != tasks[0].0);
+        assert_eq!(
+            entered, expected,
+            "deferral must log once per task, not per tick: {:?}",
+            handle.lines
+        );
+    }
+    let conn = quorum_core::db::open(&db).unwrap();
+    for (task_id, _) in &tasks[..3] {
+        assert_eq!(get_task(home.path(), *task_id).status, "done");
+        let strikes: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(attempts),0) FROM reviewer_provision_attempts WHERE task_id=?1",
+                rusqlite::params![task_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(strikes, 0, "deferral must not burn provision strikes");
+    }
+    assert_eq!(
+        get_task(home.path(), orphan_task).status,
+        "in-review",
+        "the orphaned in-review task stays in-review through deferral and dispatch"
+    );
+    assert_eq!(
+        get_task(home.path(), orphan_task).recovery_attempts,
+        before[3].recovery_attempts
+    );
+    // The post-merge collector's `gh api` is outside this file's gh shim; any
+    // other errors row (busy, lifecycle, provisioning) is a real failure.
+    let errors: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT source, detail FROM errors WHERE source <> 'review-collector'")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert!(errors.is_empty(), "unexpected errors rows: {errors:#?}");
 }
