@@ -11,6 +11,7 @@ mod cli;
 mod cockpit;
 mod config;
 mod coordinator;
+mod github_credentials;
 mod graph_blocker;
 mod input;
 mod orchestrator_mcp;
@@ -1316,7 +1317,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             // GitHub whether its retained PR actually merged.
             let merge_commit_sha = if let Some(pr) = pr {
                 let executor = serve::merge::GhMergeExecutor {
-                    token_file: None,
+                    // task-close resolves no serve config, so it keeps using
+                    // the token gh itself would use (no merge token file).
+                    credentials: std::sync::Arc::new(
+                        github_credentials::LocalDefaultCredentialSource::new(None),
+                    ),
                     gh_repo: Some(repo),
                     // task-close only queries PR state; these merge-policy
                     // fields are not consulted by merge_commit_status.
@@ -1735,7 +1740,11 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     })
                 } else {
                     std::sync::Arc::new(serve::merge::GhMergeExecutor {
-                        token_file: r_merge_token.value.map(std::path::PathBuf::from),
+                        credentials: std::sync::Arc::new(
+                            github_credentials::LocalDefaultCredentialSource::new(
+                                r_merge_token.value.map(std::path::PathBuf::from),
+                            ),
+                        ),
                         gh_repo: resolve_gh_repo(&r_repo_dir.value),
                         base_branch: r_base_branch.value.clone(),
                         self_update_branch: r_self_update_branch.value.clone(),

@@ -2,7 +2,12 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use crate::github_credentials::{
+    GithubCredentialError, GithubCredentialSource, LocalDefaultCredentialSource,
+};
 
 /// Reviewer lineage passed to the merge executor so the formal GitHub approval
 /// carries the reviewer's identity and task id.
@@ -283,6 +288,26 @@ pub trait MergeExecutor: Send + Sync {
     fn ensure_changes_requested(&self, _pr: i64, _repo_dir: &Path, _body: &str) -> bool {
         // Default no-op; real executor posts via `gh pr review --request-changes`.
         true
+    }
+
+    /// The daemon's one shared GitHub credential source, reachable by other
+    /// daemon modules through `ServeConfig.merge_executor`. The default is the
+    /// local default source with no token file (the token `gh` would use);
+    /// the GitHub executor returns its injected source.
+    #[allow(dead_code)] // consumed by sibling migrations of non-merge gh call sites
+    fn github_credentials(&self) -> Arc<dyn GithubCredentialSource> {
+        Arc::new(LocalDefaultCredentialSource::new(None))
+    }
+}
+
+/// Merge failure for a credential source that produced no token. No `gh`
+/// child was spawned; the failure classifies like any other GitHub failure
+/// that is not worker-fixable.
+fn credential_failure(error: &GithubCredentialError) -> MergeResult {
+    MergeResult {
+        success: false,
+        message: format!("GitHub credential unavailable (gh not run): {error}"),
+        failure_kind: Some(MergeFailureKind::PolicyBlocked),
     }
 }
 
@@ -605,11 +630,12 @@ pub fn parse_default_branch_ci(json: &str) -> DefaultBranchStatus {
 }
 
 /// Production executor: posts a formal GitHub approval review, then runs
-/// `gh pr merge <pr> --merge`, deleting only non-protected head branches. If `token_file` is set,
-/// reads the token at call time and passes it via `GH_TOKEN` env var.
-/// The token is never exposed to agent processes.
+/// `gh pr merge <pr> --merge`, deleting only non-protected head branches.
+/// Every `gh` child asks `credentials` for a token at call time and receives
+/// it via `GH_TOKEN` on that child only; a source failure returns before any
+/// child spawns. The token is never exposed to agent processes.
 pub struct GhMergeExecutor {
-    pub token_file: Option<std::path::PathBuf>,
+    pub credentials: Arc<dyn GithubCredentialSource>,
     /// `owner/repo` slug for `-R` flag — avoids cwd git dependency.
     pub gh_repo: Option<String>,
     /// Long-lived daemon branches that must never be deleted after a merge.
@@ -618,21 +644,14 @@ pub struct GhMergeExecutor {
 }
 
 impl GhMergeExecutor {
-    fn read_token(&self) -> Option<String> {
-        self.token_file
-            .as_ref()
-            .and_then(|p| match std::fs::read_to_string(p) {
-                Ok(s) => Some(s.trim().to_string()),
-                Err(e) => {
-                    eprintln!("warn: failed to read merge-token file {}: {e}", p.display());
-                    None
-                }
-            })
-    }
-}
-
-impl GhMergeExecutor {
-    fn build_gh_cmd(&self, args: &[&str], repo_dir: &Path) -> Command {
+    /// Build one `gh` child with `GH_TOKEN` from the credential source. The
+    /// token is fetched first, so a source failure spawns nothing.
+    fn build_gh_cmd(
+        &self,
+        args: &[&str],
+        repo_dir: &Path,
+    ) -> std::result::Result<Command, GithubCredentialError> {
+        let token = self.credentials.token()?;
         let mut cmd = Command::new("gh");
         cmd.args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -642,14 +661,15 @@ impl GhMergeExecutor {
         } else {
             cmd.current_dir(repo_dir);
         }
-        if let Some(token) = self.read_token() {
-            cmd.env("GH_TOKEN", token);
-        }
-        cmd
+        token.apply_to_command(&mut cmd);
+        Ok(cmd)
     }
 
     fn run_gh(&self, args: &[&str], repo_dir: &Path) -> MergeResult {
-        let mut cmd = self.build_gh_cmd(args, repo_dir);
+        let mut cmd = match self.build_gh_cmd(args, repo_dir) {
+            Ok(cmd) => cmd,
+            Err(error) => return credential_failure(&error),
+        };
 
         match cmd.output() {
             Ok(output) => {
@@ -682,8 +702,9 @@ impl GhMergeExecutor {
 
     fn live_base_branch(&self, pr: i64, repo_dir: &Path) -> std::result::Result<String, String> {
         let pr_str = pr.to_string();
-        let mut cmd =
-            self.build_gh_cmd(&["pr", "view", &pr_str, "--json", "baseRefName"], repo_dir);
+        let mut cmd = self
+            .build_gh_cmd(&["pr", "view", &pr_str, "--json", "baseRefName"], repo_dir)
+            .map_err(|error| error.to_string())?;
         let output = cmd
             .output()
             .map_err(|error| format!("failed to run gh: {error}"))?;
@@ -699,7 +720,9 @@ impl GhMergeExecutor {
 
     fn live_head_sha(&self, pr: i64, repo_dir: &Path) -> std::result::Result<String, String> {
         let pr_str = pr.to_string();
-        let mut cmd = self.build_gh_cmd(&["pr", "view", &pr_str, "--json", "headRefOid"], repo_dir);
+        let mut cmd = self
+            .build_gh_cmd(&["pr", "view", &pr_str, "--json", "headRefOid"], repo_dir)
+            .map_err(|error| error.to_string())?;
         let output = cmd
             .output()
             .map_err(|error| format!("failed to run gh: {error}"))?;
@@ -715,8 +738,9 @@ impl GhMergeExecutor {
 
     fn live_head_ref(&self, pr: i64, repo_dir: &Path) -> Option<String> {
         let pr_str = pr.to_string();
-        let mut cmd =
-            self.build_gh_cmd(&["pr", "view", &pr_str, "--json", "headRefName"], repo_dir);
+        let mut cmd = self
+            .build_gh_cmd(&["pr", "view", &pr_str, "--json", "headRefName"], repo_dir)
+            .ok()?;
         let output = cmd.output().ok()?;
         if !output.status.success() {
             return None;
@@ -730,7 +754,11 @@ impl GhMergeExecutor {
     /// cannot route through `build_gh_cmd` (which appends `-R <nwo>` and fails with
     /// `unknown shorthand flag: 'R' in -R`). This replicates `build_gh_cmd`'s token +
     /// cwd behavior, with the only difference being the slug is passed positionally.
-    fn repo_view_default_branch_cmd(&self, repo_dir: &Path) -> Command {
+    fn repo_view_default_branch_cmd(
+        &self,
+        repo_dir: &Path,
+    ) -> std::result::Result<Command, GithubCredentialError> {
+        let token = self.credentials.token()?;
         let mut cmd = Command::new("gh");
         cmd.args(["repo", "view"])
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -741,14 +769,18 @@ impl GhMergeExecutor {
             cmd.current_dir(repo_dir);
         }
         cmd.args(["--json", "defaultBranchRef"]);
-        if let Some(token) = self.read_token() {
-            cmd.env("GH_TOKEN", token);
-        }
-        cmd
+        token.apply_to_command(&mut cmd);
+        Ok(cmd)
     }
 
     fn repository_default_branch(&self, repo_dir: &Path) -> Option<String> {
-        let mut cmd = self.repo_view_default_branch_cmd(repo_dir);
+        let mut cmd = match self.repo_view_default_branch_cmd(repo_dir) {
+            Ok(cmd) => cmd,
+            Err(error) => {
+                eprintln!("warn: gh repo view not run: {error}");
+                return None;
+            }
+        };
         let output = cmd.output().ok()?;
         if !output.status.success() {
             eprintln!(
@@ -786,10 +818,12 @@ impl GhMergeExecutor {
     /// query failure so the caller can fail-open (post the approval).
     fn fetch_reviews_and_head(&self, pr: i64, repo_dir: &Path) -> Option<(String, String)> {
         let pr_str = pr.to_string();
-        let mut cmd = self.build_gh_cmd(
-            &["pr", "view", &pr_str, "--json", "reviews,headRefOid"],
-            repo_dir,
-        );
+        let mut cmd = self
+            .build_gh_cmd(
+                &["pr", "view", &pr_str, "--json", "reviews,headRefOid"],
+                repo_dir,
+            )
+            .ok()?;
         let output = cmd.output().ok()?;
         if !output.status.success() {
             return None;
@@ -805,7 +839,10 @@ impl GhMergeExecutor {
 
     fn verify_pr_merged(&self, pr: i64, repo_dir: &Path) -> bool {
         let pr_str = pr.to_string();
-        let mut cmd = self.build_gh_cmd(&["pr", "view", &pr_str, "--json", "state"], repo_dir);
+        let Ok(mut cmd) = self.build_gh_cmd(&["pr", "view", &pr_str, "--json", "state"], repo_dir)
+        else {
+            return false;
+        };
         let output = match cmd.output() {
             Ok(o) if o.status.success() => o,
             _ => return false,
@@ -872,9 +909,11 @@ impl GhMergeExecutor {
         } else {
             "statusCheckRollup"
         };
-        let mut cmd = self.build_gh_cmd(&["pr", "view", &pr_str, "--json", fields], repo_dir);
-        let output = match cmd.output() {
-            Ok(o) if o.status.success() => o,
+        let output = match self
+            .build_gh_cmd(&["pr", "view", &pr_str, "--json", fields], repo_dir)
+            .map(|mut cmd| cmd.output())
+        {
+            Ok(Ok(o)) if o.status.success() => o,
             _ => {
                 let issues = required_jobs
                     .iter()
@@ -905,9 +944,11 @@ impl GhMergeExecutor {
         } else {
             "statusCheckRollup,mergeStateStatus"
         };
-        let mut cmd = self.build_gh_cmd(&["pr", "view", &pr_str, "--json", fields], repo_dir);
-        let output = match cmd.output() {
-            Ok(o) if o.status.success() => o,
+        let output = match self
+            .build_gh_cmd(&["pr", "view", &pr_str, "--json", fields], repo_dir)
+            .map(|mut cmd| cmd.output())
+        {
+            Ok(Ok(o)) if o.status.success() => o,
             _ => {
                 return ChecksQueryResult::Pending;
             }
@@ -920,7 +961,7 @@ impl GhMergeExecutor {
     /// but that array still cannot satisfy the mandatory named-jobs gate.
     fn query_branch_sync_checks(&self, pr: i64, repo_dir: &Path) -> ChecksQueryResult {
         let pr_str = pr.to_string();
-        let mut cmd = self.build_gh_cmd(
+        let cmd = self.build_gh_cmd(
             &[
                 "pr",
                 "view",
@@ -930,8 +971,8 @@ impl GhMergeExecutor {
             ],
             repo_dir,
         );
-        let output = match cmd.output() {
-            Ok(o) if o.status.success() => o,
+        let output = match cmd.map(|mut cmd| cmd.output()) {
+            Ok(Ok(o)) if o.status.success() => o,
             _ => return ChecksQueryResult::Pending,
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -941,14 +982,14 @@ impl GhMergeExecutor {
 
     fn is_draft(&self, pr: i64, repo_dir: &Path) -> bool {
         let pr_str = pr.to_string();
-        let mut cmd = self.build_gh_cmd(
+        let cmd = self.build_gh_cmd(
             &[
                 "pr", "view", &pr_str, "--json", "isDraft", "--jq", ".isDraft",
             ],
             repo_dir,
         );
-        match cmd.output() {
-            Ok(o) if o.status.success() => parse_is_draft(&String::from_utf8_lossy(&o.stdout)),
+        match cmd.map(|mut cmd| cmd.output()) {
+            Ok(Ok(o)) if o.status.success() => parse_is_draft(&String::from_utf8_lossy(&o.stdout)),
             _ => false,
         }
     }
@@ -1168,6 +1209,10 @@ fn parse_is_draft(jq_out: &str) -> bool {
 }
 
 impl MergeExecutor for GhMergeExecutor {
+    fn github_credentials(&self) -> Arc<dyn GithubCredentialSource> {
+        Arc::clone(&self.credentials)
+    }
+
     fn merge(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult {
         let pr_str = pr.to_string();
 
@@ -1364,7 +1409,9 @@ impl MergeExecutor for GhMergeExecutor {
 
     fn merge_commit_sha(&self, pr: i64, repo_dir: &Path) -> Option<String> {
         let pr = pr.to_string();
-        let mut cmd = self.build_gh_cmd(&["pr", "view", &pr, "--json", "mergeCommit"], repo_dir);
+        let mut cmd = self
+            .build_gh_cmd(&["pr", "view", &pr, "--json", "mergeCommit"], repo_dir)
+            .ok()?;
         let output = cmd.output().ok()?;
         if !output.status.success() {
             return None;
@@ -1374,10 +1421,13 @@ impl MergeExecutor for GhMergeExecutor {
 
     fn merge_commit_status(&self, pr: i64, repo_dir: &Path) -> MergeCommitStatus {
         let pr = pr.to_string();
-        let mut cmd = self.build_gh_cmd(
+        let cmd = self.build_gh_cmd(
             &["pr", "view", &pr, "--json", "state,mergeCommit"],
             repo_dir,
         );
+        let Ok(mut cmd) = cmd else {
+            return MergeCommitStatus::Unknown;
+        };
         let Ok(output) = cmd.output() else {
             return MergeCommitStatus::Unknown;
         };
@@ -1437,12 +1487,12 @@ impl MergeExecutor for GhMergeExecutor {
 
     fn pending_check_names(&self, pr: i64, repo_dir: &Path) -> Vec<String> {
         let pr_str = pr.to_string();
-        let mut cmd = self.build_gh_cmd(
+        let cmd = self.build_gh_cmd(
             &["pr", "view", &pr_str, "--json", "statusCheckRollup"],
             repo_dir,
         );
-        let output = match cmd.output() {
-            Ok(output) if output.status.success() => output,
+        let output = match cmd.map(|mut cmd| cmd.output()) {
+            Ok(Ok(output)) if output.status.success() => output,
             _ => return Vec::new(),
         };
         pending_check_names_from_json(&String::from_utf8_lossy(&output.stdout))
@@ -1450,12 +1500,12 @@ impl MergeExecutor for GhMergeExecutor {
 
     fn check_mergeability(&self, pr: i64, repo_dir: &Path) -> MergeabilityState {
         let pr_str = pr.to_string();
-        let mut cmd = self.build_gh_cmd(
+        let cmd = self.build_gh_cmd(
             &["pr", "view", &pr_str, "--json", "mergeStateStatus,state"],
             repo_dir,
         );
-        let output = match cmd.output() {
-            Ok(o) if o.status.success() => o,
+        let output = match cmd.map(|mut cmd| cmd.output()) {
+            Ok(Ok(o)) if o.status.success() => o,
             _ => return MergeabilityState::Mergeable,
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1464,18 +1514,20 @@ impl MergeExecutor for GhMergeExecutor {
 
     fn head_sha(&self, pr: i64, repo_dir: &Path) -> Option<String> {
         let pr_str = pr.to_string();
-        let mut cmd = self.build_gh_cmd(
-            &[
-                "pr",
-                "view",
-                &pr_str,
-                "--json",
-                "headRefOid",
-                "--jq",
-                ".headRefOid",
-            ],
-            repo_dir,
-        );
+        let mut cmd = self
+            .build_gh_cmd(
+                &[
+                    "pr",
+                    "view",
+                    &pr_str,
+                    "--json",
+                    "headRefOid",
+                    "--jq",
+                    ".headRefOid",
+                ],
+                repo_dir,
+            )
+            .ok()?;
         let output = cmd.output().ok()?;
         if !output.status.success() {
             return None;
@@ -1508,7 +1560,7 @@ impl MergeExecutor for GhMergeExecutor {
     }
 
     fn check_default_branch_ci(&self, repo_dir: &Path, branch: &str) -> DefaultBranchStatus {
-        let mut cmd = self.build_gh_cmd(
+        let cmd = self.build_gh_cmd(
             &[
                 "run",
                 "list",
@@ -1521,8 +1573,8 @@ impl MergeExecutor for GhMergeExecutor {
             ],
             repo_dir,
         );
-        let output = match cmd.output() {
-            Ok(o) if o.status.success() => o,
+        let output = match cmd.map(|mut cmd| cmd.output()) {
+            Ok(Ok(o)) if o.status.success() => o,
             _ => return DefaultBranchStatus::Unknown,
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1536,15 +1588,14 @@ impl MergeExecutor for GhMergeExecutor {
                 &["pr", "review", &pr_str, "--request-changes", "--body", body],
                 repo_dir,
             )
-            .output()
-            .is_ok_and(|output| output.status.success())
+            .is_ok_and(|mut cmd| cmd.output().is_ok_and(|output| output.status.success()))
         };
-        let mut cmd = self.build_gh_cmd(
+        let cmd = self.build_gh_cmd(
             &["pr", "view", &pr_str, "--json", "reviewDecision"],
             repo_dir,
         );
-        let output = match cmd.output() {
-            Ok(o) if o.status.success() => o,
+        let output = match cmd.map(|mut cmd| cmd.output()) {
+            Ok(Ok(o)) if o.status.success() => o,
             // Can't check — post defensively.
             _ => return post(),
         };
@@ -1715,6 +1766,7 @@ impl MergeExecutor for CommandMergeExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github_credentials::FakeCredentialSource;
 
     fn checks_snapshot(head: &str, conclusion: &str) -> String {
         format!(
@@ -2020,18 +2072,21 @@ mod tests {
     #[test]
     fn base_validation_failure_short_circuits_approval_and_merge() {
         let ctx = test_ctx();
-        let exec = GhMergeExecutor {
-            token_file: Some(std::path::PathBuf::from("/nonexistent/token")),
-            gh_repo: None,
-            base_branch: "main".into(),
-            self_update_branch: "main".into(),
-        };
+        // A configured-but-missing token file is a typed credential failure,
+        // never a silent fallback to ambient gh auth.
+        let exec = gh_exec(
+            Arc::new(LocalDefaultCredentialSource::new(Some(
+                std::path::PathBuf::from("/nonexistent/token"),
+            ))),
+            None,
+        );
         let result = exec.merge(1, Path::new("/tmp"), &ctx);
         assert!(!result.success);
         assert_eq!(result.failure_kind, Some(MergeFailureKind::PolicyBlocked));
         assert!(
             result.message.contains("base could not be validated")
-                && result.message.contains("approval and merge not attempted"),
+                && result.message.contains("approval and merge not attempted")
+                && result.message.contains("GitHub token file"),
             "expected pre-approval base-validation failure, got: {}",
             result.message
         );
@@ -2484,44 +2539,205 @@ mod tests {
         assert_eq!(parse_mergeability(r#"{}"#), MergeabilityState::Mergeable,);
     }
 
-    #[test]
-    fn read_token_returns_none_on_missing_file() {
-        let exec = GhMergeExecutor {
-            token_file: Some(std::path::PathBuf::from("/nonexistent/path/token")),
-            gh_repo: None,
+    fn gh_exec(
+        credentials: Arc<dyn GithubCredentialSource>,
+        gh_repo: Option<String>,
+    ) -> GhMergeExecutor {
+        GhMergeExecutor {
+            credentials,
+            gh_repo,
             base_branch: "main".into(),
             self_update_branch: "main".into(),
-        };
-        assert!(exec.read_token().is_none());
+        }
+    }
+
+    fn fake_exec(secret: &str) -> (Arc<FakeCredentialSource>, GhMergeExecutor) {
+        let source = Arc::new(FakeCredentialSource::token(secret));
+        let exec = gh_exec(source.clone(), None);
+        (source, exec)
+    }
+
+    fn gh_token_env(cmd: &Command) -> Option<String> {
+        cmd.get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("GH_TOKEN"))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    fn argv(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
-    fn read_token_reads_and_trims_valid_file() {
+    fn gh_commands_fail_before_spawn_on_missing_token_file() {
+        let exec = gh_exec(
+            Arc::new(LocalDefaultCredentialSource::new(Some(
+                std::path::PathBuf::from("/nonexistent/path/token"),
+            ))),
+            None,
+        );
+        assert!(matches!(
+            exec.build_gh_cmd(&["pr", "view", "1"], Path::new("/tmp")),
+            Err(GithubCredentialError::TokenFileUnreadable { .. })
+        ));
+        assert!(matches!(
+            exec.repo_view_default_branch_cmd(Path::new("/tmp")),
+            Err(GithubCredentialError::TokenFileUnreadable { .. })
+        ));
+    }
+
+    #[test]
+    fn gh_commands_read_and_trim_token_file_at_call_time() {
         let dir = tempfile::tempdir().unwrap();
         let token_path = dir.path().join("token");
         std::fs::write(&token_path, "  my-secret-token \n").unwrap();
-        let exec = GhMergeExecutor {
-            token_file: Some(token_path),
-            gh_repo: None,
-            base_branch: "main".into(),
-            self_update_branch: "main".into(),
-        };
-        assert_eq!(exec.read_token().unwrap(), "my-secret-token");
+        let exec = gh_exec(
+            Arc::new(LocalDefaultCredentialSource::new(Some(token_path.clone()))),
+            None,
+        );
+        let cmd = exec
+            .build_gh_cmd(&["pr", "view", "1"], Path::new("/tmp"))
+            .unwrap();
+        assert_eq!(gh_token_env(&cmd).as_deref(), Some("my-secret-token"));
+
+        std::fs::write(&token_path, "rotated-token\n").unwrap();
+        let cmd = exec
+            .repo_view_default_branch_cmd(Path::new("/tmp"))
+            .unwrap();
+        assert_eq!(gh_token_env(&cmd).as_deref(), Some("rotated-token"));
     }
 
     #[test]
-    fn read_token_returns_none_when_no_file_configured() {
-        let exec = GhMergeExecutor {
-            token_file: None,
-            gh_repo: None,
-            base_branch: "main".into(),
-            self_update_branch: "main".into(),
+    fn gh_commands_get_gh_token_from_injected_source_per_call() {
+        const SECRET: &str = "ghs_injected_secret_value";
+        let (source, exec) = fake_exec(SECRET);
+        let pr_cmd = exec
+            .build_gh_cmd(&["pr", "view", "1"], Path::new("/tmp"))
+            .unwrap();
+        let repo_cmd = exec
+            .repo_view_default_branch_cmd(Path::new("/tmp"))
+            .unwrap();
+        assert_eq!(source.calls(), 2, "token is fetched once per gh child");
+        for cmd in [&pr_cmd, &repo_cmd] {
+            assert_eq!(gh_token_env(cmd).as_deref(), Some(SECRET));
+            assert!(
+                !argv(cmd).iter().any(|arg| arg.contains(SECRET)),
+                "token must never enter argv"
+            );
+        }
+    }
+
+    #[test]
+    fn failing_source_yields_classified_failure_without_spawning_gh() {
+        const SECRET: &str = "ghs_never_rendered_secret";
+        let source = Arc::new(FakeCredentialSource::failing(
+            GithubCredentialError::LookupTimedOut {
+                timeout: Duration::from_secs(10),
+            },
+        ));
+        // A slug keeps every builder independent of cwd; the failure must
+        // surface before any gh child exists.
+        let exec = gh_exec(source.clone(), Some("owner/repo".into()));
+        assert!(matches!(
+            exec.build_gh_cmd(&["pr", "view", "1"], Path::new("/tmp")),
+            Err(GithubCredentialError::LookupTimedOut { .. })
+        ));
+        assert!(matches!(
+            exec.repo_view_default_branch_cmd(Path::new("/tmp")),
+            Err(GithubCredentialError::LookupTimedOut { .. })
+        ));
+
+        let run = exec.run_gh(&["pr", "ready", "1"], Path::new("/tmp"));
+        assert!(!run.success);
+        assert_eq!(run.failure_kind, Some(MergeFailureKind::PolicyBlocked));
+        assert!(run.message.contains("gh not run"), "{}", run.message);
+
+        let ctx = test_ctx();
+        for result in [
+            exec.merge(1, Path::new("/tmp"), &ctx),
+            exec.merge_without_approval(1, Path::new("/tmp"), &ctx),
+        ] {
+            assert!(!result.success);
+            assert_eq!(result.failure_kind, Some(MergeFailureKind::PolicyBlocked));
+            assert!(
+                result.message.contains("base could not be validated")
+                    && result.message.contains("timed out"),
+                "{}",
+                result.message
+            );
+            assert!(!result.message.contains(SECRET));
+        }
+        assert!(exec.live_head_sha(1, Path::new("/tmp")).is_err());
+        assert_eq!(exec.live_head_ref(1, Path::new("/tmp")), None);
+        assert_eq!(exec.repository_default_branch(Path::new("/tmp")), None);
+        assert_eq!(exec.merge_commit_sha(1, Path::new("/tmp")), None);
+        assert_eq!(
+            exec.merge_commit_status(1, Path::new("/tmp")),
+            MergeCommitStatus::Unknown
+        );
+        assert_eq!(exec.head_sha(1, Path::new("/tmp")), None);
+        assert!(!exec.ensure_changes_requested(1, Path::new("/tmp"), "body"));
+        assert_eq!(
+            exec.check_default_branch_ci(Path::new("/tmp"), "main"),
+            DefaultBranchStatus::Unknown
+        );
+        assert_eq!(
+            exec.check_required_jobs(1, Path::new("/tmp"), &["ci".to_string()]),
+            RequiredJobsOutcome::NotReady {
+                issues: vec![("ci".into(), "query failed".into())]
+            }
+        );
+        assert!(source.calls() > 0);
+    }
+
+    #[test]
+    fn merge_failure_messages_never_contain_the_token() {
+        const SECRET: &str = "ghp_file_token_should_stay_hidden";
+        let dir = tempfile::tempdir().unwrap();
+        // An empty file is a typed failure; then a source that does yield the
+        // token must still keep it out of every rendered failure.
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "\n").unwrap();
+        let exec = gh_exec(
+            Arc::new(LocalDefaultCredentialSource::new(Some(empty))),
+            Some("owner/repo".into()),
+        );
+        let result = exec.run_gh(&["pr", "view", "1"], Path::new("/tmp"));
+        assert!(result.message.contains("is empty"), "{}", result.message);
+
+        let error = GithubCredentialError::LookupFailed {
+            reason: "gh exited with exit status: 1".into(),
         };
-        assert!(exec.read_token().is_none());
+        let rendered = credential_failure(&error);
+        assert!(!rendered.message.contains(SECRET));
+        assert!(!format!("{rendered:?}").contains(SECRET));
+    }
+
+    #[test]
+    fn merge_executor_exposes_its_credential_source() {
+        const SECRET: &str = "ghs_shared_source";
+        let (source, exec) = fake_exec(SECRET);
+        let shared = MergeExecutor::github_credentials(&exec);
+        assert_eq!(shared.token().unwrap().expose_secret(), SECRET);
+        assert_eq!(
+            source.calls(),
+            1,
+            "the executor hands out its injected source"
+        );
+
+        // Other implementors inherit the local default without code changes.
+        let command = CommandMergeExecutor {
+            command: "true".into(),
+            checks_cmd: None,
+            mergeability_cmd: None,
+        };
+        let _default: Arc<dyn GithubCredentialSource> = command.github_credentials();
     }
 
     fn repo_view_argv(exec: &GhMergeExecutor, repo_dir: &Path) -> Vec<String> {
-        let cmd = exec.repo_view_default_branch_cmd(repo_dir);
+        let cmd = exec.repo_view_default_branch_cmd(repo_dir).unwrap();
         cmd.get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
@@ -2533,13 +2749,11 @@ mod tests {
     /// parked every merge. The argv must pass the slug positionally, never via -R.
     #[test]
     fn repo_view_default_branch_passes_slug_positionally_never_with_r_flag() {
-        let exec = GhMergeExecutor {
-            token_file: None,
-            gh_repo: Some("owner/repo".into()),
-            base_branch: "main".into(),
-            self_update_branch: "main".into(),
-        };
-        let cmd = exec.repo_view_default_branch_cmd(Path::new("/tmp"));
+        let (_, mut exec) = fake_exec("t");
+        exec.gh_repo = Some("owner/repo".into());
+        let cmd = exec
+            .repo_view_default_branch_cmd(Path::new("/tmp"))
+            .unwrap();
         assert_eq!(cmd.get_program().to_string_lossy(), "gh");
 
         let argv = repo_view_argv(&exec, Path::new("/tmp"));
@@ -2557,14 +2771,9 @@ mod tests {
     /// (no positional slug), matching `build_gh_cmd`'s cwd fallback.
     #[test]
     fn repo_view_default_branch_falls_back_to_cwd_without_slug() {
-        let exec = GhMergeExecutor {
-            token_file: None,
-            gh_repo: None,
-            base_branch: "main".into(),
-            self_update_branch: "main".into(),
-        };
+        let (_, exec) = fake_exec("t");
         let repo_dir = Path::new("/tmp/some-repo");
-        let cmd = exec.repo_view_default_branch_cmd(repo_dir);
+        let cmd = exec.repo_view_default_branch_cmd(repo_dir).unwrap();
         assert_eq!(
             cmd.get_current_dir(),
             Some(repo_dir),
@@ -2578,15 +2787,12 @@ mod tests {
 
     #[test]
     fn gh_commands_disable_git_prompts_and_optional_locks() {
-        let exec = GhMergeExecutor {
-            token_file: None,
-            gh_repo: None,
-            base_branch: "main".into(),
-            self_update_branch: "main".into(),
-        };
+        let (_, exec) = fake_exec("t");
         for cmd in [
-            exec.build_gh_cmd(&["pr", "view", "1"], Path::new("/tmp")),
-            exec.repo_view_default_branch_cmd(Path::new("/tmp")),
+            exec.build_gh_cmd(&["pr", "view", "1"], Path::new("/tmp"))
+                .unwrap(),
+            exec.repo_view_default_branch_cmd(Path::new("/tmp"))
+                .unwrap(),
         ] {
             let env: std::collections::HashMap<_, _> = cmd
                 .get_envs()
@@ -2625,12 +2831,10 @@ mod tests {
         }
         // A configured slug (`gh_repo = Some`) is the exact case the old `-R` argv
         // broke: `gh repo view -R <slug>` errored, so the lookup returned None.
-        let exec = GhMergeExecutor {
-            token_file: None,
-            gh_repo: Some("cli/cli".into()),
-            base_branch: "main".into(),
-            self_update_branch: "main".into(),
-        };
+        let exec = gh_exec(
+            Arc::new(LocalDefaultCredentialSource::new(None)),
+            Some("cli/cli".into()),
+        );
         let branch = exec.repository_default_branch(Path::new("."));
         assert!(
             branch.as_deref().is_some_and(|b| !b.is_empty()),

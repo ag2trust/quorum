@@ -2002,7 +2002,9 @@ fn write_gh_pr_state_shim(dir: &std::path::Path, response: &str) {
     std::fs::write(
         &shim,
         format!(
-            "#!/bin/sh\nif [ -n \"$QUORUM_GH_ARGS_FILE\" ]; then\n  printf '%s\\n' \"$*\" > \"$QUORUM_GH_ARGS_FILE\"\nfi\ncase \"$*\" in\n  *\"pr view\"*) echo '{response}' ;;\n  *) exit 1 ;;\nesac\n"
+            // `auth token` is the local-default credential lookup; `pr view`
+            // must then receive that token through GH_TOKEN.
+            "#!/bin/sh\nif [ \"$*\" = \"auth token\" ]; then\n  echo shim-token\n  exit 0\nfi\nif [ -n \"$QUORUM_GH_ARGS_FILE\" ]; then\n  printf '%s\\n' \"$*\" > \"$QUORUM_GH_ARGS_FILE\"\nfi\n[ \"$GH_TOKEN\" = shim-token ] || exit 1\ncase \"$*\" in\n  *\"pr view\"*) echo '{response}' ;;\n  *) exit 1 ;;\nesac\n"
         ),
     )
     .unwrap();
