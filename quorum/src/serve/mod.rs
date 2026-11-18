@@ -11585,6 +11585,71 @@ async fn complete_detected_merge_with_metadata(
     Ok(true)
 }
 
+/// Map one merge-gate CI outcome to the daemon-owned `refs.merge_checks`
+/// state. `None` names mean the caller must ask the provider for the
+/// still-pending check names.
+fn merge_checks_observation(
+    outcome: &merge::ChecksOutcome,
+) -> (tasks::MergeChecksState, Option<Vec<String>>) {
+    match outcome {
+        merge::ChecksOutcome::Ready => (tasks::MergeChecksState::Passed, Some(Vec::new())),
+        merge::ChecksOutcome::Failed { failing_checks } => (
+            tasks::MergeChecksState::Failing,
+            Some(failing_checks.clone()),
+        ),
+        merge::ChecksOutcome::Pending { reason } => (
+            tasks::MergeChecksState::Pending,
+            merge::required_jobs_pending_names(reason),
+        ),
+        merge::ChecksOutcome::TimedOut => (tasks::MergeChecksState::Pending, None),
+    }
+}
+
+/// Persist the latest merge-gate CI observation for a `merging` task. Call
+/// only after the gate's network calls have returned: any pending-name lookup
+/// runs first, then the snapshot is written in its own short transaction
+/// (bounded by core). Purely observational — a task that already left
+/// `merging` is a clean negative, and an abnormal failure is logged without
+/// changing the merge decision.
+async fn record_merge_checks_observation(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    outcome: &merge::ChecksOutcome,
+) {
+    let (state, names) = merge_checks_observation(outcome);
+    let checks = match names {
+        Some(names) => names,
+        None => {
+            let repo = config.repo_dir.clone();
+            let executor = Arc::clone(&config.merge_executor);
+            tokio::task::spawn_blocking(move || executor.pending_check_names(pr, &repo))
+                .await
+                .unwrap_or_else(|error| {
+                    log(&format!(
+                        "merge-checks pending-name lookup join failed for PR #{pr}: {error}"
+                    ));
+                    Vec::new()
+                })
+        }
+    };
+    let db_path = config.db_path.clone();
+    let written = tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        tasks::set_merge_checks_snapshot(&mut conn, task_id, state, &checks, now_unix())
+    })
+    .await;
+    match written {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => log(&format!(
+            "ERROR: merge-checks snapshot write failed for task #{task_id}: {error}"
+        )),
+        Err(error) => log(&format!(
+            "ERROR: merge-checks snapshot join failed for task #{task_id}: {error}"
+        )),
+    }
+}
+
 /// Consume one durable merge request and perform at most one formal
 /// approval/merge call.
 /// All network checks precede a final durable-authority reread; failures either
@@ -11751,6 +11816,7 @@ async fn reconcile_merge_retries(
         };
         checks = merge::apply_required_jobs_gate(checks, required);
     }
+    record_merge_checks_observation(config, task_id, pr, &checks).await;
     match checks {
         merge::ChecksOutcome::Ready => {}
         merge::ChecksOutcome::Failed { failing_checks } => {
@@ -14358,6 +14424,18 @@ async fn tick(
                         other => other,
                     };
 
+                    // A drain-interrupted wait observed nothing new; leave
+                    // the prior snapshot for restart recovery.
+                    if !drain_interrupted {
+                        record_merge_checks_observation(
+                            config,
+                            reviewer_task_id,
+                            pr_num,
+                            &checks_outcome,
+                        )
+                        .await;
+                    }
+
                     match checks_outcome {
                         merge::ChecksOutcome::Failed { failing_checks } => {
                             let names = failing_checks.join(", ");
@@ -15215,6 +15293,13 @@ async fn tick(
                                     }
                                 }
                             };
+                            record_merge_checks_observation(
+                                config,
+                                reviewer_task_id,
+                                pr_num,
+                                &retry_outcome,
+                            )
+                            .await;
                             match retry_outcome {
                                 merge::ChecksOutcome::Ready => {
                                     log(&format!(
@@ -45885,6 +45970,176 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(terminal_alerts, 0, "recorded cleanup must not alert");
     }
 
+    /// Approved-merge gate executor: the reviewed head is current and the PR
+    /// is mergeable, but CI is still running.
+    struct PendingMergeGateChecks;
+
+    impl merge::MergeExecutor for PendingMergeGateChecks {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            panic!("merge must not be called while checks are pending");
+        }
+
+        fn head_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+            Some("reviewed-head".into())
+        }
+
+        fn wait_for_checks(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _timeout_secs: u64,
+            _poll_interval_secs: u64,
+        ) -> merge::ChecksOutcome {
+            merge::ChecksOutcome::TimedOut
+        }
+
+        fn pending_check_names(&self, _pr: i64, _repo_dir: &Path) -> Vec<String> {
+            vec!["shell-tests".into(), "lint".into()]
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approved_merge_gate_pending_checks_persist_merge_checks_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("approved-merge-gate-pending.db");
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet", &repo_dir.to_string_lossy()])
+            .status()
+            .unwrap();
+        let now = now_unix();
+        let (task_id, reviewer_run_id, mailbox_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "approved merge gate pending",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"branch":"daemon/reviewer-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "Author", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Author",
+                task_id,
+                &Event::SignaledDone { pr: "464".into() },
+                now + 1,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "GateReviewer", Some(task_id), &[], 3600, now + 2)
+                .unwrap()
+                .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "system",
+                task_id,
+                &Event::ReviewerAttached {
+                    agent: "GateReviewer".into(),
+                },
+                now + 2,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "GateReviewer",
+                task_id,
+                &Event::VerdictApprove,
+                now + 3,
+            )
+            .unwrap();
+            // R1-only head: the approval goes straight to the merge gate.
+            quorum_core::review_audits::record_r2_requirement(
+                &mut conn,
+                task_id,
+                464,
+                "reviewed-head",
+                false,
+            )
+            .unwrap();
+            let run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "GateReviewer",
+                "reviewer",
+                "gpt-5.6-terra",
+                "high",
+                "codex",
+                now + 2,
+            )
+            .unwrap();
+            let mailbox_id = mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "GateReviewer".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(464),
+                    verdict: Some("approved".into()),
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: Some(r#"{"blocking":0}"#.into()),
+                },
+            )
+            .unwrap();
+            (task_id, run_id, mailbox_id)
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo_dir.clone());
+        config.merge_executor = Arc::new(PendingMergeGateChecks);
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("GateReviewer").unwrap();
+
+        let _ = tick_phase2_reviewer_fixture(
+            config,
+            name_pool,
+            Phase2ReviewerFixture {
+                dir: dir.path().to_path_buf(),
+                repo_dir,
+                task_id,
+                reviewer_run_id,
+                agent: "GateReviewer".into(),
+                reviewed_head_sha: Some("reviewed-head".into()),
+            },
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "merging", "pending CI keeps the merge wait");
+        let snap = tasks::merge_checks_of(task.refs.as_deref())
+            .expect("pending merge-gate poll must persist refs.merge_checks");
+        assert_eq!(snap.state, tasks::MergeChecksState::Pending);
+        assert_eq!(
+            snap.checks,
+            vec!["shell-tests".to_string(), "lint".to_string()]
+        );
+        assert!(snap.since >= now && snap.observed_at >= snap.since);
+        let consumed: bool = conn
+            .query_row(
+                "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+                [mailbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!consumed, "merge wait retries from the unconsumed row");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn mailbox_verdict_before_buffered_reviewer_terminal_emits_recorded_cleanup_diagnostic() {
@@ -47311,6 +47566,212 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             next_needed_role(&conn, 42, "moved-head").unwrap(),
             Some("r1")
         );
+    }
+
+    fn merge_checks_snapshot_row(
+        conn: &quorum_core::Connection,
+        task_id: i64,
+    ) -> Option<tasks::MergeChecksSnapshot> {
+        let refs = tasks::get(conn, task_id).unwrap().unwrap().refs;
+        tasks::merge_checks_of(refs.as_deref())
+    }
+
+    /// Ready merge-retry executor whose merge call reads the durable
+    /// snapshot, proving what the gate persisted before the merge.
+    struct MergeChecksProbeExecutor {
+        db_path: PathBuf,
+        task_id: i64,
+        seen_at_merge: std::sync::Mutex<Option<Option<tasks::MergeChecksSnapshot>>>,
+    }
+
+    impl merge::MergeExecutor for MergeChecksProbeExecutor {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            let conn = quorum_core::db::open(&self.db_path).unwrap();
+            *self.seen_at_merge.lock().unwrap() =
+                Some(merge_checks_snapshot_row(&conn, self.task_id));
+            merge::MergeResult {
+                success: true,
+                message: "merged".into(),
+                failure_kind: None,
+            }
+        }
+
+        fn merge_commit_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+            Some("merge-42".into())
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn merge_retry_gate_records_passed_snapshot_then_merge_clears_it() {
+        let (dir, mut conn, task_id, live) = seeded_merge_retry_authority();
+        prepare_ready_approved_handoff(&conn, task_id, 1);
+        assert!(
+            request_ready_approved_merge(&mut conn, task_id, 42, &live.target.head_sha, 102,)
+                .unwrap()
+        );
+        // A prior gate poll observed pending checks.
+        assert!(tasks::set_merge_checks_snapshot(
+            &mut conn,
+            task_id,
+            tasks::MergeChecksState::Pending,
+            &["shell-tests".to_string()],
+            103,
+        )
+        .unwrap());
+        drop(conn);
+
+        let executor = Arc::new(MergeChecksProbeExecutor {
+            db_path: dir.path().join("q.db"),
+            task_id,
+            seen_at_merge: std::sync::Mutex::new(None),
+        });
+        let config =
+            merge_retry_test_config(&dir, &live, "gh-merge-checks-probe", executor.clone());
+        assert_eq!(config.db_path, executor.db_path);
+
+        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+            .await
+            .unwrap();
+
+        let seen = executor
+            .seen_at_merge
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("merge must be called")
+            .expect("gate must persist a snapshot before merging");
+        assert_eq!(seen.state, tasks::MergeChecksState::Passed);
+        assert!(seen.checks.is_empty());
+        assert!(seen.since > 103, "state change resets since");
+        assert_eq!(seen.since, seen.observed_at);
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        assert_eq!(tasks::get(&conn, task_id).unwrap().unwrap().status, "done");
+        assert_eq!(merge_checks_snapshot_row(&conn, task_id), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn merge_retry_ci_failure_rework_clears_merge_checks_snapshot() {
+        let (dir, mut conn, task_id, live) = seeded_merge_retry_authority();
+        prepare_ready_approved_handoff(&conn, task_id, 1);
+        assert!(
+            request_ready_approved_merge(&mut conn, task_id, 42, &live.target.head_sha, 102,)
+                .unwrap()
+        );
+        assert!(tasks::set_merge_checks_snapshot(
+            &mut conn,
+            task_id,
+            tasks::MergeChecksState::Pending,
+            &["flaky-test".to_string()],
+            103,
+        )
+        .unwrap());
+        drop(conn);
+
+        let executor = Arc::new(FailingChecksMergeCounter {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let config = merge_retry_test_config(&dir, &live, "gh-merge-checks-fail", executor.clone());
+
+        assert_eq!(
+            reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+                .await
+                .unwrap(),
+            Some(task_id)
+        );
+
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(merge_checks_snapshot_row(&conn, task_id), None);
+    }
+
+    #[tokio::test]
+    async fn merge_checks_observation_maps_outcomes_and_skips_non_merging_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut config = pre_review_checks_config(dir.path().join("q.db"), repo);
+        config.merge_executor = Arc::new(TimedOutPreReviewChecks);
+        let task_id = {
+            let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+            let id = tasks::create(
+                &mut conn,
+                "creator",
+                "merge checks observation",
+                None,
+                0,
+                None,
+                Some(r#"{"pr":42}"#),
+                None,
+                None,
+                100,
+            )
+            .unwrap();
+            conn.execute("UPDATE tasks SET status='merging' WHERE id=?1", [id])
+                .unwrap();
+            id
+        };
+        let read = || {
+            let conn = quorum_core::db::open(&config.db_path).unwrap();
+            merge_checks_snapshot_row(&conn, task_id).expect("snapshot")
+        };
+
+        // Rollup pending: names come from the provider lookup.
+        record_merge_checks_observation(&config, task_id, 42, &merge::ChecksOutcome::TimedOut)
+            .await;
+        let snap = read();
+        assert_eq!(snap.state, tasks::MergeChecksState::Pending);
+        assert_eq!(snap.checks, vec!["shell-tests".to_string()]);
+
+        // Required-job pending: names come from the gate outcome.
+        let required_pending = merge::apply_required_jobs_gate(
+            merge::ChecksOutcome::Ready,
+            merge::RequiredJobsOutcome::Pending {
+                pending_jobs: vec!["ci-gate".into()],
+            },
+        );
+        record_merge_checks_observation(&config, task_id, 42, &required_pending).await;
+        assert_eq!(read().checks, vec!["ci-gate".to_string()]);
+
+        // Failing checks are bounded to the core limit.
+        let failing: Vec<String> = (0..30).map(|i| format!("job-{i}")).collect();
+        record_merge_checks_observation(
+            &config,
+            task_id,
+            42,
+            &merge::ChecksOutcome::Failed {
+                failing_checks: failing.clone(),
+            },
+        )
+        .await;
+        let snap = read();
+        assert_eq!(snap.state, tasks::MergeChecksState::Failing);
+        assert_eq!(snap.checks, failing[..20].to_vec());
+
+        record_merge_checks_observation(&config, task_id, 42, &merge::ChecksOutcome::Ready).await;
+        let snap = read();
+        assert_eq!(snap.state, tasks::MergeChecksState::Passed);
+        assert!(snap.checks.is_empty());
+
+        // A task that left `merging` is a clean negative: no write, no panic.
+        {
+            let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+            assert!(tasks::clear_merge_checks_snapshot(&mut conn, task_id).unwrap());
+            conn.execute("UPDATE tasks SET status='in-review' WHERE id=?1", [task_id])
+                .unwrap();
+        }
+        record_merge_checks_observation(&config, task_id, 42, &merge::ChecksOutcome::TimedOut)
+            .await;
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        assert_eq!(merge_checks_snapshot_row(&conn, task_id), None);
     }
 
     #[cfg(unix)]
