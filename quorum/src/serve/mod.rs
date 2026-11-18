@@ -12653,6 +12653,8 @@ async fn tick_loop_owning_doctor(
         &mut workers,
         &mut reviewers,
         &mut lifetime_roster,
+        &mut unrecordable_strikes,
+        &mut reviewer_respawn_backoff,
         &mut profile_cooldown,
     )
     .await?;
@@ -13882,6 +13884,7 @@ async fn tick(
                                             reviewers,
                                             lifetime_roster,
                                             unrecordable,
+                                            reviewer_respawn_backoff,
                                             profile_cooldown,
                                             pr_num,
                                             worker_cp,
@@ -16828,7 +16831,7 @@ async fn tick(
     order_reviewer_teardowns(&mut reviewer_fallback_teardowns);
     for (i, end_reason) in reviewer_fallback_teardowns.into_iter().rev() {
         let dead = reviewers.remove(i);
-        let close_reason = strike_reviewer_unclassified_teardown(
+        let close_reason = strike_reviewer_provider_failure_teardown(
             config,
             unrecordable,
             reviewer_respawn_backoff,
@@ -17705,8 +17708,15 @@ async fn tick(
                     Ok(ReviewerFallbackActivation::Activated) => continue,
                     Ok(ReviewerFallbackActivation::Settled) => {
                         let dead = reviewers.remove(i);
-                        teardown_reviewer(config, wt_mgr, name_pool, dead, "provider_blocked")
-                            .await;
+                        let close_reason = strike_reviewer_provider_failure_teardown(
+                            config,
+                            unrecordable,
+                            reviewer_respawn_backoff,
+                            "provider_blocked",
+                            &dead,
+                        )
+                        .await;
+                        teardown_reviewer(config, wt_mgr, name_pool, dead, close_reason).await;
                         continue;
                     }
                     Ok(ReviewerFallbackActivation::NotInstalled) => {}
@@ -18214,6 +18224,7 @@ async fn tick(
                         reviewers,
                         lifetime_roster,
                         unrecordable,
+                        reviewer_respawn_backoff,
                         profile_cooldown,
                         *pr,
                         counterpart,
@@ -18669,6 +18680,7 @@ async fn tick(
                         reviewers,
                         lifetime_roster,
                         unrecordable,
+                        reviewer_respawn_backoff,
                         profile_cooldown,
                         *pr,
                         counterpart,
@@ -23246,28 +23258,47 @@ async fn record_reviewer_strike(
 const REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON: &str =
     "turn-error-unclassified-strike-unrecorded";
 
-/// Burn one per-head strike for an unclassified terminal reviewer turn before
-/// teardown closes the exact agent run. First-turn failures can precede the
-/// slot's in-memory PR/head fields, so recover either missing value from the
-/// immutable launch evidence persisted on that run.
+/// Burn one per-head strike for a provider-failed terminal reviewer before
+/// teardown closes the exact agent run, and pause the next provision for that
+/// (task, PR). Two end reasons qualify:
+///
+/// - `turn-error-unclassified`: an unclassified terminal reviewer turn.
+/// - `provider_blocked`: a provider/profile-unavailable failure whose fallback
+///   install settled with no live alternate. Without a strike and pause the
+///   daemon re-provisions the same blocked provider every tick until the
+///   lifetime cap parks the task.
+///
+/// Every other end reason is returned unchanged with no strike or pause.
+/// First-turn failures can precede the slot's in-memory PR/head fields, so
+/// recover either missing value from the immutable launch evidence persisted
+/// on that run.
 ///
 /// Returns the end reason teardown must persist. A successful strike keeps
-/// `turn-error-unclassified`, whose short closes stay out of
+/// the given reason. Short `turn-error-unclassified` closes stay out of
 /// `MAX_TOTAL_REVIEWER_RUNS` because this strike is the durable bound across
-/// restarts. A failed strike write returns
-/// [`REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON`] so that close still
+/// restarts, so a failed strike write returns
+/// [`REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON`] and that close still
 /// counts toward the lifetime cap; the in-memory backstop does not survive a
-/// restart.
-async fn strike_reviewer_unclassified_teardown(
+/// restart. `provider_blocked` closes always count toward that cap, so their
+/// reason is kept even when the strike write fails.
+async fn strike_reviewer_provider_failure_teardown(
     config: &ServeConfig,
     unrecordable: &mut UnrecordableStrikes,
     respawn_backoff: &mut ReviewerRespawnBackoff,
     end_reason: &'static str,
     dead: &SlotState,
 ) -> &'static str {
-    if end_reason != "turn-error-unclassified" {
-        return end_reason;
-    }
+    let (unrecorded_reason, default_error) = match end_reason {
+        "turn-error-unclassified" => (
+            REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON,
+            "reviewer turn ended with an unclassified error",
+        ),
+        "provider_blocked" => (
+            "provider_blocked",
+            "reviewer provider unavailable with no eligible alternate",
+        ),
+        _ => return end_reason,
+    };
 
     let role = if dead.r2_origin { "r2" } else { "r1" };
     let mut pr = dead.pr;
@@ -23275,7 +23306,7 @@ async fn strike_reviewer_unclassified_teardown(
     if pr.is_none() || head_sha.is_none() {
         let Some(run_id) = dead.agent_run_id else {
             log(&format!(
-                "reviewer {} ended turn-error-unclassified for task #{} without slot PR/head or an agent run id; cannot record a durable strike",
+                "reviewer {} ended {end_reason} for task #{} without slot PR/head or an agent run id; cannot record a durable strike",
                 dead.agent_name, dead.task_id,
             ));
             return end_reason;
@@ -23304,39 +23335,36 @@ async fn strike_reviewer_unclassified_teardown(
             }
             Ok(Ok(None)) => {
                 log(&format!(
-                    "reviewer {} ended turn-error-unclassified for task #{} but exact agent run #{run_id} has no durable reviewer launch; cannot record a strike",
+                    "reviewer {} ended {end_reason} for task #{} but exact agent run #{run_id} has no durable reviewer launch; cannot record a strike",
                     dead.agent_name, dead.task_id,
                 ));
                 return end_reason;
             }
             Ok(Err(error)) => {
                 log(&format!(
-                    "reviewer {} ended turn-error-unclassified for task #{} but durable launch lookup for agent run #{run_id} failed: {error}; closing as {REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON} so the lifetime cap still counts this run",
+                    "reviewer {} ended {end_reason} for task #{} but durable launch lookup for agent run #{run_id} failed: {error}; closing as {unrecorded_reason} so the lifetime cap still counts this run",
                     dead.agent_name, dead.task_id,
                 ));
-                return REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON;
+                return unrecorded_reason;
             }
             Err(error) => {
                 log(&format!(
-                    "reviewer {} ended turn-error-unclassified for task #{} but durable launch lookup for agent run #{run_id} could not join: {error}; closing as {REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON} so the lifetime cap still counts this run",
+                    "reviewer {} ended {end_reason} for task #{} but durable launch lookup for agent run #{run_id} could not join: {error}; closing as {unrecorded_reason} so the lifetime cap still counts this run",
                     dead.agent_name, dead.task_id,
                 ));
-                return REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON;
+                return unrecorded_reason;
             }
         }
     }
 
     let (Some(pr), Some(head_sha)) = (pr, head_sha) else {
         log(&format!(
-            "reviewer {} ended turn-error-unclassified for task #{} but neither slot nor durable agent run supplied a complete PR/head; cannot record a strike",
+            "reviewer {} ended {end_reason} for task #{} but neither slot nor durable agent run supplied a complete PR/head; cannot record a strike",
             dead.agent_name, dead.task_id,
         ));
         return end_reason;
     };
-    let provider_error = dead
-        .last_error_text
-        .as_deref()
-        .unwrap_or("reviewer turn ended with an unclassified error");
+    let provider_error = dead.last_error_text.as_deref().unwrap_or(default_error);
     // An unrecordable strike is already loud and counted by the common
     // in-memory backstop; still pause so this failure cannot respawn per tick.
     // The backstop resets on restart, so a failed write must not close under
@@ -23356,7 +23384,7 @@ async fn strike_reviewer_unclassified_teardown(
             let delay =
                 respawn_backoff.record(dead.task_id, pr, strikes, std::time::Instant::now());
             log(&format!(
-                "reviewer {} ended turn-error-unclassified for task #{} PR #{pr} head {head_sha}: recorded a {role_label} provider-failure strike and deferring the next provision by {:.1}s",
+                "reviewer {} ended {end_reason} for task #{} PR #{pr} head {head_sha}: recorded a {role_label} provider-failure strike and deferring the next provision by {:.1}s",
                 dead.agent_name,
                 dead.task_id,
                 delay.as_secs_f64(),
@@ -23367,12 +23395,12 @@ async fn strike_reviewer_unclassified_teardown(
         Err(error) => {
             let delay = respawn_backoff.record(dead.task_id, pr, 1, std::time::Instant::now());
             log(&format!(
-                "reviewer {} ended turn-error-unclassified for task #{} PR #{pr} head {head_sha}: durable provider-failure strike was not recorded ({error}); closing as {REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON} so the lifetime cap still counts this run, deferring the next provision by {:.1}s",
+                "reviewer {} ended {end_reason} for task #{} PR #{pr} head {head_sha}: durable provider-failure strike was not recorded ({error}); closing as {unrecorded_reason} so the lifetime cap still counts this run, deferring the next provision by {:.1}s",
                 dead.agent_name,
                 dead.task_id,
                 delay.as_secs_f64(),
             ));
-            REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON
+            unrecorded_reason
         }
     }
 }
@@ -23487,6 +23515,7 @@ async fn provision_reviewer(
     reviewers: &mut Vec<SlotState>,
     lifetime_roster: &mut LifetimeRoster,
     unrecordable: &mut UnrecordableStrikes,
+    respawn_backoff: &mut ReviewerRespawnBackoff,
     profile_cooldown: &mut ProfileCooldown,
     pr: i64,
     worker: ReviewCounterpart<'_>,
@@ -23535,6 +23564,7 @@ async fn provision_reviewer(
         reviewers,
         lifetime_roster,
         unrecordable,
+        respawn_backoff,
         profile_cooldown,
         pr,
         worker,
@@ -23567,6 +23597,7 @@ async fn provision_reviewer_reserved(
     reviewers: &mut Vec<SlotState>,
     lifetime_roster: &mut LifetimeRoster,
     unrecordable: &mut UnrecordableStrikes,
+    respawn_backoff: &mut ReviewerRespawnBackoff,
     profile_cooldown: &mut ProfileCooldown,
     pr: i64,
     worker: ReviewCounterpart<'_>,
@@ -24668,14 +24699,16 @@ async fn provision_reviewer_reserved(
                         return Ok(ReviewerProvisionOutcome::Attached);
                     }
                     ReviewerFallbackActivation::Settled => {
-                        teardown_reviewer(
+                        let close_reason = strike_reviewer_provider_failure_teardown(
                             config,
-                            wt_mgr,
-                            name_pool,
-                            failed_slot,
+                            unrecordable,
+                            respawn_backoff,
                             "provider_blocked",
+                            &failed_slot,
                         )
                         .await;
+                        teardown_reviewer(config, wt_mgr, name_pool, failed_slot, close_reason)
+                            .await;
                         return Ok(ReviewerProvisionOutcome::Failed(reason));
                     }
                     ReviewerFallbackActivation::NotInstalled => {}
@@ -28738,6 +28771,7 @@ async fn activate_worker_fallback(
 /// provider launch. Generic recovery preserves these rows and worktrees; this
 /// pass either installs a live slot, advances through another unavailable
 /// route, or settles the responsibility fail-safe.
+#[allow(clippy::too_many_arguments)]
 async fn resume_pending_fallbacks(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -28745,6 +28779,8 @@ async fn resume_pending_fallbacks(
     workers: &mut Vec<SlotState>,
     reviewers: &mut Vec<SlotState>,
     lifetime_roster: &mut LifetimeRoster,
+    unrecordable: &mut UnrecordableStrikes,
+    respawn_backoff: &mut ReviewerRespawnBackoff,
     profile_cooldown: &mut ProfileCooldown,
 ) -> Result<()> {
     let recoveries = {
@@ -28998,8 +29034,15 @@ async fn resume_pending_fallbacks(
                     {
                         ReviewerFallbackActivation::Activated => reviewers.push(slot),
                         ReviewerFallbackActivation::Settled => {
-                            teardown_reviewer(config, wt_mgr, name_pool, slot, "provider_blocked")
-                                .await;
+                            let close_reason = strike_reviewer_provider_failure_teardown(
+                                config,
+                                unrecordable,
+                                respawn_backoff,
+                                "provider_blocked",
+                                &slot,
+                            )
+                            .await;
+                            teardown_reviewer(config, wt_mgr, name_pool, slot, close_reason).await;
                             continue;
                         }
                         ReviewerFallbackActivation::NotInstalled => {
@@ -39331,6 +39374,8 @@ mod tests {
             &mut workers,
             &mut reviewers,
             &mut roster,
+            &mut UnrecordableStrikes::new(),
+            &mut ReviewerRespawnBackoff::new(),
             &mut ProfileCooldown::new(),
         )
         .await
@@ -39380,6 +39425,8 @@ mod tests {
             &mut workers,
             &mut reviewers,
             &mut roster,
+            &mut UnrecordableStrikes::new(),
+            &mut ReviewerRespawnBackoff::new(),
             &mut ProfileCooldown::new(),
         )
         .await
@@ -50647,7 +50694,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let mut backoff = ReviewerRespawnBackoff::new();
 
         for strike in 1..=MAX_REVIEWER_PROVISION_STRIKES as i64 {
-            strike_reviewer_unclassified_teardown(
+            strike_reviewer_provider_failure_teardown(
                 &config,
                 &mut unrecordable,
                 &mut backoff,
@@ -50732,7 +50779,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let mut unrecordable = UnrecordableStrikes::new();
         let mut backoff = ReviewerRespawnBackoff::new();
 
-        let close_reason = strike_reviewer_unclassified_teardown(
+        let close_reason = strike_reviewer_provider_failure_teardown(
             &config,
             &mut unrecordable,
             &mut backoff,
@@ -50867,7 +50914,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
         let mut unrecordable = UnrecordableStrikes::new();
         let mut backoff = ReviewerRespawnBackoff::new();
-        strike_reviewer_unclassified_teardown(
+        strike_reviewer_provider_failure_teardown(
             &config,
             &mut unrecordable,
             &mut backoff,
