@@ -2919,8 +2919,12 @@ streamed-stdout backstop; no provider spend ceiling is set. The response remains
 bounded to 8 KiB per text field and 32 list items. A separate planner spawn boundary enforces
 those restrictions and accepts only one bounded, closed plan or blocker response; a provider whose
 transport cannot be separated from model-generated network or filesystem access is refused
-fail-closed. The view is an archive of the recorded frozen base SHA,
-and source drift is rejected before launch. A valid concrete blocker parks the source immediately
+fail-closed. The view is an archive of the recorded frozen base SHA. At the drain-to-planning
+handoff that SHA is bound from the freshly fetched `origin/<target>` of the source task, verified
+to contain every dependency merge commit through the same fetch workers use, never the daemon
+clone's checked-out `HEAD`; a fetch or verification failure leaves the graph `draining` with no
+SHA, records a deduplicated `decomposition_base_deferred` event on the source, and retries on a
+later tick. The view is content-addressed by that commit and immutable for the attempt. A valid concrete blocker parks the source immediately
 with no second opinion.
 
 The planner reports its plan by calling the daemon-owned `submit_plan` tool exactly once, over
