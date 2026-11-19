@@ -297,9 +297,11 @@ configuration or protocol-level inventory handling fails outside their protocol.
 
 The server advertises only tools valid for the derived live run, current collaboration attempt,
 and lifecycle generation. An agent cannot discover a forbidden mutation and cannot enable a
-larger toolset through arguments or environment. On a same-process phase change, the old list is
-invalid before the new one is acknowledged; endpoint authorization remains authoritative even if
-a client invokes a cached tool name.
+larger toolset through arguments or environment. On a phase change, the old list becomes invalid
+immediately; there is no acknowledgement or relist step gating the handoff, since the transport
+(see "MCP process and provider injection" above) is stateless and resolves inventory fresh from
+the bearer on every request. Endpoint authorization remains authoritative even if a client
+invokes a cached tool name.
 
 | Tool | Reviewer | Rework worker | Initial worker |
 |---|---:|---:|---:|
@@ -1049,10 +1051,10 @@ runs.
 
 Contained rollout additionally requires parity for every registered public command and the
 installed-Claude two-turn inventory test. A warm persistent Claude worker is not migrated until it
-can complete the same-capability attempt handoff, acknowledge the rework inventory, and reject old
-turn descriptors. Until those gates pass, that provider/profile remains on the existing managed
-runtime as one unit; Quorum does not partially remove its public CLI or direct-collaboration
-instructions.
+can complete the same-capability attempt handoff, relist and receive only the rework inventory
+on the stateless HTTP transport, and reject old turn descriptors. Until those gates pass, that
+provider/profile remains on the existing managed runtime as one unit; Quorum does not partially
+remove its public CLI or direct-collaboration instructions.
 
 During migration, formal daemon GitHub commands and the collector retain their existing paths.
 After all managed collaboration prompts use MCP and negative tests pass, the design may remove the

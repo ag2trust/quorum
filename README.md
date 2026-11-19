@@ -435,7 +435,9 @@ This is a non-binding view of ongoing directions, not a release schedule:
   operator use and is not what `quorum serve` spawns for that contract; agent prompts still
   instruct the shell commands, and its GitHub tools remain unimplemented. It is separate from the
   orchestrator server above: it authorizes each request by its run capability sent as a bearer
-  token, not an operator token.
+  token, not an operator token. `agent_mcp_listen` binds loopback only by default; a non-loopback
+  bind is refused unless `agent_mcp_allowed_hosts` explicitly opts it in, and a config that gives
+  `agent_mcp_listen` the same socket address as `orchestrator_mcp_listen` exits 2.
 
 ## Working on Quorum
 
