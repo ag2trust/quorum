@@ -4181,6 +4181,11 @@ fn managed_run_environment(
     if let Some(capability) = capability {
         environment.push(("QUORUM_RUN_ID".into(), capability.to_string()));
     }
+    // `tick_loop` refuses to run without a bound listener, so every managed
+    // launch it makes carries the URL.
+    if let Some(url) = config.agent_mcp_url.as_deref() {
+        environment.push((runner::AGENT_MCP_URL_ENV.into(), url.to_string()));
+    }
     environment
 }
 
@@ -4941,6 +4946,11 @@ pub struct ServeConfig {
     /// Default 2, minimum 1. Enforced by the guarded counts in planning
     /// admission, freeze reacquisition, and activation.
     pub max_active_graphs: usize,
+    /// `http://<bound addr>/mcp` of the daemon-embedded agent MCP listener,
+    /// exported to every managed run as `QUORUM_AGENT_MCP_URL`. `run_serve`
+    /// sets it only after the listener is bound; `tick_loop`, which makes
+    /// every managed launch, refuses to start while it is `None`.
+    pub agent_mcp_url: Option<String>,
 }
 
 impl ServeConfig {
@@ -4964,7 +4974,10 @@ const PUBLICATION_REF_RECONCILE_INTERVAL_SECS: u64 = 60;
 const WORKTREE_PRUNE_INTERVAL_SECS: u64 = 60 * 60;
 const PUBLICATION_REF_RECONCILE_BATCH_SIZE: i64 = 64;
 
-pub fn run_serve(config: ServeConfig) -> Result<i32> {
+pub fn run_serve(
+    mut config: ServeConfig,
+    agent_mcp: crate::serve_config::AgentMcpServeConfig,
+) -> Result<i32> {
     configure_daemon_log(config.log_dir.as_deref());
     log(&format!(
         "starting (cap={}, repo={}, max_active_graphs={})",
@@ -5003,45 +5016,30 @@ pub fn run_serve(config: ServeConfig) -> Result<i32> {
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| QuorumError::Io(format!("failed to create tokio runtime: {e}")))?;
 
-    let result = rt.block_on(async {
-        // One writable-path resolver for the whole process. Its admission gate
-        // is a single-slot bound — a stalled filesystem call must reject later
-        // resolutions rather than spawn another resolver thread — so the
-        // endpoint and the decomposition coordinator share this instance
-        // instead of each holding their own.
-        let writable_path_resolver = planner::WritablePathResolver::default();
-        let endpoint = agent_endpoint::AgentEndpoint::start(
-            &config.db_path,
-            &config.repo,
-            &config.repo_dir,
-            writable_path_resolver.clone(),
-        )
-        .await?;
-        // The one GitHub outbox executor for this daemon. It reconciles
-        // claims left by a previous daemon before its first claim; the
-        // daemon_lock acquired above makes it the only executor on this DB.
-        let outbox_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let outbox = start_github_outbox(&config, outbox_shutdown.clone());
-        let result = tick_loop(
-            &config,
-            daemon_pid,
-            daemon_instance.clone(),
-            writable_path_resolver,
-        )
-        .await;
-        // Flag only: the executor stops claiming and drains in-flight work
-        // within its bounded grace; leftovers reconcile on the next start.
-        outbox_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(outbox) = outbox {
-            match outbox.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => log(&format!("github outbox: stopped with error: {error}")),
-                Err(error) => log(&format!("github outbox: executor task failed: {error}")),
-            }
+    // The agent MCP listener is bound before anything can launch a managed
+    // run. A failure is logged, recorded, and alerted, and the daemon exits
+    // without entering the tick loop: no managed run, planners included, is
+    // ever launched without it, and nothing falls back to stdio.
+    let result = match rt.block_on(crate::agent_mcp::AgentMcpListener::bind(
+        agent_mcp.listen,
+        agent_mcp.allowed_hosts,
+    )) {
+        Err(error) => {
+            record_agent_mcp_listener_failure(&config.db_path, agent_mcp.listen, &error);
+            Err(QuorumError::from(error))
         }
-        endpoint.shutdown().await;
-        result
-    });
+        Ok(listener) => {
+            // The exported authority is one the listener's Host check admits
+            // (resolve_agent_mcp adds it), never a raw wildcard address.
+            let url = crate::serve_config::agent_mcp_url(listener.local_addr());
+            log(&format!(
+                "agent MCP: bound {}, managed runs use {url}",
+                listener.local_addr()
+            ));
+            config.agent_mcp_url = Some(url);
+            serve_with_agent_mcp(&rt, &config, listener, daemon_pid, &daemon_instance)
+        }
+    };
 
     // Release the lock on clean shutdown (best-effort). Guarded by instance
     // identity so a superseded daemon cannot delete the new holder's row.
@@ -5055,6 +5053,116 @@ pub fn run_serve(config: ServeConfig) -> Result<i32> {
     rt.shutdown_timeout(std::time::Duration::from_secs(1));
 
     result
+}
+
+/// How often the agent MCP listener's shutdown future polls its flag.
+const AGENT_MCP_SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Log, record in `errors`, and alert the owner that the agent MCP listener
+/// could not start. Each write is best-effort: a failure to record is logged
+/// and never masks the listener failure the caller returns.
+fn record_agent_mcp_listener_failure(
+    db_path: &Path,
+    listen: std::net::SocketAddr,
+    error: &crate::agent_mcp::AgentMcpListenError,
+) {
+    let detail = format!(
+        "agent MCP listener on {listen} could not start: {error}; no managed runs will be \
+         launched"
+    );
+    log(&format!("agent MCP: {detail}"));
+    let now = now_unix();
+    match quorum_core::db::open(db_path) {
+        Ok(mut conn) => {
+            quorum_core::errlog::log_error(&conn, now, "agent_mcp", &detail);
+            if let Err(alert_error) = quorum_core::feed::post_owner_alert_once(
+                &mut conn,
+                "daemon",
+                &detail,
+                "agent_mcp:listener",
+                quorum_core::feed::DEFAULT_MESSAGE_TTL_SECS,
+                now,
+            ) {
+                log(&format!(
+                    "agent MCP: failed to alert the owner: {alert_error}"
+                ));
+            }
+        }
+        Err(open_error) => log(&format!(
+            "agent MCP: failed to record listener failure: {open_error}"
+        )),
+    }
+}
+
+/// Run the daemon with a bound agent MCP listener. The listener serves on
+/// this runtime until the tick loop has returned (its drain lets in-flight
+/// runs finish their MCP calls), then stops through its flag. Signals reach
+/// it only through the tick loop's own shutdown handling.
+fn serve_with_agent_mcp(
+    rt: &tokio::runtime::Runtime,
+    config: &ServeConfig,
+    agent_mcp: crate::agent_mcp::AgentMcpListener,
+    daemon_pid: i64,
+    daemon_instance: &str,
+) -> Result<i32> {
+    rt.block_on(async {
+        // One writable-path resolver for the whole process. Its admission gate
+        // is a single-slot bound — a stalled filesystem call must reject later
+        // resolutions rather than spawn another resolver thread — so the
+        // endpoint and the decomposition coordinator share this instance
+        // instead of each holding their own.
+        let writable_path_resolver = planner::WritablePathResolver::default();
+        let endpoint = agent_endpoint::AgentEndpoint::start(
+            &config.db_path,
+            &config.repo,
+            &config.repo_dir,
+            writable_path_resolver.clone(),
+        )
+        .await?;
+        let agent_mcp_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let agent_mcp_task = {
+            let shutdown = agent_mcp_shutdown.clone();
+            tokio::spawn(agent_mcp.serve(
+                agent_endpoint::locator(&config.db_path),
+                config.repo.clone(),
+                async move {
+                    while !shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                        tokio::time::sleep(AGENT_MCP_SHUTDOWN_POLL).await;
+                    }
+                },
+            ))
+        };
+        // The one GitHub outbox executor for this daemon. It reconciles
+        // claims left by a previous daemon before its first claim; the
+        // daemon_lock acquired above makes it the only executor on this DB.
+        let outbox_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let outbox = start_github_outbox(config, outbox_shutdown.clone());
+        let result = tick_loop(
+            config,
+            daemon_pid,
+            daemon_instance.to_string(),
+            writable_path_resolver,
+        )
+        .await;
+        // Flag only: the listener stops accepting and drains open connections
+        // for a bounded time.
+        agent_mcp_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Err(error) = agent_mcp_task.await {
+            log(&format!("agent MCP: listener task failed: {error}"));
+        }
+        // Flag only: the executor stops claiming and drains in-flight work
+        // within its bounded grace; leftovers reconcile on the next start.
+        outbox_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(outbox) = outbox {
+            match outbox.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => log(&format!("github outbox: stopped with error: {error}")),
+                Err(error) => log(&format!("github outbox: executor task failed: {error}")),
+            }
+        }
+        endpoint.shutdown().await;
+        result
+    })
 }
 
 /// Spawn the daemon's GitHub outbox executor. The target repository comes
@@ -10080,6 +10188,9 @@ async fn tick_decomposition(
             agent: planner_agent,
             repo: config.repo.clone(),
             endpoint: agent_endpoint::locator(&config.db_path),
+            // An absent URL stays empty and `environment()` refuses it before
+            // the provider spawns; there is no stdio fallback.
+            agent_mcp_url: config.agent_mcp_url.clone().unwrap_or_default(),
         };
         match planner::spawn_planner(
             planner_kind,
@@ -13068,6 +13179,13 @@ async fn tick_loop(
     daemon_instance: String,
     writable_path_resolver: planner::WritablePathResolver,
 ) -> Result<i32> {
+    // Every managed launch, planners included, is made from this loop. Without
+    // a bound agent MCP listener none may start, so the loop does not either.
+    if config.agent_mcp_url.is_none() {
+        return Err(QuorumError::Io(
+            "agent MCP listener is not running; refusing to launch managed runs".into(),
+        ));
+    }
     // The daemon owns the doctor and the detached collectors outside the loop
     // body so no return — an explicit exit path or a propagated tick-loop
     // error — can leave their process groups running. The explicit exit paths
@@ -33820,6 +33938,7 @@ mod tests {
             grok: Default::default(),
             pr_target_program: None,
             max_active_graphs: 2,
+            agent_mcp_url: Some("http://127.0.0.1:9/mcp".into()),
         }
     }
 
@@ -34988,6 +35107,26 @@ mod tests {
         );
     }
 
+    /// Every managed launch, planners included, is made from `tick_loop`, so
+    /// without a bound agent MCP listener it refuses to start at all.
+    #[tokio::test]
+    async fn tick_loop_refuses_to_run_without_an_agent_mcp_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = pre_review_checks_config(dir.path().join("quorum.db"), dir.path().into());
+        config.agent_mcp_url = None;
+        let error = tick_loop(
+            &config,
+            1,
+            "instance".into(),
+            planner::WritablePathResolver::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 3, "{error}");
+        assert!(error.to_string().contains("agent MCP listener"), "{error}");
+        assert!(!dir.path().join("quorum.db").exists(), "nothing may run");
+    }
+
     #[test]
     fn managed_run_environment_exposes_only_scoped_coordination_values() {
         let config = pre_review_checks_config(
@@ -34996,7 +35135,13 @@ mod tests {
         );
         let environment = managed_run_environment(&config, "Worker-1", Some("run-capability"));
         let environment: std::collections::BTreeMap<_, _> = environment.into_iter().collect();
-        assert_eq!(environment.len(), 4);
+        assert_eq!(environment.len(), 5);
+        assert_eq!(
+            environment["QUORUM_AGENT_MCP_URL"],
+            config.agent_mcp_url.as_deref().unwrap()
+        );
+        assert!(environment["QUORUM_AGENT_MCP_URL"].starts_with("http://127.0.0.1:"));
+        assert!(environment["QUORUM_AGENT_MCP_URL"].ends_with("/mcp"));
         assert_eq!(environment["QUORUM_REPO"], "owner/repo");
         assert_eq!(environment["QUORUM_AGENT"], "Worker-1");
         assert_eq!(environment["QUORUM_RUN_ID"], "run-capability");
@@ -36879,6 +37024,7 @@ mod tests {
             grok: Default::default(),
             pr_target_program: None,
             max_active_graphs: 2,
+            agent_mcp_url: Some("http://127.0.0.1:9/mcp".into()),
         }
     }
 
@@ -47792,6 +47938,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             grok: Default::default(),
             pr_target_program: None,
             max_active_graphs: 2,
+            agent_mcp_url: Some("http://127.0.0.1:9/mcp".into()),
         }
     }
 
