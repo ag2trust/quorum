@@ -478,6 +478,19 @@ pub struct TaskDetail {
     pub task: Task,
     pub notes: Vec<Note>,
     pub agent_runs: Vec<crate::agent_runs::AgentRun>,
+    /// The planner blocker holding this source's decomposition graph, if any.
+    /// Absent from JSON when no planner blocker holds a graph.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planner_hold: Option<PlannerHold>,
+}
+
+/// Planner blocker hold reason read from `task_decompositions.hold_code` /
+/// `hold_summary` (bounded by `ATTEMPT_SUMMARY_MAX_BYTES` at write time).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct PlannerHold {
+    pub graph_id: i64,
+    pub category: String,
+    pub summary: String,
 }
 
 #[derive(Default)]
@@ -1261,7 +1274,7 @@ pub const NO_REWORK_FINDINGS_MAX_BYTES: usize = 4096;
 const NO_REWORK_MAX_CHECKS: usize = 20;
 const NO_REWORK_CHECK_NAME_MAX_BYTES: usize = 200;
 
-fn truncate_utf8(text: &str, max_bytes: usize) -> String {
+pub(crate) fn truncate_utf8(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
     }
@@ -6509,6 +6522,74 @@ fn process_cancelled_dependency_reconciliation(
     Ok(candidates.len())
 }
 
+/// Return dependents that the dependency cascade parked solely because
+/// `dependency_id` was terminal-not-done to `open`, inside the caller's write
+/// transaction that just made that dependency non-terminal again (an operator
+/// decomposition-planning retry restores its source from `failed` to
+/// `planning`).
+///
+/// A resumed dependent is open but unready until the dependency reaches
+/// `done`, exactly like a dependent of any other retryable hold; if the
+/// dependency fails again the ordinary cascade re-parks it. Only `open`
+/// resumes are restored: a `rework` resume would add started work to the drain
+/// set that the retried source's own planning freeze waits on, so it keeps
+/// waiting for an explicit `task-retry`. Unsatisfiable, classifier-policy, and
+/// differently-caused parks are untouched. This runs only on an operator
+/// retry, so its scan of parked rows is not on any polling path.
+pub(crate) fn resume_dependents_parked_on(
+    tx: &Connection,
+    dependency_id: i64,
+    by: &str,
+    now: i64,
+) -> Result<usize> {
+    let reason = format!("dependency #{dependency_id} is terminal-not-done");
+    let candidates: Vec<i64> = {
+        let mut stmt = tx.prepare(
+            "SELECT t.id FROM tasks t
+             WHERE t.status='failed' AND json_valid(t.refs)
+               AND json_extract(t.refs, '$.daemon_parked')=1
+               AND json_extract(t.refs, '$.daemon_parked_reason')=?2
+               AND json_extract(t.refs, '$.daemon_resume_status')='open'
+               AND COALESCE(json_extract(t.refs, '$.daemon_parked_unsatisfiable'), 0)=0
+               AND COALESCE(json_extract(t.refs, '$.classifier_policy_parked'), 0)<>1
+               AND json_valid(t.depends_on)
+               AND EXISTS (SELECT 1 FROM json_each(t.depends_on) j WHERE j.value=?1)
+               AND NOT EXISTS (
+                   SELECT 1 FROM json_each(t.depends_on) j
+                   LEFT JOIN tasks d ON d.id=j.value
+                   WHERE d.id IS NULL OR d.status='cancelled'
+               )
+             ORDER BY t.id",
+        )?;
+        let rows = stmt.query_map(params![dependency_id, reason], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let body = format!("parked dependent resumed: dependency #{dependency_id} retried by {by}");
+    for task_id in &candidates {
+        tx.execute(
+            "UPDATE tasks
+             SET status='open',assignee=NULL,
+                 refs=json_remove(
+                     refs,
+                     '$.daemon_parked',
+                     '$.daemon_parked_reason',
+                     '$.daemon_parked_unsatisfiable',
+                     '$.daemon_resume_status'
+                 ),
+                 updated_at=?2
+             WHERE id=?1 AND status='failed'",
+            params![task_id, now],
+        )?;
+        tx.execute(
+            "INSERT INTO task_notes(task_id, ts, agent, body)
+             VALUES (?1, ?2, 'daemon', ?3)",
+            params![task_id, now, body],
+        )?;
+        crate::events::emit(tx, "task_unparked", &lease_target(*task_id), &body, now)?;
+    }
+    Ok(candidates.len())
+}
+
 /// Cancelled dep ids in a task's `depends_on`. Cancelled is terminal, so
 /// these are the ones a bare `task-retry` cannot re-satisfy; the operator
 /// must edit `depends_on` or close the dependent. Empty when `depends_on`
@@ -7857,11 +7938,38 @@ pub fn get_with_notes(conn: &Connection, id: i64) -> Result<Option<TaskDetail>> 
     };
     let notes = notes_for(conn, id)?;
     let agent_runs = crate::agent_runs::runs_for_task(conn, id)?;
+    let planner_hold = planner_hold_for(conn, id)?;
     Ok(Some(TaskDetail {
         task,
         notes,
         agent_runs,
+        planner_hold,
     }))
+}
+
+/// The newest held graph for `source_id` whose hold was written by a planner
+/// blocker (a `blocker` attempt at the planned revision names the hold code).
+fn planner_hold_for(conn: &Connection, source_id: i64) -> Result<Option<PlannerHold>> {
+    Ok(conn
+        .query_row(
+            "SELECT d.id,d.hold_code,d.hold_summary FROM task_decompositions d
+             WHERE d.source_task_id=?1 AND d.state='held'
+               AND d.hold_code IS NOT NULL AND d.hold_summary IS NOT NULL
+               AND EXISTS (SELECT 1 FROM decomposition_attempts a
+                           WHERE a.graph_id=d.id AND a.kind='blocker'
+                             AND a.source_revision=d.planned_source_revision
+                             AND a.reason_code=d.hold_code)
+             ORDER BY d.id DESC LIMIT 1",
+            [source_id],
+            |r| {
+                Ok(PlannerHold {
+                    graph_id: r.get(0)?,
+                    category: r.get(1)?,
+                    summary: r.get(2)?,
+                })
+            },
+        )
+        .optional()?)
 }
 
 pub fn add_note(

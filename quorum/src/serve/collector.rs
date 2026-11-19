@@ -23,6 +23,7 @@ use super::role_failover::{settle, RouteFailure};
 use super::runner::{
     AdapterConfig, AgentEvent, AgentKind, LaunchMode, LaunchRequest, RunnerFailure, RunnerProc,
 };
+use crate::github_credentials::{GithubCredentialSource, LocalDefaultCredentialSource};
 use quorum_core::clock;
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::review_findings::{
@@ -41,6 +42,7 @@ use serde_json::value::RawValue;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -933,7 +935,7 @@ impl Visitor<'_> for FetchedEvidenceFieldVisitor {
 
 /// Everything the collector needs to run for one PR. Passed into
 /// [`run_collection_with_inputs`] so tests can bypass `gh api` entirely.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CollectionRequest {
     pub pr_number: i64,
     pub task_id: Option<i64>,
@@ -960,6 +962,36 @@ pub struct CollectionRequest {
     /// Provider failover state for a daemon run. `None` keeps the request on
     /// its one configured route, as the one-shot CLI path does.
     pub routing: Option<CollectorRouting>,
+    /// Token source for every `gh` child this collector spawns. Fetched at
+    /// call time and set only via `GH_TOKEN` on that one child; see
+    /// [`crate::github_credentials`]. The daemon path injects the daemon's
+    /// shared source (`ServeConfig.merge_executor.github_credentials()`); the
+    /// one-shot CLI path keeps the local default (ambient `gh` auth).
+    pub credentials: Arc<dyn GithubCredentialSource>,
+}
+
+impl fmt::Debug for CollectionRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CollectionRequest")
+            .field("pr_number", &self.pr_number)
+            .field("task_id", &self.task_id)
+            .field("repo_slug", &self.repo_slug)
+            .field("db_path", &self.db_path)
+            .field("repo_dir", &self.repo_dir)
+            .field("agent_bin", &self.agent_bin)
+            .field("bare_agent", &self.bare_agent)
+            .field("collector_provider", &self.collector_provider)
+            .field("collector_runner", &self.collector_runner)
+            .field("collector_model", &self.collector_model)
+            .field("collector_effort", &self.collector_effort)
+            .field("role_assignment_id", &self.role_assignment_id)
+            .field("codex_sandbox", &self.codex_sandbox)
+            .field("env_vars", &self.env_vars)
+            .field("tracker", &self.tracker)
+            .field("routing", &self.routing)
+            .field("credentials", &"<GithubCredentialSource>")
+            .finish()
+    }
 }
 
 /// The route a daemon collection is running and the executable override for
@@ -1001,6 +1033,7 @@ impl CollectionRequest {
             env_vars: vec![],
             tracker: None,
             routing: None,
+            credentials: Arc::new(LocalDefaultCredentialSource::new(None)),
         }
     }
 
@@ -1017,6 +1050,14 @@ impl CollectionRequest {
         self.collector_model = model.into();
         self.collector_effort = effort.into();
         self.codex_sandbox = codex_sandbox.into();
+        self
+    }
+
+    /// Point this request at the daemon's shared GitHub credential source
+    /// (`ServeConfig.merge_executor.github_credentials()`) instead of the
+    /// local default set by [`CollectionRequest::new`].
+    pub fn with_credentials(mut self, credentials: Arc<dyn GithubCredentialSource>) -> Self {
+        self.credentials = credentials;
         self
     }
 
@@ -1411,12 +1452,14 @@ pub async fn fetch_inputs(request: &CollectionRequest) -> Result<CollectorInputs
     let pr = request.pr_number;
     let repo = request.repo_slug.clone();
     let repo_dir = request.repo_dir.clone();
+    let credentials = &request.credentials;
 
     let pr_metadata_json = gh_api(
         &repo,
         &repo_dir,
         &format!("repos/{{owner}}/{{repo}}/pulls/{pr}"),
         false,
+        credentials,
     )
     .await?;
     let reviews_json = gh_api(
@@ -1424,6 +1467,7 @@ pub async fn fetch_inputs(request: &CollectionRequest) -> Result<CollectorInputs
         &repo_dir,
         &format!("repos/{{owner}}/{{repo}}/pulls/{pr}/reviews"),
         true,
+        credentials,
     )
     .await?;
     let review_comments_json = gh_api(
@@ -1431,6 +1475,7 @@ pub async fn fetch_inputs(request: &CollectionRequest) -> Result<CollectorInputs
         &repo_dir,
         &format!("repos/{{owner}}/{{repo}}/pulls/{pr}/comments"),
         true,
+        credentials,
     )
     .await?;
     let issue_comments_json = gh_api(
@@ -1438,6 +1483,7 @@ pub async fn fetch_inputs(request: &CollectionRequest) -> Result<CollectorInputs
         &repo_dir,
         &format!("repos/{{owner}}/{{repo}}/issues/{pr}/comments"),
         true,
+        credentials,
     )
     .await?;
     let commits_json = gh_api(
@@ -1445,10 +1491,11 @@ pub async fn fetch_inputs(request: &CollectionRequest) -> Result<CollectorInputs
         &repo_dir,
         &format!("repos/{{owner}}/{{repo}}/pulls/{pr}/commits"),
         true,
+        credentials,
     )
     .await?;
-    let diff_stat = gh_diff_stat(&repo, &repo_dir, pr).await?;
-    let checks_summary = gh_checks_summary(&repo, &repo_dir, pr).await?;
+    let diff_stat = gh_diff_stat(&repo, &repo_dir, pr, credentials).await?;
+    let checks_summary = gh_checks_summary(&repo, &repo_dir, pr, credentials).await?;
     let mut fetched_evidence =
         fetched_evidence_from_json(&reviews_json, &review_comments_json, &issue_comments_json)?
             .into_iter()
@@ -1577,12 +1624,18 @@ async fn gh_api(
     cwd: &Path,
     endpoint: &str,
     paginate: bool,
+    credentials: &Arc<dyn GithubCredentialSource>,
 ) -> Result<String> {
     let args = build_gh_api_args(endpoint, paginate);
-    run_gh(&args, cwd, &gh_env(repo)).await
+    run_gh(&args, cwd, &gh_env(repo), credentials).await
 }
 
-async fn gh_diff_stat(repo: &Option<String>, cwd: &Path, pr: i64) -> Result<String> {
+async fn gh_diff_stat(
+    repo: &Option<String>,
+    cwd: &Path,
+    pr: i64,
+    credentials: &Arc<dyn GithubCredentialSource>,
+) -> Result<String> {
     // `gh pr view` accepts `-R` and it is the canonical way to override repo for
     // the higher-level `gh pr *` surface. Keep it explicit here (belt + braces:
     // GH_REPO is also set) so a shim that greps the argv sees the target repo.
@@ -1597,16 +1650,21 @@ async fn gh_diff_stat(repo: &Option<String>, cwd: &Path, pr: i64) -> Result<Stri
         args.push("-R".into());
         args.push(r.clone());
     }
-    run_gh(&args, cwd, &gh_env(repo)).await
+    run_gh(&args, cwd, &gh_env(repo), credentials).await
 }
 
-async fn gh_checks_summary(repo: &Option<String>, cwd: &Path, pr: i64) -> Result<String> {
+async fn gh_checks_summary(
+    repo: &Option<String>,
+    cwd: &Path,
+    pr: i64,
+    credentials: &Arc<dyn GithubCredentialSource>,
+) -> Result<String> {
     let mut args: Vec<String> = vec!["pr".into(), "checks".into(), pr.to_string()];
     if let Some(r) = repo {
         args.push("-R".into());
         args.push(r.clone());
     }
-    match run_gh_raw(&args, cwd, &gh_env(repo)).await {
+    match run_gh_raw(&args, cwd, &gh_env(repo), credentials).await {
         Ok(stdout) => Ok(stdout),
         Err(GhError::NoChecks) => Ok("no checks reported".to_string()),
         Err(GhError::Failed(e)) => Err(e),
@@ -1622,8 +1680,13 @@ enum GhError {
     Failed(QuorumError),
 }
 
-async fn run_gh(args: &[String], cwd: &Path, env: &[(String, String)]) -> Result<String> {
-    match run_gh_raw(args, cwd, env).await {
+async fn run_gh(
+    args: &[String],
+    cwd: &Path,
+    env: &[(String, String)],
+    credentials: &Arc<dyn GithubCredentialSource>,
+) -> Result<String> {
+    match run_gh_raw(args, cwd, env, credentials).await {
         Ok(s) => Ok(s),
         Err(GhError::NoChecks) => Err(QuorumError::Io(
             "gh: no checks reported (unexpected in run_gh)".into(),
@@ -1632,20 +1695,32 @@ async fn run_gh(args: &[String], cwd: &Path, env: &[(String, String)]) -> Result
     }
 }
 
+/// Asks `credentials` for a token before touching the process table, so a
+/// failing source never spawns `gh`. The token reaches the child only via
+/// `GH_TOKEN`, set alongside the caller's `gh_env` vars — never in argv, and
+/// never rendered into the failure message below.
 async fn run_gh_raw(
     args: &[String],
     cwd: &Path,
     env: &[(String, String)],
+    credentials: &Arc<dyn GithubCredentialSource>,
 ) -> std::result::Result<String, GhError> {
     let cwd = cwd.to_path_buf();
     let args = args.to_vec();
     let env = env.to_vec();
+    let credentials = Arc::clone(credentials);
     let handle = tokio::task::spawn_blocking(move || -> std::result::Result<String, GhError> {
+        let token = credentials.token().map_err(|e| {
+            GhError::Failed(QuorumError::Io(format!(
+                "GitHub credential unavailable (gh not run): {e}"
+            )))
+        })?;
         let mut cmd = std::process::Command::new("gh");
         cmd.args(&args).current_dir(&cwd);
         for (k, v) in &env {
             cmd.env(k, v);
         }
+        token.apply_to_command(&mut cmd);
         let out = cmd
             .output()
             .map_err(|e| GhError::Failed(QuorumError::Io(format!("gh: {e}"))))?;
@@ -3574,6 +3649,7 @@ mod tests {
             env_vars,
             tracker: None,
             routing: None,
+            credentials: Arc::new(LocalDefaultCredentialSource::new(None)),
         }
     }
 
@@ -4249,6 +4325,109 @@ mod tests {
         assert!(gh_env(&Some(String::new())).is_empty());
     }
 
+    /// Fake `gh` executable that writes its `GH_TOKEN` env var to `log_path`
+    /// and prints an empty JSON object so `gh_api` succeeds.
+    fn write_token_logging_gh_shim(dir: &std::path::Path, log_path: &std::path::Path) -> PathBuf {
+        let gh_path = dir.join("gh");
+        std::fs::write(
+            &gh_path,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$GH_TOKEN\" > {log:?}\necho '{{}}'\n",
+                log = log_path
+            ),
+        )
+        .unwrap();
+        let out = std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&gh_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "chmod +x failed");
+        gh_path
+    }
+
+    #[tokio::test]
+    async fn run_gh_passes_gh_token_from_credential_source_to_the_child() {
+        const SECRET: &str = "ghs_collector-secret-t433";
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("gh-token.log");
+        write_token_logging_gh_shim(dir.path(), &log_path);
+
+        // Override only PATH on this one child — the shim needs no other
+        // binaries, so the rest of the inherited environment is irrelevant.
+        let env = vec![(
+            "PATH".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+        )];
+        let credentials: Arc<dyn GithubCredentialSource> = Arc::new(
+            crate::github_credentials::FakeCredentialSource::token(SECRET),
+        );
+
+        let result = run_gh(
+            &["api".to_string(), "repos/x/y".to_string()],
+            Path::new("/tmp"),
+            &env,
+            &credentials,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(logged, SECRET, "GH_TOKEN must carry the source's token");
+    }
+
+    #[tokio::test]
+    async fn run_gh_fails_closed_without_spawning_gh_when_the_source_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("gh-was-invoked");
+        let gh_path = dir.path().join("gh");
+        std::fs::write(
+            &gh_path,
+            format!("#!/bin/sh\ntouch {marker:?}\necho '{{}}'\n"),
+        )
+        .unwrap();
+        let out = std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&gh_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "chmod +x failed");
+
+        let env = vec![(
+            "PATH".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+        )];
+        let credentials: Arc<dyn GithubCredentialSource> =
+            Arc::new(crate::github_credentials::FakeCredentialSource::failing(
+                crate::github_credentials::GithubCredentialError::LookupFailed {
+                    reason: "no oauth token found".into(),
+                },
+            ));
+
+        let err = run_gh(
+            &["api".to_string(), "repos/x/y".to_string()],
+            Path::new("/tmp"),
+            &env,
+            &credentials,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            !marker.exists(),
+            "a failing credential source must never spawn gh"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("GitHub credential unavailable"),
+            "{message}"
+        );
+        assert!(
+            message.contains("no oauth token found"),
+            "the credential error's reason should propagate: {message}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fetch_failure_preserves_prior_good_findings() {
         // A subsequent collector run that fails at fetch (loud error) must NOT
@@ -4294,6 +4473,7 @@ mod tests {
             env_vars: vec![],
             tracker: None,
             routing: None,
+            credentials: Arc::new(LocalDefaultCredentialSource::new(None)),
         };
         let result = run_collection(&retry).await;
 

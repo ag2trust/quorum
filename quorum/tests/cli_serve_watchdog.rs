@@ -66,6 +66,7 @@ fn create_gh_shim() -> (tempfile::TempDir, std::path::PathBuf, String) {
         r#"#!/bin/sh
 set -eu
 cmd="${1:-} ${2:-}"
+if [ "$cmd" = "auth token" ]; then printf 'shim-token\n'; exit 0; fi
 if [ "$cmd" = "pr create" ]; then
   shift 2; head=""; base=""
   while [ "$#" -gt 0 ]; do
@@ -146,6 +147,7 @@ impl ServeHandle {
             r#"#!/bin/sh
 set -eu
 cmd="${1:-} ${2:-}"
+if [ "$cmd" = "auth token" ]; then printf 'shim-token\n'; exit 0; fi
 if [ "$cmd" = "pr create" ]; then
   shift 2
   head=""
