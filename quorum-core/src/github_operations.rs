@@ -311,6 +311,7 @@ const AMBIGUOUS_SEND_SQL: &str =
     "CASE WHEN kind='pull_request_read' THEN send_state ELSE 'ambiguous' END";
 
 const ERR_DEADLINE: &str = "deadline_exceeded";
+const ERR_ATTEMPT_REVOKED: &str = "attempt_revoked";
 const ERR_ATTEMPTS: &str = "attempts_exhausted";
 const ERR_INTERRUPTED: &str = "interrupted";
 const ERR_INTERRUPTED_AMBIGUOUS: &str = "interrupted_ambiguous";
@@ -424,6 +425,13 @@ pub fn claim_next(conn: &mut Connection, now: i64) -> Result<Option<ClaimedOpera
         params![now, ERR_ATTEMPTS, MAX_OPERATION_CLAIMS],
     )
     .map_err(map_sql_err)?;
+    // A revoked run's attempt is terminal: terminalize it and cancel its
+    // provably unsent rows before picking, so its queued work is never sent.
+    crate::collaboration_admission::revoke_dead_run_attempts(
+        &tx,
+        now,
+        crate::collaboration_admission::UNBOUNDED_GROUP_SWEEP,
+    )?;
     let candidate: Option<i64> = tx
         .query_row(
             "SELECT o.id FROM github_agent_operations o
@@ -432,6 +440,10 @@ pub fn claim_next(conn: &mut Connection, now: i64) -> Result<Option<ClaimedOpera
                AND (o.next_attempt_at IS NULL OR o.next_attempt_at<=?1)
                AND o.deadline_at>?1 AND o.attempts<?2
                AND a.state='active'
+               AND EXISTS (
+                   SELECT 1 FROM run_capabilities c
+                   WHERE c.run_id=a.active_run_id AND c.revoked_at IS NULL
+               )
              ORDER BY COALESCE(o.next_attempt_at, o.created_at), o.id
              LIMIT 1",
             params![now, MAX_OPERATION_CLAIMS],
@@ -487,6 +499,26 @@ pub fn mark_execution_started(
     now: i64,
 ) -> Result<bool> {
     let tx = begin_immediate(conn)?;
+    // The run may have been revoked between claim and send. A row that has
+    // provably not been sent is cancelled instead of started; the caller's
+    // later settle of this claim is then a guarded no-op.
+    tx.execute(
+        "UPDATE github_agent_operations
+         SET state='cancelled', active=0, next_attempt_at=NULL, error_kind=?3,
+             error_summary='collaboration attempt revoked before the send started',
+             updated_at=?4
+         WHERE id=?1 AND attempts=?2 AND active=1 AND state='running'
+           AND execution_started_at IS NULL
+           AND send_state IN ('not_started','definitely_unsent')
+           AND NOT EXISTS (
+               SELECT 1 FROM github_collaboration_attempts a
+               JOIN run_capabilities c ON c.run_id=a.active_run_id
+               WHERE a.attempt_id=github_agent_operations.attempt_id
+                 AND a.state='active' AND c.revoked_at IS NULL
+           )",
+        params![claim.id, claim.attempt, ERR_ATTEMPT_REVOKED, now],
+    )
+    .map_err(map_sql_err)?;
     let changed = tx
         .execute(
             "UPDATE github_agent_operations
@@ -966,6 +998,58 @@ mod tests {
         assert_eq!(row.error_kind.as_deref(), Some(ERR_DEADLINE));
         assert_eq!(row.attempts, 0);
         assert!(!row.active);
+    }
+
+    #[test]
+    fn revoked_run_queued_write_is_cancelled_never_claimed_or_started() {
+        // Revoked before claim: the attempt terminalizes and the queued
+        // comment is cancelled, never handed to the executor.
+        let (mut conn, _dir) = test_conn();
+        enqueue_op(&mut conn, "op-w", WRITE);
+        crate::capabilities::revoke(&mut conn, "run-1", 105).unwrap();
+        assert!(claim_next(&mut conn, 110).unwrap().is_none());
+        let row = get(&conn, "op-w");
+        assert_eq!(
+            (row.state.as_str(), row.send_state.as_str(), row.attempts),
+            ("cancelled", "not_started", 0)
+        );
+        assert_eq!(row.error_kind.as_deref(), Some(ERR_ATTEMPT_REVOKED));
+        let attempt: (String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT state,active_run_id,expires_at FROM github_collaboration_attempts
+                 WHERE attempt_id='att-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(attempt, ("revoked".to_string(), None, 110));
+
+        // Revoked between claim and send start: the claimed row is cancelled
+        // instead of started, and the executor's later settle is a no-op.
+        let (mut conn, _dir) = test_conn();
+        enqueue_op(&mut conn, "op-w", WRITE);
+        let won = claim(&mut conn, 110);
+        crate::capabilities::revoke(&mut conn, "run-1", 111).unwrap();
+        assert!(!mark_execution_started(&mut conn, &won.claim, 112).unwrap());
+        let row = get(&conn, "op-w");
+        assert_eq!(
+            (row.state.as_str(), row.send_state.as_str(), row.active),
+            ("cancelled", "not_started", false)
+        );
+        assert_eq!(row.execution_started_at, None);
+        let s = summary("late");
+        assert!(!settle(
+            &mut conn,
+            &won.claim,
+            Settlement::Ambiguous {
+                error_kind: "not_resent",
+                error_summary: &s
+            },
+            113
+        )
+        .unwrap());
+        assert_eq!(get(&conn, "op-w"), row);
+        assert_eq!(errors_rows(&conn), 0);
     }
 
     #[test]

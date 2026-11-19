@@ -344,6 +344,31 @@ GitHub models a general PR comment through the issue-comment endpoint. The suppl
 must equal the bound PR. `body` is authored GitHub-flavored Markdown. This tool cannot target a
 standalone issue in the first increment.
 
+Implemented bounds (delivery slice 3). Both tools are admitted by the endpoint into the outbox
+and executed by the daemon executor; the adapter waits at most 8 seconds (below its HTTP request
+bound) and otherwise returns the pending `attemptId`/`operationId` for `github_operation_read`.
+A mismatched `owner`/`repo`/PR number is `forbidden_operation`. Reads page with `page` and
+`perPage` (1–100, default 30); each result's serialized JSON fits 48 KiB, text fields are
+clipped per field, items that do not fit are counted in `items_omitted`, `get_diff` returns
+newline-aligned pages of at most 40 KiB of escaped diff text, and `truncated` marks any clipping.
+Review comments report `outdated` from the missing current-diff line; thread node ID and resolved
+state need GraphQL and arrive with the thread slice. A comment body is at most 32 KiB, non-blank,
+NUL-free, and must close every code fence; it is posted from a JSON stdin document followed by a
+blank line and the hidden marker. Without `clientRequestId`, a comment's client request ID is a
+digest of its canonical request, so an identical retry returns the original operation; each read
+is its own operation. Failures surface as typed tool errors: `github_rate_limited`,
+`github_unavailable`, `github_rejected`, `github_invalid_response`, `github_outcome_unknown`
+(a possibly-sent write, never re-sent), and `github_operation_cancelled`.
+
+Until provisioning-bound attempt issuance lands, the endpoint resolves the run's attempt on its
+first collaboration call (`ensure_run_attempt`): an attempt bound to the run is reused only for
+the same lifecycle generation and launch SHA; otherwise a new attempt is issued under the
+ordinary issuance checks. An active attempt whose run capability is revoked (by any path) or
+missing is terminal: generic sweep, attempt issuance, operation admission, and executor claim
+each revoke it, end its retention, and cancel its queued provably unsent rows; the executor
+neither claims nor starts a send for it. A claimed or possibly-sent row keeps its disposition and
+pins the group until settled, after which the group is reclaimed.
+
 ### `pull_request_review_write`
 
 Only `method=create` and `method=submit_pending` are accepted.
