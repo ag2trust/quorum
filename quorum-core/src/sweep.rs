@@ -856,9 +856,17 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     delete_bounded(conn, "agent_sessions", now, limit)?;
     delete_bounded(conn, "activity_events", now, limit)?;
     delete_token_usage_bounded(conn, now, limit)?;
-    // Collaboration operation groups are reclaimed only by the executor's
-    // atomic terminal-and-settled group proof. Generic sweep has no authority
-    // to discard their recovery identities independently.
+    // Generic sweep reclaims GitHub collaboration state only as whole
+    // executor-proven terminal attempt groups (attempt plus every operation),
+    // through `sweep_expired_terminal_groups` and its unchanged eligibility
+    // predicate. It never deletes an operation independently: `operation_id`
+    // is the outbox idempotency key, so early deletion could repost a side
+    // effect. Runs before task reclamation so a freed task is GC-able now.
+    crate::collaboration_admission::sweep_expired_terminal_groups(
+        conn,
+        now,
+        i64::try_from(limit).unwrap_or(i64::MAX),
+    )?;
     crate::task_messages::expire_stale_deliveries(conn, now, limit)?;
     delete_bounded(conn, "task_messages", now, limit)?;
     delete_agent_runs_bounded(conn, now, limit)?;
@@ -903,8 +911,15 @@ pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
         params![now],
     )?;
     delete_all_expired_token_usage(&tx, now)?;
-    // See sweep_on_write: executor-owned group reclamation is deliberately
-    // deferred until it can prove terminal and settled parent state atomically.
+    // See sweep_on_write: only whole executor-proven terminal groups. Each
+    // batch is bounded; explicit sweep drains every ready group, like the
+    // dependency-reconciliation loop above.
+    while crate::collaboration_admission::sweep_expired_terminal_groups(
+        &tx,
+        now,
+        SWEEP_LIMIT as i64,
+    )? > 0
+    {}
     crate::task_messages::expire_stale_deliveries(&tx, now, usize::MAX)?;
     tx.execute(
         "DELETE FROM task_messages WHERE expires_at <= ?1",

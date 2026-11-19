@@ -1344,7 +1344,17 @@ fn load_operation_by_dedup_key(
 /// attempt: this preserves the "sweeper never deletes an operation
 /// independently" contract. The transaction guards ensure a live parent, an
 /// unresolved child, or a pending publication slot pins the group.
-fn sweep_expired_terminal_groups(tx: &Transaction<'_>, now: i64) -> Result<()> {
+///
+/// At most `limit` groups are reclaimed per call; every reclaimed group is
+/// deleted whole (all of its operations, then the attempt). Callers must hold
+/// the write transaction: `admit_operation` passes [`UNBOUNDED_GROUP_SWEEP`]
+/// so its capacity accounting never counts a reclaimable group, while generic
+/// sweep passes its per-call bound. Returns the number of groups reclaimed.
+pub(crate) fn sweep_expired_terminal_groups(
+    tx: &Connection,
+    now: i64,
+    limit: i64,
+) -> Result<usize> {
     let attempt_ids: Vec<String> = {
         let mut statement = tx.prepare(
             "SELECT a.attempt_id FROM github_collaboration_attempts a
@@ -1362,13 +1372,15 @@ fn sweep_expired_terminal_groups(tx: &Transaction<'_>, now: i64) -> Result<()> {
                          o.state NOT IN ('succeeded','failed','cancelled')
                          OR o.send_state = 'ambiguous'
                      )
-               )",
+               )
+             LIMIT ?2",
         )?;
         let rows = statement
-            .query_map([now], |row| row.get::<_, String>(0))?
+            .query_map(params![now, limit], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows
     };
+    let reclaimed = attempt_ids.len();
     for attempt_id in attempt_ids {
         tx.execute(
             "DELETE FROM github_agent_operations WHERE attempt_id=?1",
@@ -1379,8 +1391,12 @@ fn sweep_expired_terminal_groups(tx: &Transaction<'_>, now: i64) -> Result<()> {
             [&attempt_id],
         )?;
     }
-    Ok(())
+    Ok(reclaimed)
 }
+
+/// Group bound for `admit_operation`: SQLite treats a negative `LIMIT` as no
+/// limit, preserving admission's sweep-everything-before-counting behavior.
+pub(crate) const UNBOUNDED_GROUP_SWEEP: i64 = -1;
 
 fn operation_capacity_rejection(
     tx: &Transaction<'_>,
@@ -1585,7 +1601,7 @@ pub fn admit_operation(
 
     let tx = begin_immediate(conn)?;
 
-    sweep_expired_terminal_groups(&tx, now)?;
+    sweep_expired_terminal_groups(&tx, now, UNBOUNDED_GROUP_SWEEP)?;
 
     let context = match capabilities::resolve_live_run_context_for_admission(
         &tx,
@@ -3739,5 +3755,275 @@ mod tests {
                 "round {round} task lifecycle must not move"
             );
         }
+    }
+
+    // ---- Generic sweep reclamation of whole terminal attempt groups ----
+
+    /// Insert one attempt group: the attempt row plus one operation per
+    /// `(state, send_state)` pair, all created by a fresh capability.
+    fn insert_sweep_group(
+        conn: &mut Connection,
+        attempt_id: &str,
+        attempt_state: &str,
+        expires_at: i64,
+        pin_active_run: bool,
+        operations: &[(&str, &str)],
+    ) {
+        let run_id = format!("sweep-run-{attempt_id}");
+        crate::capabilities::issue(conn, &run_id, 1, "Worker", "worker", 1).unwrap();
+        insert_attempt_row(
+            conn,
+            attempt_id,
+            1,
+            "Worker",
+            "worker",
+            WORKER_PR,
+            None,
+            pin_active_run.then_some(run_id.as_str()),
+            attempt_state,
+            expires_at,
+        );
+        for (ordinal, (state, send_state)) in operations.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO github_agent_operations(
+                     operation_id, client_request_id, attempt_id, created_by_run_id,
+                     task_id, agent, role, pr_number, kind, request_json,
+                     state, send_state, attempts, deadline_at,
+                     created_at, updated_at, expires_at
+                 ) VALUES (?1,?2,?3,?4,1,'Worker','worker',?5,'pull_request_read','{}',
+                           ?6,?7,1,?8,1,1,?8)",
+                params![
+                    format!("op-{attempt_id}-{ordinal}"),
+                    format!("req-{attempt_id}-{ordinal}"),
+                    attempt_id,
+                    run_id,
+                    WORKER_PR,
+                    state,
+                    send_state,
+                    expires_at,
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    /// `(attempt rows, operation rows)` retained for one attempt group.
+    fn group_rows(conn: &Connection, attempt_id: &str) -> (i64, i64) {
+        let attempts = conn
+            .query_row(
+                "SELECT COUNT(*) FROM github_collaboration_attempts WHERE attempt_id=?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let operations = conn
+            .query_row(
+                "SELECT COUNT(*) FROM github_agent_operations WHERE attempt_id=?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (attempts, operations)
+    }
+
+    fn assert_generic_sweep_reclaims_only_ready_groups(sweep: fn(&Connection, i64)) {
+        const SETTLED: &[(&str, &str)] = &[
+            ("succeeded", "confirmed"),
+            ("failed", "definitely_unsent"),
+            ("cancelled", "not_started"),
+        ];
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "Worker", WORKER_PR);
+        let past = OP_NOW - 1;
+        // Reclamation-ready groups, including the exact expiry boundary.
+        insert_sweep_group(
+            &mut conn,
+            "ready-completed",
+            "completed",
+            past,
+            false,
+            SETTLED,
+        );
+        insert_sweep_group(&mut conn, "ready-revoked", "revoked", past, false, SETTLED);
+        insert_sweep_group(
+            &mut conn,
+            "ready-boundary",
+            "completed",
+            OP_NOW,
+            false,
+            SETTLED,
+        );
+        insert_sweep_group(&mut conn, "ready-empty", "revoked", past, false, &[]);
+        // Negative cases: each pins its whole group.
+        insert_sweep_group(&mut conn, "keep-active", "active", past, false, SETTLED);
+        insert_sweep_group(
+            &mut conn,
+            "keep-awaiting",
+            "awaiting_resume",
+            past,
+            false,
+            SETTLED,
+        );
+        insert_sweep_group(&mut conn, "keep-run", "completed", past, true, SETTLED);
+        insert_sweep_group(&mut conn, "keep-slot", "completed", past, false, SETTLED);
+        conn.execute(
+            "INSERT INTO github_review_publication_slots(
+                 publisher_scope,pr_number,task_id,attempt_id,state,created_at,updated_at)
+             VALUES ('scope-sweep',?1,1,'keep-slot','owned',1,1)",
+            [WORKER_PR],
+        )
+        .unwrap();
+        let mut queued = SETTLED.to_vec();
+        queued.push(("queued", "not_started"));
+        insert_sweep_group(&mut conn, "keep-queued", "completed", past, false, &queued);
+        let mut running = SETTLED.to_vec();
+        running.push(("running", "not_started"));
+        insert_sweep_group(&mut conn, "keep-running", "revoked", past, false, &running);
+        let mut ambiguous = SETTLED.to_vec();
+        ambiguous.push(("failed", "ambiguous"));
+        insert_sweep_group(
+            &mut conn,
+            "keep-ambiguous",
+            "completed",
+            past,
+            false,
+            &ambiguous,
+        );
+        insert_sweep_group(
+            &mut conn,
+            "keep-future",
+            "completed",
+            OP_NOW + 1,
+            false,
+            SETTLED,
+        );
+
+        sweep(&conn, OP_NOW);
+
+        for ready in [
+            "ready-completed",
+            "ready-revoked",
+            "ready-boundary",
+            "ready-empty",
+        ] {
+            assert_eq!(
+                group_rows(&conn, ready),
+                (0, 0),
+                "{ready} must be reclaimed whole"
+            );
+        }
+        for (kept, operations) in [
+            ("keep-active", 3),
+            ("keep-awaiting", 3),
+            ("keep-run", 3),
+            ("keep-slot", 3),
+            ("keep-queued", 4),
+            ("keep-running", 4),
+            ("keep-ambiguous", 4),
+            ("keep-future", 3),
+        ] {
+            assert_eq!(
+                group_rows(&conn, kept),
+                (1, operations),
+                "{kept} must keep its whole group"
+            );
+        }
+        let slots: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM github_review_publication_slots WHERE attempt_id='keep-slot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(slots, 1);
+        assert_eq!(count_errors(&conn), 0);
+    }
+
+    #[test]
+    fn sweep_all_reclaims_ready_groups_without_admission_and_keeps_pinned_groups() {
+        assert_generic_sweep_reclaims_only_ready_groups(|conn, now| {
+            crate::sweep::sweep_all(conn, now).unwrap();
+        });
+    }
+
+    #[test]
+    fn sweep_on_write_reclaims_ready_groups_without_admission_and_keeps_pinned_groups() {
+        assert_generic_sweep_reclaims_only_ready_groups(|conn, now| {
+            let tx =
+                Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate).unwrap();
+            crate::sweep::sweep_on_write(&tx, now, crate::sweep::SWEEP_LIMIT).unwrap();
+            tx.commit().unwrap();
+        });
+    }
+
+    fn insert_ready_groups(conn: &mut Connection, count: usize) {
+        for ordinal in 0..count {
+            insert_sweep_group(
+                conn,
+                &format!("bounded-{ordinal}"),
+                "completed",
+                OP_NOW - 1,
+                false,
+                &[("succeeded", "confirmed"), ("failed", "definitely_unsent")],
+            );
+        }
+    }
+
+    fn retained_attempts_and_operations(conn: &Connection) -> (i64, i64) {
+        let attempts = conn
+            .query_row(
+                "SELECT COUNT(*) FROM github_collaboration_attempts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (attempts, count_operations(conn))
+    }
+
+    #[test]
+    fn sweep_on_write_honors_group_bound_and_next_call_drains_remainder() {
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "Worker", WORKER_PR);
+        insert_ready_groups(&mut conn, 3);
+
+        crate::sweep::sweep_on_write(&conn, OP_NOW, 2).unwrap();
+        // Exactly two whole groups go; the survivor keeps all of its rows.
+        assert_eq!(retained_attempts_and_operations(&conn), (1, 2));
+        let survivor: String = conn
+            .query_row(
+                "SELECT attempt_id FROM github_collaboration_attempts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(group_rows(&conn, &survivor), (1, 2));
+
+        crate::sweep::sweep_on_write(&conn, OP_NOW, 2).unwrap();
+        assert_eq!(retained_attempts_and_operations(&conn), (0, 0));
+    }
+
+    #[test]
+    fn bounded_group_sweep_returns_reclaimed_group_count() {
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "Worker", WORKER_PR);
+        insert_ready_groups(&mut conn, 3);
+        assert_eq!(sweep_expired_terminal_groups(&conn, OP_NOW, 2).unwrap(), 2);
+        assert_eq!(sweep_expired_terminal_groups(&conn, OP_NOW, 2).unwrap(), 1);
+        assert_eq!(sweep_expired_terminal_groups(&conn, OP_NOW, 2).unwrap(), 0);
+        assert_eq!(retained_attempts_and_operations(&conn), (0, 0));
+    }
+
+    #[test]
+    fn sweep_all_drains_more_ready_groups_than_one_batch() {
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "Worker", WORKER_PR);
+        let count = crate::sweep::SWEEP_LIMIT + 1;
+        insert_ready_groups(&mut conn, count);
+        assert_eq!(
+            retained_attempts_and_operations(&conn),
+            (count as i64, 2 * count as i64)
+        );
+        crate::sweep::sweep_all(&conn, OP_NOW).unwrap();
+        assert_eq!(retained_attempts_and_operations(&conn), (0, 0));
     }
 }
