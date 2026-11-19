@@ -431,7 +431,10 @@ This is a non-binding view of ongoing directions, not a release schedule:
   adapter itself as a Streamable HTTP server on its own loopback listener and exports
   `QUORUM_AGENT_MCP_URL` (`http://<bound addr>/mcp`) alongside the run's `QUORUM_RUN_ID` bearer
   to every managed run; this is the env-var contract any `agent_bin` must honor, and there is no
-  stdio fallback. Running `quorum agent-mcp` directly (optionally with `--listen <SOCKETADDR>`,
+  stdio fallback for that generic contract. Codex and Grok's own provider-native MCP
+  configuration formats are unaffected by this decision: they still declare `quorum agent-mcp`
+  as their own stdio child on every launch (see the GitHub collaboration MCP technical spec).
+  Running `quorum agent-mcp` directly (optionally with `--listen <SOCKETADDR>`,
   loopback addresses only, for the same Streamable HTTP form) remains for manual, attended
   operator use and is not what `quorum serve` spawns for that contract; agent prompts still
   instruct the shell commands. It is separate from the
