@@ -728,7 +728,8 @@ pub enum Command {
         #[arg(long = "reason-file")]
         reason_file: Option<PathBuf>,
     },
-    /// Explicitly retry a daemon park, provider block, or eligible exhausted decomposition plan.
+    /// Explicitly retry a daemon park, provider block, or eligible exhausted decomposition plan
+    /// or external_constraint planner hold.
     TaskRetry {
         #[arg(long = "task-id")]
         task_id: i64,

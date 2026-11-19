@@ -1207,6 +1207,110 @@ fn exhausted_decomposition_retry_cap_has_actionable_json() {
         .stdout(predicates::str::contains("\"retry_cap\":2"));
 }
 
+#[test]
+fn task_retry_accepts_only_the_external_constraint_planner_blocker() {
+    for (category, accepted) in [
+        ("external_constraint", true),
+        ("ambiguous_scope", false),
+        ("missing_decision", false),
+        ("no_safe_split", false),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        quorum(home.path())
+            .args([
+                "task-create",
+                "--created-by",
+                "boss",
+                "--title",
+                "blocked plan",
+            ])
+            .assert()
+            .success();
+        let db = home.path().join("repos/test__repo/quorum.db");
+        let conn = quorum_core::db::open(&db).unwrap();
+        conn.execute("UPDATE tasks SET status='failed' WHERE id=1", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,planned_source_revision,frozen_base_sha,
+                 planner_session_id,hold_code,hold_summary,created_at,updated_at)
+             VALUES (1,'held',1,'0123456789abcdef0123456789abcdef01234567',
+                     'planner-session',?1,'blocked',1,1)",
+            [category],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO decomposition_attempts(
+                 graph_id,source_revision,kind,ordinal,reason_code,summary,created_at)
+             VALUES (1,1,'blocker',1,?1,'blocked',1)",
+            [category],
+        )
+        .unwrap();
+        drop(conn);
+
+        let assert = quorum(home.path())
+            .args(["task-retry", "--task-id", "1", "--by", "operator"])
+            .assert();
+        if accepted {
+            assert.success().stdout(predicates::str::contains(
+                "\"outcome\":\"decomposition-planning-retried\"",
+            ));
+        } else {
+            assert
+                .code(1)
+                .stdout(predicates::str::contains(
+                    "\"outcome\":\"task-retry-rejected\"",
+                ))
+                .stdout(predicates::str::contains("external_constraint-held"));
+        }
+        let conn = quorum_core::db::open(&db).unwrap();
+        let state: (String, String, Option<String>, Option<String>, i64, i64) = conn
+            .query_row(
+                "SELECT d.state,t.status,d.frozen_base_sha,d.hold_code,d.operator_retry_count,
+                        (SELECT count(*) FROM errors)
+                 FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        if accepted {
+            assert_eq!(
+                state,
+                (
+                    "provider-backoff".into(),
+                    "planning".into(),
+                    None,
+                    None,
+                    1,
+                    0
+                )
+            );
+        } else {
+            assert_eq!(
+                state,
+                (
+                    "held".into(),
+                    "failed".into(),
+                    Some("0123456789abcdef0123456789abcdef01234567".into()),
+                    Some(category.into()),
+                    0,
+                    0
+                ),
+                "{category}"
+            );
+        }
+    }
+}
+
 /// Task #473: `task-retry` on a dependent whose depends_on contains a
 /// cancelled task must exit 1 naming the cancelled dep and NOT restore the
 /// dependent (the sweep would just re-park it and give the operator no
@@ -1898,7 +2002,9 @@ fn write_gh_pr_state_shim(dir: &std::path::Path, response: &str) {
     std::fs::write(
         &shim,
         format!(
-            "#!/bin/sh\nif [ -n \"$QUORUM_GH_ARGS_FILE\" ]; then\n  printf '%s\\n' \"$*\" > \"$QUORUM_GH_ARGS_FILE\"\nfi\ncase \"$*\" in\n  *\"pr view\"*) echo '{response}' ;;\n  *) exit 1 ;;\nesac\n"
+            // `auth token` is the local-default credential lookup; `pr view`
+            // must then receive that token through GH_TOKEN.
+            "#!/bin/sh\nif [ \"$*\" = \"auth token\" ]; then\n  echo shim-token\n  exit 0\nfi\nif [ -n \"$QUORUM_GH_ARGS_FILE\" ]; then\n  printf '%s\\n' \"$*\" > \"$QUORUM_GH_ARGS_FILE\"\nfi\n[ \"$GH_TOKEN\" = shim-token ] || exit 1\ncase \"$*\" in\n  *\"pr view\"*) echo '{response}' ;;\n  *) exit 1 ;;\nesac\n"
         ),
     )
     .unwrap();
@@ -2347,4 +2453,90 @@ fn task_create_refuses_a_malformed_serve_config_even_with_a_base_branch() {
         .collect::<Result<_, _>>()
         .unwrap();
     assert_eq!(rows, vec!["main".to_string()]);
+}
+
+#[test]
+fn planner_blocker_hold_is_logged_and_shown_in_task_get() {
+    let home = tempfile::tempdir().unwrap();
+    for title in ["blocked plan", "plain task"] {
+        quorum(home.path())
+            .args(["task-create", "--created-by", "boss", "--title", title])
+            .assert()
+            .success();
+    }
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let summary = serde_json::json!({
+        "evidence": ["upstream API is not yet released"],
+        "required_decision": "wait for the vendor release or drop the feature",
+        "why_no_safe_split": "every slice depends on the API",
+    })
+    .to_string();
+    {
+        let mut conn = quorum_core::db::open(&db).unwrap();
+        conn.execute("UPDATE tasks SET status='planning' WHERE id=1", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO task_decompositions(
+                 source_task_id,state,active,freeze_active,planned_source_revision,
+                 created_at,updated_at)
+             VALUES (1,'planning',0,0,1,1,1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            quorum_core::decomposition::record_attempt(
+                &mut conn,
+                1,
+                "blocker",
+                "external_constraint",
+                &summary,
+                quorum_core::clock::now(),
+            )
+            .unwrap(),
+            Some(1)
+        );
+    }
+
+    let log = quorum(home.path())
+        .args(["log", "--refs", "task#1"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let log = String::from_utf8(log).unwrap();
+    let all: Vec<serde_json::Value> = serde_json::from_str(&log).unwrap();
+    let events: Vec<&serde_json::Value> = all
+        .iter()
+        .filter(|event| event["kind"] == quorum_core::decomposition::PLANNER_BLOCKER_HOLD_EVENT)
+        .collect();
+    assert_eq!(events.len(), 1, "{log}");
+    let body = events[0]["body"].as_str().unwrap();
+    assert!(body.contains("external_constraint"), "{body}");
+    assert!(body.contains("wait for the vendor release"), "{body}");
+    assert!(body.contains("upstream API is not yet released"), "{body}");
+    assert!(body.len() <= quorum_core::decomposition::ATTEMPT_SUMMARY_MAX_BYTES);
+
+    let out = quorum(home.path())
+        .args(["task-get", "--task-id", "1"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let task: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(task["status"], "failed");
+    assert_eq!(task["planner_hold"]["category"], "external_constraint");
+    assert_eq!(task["planner_hold"]["summary"], summary.as_str());
+    assert_eq!(task["planner_hold"]["graph_id"], 1);
+
+    let out = quorum(home.path())
+        .args(["task-get", "--task-id", "2"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let task: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert!(task.get("planner_hold").is_none(), "{task}");
 }

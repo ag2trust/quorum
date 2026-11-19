@@ -134,6 +134,7 @@ impl ServeHandle {
             r#"#!/bin/sh
 set -eu
 cmd="${1:-} ${2:-}"
+if [ "$cmd" = "auth token" ]; then printf 'shim-token\n'; exit 0; fi
 if [ "$cmd" = "pr list" ]; then
   printf '[]\n'
 elif [ "$cmd" = "pr view" ]; then

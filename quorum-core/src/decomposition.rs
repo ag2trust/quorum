@@ -22,6 +22,15 @@ pub const MAX_CHILDREN: usize = 8;
 /// planner's retry feedback (`MAX_REJECTION_SUMMARY_BYTES`) is derived from
 /// this bound so a complete child rejection is never dropped at persistence.
 pub const ATTEMPT_SUMMARY_MAX_BYTES: usize = 8 * 1024;
+/// Lifecycle event emitted on `task#<source>` when a planner blocker holds a
+/// graph. The body names the blocker category and a bounded summary.
+pub const PLANNER_BLOCKER_HOLD_EVENT: &str = "decomposition_planner_blocker";
+/// The one planner blocker category an operator `task-retry` may resume. An
+/// external constraint (a base that has since moved, or work named by the
+/// source that is not merged yet) can clear without editing the source, so a
+/// retry replans against a freshly bound base within [`MAX_OPERATOR_RETRIES`].
+/// Every other blocker category stays terminal.
+pub const RETRYABLE_PLANNER_BLOCKER: &str = "external_constraint";
 const MAX_CLEANUP_ARTIFACT_BYTES: usize = 4096;
 
 type MaterializationSource = (i64, i64, i64, i64, String, Option<String>, Option<String>);
@@ -445,25 +454,33 @@ fn planning_attempt_history_is_consistent(
 ) -> Result<bool> {
     let generation_count = (retry_count + 1) as usize;
     let mut attempts_by_generation = vec![[0_i64; 2]; generation_count];
-    let mut expected_ordinal = [1_i64; 2];
-    let mut last_generation = [-1_i64; 2];
-    // Retry eligibility replays only budget-bearing attempts. Observational
-    // rows (including Arbiter verdicts) never consume either retry budget.
+    // A planner blocker holds its graph immediately, so each generation has at
+    // most one, recorded after every budget-bearing attempt of that generation.
+    let mut blocker_by_generation: Vec<Option<(i64, String)>> = vec![None; generation_count];
+    let mut last_budget_attempt_id = vec![0_i64; generation_count];
+    let mut expected_ordinal = [1_i64; 3];
+    let mut last_generation = [-1_i64; 3];
+    // Retry eligibility replays only budget-bearing attempts and planner
+    // blockers. Observational rows (including Arbiter verdicts) never consume
+    // either retry budget.
     let mut stmt = conn.prepare(
-        "SELECT source_revision,kind,ordinal,retry_generation
+        "SELECT id,source_revision,kind,ordinal,retry_generation,reason_code
          FROM decomposition_attempts
-         WHERE graph_id=?1 AND kind IN ('proposal','provider')
+         WHERE graph_id=?1 AND kind IN ('proposal','provider','blocker')
          ORDER BY kind,ordinal",
     )?;
     let mut rows = stmt.query([graph_id])?;
     while let Some(row) = rows.next()? {
-        let attempt_source_revision: i64 = row.get(0)?;
-        let kind: String = row.get(1)?;
-        let ordinal: i64 = row.get(2)?;
-        let generation: i64 = row.get(3)?;
+        let attempt_id: i64 = row.get(0)?;
+        let attempt_source_revision: i64 = row.get(1)?;
+        let kind: String = row.get(2)?;
+        let ordinal: i64 = row.get(3)?;
+        let generation: i64 = row.get(4)?;
+        let reason_code: String = row.get(5)?;
         let kind_index = match kind.as_str() {
             "proposal" => 0,
             "provider" => 1,
+            "blocker" => 2,
             _ => return Ok(false),
         };
         if attempt_source_revision != source_revision
@@ -473,6 +490,16 @@ fn planning_attempt_history_is_consistent(
             || generation > retry_count
         {
             return Ok(false);
+        }
+        expected_ordinal[kind_index] += 1;
+        last_generation[kind_index] = generation;
+        if kind_index == 2 {
+            let blocker = &mut blocker_by_generation[generation as usize];
+            if blocker.is_some() {
+                return Ok(false);
+            }
+            *blocker = Some((attempt_id, reason_code));
+            continue;
         }
         let count = &mut attempts_by_generation[generation as usize][kind_index];
         *count += 1;
@@ -484,8 +511,8 @@ fn planning_attempt_history_is_consistent(
         if *count > per_generation_cap {
             return Ok(false);
         }
-        expected_ordinal[kind_index] += 1;
-        last_generation[kind_index] = generation;
+        let last_id = &mut last_budget_attempt_id[generation as usize];
+        *last_id = (*last_id).max(attempt_id);
     }
 
     let mut replayed = [0_i64; 2];
@@ -495,25 +522,49 @@ fn planning_attempt_history_is_consistent(
         if replayed[0] > MAX_PROPOSAL_ATTEMPTS || replayed[1] > MAX_PROVIDER_FAILURES {
             return Ok(false);
         }
+        let blocker = &blocker_by_generation[generation];
+        // A blocker is recorded only while both budgets remain, and it ends
+        // its generation: no budget-bearing attempt may follow it.
+        if let Some((blocker_id, _)) = blocker {
+            if *blocker_id < last_budget_attempt_id[generation]
+                || replayed[0] >= MAX_PROPOSAL_ATTEMPTS
+                || replayed[1] >= MAX_PROVIDER_FAILURES
+            {
+                return Ok(false);
+            }
+        }
         if generation + 1 < generation_count {
-            match (
-                replayed[0] == MAX_PROPOSAL_ATTEMPTS,
-                replayed[1] == MAX_PROVIDER_FAILURES,
-            ) {
-                (true, false) => replayed[0] = 0,
-                (false, true) => replayed[1] = 0,
-                _ => return Ok(false),
+            match blocker {
+                // A retried blocker consumed neither budget, so nothing resets.
+                Some((_, reason_code)) if reason_code == RETRYABLE_PLANNER_BLOCKER => {}
+                Some(_) => return Ok(false),
+                None => match (
+                    replayed[0] == MAX_PROPOSAL_ATTEMPTS,
+                    replayed[1] == MAX_PROVIDER_FAILURES,
+                ) {
+                    (true, false) => replayed[0] = 0,
+                    (false, true) => replayed[1] = 0,
+                    _ => return Ok(false),
+                },
             }
         }
     }
 
+    let final_blocker = blocker_by_generation[generation_count - 1].as_ref();
     Ok(replayed == [proposal_attempts, provider_failures]
         && match hold_code {
             "proposal-attempts-exhausted" => {
-                replayed[0] == MAX_PROPOSAL_ATTEMPTS && replayed[1] < MAX_PROVIDER_FAILURES
+                final_blocker.is_none()
+                    && replayed[0] == MAX_PROPOSAL_ATTEMPTS
+                    && replayed[1] < MAX_PROVIDER_FAILURES
             }
             "provider-attempts-exhausted" => {
-                replayed[1] == MAX_PROVIDER_FAILURES && replayed[0] < MAX_PROPOSAL_ATTEMPTS
+                final_blocker.is_none()
+                    && replayed[1] == MAX_PROVIDER_FAILURES
+                    && replayed[0] < MAX_PROPOSAL_ATTEMPTS
+            }
+            RETRYABLE_PLANNER_BLOCKER => {
+                final_blocker.is_some_and(|(_, reason_code)| reason_code == hold_code)
             }
             _ => false,
         })
@@ -533,7 +584,7 @@ fn planning_retry_candidate(
              WHERE d.source_task_id=?1
                AND d.state='held' AND d.active=0 AND d.freeze_active=0
                AND d.hold_code IN ('provider-attempts-exhausted',
-                                   'proposal-attempts-exhausted')
+                                   'proposal-attempts-exhausted',?4)
                AND d.operator_retry_count BETWEEN 0 AND ?2
                AND d.accepted_proposal_json IS NULL
                AND d.accepted_plan_revision IS NULL
@@ -558,7 +609,12 @@ fn planning_retry_candidate(
                AND NOT EXISTS (SELECT 1 FROM claims c
                                WHERE c.target=('task#' || t.id)
                                  AND c.active=1 AND c.expires_at>?3)",
-            params![source_task_id, MAX_OPERATOR_RETRIES, now],
+            params![
+                source_task_id,
+                MAX_OPERATOR_RETRIES,
+                now,
+                RETRYABLE_PLANNER_BLOCKER
+            ],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -609,11 +665,16 @@ pub(crate) fn exhausted_planning_retry_is_eligible(
         .is_some_and(|candidate| candidate.retry_count < MAX_OPERATOR_RETRIES))
 }
 
-/// Explicitly resume an exhausted, pre-materialization planning aggregate.
+/// Explicitly resume an exhausted, pre-materialization planning aggregate, or
+/// one held by a [`RETRYABLE_PLANNER_BLOCKER`] planner blocker.
 ///
 /// Every eligibility and negative-evidence check is made under one immediate
 /// transaction. A stale or racing caller is a clean negative; attempt history
-/// is retained and the current budget alone is reset.
+/// is retained and only an exhausted current budget is reset (a blocker
+/// consumed neither budget). Either way the graph re-enters the provider
+/// backoff re-drain path with its frozen base and planner session cleared, so
+/// the next attempt binds a fresh base. Dependents parked because the source
+/// failed are restored to `open` in the same transaction.
 pub fn retry_exhausted_planning(
     conn: &mut Connection,
     source_task_id: i64,
@@ -663,6 +724,9 @@ pub fn retry_exhausted_planning(
     if source_changed != 1 {
         return Ok(PlanningRetryOutcome::NotEligible);
     }
+    // The source is non-terminal again, so dependents the cascade parked on
+    // its failure wait as open-but-unready and dispatch once it is `done`.
+    crate::tasks::resume_dependents_parked_on(&tx, source_task_id, by, now)?;
     crate::events::emit(
         &tx,
         "decomposition_planning_retry",
@@ -923,6 +987,14 @@ pub fn bind_frozen_base_and_enter_planning(
     Ok(changed == 1)
 }
 
+/// Bounded, NUL-free lifecycle text for a planner blocker hold. The summary
+/// already carries the planner's evidence and required decision; the whole
+/// body is capped at [`ATTEMPT_SUMMARY_MAX_BYTES`] on a UTF-8 char boundary.
+fn planner_blocker_event_body(category: &str, summary: &str) -> String {
+    let body = format!("planner blocker {category}: {summary}").replace('\0', "\u{FFFD}");
+    crate::tasks::truncate_utf8(&body, ATTEMPT_SUMMARY_MAX_BYTES)
+}
+
 /// Record one bounded planning result. A valid blocker holds immediately and
 /// consumes neither retry budget. Returns the new ordinal for retry attempts.
 pub fn record_attempt(
@@ -990,6 +1062,13 @@ pub fn record_attempt(
                 summary,
                 now
             ],
+        )?;
+        crate::events::emit(
+            &tx,
+            PLANNER_BLOCKER_HOLD_EVENT,
+            &format!("task#{source_id}"),
+            &planner_blocker_event_body(reason_code, summary),
+            now,
         )?;
         tx.commit().map_err(map_sql_err)?;
         return Ok(Some(ordinal));
@@ -5747,6 +5826,106 @@ mod tests {
         assert_eq!(state, ("held".into(), 0, 0, 0));
     }
 
+    fn planner_blocker_events(conn: &Connection, source: i64) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT body FROM events WHERE kind=?1 AND subject=?2 ORDER BY seq")
+            .unwrap();
+        stmt.query_map(
+            params![PLANNER_BLOCKER_HOLD_EVENT, format!("task#{source}")],
+            |r| r.get(0),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<String>>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn planner_blocker_hold_logs_one_bounded_event_and_surfaces_in_task_get() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        assert!(crate::tasks::get_with_notes(&conn, 1)
+            .unwrap()
+            .unwrap()
+            .planner_hold
+            .is_none());
+        // Multi-byte summary exactly at the cap: the prefixed event body must
+        // be truncated on a char boundary and stay within the shared bound.
+        let summary = format!("{}\0", "é".repeat((ATTEMPT_SUMMARY_MAX_BYTES - 1) / 2));
+        assert!(summary.len() <= ATTEMPT_SUMMARY_MAX_BYTES);
+        assert_eq!(
+            record_attempt(
+                &mut conn,
+                graph,
+                "blocker",
+                "external_constraint",
+                &summary,
+                4
+            )
+            .unwrap(),
+            Some(1)
+        );
+        let events = planner_blocker_events(&conn, 1);
+        assert_eq!(events.len(), 1, "exactly one hold event");
+        let body = &events[0];
+        assert!(body.starts_with("planner blocker external_constraint: éé"));
+        assert!(body.len() <= ATTEMPT_SUMMARY_MAX_BYTES, "{}", body.len());
+        assert!(!body.contains('\0'));
+        let state: (String, String) = conn
+            .query_row(
+                "SELECT d.state,t.status FROM task_decompositions d
+                 JOIN tasks t ON t.id=d.source_task_id WHERE d.id=?1",
+                [graph],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state.0, "held");
+        let hold = crate::tasks::get_with_notes(&conn, 1)
+            .unwrap()
+            .unwrap()
+            .planner_hold
+            .expect("planner hold surfaced");
+        assert_eq!(hold.graph_id, graph);
+        assert_eq!(hold.category, "external_constraint");
+        assert_eq!(hold.summary, summary);
+        // A replay against the held graph is a clean loss and logs nothing.
+        assert_eq!(
+            record_attempt(&mut conn, graph, "blocker", "external_constraint", "x", 5).unwrap(),
+            None
+        );
+        assert_eq!(planner_blocker_events(&conn, 1).len(), 1);
+    }
+
+    #[test]
+    fn exhaustion_hold_is_not_reported_as_planner_blocker() {
+        let mut conn = setup();
+        let graph = begin(&mut conn);
+        for now in [4, 5] {
+            record_attempt(
+                &mut conn,
+                graph,
+                "provider",
+                "planner-provider",
+                "boom",
+                now,
+            )
+            .unwrap();
+        }
+        let code: String = conn
+            .query_row(
+                "SELECT hold_code FROM task_decompositions WHERE id=?1 AND state='held'",
+                [graph],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(code, "provider-attempts-exhausted");
+        assert!(planner_blocker_events(&conn, 1).is_empty());
+        assert!(crate::tasks::get_with_notes(&conn, 1)
+            .unwrap()
+            .unwrap()
+            .planner_hold
+            .is_none());
+    }
+
     fn accepted_columns(conn: &Connection, graph: i64) -> (String, Option<String>, Option<String>) {
         conn.query_row(
             "SELECT state,accepted_proposal_json,accepted_classifications_json
@@ -7458,6 +7637,484 @@ mod tests {
         )
         .unwrap();
         assert_exhausted_retry_rejected(conn, graph);
+    }
+
+    const BLOCKED_BASE_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    const ADVANCED_BASE_SHA: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    /// Bind `sha` through a real drain and record one planner blocker.
+    fn drain_plan_and_block(conn: &mut Connection, graph: i64, sha: &str, category: &str, at: i64) {
+        assert!(set_frozen_phase(conn, graph, "freeze-requested", "draining", None, at).unwrap());
+        assert!(bind_frozen_base_and_enter_planning(conn, graph, sha, at + 1).unwrap());
+        conn.execute(
+            "UPDATE task_decompositions SET planner_session_id='planner-session' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        assert!(record_attempt(
+            conn,
+            graph,
+            "blocker",
+            category,
+            "dependency #9 is not merged into the frozen base",
+            at + 2,
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    /// A source held by a planner blocker after one rejected proposal.
+    fn blocker_held(category: &str) -> (Connection, i64) {
+        let mut conn = setup();
+        let graph = begin_planning(
+            &mut conn,
+            &BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "ignored-until-drained",
+                now: 2,
+                max_active_graphs: 1,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "draining", None, 3).unwrap()
+        );
+        assert!(
+            bind_frozen_base_and_enter_planning(&mut conn, graph, BLOCKED_BASE_SHA, 4).unwrap()
+        );
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "proposal",
+            "test-failure",
+            "first proposal rejected",
+            5,
+        )
+        .unwrap()
+        .is_some());
+        conn.execute(
+            "UPDATE task_decompositions SET planner_session_id='planner-session' WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        assert!(record_attempt(
+            &mut conn,
+            graph,
+            "blocker",
+            category,
+            "dependency #9 is not merged into the frozen base",
+            6,
+        )
+        .unwrap()
+        .is_some());
+        (conn, graph)
+    }
+
+    type RetryRow = (
+        String,
+        i64,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        i64,
+        i64,
+        i64,
+        String,
+    );
+
+    fn retry_row(conn: &Connection, graph: i64) -> RetryRow {
+        conn.query_row(
+            "SELECT d.state,d.freeze_active,d.frozen_base_sha,d.planner_session_id,
+                    d.hold_code,d.hold_summary,d.operator_retry_count,
+                    d.proposal_attempts,d.provider_failures,t.status
+             FROM task_decompositions d JOIN tasks t ON t.id=d.source_task_id
+             WHERE d.id=?1",
+            [graph],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn external_constraint_hold_is_operator_retryable_and_rebinds_a_fresh_base() {
+        let (mut conn, graph) = blocker_held(RETRYABLE_PLANNER_BLOCKER);
+        assert!(exhausted_planning_retry_is_eligible(&conn, 1, 7).unwrap());
+        assert_eq!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 30).unwrap(),
+            PlanningRetryOutcome::Retried {
+                graph_id: graph,
+                generation: 1,
+            }
+        );
+        // The hold, base, and session clear; a blocker consumed neither
+        // budget, so the carried proposal attempt is kept.
+        assert_eq!(
+            retry_row(&conn, graph),
+            (
+                "provider-backoff".into(),
+                0,
+                None,
+                None,
+                None,
+                None,
+                1,
+                1,
+                0,
+                "planning".into(),
+            )
+        );
+        let history: Vec<(String, i64, i64)> = conn
+            .prepare(
+                "SELECT kind,ordinal,retry_generation FROM decomposition_attempts
+                 WHERE graph_id=?1 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([graph], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            history,
+            vec![("proposal".into(), 1, 0), ("blocker".into(), 1, 0)]
+        );
+        let retry_events: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='decomposition_planning_retry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retry_events, 1);
+
+        // The ordinary re-drain binds the newer base for the new attempt.
+        assert!(reacquire_freeze(&mut conn, graph, 1, 31).unwrap());
+        drain_plan_and_block(
+            &mut conn,
+            graph,
+            ADVANCED_BASE_SHA,
+            RETRYABLE_PLANNER_BLOCKER,
+            32,
+        );
+        let rebound: Option<String> = conn
+            .query_row(
+                "SELECT frozen_base_sha FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rebound.as_deref(), Some(ADVANCED_BASE_SHA));
+
+        // Still blocked: it holds again and stays retryable within the cap.
+        assert_eq!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 40).unwrap(),
+            PlanningRetryOutcome::Retried {
+                graph_id: graph,
+                generation: 2,
+            }
+        );
+        assert!(reacquire_freeze(&mut conn, graph, 1, 41).unwrap());
+        drain_plan_and_block(
+            &mut conn,
+            graph,
+            ADVANCED_BASE_SHA,
+            RETRYABLE_PLANNER_BLOCKER,
+            42,
+        );
+        let before = retry_row(&conn, graph);
+        assert_eq!(before.4.as_deref(), Some(RETRYABLE_PLANNER_BLOCKER));
+        assert!(!exhausted_planning_retry_is_eligible(&conn, 1, 50).unwrap());
+        assert_eq!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 50).unwrap(),
+            PlanningRetryOutcome::RetryCapExhausted {
+                retry_count: MAX_OPERATOR_RETRIES,
+            }
+        );
+        assert_eq!(retry_row(&conn, graph), before);
+        let blockers: Vec<i64> = conn
+            .prepare(
+                "SELECT retry_generation FROM decomposition_attempts
+                 WHERE graph_id=?1 AND kind='blocker' ORDER BY ordinal",
+            )
+            .unwrap()
+            .query_map([graph], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(blockers, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn exhaustion_after_a_retried_external_constraint_remains_retryable() {
+        let (mut conn, graph) = blocker_held(RETRYABLE_PLANNER_BLOCKER);
+        assert!(matches!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 30).unwrap(),
+            PlanningRetryOutcome::Retried { generation: 1, .. }
+        ));
+        assert!(reacquire_freeze(&mut conn, graph, 1, 31).unwrap());
+        assert!(
+            set_frozen_phase(&mut conn, graph, "freeze-requested", "planning", None, 32).unwrap()
+        );
+        // The carried proposal attempt plus one more exhausts that budget.
+        assert!(
+            record_attempt(&mut conn, graph, "proposal", "test-failure", "again", 33)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            retry_row(&conn, graph).4.as_deref(),
+            Some("proposal-attempts-exhausted")
+        );
+        assert_eq!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 40).unwrap(),
+            PlanningRetryOutcome::Retried {
+                graph_id: graph,
+                generation: 2,
+            }
+        );
+        assert_eq!(retry_row(&conn, graph).7, 0);
+    }
+
+    #[test]
+    fn terminal_planner_blockers_stay_rejected_by_operator_retry() {
+        for category in ["ambiguous_scope", "missing_decision", "no_safe_split"] {
+            let (conn, graph) = blocker_held(category);
+            assert!(!exhausted_planning_retry_is_eligible(&conn, 1, 7).unwrap());
+            assert_exhausted_retry_rejected(conn, graph);
+        }
+    }
+
+    #[test]
+    fn external_constraint_retry_rejects_corrupt_or_materialized_authority() {
+        for mutation in [
+            "UPDATE task_decompositions SET accepted_proposal_json='[]' WHERE id=?1",
+            "UPDATE task_decompositions SET accepted_plan_revision=1 WHERE id=?1",
+            "UPDATE task_decompositions SET freeze_active=1 WHERE id=?1",
+            "UPDATE task_decompositions SET proposal_attempts=0 WHERE id=?1",
+            // The recorded blocker no longer matches the hold it explains.
+            "UPDATE decomposition_attempts SET reason_code='no_safe_split'
+             WHERE graph_id=?1 AND kind='blocker'",
+            "DELETE FROM decomposition_attempts WHERE graph_id=?1 AND kind='blocker'",
+            // A second blocker in one generation is impossible.
+            "INSERT INTO decomposition_attempts(graph_id,source_revision,kind,ordinal,
+                 retry_generation,reason_code,summary,created_at)
+             VALUES (?1,1,'blocker',2,0,'external_constraint','again',8)",
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (?1,1,'child',1,0)",
+        ] {
+            let (conn, graph) = blocker_held(RETRYABLE_PLANNER_BLOCKER);
+            conn.execute(mutation, [graph]).unwrap();
+            assert_exhausted_retry_rejected(conn, graph);
+        }
+
+        // A budget-bearing attempt recorded after the blocker in the same
+        // generation contradicts the immediate hold.
+        let (conn, graph) = blocker_held(RETRYABLE_PLANNER_BLOCKER);
+        conn.execute(
+            "INSERT INTO decomposition_attempts(graph_id,source_revision,kind,ordinal,
+                 retry_generation,reason_code,summary,created_at)
+             VALUES (?1,1,'provider',1,0,'timeout','late',8)",
+            [graph],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE task_decompositions SET provider_failures=1 WHERE id=?1",
+            [graph],
+        )
+        .unwrap();
+        assert_exhausted_retry_rejected(conn, graph);
+
+        for mutation in [
+            "INSERT INTO claims(target,holder,ts,expires_at,active)
+             VALUES ('task#1','worker',7,999999,1)",
+            "INSERT INTO agent_runs(task_id,agent_name,role,model,effort,spawned_at)
+             VALUES (1,'worker','worker','model','high',7)",
+            "INSERT INTO journal(agent,role,task_id,session_id,phase,updated_at)
+             VALUES ('worker','worker',1,'session','working',7)",
+            "UPDATE tasks SET revision=2 WHERE id=1",
+            "UPDATE tasks SET refs=json_object('pr',42) WHERE id=1",
+        ] {
+            let (conn, graph) = blocker_held(RETRYABLE_PLANNER_BLOCKER);
+            conn.execute(mutation, []).unwrap();
+            assert_exhausted_retry_rejected(conn, graph);
+        }
+    }
+
+    #[test]
+    fn concurrent_external_constraint_retry_has_one_clean_winner() {
+        use std::sync::{Arc, Barrier};
+
+        for round in 0..8 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("blocker-retry-race-{round}.db"));
+            let graph = {
+                let (memory, graph) = blocker_held(RETRYABLE_PLANNER_BLOCKER);
+                memory
+                    .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+                    .unwrap();
+                graph
+            };
+            let barrier = Arc::new(Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let mut conn = crate::db::open(&path).unwrap();
+                        barrier.wait();
+                        retry_exhausted_planning(&mut conn, 1, "operator", 30).unwrap()
+                    })
+                })
+                .collect();
+            let mut outcomes: Vec<_> = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect();
+            outcomes.sort_by_key(|outcome| matches!(outcome, PlanningRetryOutcome::Retried { .. }));
+            assert_eq!(
+                outcomes,
+                vec![
+                    PlanningRetryOutcome::NotEligible,
+                    PlanningRetryOutcome::Retried {
+                        graph_id: graph,
+                        generation: 1,
+                    },
+                ]
+            );
+            let conn = crate::db::open(&path).unwrap();
+            let (retry_count, retry_events, errors): (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT operator_retry_count,
+                            (SELECT count(*) FROM events WHERE kind='decomposition_planning_retry'),
+                            (SELECT count(*) FROM errors)
+                     FROM task_decompositions WHERE id=?1",
+                    [graph],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!((retry_count, retry_events, errors), (1, 1, 0));
+        }
+    }
+
+    #[test]
+    fn external_constraint_retry_resumes_dependent_parked_on_the_source() {
+        let mut conn = setup();
+        let dependent = crate::tasks::create(
+            &mut conn,
+            "owner",
+            "after the source",
+            None,
+            0,
+            None,
+            None,
+            Some("[1]"),
+            None,
+            2,
+        )
+        .unwrap();
+        // A dependent parked for another cause is not this path's to resume.
+        let other = crate::tasks::create(
+            &mut conn,
+            "owner",
+            "parked for another cause",
+            None,
+            0,
+            None,
+            None,
+            Some("[1]"),
+            None,
+            2,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='failed',refs=json_object(
+                 'daemon_parked',json('true'),'daemon_parked_reason','worker blocked',
+                 'daemon_resume_status','open') WHERE id=?1",
+            [other],
+        )
+        .unwrap();
+        let graph = begin_planning(
+            &mut conn,
+            &BeginPlanning {
+                source_task_id: 1,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "ignored-until-drained",
+                now: 3,
+                max_active_graphs: 1,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        drain_plan_and_block(
+            &mut conn,
+            graph,
+            BLOCKED_BASE_SHA,
+            RETRYABLE_PLANNER_BLOCKER,
+            4,
+        );
+        assert_eq!(crate::sweep::cascade_dead_deps(&conn, 8, 100).unwrap(), 1);
+        let parked = crate::tasks::get(&conn, dependent).unwrap().unwrap();
+        assert_eq!(parked.status, "failed");
+        let refs: serde_json::Value =
+            serde_json::from_str(parked.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            refs["daemon_parked_reason"],
+            "dependency #1 is terminal-not-done"
+        );
+
+        assert!(matches!(
+            retry_exhausted_planning(&mut conn, 1, "operator", 9).unwrap(),
+            PlanningRetryOutcome::Retried { generation: 1, .. }
+        ));
+        let resumed = crate::tasks::get(&conn, dependent).unwrap().unwrap();
+        assert_eq!(resumed.status, "open");
+        assert!(!resumed.ready, "the source has not completed yet");
+        let refs: serde_json::Value =
+            serde_json::from_str(resumed.refs.as_deref().unwrap_or("{}")).unwrap();
+        assert!(refs.get("daemon_parked").is_none(), "{refs}");
+        assert!(refs.get("daemon_parked_reason").is_none(), "{refs}");
+        let resumed_events: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='task_unparked' AND subject=?1",
+                [format!("task#{dependent}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(resumed_events, 1);
+        assert_eq!(
+            crate::tasks::get(&conn, other).unwrap().unwrap().status,
+            "failed"
+        );
+        // A non-terminal source no longer re-parks its dependent.
+        assert_eq!(crate::sweep::cascade_dead_deps(&conn, 10, 100).unwrap(), 0);
+
+        conn.execute("UPDATE tasks SET status='done' WHERE id=1", [])
+            .unwrap();
+        let ready = crate::tasks::get(&conn, dependent).unwrap().unwrap();
+        assert_eq!(ready.status, "open");
+        assert!(
+            ready.ready,
+            "the dependent dispatches once the source is done"
+        );
     }
 
     #[test]

@@ -2952,8 +2952,9 @@ the daemon serializes planning per repository: one graph plans at a time, and at
 configured `max_active_graphs` (default 2) graphs are counted at once (see the admission limit
 below). There is no drain
 precondition: unrelated started work keeps running and merging while a graph plans. When the graph
-moves from `draining` to `planning`, the daemon reads the current base-branch head (outside any DB
-transaction) and binds it as `frozen_base_sha` in one guarded `BEGIN IMMEDIATE` update (state
+moves from `draining` to `planning`, the daemon fetches the source task's target branch and reads
+the fetched `origin/<target>` head (outside any DB transaction; see the planner view below) and
+binds it as `frozen_base_sha` in one guarded `BEGIN IMMEDIATE` update (state
 `draining`, freeze held, inactive, no base yet bound); a zero-row bind is an expected lost race.
 That recorded SHA is the planner's base for the whole attempt, served through the read-only
 snapshot archive described below, so later base movement is never visible to it. Generated
@@ -3026,10 +3027,15 @@ those restrictions and accepts only one bounded, closed plan or blocker response
 transport cannot be separated from model-generated network or filesystem access is refused
 fail-closed. The view is an archive of the recorded frozen base SHA, built from the object store
 regardless of the repository's current HEAD, so the base does not move during one planning attempt
-even when unrelated merges advance the base branch. Source-revision drift is still rejected: an
-accepted source edit removes the pending aggregate, so the attempt's planner run no longer resolves
-to a live graph and cannot submit or be accepted. A valid concrete blocker parks the source immediately
-with no second opinion.
+even when unrelated merges advance the base branch. At planning start that SHA is bound from the
+freshly fetched `origin/<target>` of the source task, verified to contain every dependency merge
+commit through the same fetch workers use, never the daemon clone's checked-out `HEAD`; a fetch or
+verification failure leaves the graph `draining` with no SHA, records a deduplicated
+`decomposition_base_deferred` event on the source, and retries on a later tick. The view is
+content-addressed by that commit and immutable for the attempt. Source-revision drift is still
+rejected: an accepted source edit removes the pending aggregate, so the attempt's planner run no
+longer resolves to a live graph and cannot submit or be accepted. A valid concrete blocker parks
+the source immediately with no second opinion.
 
 The planner reports its plan by calling the daemon-owned `submit_plan` tool exactly once, over
 the same authorized agent endpoint workers and reviewers submit through; its transcript is never
@@ -3196,9 +3202,9 @@ self-attestation nor redesigns the worker filesystem sandbox.
 Semantic proposal rejections and provider/protocol failures have independent caps of three per
 unchanged source revision. Semantic retries keep the repository freeze. Provider failure releases
 the freeze during backoff and clears the frozen SHA; when backoff expires the graph reacquires the
-freeze through the ordinary guarded path and binds the then-current base head at its next planning
-start. There is no provider-blocked release valve: unrelated provider-blocked work neither holds
-planning nor delays reacquisition. Full prompts and transcripts are not persisted; only bounded
+freeze through the ordinary guarded path and binds the then-current fetched base head at its next
+planning start. There is no provider-blocked release valve: unrelated provider-blocked work neither
+holds planning nor delays reacquisition. Full prompts and transcripts are not persisted; only bounded
 structured attempts, the accepted closed proposal and its accepted classification needed to resume
 preclassification or validation, and final reasons are durable. Restart inspection never consumes a
 semantic proposal attempt.
@@ -3211,8 +3217,19 @@ neither review-only nor a continuation, and no accepted plan, member/child, proc
 delivery/merge evidence exists. The winner restores the source to `planning`, clears only the
 retryable hold/session/base fields, resets the exhausted current-generation counter, and places the
 graph in provider backoff so the coordinator must reacquire planning authority through the
-ordinary guarded, counted `reacquire_freeze` path. Semantic blockers, inconsistent holds, stale authority, materialization,
-delivery evidence, and racing callers are clean negatives.
+ordinary guarded, counted `reacquire_freeze` path. A planner blocker of category
+`external_constraint` (the frozen base has since moved, or the source names work not merged yet)
+is resumable the same way and under the same negative-evidence checks and operator retry cap: the
+replayed attempt history must end the current generation in exactly one matching blocker recorded
+after that generation's budget-bearing attempts. Because a blocker consumes neither budget, its
+retry resets no counter; it clears the hold, frozen base, and planner session so the next planning
+start binds a fresh fetched base and a new attempt starts with its own immutable frozen view. The
+same transaction returns to `open` every dependent the cascade parked only because this source was
+terminal-not-done (`open` resumes only; a `rework` resume keeps waiting for an explicit
+`task-retry`); a resumed dependent stays unready until the source is `done`, and a renewed hold
+parks it again. The `ambiguous_scope`, `missing_decision`, and `no_safe_split` blockers,
+inconsistent holds, stale authority, materialization, delivery evidence, and racing callers are
+clean negatives.
 
 Coordinator snapshot selection always prioritizes the single `freeze_active=1` aggregate before
 older provider-backoff aggregates. An explicitly retried graph therefore cannot shadow, stall, or

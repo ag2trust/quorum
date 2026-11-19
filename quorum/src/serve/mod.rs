@@ -2949,7 +2949,8 @@ fn routed_collector_request(
         profile.model,
         profile.effort,
         config.codex_sandbox.clone(),
-    );
+    )
+    .with_credentials(config.merge_executor.github_credentials());
     request.role_assignment_id = route
         .links_assignment(&responsibility_key)
         .then_some(route.assignment.id);
@@ -6406,8 +6407,12 @@ const PLANNER_VIEW_TIMEOUT: Duration = Duration::from_secs(30);
 const PLANNER_VIEW_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const PLANNER_ARCHIVE_MAX_BYTES: usize = 256 * 1024 * 1024;
 const PLANNER_ARCHIVE_DIAGNOSTIC_BYTES: usize = 64 * 1024;
-const FROZEN_BASE_CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
-const FROZEN_BASE_CAPTURE_PIPE_BYTES: usize = 4096;
+/// Lifecycle event kind recorded on `task#<source>` when the drain-to-planning
+/// handoff cannot bind a verified frozen base.
+const DECOMPOSITION_BASE_DEFERRED_EVENT: &str = "decomposition_base_deferred";
+/// A persistent identical deferral reason is recorded once per live event
+/// lifetime; a changing reason is recorded at most once per this interval.
+const DECOMPOSITION_BASE_DEFERRED_EVENT_INTERVAL_SECS: i64 = 300;
 
 /// Select the ordinary classifier's next queue and its duplicate context.
 ///
@@ -6938,11 +6943,30 @@ async fn frozen_planner_view_with_options(
     // of the daemon tick therefore cannot skip its bounded kill/reap path.
     tokio::spawn(async move {
         let deadline = tokio::time::Instant::now() + timeout;
-        // The view is exactly the tree of `frozen_sha`, read from the object
-        // store, whatever the repository's current HEAD is. There is no drain,
-        // so unrelated merges may move the base branch during planning; the
-        // archive is what keeps the planner's base fixed for the attempt.
         let isolated = PlannerArchiveSource::create(&repo, &git_bin, deadline).await?;
+
+        // The view is exactly the tree of `frozen_sha`, read from the object
+        // store, whatever the repository's current HEAD is. The frozen base is
+        // the fetched target-branch commit bound at planning start, not the
+        // clone's checked-out HEAD (which may lag the remote). There is no
+        // drain, so unrelated merges may move the base branch during planning;
+        // content addressing is what keeps the planner's base fixed for the
+        // attempt. Only that exact commit object must be present.
+        let mut commit_command = isolated.git_command(&git_bin);
+        commit_command.args(["cat-file", "-e", &format!("{frozen_sha}^{{commit}}")]);
+        let commit = run_publication_gh_command_with_limit(
+            commit_command,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            4096,
+            "planner frozen base check",
+        )
+        .await
+        .map_err(QuorumError::Io)?;
+        if !commit.status.success() {
+            return Err(QuorumError::Io(format!(
+                "planner frozen base {frozen_sha} is not a commit in the repository object store"
+            )));
+        }
 
         // `archive --worktree-attributes` skips the index load that rejects
         // `.git` components and `..` in tree paths, so validate the tree
@@ -7205,51 +7229,189 @@ async fn kill_and_reap_planner_view_processes(
     }
 }
 
-async fn repository_head_sha(repo: &Path) -> Result<String> {
-    repository_head_sha_with_options(
-        repo,
-        Path::new("git"),
-        FROZEN_BASE_CAPTURE_TIMEOUT,
-        FROZEN_BASE_CAPTURE_PIPE_BYTES,
+/// Capture the planner's frozen base from the freshly fetched
+/// `origin/<target>` of the source task, proving every dependency merge commit
+/// is reachable from it. This is the same target resolution and the same
+/// bounded fetch/verification workers use before cutting a branch; the
+/// daemon's repo-dir `HEAD` is never a planning base.
+///
+/// Done dependencies with a PR but no stamped SHA are first recovered through
+/// the worker path's shared `recover_missing_dependency_merge_commits`.
+///
+/// `Ok(Err(reason))` is an expected deferral (fetch/resolve failure, an open or
+/// unmerged dependency PR, unrecoverable dependency provenance, or a dependency
+/// merge not yet on the fetched tip):
+/// the caller must not bind. Only DB/join failures are `Err`. No transaction
+/// is held across the git calls.
+async fn capture_decomposition_frozen_base(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    source_task_id: i64,
+) -> Result<std::result::Result<String, String>> {
+    let load_source = || {
+        let path = config.db_path.clone();
+        tokio::task::spawn_blocking(
+            move || -> Result<Option<(Option<String>, tasks::DependencyMergeCommitResolution)>> {
+                let conn = quorum_core::db::open(&path)?;
+                let Some(task) = tasks::get(&conn, source_task_id)? else {
+                    return Ok(None);
+                };
+                let resolution =
+                    tasks::dependency_merge_commits(&conn, task.depends_on.as_deref())?;
+                Ok(Some((task.target_branch, resolution)))
+            },
+        )
+    };
+    let loaded = load_source()
+        .await
+        .map_err(|error| QuorumError::Io(format!("frozen base source read join: {error}")))??;
+    let Some((target_branch, resolution)) = loaded else {
+        return Ok(Err(format!(
+            "source task #{source_task_id} no longer exists"
+        )));
+    };
+    // Legacy tasks without a persisted target use the configured base, exactly
+    // as worker provisioning does; an invalid persisted target fails closed.
+    let base_branch = match target_branch {
+        Some(target) => {
+            if let Err(error) = tasks::validate_target_branch(&target) {
+                return Ok(Err(format!(
+                    "source task has invalid authoritative target branch: {error}"
+                )));
+            }
+            target
+        }
+        None => config.base_branch.clone(),
+    };
+    let mut dependencies = match resolution {
+        tasks::DependencyMergeCommitResolution::Resolved(dependencies) => dependencies,
+        tasks::DependencyMergeCommitResolution::Unresolved { reason } => return Ok(Err(reason)),
+    };
+    // A manually closed dependency may be done with its PR merged but no SHA
+    // stamped. Recover it exactly as worker provisioning does; otherwise the
+    // source's own planning freeze would block the worker provisioning that
+    // stamps it for this source. A PR that is open/closed-unmerged (the worker
+    // parks) or a failed lookup defers here.
+    if dependencies
+        .iter()
+        .any(|dependency| dependency.merge_commit_sha.is_none())
+    {
+        match recover_missing_dependency_merge_commits(
+            config,
+            &config.db_path,
+            wt_mgr,
+            &config.repo_dir,
+            &dependencies,
+            &base_branch,
+        )
+        .await?
+        {
+            DependencyMergeRecovery::Recovered => {}
+            DependencyMergeRecovery::PrNotMerged { reason }
+            | DependencyMergeRecovery::LookupFailed { reason } => return Ok(Err(reason)),
+        }
+        let reloaded = load_source().await.map_err(|error| {
+            QuorumError::Io(format!("frozen base source reload join: {error}"))
+        })??;
+        dependencies = match reloaded {
+            None => {
+                return Ok(Err(format!(
+                    "source task #{source_task_id} no longer exists"
+                )));
+            }
+            Some((_, tasks::DependencyMergeCommitResolution::Resolved(reloaded))) => reloaded,
+            Some((_, tasks::DependencyMergeCommitResolution::Unresolved { reason })) => {
+                return Ok(Err(reason));
+            }
+        };
+    }
+    let mut merge_commits = Vec::with_capacity(dependencies.len());
+    for dependency in dependencies {
+        match dependency.merge_commit_sha {
+            Some(sha) => merge_commits.push(sha),
+            None => {
+                return Ok(Err(match dependency.pr_number {
+                    Some(pr) => format!(
+                        "dependency #{} is done but PR #{pr} has no recoverable merge commit SHA",
+                        dependency.task_id
+                    ),
+                    None => format!(
+                        "dependency #{} is done but has no recorded merge commit SHA",
+                        dependency.task_id
+                    ),
+                }));
+            }
+        }
+    }
+    Ok(
+        match wt_mgr
+            .fetch_base_and_verify_dependency_commits(
+                &config.repo_dir,
+                &base_branch,
+                &merge_commits,
+            )
+            .await
+        {
+            Ok(DependencyBaseVerification::Verified { base_sha }) => Ok(base_sha),
+            Ok(DependencyBaseVerification::Missing { merge_commit_sha }) => Err(format!(
+                "fetched origin/{base_branch} does not yet contain dependency merge commit \
+                 {merge_commit_sha}"
+            )),
+            Err(error) => Err(format!(
+                "fetching origin/{base_branch} for the frozen base failed: {error}"
+            )),
+        },
     )
-    .await
 }
 
-async fn repository_head_sha_with_options(
-    repo: &Path,
-    git_bin: &Path,
-    timeout: Duration,
-    pipe_limit: usize,
-) -> Result<String> {
-    let repo = repo.to_path_buf();
-    let git_bin = git_bin.to_path_buf();
-    // The detached owner retains the child if an awaiting daemon tick is
-    // cancelled during shutdown; it will still hit the deadline and reap.
-    tokio::spawn(async move {
-        let mut command = tokio::process::Command::from(quorum_core::git::git_command(git_bin));
-        command.args(["rev-parse", "HEAD"]).current_dir(repo);
-        configure_planner_view_process_group(&mut command);
-        let output = run_publication_gh_command_with_limit(
-            command,
-            timeout,
-            pipe_limit,
-            "frozen-base capture",
-        )
-        .await
-        .map_err(QuorumError::Io)?;
-        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !output.status.success()
-            || !matches!(sha.len(), 40 | 64)
-            || !sha.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(QuorumError::Io(
-                "frozen-base capture returned no valid commit SHA".into(),
-            ));
+/// Record why the drain-to-planning handoff did not bind a frozen base. The
+/// lifecycle event on `task#<source>` is bounded: an identical live reason is
+/// never repeated, and a changed reason is rate-limited. Returns whether a new
+/// event was written, so the caller logs each recorded reason exactly once.
+async fn record_decomposition_base_deferral(
+    config: &ServeConfig,
+    graph_id: i64,
+    source_task_id: i64,
+    reason: &str,
+) -> Result<bool> {
+    let path = config.db_path.clone();
+    let body = truncate_utf8_bytes(
+        &format!("graph {graph_id}: planner frozen base not bound; {reason}"),
+        DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES,
+    )
+    .to_string();
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        let subject = format!("task#{source_task_id}");
+        let now = now_unix();
+        let suppressed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events
+             WHERE kind=?1 AND subject=?2 AND expires_at>?4
+               AND (body=?3 OR ts>?4-?5))",
+            rusqlite::params![
+                DECOMPOSITION_BASE_DEFERRED_EVENT,
+                subject,
+                body,
+                now,
+                DECOMPOSITION_BASE_DEFERRED_EVENT_INTERVAL_SECS
+            ],
+            |row| row.get(0),
+        )?;
+        if !suppressed {
+            quorum_core::events::emit(
+                &tx,
+                DECOMPOSITION_BASE_DEFERRED_EVENT,
+                &subject,
+                &body,
+                now,
+            )?;
         }
-        Ok(sha)
+        tx.commit()?;
+        Ok(!suppressed)
     })
     .await
-    .map_err(|error| QuorumError::Io(format!("frozen-base capture owner join failed: {error}")))?
+    .map_err(|error| QuorumError::Io(format!("frozen base deferral join: {error}")))?
 }
 
 impl DrainState {
@@ -9052,6 +9214,7 @@ fn planned_children(
 /// repository planning freeze is active after this tick.
 async fn tick_decomposition(
     config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
     coordinator: &mut DecompositionCoordinator,
 ) -> Result<bool> {
     // First consume terminal provider output. Provider processes are always
@@ -9587,17 +9750,41 @@ async fn tick_decomposition(
     }
     if snapshot.state == "draining" {
         // There is no drain precondition: unrelated work keeps running. The
-        // planner's base is the base-branch head captured here, when planning
-        // starts, outside any DB transaction. The planner reads it only
-        // through the read-only snapshot archive of that SHA, so the base
-        // never moves during one planning attempt.
-        let sha = repository_head_sha(&config.repo_dir).await?;
+        // planner's base is captured here, when planning starts, outside any
+        // DB transaction: the fetched target-branch tip, verified to contain
+        // every dependency merge. The planner reads it only through the
+        // read-only snapshot archive of that SHA, so the base never moves
+        // during one planning attempt. A failed fetch/verification leaves the
+        // graph `draining` with no SHA (its source-only freeze stays held) and
+        // a later tick retries; planning never starts on a stale base.
+        let sha = match capture_decomposition_frozen_base(config, wt_mgr, snapshot.source_task_id)
+            .await?
+        {
+            Ok(sha) => sha,
+            Err(reason) => {
+                if record_decomposition_base_deferral(
+                    config,
+                    snapshot.graph_id,
+                    snapshot.source_task_id,
+                    &reason,
+                )
+                .await?
+                {
+                    log(&format!(
+                        "graph {}: task #{}: planner frozen base not bound; retrying on a \
+                         later tick: {reason}",
+                        snapshot.graph_id, snapshot.source_task_id
+                    ));
+                }
+                return Ok(true);
+            }
+        };
         let path = config.db_path.clone();
         let graph_id = snapshot.graph_id;
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = quorum_core::db::open(&path)?;
             // A zero-row bind is an expected lost race (invariant #3): a concurrent
-            // block/cancel/recovery moved the graph off 'draining' during the head-SHA
+            // block/cancel/recovery moved the graph off 'draining' during the base
             // fetch above. Clean negative, not an internal error — the next tick re-reads
             // the new state. Mirrors begin_planning's Ok(None)-is-expected contract.
             quorum_core::decomposition::bind_frozen_base_and_enter_planning(
@@ -13546,7 +13733,7 @@ async fn tick(
 
     // The returned freeze flag is not a dispatch gate: a planning graph blocks
     // only its own source task (claim SQL), never unrelated work this tick.
-    tick_decomposition(config, decomposition_coordinator).await?;
+    tick_decomposition(config, wt_mgr, decomposition_coordinator).await?;
 
     // Graph consistency authority runs first. Exact merged-continuation
     // adoption is then settled before any ordinary recovery or provisioning
@@ -25136,6 +25323,106 @@ async fn provision_reviewer_reserved(
     Ok(ReviewerProvisionOutcome::Attached)
 }
 
+/// Outcome of recovering merge commits for done dependencies whose PR merged
+/// but whose SHA was never stamped (for example a manual close).
+enum DependencyMergeRecovery {
+    /// Every recoverable SHA was stamped; callers reload the resolution. A
+    /// dependency may still lack a SHA when no witness could be found.
+    Recovered,
+    /// A dependency's PR is still open or closed without merging.
+    PrNotMerged { reason: String },
+    /// The GitHub/Git merge lookup itself failed.
+    LookupFailed { reason: String },
+}
+
+/// Recover and durably stamp the merge commit of every done dependency that has
+/// a PR but no recorded SHA. Shared by worker provisioning and the planner's
+/// frozen-base capture so both resolve dependency provenance identically. All
+/// GitHub/Git work runs with no transaction held; each stamp is a tiny guarded
+/// write that never overwrites an existing SHA.
+async fn recover_missing_dependency_merge_commits(
+    config: &ServeConfig,
+    db_path: &Path,
+    wt_mgr: &WorktreeManager,
+    repo_dir: &Path,
+    dependencies: &[tasks::DependencyMergeCommit],
+    base_branch: &str,
+) -> Result<DependencyMergeRecovery> {
+    for dependency in dependencies
+        .iter()
+        .filter(|dependency| dependency.merge_commit_sha.is_none())
+    {
+        let Some(pr_number) = dependency.pr_number else {
+            continue;
+        };
+        let repo = repo_dir.to_path_buf();
+        let executor = Arc::clone(&config.merge_executor);
+        let status =
+            tokio::task::spawn_blocking(move || executor.merge_commit_status(pr_number, &repo))
+                .await
+                .map_err(|error| QuorumError::Io(format!("dependency PR lookup join: {error}")))?;
+        let merge_commit_sha = match status {
+            merge::MergeCommitStatus::Merged {
+                merge_commit_sha: Some(sha),
+            } => Some(sha),
+            merge::MergeCommitStatus::Merged {
+                merge_commit_sha: None,
+            }
+            | merge::MergeCommitStatus::Unknown => {
+                match wt_mgr
+                    .find_merged_pr_commit(repo_dir, base_branch, pr_number)
+                    .await
+                {
+                    Ok(sha) => sha,
+                    Err(error) => {
+                        return Ok(DependencyMergeRecovery::LookupFailed {
+                            reason: format!(
+                                "dependency #{}, PR #{pr_number} merge lookup failed: {error}",
+                                dependency.task_id
+                            ),
+                        });
+                    }
+                }
+            }
+            merge::MergeCommitStatus::Open => {
+                return Ok(DependencyMergeRecovery::PrNotMerged {
+                    reason: format!(
+                        "dependency #{} is done but PR #{pr_number} is still open",
+                        dependency.task_id
+                    ),
+                });
+            }
+            merge::MergeCommitStatus::Closed => {
+                return Ok(DependencyMergeRecovery::PrNotMerged {
+                    reason: format!(
+                        "dependency #{} is done but PR #{pr_number} closed without merging",
+                        dependency.task_id
+                    ),
+                });
+            }
+        };
+        let Some(merge_commit_sha) = merge_commit_sha else {
+            continue;
+        };
+        let db_path = db_path.to_path_buf();
+        let task_id = dependency.task_id;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut conn = quorum_core::db::open(&db_path)?;
+            tasks::record_dependency_merge_commit(
+                &mut conn,
+                task_id,
+                pr_number,
+                &merge_commit_sha,
+                now_unix(),
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("dependency merge stamp join: {error}")))??;
+    }
+    Ok(DependencyMergeRecovery::Recovered)
+}
+
 /// Spawn a worker for the next highest-priority ready task.
 /// Returns true if a worker was spawned, false if no ready tasks or names available.
 enum DependencyBaseAdmission {
@@ -25183,94 +25470,35 @@ async fn verify_dependency_base_before_allocation(
     // already merged. Recover that immutable witness before allocation. All
     // GitHub/Git work completes before the tiny guarded SQLite write below.
     if unresolved_reason.is_none() {
-        for dependency in dependencies
-            .iter()
-            .filter(|dependency| dependency.merge_commit_sha.is_none())
+        match recover_missing_dependency_merge_commits(
+            config,
+            db_path,
+            wt_mgr,
+            repo_dir,
+            &dependencies,
+            base_branch,
+        )
+        .await?
         {
-            let Some(pr_number) = dependency.pr_number else {
-                continue;
-            };
-            let repo = repo_dir.to_path_buf();
-            let executor = Arc::clone(&config.merge_executor);
-            let status =
-                tokio::task::spawn_blocking(move || executor.merge_commit_status(pr_number, &repo))
-                    .await
-                    .map_err(|error| {
-                        QuorumError::Io(format!("dependency PR lookup join: {error}"))
-                    })?;
-            let merge_commit_sha = match status {
-                merge::MergeCommitStatus::Merged {
-                    merge_commit_sha: Some(sha),
-                } => Some(sha),
-                merge::MergeCommitStatus::Merged {
-                    merge_commit_sha: None,
-                }
-                | merge::MergeCommitStatus::Unknown => wt_mgr
-                    .find_merged_pr_commit(repo_dir, base_branch, pr_number)
-                    .await
-                    .map_err(|error| {
-                        QuorumError::Io(format!(
-                            "dependency #{}, PR #{pr_number} merge lookup failed: {error}",
-                            dependency.task_id
-                        ))
-                    })?,
-                merge::MergeCommitStatus::Open => {
-                    let reason = format!(
-                        "dependency #{} is done but PR #{pr_number} is still open",
-                        dependency.task_id
-                    );
-                    require_park_task(
-                        db_path,
-                        task.id,
-                        &reason,
-                        if task.status == "rework" {
-                            "rework"
-                        } else {
-                            "open"
-                        },
-                    )
-                    .await?;
-                    log(&format!("PARKED: task #{}: {reason}", task.id));
-                    return Ok(DependencyBaseAdmission::Deferred);
-                }
-                merge::MergeCommitStatus::Closed => {
-                    let reason = format!(
-                        "dependency #{} is done but PR #{pr_number} closed without merging",
-                        dependency.task_id
-                    );
-                    require_park_task(
-                        db_path,
-                        task.id,
-                        &reason,
-                        if task.status == "rework" {
-                            "rework"
-                        } else {
-                            "open"
-                        },
-                    )
-                    .await?;
-                    log(&format!("PARKED: task #{}: {reason}", task.id));
-                    return Ok(DependencyBaseAdmission::Deferred);
-                }
-            };
-            let Some(merge_commit_sha) = merge_commit_sha else {
-                continue;
-            };
-            let db_path = db_path.to_path_buf();
-            let task_id = dependency.task_id;
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                let mut conn = quorum_core::db::open(&db_path)?;
-                tasks::record_dependency_merge_commit(
-                    &mut conn,
-                    task_id,
-                    pr_number,
-                    &merge_commit_sha,
-                    now_unix(),
-                )?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| QuorumError::Io(format!("dependency merge stamp join: {error}")))??;
+            DependencyMergeRecovery::Recovered => {}
+            DependencyMergeRecovery::PrNotMerged { reason } => {
+                require_park_task(
+                    db_path,
+                    task.id,
+                    &reason,
+                    if task.status == "rework" {
+                        "rework"
+                    } else {
+                        "open"
+                    },
+                )
+                .await?;
+                log(&format!("PARKED: task #{}: {reason}", task.id));
+                return Ok(DependencyBaseAdmission::Deferred);
+            }
+            DependencyMergeRecovery::LookupFailed { reason } => {
+                return Err(QuorumError::Io(reason));
+            }
         }
         resolution = load_dependencies()
             .await
@@ -64429,7 +64657,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(startup_state.defers_lifecycle_recovery());
         assert_eq!(coordinator.graph_id, Some(newer_graph));
 
-        assert!(tick_decomposition(&config, &mut coordinator).await.unwrap());
+        assert!(
+            tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap()
+        );
         assert_eq!(coordinator.graph_id, Some(newer_graph));
 
         let conn = quorum_core::db::open(&db_path).unwrap();
@@ -64489,11 +64721,19 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             .unwrap()
         };
 
-        assert!(!tick_decomposition(&config, &mut coordinator).await.unwrap());
+        assert!(
+            !tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap()
+        );
         assert_eq!(reset_row(), ("freeze-requested".into(), 0), "limit full");
 
         config.max_active_graphs = 3;
-        assert!(tick_decomposition(&config, &mut coordinator).await.unwrap());
+        assert!(
+            tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap()
+        );
         assert_eq!(reset_row(), ("freeze-requested".into(), 1));
         let conn = quorum_core::db::open(&db_path).unwrap();
         let errors: i64 = conn
@@ -65833,7 +66073,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             proposal: Some(proposal),
             ..DecompositionCoordinator::default()
         };
-        assert!(tick_decomposition(&config, &mut coordinator).await.unwrap());
+        assert!(
+            tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap()
+        );
         assert!(coordinator.proposal.is_none());
 
         let conn = quorum_core::db::open(&db_path).unwrap();
@@ -66697,7 +66941,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             classifications: Some(arbiter_gate_classifications()),
             ..DecompositionCoordinator::default()
         };
-        tick_decomposition(&config, &mut coordinator).await.unwrap();
+        tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+            .await
+            .unwrap();
 
         let attempts = arbiter_gate_attempts(&db_path, graph);
         assert!(
@@ -67234,6 +67480,52 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_ne!(retried.profile.provider, current.profile.provider);
     }
 
+    /// The remote `main` head as origin itself reports it, independent of the
+    /// daemon clone's tracking refs and HEAD.
+    #[cfg(unix)]
+    fn origin_main_head(repo_dir: &Path) -> String {
+        lifecycle_git(repo_dir, &["ls-remote", "origin", "refs/heads/main"])
+            .split_whitespace()
+            .next()
+            .expect("origin has a main head")
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    fn lifecycle_git(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Advance origin's `main` past the daemon clone's HEAD with a file that
+    /// exists only on the remote. The clone's refs and HEAD are untouched.
+    #[cfg(unix)]
+    fn push_remote_only_commit(repo_dir: &Path) -> String {
+        let scratch = tempfile::tempdir().unwrap();
+        let origin = lifecycle_git(repo_dir, &["remote", "get-url", "origin"]);
+        lifecycle_git(
+            scratch.path(),
+            &["clone", "-q", "-b", "main", &origin, "clone"],
+        );
+        let clone = scratch.path().join("clone");
+        lifecycle_git(&clone, &["config", "user.email", "test@example.com"]);
+        lifecycle_git(&clone, &["config", "user.name", "test"]);
+        std::fs::write(clone.join("src/remote_only.rs"), "pub fn remote() {}\n").unwrap();
+        lifecycle_git(&clone, &["add", "."]);
+        lifecycle_git(&clone, &["commit", "-qm", "remote only"]);
+        lifecycle_git(&clone, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        lifecycle_git(&clone, &["rev-parse", "HEAD"])
+    }
+
     struct LifecycleHarness {
         _dir: tempfile::TempDir,
         db_path: PathBuf,
@@ -67269,6 +67561,12 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         git(&["add", "."]);
         git(&["commit", "-qm", "frozen"]);
         let frozen_base_sha = git(&["rev-parse", "HEAD"]);
+        // The drain handoff binds the fetched `origin/main`, so the fixture
+        // needs a real origin whose base branch starts at the same commit.
+        let origin_dir = dir.path().join("origin.git");
+        git(&["init", "-q", "--bare", origin_dir.to_str().unwrap()]);
+        git(&["remote", "add", "origin", origin_dir.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "HEAD:refs/heads/main"]);
 
         let arbiter_output = dir.path().join("arbiter.jsonl");
         let classifier_output = dir.path().join("classifier.jsonl");
@@ -67411,7 +67709,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         }
 
         async fn tick(&self, coordinator: &mut DecompositionCoordinator) -> bool {
-            tick_decomposition(&self.config, coordinator).await.unwrap()
+            tick_decomposition(&self.config, &WorktreeManager::new(), coordinator)
+                .await
+                .unwrap()
         }
 
         /// Tick until the given slot predicate clears; the fake provider's exit
@@ -67506,7 +67806,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
 
         assert!(harness.tick(&mut coordinator).await);
-        let expected_sha = repository_head_sha(&harness.config.repo_dir).await.unwrap();
+        let expected_sha = origin_main_head(&harness.config.repo_dir);
         let conn = quorum_core::db::open(&harness.db_path).unwrap();
         let state: (String, bool, Option<String>) = conn
             .query_row(
@@ -67595,6 +67895,15 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             .unwrap();
         }
 
+        fn expire_backoff(&self) {
+            let conn = quorum_core::db::open(&self.db_path).unwrap();
+            conn.execute(
+                "UPDATE task_decompositions SET updated_at=5 WHERE id=?1",
+                [self.graph],
+            )
+            .unwrap();
+        }
+
         fn freeze_row(&self) -> FreezeRow {
             let conn = quorum_core::db::open(&self.db_path).unwrap();
             conn.query_row(
@@ -67623,11 +67932,406 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             assert!(self.tick(coordinator).await);
             assert_eq!(self.freeze_row().state, "draining");
             assert!(self.tick(coordinator).await);
-            let expected = repository_head_sha(&self.config.repo_dir).await.unwrap();
+            let expected = origin_main_head(&self.config.repo_dir);
             let row = self.freeze_row();
             assert_eq!(row.state, "planning");
             assert_eq!(row.frozen_base_sha, Some(expected));
         }
+
+        /// Return the graph to a pre-bind `draining` phase: freeze held, no SHA.
+        fn enter_unbound_drain(&self) {
+            let conn = quorum_core::db::open(&self.db_path).unwrap();
+            conn.execute(
+                "UPDATE task_decompositions SET state='draining',frozen_base_sha=NULL
+                 WHERE id=?1",
+                [self.graph],
+            )
+            .unwrap();
+        }
+
+        fn base_deferral_events(&self) -> Vec<String> {
+            let conn = quorum_core::db::open(&self.db_path).unwrap();
+            let mut statement = conn
+                .prepare("SELECT body FROM events WHERE kind=?1 AND subject=?2 ORDER BY rowid")
+                .unwrap();
+            statement
+                .query_map(
+                    rusqlite::params![
+                        DECOMPOSITION_BASE_DEFERRED_EVENT,
+                        format!("task#{}", self.source)
+                    ],
+                    |row| row.get(0),
+                )
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        }
+    }
+
+    /// An `external_constraint` planner blocker is operator-retryable: after
+    /// origin advances, the retried graph re-drains, binds the newer fetched
+    /// origin head instead of the blocked attempt's base, and starts a new
+    /// planner attempt under a fresh session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_constraint_retry_rebinds_advanced_origin_and_replans() {
+        let harness = lifecycle_harness("external-constraint-retry");
+        let blocked_base = harness
+            .freeze_row()
+            .frozen_base_sha
+            .expect("the blocked attempt bound a base");
+        {
+            let mut conn = quorum_core::db::open(&harness.db_path).unwrap();
+            conn.execute(
+                "UPDATE task_decompositions SET planner_session_id='blocked-session'
+                 WHERE id=?1",
+                [harness.graph],
+            )
+            .unwrap();
+            assert!(quorum_core::decomposition::record_attempt(
+                &mut conn,
+                harness.graph,
+                "blocker",
+                quorum_core::decomposition::RETRYABLE_PLANNER_BLOCKER,
+                "the named dependency is not merged into the frozen base",
+                5,
+            )
+            .unwrap()
+            .is_some());
+        }
+        let held = harness.freeze_row();
+        assert_eq!((held.state.as_str(), held.freeze_active), ("held", false));
+        let advanced = push_remote_only_commit(&harness.config.repo_dir);
+        assert_ne!(advanced, blocked_base);
+
+        {
+            let mut conn = quorum_core::db::open(&harness.db_path).unwrap();
+            assert_eq!(
+                quorum_core::decomposition::retry_exhausted_planning(
+                    &mut conn,
+                    harness.source,
+                    "operator",
+                    now_unix(),
+                )
+                .unwrap(),
+                quorum_core::decomposition::PlanningRetryOutcome::Retried {
+                    graph_id: harness.graph,
+                    generation: 1,
+                }
+            );
+        }
+        harness.expire_backoff();
+        let retried = harness.freeze_row();
+        assert_eq!(
+            (retried.state.as_str(), retried.frozen_base_sha),
+            ("provider-backoff", None)
+        );
+
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        harness
+            .assert_freeze_reaches_planning(&mut coordinator)
+            .await;
+        assert_eq!(
+            harness.freeze_row().frozen_base_sha.as_deref(),
+            Some(advanced.as_str())
+        );
+
+        harness.tick(&mut coordinator).await;
+        assert!(
+            coordinator.planner_slot.is_some(),
+            "the retried graph starts a new planner attempt"
+        );
+        let session: Option<String> = {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            conn.query_row(
+                "SELECT planner_session_id FROM task_decompositions WHERE id=?1",
+                [harness.graph],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(session.is_some());
+        assert_ne!(session.as_deref(), Some("blocked-session"));
+        assert_eq!(session, coordinator.planner_run_id);
+        // The new attempt keeps the base it bound for its whole life.
+        assert_eq!(
+            harness.freeze_row().frozen_base_sha.as_deref(),
+            Some(advanced.as_str())
+        );
+        harness.settle(&mut coordinator).await;
+    }
+
+    /// The daemon clone's HEAD lags origin: the handoff binds the fetched
+    /// remote head, and the planner view contains the remote-only file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_handoff_binds_fetched_origin_base_not_stale_repo_head() {
+        let harness = lifecycle_harness("origin-frozen-base");
+        let repo_dir = harness.config.repo_dir.clone();
+        let stale_head = lifecycle_git(&repo_dir, &["rev-parse", "HEAD"]);
+        let remote_head = push_remote_only_commit(&repo_dir);
+        assert_ne!(remote_head, stale_head);
+        harness.enter_unbound_drain();
+
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        let row = harness.freeze_row();
+        assert_eq!(row.state, "planning");
+        assert!(row.freeze_active);
+        assert_eq!(row.frozen_base_sha.as_deref(), Some(remote_head.as_str()));
+        assert_eq!(lifecycle_git(&repo_dir, &["rev-parse", "HEAD"]), stale_head);
+        assert!(harness.base_deferral_events().is_empty());
+
+        let snapshot = {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            load_planning_snapshot(&conn).unwrap().unwrap()
+        };
+        assert_eq!(snapshot.frozen_base_sha, remote_head);
+        let view = retain_cached_frozen_planner_view(&harness.config, &mut coordinator, &snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(view.join("src/remote_only.rs")).unwrap(),
+            "pub fn remote() {}\n"
+        );
+        assert!(view.join("src/core.rs").exists());
+    }
+
+    /// A failed base fetch never binds: the graph stays `draining` with no SHA,
+    /// one bounded reason event is recorded, and a later tick binds once the
+    /// origin is reachable again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_handoff_defers_without_binding_when_base_fetch_fails() {
+        let harness = lifecycle_harness("origin-fetch-failure");
+        let repo_dir = harness.config.repo_dir.clone();
+        let origin = lifecycle_git(&repo_dir, &["remote", "get-url", "origin"]);
+        let missing = harness._dir.path().join("missing.git");
+        lifecycle_git(
+            &repo_dir,
+            &["remote", "set-url", "origin", missing.to_str().unwrap()],
+        );
+        harness.enter_unbound_drain();
+        let held = harness.freeze_row();
+        assert_eq!(
+            (held.state.as_str(), held.freeze_active),
+            ("draining", true)
+        );
+
+        let mut coordinator = DecompositionCoordinator::default();
+        for _ in 0..3 {
+            assert!(
+                harness.tick(&mut coordinator).await,
+                "the freeze stays held"
+            );
+            assert_eq!(harness.freeze_row(), held);
+            assert!(coordinator.planner_slot.is_none());
+        }
+        let events = harness.base_deferral_events();
+        assert_eq!(
+            events.len(),
+            1,
+            "a persistent failure is not re-emitted: {events:?}"
+        );
+        assert!(
+            events[0].contains("planner frozen base not bound")
+                && events[0].contains("fetching origin/main"),
+            "{events:?}"
+        );
+
+        lifecycle_git(&repo_dir, &["remote", "set-url", "origin", &origin]);
+        let remote_head = push_remote_only_commit(&repo_dir);
+        assert!(harness.tick(&mut coordinator).await);
+        let row = harness.freeze_row();
+        assert_eq!(row.state, "planning");
+        assert_eq!(row.frozen_base_sha, Some(remote_head));
+    }
+
+    /// A dependency merge commit absent from the fetched base is the same
+    /// deferral: no bind, no planning, one visible reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_handoff_defers_while_dependency_merge_is_missing_from_fetched_base() {
+        let harness = lifecycle_harness("origin-missing-dependency");
+        let repo_dir = harness.config.repo_dir.clone();
+        // An unpushed local commit stands in for a dependency merge GitHub
+        // reported before it reached origin/main.
+        std::fs::write(repo_dir.join("src/unpublished.rs"), "pub fn later() {}\n").unwrap();
+        lifecycle_git(&repo_dir, &["add", "."]);
+        lifecycle_git(&repo_dir, &["commit", "-qm", "unpublished"]);
+        let unpublished = lifecycle_git(&repo_dir, &["rev-parse", "HEAD"]);
+        let dependency = harness.add_task(
+            "done",
+            Some(&serde_json::json!({ "pr": 7, "merge_commit_sha": unpublished }).to_string()),
+        );
+        {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET depends_on=?2 WHERE id=?1",
+                rusqlite::params![harness.source, format!("[{dependency}]")],
+            )
+            .unwrap();
+        }
+        harness.enter_unbound_drain();
+        let held = harness.freeze_row();
+
+        let mut coordinator = DecompositionCoordinator::default();
+        for _ in 0..2 {
+            assert!(harness.tick(&mut coordinator).await);
+            assert_eq!(harness.freeze_row(), held);
+        }
+        let events = harness.base_deferral_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            events[0].contains(&format!(
+                "does not yet contain dependency merge commit {unpublished}"
+            )),
+            "{events:?}"
+        );
+    }
+
+    /// Push a GitHub-style `Merge pull request #<pr>` merge commit to origin's
+    /// `main`, as a PR merged on GitHub would land. Returns the merge SHA.
+    #[cfg(unix)]
+    fn push_remote_pr_merge(repo_dir: &Path, pr: i64) -> String {
+        let scratch = tempfile::tempdir().unwrap();
+        let origin = lifecycle_git(repo_dir, &["remote", "get-url", "origin"]);
+        lifecycle_git(
+            scratch.path(),
+            &["clone", "-q", "-b", "main", &origin, "clone"],
+        );
+        let clone = scratch.path().join("clone");
+        lifecycle_git(&clone, &["config", "user.email", "test@example.com"]);
+        lifecycle_git(&clone, &["config", "user.name", "test"]);
+        lifecycle_git(&clone, &["checkout", "-qb", "feature"]);
+        std::fs::write(clone.join("src/merged_dep.rs"), "pub fn dep() {}\n").unwrap();
+        lifecycle_git(&clone, &["add", "."]);
+        lifecycle_git(&clone, &["commit", "-qm", "dependency work"]);
+        lifecycle_git(&clone, &["checkout", "-q", "main"]);
+        lifecycle_git(
+            &clone,
+            &[
+                "merge",
+                "--no-ff",
+                "-q",
+                "-m",
+                &format!("Merge pull request #{pr} from org/feature"),
+                "feature",
+            ],
+        );
+        lifecycle_git(&clone, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        lifecycle_git(&clone, &["rev-parse", "HEAD"])
+    }
+
+    /// Make `harness.source` depend on a done task whose PR is recorded but
+    /// whose merge commit SHA was never stamped (a manual close).
+    #[cfg(unix)]
+    fn add_unstamped_pr_dependency(harness: &LifecycleHarness, pr: i64) -> i64 {
+        let dependency =
+            harness.add_task("done", Some(&serde_json::json!({ "pr": pr }).to_string()));
+        let conn = quorum_core::db::open(&harness.db_path).unwrap();
+        conn.execute(
+            "UPDATE tasks SET depends_on=?2 WHERE id=?1",
+            rusqlite::params![harness.source, format!("[{dependency}]")],
+        )
+        .unwrap();
+        dependency
+    }
+
+    #[cfg(unix)]
+    fn stamped_merge_commit(harness: &LifecycleHarness, task: i64) -> Option<String> {
+        let conn = quorum_core::db::open(&harness.db_path).unwrap();
+        conn.query_row(
+            "SELECT json_extract(refs,'$.merge_commit_sha') FROM tasks WHERE id=?1",
+            [task],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A done dependency with a PR but no stamped SHA is recovered exactly as
+    /// worker provisioning recovers it: the merge commit is found on the
+    /// fetched base, stamped durably, and the drain handoff binds instead of
+    /// holding the repo-wide freeze forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_handoff_recovers_unstamped_dependency_merge_and_binds() {
+        let harness = lifecycle_harness("origin-recover-dependency");
+        let repo_dir = harness.config.repo_dir.clone();
+        let dependency = add_unstamped_pr_dependency(&harness, 41);
+        let merge_sha = push_remote_pr_merge(&repo_dir, 41);
+        assert_eq!(stamped_merge_commit(&harness, dependency), None);
+        harness.enter_unbound_drain();
+
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        let row = harness.freeze_row();
+        assert_eq!(row.state, "planning");
+        assert_eq!(row.frozen_base_sha.as_deref(), Some(merge_sha.as_str()));
+        assert_eq!(
+            stamped_merge_commit(&harness, dependency).as_deref(),
+            Some(merge_sha.as_str())
+        );
+        assert!(harness.base_deferral_events().is_empty());
+    }
+
+    /// Where worker provisioning parks on an open dependency PR, the drain
+    /// handoff defers: no bind, no stamp, one visible reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_handoff_defers_while_dependency_pr_is_open() {
+        let mut harness = lifecycle_harness("origin-open-dependency");
+        harness.config.merge_executor = Arc::new(OpenDependencyMergeStatusExecutor);
+        let dependency = add_unstamped_pr_dependency(&harness, 42);
+        harness.enter_unbound_drain();
+        let held = harness.freeze_row();
+
+        let mut coordinator = DecompositionCoordinator::default();
+        for _ in 0..2 {
+            assert!(harness.tick(&mut coordinator).await);
+            assert_eq!(harness.freeze_row(), held);
+            assert!(coordinator.planner_slot.is_none());
+        }
+        assert_eq!(stamped_merge_commit(&harness, dependency), None);
+        let events = harness.base_deferral_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            events[0].contains(&format!(
+                "dependency #{dependency} is done but PR #42 is still open"
+            )),
+            "{events:?}"
+        );
+    }
+
+    /// A PR that merged without a findable merge commit defers with the
+    /// worker's "no recoverable merge commit SHA" reason.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_handoff_defers_when_dependency_merge_is_unrecoverable() {
+        let harness = lifecycle_harness("origin-unrecoverable-dependency");
+        let dependency = add_unstamped_pr_dependency(&harness, 43);
+        harness.enter_unbound_drain();
+        let held = harness.freeze_row();
+
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(harness.freeze_row(), held);
+        let events = harness.base_deferral_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            events[0].contains(&format!(
+                "dependency #{dependency} is done but PR #43 has no recoverable merge commit SHA"
+            )),
+            "{events:?}"
+        );
+
+        // Once the merge lands on origin, a later tick recovers and binds.
+        let merge_sha = push_remote_pr_merge(&harness.config.repo_dir, 43);
+        assert!(harness.tick(&mut coordinator).await);
+        let row = harness.freeze_row();
+        assert_eq!(row.state, "planning");
+        assert_eq!(row.frozen_base_sha, Some(merge_sha));
     }
 
     /// `tick` needs more stack than a default test thread provides, and the
@@ -67698,7 +68402,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 .unwrap()
                 .success());
             git(&["branch", "-M", "main"]);
-            git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+            // The lifecycle harness already has an origin; repoint it here.
+            git(&["remote", "set-url", "origin", remote.to_str().unwrap()]);
             git(&["push", "-q", "origin", "main"]);
 
             let task = harness.add_task(
@@ -67897,7 +68602,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             fixture.assert_worker_attached(&harness);
 
             assert!(harness.tick(&mut coordinator).await);
-            let expected = repository_head_sha(&harness.config.repo_dir).await.unwrap();
+            let expected = origin_main_head(&harness.config.repo_dir);
             let row = harness.freeze_row();
             assert_eq!(row.state, "planning");
             assert_eq!(row.frozen_base_sha, Some(expected));
@@ -67963,9 +68668,10 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 .status()
                 .unwrap()
                 .success());
+            // The lifecycle harness already has an origin; repoint it here.
             for args in [
                 vec!["branch", "-M", "main"],
-                vec!["remote", "add", "origin", remote.to_str().unwrap()],
+                vec!["remote", "set-url", "origin", remote.to_str().unwrap()],
                 vec!["push", "-q", "origin", "main"],
             ] {
                 let output = std::process::Command::new("git")
@@ -68110,9 +68816,15 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
     /// Commit `name` on the harness repository's current branch.
     #[cfg(unix)]
+    /// Commit `name` and publish it to origin's `main`, as a base merge would:
+    /// the planning base is the fetched origin head, not the clone's HEAD.
     fn commit_file(repo: &Path, name: &str) {
         std::fs::write(repo.join(name), name).unwrap();
-        for args in [vec!["add", name], vec!["commit", "-qm", name]] {
+        for args in [
+            vec!["add", name],
+            vec!["commit", "-qm", name],
+            vec!["push", "-q", "origin", "HEAD:refs/heads/main"],
+        ] {
             let output = std::process::Command::new("git")
                 .args(&args)
                 .current_dir(repo)
@@ -68129,9 +68841,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     /// No drain precondition: a graph moves from `freeze-requested` through
     /// `draining` to `planning` while unrelated work is started in every
     /// non-terminal status (including parked and provider-blocked work and a
-    /// live-agent journal row). The bound base is the head at planning start,
-    /// not at freeze request, and the planner's archive of it does not follow
-    /// later base movement.
+    /// live-agent journal row). The bound base is the fetched origin head at
+    /// planning start, not at freeze request, and the planner's archive of it
+    /// does not follow later base movement.
     #[cfg(unix)]
     #[tokio::test]
     async fn planning_starts_while_unrelated_work_is_started() {
@@ -68173,11 +68885,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(harness.tick(&mut coordinator).await);
         assert_eq!(harness.freeze_row().state, "draining");
 
-        // The base moves after the freeze request; the bind records the head
-        // at planning start.
+        // The base moves after the freeze request; the bind records the
+        // fetched origin head at planning start.
         let repo = harness.config.repo_dir.clone();
         commit_file(&repo, "before-planning.txt");
-        let planning_head = repository_head_sha(&repo).await.unwrap();
+        let planning_head = origin_main_head(&repo);
         assert!(harness.tick(&mut coordinator).await);
         let row = harness.freeze_row();
         assert_eq!(row.state, "planning");
@@ -68198,7 +68910,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         // An unrelated merge moves the base during planning. The planner's
         // snapshot archive stays at the recorded SHA.
         commit_file(&repo, "after-planning-start.txt");
-        assert_ne!(repository_head_sha(&repo).await.unwrap(), planning_head);
+        assert_ne!(origin_main_head(&repo), planning_head);
         let snapshot = {
             let conn = quorum_core::db::open(&harness.db_path).unwrap();
             load_planning_snapshot(&conn).unwrap().unwrap()
@@ -68870,7 +69582,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
         let mut error = None;
         for _ in 0..200 {
-            match tick_decomposition(&config, &mut coordinator).await {
+            match tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator).await {
                 Ok(_) if coordinator.arbiter_slot.is_some() => {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
@@ -69217,7 +69929,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
             let config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
             let mut coordinator = DecompositionCoordinator::default();
-            assert!(tick_decomposition(&config, &mut coordinator).await.unwrap());
+            assert!(
+                tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                    .await
+                    .unwrap()
+            );
 
             let conn = quorum_core::db::open(&db_path).unwrap();
             let state: (String, Option<String>, i64) = conn
@@ -69784,7 +70500,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         // The fake provider's exit is observed by the poll, not by the tick
         // count: under load its EOF can precede its reaped status by a tick.
         for _ in 0..200 {
-            tick_decomposition(&config, &mut coordinator).await.unwrap();
+            tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap();
             if coordinator.planner_slot.is_none() {
                 break;
             }
@@ -69831,7 +70549,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(coordinator.arbiter_slot.is_none());
 
         for _ in 0..200 {
-            tick_decomposition(&config, &mut coordinator).await.unwrap();
+            tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap();
             if coordinator.classifier_slot.is_none() {
                 break;
             }
@@ -69863,7 +70583,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
 
         for _ in 0..200 {
-            tick_decomposition(&config, &mut coordinator).await.unwrap();
+            tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap();
             if coordinator.arbiter_slot.is_none() {
                 break;
             }
@@ -70070,7 +70792,9 @@ exec /bin/cat '{stdout}'
         .await
         .unwrap();
 
-        tick_decomposition(&config, &mut coordinator).await.unwrap();
+        tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+            .await
+            .unwrap();
         let run_id = coordinator
             .planner_run_id
             .clone()
@@ -70130,7 +70854,9 @@ exec /bin/cat '{stdout}'
             if coordinator.planner_slot.is_none() {
                 break;
             }
-            tick_decomposition(&config, &mut coordinator).await.unwrap();
+            tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap();
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(
@@ -70292,7 +71018,9 @@ exec /bin/cat '{stdout}'
         };
 
         for _ in 0..200 {
-            tick_decomposition(&config, &mut coordinator).await.unwrap();
+            tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap();
             if coordinator.planner_slot.is_none() {
                 break;
             }
@@ -70377,24 +71105,27 @@ exec /bin/cat '{stdout}'
         git(&["add", "state.txt"]);
         git(&["commit", "-qm", "drift"]);
         let moved_head = git(&["rev-parse", "HEAD"]);
-        assert_eq!(repository_head_sha(repo.path()).await.unwrap(), moved_head);
         assert_ne!(moved_head, frozen);
-        // No drain holds the base still, so the view must not follow HEAD: a
-        // fresh archive of the frozen SHA still shows the frozen tree.
-        let view = frozen_planner_view(repo.path(), &frozen).await.unwrap();
+        // No drain holds the base still, so the view must not follow HEAD: it
+        // is addressed by the bound commit, never the clone's HEAD, and a moved
+        // HEAD neither changes nor refuses the frozen tree.
+        let again = frozen_planner_view(repo.path(), &frozen).await.unwrap();
         assert_eq!(
-            std::fs::read_to_string(view.path().join("state.txt")).unwrap(),
+            std::fs::read_to_string(again.path().join("state.txt")).unwrap(),
             "frozen"
         );
-        // An unknown frozen SHA still fails closed.
-        assert!(
-            frozen_planner_view(repo.path(), "0123456789abcdef0123456789abcdef01234567")
-                .await
-                .is_err()
-        );
+        // An unknown frozen SHA (its commit object is absent) still fails closed.
+        let absent = "0123456789abcdef0123456789abcdef01234567";
+        let error = frozen_planner_view(repo.path(), absent)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is not a commit"), "{error}");
 
         let not_a_repo = tempfile::tempdir().unwrap();
-        assert!(repository_head_sha(not_a_repo.path()).await.is_err());
+        assert!(frozen_planner_view(not_a_repo.path(), &frozen)
+            .await
+            .is_err());
     }
 
     #[cfg(unix)]
@@ -70625,94 +71356,6 @@ exec /bin/cat '{stdout}'
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn frozen_base_capture_bounds_silent_and_continuous_git_and_reaps() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let repo = tempfile::tempdir().unwrap();
-        for (case, body, expected, timeout) in [
-            (
-                "silent",
-                "exec sleep 30",
-                "timed out",
-                Duration::from_secs(5),
-            ),
-            (
-                "noisy",
-                "exec yes x",
-                "stdout exceeded",
-                Duration::from_secs(15),
-            ),
-        ] {
-            let pid_path = repo.path().join(format!("{case}.pid"));
-            let git = repo.path().join(format!("git-{case}"));
-            std::fs::write(
-                &git,
-                format!(
-                    "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\n{body}\n",
-                    pid_path.display()
-                ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let error = repository_head_sha_with_options(repo.path(), &git, timeout, 4096)
-                .await
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains(expected), "{case}: {error}");
-            let pid: i32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
-            assert_eq!(
-                unsafe { libc::kill(pid, 0) },
-                -1,
-                "{case} frozen-base capture was not reaped"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn cancelled_frozen_base_wait_retains_owner_until_kill_and_reap() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let repo = tempfile::tempdir().unwrap();
-        let pid_path = repo.path().join("cancelled.pid");
-        let git = repo.path().join("git-cancelled");
-        std::fs::write(
-            &git,
-            format!(
-                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
-                pid_path.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let repo_path = repo.path().to_path_buf();
-        let capture = tokio::spawn(async move {
-            repository_head_sha_with_options(&repo_path, &git, Duration::from_secs(5), 4096).await
-        });
-        let mut pid = None;
-        for _ in 0..1_500 {
-            pid = std::fs::read_to_string(&pid_path)
-                .ok()
-                .and_then(|value| value.parse().ok());
-            if pid.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let pid: i32 = pid.expect("frozen-base child did not publish its pid");
-        capture.abort();
-        let _ = capture.await;
-        for _ in 0..500 {
-            if unsafe { libc::kill(pid, 0) } == -1 {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("cancelled frozen-base capture escaped bounded kill/reap");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
     async fn planner_view_streams_through_a_hard_archive_ceiling() {
         let repo = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
@@ -70889,7 +71532,7 @@ exec /bin/cat '{stdout}'
         std::fs::write(
             &git_wrapper,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = -c ] && [ \"$2\" = core.fsmonitor=false ]; then shift 2; fi\nif [ \"$1\" = rev-parse ]; then exec '{}' \"$@\"; fi\ncase \" $* \" in *\" read-tree \"*) exec '{}' \"$@\";; esac\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+                "#!/bin/sh\nif [ \"$1\" = -c ] && [ \"$2\" = core.fsmonitor=false ]; then shift 2; fi\nif [ \"$1\" = rev-parse ]; then exec '{}' \"$@\"; fi\ncase \" $* \" in *\" read-tree \"*|*\" cat-file \"*) exec '{}' \"$@\";; esac\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
                 real_git,
                 real_git,
                 archive_pid.display()
