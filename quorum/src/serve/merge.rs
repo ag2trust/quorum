@@ -296,7 +296,19 @@ pub trait MergeExecutor: Send + Sync {
     /// the GitHub executor returns its injected source.
     #[allow(dead_code)] // consumed by sibling migrations of non-merge gh call sites
     fn github_credentials(&self) -> Arc<dyn GithubCredentialSource> {
-        Arc::new(LocalDefaultCredentialSource::new(None))
+        // Test builds hand every mock executor a fixed fake token so unit
+        // fixtures never depend on ambient `gh auth` on the test host (CI
+        // runners have none). Production keeps the local default source.
+        #[cfg(test)]
+        {
+            Arc::new(crate::github_credentials::FakeCredentialSource::token(
+                "test-fixture-token",
+            ))
+        }
+        #[cfg(not(test))]
+        {
+            Arc::new(LocalDefaultCredentialSource::new(None))
+        }
     }
 }
 
@@ -2727,13 +2739,18 @@ mod tests {
             "the executor hands out its injected source"
         );
 
-        // Other implementors inherit the local default without code changes.
+        // Other implementors inherit the default without code changes; in
+        // test builds that default is hermetic (no ambient `gh auth`).
         let command = CommandMergeExecutor {
             command: "true".into(),
             checks_cmd: None,
             mergeability_cmd: None,
         };
-        let _default: Arc<dyn GithubCredentialSource> = command.github_credentials();
+        let default: Arc<dyn GithubCredentialSource> = command.github_credentials();
+        assert_eq!(
+            default.token().unwrap().expose_secret(),
+            "test-fixture-token"
+        );
     }
 
     fn repo_view_argv(exec: &GhMergeExecutor, repo_dir: &Path) -> Vec<String> {
