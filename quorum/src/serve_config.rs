@@ -1843,7 +1843,10 @@ mod tests {
         .unwrap();
         // The operator's host opts the bind in; the daemon adds the loopback
         // literal its managed runs dial for a wildcard bind.
-        assert_eq!(resolved.allowed_hosts, ["quorum.internal:8812", "127.0.0.1"]);
+        assert_eq!(
+            resolved.allowed_hosts,
+            ["quorum.internal:8812", "127.0.0.1"]
+        );
         let error = agent_mcp_config(
             "agent_mcp_listen = \"0.0.0.0:8812\"\nagent_mcp_allowed_hosts = [\"bad host\"]\n",
         )
@@ -1854,10 +1857,19 @@ mod tests {
     #[test]
     fn exported_agent_mcp_authority_is_always_admitted() {
         let addr = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
-        assert_eq!(agent_mcp_url(addr("0.0.0.0:8812")), "http://127.0.0.1:8812/mcp");
+        assert_eq!(
+            agent_mcp_url(addr("0.0.0.0:8812")),
+            "http://127.0.0.1:8812/mcp"
+        );
         assert_eq!(agent_mcp_url(addr("[::]:8812")), "http://[::1]:8812/mcp");
-        assert_eq!(agent_mcp_url(addr("192.0.2.7:8812")), "http://192.0.2.7:8812/mcp");
-        assert_eq!(agent_mcp_url(addr("127.0.0.1:4100")), "http://127.0.0.1:4100/mcp");
+        assert_eq!(
+            agent_mcp_url(addr("192.0.2.7:8812")),
+            "http://192.0.2.7:8812/mcp"
+        );
+        assert_eq!(
+            agent_mcp_url(addr("127.0.0.1:4100")),
+            "http://127.0.0.1:4100/mcp"
+        );
 
         let hosts = |listen: &str| {
             agent_mcp_config(&format!(
