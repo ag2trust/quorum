@@ -781,6 +781,13 @@ pub const AGENT_MCP_ENV_VARS: &[&str] = &[
     "QUORUM_AGENT_ENDPOINT",
 ];
 
+/// Environment name carrying the daemon-embedded agent MCP Streamable HTTP
+/// URL (`http://<bound addr>/mcp`) into every managed run, planners included.
+/// Requests authenticate with `Authorization: Bearer $QUORUM_RUN_ID`. It is
+/// deliberately not in [`AGENT_MCP_ENV_VARS`], which the retired stdio
+/// adapters copy into their `quorum agent-mcp` child.
+pub const AGENT_MCP_URL_ENV: &str = "QUORUM_AGENT_MCP_URL";
+
 pub const AGENT_MCP_SERVER: AgentMcpServer = AgentMcpServer {
     command: "quorum",
     args: &["agent-mcp"],

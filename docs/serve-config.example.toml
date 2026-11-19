@@ -126,6 +126,16 @@ base_branch = "main"
 # a branch sync fails loudly once published if the effective gate is empty.
 sync_pairs = []
 
+# ── agent MCP listener ───────────────────────────────────────────────
+# serve binds the agent MCP (Streamable HTTP at http://<addr>/mcp) at
+# startup and exports QUORUM_AGENT_MCP_URL to every managed run; the bearer
+# is the run's QUORUM_RUN_ID. Loopback by default. A non-loopback bind
+# requires explicit allowed hosts. orchestrator_mcp_listen only declares the
+# separately run orchestrator-mcp address so startup can refuse a clash.
+# agent_mcp_listen = "127.0.0.1:0"
+# agent_mcp_allowed_hosts = ["quorum.internal:8812"]
+# orchestrator_mcp_listen = "127.0.0.1:8811"
+
 # ── observational host resources ─────────────────────────────────────
 # These values affect status severity and transition-only daemon warnings.
 # They never throttle agents or change task lifecycle.

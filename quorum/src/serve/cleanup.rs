@@ -920,6 +920,7 @@ mod tests {
             grok: Default::default(),
             pr_target_program: None,
             max_active_graphs: 2,
+            agent_mcp_url: Some("http://127.0.0.1:9/mcp".into()),
         }
     }
 
