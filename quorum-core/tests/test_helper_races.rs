@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use support::protocol::{
     AcquireDaemonLockInput, AllocateRoleInput, Barrier, ClaimCleanupInput,
-    ClaimGithubOperationInput, ClaimProviderRetryReworkInput, Operation, EXIT_NEGATIVE,
-    EXIT_SUCCESS,
+    ClaimGithubOperationInput, ClaimProviderRetryReworkInput, DiscardRunnerRetryInput, Operation,
+    PendingTurnInput, RetryProviderBlockedInput, EXIT_NEGATIVE, EXIT_SUCCESS,
 };
 
 const BARRIER_TIMEOUT_MS: u64 = 30_000;
@@ -622,4 +622,185 @@ fn real_process_provider_rework_claim_smoke_has_exactly_one_winner() {
 #[ignore = "stress lane: run scripts/stress-process-canaries.sh"]
 fn stress_repeats_provider_rework_claim_race() {
     provider_rework_claim_has_exactly_one_winner(3, 12);
+}
+
+fn discard_turn() -> PendingTurnInput {
+    PendingTurnInput {
+        provider: "codex".into(),
+        model: "gpt-5".into(),
+        effort: "high".into(),
+        prompt: "finish exact turn".into(),
+        turn_kind: "rework".into(),
+        continuation_id: Some("thread-live".into()),
+        requested: true,
+    }
+}
+
+/// Real-process race between the core `task-retry` path and the guarded
+/// discard of an unresumable runner retry. The seeded refs make both
+/// individually admissible (a provider block beside a requested turn), and
+/// either winner invalidates every other racer, so each round must have
+/// exactly one winner, clean losers, and no `errors` rows.
+fn task_retry_and_runner_retry_discard_have_exactly_one_winner(rounds: usize, per_kind: usize) {
+    const TTL: i64 = 3_600;
+
+    for round in 0..rounds {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("quorum.db");
+        let now = 20_000 + round as i64;
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "runner retry discard race",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now - 3,
+        )
+        .unwrap();
+        quorum_core::classify::store_classifications(
+            &mut conn,
+            &[quorum_core::classify::TaskClassification {
+                task_id,
+                cx_est: 3,
+                size: "M".into(),
+                size_reason: "bounded test classification rationale".into(),
+                ready: true,
+                not_ready_reason: None,
+                duplicate_of: vec![],
+                risk_flags: vec![],
+            }],
+            "integration-test:v2",
+            now - 3,
+        )
+        .unwrap();
+        quorum_core::tasks::claim(&mut conn, "worker", Some(task_id), &[], TTL, now - 2)
+            .unwrap()
+            .expect("seed worker claims the task");
+        let turn = discard_turn();
+        let refs = serde_json::json!({
+            "runner_provider_block": {"provider": "codex", "reason": "quota"},
+            "runner_retry": turn,
+            "runner_continuation": {"provider": "codex", "id": "thread-live"},
+        });
+        quorum_core::tasks::update_refs_daemon(&mut conn, task_id, &refs.to_string(), now - 1)
+            .unwrap();
+        drop(conn);
+
+        let go_path = dir.path().join("go");
+        let mut labels = Vec::new();
+        let mut ready_paths = Vec::new();
+        let mut helpers = Vec::new();
+        for index in 0..per_kind {
+            let ready = dir.path().join(format!("ready-retry-{index}"));
+            helpers.push(
+                support::spawn(
+                    Operation::RetryProviderBlocked,
+                    &RetryProviderBlockedInput {
+                        db_path: db_path.clone(),
+                        task_id,
+                        by: format!("operator-{index}"),
+                        now,
+                        barrier: barrier(ready.clone(), &go_path),
+                    },
+                )
+                .unwrap(),
+            );
+            labels.push(format!("retry-{index}"));
+            ready_paths.push(ready);
+
+            let ready = dir.path().join(format!("ready-discard-{index}"));
+            helpers.push(
+                support::spawn(
+                    Operation::DiscardRunnerRetry,
+                    &DiscardRunnerRetryInput {
+                        db_path: db_path.clone(),
+                        task_id,
+                        holder: "worker".into(),
+                        expected_turn: discard_turn(),
+                        new_profile_id: "worker.M.fallback".into(),
+                        now,
+                        barrier: barrier(ready.clone(), &go_path),
+                    },
+                )
+                .unwrap(),
+            );
+            labels.push(format!("discard-{index}"));
+            ready_paths.push(ready);
+        }
+        release_when_ready(&ready_paths, &go_path);
+
+        let outcomes: Vec<_> = labels
+            .iter()
+            .zip(helpers)
+            .map(|(label, helper)| (label, helper.wait(PARENT_TIMEOUT).unwrap()))
+            .collect();
+        let rendered = render_provider_retry_outcomes(&outcomes);
+        let winners: Vec<&String> = outcomes
+            .iter()
+            .filter(|(_, output)| output.status.code() == Some(EXIT_SUCCESS))
+            .map(|(label, _)| *label)
+            .collect();
+        assert_eq!(winners.len(), 1, "round {round}: {rendered}");
+        assert!(
+            outcomes.iter().all(|(_, output)| matches!(
+                output.status.code(),
+                Some(EXIT_SUCCESS | EXIT_NEGATIVE)
+            )),
+            "round {round}: losers must be clean; {rendered}"
+        );
+        for (_, output) in &outcomes {
+            assert_eq!(
+                output.json()["ok"],
+                output.status.code() == Some(EXIT_SUCCESS),
+                "round {round}: {rendered}"
+            );
+        }
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        let notes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_notes WHERE task_id=?1 AND agent='daemon'
+                   AND body LIKE 'runner retry discarded:%'",
+                rusqlite::params![task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if winners[0].starts_with("discard-") {
+            assert_eq!(task.status, "working", "round {round}");
+            assert_eq!(task.assignee.as_deref(), Some("worker"), "round {round}");
+            for key in [
+                "runner_retry",
+                "runner_continuation",
+                "runner_provider_block",
+            ] {
+                assert!(refs.get(key).is_none(), "round {round}: {key} in {refs}");
+            }
+            assert_eq!(notes, 1, "round {round}");
+        } else {
+            assert_eq!(task.status, "open", "round {round}");
+            assert_eq!(task.assignee, None, "round {round}");
+            assert_eq!(refs["runner_retry"]["requested"], true, "round {round}");
+            assert!(refs.get("runner_provider_block").is_none(), "round {round}");
+            assert_eq!(notes, 0, "round {round}");
+        }
+        assert_eq!(count(&conn, "errors"), 0, "round {round}: {rendered}");
+    }
+}
+
+#[test]
+fn real_process_task_retry_and_runner_retry_discard_smoke_has_exactly_one_winner() {
+    task_retry_and_runner_retry_discard_have_exactly_one_winner(2, 2);
+}
+
+#[test]
+#[ignore = "stress lane: run scripts/stress-process-canaries.sh"]
+fn stress_repeats_task_retry_and_runner_retry_discard_race() {
+    task_retry_and_runner_retry_discard_have_exactly_one_winner(12, 6);
 }

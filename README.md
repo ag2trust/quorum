@@ -216,6 +216,10 @@ Provider retries and an optional doctor turn can add further calls. A decomposed
 parent can also produce several child implementation and review paths. At most
 `max_graph_children_working` children of one graph implement at once; the key
 defaults to `cap`, must be at least 1, and is effectively bounded by `cap`.
+`max_active_graphs` (defaults to 2, must be at least 1) caps the graphs counted
+at once: active or blocked graphs plus the one graph holding planning
+authority. A new source enters planning, and a planned graph activates, only
+while fewer graphs are counted; one graph still plans at a time.
 
 Set token, USD, and wall-clock ceilings in the
 [serve configuration](docs/serve-config.example.toml); the exact flags are also
@@ -245,9 +249,17 @@ cp target/release/quorum ~/.local/bin/
 quorum init
 ```
 
-For the initial self-hostable container image, including its persistence and
-provider packaging contract, see [`docker/README.md`](docker/README.md). It is
-an image/runtime foundation, not a completed hosted service.
+For the initial self-hostable container image — designed to be deployed by
+pulling `ghcr.io/ag2trust/quorum` by its exact, attestation-verified release
+digest rather than a mutable tag, with persistence and provider-credential
+mounting under one `/data` volume — see [`docker/README.md`](docker/README.md).
+It is an image/runtime foundation, not a completed hosted service, and the
+build/verify/promote pipeline that publishes that digest is not yet wired
+into a release trigger (see "Publishing a release" there). A fork that wires
+up and runs its own publish pipeline to a fresh GHCR package must also
+complete GHCR's one-time, irreversible step of making that package public
+before anonymous release verification (and therefore anonymous `docker
+pull`) can succeed.
 
 State lives under `~/.quorum/repos/<owner>__<name>/`.
 

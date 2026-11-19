@@ -1078,3 +1078,170 @@ fn stable_graph_rejection_is_filtered_without_skip_or_spawn() {
 
     handle.stop();
 }
+
+// ── #419: source-only planning freeze under concurrent claim processes ──
+
+const FREEZE_RACE_DB: &str = "QUORUM_FREEZE_CLAIM_RACE_DB";
+const FREEZE_RACE_TARGET: &str = "QUORUM_FREEZE_CLAIM_RACE_TARGET";
+const FREEZE_RACE_AGENT: &str = "QUORUM_FREEZE_CLAIM_RACE_AGENT";
+const FREEZE_RACE_NOW: i64 = 1_000;
+
+#[test]
+fn planning_freeze_claim_race_blocks_only_the_source() {
+    // Child mode: one claim attempt per process against the shared real DB.
+    if let (Ok(db), Ok(target), Ok(agent)) = (
+        env::var(FREEZE_RACE_DB),
+        env::var(FREEZE_RACE_TARGET),
+        env::var(FREEZE_RACE_AGENT),
+    ) {
+        let task_id = match target.as_str() {
+            "selector" => None,
+            id => Some(id.parse::<i64>().unwrap()),
+        };
+        let mut conn = quorum_core::db::open(std::path::Path::new(&db)).unwrap();
+        let won = quorum_core::tasks::claim(&mut conn, &agent, task_id, &[], 300, FREEZE_RACE_NOW)
+            .unwrap();
+        match won {
+            Some(task) => println!("RACE-WON {}", task.id),
+            None => println!("RACE-LOST"),
+        }
+        return;
+    }
+
+    const READY: &str = r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#;
+    for round in 0..8 {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("q.db");
+        let (frozen_source, child, standalone) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let mut create = |title: &str, priority: i64, refs: Option<&str>| {
+                quorum_core::tasks::create(
+                    &mut conn, "owner", title, None, priority, None, refs, None, None, 1,
+                )
+                .unwrap()
+            };
+            // An otherwise dispatchable, highest-priority open source whose
+            // graph holds the freeze: only the source-scoped clause excludes it.
+            let frozen_source = create("frozen source", 9, Some(READY));
+            let other_source = create("active source", 1, None);
+            let child = create("other graph child", 1, Some(READY));
+            let standalone = create("standalone", 1, Some(READY));
+            conn.execute(
+                "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                     planned_source_revision,created_at,updated_at)
+                 VALUES (?1,'planning',0,1,1,1,1)",
+                params![frozen_source],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='decomposed' WHERE id=?1",
+                params![other_source],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                     planned_source_revision,plan_revision,accepted_plan_revision,
+                     created_at,updated_at)
+                 VALUES (?1,'active',1,0,1,1,1,1,1)",
+                params![other_source],
+            )
+            .unwrap();
+            let graph = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+                 VALUES (?1,?2,'a',1,1)",
+                params![graph, child],
+            )
+            .unwrap();
+            (frozen_source, child, standalone)
+        };
+
+        let mut targets = Vec::new();
+        for _ in 0..3 {
+            targets.push(standalone.to_string());
+            targets.push(child.to_string());
+            targets.push(frozen_source.to_string());
+            targets.push("selector".to_string());
+        }
+        let children: Vec<_> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, target)| {
+                Command::new(env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "planning_freeze_claim_race_blocks_only_the_source",
+                        "--nocapture",
+                    ])
+                    .env(FREEZE_RACE_DB, &db_path)
+                    .env(FREEZE_RACE_TARGET, target)
+                    .env(FREEZE_RACE_AGENT, format!("racer{i}"))
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let mut winners = Vec::new();
+        for child_proc in children {
+            let output = child_proc.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "round {round}: claim process failed"
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let won: Vec<i64> = stdout
+                .lines()
+                .filter_map(|l| l.strip_prefix("RACE-WON "))
+                .map(|id| id.trim().parse().unwrap())
+                .collect();
+            assert!(
+                won.len() + stdout.matches("RACE-LOST").count() == 1,
+                "round {round}: each process reports exactly one outcome: {stdout}"
+            );
+            winners.extend(won);
+        }
+        winners.sort_unstable();
+        let mut expected = vec![child, standalone];
+        expected.sort_unstable();
+        assert_eq!(
+            winners, expected,
+            "round {round}: exactly one winner per unrelated task; source never won"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        for id in [child, standalone] {
+            let (status, leases): (String, i64) = conn
+                .query_row(
+                    "SELECT status,(SELECT count(*) FROM claims
+                                    WHERE target='task#'||tasks.id AND active=1)
+                     FROM tasks WHERE id=?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (status.as_str(), leases),
+                ("working", 1),
+                "round {round}: task {id}"
+            );
+        }
+        let (status, assignee, leases): (String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT status,assignee,(SELECT count(*) FROM claims
+                                         WHERE target='task#'||tasks.id)
+                 FROM tasks WHERE id=?1",
+                params![frozen_source],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (status.as_str(), assignee, leases),
+            ("open", None, 0),
+            "round {round}: planning source must never be claimed"
+        );
+        let errs: i64 = conn
+            .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(errs, 0, "round {round}: lost races must not log errors");
+    }
+}

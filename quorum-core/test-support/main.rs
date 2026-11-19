@@ -1,11 +1,12 @@
 mod protocol;
 
 use protocol::{
-    AcquireDaemonLockInput, AllocateRoleInput, ApplyGraphEventInput, Barrier,
+    AcquireDaemonLockInput, AdmitGraphInput, AllocateRoleInput, ApplyGraphEventInput, Barrier,
     CancelSourceGraphInput, ClaimCleanupInput, ClaimGithubOperationInput,
-    ClaimProviderRetryReworkInput, ClaimTaskInput, GraphEvent, MaterializeAssessmentInput,
-    Operation, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE, MAX_BARRIER_WAIT_MS,
-    MAX_INPUT_BYTES, MAX_PATH_BYTES, MAX_TEXT_BYTES,
+    ClaimProviderRetryReworkInput, ClaimTaskInput, DiscardRunnerRetryInput, GraphAdmission,
+    GraphEvent, MaterializeAssessmentInput, Operation, RetryProviderBlockedInput, EXIT_INTERNAL,
+    EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE, MAX_BARRIER_WAIT_MS, MAX_INPUT_BYTES, MAX_PATH_BYTES,
+    MAX_TEXT_BYTES,
 };
 use quorum_core::decomposition::SourceCancellation;
 use quorum_core::error::QuorumError;
@@ -75,6 +76,9 @@ fn run() -> Result<i32, HelperError> {
         Operation::ClaimCleanup => claim_cleanup(parse(&input)?)?,
         Operation::MaterializeAssessment => materialize_assessment(parse(&input)?)?,
         Operation::AcquireDaemonLock => acquire_daemon_lock(parse(&input)?)?,
+        Operation::AdmitGraph => admit_graph(parse(&input)?)?,
+        Operation::RetryProviderBlocked => retry_provider_blocked(parse(&input)?)?,
+        Operation::DiscardRunnerRetry => discard_runner_retry(parse(&input)?)?,
         Operation::ClaimGithubOp => claim_github_operation(parse(&input)?)?,
     };
     let stdout = io::stdout();
@@ -243,6 +247,64 @@ fn claim_provider_retry_rework(
     ))
 }
 
+fn retry_provider_blocked(
+    input: RetryProviderBlockedInput,
+) -> Result<OperationResult, HelperError> {
+    validate_path("database", &input.db_path)?;
+    validate_positive("task id", input.task_id)?;
+    validate_text("retry requester", &input.by)?;
+    wait_at_barrier(&input.barrier)?;
+    let mut conn = quorum_core::db::open(&input.db_path)?;
+    let won =
+        quorum_core::tasks::retry_provider_blocked(&mut conn, input.task_id, &input.by, input.now)?
+            .is_some();
+    Ok(OperationResult::race(
+        json!({"ok": won, "by": input.by}),
+        won,
+    ))
+}
+
+fn discard_runner_retry(input: DiscardRunnerRetryInput) -> Result<OperationResult, HelperError> {
+    validate_path("database", &input.db_path)?;
+    validate_positive("task id", input.task_id)?;
+    let turn = input.expected_turn;
+    for (label, value) in [
+        ("turn provider", &turn.provider),
+        ("turn model", &turn.model),
+        ("turn effort", &turn.effort),
+        ("turn prompt", &turn.prompt),
+        ("turn kind", &turn.turn_kind),
+    ] {
+        validate_text(label, value)?;
+    }
+    if let Some(id) = &turn.continuation_id {
+        validate_text("turn continuation id", id)?;
+    }
+    wait_at_barrier(&input.barrier)?;
+    let mut conn = quorum_core::db::open(&input.db_path)?;
+    let outcome = quorum_core::tasks::discard_unresumable_runner_retry(
+        &mut conn,
+        input.task_id,
+        &input.holder,
+        &quorum_core::runner_state::PendingTurn {
+            provider: turn.provider,
+            model: turn.model,
+            effort: turn.effort,
+            prompt: turn.prompt,
+            turn_kind: turn.turn_kind,
+            continuation_id: turn.continuation_id,
+            requested: turn.requested,
+        },
+        &input.new_profile_id,
+        input.now,
+    )?;
+    let won = outcome == quorum_core::tasks::RunnerRetryDiscard::Discarded;
+    Ok(OperationResult::race(
+        json!({"ok": won, "holder": input.holder}),
+        won,
+    ))
+}
+
 fn cancel_source_graph(input: CancelSourceGraphInput) -> Result<OperationResult, HelperError> {
     validate_path("database", &input.db_path)?;
     validate_positive("source task id", input.source_task_id)?;
@@ -405,6 +467,61 @@ fn acquire_daemon_lock(input: AcquireDaemonLockInput) -> Result<OperationResult,
             false,
         ),
     })
+}
+
+fn admit_graph(input: AdmitGraphInput) -> Result<OperationResult, HelperError> {
+    use quorum_core::decomposition::{self, BeginPlanning, PlannedChild};
+    validate_path("database", &input.db_path)?;
+    validate_positive("target id", input.target_id)?;
+    if !(1..=100).contains(&input.max_active_graphs) {
+        return Err(HelperError::usage("max_active_graphs must be 1..=100"));
+    }
+    let mut conn = quorum_core::db::open(&input.db_path)?;
+    wait_at_barrier(&input.barrier)?;
+    let won = match input.admission {
+        GraphAdmission::BeginPlanning => decomposition::begin_planning(
+            &mut conn,
+            &BeginPlanning {
+                source_task_id: input.target_id,
+                expected_revision: 1,
+                provider: "codex",
+                model: "sol",
+                frozen_base_sha: "abc",
+                now: input.now,
+                max_active_graphs: input.max_active_graphs,
+            },
+        )?
+        .is_some(),
+        GraphAdmission::ReacquireFreeze => decomposition::reacquire_freeze(
+            &mut conn,
+            input.target_id,
+            input.max_active_graphs,
+            input.now,
+        )?,
+        GraphAdmission::Activate => {
+            let child = |key: &str| {
+                PlannedChild {
+                local_key: key.into(),
+                title: key.into(),
+                body: format!("deliver {key}"),
+                labels: None,
+                classification_refs: r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#.into(),
+                prerequisite_keys: Vec::new(),
+                source_dependency_ids: Vec::new(),
+            }
+            };
+            decomposition::materialize_terminal_children(
+                &mut conn,
+                input.target_id,
+                1,
+                &[child("a"), child("b")],
+                input.max_active_graphs,
+                input.now,
+            )?
+            .is_some()
+        }
+    };
+    Ok(OperationResult::race(json!({"won": won}), won))
 }
 
 fn wait_at_barrier(barrier: &Barrier) -> Result<(), HelperError> {

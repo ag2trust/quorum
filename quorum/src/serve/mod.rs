@@ -26,6 +26,7 @@ pub mod merge;
 pub mod merged_continuation;
 pub mod names;
 pub mod planner;
+mod profile_cooldown;
 pub mod recovery;
 pub mod render;
 pub mod repository_service;
@@ -48,6 +49,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 
 use names::Pool;
+use profile_cooldown::{CooldownPlan, ProfileCooldown};
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::journal::{self, JournalEntry};
 use quorum_core::lifecycle::{self, Effect, Event};
@@ -816,6 +818,274 @@ impl ReviewerRespawnBackoff {
     }
 }
 
+/// Free reviewer-process slots under `reviewer_cap`. Modeled on
+/// `available_worker_slots`; every live entry in `reviewers` occupies a slot.
+fn available_reviewer_slots(reviewer_cap: usize, active_reviewers: usize) -> usize {
+    reviewer_cap.saturating_sub(active_reviewers)
+}
+
+/// Classified, provider-free stand-in for launching a cooling profile. It is
+/// profile-scoped on purpose: the skip adds only this profile to the
+/// responsibility's durable exclusions, never its whole provider.
+fn cooling_profile_failure(profile_id: &str) -> runner::RunnerFailure {
+    runner::RunnerFailure::classified(
+        runner::FailureDisposition::ProfileUnavailable,
+        format!(
+            "profile {profile_id} skipped: cooling down after a recent provider/profile-unavailable \
+             classification"
+        ),
+        std::io::ErrorKind::Other,
+    )
+}
+
+/// Route decision for one reviewer provision against the profile cooldown.
+/// The pool and durable exclusions are read only when the assigned profile is
+/// actually cooling, so the common path adds no I/O.
+async fn reviewer_cooldown_plan(
+    config: &ServeConfig,
+    profile_cooldown: &ProfileCooldown,
+    assignment: &quorum_core::role_assignments::RoleAssignment,
+    complexity: u8,
+    role: &ReviewRole,
+    now: std::time::Instant,
+) -> Result<CooldownPlan> {
+    if !profile_cooldown.is_cooling(&assignment.profile_id, now) {
+        return Ok(CooldownPlan::Run);
+    }
+    let pool = configured_routing_pool(config, "reviewer", Some(complexity), Some(role.as_str()))?;
+    let exclusions = {
+        let path = config.db_path.clone();
+        let key = assignment.responsibility_key.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = quorum_core::db::open(&path)?;
+            quorum_core::routing_attempts::exclusions(&conn, &key)
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("reviewer cooldown exclusions join: {error}")))??
+    };
+    Ok(profile_cooldown.plan(&assignment.profile_snapshot(), &pool, &exclusions, now))
+}
+
+/// Pre-claim worker gate against the profile cooldown. It is read-only (it
+/// never assigns or claims) and returns `Some(until)` only when every profile
+/// of the task's worker pool that the responsibility's durable routing
+/// evidence has not already excluded is cooling down. A pool with no cooling
+/// profile adds no I/O. A fully excluded pool or an unroutable task is left to
+/// the ordinary provisioning path, which owns those outcomes.
+async fn worker_cooldown_deferral(
+    config: &ServeConfig,
+    profile_cooldown: &ProfileCooldown,
+    task: &tasks::Task,
+    now: std::time::Instant,
+) -> Result<Option<std::time::Instant>> {
+    let Some(complexity) = classifier_complexity(&task.refs) else {
+        return Ok(None);
+    };
+    let Ok(pool) = configured_routing_pool(config, "worker", Some(complexity), None) else {
+        return Ok(None);
+    };
+    if !pool
+        .profiles
+        .iter()
+        .any(|weighted| profile_cooldown.is_cooling(&weighted.profile.id, now))
+    {
+        return Ok(None);
+    }
+    let exclusions = {
+        let path = config.db_path.clone();
+        let key = worker_responsibility_key(task.id, task.revision);
+        tokio::task::spawn_blocking(move || {
+            let conn = quorum_core::db::open(&path)?;
+            quorum_core::routing_attempts::exclusions(&conn, &key)
+        })
+        .await
+        .map_err(|error| QuorumError::Io(format!("worker cooldown exclusions join: {error}")))??
+    };
+    let Some(first_eligible) = pool
+        .profiles
+        .iter()
+        .map(|weighted| &weighted.profile)
+        .find(|profile| !exclusions.excludes(profile))
+    else {
+        return Ok(None);
+    };
+    Ok(
+        match profile_cooldown.plan(first_eligible, &pool, &exclusions, now) {
+            CooldownPlan::Defer { until } => Some(until),
+            CooldownPlan::Run | CooldownPlan::SkipAssigned => None,
+        },
+    )
+}
+
+/// Whether every configured route a failed worker could fall back to is
+/// eligible only after a cooldown: at least one non-excluded alternate exists
+/// and all of them are cooling. The failure's own exclusion (its profile, or
+/// its whole provider for a provider-unavailable failure) is applied here
+/// because it is not yet durable. A pool with no non-excluded alternate is
+/// left to the existing provider block.
+fn worker_fallback_alternates_all_cooling(
+    profile_cooldown: &ProfileCooldown,
+    pool: &quorum_core::role_assignments::ValidatedPool,
+    exclusions: &quorum_core::routing_attempts::RouteExclusions,
+    failed_route: &quorum_core::role_assignments::ModelProfile,
+    disposition: runner::FailureDisposition,
+    now: std::time::Instant,
+) -> bool {
+    let mut cooling_alternate = false;
+    for weighted in &pool.profiles {
+        let profile = &weighted.profile;
+        if profile.id == failed_route.id
+            || exclusions.excludes(profile)
+            || (disposition == runner::FailureDisposition::ProviderUnavailable
+                && profile.provider == failed_route.provider)
+        {
+            continue;
+        }
+        if !profile_cooldown.is_cooling(&profile.id, now) {
+            return false;
+        }
+        cooling_alternate = true;
+    }
+    cooling_alternate
+}
+
+/// The profile a worker run executed: an attributed fallback run carries it
+/// explicitly; an initially assigned run uses its assignment snapshot.
+fn worker_run_profile_id(
+    conn: &quorum_core::Connection,
+    agent_run_id: i64,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT COALESCE(r.configured_profile_id, a.profile_id)
+             FROM agent_runs r LEFT JOIN role_assignments a ON a.id = r.role_assignment_id
+             WHERE r.id=?1 AND r.role='worker'",
+            [agent_run_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// How one reviewer provision is counted against `reviewer_cap`.
+///
+/// R2 policy (deadlock freedom): an R2 started by the R1-approval handoff
+/// inherits the approving R1's slot, because that R1 is still in `reviewers`
+/// at the call and is torn down immediately afterwards. An R2 therefore never
+/// waits behind the R1 it replaces. An R2 that is re-dispatched later (after a
+/// failed handoff, a restart, or an overshoot) shares the bound and is queued
+/// ahead of every R1 by `ReviewerSlotQueue`, so R1 work cannot starve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewerSlotClaim {
+    /// A new reviewer process: needs one free slot.
+    Fresh,
+    /// R1→R2 handoff: the approving R1's slot transfers to the R2.
+    InheritR1,
+}
+
+/// Free slots for a provision of kind `claim` given the live reviewer set.
+fn reviewer_slots_free(
+    reviewer_cap: usize,
+    reviewers: &[SlotState],
+    claim: ReviewerSlotClaim,
+) -> usize {
+    let occupied = match claim {
+        ReviewerSlotClaim::Fresh => reviewers.len(),
+        ReviewerSlotClaim::InheritR1 => reviewers.len().saturating_sub(1),
+    };
+    available_reviewer_slots(reviewer_cap, occupied)
+}
+
+/// Outcome of asking `ReviewerSlotQueue` for a reviewer slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewerSlotAdmission {
+    Admitted,
+    /// Admitted after at least one deferred pass.
+    AdmittedAfterDeferral,
+    /// No slot: retry on a later tick. `entered` is true only on the pass the
+    /// task joined the queue, which is the only pass that logs.
+    Deferred {
+        entered: bool,
+    },
+}
+
+impl ReviewerSlotAdmission {
+    fn admitted(self) -> bool {
+        !matches!(self, Self::Deferred { .. })
+    }
+}
+
+/// In-memory admission queue for review work that is ready to dispatch while
+/// every reviewer slot is busy. Deferral is purely in memory: no DB write, no
+/// lifecycle change, no reservation, no strike, no recovery attempt.
+///
+/// Ordering is (R2 first, then oldest task id). A waiting entry reserves its
+/// place across ticks: a task is admitted only when the free slots exceed the
+/// number of waiting entries ahead of it, so a slot freed for an older task is
+/// not taken by a younger one evaluated earlier in the same tick. Entries that
+/// stop reaching the gate (merged, closed, held, backed off) are pruned at the
+/// next `begin_pass`, so a stale entry can hold a slot idle for at most one
+/// tick. Size is bounded by the number of in-review tasks.
+#[derive(Debug, Default)]
+struct ReviewerSlotQueue {
+    /// (priority: 0 = R2, 1 = R1; task id) → reached the gate this pass.
+    waiting: std::collections::BTreeMap<(u8, i64), bool>,
+}
+
+impl ReviewerSlotQueue {
+    /// Start a dispatch pass: drop entries that did not reach the gate during
+    /// the previous pass, and mark the survivors unseen.
+    fn begin_pass(&mut self) {
+        self.waiting
+            .retain(|_, seen| std::mem::replace(seen, false));
+    }
+
+    /// Admit `task_id` when a slot is free for it, else defer it. Logs once on
+    /// entering the queue and once on dispatch after deferral.
+    fn admit(
+        &mut self,
+        task_id: i64,
+        pr: i64,
+        r2: bool,
+        free: usize,
+        reviewer_cap: usize,
+    ) -> ReviewerSlotAdmission {
+        let key = (u8::from(!r2), task_id);
+        // A role change while queued (R1 approved during a restart window)
+        // moves the entry; it is still the same deferral.
+        let was_waiting = self.waiting.remove(&key).is_some()
+            | self.waiting.remove(&(u8::from(r2), task_id)).is_some();
+        let ahead = self.waiting.range(..key).count();
+        if free > ahead {
+            if was_waiting {
+                log(&format!(
+                    "task #{task_id} PR #{pr}: reviewer slot available — dispatching deferred {}",
+                    if r2 { "R2" } else { "R1" }
+                ));
+                return ReviewerSlotAdmission::AdmittedAfterDeferral;
+            }
+            return ReviewerSlotAdmission::Admitted;
+        }
+        self.waiting.insert(key, true);
+        if !was_waiting {
+            log(&format!(
+                "task #{task_id} PR #{pr}: all {reviewer_cap} reviewer slot(s) busy — {} review \
+                 deferred (queue position {}); no lifecycle change",
+                if r2 { "R2" } else { "R1" },
+                ahead + 1
+            ));
+        }
+        ReviewerSlotAdmission::Deferred {
+            entered: !was_waiting,
+        }
+    }
+
+    #[cfg(test)]
+    fn waiting_task_ids(&self) -> Vec<i64> {
+        self.waiting.keys().map(|(_, task_id)| *task_id).collect()
+    }
+}
+
 impl ClaimSkipLogLimiter {
     fn new() -> Self {
         Self {
@@ -872,6 +1142,13 @@ enum ReviewerProvisionOutcome {
         fetched: String,
     },
     Failed(String),
+    /// Every reviewer slot under `reviewer_cap` is busy. Checked before the
+    /// reservation, so nothing durable changed; retry on a later tick.
+    Deferred,
+    /// Every eligible reviewer profile is cooling down after a recent
+    /// provider/profile-unavailable classification. No reviewer name,
+    /// worktree, run, or process was created; retry once a cooldown expires.
+    ProfilesCoolingDown,
 }
 
 /// The R1 terminal telemetry for an attempted mandatory-R2 handoff. These
@@ -903,9 +1180,12 @@ fn r2_provision_disposition(
     }
     match result {
         Ok(ReviewerProvisionOutcome::Attached) => R2ProvisionDisposition::Attached,
-        Ok(ReviewerProvisionOutcome::Unavailable | ReviewerProvisionOutcome::HeadMoved { .. }) => {
-            R2ProvisionDisposition::Unavailable
-        }
+        Ok(
+            ReviewerProvisionOutcome::Unavailable
+            | ReviewerProvisionOutcome::HeadMoved { .. }
+            | ReviewerProvisionOutcome::Deferred
+            | ReviewerProvisionOutcome::ProfilesCoolingDown,
+        ) => R2ProvisionDisposition::Unavailable,
         Ok(ReviewerProvisionOutcome::Failed(_)) => R2ProvisionDisposition::Error,
         Err(_) => R2ProvisionDisposition::Error,
     }
@@ -4646,6 +4926,9 @@ pub struct ServeConfig {
     /// decomposition graph may be `working` at once. `None` means the worker
     /// `cap`; values above `cap` are effectively bounded by `cap`.
     pub max_graph_children_working: Option<usize>,
+    /// Validated `reviewer_cap`: concurrent reviewer processes (R1, R2, and
+    /// review-only) the daemon may run. See `available_reviewer_slots`.
+    pub reviewer_cap: usize,
     /// Codex sandbox mode (default: "danger-full-access").
     pub codex_sandbox: String,
     /// Validated Grok adapter settings used by every managed worker launch.
@@ -4653,6 +4936,11 @@ pub struct ServeConfig {
     /// Test-only override for the `gh` binary used by live PR target
     /// resolution. None → look up "gh" on PATH.
     pub pr_target_program: Option<PathBuf>,
+    /// Validated `max_active_graphs`: graphs that may be counted (active,
+    /// blocked, or holding planning authority) at once across the daemon.
+    /// Default 2, minimum 1. Enforced by the guarded counts in planning
+    /// admission, freeze reacquisition, and activation.
+    pub max_active_graphs: usize,
 }
 
 impl ServeConfig {
@@ -4679,8 +4967,8 @@ const PUBLICATION_REF_RECONCILE_BATCH_SIZE: i64 = 64;
 pub fn run_serve(config: ServeConfig) -> Result<i32> {
     configure_daemon_log(config.log_dir.as_deref());
     log(&format!(
-        "starting (cap={}, repo={})",
-        config.cap, config.repo
+        "starting (cap={}, repo={}, max_active_graphs={})",
+        config.cap, config.repo, config.max_active_graphs
     ));
 
     let daemon_pid = std::process::id() as i64;
@@ -5041,6 +5329,12 @@ pub(crate) struct SlotState {
     /// This is intentionally separate from provider turn retries: an install
     /// is a daemon/DB operation, not another provider turn.
     fallback_install_error_count: u32,
+    /// `(agent_run_id, first_deferred_at)` of a worker fallback that deferred
+    /// because every eligible alternate was cooling. A retained slot re-enters
+    /// fallback every tick; this marker makes the failed profile's cooldown
+    /// recorded once per failure observation (not renewed on re-entry) and
+    /// caps the slot's total deferral at one cooldown window.
+    worker_fallback_deferral: Option<(i64, std::time::Instant)>,
     last_error_text: Option<String>,
     agent_run_id: Option<i64>,
     /// Daemon-issued run capability id (#130). Used for revocation on teardown.
@@ -5303,6 +5597,27 @@ fn runner_retry_turn(refs: Option<&str>) -> Option<PendingTurn> {
     let turn = runner_state::requested_retry_any(&refs)?;
     let resolved = resolve_worker_provider(&turn.model).ok()?;
     (turn.provider == resolved.to_string()).then_some(turn)
+}
+
+/// Whether a stored requested retry turn may resume its exact provider
+/// session under the current durable worker assignment. A configured profile
+/// must still carry the turn's runner/model/effort, and the assignment must
+/// name that same provider, model, and effort. Anything else would splice the
+/// stored provider's session into a different route.
+fn retry_turn_resumable(
+    config: &ServeConfig,
+    assignment: &quorum_core::role_assignments::RoleAssignment,
+    turn: &PendingTurn,
+) -> bool {
+    let configured = config.model_profiles.values().any(|profile| {
+        profile.runner == turn.provider
+            && profile.model == turn.model
+            && profile.effort == turn.effort
+    });
+    configured
+        && assignment.provider == turn.provider
+        && assignment.model == turn.model
+        && assignment.effort == turn.effort
 }
 
 /// A Grok provider block is durable authority that its exact pending turn
@@ -6083,6 +6398,13 @@ struct DrainState {
     last_sha_poll: Option<std::time::Instant>,
 }
 
+/// Owns the one *planning* graph's provider slots and caches. Planning is
+/// serialized per repository (one `freeze_active` graph), so `graph_id` names
+/// at most that graph. Materialized graphs are never selected or cached here:
+/// every active graph's children are dispatched, held, and completed through
+/// SQL scoped by that child's own `graph_id` (the claim's graph-ready clause,
+/// `block_graph_if_child_failed`, `complete_graph_if_final_child`), so any
+/// number of counted graphs execute side by side within the shared worker cap.
 #[derive(Default)]
 struct DecompositionCoordinator {
     graph_id: Option<i64>,
@@ -6109,7 +6431,7 @@ struct DecompositionCoordinator {
     /// classifier slots.
     arbiter_slot: Option<arbiter::ArbiterSlot>,
     arbiter_source_task_id: Option<i64>,
-    /// One extracted frozen tree per active graph. The cache key includes the
+    /// One extracted frozen tree for the planning graph. The cache key includes the
     /// repository path as well as the frozen SHA, so planner retries and the
     /// later Arbiter share an exact immutable tree without cross-repository
     /// reuse.
@@ -6282,43 +6604,20 @@ const DECOMPOSITION_BASE_DEFERRED_EVENT: &str = "decomposition_base_deferred";
 /// lifetime; a changing reason is recorded at most once per this interval.
 const DECOMPOSITION_BASE_DEFERRED_EVENT_INTERVAL_SECS: i64 = 300;
 
-#[derive(Debug, Default, Clone, Copy)]
-struct DecompositionLiveWork {
-    // These are the only provider/network futures retained across tick
-    // boundaries. Merge, publication, collector, and recovery calls are
-    // awaited inline. Inline execution keeps no future here, but a task can
-    // still sit at a non-terminal status ('working' after worker teardown but
-    // before reviewer attach, 'in-review' between reviewers, 'rework' waiting
-    // for a rework worker) across ticks. The `started_non_terminal` gate at
-    // the call site closes that gap; these flags alone are not sufficient.
-    ordinary_classifier: bool,
-    doctor: bool,
-    pre_review_checks: bool,
-}
-
 /// Select the ordinary classifier's next queue and its duplicate context.
 ///
-/// Outside a decomposition freeze every unclassified task is eligible. Under
-/// a freeze only already-started work is: the freeze exists so no new
-/// implementation starts while the planner captures a quiescent frozen base,
-/// and an `open` task's classification would only feed a claim (or a planning
-/// source selection) the freeze already forbids. Started work — chiefly a
-/// review-only task created `in-review` during the freeze — is the opposite
-/// case: the drain counts it (`count_started_non_terminal_excluding`) and its
-/// reviewer cannot dispatch unclassified, so gating it would deadlock the
-/// drain against itself.
+/// Every unclassified task is eligible, including while a graph plans: a
+/// planning freeze blocks only its own source task, and that source is in
+/// `planning` status, which `unclassified_tasks` never selects. Even a
+/// classified source stays unclaimable while its freeze is held, because the
+/// claim SQL's source-scoped freeze clause excludes it.
 fn classifier_queue(
     conn: &rusqlite::Connection,
-    decomposition_freeze: bool,
 ) -> Result<(
     Vec<quorum_core::classify::TaskForClassification>,
     Vec<quorum_core::classify::TaskForClassification>,
 )> {
-    let tasks = if decomposition_freeze {
-        quorum_core::classify::unclassified_started_tasks(conn)?
-    } else {
-        quorum_core::classify::unclassified_tasks(conn)?
-    };
+    let tasks = quorum_core::classify::unclassified_tasks(conn)?;
     if tasks.is_empty() {
         return Ok((vec![], vec![]));
     }
@@ -6332,34 +6631,6 @@ fn classifier_queue(
     Ok((tasks, dup_context))
 }
 
-/// Durable journal rows that represent live agent/provider work a freeze
-/// must drain. A `frozen-view` row is only a recovery marker for the
-/// coordinator's cached `git archive` tree: no process runs behind it, and a
-/// graph's own marker is always released before it re-freezes. Counting it
-/// would let one graph's leftover marker stall a different graph's drain.
-fn count_drain_blocking_journal_rows(conn: &rusqlite::Connection) -> Result<i64> {
-    Ok(conn.query_row(
-        "SELECT count(*) FROM journal WHERE role!='frozen-view'",
-        [],
-        |row| row.get::<_, i64>(0),
-    )?)
-}
-
-fn decomposition_drain_ready(
-    workers: usize,
-    reviewers: usize,
-    durable_journal: i64,
-    started_non_terminal: i64,
-    live: DecompositionLiveWork,
-) -> bool {
-    workers == 0
-        && reviewers == 0
-        && durable_journal == 0
-        && started_non_terminal == 0
-        && !live.ordinary_classifier
-        && !live.doctor
-        && !live.pre_review_checks
-}
 type PlanningSnapshotRow = (
     i64,
     i64,
@@ -6562,22 +6833,23 @@ impl StartupDecompositionState {
     }
 }
 
+/// Classify the repository's decomposition state at startup across every
+/// non-terminal graph rather than one selected row: several materialized
+/// graphs may be counted at once, and each is evaluated by its own `graph_id`.
+/// Any graph in a proposal phase must carry a valid accepted proposal. Planning
+/// authority wins (`Frozen`), then any executing graph (`Active`), then any
+/// held-active graph (`Blocked`).
 fn inspect_startup_decomposition(conn: &rusqlite::Connection) -> Result<StartupDecompositionState> {
-    use rusqlite::OptionalExtension;
-    let row: Option<(String, bool, Option<String>)> = conn
-        .query_row(
-            "SELECT state,freeze_active,accepted_proposal_json
-             FROM task_decompositions
-             WHERE state NOT IN ('held','completed','cancelled')
-             ORDER BY freeze_active DESC,id LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    let Some((state, freeze, proposal)) = row else {
-        return Ok(StartupDecompositionState::None);
-    };
-    if matches!(state.as_str(), "validating" | "preclassifying") {
+    let mut statement = conn.prepare(
+        "SELECT state,accepted_proposal_json FROM task_decompositions
+         WHERE state IN ('validating','preclassifying') ORDER BY id",
+    )?;
+    let proposals = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (state, proposal) in proposals {
         let raw = proposal.ok_or_else(|| {
             QuorumError::Io(format!("{state} decomposition lacks accepted proposal"))
         })?;
@@ -6587,11 +6859,20 @@ fn inspect_startup_decomposition(conn: &rusqlite::Connection) -> Result<StartupD
             ))
         })?;
     }
-    Ok(if freeze {
+    let (frozen, active, blocked): (bool, bool, bool) = conn.query_row(
+        "SELECT
+             EXISTS(SELECT 1 FROM task_decompositions
+                    WHERE freeze_active=1 AND state NOT IN ('held','completed','cancelled')),
+             EXISTS(SELECT 1 FROM task_decompositions WHERE state='active'),
+             EXISTS(SELECT 1 FROM task_decompositions WHERE state='blocked')",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok(if frozen {
         StartupDecompositionState::Frozen
-    } else if state == "active" {
+    } else if active {
         StartupDecompositionState::Active
-    } else if state == "blocked" {
+    } else if blocked {
         StartupDecompositionState::Blocked
     } else {
         StartupDecompositionState::None
@@ -6603,10 +6884,15 @@ async fn reconcile_decomposition_startup(
     coordinator: &mut DecompositionCoordinator,
 ) -> Result<StartupDecompositionState> {
     let path = config.db_path.clone();
+    let max_active_graphs = config.max_active_graphs;
     let (state, snapshot) = tokio::task::spawn_blocking(move || {
         let mut conn = quorum_core::db::open(&path)?;
         tasks::clear_reviewer_provision_reservations(&mut conn)?;
-        quorum_core::decomposition::reconcile_startup_graphs(&mut conn, now_unix())?;
+        quorum_core::decomposition::reconcile_startup_graphs(
+            &mut conn,
+            max_active_graphs,
+            now_unix(),
+        )?;
         Ok::<_, QuorumError>((
             inspect_startup_decomposition(&conn)?,
             load_planning_snapshot(&conn)?,
@@ -6623,21 +6909,27 @@ async fn reconcile_decomposition_startup(
     Ok(state)
 }
 
-fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>> {
+fn planning_candidate(
+    conn: &rusqlite::Connection,
+    max_active_graphs: usize,
+) -> Result<Option<(i64, i64)>> {
     use rusqlite::OptionalExtension;
     // Route and per-task exclusions come from the shared predicate. The
-    // one-active-graph rule stays here: status names that graph instead of
-    // folding the exclusion into eligibility.
+    // counted `max_active_graphs` admission check stays here (status names the
+    // counted graphs instead of folding the limit into eligibility); the
+    // guarded count in `begin_routed_planning` remains the atomic authority.
     let eligible = quorum_core::tasks::PLANNER_ELIGIBILITY_PREDICATE;
+    let counted = quorum_core::decomposition::COUNTED_GRAPH_PREDICATE;
+    let limit = i64::try_from(max_active_graphs)
+        .map_err(|_| QuorumError::Usage("max_active_graphs is out of range".into()))?;
     let dep_satisfied = quorum_core::tasks::DEP_SATISFIED_PREDICATE;
     Ok(conn
         .query_row(
             &format!(
                 "SELECT t.id,t.revision FROM tasks t
          WHERE t.status='open' AND t.assignee IS NULL
-           AND NOT EXISTS (SELECT 1 FROM task_decompositions repository_graph
-                           WHERE repository_graph.state IN ('active','blocked')
-                              OR repository_graph.active=1)
+           AND (SELECT COUNT(*) FROM task_decompositions
+                WHERE {counted}) < ?1
            AND {eligible}
            AND (t.depends_on IS NULL OR NOT EXISTS (
                SELECT 1 FROM json_each(t.depends_on) dep
@@ -6646,7 +6938,7 @@ fn planning_candidate(conn: &rusqlite::Connection) -> Result<Option<(i64, i64)>>
            ))
          ORDER BY t.priority DESC,t.id ASC LIMIT 1"
             ),
-            [],
+            [limit],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?)
@@ -6665,7 +6957,7 @@ async fn frozen_planner_view(repo: &Path, frozen_sha: &str) -> Result<tempfile::
 }
 
 /// Return this coordinator's frozen archive for `(repo, frozen_sha)`, creating
-/// it only when that immutable source has changed. A coordinator advances one
+/// it only when that immutable source has changed. A coordinator plans one
 /// graph at a time, which bounds this cache to one temporary archive.
 async fn cached_frozen_planner_view(
     coordinator: &mut DecompositionCoordinator,
@@ -6843,10 +7135,13 @@ async fn frozen_planner_view_with_options(
         let deadline = tokio::time::Instant::now() + timeout;
         let isolated = PlannerArchiveSource::create(&repo, &git_bin, deadline).await?;
 
-        // The frozen base is the fetched target-branch commit bound at the
-        // drain handoff, not the clone's checked-out HEAD (which may lag the
-        // remote). Content addressing keeps the view immutable for the attempt;
-        // only that exact commit object must be present.
+        // The view is exactly the tree of `frozen_sha`, read from the object
+        // store, whatever the repository's current HEAD is. The frozen base is
+        // the fetched target-branch commit bound at planning start, not the
+        // clone's checked-out HEAD (which may lag the remote). There is no
+        // drain, so unrelated merges may move the base branch during planning;
+        // content addressing is what keeps the planner's base fixed for the
+        // attempt. Only that exact commit object must be present.
         let mut commit_command = isolated.git_command(&git_bin);
         commit_command.args(["cat-file", "-e", &format!("{frozen_sha}^{{commit}}")]);
         let commit = run_publication_gh_command_with_limit(
@@ -7131,7 +7426,9 @@ async fn kill_and_reap_planner_view_processes(
 /// daemon's repo-dir `HEAD` is never a planning base.
 ///
 /// Done dependencies with a PR but no stamped SHA are first recovered through
-/// the worker path's shared `recover_missing_dependency_merge_commits`.
+/// the worker path's shared `recover_missing_dependency_merge_commits`. A
+/// PR-less dependency closed by hand imposes no merge commit, per the worker
+/// path's shared `manually_closed_dependencies_without_merge`.
 ///
 /// `Ok(Err(reason))` is an expected deferral (fetch/resolve failure, an open or
 /// unmerged dependency PR, unrecoverable dependency provenance, or a dependency
@@ -7184,8 +7481,9 @@ async fn capture_decomposition_frozen_base(
     };
     // A manually closed dependency may be done with its PR merged but no SHA
     // stamped. Recover it exactly as worker provisioning does; otherwise the
-    // repo-wide freeze would block the only path that stamps it. A PR that is
-    // open/closed-unmerged (the worker parks) or a failed lookup defers here.
+    // source's own planning freeze would block the worker provisioning that
+    // stamps it for this source. A PR that is open/closed-unmerged (the worker
+    // parks) or a failed lookup defers here.
     if dependencies
         .iter()
         .any(|dependency| dependency.merge_commit_sha.is_none())
@@ -7219,10 +7517,15 @@ async fn capture_decomposition_frozen_base(
             }
         };
     }
+    // A hand-closed, PR-less dependency imposes no merge commit to contain,
+    // exactly as in worker admission: planning proceeds on the fetched base.
+    let manually_closed =
+        manually_closed_dependencies_without_merge(&config.db_path, &dependencies).await?;
     let mut merge_commits = Vec::with_capacity(dependencies.len());
     for dependency in dependencies {
         match dependency.merge_commit_sha {
             Some(sha) => merge_commits.push(sha),
+            None if manually_closed.contains(&dependency.task_id) => {}
             None => {
                 return Ok(Err(match dependency.pr_number {
                     Some(pr) => format!(
@@ -7958,6 +8261,7 @@ async fn reject_decomposition_proposal(
     let path = config.db_path.clone();
     let code = code.to_string();
     let summary = truncate_utf8_bytes(summary, DECOMPOSITION_ATTEMPT_SUMMARY_MAX_BYTES).to_string();
+    let max_active_graphs = config.max_active_graphs;
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut conn = quorum_core::db::open(&path)?;
         quorum_core::decomposition::reject_frozen_proposal(
@@ -7968,6 +8272,7 @@ async fn reject_decomposition_proposal(
             &summary,
             eligibility,
             plan_snapshot.as_deref(),
+            max_active_graphs,
             now_unix(),
         )?;
         Ok(())
@@ -8389,7 +8694,7 @@ fn summarize_arbiter_findings(findings: &[arbiter::ArbiterFinding]) -> String {
 /// Materialize the Arbiter-approved proposal from `validating` using the
 /// classifier batch that was durably accepted before the Arbiter ran. The
 /// guarded `materialize_graph` write (state/freeze/active/source-revision
-/// checks plus the one-active-graph index) is the exactly-once authority: a
+/// checks plus the counted `max_active_graphs` guard) is the exactly-once authority: a
 /// restart that re-polls a fresh Arbiter, or a concurrent block/cancel, binds
 /// zero rows and is a clean no-op (invariant #3). Returns whether children were
 /// created.
@@ -8461,28 +8766,66 @@ async fn materialize_validated_proposal(
         return Ok(false);
     };
     let path = config.db_path.clone();
-    let materialized = tokio::task::spawn_blocking(move || -> Result<Option<bool>> {
+    let max_active_graphs = config.max_active_graphs;
+    enum Materialized {
+        Activated,
+        /// The guarded write bound zero rows; `true` when a lowered
+        /// `max_active_graphs` refused it rather than lost authority.
+        Refused {
+            limit_reached: bool,
+        },
+        /// Durable-input usage error.
+        Unusable,
+    }
+    let materialized = tokio::task::spawn_blocking(move || -> Result<Materialized> {
         let mut conn = quorum_core::db::open(&path)?;
         match quorum_core::decomposition::materialize_terminal_children(
             &mut conn,
             graph_id,
             snapshot.source_revision,
             &children,
+            max_active_graphs,
             now_unix(),
         ) {
-            Ok(ids) => Ok(Some(ids.is_some())),
+            Ok(Some(_)) => Ok(Materialized::Activated),
+            Ok(None) => Ok(Materialized::Refused {
+                limit_reached: quorum_core::decomposition::activation_limit_reached(
+                    &conn,
+                    graph_id,
+                    max_active_graphs,
+                )?,
+            }),
             // A usage error is a durable-input problem (unclassified child,
             // cycle, source dependency not done): bounded rejection, not a
             // tick error that would re-spawn the Arbiter every tick.
-            Err(QuorumError::Usage(_)) => Ok(None),
+            Err(QuorumError::Usage(_)) => Ok(Materialized::Unusable),
             Err(error) => Err(error),
         }
     })
     .await
     .map_err(|error| QuorumError::Io(format!("materialization join: {error}")))??;
     match materialized {
-        Some(true) => Ok(true),
-        Some(false) => {
+        Materialized::Activated => Ok(true),
+        // A `max_active_graphs` lowered below the counted set (e.g. across a
+        // restart while this graph planned) refuses activation. Like lost
+        // authority this holds the graph and fails the source, but under its
+        // own reason code so the operator sees the configuration cause.
+        Materialized::Refused {
+            limit_reached: true,
+        } => {
+            record_decomposition_attempt(
+                config,
+                graph_id,
+                "blocker",
+                "max-active-graphs-reached",
+                "activation refused: max_active_graphs other graphs are already counted",
+            )
+            .await?;
+            Ok(false)
+        }
+        Materialized::Refused {
+            limit_reached: false,
+        } => {
             record_decomposition_attempt(
                 config,
                 graph_id,
@@ -8493,7 +8836,7 @@ async fn materialize_validated_proposal(
             .await?;
             Ok(false)
         }
-        None => {
+        Materialized::Unusable => {
             reject_decomposition_proposal(
                 config,
                 graph_id,
@@ -9064,24 +9407,12 @@ fn planned_children(
         .collect()
 }
 
-/// Task ids with a live worker or reviewer slot in this coordinator tick.
-fn live_slot_task_ids(workers: &[SlotState], reviewers: &[SlotState]) -> Vec<i64> {
-    workers
-        .iter()
-        .chain(reviewers)
-        .map(|slot| slot.task_id)
-        .collect()
-}
-
 /// Advance at most one durable decomposition coordinator. Returns whether the
 /// repository planning freeze is active after this tick.
 async fn tick_decomposition(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
     coordinator: &mut DecompositionCoordinator,
-    workers: &[SlotState],
-    reviewers: &[SlotState],
-    live: DecompositionLiveWork,
 ) -> Result<bool> {
     // First consume terminal provider output. Provider processes are always
     // killed and reaped before durable retry/materialization decisions.
@@ -9412,7 +9743,7 @@ async fn tick_decomposition(
         if coordinator.planner_slot.is_none() && coordinator.classifier_slot.is_none() {
             let candidate = {
                 let conn = quorum_core::db::open(&config.db_path)?;
-                planning_candidate(&conn)?
+                planning_candidate(&conn, config.max_active_graphs)?
             };
             if let Some((source_task_id, expected_revision)) = candidate {
                 let assignment_request = quorum_core::role_assignments::AssignmentRequest {
@@ -9427,6 +9758,7 @@ async fn tick_decomposition(
                 };
                 let pool = configured_routing_pool(config, "planner", None, None)?;
                 let path = config.db_path.clone();
+                let max_active_graphs = config.max_active_graphs;
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = quorum_core::db::open(&path)?;
                     let seed =
@@ -9440,6 +9772,7 @@ async fn tick_decomposition(
                             pool: &pool,
                             seed,
                             now: now_unix(),
+                            max_active_graphs,
                         },
                     )?;
                     Ok(())
@@ -9558,38 +9891,31 @@ async fn tick_decomposition(
         return Ok(stepped_back);
     }
 
-    if snapshot.state == "provider-backoff" {
-        if now_unix() - snapshot.updated_at >= DECOMPOSITION_PROVIDER_BACKOFF_SECS {
-            // A freeze reacquired over an idle provider-blocked task could only
-            // drain until the next release, so hold here without touching the
-            // graph: the backoff window is far shorter than a provider block.
-            let live_task_ids = live_slot_task_ids(workers, reviewers);
-            let path = config.db_path.clone();
-            let source_task_id = snapshot.source_task_id;
-            let idle_blocked = tokio::task::spawn_blocking(move || -> Result<bool> {
-                let conn = quorum_core::db::open(&path)?;
-                let blocked = quorum_core::decomposition::provider_blocked_started_task_ids(
-                    &conn,
-                    source_task_id,
-                )?;
-                Ok(blocked.iter().any(|id| !live_task_ids.contains(id)))
-            })
-            .await
-            .map_err(|error| QuorumError::Io(format!("provider block query join: {error}")))??;
-            if idle_blocked {
-                return Ok(false);
-            }
+    // A startup recovery reset leaves a graph in `freeze-requested` without
+    // planning authority when its immediate reacquire lost the counted
+    // admission guard (another graph held planning authority, or the limit was
+    // reached). Retry the same guarded reacquire each tick so it is not stranded.
+    let reset_unadmitted = snapshot.state == "freeze-requested" && !snapshot.freeze_active;
+    if snapshot.state == "provider-backoff" || reset_unadmitted {
+        if reset_unadmitted
+            || now_unix() - snapshot.updated_at >= DECOMPOSITION_PROVIDER_BACKOFF_SECS
+        {
             // A provider failure released this graph's freeze and cleared its
-            // SHA. The cached archive can no longer be reused, and its
-            // durable recovery marker must not count as in-flight work while
-            // the next freeze drains the repository.
+            // SHA. The cached archive can no longer be reused: the next
+            // attempt records the then-current base head and archives that.
             coordinator.release_frozen_view();
             delete_decomposition_process(config, snapshot.graph_id, "frozen-view").await?;
             let path = config.db_path.clone();
             let graph_id = snapshot.graph_id;
+            let max_active_graphs = config.max_active_graphs;
             let reacquired = tokio::task::spawn_blocking(move || -> Result<bool> {
                 let mut conn = quorum_core::db::open(&path)?;
-                quorum_core::decomposition::reacquire_freeze(&mut conn, graph_id, now_unix())
+                quorum_core::decomposition::reacquire_freeze(
+                    &mut conn,
+                    graph_id,
+                    max_active_graphs,
+                    now_unix(),
+                )
             })
             .await
             .map_err(|error| QuorumError::Io(format!("freeze reacquire join: {error}")))??;
@@ -9599,49 +9925,6 @@ async fn tick_decomposition(
     }
     if !snapshot.freeze_active {
         return Ok(false);
-    }
-    let durable_in_flight = {
-        let conn = quorum_core::db::open(&config.db_path)?;
-        count_drain_blocking_journal_rows(&conn)?
-    };
-    // Every task that had already started (working/in-review/rework/merging)
-    // must reach a terminal state before we capture the frozen base. The
-    // planning source itself sits in 'planning' — exclude it. Live-process
-    // counts alone miss the `in-review` gap between worker teardown and
-    // reviewer attach, and the slotless `merging` gap before Phase 4e.
-    let started_non_terminal = {
-        let conn = quorum_core::db::open(&config.db_path)?;
-        quorum_core::tasks::count_started_non_terminal_excluding(&conn, snapshot.source_task_id)?
-    };
-    // Tasks waiting on `task-retry` cannot finish by themselves, so a drain
-    // held only by them would freeze the repository indefinitely. They stay in
-    // the count above: the frozen base is captured only after a real drain.
-    if matches!(snapshot.state.as_str(), "freeze-requested" | "draining")
-        && started_non_terminal > 0
-    {
-        let live_task_ids = live_slot_task_ids(workers, reviewers);
-        let path = config.db_path.clone();
-        let graph_id = snapshot.graph_id;
-        let released = tokio::task::spawn_blocking(move || -> Result<bool> {
-            let mut conn = quorum_core::db::open(&path)?;
-            quorum_core::decomposition::release_freeze_for_provider_block(
-                &mut conn,
-                graph_id,
-                &live_task_ids,
-                now_unix(),
-            )
-        })
-        .await
-        .map_err(|error| QuorumError::Io(format!("provider block release join: {error}")))??;
-        if released {
-            log(&format!(
-                "graph {graph_id}: released the planning freeze; only provider-blocked \
-                 tasks are holding the drain"
-            ));
-            // The freeze was held when this tick began, so its remaining
-            // phases stay frozen; the next tick reports the release.
-            return Ok(true);
-        }
     }
     if snapshot.state == "freeze-requested" {
         let path = config.db_path.clone();
@@ -9662,19 +9945,15 @@ async fn tick_decomposition(
         .map_err(|error| QuorumError::Io(format!("draining phase join: {error}")))??;
         return Ok(true);
     }
-    if snapshot.state == "draining"
-        && decomposition_drain_ready(
-            workers.len(),
-            reviewers.len(),
-            durable_in_flight,
-            started_non_terminal,
-            live,
-        )
-    {
-        // The frozen base is the fetched target-branch tip, verified to contain
-        // every dependency merge. A failed fetch/verification leaves the graph
-        // `draining` with no SHA (the freeze stays held) and a later tick retries;
-        // planning never starts on a stale base.
+    if snapshot.state == "draining" {
+        // There is no drain precondition: unrelated work keeps running. The
+        // planner's base is captured here, when planning starts, outside any
+        // DB transaction: the fetched target-branch tip, verified to contain
+        // every dependency merge. The planner reads it only through the
+        // read-only snapshot archive of that SHA, so the base never moves
+        // during one planning attempt. A failed fetch/verification leaves the
+        // graph `draining` with no SHA (its source-only freeze stays held) and
+        // a later tick retries; planning never starts on a stale base.
         let sha = match capture_decomposition_frozen_base(config, wt_mgr, snapshot.source_task_id)
             .await?
         {
@@ -10091,7 +10370,6 @@ async fn tick_classifier(
     classifier_consec_errors: &mut u32,
     classifier_backoff_until: &mut Option<std::time::Instant>,
     draining: bool,
-    decomposition_freeze: bool,
     provider_bin: &(dyn Fn(runner::AgentKind) -> Option<String> + Sync),
 ) -> Result<()> {
     let db_path = config.db_path.clone();
@@ -10192,16 +10470,13 @@ async fn tick_classifier(
             *classifier_backoff_until = None;
         }
     }
-    // A decomposition freeze does not stop the classifier outright: already
-    // started work (notably a review-only task, created `in-review` and
-    // unclassified) must classify before its reviewer can dispatch, and the
-    // freeze's own drain waits for that work to finish. `classifier_queue`
-    // narrows the freeze-time queue to that started set.
+    // A planning graph does not pause the classifier: the freeze guards only
+    // its own source task, which `classifier_queue` never selects.
     if classifier_slot.is_none() && !draining && classifier_backoff_until.is_none() {
         let p = db_path.clone();
         let unclassified = tokio::task::spawn_blocking(move || -> Result<(Vec<quorum_core::classify::TaskForClassification>, Vec<quorum_core::classify::TaskForClassification>)> {
             let conn = quorum_core::db::open(&p)?;
-            classifier_queue(&conn, decomposition_freeze)
+            classifier_queue(&conn)
         })
         .await
         .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?;
@@ -10859,6 +11134,7 @@ async fn handle_pre_review_checks_failure(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     _lifetime_roster: &mut LifetimeRoster,
+    profile_cooldown: &mut ProfileCooldown,
     task_id: i64,
     pr: i64,
     head_sha: &str,
@@ -10992,6 +11268,7 @@ async fn handle_pre_review_checks_failure(
                             workers,
                             worker_index,
                             &error,
+                            profile_cooldown,
                         )
                         .await
                         {
@@ -11120,6 +11397,7 @@ async fn resume_reviewer_after_ci(
     workers: &mut Vec<SlotState>,
     reviewers: &mut Vec<SlotState>,
     lifetime_roster: &mut LifetimeRoster,
+    profile_cooldown: &mut ProfileCooldown,
     pre_review_checks: &mut HashMap<i64, PreReviewChecksEntry>,
     task_id: i64,
     pr: i64,
@@ -11176,6 +11454,7 @@ async fn resume_reviewer_after_ci(
                 name_pool,
                 workers,
                 lifetime_roster,
+                profile_cooldown,
                 task_id,
                 pr,
                 &gated_head_sha,
@@ -12130,6 +12409,71 @@ async fn complete_detected_merge_with_metadata(
     Ok(true)
 }
 
+/// Map one merge-gate CI outcome to the daemon-owned `refs.merge_checks`
+/// state. `None` names mean the caller must ask the provider for the
+/// still-pending check names.
+fn merge_checks_observation(
+    outcome: &merge::ChecksOutcome,
+) -> (tasks::MergeChecksState, Option<Vec<String>>) {
+    match outcome {
+        merge::ChecksOutcome::Ready => (tasks::MergeChecksState::Passed, Some(Vec::new())),
+        merge::ChecksOutcome::Failed { failing_checks } => (
+            tasks::MergeChecksState::Failing,
+            Some(failing_checks.clone()),
+        ),
+        merge::ChecksOutcome::Pending { reason } => (
+            tasks::MergeChecksState::Pending,
+            merge::required_jobs_pending_names(reason),
+        ),
+        merge::ChecksOutcome::TimedOut => (tasks::MergeChecksState::Pending, None),
+    }
+}
+
+/// Persist the latest merge-gate CI observation for a `merging` task. Call
+/// only after the gate's network calls have returned: any pending-name lookup
+/// runs first, then the snapshot is written in its own short transaction
+/// (bounded by core). Purely observational — a task that already left
+/// `merging` is a clean negative, and an abnormal failure is logged without
+/// changing the merge decision.
+async fn record_merge_checks_observation(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    outcome: &merge::ChecksOutcome,
+) {
+    let (state, names) = merge_checks_observation(outcome);
+    let checks = match names {
+        Some(names) => names,
+        None => {
+            let repo = config.repo_dir.clone();
+            let executor = Arc::clone(&config.merge_executor);
+            tokio::task::spawn_blocking(move || executor.pending_check_names(pr, &repo))
+                .await
+                .unwrap_or_else(|error| {
+                    log(&format!(
+                        "merge-checks pending-name lookup join failed for PR #{pr}: {error}"
+                    ));
+                    Vec::new()
+                })
+        }
+    };
+    let db_path = config.db_path.clone();
+    let written = tokio::task::spawn_blocking(move || -> Result<bool> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        tasks::set_merge_checks_snapshot(&mut conn, task_id, state, &checks, now_unix())
+    })
+    .await;
+    match written {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => log(&format!(
+            "ERROR: merge-checks snapshot write failed for task #{task_id}: {error}"
+        )),
+        Err(error) => log(&format!(
+            "ERROR: merge-checks snapshot join failed for task #{task_id}: {error}"
+        )),
+    }
+}
+
 /// Consume one durable merge request and perform at most one formal
 /// approval/merge call.
 /// All network checks precede a final durable-authority reread; failures either
@@ -12301,6 +12645,7 @@ async fn reconcile_merge_retries(
         };
         checks = merge::apply_required_jobs_gate(checks, required);
     }
+    record_merge_checks_observation(config, task_id, pr, &checks).await;
     match checks {
         merge::ChecksOutcome::Ready => {}
         merge::ChecksOutcome::Failed { failing_checks } => {
@@ -12511,9 +12856,17 @@ async fn resume_retained_merge_replay_rework(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     task_id: i64,
+    profile_cooldown: &mut ProfileCooldown,
 ) {
-    let Err(error) =
-        feed_retained_merge_replay_rework(config, wt_mgr, name_pool, workers, task_id).await
+    let Err(error) = feed_retained_merge_replay_rework(
+        config,
+        wt_mgr,
+        name_pool,
+        workers,
+        task_id,
+        profile_cooldown,
+    )
+    .await
     else {
         return;
     };
@@ -12546,6 +12899,7 @@ async fn feed_retained_merge_replay_rework(
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
     task_id: i64,
+    profile_cooldown: &mut ProfileCooldown,
 ) -> Result<()> {
     let Some(worker_index) = workers
         .iter()
@@ -12641,6 +12995,7 @@ async fn feed_retained_merge_replay_rework(
             workers,
             worker_index,
             &error,
+            profile_cooldown,
         )
         .await
         {
@@ -12802,6 +13157,10 @@ async fn tick_loop_owning_doctor(
     let mut graph_skip_logs = ClaimSkipLogLimiter::new();
     let mut unrecordable_strikes = UnrecordableStrikes::new();
     let mut reviewer_respawn_backoff = ReviewerRespawnBackoff::new();
+    // In-memory skip window for reviewer profiles recently classified
+    // provider- or profile-unavailable.
+    let mut profile_cooldown = ProfileCooldown::new();
+    let mut reviewer_slot_queue = ReviewerSlotQueue::default();
     let mut drain_state = DrainState::new();
     let mut lifetime_roster = LifetimeRoster::new();
     let mut last_drift_check: Option<std::time::Instant> = None;
@@ -12951,6 +13310,9 @@ async fn tick_loop_owning_doctor(
         &mut workers,
         &mut reviewers,
         &mut lifetime_roster,
+        &mut unrecordable_strikes,
+        &mut reviewer_respawn_backoff,
+        &mut profile_cooldown,
     )
     .await?;
     match reconcile_publication_source_refs(config, &wt_mgr, publication_ref_reconcile_cursor).await
@@ -12974,8 +13336,14 @@ async fn tick_loop_owning_doctor(
     // policy. A failed durable disposition (including post-timeout BUSY) is an
     // abnormal startup failure and must exit 3 instead of repeating baseline
     // and provider subprocesses while starving mailbox processing.
-    if let Err(error) =
-        resume_recovered_dormant_reworks(config, &wt_mgr, &mut name_pool, &mut workers).await
+    if let Err(error) = resume_recovered_dormant_reworks(
+        config,
+        &wt_mgr,
+        &mut name_pool,
+        &mut workers,
+        &mut profile_cooldown,
+    )
+    .await
     {
         log(&format!(
             "FATAL: recovered dormant rework startup failed: {error}"
@@ -13410,6 +13778,8 @@ async fn tick_loop_owning_doctor(
             &mut graph_skip_logs,
             &mut unrecordable_strikes,
             &mut reviewer_respawn_backoff,
+            &mut profile_cooldown,
+            &mut reviewer_slot_queue,
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
@@ -13537,6 +13907,10 @@ async fn tick(
     unrecordable: &mut UnrecordableStrikes,
     // Bounded pause after a reviewer's no-verdict exit before re-provisioning.
     reviewer_respawn_backoff: &mut ReviewerRespawnBackoff,
+    // Bounded skip window for recently unavailable reviewer profiles.
+    profile_cooldown: &mut ProfileCooldown,
+    // Ready review work deferred because every reviewer slot is busy.
+    reviewer_slot_queue: &mut ReviewerSlotQueue,
     drain_state: &mut DrainState,
     lifetime_roster: &mut LifetimeRoster,
     classifier_slot: &mut Option<classifier::ClassifierSlot>,
@@ -13562,21 +13936,9 @@ async fn tick(
     branch_sync::intake_ci_failure_fix_task(config).await?;
     branch_sync::reconcile_failed_ci_fix_comment(config).await?;
 
-    let decomposition_freeze = tick_decomposition(
-        config,
-        wt_mgr,
-        decomposition_coordinator,
-        workers,
-        reviewers,
-        DecompositionLiveWork {
-            ordinary_classifier: classifier_slot.is_some(),
-            doctor: doctor_slot.is_some(),
-            pre_review_checks: pre_review_checks.values().any(|entry| {
-                matches!(&entry.state, PreReviewChecksState::Waiting(handle) if !handle.is_finished())
-            }),
-        },
-    )
-    .await?;
+    // The returned freeze flag is not a dispatch gate: a planning graph blocks
+    // only its own source task (claim SQL), never unrelated work this tick.
+    tick_decomposition(config, wt_mgr, decomposition_coordinator).await?;
 
     // Graph consistency authority runs first. Exact merged-continuation
     // adoption is then settled before any ordinary recovery or provisioning
@@ -14176,11 +14538,17 @@ async fn tick(
                                             reviewers,
                                             lifetime_roster,
                                             unrecordable,
+                                            reviewer_respawn_backoff,
+                                            profile_cooldown,
                                             pr_num,
                                             worker_cp,
                                             &role,
                                             &head_sha,
                                             false,
+                                            // The approving R1 is still at
+                                            // `reviewers[ri]` and is torn down
+                                            // below: R2 takes over its slot.
+                                            ReviewerSlotClaim::InheritR1,
                                         )
                                         .await;
                                         if matches!(
@@ -14212,6 +14580,25 @@ async fn tick(
                                                 (
                                                     true,
                                                     R2ProvisionDisposition::Attached.end_reason(),
+                                                )
+                                            }
+                                            R2ProvisionDisposition::Unavailable
+                                                if matches!(
+                                                    &r2_provision,
+                                                    Ok(ReviewerProvisionOutcome::Deferred)
+                                                ) =>
+                                            {
+                                                log(&format!(
+                                                    "R2 GATE: PR #{pr_num} — reviewer_cap {} is \
+                                                     still exceeded without the approving R1; \
+                                                     R1 approval stored, Phase 5 will dispatch R2 \
+                                                     ahead of queued R1 work",
+                                                    config.reviewer_cap
+                                                ));
+                                                (
+                                                    false,
+                                                    R2ProvisionDisposition::Unavailable
+                                                        .end_reason(),
                                                 )
                                             }
                                             R2ProvisionDisposition::Unavailable => {
@@ -14288,6 +14675,7 @@ async fn tick(
                                         name_pool,
                                         workers,
                                         lifetime_roster,
+                                        profile_cooldown,
                                         reviewer_task_id,
                                         pr_num,
                                         &head_sha,
@@ -14713,7 +15101,13 @@ async fn tick(
                                                 "conflict rework feed failed: {e} — cleaning up"
                                             ));
                                                 if !handle_dormant_worker_feed_failure(
-                                                    config, wt_mgr, name_pool, workers, wi, &e,
+                                                    config,
+                                                    wt_mgr,
+                                                    name_pool,
+                                                    workers,
+                                                    wi,
+                                                    &e,
+                                                    profile_cooldown,
                                                 )
                                                 .await
                                                 {
@@ -14917,6 +15311,18 @@ async fn tick(
                         other => other,
                     };
 
+                    // A drain-interrupted wait observed nothing new; leave
+                    // the prior snapshot for restart recovery.
+                    if !drain_interrupted {
+                        record_merge_checks_observation(
+                            config,
+                            reviewer_task_id,
+                            pr_num,
+                            &checks_outcome,
+                        )
+                        .await;
+                    }
+
                     match checks_outcome {
                         merge::ChecksOutcome::Failed { failing_checks } => {
                             let names = failing_checks.join(", ");
@@ -15012,7 +15418,13 @@ async fn tick(
                                                 "checks-failure rework feed failed: {e} — cleaning up"
                                             ));
                                                 if !handle_dormant_worker_feed_failure(
-                                                    config, wt_mgr, name_pool, workers, wi, &e,
+                                                    config,
+                                                    wt_mgr,
+                                                    name_pool,
+                                                    workers,
+                                                    wi,
+                                                    &e,
+                                                    profile_cooldown,
                                                 )
                                                 .await
                                                 {
@@ -15229,7 +15641,13 @@ async fn tick(
                                                      {e} — cleaning up"
                                                     ));
                                                     if !handle_dormant_worker_feed_failure(
-                                                        config, wt_mgr, name_pool, workers, wi, &e,
+                                                        config,
+                                                        wt_mgr,
+                                                        name_pool,
+                                                        workers,
+                                                        wi,
+                                                        &e,
+                                                        profile_cooldown,
                                                     )
                                                     .await
                                                     {
@@ -15575,7 +15993,13 @@ async fn tick(
                                                  {e} — cleaning up"
                                                 ));
                                                 if !handle_dormant_worker_feed_failure(
-                                                    config, wt_mgr, name_pool, workers, wi, &e,
+                                                    config,
+                                                    wt_mgr,
+                                                    name_pool,
+                                                    workers,
+                                                    wi,
+                                                    &e,
+                                                    profile_cooldown,
                                                 )
                                                 .await
                                                 {
@@ -15777,6 +16201,13 @@ async fn tick(
                                     }
                                 }
                             };
+                            record_merge_checks_observation(
+                                config,
+                                reviewer_task_id,
+                                pr_num,
+                                &retry_outcome,
+                            )
+                            .await;
                             match retry_outcome {
                                 merge::ChecksOutcome::Ready => {
                                     log(&format!(
@@ -16129,8 +16560,13 @@ async fn tick(
                                                     "merge-failure rework feed failed: {e} — cleaning up"
                                                 ));
                                                         if !handle_dormant_worker_feed_failure(
-                                                            config, wt_mgr, name_pool, workers, wi,
+                                                            config,
+                                                            wt_mgr,
+                                                            name_pool,
+                                                            workers,
+                                                            wi,
                                                             &e,
+                                                            profile_cooldown,
                                                         )
                                                         .await
                                                         {
@@ -16412,7 +16848,13 @@ async fn tick(
                                     {
                                         log(&format!("rework feed_turn failed: {e} — cleaning up"));
                                         if !handle_dormant_worker_feed_failure(
-                                            config, wt_mgr, name_pool, workers, wi, &e,
+                                            config,
+                                            wt_mgr,
+                                            name_pool,
+                                            workers,
+                                            wi,
+                                            &e,
+                                            profile_cooldown,
                                         )
                                         .await
                                         {
@@ -16814,6 +17256,7 @@ async fn tick(
                                             workers,
                                             reviewers,
                                             lifetime_roster,
+                                            profile_cooldown,
                                             pre_review_checks,
                                             task_id,
                                             pr,
@@ -16940,6 +17383,7 @@ async fn tick(
             workers,
             reviewers,
             lifetime_roster,
+            profile_cooldown,
             pre_review_checks,
             task_id,
             pr,
@@ -17043,7 +17487,9 @@ async fn tick(
                 continue;
             }
         };
-        match activate_reviewer_fallback(config, reviewer, &failure, &currency).await {
+        match activate_reviewer_fallback(config, reviewer, &failure, &currency, profile_cooldown)
+            .await
+        {
             Ok(ReviewerFallbackActivation::Activated) => {}
             Ok(ReviewerFallbackActivation::Settled) => {
                 reviewer_fallback_teardowns.push((i, "provider_blocked"))
@@ -17086,7 +17532,7 @@ async fn tick(
     order_reviewer_teardowns(&mut reviewer_fallback_teardowns);
     for (i, end_reason) in reviewer_fallback_teardowns.into_iter().rev() {
         let dead = reviewers.remove(i);
-        let close_reason = strike_reviewer_unclassified_teardown(
+        let close_reason = strike_reviewer_provider_failure_teardown(
             config,
             unrecordable,
             reviewer_respawn_backoff,
@@ -17212,33 +17658,12 @@ async fn tick(
         }
     }
 
-    // ── Phase 4-react: Park persistent workers that ended on blocked/needs-info ─
+    // ── Phase 4-react: Park persistent workers that ended on blocked/needs-info/failed ─
     // Turn-oriented runners park through `dispose_dead_turn_runner` when their
     // process exits. A persistent Claude child stays alive between turns, so
-    // its explicit reaction is honored here when the turn has ended.
-    let mut parked_workers = Vec::new();
-    for (i, w) in workers.iter_mut().enumerate() {
-        if !slot_is_reaction_park_candidate(w) {
-            continue;
-        }
-        match park_worker_on_reaction(&db_path, w).await {
-            Some(tasks::PersistentReactionDisposition::Parked) => parked_workers.push(i),
-            Some(tasks::PersistentReactionDisposition::NotParked) => {
-                // A delivery or ownership change outranks the reaction; stop
-                // re-checking it every tick until the worker reacts again.
-                w.agent_state = None;
-            }
-            None => {}
-        }
-    }
-    for &i in parked_workers.iter().rev() {
-        let dead = workers.remove(i);
-        log(&format!(
-            "worker {} parked task #{} on its explicit reaction",
-            dead.agent_name, dead.task_id
-        ));
-        cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
-    }
+    // its explicit reaction is honored here when the turn has ended — before
+    // the idle watchdog below can count the slot as a zombie.
+    park_reacted_persistent_workers(config, wt_mgr, name_pool, workers).await;
 
     // ── Phase 4-idle: Kill workers idle too long between turns ─────────
     // A worker that completed a turn (draining=false) but never gets a new
@@ -17371,10 +17796,13 @@ async fn tick(
     let mut error_failed: Vec<i64> = Vec::new();
     let mut settled_worker_fallbacks = Vec::new();
     for (i, worker) in workers.iter_mut().enumerate() {
-        match route_live_worker_provider_failure(config, worker).await {
+        match route_live_worker_provider_failure(config, worker, profile_cooldown).await {
             Ok(LiveWorkerFallbackRoute::NotCandidate) => {}
             Ok(LiveWorkerFallbackRoute::Activated) => {}
             Ok(LiveWorkerFallbackRoute::Settled) => settled_worker_fallbacks.push(i),
+            // Every alternate is cooling: keep the idle slot, its lease, and
+            // its pending turn; the next tick routes it again.
+            Ok(LiveWorkerFallbackRoute::Deferred) => {}
             // A stale or fail-closed installation must not reopen the
             // same-provider refeed loop. Fall through to the established
             // terminal disposition below instead.
@@ -17459,7 +17887,15 @@ async fn tick(
                 runner::FailureDisposition::ProviderUnavailable
                     | runner::FailureDisposition::ProfileUnavailable
             ) {
-                match activate_worker_fallback(config, &mut dead, failure, currency).await {
+                match activate_worker_fallback(
+                    config,
+                    &mut dead,
+                    failure,
+                    currency,
+                    profile_cooldown,
+                )
+                .await
+                {
                     Ok(WorkerFallbackActivation::Activated) => {
                         workers.insert(i, dead);
                         continue;
@@ -17467,6 +17903,10 @@ async fn tick(
                     Ok(WorkerFallbackActivation::Settled) => {
                         cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked")
                             .await;
+                        continue;
+                    }
+                    Ok(WorkerFallbackActivation::Deferred) => {
+                        workers.insert(i, dead);
                         continue;
                     }
                     Ok(WorkerFallbackActivation::NotInstalled) => {}
@@ -17699,7 +18139,15 @@ async fn tick(
                 runner::FailureDisposition::ProviderUnavailable
                     | runner::FailureDisposition::ProfileUnavailable
             ) {
-                match activate_worker_fallback(config, &mut dead, failure, currency).await {
+                match activate_worker_fallback(
+                    config,
+                    &mut dead,
+                    failure,
+                    currency,
+                    profile_cooldown,
+                )
+                .await
+                {
                     Ok(WorkerFallbackActivation::Activated) => {
                         workers.insert(i, dead);
                         continue;
@@ -17707,6 +18155,10 @@ async fn tick(
                     Ok(WorkerFallbackActivation::Settled) => {
                         cleanup_slot(config, wt_mgr, name_pool, dead, None, "provider_blocked")
                             .await;
+                        continue;
+                    }
+                    Ok(WorkerFallbackActivation::Deferred) => {
+                        workers.insert(i, dead);
                         continue;
                     }
                     Ok(WorkerFallbackActivation::NotInstalled) => {}
@@ -17972,13 +18424,27 @@ async fn tick(
                 runner::FailureDisposition::ProviderUnavailable
                     | runner::FailureDisposition::ProfileUnavailable
             ) {
-                match activate_reviewer_fallback(config, &mut reviewers[i], failure, currency).await
+                match activate_reviewer_fallback(
+                    config,
+                    &mut reviewers[i],
+                    failure,
+                    currency,
+                    profile_cooldown,
+                )
+                .await
                 {
                     Ok(ReviewerFallbackActivation::Activated) => continue,
                     Ok(ReviewerFallbackActivation::Settled) => {
                         let dead = reviewers.remove(i);
-                        teardown_reviewer(config, wt_mgr, name_pool, dead, "provider_blocked")
-                            .await;
+                        let close_reason = strike_reviewer_provider_failure_teardown(
+                            config,
+                            unrecordable,
+                            reviewer_respawn_backoff,
+                            "provider_blocked",
+                            &dead,
+                        )
+                        .await;
+                        teardown_reviewer(config, wt_mgr, name_pool, dead, close_reason).await;
                         continue;
                     }
                     Ok(ReviewerFallbackActivation::NotInstalled) => {}
@@ -18228,7 +18694,15 @@ async fn tick(
     // tick. A valid replay never allocates a reviewer or worker.
     let replay_rework_task = reconcile_merge_retries(config, wt_mgr, drain_state.draining).await?;
     if let Some(task_id) = replay_rework_task {
-        resume_retained_merge_replay_rework(config, wt_mgr, name_pool, workers, task_id).await;
+        resume_retained_merge_replay_rework(
+            config,
+            wt_mgr,
+            name_pool,
+            workers,
+            task_id,
+            profile_cooldown,
+        )
+        .await;
     }
 
     // ── Phase 4f: GitHub REQUEST_CHANGES outbox for review-only closes ──
@@ -18245,16 +18719,14 @@ async fn tick(
     // Skip during shutdown drain — no new work, let existing agents finish.
     //
     // A decomposition freeze must NOT skip this. Phase 5 only ever serves
-    // workers that already exist (phase 6 spawns none during the freeze), and
-    // the freeze's own drain predicate (decomposition_drain_ready) requires
-    // reviewers==0 && workers==0 && started_non_terminal==0. Gating reviewer
-    // provisioning on the freeze strands a retained worker awaiting review: it
-    // keeps the drain predicate false forever, and the freeze keeps its
-    // reviewer from spawning — a deadlock against the very drain the freeze
-    // waits for. Letting the reviewer run lets the retained worker settle and
-    // drives every started task toward a terminal state, which is exactly what
-    // the frozen-base capture waits for.
+    // workers that already exist (phase 6 spawns none during the freeze).
+    // Planning does not wait for that work — its base is the head recorded at
+    // planning start, read through the snapshot archive — so gating reviewer
+    // provisioning on the freeze would only strand a retained worker awaiting
+    // review for the whole planning attempt.
     if !drain_state.draining {
+        // Reviewer-slot admission spans Phases 5 and 5b: one queue, one pass.
+        reviewer_slot_queue.begin_pass();
         let active_in_review = {
             let p = db_path.clone();
             tokio::task::spawn_blocking(move || -> Result<HashSet<i64>> {
@@ -18296,6 +18768,8 @@ async fn tick(
             .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))??;
             needs_reviewer_from_workers.retain(|(_, task_id, _)| reviewable.contains(task_id));
         }
+        // Oldest first, so reviewer slots go to the longest-waiting task.
+        needs_reviewer_from_workers.sort_by_key(|(_, task_id, _)| *task_id);
         let mut parked_workers: Vec<(usize, String, String)> = Vec::new();
         let mut repo_mismatch_workers: Vec<(usize, String)> = Vec::new();
         let mut pr_closed_workers: Vec<usize> = Vec::new();
@@ -18426,6 +18900,24 @@ async fn tick(
                     if reviewer_respawn_backoff.blocks(*task_id, *pr, std::time::Instant::now()) {
                         continue;
                     }
+                    // Before any reservation or CI-gate bookkeeping: a
+                    // deferral changes nothing and retries next tick.
+                    if !reviewer_slot_queue
+                        .admit(
+                            *task_id,
+                            *pr,
+                            role_str == "r2",
+                            reviewer_slots_free(
+                                config.reviewer_cap,
+                                reviewers,
+                                ReviewerSlotClaim::Fresh,
+                            ),
+                            config.reviewer_cap,
+                        )
+                        .admitted()
+                    {
+                        continue;
+                    }
                     let role = if role_str == "r2" {
                         // Look up R1 reviewer info from durable approval
                         let r1_info = {
@@ -18469,11 +18961,14 @@ async fn tick(
                         reviewers,
                         lifetime_roster,
                         unrecordable,
+                        reviewer_respawn_backoff,
+                        profile_cooldown,
                         *pr,
                         counterpart,
                         &role,
                         &head_sha,
                         false,
+                        ReviewerSlotClaim::Fresh,
                     )
                     .await
                     {
@@ -18504,7 +18999,9 @@ async fn tick(
                             defer_pre_review_after_head_move(pre_review_checks, *task_id, *pr);
                         }
                         ReviewerProvisionOutcome::Unavailable
-                        | ReviewerProvisionOutcome::Failed(_) => {}
+                        | ReviewerProvisionOutcome::Failed(_)
+                        | ReviewerProvisionOutcome::Deferred
+                        | ReviewerProvisionOutcome::ProfilesCoolingDown => {}
                     }
                 }
                 Err(e) => {
@@ -18514,6 +19011,10 @@ async fn tick(
                 }
             }
         }
+        // Candidates were visited by task id, not slot index: restore index
+        // order so the reverse-order removals below stay valid.
+        pr_closed_workers.sort_unstable();
+        parked_workers.sort_by_key(|(wi, _, _)| *wi);
         for &wi in pr_closed_workers.iter().rev() {
             let w = workers.remove(wi);
             cleanup_slot(config, wt_mgr, name_pool, w, None, "pr_closed").await;
@@ -18562,6 +19063,7 @@ async fn tick(
                 name_pool,
                 workers,
                 lifetime_roster,
+                profile_cooldown,
                 task_id,
                 pr,
                 &head_sha,
@@ -18586,7 +19088,7 @@ async fn tick(
             Option<String>,
             Option<String>,
         );
-        let orphan_in_review: Vec<OrphanRow> = {
+        let mut orphan_in_review: Vec<OrphanRow> = {
             let p = db_path.clone();
             tokio::task::spawn_blocking(move || -> Result<Vec<OrphanRow>> {
                 let conn = quorum_core::db::open(&p)?;
@@ -18614,6 +19116,8 @@ async fn tick(
             .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
             .unwrap_or_default()
         };
+        // Oldest first, matching Phase 5 and the reviewer-slot queue order.
+        orphan_in_review.sort_by_key(|row| row.0);
         for (
             task_id,
             pr,
@@ -18745,6 +19249,7 @@ async fn tick(
                         name_pool,
                         workers,
                         lifetime_roster,
+                        profile_cooldown,
                         *task_id,
                         *pr,
                         &head_sha,
@@ -18828,6 +19333,24 @@ async fn tick(
                         ));
                         continue;
                     }
+                    // Same reviewer-slot gate as Phase 5; review-only and
+                    // restart-orphaned reviews queue with worker reviews.
+                    if !reviewer_slot_queue
+                        .admit(
+                            *task_id,
+                            *pr,
+                            role_str == "r2",
+                            reviewer_slots_free(
+                                config.reviewer_cap,
+                                reviewers,
+                                ReviewerSlotClaim::Fresh,
+                            ),
+                            config.reviewer_cap,
+                        )
+                        .admitted()
+                    {
+                        continue;
+                    }
                     let role = if role_str == "r2" {
                         let r1_info = {
                             let p = db_path.clone();
@@ -18903,11 +19426,14 @@ async fn tick(
                         reviewers,
                         lifetime_roster,
                         unrecordable,
+                        reviewer_respawn_backoff,
+                        profile_cooldown,
                         *pr,
                         counterpart,
                         &role,
                         &head_sha,
                         true,
+                        ReviewerSlotClaim::Fresh,
                     )
                     .await
                     {
@@ -18936,7 +19462,9 @@ async fn tick(
                             defer_pre_review_after_head_move(pre_review_checks, *task_id, *pr);
                         }
                         ReviewerProvisionOutcome::Unavailable
-                        | ReviewerProvisionOutcome::Failed(_) => {}
+                        | ReviewerProvisionOutcome::Failed(_)
+                        | ReviewerProvisionOutcome::Deferred
+                        | ReviewerProvisionOutcome::ProfilesCoolingDown => {}
                     }
                 }
                 Err(e) => {
@@ -18984,7 +19512,7 @@ async fn tick(
             poison_tracker,
             claim_skip_logs,
             lifetime_roster,
-            decomposition_freeze,
+            profile_cooldown,
         )
         .await?;
     }
@@ -18996,7 +19524,6 @@ async fn tick(
         classifier_consec_errors,
         classifier_backoff_until,
         drain_state.draining,
-        decomposition_freeze,
         &|kind| agent_bin_for_kind(config, kind).map(str::to_owned),
     )
     .await?;
@@ -19009,7 +19536,8 @@ async fn tick(
     // priority ready job (attempts asc, past backoff, under cap), and (c)
     // log dead-lettered rows so operators see poison PRs instead of silent
     // starvation. Never touches task lifecycle: analytics-only, retry-only.
-    if !drain_state.draining && !decomposition_freeze {
+    // A planning graph does not pause it; only the self-update drain does.
+    if !drain_state.draining {
         let p = db_path.clone();
         let now_ts = now_unix();
         let outcome = tokio::task::spawn_blocking(move || -> Result<InterpretTickOutcome> {
@@ -19138,11 +19666,8 @@ async fn tick(
     }
 
     // 8b: Spawn doctor if enabled, idle, not draining, and a stalled task exists.
-    if config.doctor_enabled
-        && doctor_slot.is_none()
-        && !drain_state.draining
-        && !decomposition_freeze
-    {
+    // A planning graph does not pause the doctor; only the self-update drain does.
+    if config.doctor_enabled && doctor_slot.is_none() && !drain_state.draining {
         let p = db_path.clone();
         let active_worker_task_ids: Vec<i64> = workers.iter().map(|w| w.task_id).collect();
         let active_reviewer_task_ids: Vec<i64> = reviewers.iter().map(|r| r.task_id).collect();
@@ -20462,6 +20987,7 @@ async fn handle_dormant_worker_feed_failure(
     workers: &mut Vec<SlotState>,
     worker_index: usize,
     error: &std::io::Error,
+    profile_cooldown: &mut ProfileCooldown,
 ) -> bool {
     match settle_dormant_worker_feed_failure(
         config,
@@ -20470,6 +20996,7 @@ async fn handle_dormant_worker_feed_failure(
         workers,
         worker_index,
         error,
+        profile_cooldown,
     )
     .await
     {
@@ -20497,6 +21024,7 @@ async fn settle_dormant_worker_feed_failure(
     workers: &mut Vec<SlotState>,
     worker_index: usize,
     error: &std::io::Error,
+    profile_cooldown: &mut ProfileCooldown,
 ) -> Result<DormantWorkerFeedFailureDisposition> {
     let (provider, continuation_id) = match &workers[worker_index].proc {
         SlotProcess::Dormant {
@@ -20512,6 +21040,40 @@ async fn settle_dormant_worker_feed_failure(
             ));
         }
     };
+    // A dormant continuation launch carries the runner's classification. A
+    // provider- or profile-unavailable one starts the slot profile's cooldown
+    // so the next worker provision does not launch straight back onto it.
+    if let (Some(failure), Some(agent_run_id)) = (
+        runner::launch_failure(error),
+        workers[worker_index].agent_run_id,
+    ) {
+        if matches!(
+            failure.disposition(),
+            runner::FailureDisposition::ProviderUnavailable
+                | runner::FailureDisposition::ProfileUnavailable
+        ) {
+            // Best effort: recording a cooldown must never gate the durable
+            // disposition below.
+            let db_path = config.db_path.clone();
+            match tokio::task::spawn_blocking(move || {
+                let conn = quorum_core::db::open(&db_path)?;
+                worker_run_profile_id(&conn, agent_run_id)
+            })
+            .await
+            {
+                Ok(Ok(Some(profile_id))) => {
+                    profile_cooldown.record(&profile_id, std::time::Instant::now());
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => log(&format!(
+                    "worker run {agent_run_id} cooldown profile lookup failed: {error}"
+                )),
+                Err(error) => log(&format!(
+                    "worker run {agent_run_id} cooldown profile lookup join failed: {error}"
+                )),
+            }
+        }
+    }
     let pending = PendingTurn {
         provider,
         model: workers[worker_index].model.clone(),
@@ -21510,15 +22072,53 @@ async fn reap_idle_zombie_worker(
     cleanup_slot(config, wt_mgr, name_pool, dead, None, "idle_reaped").await;
 }
 
+/// Phase 4-react: park every live persistent worker whose turn ended on a
+/// parkable reaction and tear its slot down as `parked` — no idle breach, no
+/// `AgentFailed` recovery attempt, and no respawn on the unchanged contract.
+async fn park_reacted_persistent_workers(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+) {
+    let mut parked_workers = Vec::new();
+    for (i, w) in workers.iter_mut().enumerate() {
+        if !slot_is_reaction_park_candidate(w) {
+            continue;
+        }
+        match park_worker_on_reaction(&config.db_path, w).await {
+            Some(tasks::PersistentReactionDisposition::Parked) => parked_workers.push(i),
+            Some(tasks::PersistentReactionDisposition::NotParked) => {
+                // A delivery or ownership change outranks the reaction; stop
+                // re-checking it every tick until the worker reacts again.
+                w.agent_state = None;
+            }
+            None => {}
+        }
+    }
+    for &i in parked_workers.iter().rev() {
+        let dead = workers.remove(i);
+        log(&format!(
+            "worker {} parked task #{} on its explicit reaction",
+            dead.agent_name, dead.task_id
+        ));
+        cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
+    }
+}
+
 /// A live persistent worker whose turn ended after a `blocked` /
-/// `needs-info` reaction.
+/// `needs-info` / `failed` reaction. Must accept exactly the reactions
+/// `tasks::park_persistent_worker_reaction` parks.
 fn slot_is_reaction_park_candidate(slot: &SlotState) -> bool {
     !slot.draining
         && slot.error_turn_count == 0
         && !slot_has_pending_watchdog_outcome(slot)
         && slot.process_kind().turn_mode() == runner::TurnMode::PersistentChild
         && matches!(slot.proc, SlotProcess::Running(_))
-        && matches!(slot.agent_state.as_deref(), Some("blocked" | "needs-info"))
+        && slot
+            .agent_state
+            .as_deref()
+            .is_some_and(tasks::is_persistent_park_reaction)
 }
 
 /// Park the slot's task on the worker's latest durable reaction. `None` means
@@ -23438,28 +24038,47 @@ async fn record_reviewer_strike(
 const REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON: &str =
     "turn-error-unclassified-strike-unrecorded";
 
-/// Burn one per-head strike for an unclassified terminal reviewer turn before
-/// teardown closes the exact agent run. First-turn failures can precede the
-/// slot's in-memory PR/head fields, so recover either missing value from the
-/// immutable launch evidence persisted on that run.
+/// Burn one per-head strike for a provider-failed terminal reviewer before
+/// teardown closes the exact agent run, and pause the next provision for that
+/// (task, PR). Two end reasons qualify:
+///
+/// - `turn-error-unclassified`: an unclassified terminal reviewer turn.
+/// - `provider_blocked`: a provider/profile-unavailable failure whose fallback
+///   install settled with no live alternate. Without a strike and pause the
+///   daemon re-provisions the same blocked provider every tick until the
+///   lifetime cap parks the task.
+///
+/// Every other end reason is returned unchanged with no strike or pause.
+/// First-turn failures can precede the slot's in-memory PR/head fields, so
+/// recover either missing value from the immutable launch evidence persisted
+/// on that run.
 ///
 /// Returns the end reason teardown must persist. A successful strike keeps
-/// `turn-error-unclassified`, whose short closes stay out of
+/// the given reason. Short `turn-error-unclassified` closes stay out of
 /// `MAX_TOTAL_REVIEWER_RUNS` because this strike is the durable bound across
-/// restarts. A failed strike write returns
-/// [`REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON`] so that close still
+/// restarts, so a failed strike write returns
+/// [`REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON`] and that close still
 /// counts toward the lifetime cap; the in-memory backstop does not survive a
-/// restart.
-async fn strike_reviewer_unclassified_teardown(
+/// restart. `provider_blocked` closes always count toward that cap, so their
+/// reason is kept even when the strike write fails.
+async fn strike_reviewer_provider_failure_teardown(
     config: &ServeConfig,
     unrecordable: &mut UnrecordableStrikes,
     respawn_backoff: &mut ReviewerRespawnBackoff,
     end_reason: &'static str,
     dead: &SlotState,
 ) -> &'static str {
-    if end_reason != "turn-error-unclassified" {
-        return end_reason;
-    }
+    let (unrecorded_reason, default_error) = match end_reason {
+        "turn-error-unclassified" => (
+            REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON,
+            "reviewer turn ended with an unclassified error",
+        ),
+        "provider_blocked" => (
+            "provider_blocked",
+            "reviewer provider unavailable with no eligible alternate",
+        ),
+        _ => return end_reason,
+    };
 
     let role = if dead.r2_origin { "r2" } else { "r1" };
     let mut pr = dead.pr;
@@ -23467,7 +24086,7 @@ async fn strike_reviewer_unclassified_teardown(
     if pr.is_none() || head_sha.is_none() {
         let Some(run_id) = dead.agent_run_id else {
             log(&format!(
-                "reviewer {} ended turn-error-unclassified for task #{} without slot PR/head or an agent run id; cannot record a durable strike",
+                "reviewer {} ended {end_reason} for task #{} without slot PR/head or an agent run id; cannot record a durable strike",
                 dead.agent_name, dead.task_id,
             ));
             return end_reason;
@@ -23496,39 +24115,36 @@ async fn strike_reviewer_unclassified_teardown(
             }
             Ok(Ok(None)) => {
                 log(&format!(
-                    "reviewer {} ended turn-error-unclassified for task #{} but exact agent run #{run_id} has no durable reviewer launch; cannot record a strike",
+                    "reviewer {} ended {end_reason} for task #{} but exact agent run #{run_id} has no durable reviewer launch; cannot record a strike",
                     dead.agent_name, dead.task_id,
                 ));
                 return end_reason;
             }
             Ok(Err(error)) => {
                 log(&format!(
-                    "reviewer {} ended turn-error-unclassified for task #{} but durable launch lookup for agent run #{run_id} failed: {error}; closing as {REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON} so the lifetime cap still counts this run",
+                    "reviewer {} ended {end_reason} for task #{} but durable launch lookup for agent run #{run_id} failed: {error}; closing as {unrecorded_reason} so the lifetime cap still counts this run",
                     dead.agent_name, dead.task_id,
                 ));
-                return REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON;
+                return unrecorded_reason;
             }
             Err(error) => {
                 log(&format!(
-                    "reviewer {} ended turn-error-unclassified for task #{} but durable launch lookup for agent run #{run_id} could not join: {error}; closing as {REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON} so the lifetime cap still counts this run",
+                    "reviewer {} ended {end_reason} for task #{} but durable launch lookup for agent run #{run_id} could not join: {error}; closing as {unrecorded_reason} so the lifetime cap still counts this run",
                     dead.agent_name, dead.task_id,
                 ));
-                return REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON;
+                return unrecorded_reason;
             }
         }
     }
 
     let (Some(pr), Some(head_sha)) = (pr, head_sha) else {
         log(&format!(
-            "reviewer {} ended turn-error-unclassified for task #{} but neither slot nor durable agent run supplied a complete PR/head; cannot record a strike",
+            "reviewer {} ended {end_reason} for task #{} but neither slot nor durable agent run supplied a complete PR/head; cannot record a strike",
             dead.agent_name, dead.task_id,
         ));
         return end_reason;
     };
-    let provider_error = dead
-        .last_error_text
-        .as_deref()
-        .unwrap_or("reviewer turn ended with an unclassified error");
+    let provider_error = dead.last_error_text.as_deref().unwrap_or(default_error);
     // An unrecordable strike is already loud and counted by the common
     // in-memory backstop; still pause so this failure cannot respawn per tick.
     // The backstop resets on restart, so a failed write must not close under
@@ -23548,7 +24164,7 @@ async fn strike_reviewer_unclassified_teardown(
             let delay =
                 respawn_backoff.record(dead.task_id, pr, strikes, std::time::Instant::now());
             log(&format!(
-                "reviewer {} ended turn-error-unclassified for task #{} PR #{pr} head {head_sha}: recorded a {role_label} provider-failure strike and deferring the next provision by {:.1}s",
+                "reviewer {} ended {end_reason} for task #{} PR #{pr} head {head_sha}: recorded a {role_label} provider-failure strike and deferring the next provision by {:.1}s",
                 dead.agent_name,
                 dead.task_id,
                 delay.as_secs_f64(),
@@ -23559,12 +24175,12 @@ async fn strike_reviewer_unclassified_teardown(
         Err(error) => {
             let delay = respawn_backoff.record(dead.task_id, pr, 1, std::time::Instant::now());
             log(&format!(
-                "reviewer {} ended turn-error-unclassified for task #{} PR #{pr} head {head_sha}: durable provider-failure strike was not recorded ({error}); closing as {REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON} so the lifetime cap still counts this run, deferring the next provision by {:.1}s",
+                "reviewer {} ended {end_reason} for task #{} PR #{pr} head {head_sha}: durable provider-failure strike was not recorded ({error}); closing as {unrecorded_reason} so the lifetime cap still counts this run, deferring the next provision by {:.1}s",
                 dead.agent_name,
                 dead.task_id,
                 delay.as_secs_f64(),
             ));
-            REVIEWER_UNCLASSIFIED_STRIKE_UNRECORDED_END_REASON
+            unrecorded_reason
         }
     }
 }
@@ -23679,12 +24295,20 @@ async fn provision_reviewer(
     reviewers: &mut Vec<SlotState>,
     lifetime_roster: &mut LifetimeRoster,
     unrecordable: &mut UnrecordableStrikes,
+    respawn_backoff: &mut ReviewerRespawnBackoff,
+    profile_cooldown: &mut ProfileCooldown,
     pr: i64,
     worker: ReviewCounterpart<'_>,
     role: &ReviewRole,
     head_sha: &str,
     recover_interrupted: bool,
+    slot_claim: ReviewerSlotClaim,
 ) -> Result<ReviewerProvisionOutcome> {
+    // The reviewer-process bound shared by every spawn path. Checked before
+    // the reservation so a deferral leaves no durable trace.
+    if reviewer_slots_free(config.reviewer_cap, reviewers, slot_claim) == 0 {
+        return Ok(ReviewerProvisionOutcome::Deferred);
+    }
     let reservation = uuid::Uuid::new_v4().to_string();
     let reserved = {
         let path = config.db_path.clone();
@@ -23720,6 +24344,8 @@ async fn provision_reviewer(
         reviewers,
         lifetime_roster,
         unrecordable,
+        respawn_backoff,
+        profile_cooldown,
         pr,
         worker,
         role,
@@ -23751,6 +24377,8 @@ async fn provision_reviewer_reserved(
     reviewers: &mut Vec<SlotState>,
     lifetime_roster: &mut LifetimeRoster,
     unrecordable: &mut UnrecordableStrikes,
+    respawn_backoff: &mut ReviewerRespawnBackoff,
+    profile_cooldown: &mut ProfileCooldown,
     pr: i64,
     worker: ReviewCounterpart<'_>,
     role: &ReviewRole,
@@ -23911,6 +24539,38 @@ async fn provision_reviewer_reserved(
             )));
         }
     }
+    // A profile another reviewer just proved unavailable is skipped before any
+    // reviewer resource exists. An eligible alternate is reached through the
+    // ordinary classified-launch-failure fallback below, so the alternate's
+    // routing evidence and verdict attribution are the existing ones.
+    let skip_cooling_assignment = match reviewer_cooldown_plan(
+        config,
+        profile_cooldown,
+        &assignment,
+        complexity,
+        role,
+        std::time::Instant::now(),
+    )
+    .await?
+    {
+        CooldownPlan::Run => false,
+        CooldownPlan::SkipAssigned => true,
+        CooldownPlan::Defer { until } => {
+            let now = std::time::Instant::now();
+            if profile_cooldown.take_deferral_log_slot(now) {
+                log(&format!(
+                    "{}: task #{} PR #{pr} reviewer deferred — profile {} and every eligible \
+                     alternate are cooling down for another {:.1}s (further deferrals are \
+                     rate-limited)",
+                    role.as_str().to_uppercase(),
+                    worker.task_id,
+                    assignment.profile_id,
+                    until.saturating_duration_since(now).as_secs_f64(),
+                ));
+            }
+            return Ok(ReviewerProvisionOutcome::ProfilesCoolingDown);
+        }
+    };
     let reviewer_name = if let Some(recovery) = &recovery {
         // Restart recovery deliberately reuses the interrupted reviewer's
         // durable identity. Normal provisioning below excludes every prior
@@ -24552,19 +25212,26 @@ async fn provision_reviewer_reserved(
         &session_id,
         reviewer_continuation_id.as_deref(),
     );
-    let spawn_result = runner::RunnerProc::launch(
-        &runner::LaunchRequest {
-            model: &reviewer_model,
-            effort: &reviewer_effort,
-            worktree: &wt_path,
-            prompt: &prompt,
-            environment: &reviewer_env,
-            mode: runner::LaunchMode::Normal,
-            continuation_id,
-        },
-        &runner_adapter_config(config, reviewer_agent_bin),
-    )
-    .await;
+    let spawn_result = if skip_cooling_assignment {
+        // No provider call: the cooling profile is retired as a classified
+        // profile-unavailable launch, which hands this exact persisted run to
+        // `activate_reviewer_fallback` for the alternate route.
+        Err(cooling_profile_failure(&assignment.profile_id))
+    } else {
+        runner::RunnerProc::launch(
+            &runner::LaunchRequest {
+                model: &reviewer_model,
+                effort: &reviewer_effort,
+                worktree: &wt_path,
+                prompt: &prompt,
+                environment: &reviewer_env,
+                mode: runner::LaunchMode::Normal,
+                continuation_id,
+            },
+            &runner_adapter_config(config, reviewer_agent_bin),
+        )
+        .await
+    };
     match spawn_result {
         Ok(proc) => {
             // M7: persist PID immediately so crash recovery can clean up
@@ -24708,6 +25375,7 @@ async fn provision_reviewer_reserved(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: None,
                 agent_run_id: Some(reviewer_run_id),
                 cap_run_id: Some(cap_run_id),
@@ -24775,6 +25443,7 @@ async fn provision_reviewer_reserved(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: Some(e.detail().to_string()),
                 agent_run_id: Some(reviewer_run_id),
                 cap_run_id: Some(cap_run_id.clone()),
@@ -24797,7 +25466,15 @@ async fn provision_reviewer_reserved(
                 let currency = quorum_core::db::open(&config.db_path).and_then(|conn| {
                     load_reviewer_fallback_currency(&conn, &failed_slot, observed_at)
                 })?;
-                match activate_reviewer_fallback(config, &mut failed_slot, &e, &currency).await? {
+                match activate_reviewer_fallback(
+                    config,
+                    &mut failed_slot,
+                    &e,
+                    &currency,
+                    profile_cooldown,
+                )
+                .await?
+                {
                     ReviewerFallbackActivation::Activated => {
                         // Same as the direct launch above: activation is not a
                         // verdict, so the per-head budget stays as it is.
@@ -24805,14 +25482,16 @@ async fn provision_reviewer_reserved(
                         return Ok(ReviewerProvisionOutcome::Attached);
                     }
                     ReviewerFallbackActivation::Settled => {
-                        teardown_reviewer(
+                        let close_reason = strike_reviewer_provider_failure_teardown(
                             config,
-                            wt_mgr,
-                            name_pool,
-                            failed_slot,
+                            unrecordable,
+                            respawn_backoff,
                             "provider_blocked",
+                            &failed_slot,
                         )
                         .await;
+                        teardown_reviewer(config, wt_mgr, name_pool, failed_slot, close_reason)
+                            .await;
                         return Ok(ReviewerProvisionOutcome::Failed(reason));
                     }
                     ReviewerFallbackActivation::NotInstalled => {}
@@ -24952,6 +25631,41 @@ async fn recover_missing_dependency_merge_commits(
     Ok(DependencyMergeRecovery::Recovered)
 }
 
+/// The done dependencies that impose no merge commit to contain: no stamped
+/// merge SHA, no recorded PR, and closed by the owner with `quorum task-close`.
+/// Callers run this after `recover_missing_dependency_merge_commits`, so a
+/// dependency with a PR is never exempt: a recovered merge is already stamped,
+/// and an unrecoverable one keeps the caller's fail-closed deferral. Shared by
+/// worker admission and the planner's frozen-base capture.
+async fn manually_closed_dependencies_without_merge(
+    db_path: &Path,
+    dependencies: &[tasks::DependencyMergeCommit],
+) -> Result<std::collections::HashSet<i64>> {
+    let candidates = dependencies
+        .iter()
+        .filter(|dependency| {
+            dependency.merge_commit_sha.is_none() && dependency.pr_number.is_none()
+        })
+        .map(|dependency| dependency.task_id)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let db_path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<std::collections::HashSet<i64>> {
+        let conn = quorum_core::db::open(&db_path)?;
+        let mut closed = std::collections::HashSet::new();
+        for task_id in candidates {
+            if tasks::dependency_closed_manually(&conn, task_id)? {
+                closed.insert(task_id);
+            }
+        }
+        Ok(closed)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("dependency manual-close join: {error}")))?
+}
+
 /// Spawn a worker for the next highest-priority ready task.
 /// Returns true if a worker was spawned, false if no ready tasks or names available.
 enum DependencyBaseAdmission {
@@ -25041,9 +25755,20 @@ async fn verify_dependency_base_before_allocation(
         }
     }
 
-    let missing_record = dependencies
-        .iter()
-        .find(|dependency| dependency.merge_commit_sha.is_none());
+    // A leaf with no merge SHA and no recorded PR is satisfied only if the
+    // owner closed it with `quorum task-close`: there is no merge to verify,
+    // so admission falls back to the fetched base head. A leaf with a PR is
+    // never exempt: a recovered merge was stamped above and reloaded as
+    // `Some`, and an unrecoverable one (e.g. `Unknown` from a transient `gh`
+    // failure on a still-open PR) keeps the fail-closed deferral below.
+    let manually_closed = if unresolved_reason.is_none() {
+        manually_closed_dependencies_without_merge(db_path, &dependencies).await?
+    } else {
+        std::collections::HashSet::new()
+    };
+    let missing_record = dependencies.iter().find(|dependency| {
+        dependency.merge_commit_sha.is_none() && !manually_closed.contains(&dependency.task_id)
+    });
     let reason = if let Some(reason) = unresolved_reason {
         reason
     } else if let Some(dependency) = missing_record {
@@ -25464,24 +26189,21 @@ async fn resolve_branch_sync_adoption(
     }))
 }
 
-/// Which ready tasks one worker dispatch may start.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WorkerAdmission {
-    /// Implementation-ready open tasks, then retried rework.
-    AllReady,
-    /// Retried rework only, for a decomposition freeze. No new task starts.
-    RetriedRework,
-}
-
-/// Start workers up to the cap.
+/// Start workers up to the cap: implementation-ready open tasks, then
+/// retried rework.
 ///
-/// A decomposition freeze stops new implementation, not started work. The drain
-/// counts a retried rework task, and only this dispatch can give it a worker:
-/// `reconcile_remediation_retries` needs retry feedback or a recovery marker,
-/// and the sweep leaves it alone. Skipping it under a freeze would stall the
-/// drain against itself, as `tasks::claim` and `classifier_queue` also note.
-/// The pass admits only rows the drain already counts, so it adds no started
-/// work, and the base is still captured only after those rows finish.
+/// A planning graph does not narrow this pass. Its freeze blocks only its own
+/// source task, which is in `planning` status and is also excluded by the
+/// claim SQL's source-scoped freeze clause, so unrelated open tasks and other
+/// graphs' ready children keep dispatching while a graph plans.
+///
+/// Every active graph advances in this same pass. Each admission re-reads the
+/// candidate listing on its own short connection (`priority DESC, id ASC`),
+/// and the listing and the claim both evaluate holds, hard-failed siblings,
+/// and the `max_graph_children_working` limit per child's own `graph_id`. A
+/// held graph therefore withholds only its own children, while children of
+/// every graph share — and never exceed in aggregate — the worker `cap`, which
+/// also bounds the pass to at most `cap` admissions per tick.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_workers(
     config: &ServeConfig,
@@ -25491,13 +26213,8 @@ async fn dispatch_workers(
     poison_tracker: &mut PoisonTracker,
     claim_skip_logs: &mut ClaimSkipLogLimiter,
     lifetime_roster: &mut LifetimeRoster,
-    decomposition_freeze: bool,
+    profile_cooldown: &mut ProfileCooldown,
 ) -> Result<()> {
-    let admission = if decomposition_freeze {
-        WorkerAdmission::RetriedRework
-    } else {
-        WorkerAdmission::AllReady
-    };
     while workers.len() < config.cap {
         if !spawn_admitted_worker(
             config,
@@ -25507,7 +26224,7 @@ async fn dispatch_workers(
             poison_tracker,
             claim_skip_logs,
             lifetime_roster,
-            admission,
+            profile_cooldown,
         )
         .await?
         {
@@ -25535,9 +26252,75 @@ async fn spawn_worker(
         poison_tracker,
         claim_skip_logs,
         lifetime_roster,
-        WorkerAdmission::AllReady,
+        &mut ProfileCooldown::new(),
     )
     .await
+}
+
+/// Settle a worker launch refused after the atomic claim succeeded.
+///
+/// The refusal never escapes as a tick error while the claim is held: the
+/// specific reason is recorded in `errors`, then `tasks::park` clears the
+/// assignee, deactivates the lease and stores the parked reason in one
+/// transaction. Only after that durable settlement are the checkout (the
+/// branch is kept), the working journal row and the worker name released.
+/// A parked task is excluded from dispatch, so a refusal that recurs on every
+/// launch attempt parks once instead of looping each tick. A failed park is a
+/// DB failure: the claim may still be held, so runtime state is retained for
+/// lease/restart recovery and the error is returned. A clean-negative refusal
+/// (`record_error = false`, e.g. a lost race) settles identically but writes
+/// no `errors` row.
+#[allow(clippy::too_many_arguments)]
+async fn refuse_claimed_worker_launch(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    task_id: i64,
+    agent_name: &str,
+    wt_path: &Path,
+    branch: &str,
+    release_checkout: bool,
+    worker_session_log: &mut Option<session_log::SessionLog>,
+    reason: &str,
+    resume_status: &str,
+    record_error: bool,
+) -> Result<bool> {
+    let db_path = &config.db_path;
+    log(&format!("task #{task_id}: {reason}"));
+    if record_error {
+        persist_provisioning_failure(db_path, task_id, reason).await;
+    }
+    if let Err(error) = park_task_result(db_path, task_id, reason, resume_status).await {
+        log(&format!(
+            "FATAL: failed to park task #{task_id} after refused worker launch: {error}"
+        ));
+        return Err(error);
+    }
+    if release_checkout {
+        let _ = release_worker_worktree(
+            config,
+            wt_mgr,
+            wt_path,
+            branch,
+            false,
+            &worktree::RecoverIdentity::new(task_id, agent_name, "launch_refused"),
+        )
+        .await;
+    }
+    if let Some(log) = worker_session_log.as_mut() {
+        log.finalize(None);
+    }
+    let journal_db = db_path.clone();
+    let journal_agent = agent_name.to_string();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&journal_db)?;
+        journal::delete(&mut conn, &journal_agent).map(|_| ())
+    })
+    .await
+    .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
+    .ok();
+    guarded_worker_name_release(db_path, name_pool, agent_name, task_id).await;
+    Ok(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -25549,7 +26332,7 @@ async fn spawn_admitted_worker(
     poison_tracker: &mut PoisonTracker,
     claim_skip_logs: &mut ClaimSkipLogLimiter,
     lifetime_roster: &mut LifetimeRoster,
-    admission: WorkerAdmission,
+    profile_cooldown: &mut ProfileCooldown,
 ) -> Result<bool> {
     let db_path = config.db_path.clone();
     let p = db_path.clone();
@@ -25558,15 +26341,8 @@ async fn spawn_admitted_worker(
     let graph_children_limit = config.graph_children_working_limit();
     let available = tokio::task::spawn_blocking(move || -> Result<Vec<tasks::Task>> {
         let conn = quorum_core::db::open(&p)?;
-        // Open tasks must stay out of a frozen selection, not merely lose their
-        // claim: they sort first, and a refused claim would end the pass before
-        // it reached any retried rework.
-        let mut available = match admission {
-            WorkerAdmission::AllReady => {
-                tasks::list_implementation_ready_open_with_graph_limit(&conn, graph_children_limit)?
-            }
-            WorkerAdmission::RetriedRework => Vec::new(),
-        };
+        let mut available =
+            tasks::list_implementation_ready_open_with_graph_limit(&conn, graph_children_limit)?;
         available.extend(
             tasks::list(&conn, Some("rework"), None, None)?
                 .into_iter()
@@ -25595,7 +26371,7 @@ async fn spawn_admitted_worker(
         );
     }
 
-    let ready_task = available.into_iter().find(|t| {
+    let dispatchable = available.into_iter().filter(|t| {
         if !t.ready || in_flight.contains(&t.id) || poison_tracker.is_poisoned(t.id) {
             return false;
         }
@@ -25610,6 +26386,31 @@ async fn spawn_admitted_worker(
         }
         !t.review_only
     });
+    // A task whose every eligible worker profile is cooling down after a
+    // recent provider/profile-unavailable classification is passed over before
+    // any name, claim, worktree, run, or process exists; it is retried once a
+    // cooldown expires. The gate is read-only, so a passed-over task is
+    // unchanged.
+    let mut ready_task = None;
+    for candidate in dispatchable {
+        let now = std::time::Instant::now();
+        match worker_cooldown_deferral(config, profile_cooldown, &candidate, now).await? {
+            None => {
+                ready_task = Some(candidate);
+                break;
+            }
+            Some(until) => {
+                if profile_cooldown.take_deferral_log_slot(now) {
+                    log(&format!(
+                        "task #{} worker deferred — every eligible worker profile is cooling \
+                         down for another {:.1}s (further deferrals are rate-limited)",
+                        candidate.id,
+                        until.saturating_duration_since(now).as_secs_f64(),
+                    ));
+                }
+            }
+        }
+    }
 
     let mut task = match ready_task {
         Some(t) => t,
@@ -26387,13 +27188,41 @@ async fn spawn_admitted_worker(
     .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))?
     .ok();
 
-    let complexity = classifier_complexity(&task.refs).ok_or_else(|| {
-        QuorumError::Usage(format!(
-            "task #{} cannot dispatch without classifier-owned complexity",
-            task.id
-        ))
-    })?;
-    let assignment = assign_role(
+    // Every launch refusal from here until the run exists holds the claim,
+    // the checkout and the name. Each one settles through the same park +
+    // release path; none may escape as a tick error with the claim held.
+    macro_rules! refuse_launch {
+        (@settle $record_error:expr, $reason:expr) => {
+            return refuse_claimed_worker_launch(
+                config,
+                wt_mgr,
+                name_pool,
+                task.id,
+                &agent_name,
+                &wt_path,
+                &branch,
+                sync_adoption.is_none(),
+                &mut worker_session_log,
+                &$reason,
+                if retrying_rework { "rework" } else { "open" },
+                $record_error,
+            )
+            .await
+        };
+        (clean $reason:expr) => {
+            refuse_launch!(@settle false, $reason)
+        };
+        ($reason:expr) => {
+            refuse_launch!(@settle true, $reason)
+        };
+    }
+
+    let Some(complexity) = classifier_complexity(&task.refs) else {
+        refuse_launch!(String::from(
+            "worker launch refused: task has no classifier-owned complexity"
+        ));
+    };
+    let assignment = match assign_role(
         config,
         quorum_core::role_assignments::AssignmentRequest {
             responsibility_key: worker_responsibility_key(task.id, task.revision),
@@ -26404,20 +27233,82 @@ async fn spawn_admitted_worker(
             complexity: Some(complexity.to_string()),
         },
         Some(complexity),
-    )?;
+    ) {
+        Ok(assignment) => assignment,
+        Err(error) => {
+            refuse_launch!(format!(
+                "worker launch refused: worker role assignment failed: {error}"
+            ));
+        }
+    };
+    // The pre-claim gate proved an eligible alternate exists when the assigned
+    // profile is cooling. Retire the assignment as a classified launch failure
+    // without contacting the provider, so the existing worker fallback install
+    // reaches the alternate with ordinary routing evidence and attribution.
+    let skip_cooling_assignment =
+        profile_cooldown.is_cooling(&assignment.profile_id, std::time::Instant::now());
     let resolved_model = assignment.model.clone();
     let resolved_effort = assignment.effort.clone();
     log(&format!(
         "model routing: task #{} complexity {} -> profile {} ({}/{})",
         task.id, complexity, assignment.profile_id, resolved_model, resolved_effort
     ));
-    let retry_turn = runner_retry_turn(task.refs.as_deref());
-    if let Some(retry) = &retry_turn {
-        if retry.model != resolved_model || retry.effort != resolved_effort {
-            return Err(QuorumError::Io(format!(
-                "task #{} retry identity {}/{} does not match durable role assignment {}/{}",
-                task.id, retry.model, retry.effort, resolved_model, resolved_effort
-            )));
+    let mut retry_turn = runner_retry_turn(task.refs.as_deref());
+    if let Some(retry) = retry_turn
+        .as_ref()
+        .filter(|retry| !retry_turn_resumable(config, &assignment, retry))
+        .cloned()
+    {
+        // The stored exact turn names a provider/model/effort the current
+        // durable assignment cannot resume. Drop that turn (and its provider
+        // continuation) atomically, then launch a fresh initial worker turn
+        // on the current assignment from the already-resumed task branch.
+        let dropped = format!("{}/{}/{}", retry.provider, retry.model, retry.effort);
+        let p = db_path.clone();
+        let holder = agent_name.clone();
+        let profile_id = assignment.profile_id.clone();
+        let task_id = task.id;
+        let discarded = tokio::task::spawn_blocking(
+            move || -> Result<(tasks::RunnerRetryDiscard, Option<String>)> {
+                let mut conn = quorum_core::db::open(&p)?;
+                let outcome = tasks::discard_unresumable_runner_retry(
+                    &mut conn,
+                    task_id,
+                    &holder,
+                    &retry,
+                    &profile_id,
+                    now_unix(),
+                )?;
+                let refs = tasks::get(&conn, task_id)?.and_then(|task| task.refs);
+                Ok((outcome, refs))
+            },
+        )
+        .await
+        .map_err(|e| QuorumError::Io(format!("spawn_blocking join: {e}")))
+        .and_then(|result| result);
+        match discarded {
+            Ok((tasks::RunnerRetryDiscard::Discarded, refs)) => {
+                log(&format!(
+                    "task #{}: discarded unresumable runner retry {dropped} for worker profile \
+                     {}; launching a fresh worker",
+                    task.id, assignment.profile_id
+                ));
+                retry_turn = None;
+                task.refs = refs;
+            }
+            Ok((tasks::RunnerRetryDiscard::NoLongerMatching, _)) => {
+                // Clean negative: the stored turn changed under this claim.
+                // Settle the claim without recording an internal error.
+                refuse_launch!(clean String::from(
+                    "worker launch refused: unresumable runner retry turn changed \
+                     concurrently before it could be discarded"
+                ));
+            }
+            Err(error) => {
+                refuse_launch!(format!(
+                    "worker launch refused: unresumable runner retry discard failed: {error}"
+                ));
+            }
         }
     }
 
@@ -26429,7 +27320,14 @@ async fn spawn_admitted_worker(
 
     let body = task.body.as_deref().unwrap_or(&task.title);
     let worker_task_context = if retry_turn.is_none() {
-        load_worker_task_context(&config.db_path, task.id).await?
+        match load_worker_task_context(&config.db_path, task.id).await {
+            Ok(context) => context,
+            Err(error) => {
+                refuse_launch!(format!(
+                    "worker launch refused: worker task context failed to load: {error}"
+                ));
+            }
+        }
     } else {
         String::new()
     };
@@ -26455,7 +27353,15 @@ async fn spawn_admitted_worker(
         prompt_text.push_str(context);
     }
 
-    let resolved_kind = resolve_worker_provider(&resolved_model)?;
+    let resolved_kind = match resolve_worker_provider(&resolved_model) {
+        Ok(kind) => kind,
+        Err(error) => {
+            refuse_launch!(format!(
+                "worker launch refused: worker provider resolution failed for model \
+                 {resolved_model}: {error}"
+            ));
+        }
+    };
 
     // Codex cannot fabricate USD cost — reject rather than silently spawn
     // with no cost enforcement.
@@ -26598,7 +27504,9 @@ async fn spawn_admitted_worker(
         .await
         .map_err(|error| QuorumError::Io(format!("worker run persistence join: {error}")))??
     };
-    let spawn_result = if resolved_kind == runner::AgentKind::Grok && continuation_id.is_none() {
+    let spawn_result = if skip_cooling_assignment {
+        Err(cooling_profile_failure(&assignment.profile_id))
+    } else if resolved_kind == runner::AgentKind::Grok && continuation_id.is_none() {
         // Grok publishes its provider session only in terminal `end`; retain
         // the exact worker identity so that handoff is durable before success.
         runner::RunnerProc::launch_internal_worker(
@@ -26705,6 +27613,7 @@ async fn spawn_admitted_worker(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: None,
                 agent_run_id: Some(worker_run_id),
                 cap_run_id: Some(cap_run_id),
@@ -26759,6 +27668,7 @@ async fn spawn_admitted_worker(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: Some(e.detail().to_string()),
                 agent_run_id: Some(worker_run_id),
                 cap_run_id: Some(cap_run_id),
@@ -26782,7 +27692,15 @@ async fn spawn_admitted_worker(
                 let currency = quorum_core::db::open(&config.db_path).and_then(|conn| {
                     load_worker_fallback_currency(&conn, &failed_slot, observed_at)
                 })?;
-                match activate_worker_fallback(config, &mut failed_slot, &e, &currency).await? {
+                match activate_worker_fallback(
+                    config,
+                    &mut failed_slot,
+                    &e,
+                    &currency,
+                    profile_cooldown,
+                )
+                .await?
+                {
                     WorkerFallbackActivation::Activated => {
                         workers.push(failed_slot);
                         return Ok(true);
@@ -26797,6 +27715,22 @@ async fn spawn_admitted_worker(
                             "provider_blocked",
                         )
                         .await;
+                        return Ok(false);
+                    }
+                    // Every alternate is cooling, or the provider-free skip of
+                    // a cooling assignment could not install an alternate
+                    // (for example a stale pool generation). No provider
+                    // refused this task, so release it without a poison
+                    // strike; the pre-claim gate holds it until a cooldown
+                    // expires.
+                    WorkerFallbackActivation::Deferred => {
+                        release_task(&db_path, &agent_name, task.id).await;
+                        cleanup_slot(config, wt_mgr, name_pool, failed_slot, None, "failed").await;
+                        return Ok(false);
+                    }
+                    WorkerFallbackActivation::NotInstalled if skip_cooling_assignment => {
+                        release_task(&db_path, &agent_name, task.id).await;
+                        cleanup_slot(config, wt_mgr, name_pool, failed_slot, None, "failed").await;
                         return Ok(false);
                     }
                     WorkerFallbackActivation::NotInstalled => {}
@@ -27662,6 +28596,15 @@ fn routed_provider_executable_in_path(
     )))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: a classified launch failure returned for one fallback model.
+    /// Real classified launch failures depend on a provider child racing its
+    /// first stdin write, which a test cannot reproduce deterministically.
+    static FORCED_FALLBACK_LAUNCH_FAILURE: std::cell::RefCell<Option<(String, runner::RunnerFailure)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Start a fallback provider behind the daemon gate and make the process
 /// recoverable before releasing it.  The caller owns lifecycle disposition,
 /// but this helper always reaps a wrapper if either durable setup or release
@@ -27673,6 +28616,16 @@ async fn launch_and_commit_fallback(
     grok_worker_request: Option<runner::WorkerTurnRequest>,
     journal: FallbackJournalPromotion<'_>,
 ) -> std::result::Result<runner::RunnerProc, runner::RunnerFailure> {
+    #[cfg(test)]
+    if let Some(failure) = FORCED_FALLBACK_LAUNCH_FAILURE.with(|forced| {
+        forced
+            .borrow()
+            .as_ref()
+            .filter(|(model, _)| model == launch.model)
+            .map(|(_, failure)| failure.clone())
+    }) {
+        return Err(failure);
+    }
     if grok_worker_request.is_some() {
         // Same fail-closed rule as the primary spawn path: a fresh Grok
         // worker turn over a retained durable handoff can never persist its
@@ -27879,6 +28832,7 @@ async fn activate_reviewer_fallback(
     slot: &mut SlotState,
     failure: &runner::RunnerFailure,
     expected_currency: &fallback_preflight::ManagedTurnCurrency,
+    profile_cooldown: &mut ProfileCooldown,
 ) -> Result<ReviewerFallbackActivation> {
     let agent_run_id = slot
         .agent_run_id
@@ -27896,23 +28850,6 @@ async fn activate_reviewer_fallback(
         .ok_or_else(|| QuorumError::Io("reviewer fallback is missing its reviewed head".into()))?;
     let pending_turn = reviewer_fallback_pending_turn(slot);
     let installed_at = now_unix();
-    let current_head = {
-        let repo = config.repo_dir.clone();
-        let executor = Arc::clone(&config.merge_executor);
-        tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
-            .await
-            .map_err(|error| QuorumError::Io(format!("reviewer fallback head join: {error}")))?
-    };
-    if current_head.as_deref() != Some(reviewed_head.as_str()) {
-        log(&format!(
-            "reviewer {} fallback rejected because PR #{} head moved from {} to {}",
-            slot.agent_name,
-            pr,
-            reviewed_head,
-            current_head.as_deref().unwrap_or("<unavailable>")
-        ));
-        return Ok(ReviewerFallbackActivation::NotInstalled);
-    }
     let same_agent = slot.agent_name.clone();
     let worktree = slot.worktree_path.to_string_lossy().into_owned();
     let disposition = failure.disposition();
@@ -27988,6 +28925,33 @@ async fn activate_reviewer_fallback(
             ))
         }
     };
+    // Every classified reviewer unavailability funnels through here, so this
+    // is the single place the failing profile starts its cooldown. It is
+    // recorded before any rejection below so a later provision still skips it.
+    if matches!(
+        disposition,
+        runner::FailureDisposition::ProviderUnavailable
+            | runner::FailureDisposition::ProfileUnavailable
+    ) {
+        profile_cooldown.record(&failed_route.id, std::time::Instant::now());
+    }
+    let current_head = {
+        let repo = config.repo_dir.clone();
+        let executor = Arc::clone(&config.merge_executor);
+        tokio::task::spawn_blocking(move || executor.head_sha(pr, &repo))
+            .await
+            .map_err(|error| QuorumError::Io(format!("reviewer fallback head join: {error}")))?
+    };
+    if current_head.as_deref() != Some(reviewed_head.as_str()) {
+        log(&format!(
+            "reviewer {} fallback rejected because PR #{} head moved from {} to {}",
+            slot.agent_name,
+            pr,
+            reviewed_head,
+            current_head.as_deref().unwrap_or("<unavailable>")
+        ));
+        return Ok(ReviewerFallbackActivation::NotInstalled);
+    }
     let responsibility = quorum_core::role_assignments::AssignmentIdentity {
         task_id: assignment.task_id,
         responsibility_key: &assignment.responsibility_key,
@@ -28092,6 +29056,49 @@ async fn activate_reviewer_fallback(
                 .await;
             }
         };
+    // The selected alternate may itself be cooling down. Retire it as a
+    // classified profile-unavailable launch without contacting the provider;
+    // each skip adds one durable profile exclusion, so this walk is bounded by
+    // the pool and ends on a non-cooling route or the existing provider block.
+    let alternate_profile_id: Option<String> = {
+        let conn = quorum_core::db::open(&config.db_path)?;
+        conn.query_row(
+            "SELECT configured_profile_id FROM agent_runs WHERE id=?1",
+            [intent.agent_run_id],
+            |row| row.get(0),
+        )?
+    };
+    if let Some(alternate_profile_id) = alternate_profile_id
+        .as_deref()
+        .filter(|id| profile_cooldown.is_cooling(id, std::time::Instant::now()))
+    {
+        log(&format!(
+            "reviewer {} fallback skips cooling profile {alternate_profile_id} for task #{} PR #{}",
+            slot.agent_name, slot.task_id, pr
+        ));
+        let skipped = cooling_profile_failure(alternate_profile_id);
+        let old = std::mem::replace(
+            &mut slot.proc,
+            SlotProcess::Failed {
+                kind: alternate_kind,
+            },
+        );
+        let old_output = old.kill_and_reap().await;
+        persist_terminal_output(&mut slot.session_log, old_output);
+        slot.model = intent.pending_turn.model;
+        slot.effort = intent.pending_turn.effort;
+        slot.agent_run_id = Some(intent.agent_run_id);
+        slot.cap_run_id = Some(intent.capability_run_id);
+        slot.continuation_id = None;
+        return Box::pin(activate_reviewer_fallback(
+            config,
+            slot,
+            &skipped,
+            expected_currency,
+            profile_cooldown,
+        ))
+        .await;
+    }
     let environment = managed_run_environment(
         config,
         &slot.agent_name,
@@ -28175,6 +29182,7 @@ async fn activate_reviewer_fallback(
                     slot,
                     &error,
                     expected_currency,
+                    profile_cooldown,
                 ))
                 .await;
             }
@@ -28324,6 +29332,10 @@ enum WorkerFallbackActivation {
     NotInstalled,
     Activated,
     Settled,
+    /// Every eligible alternate is cooling down. Nothing durable changed: the
+    /// failed run, its capability, and the pending turn are untouched, so the
+    /// caller retains the slot and retries once a cooldown expires.
+    Deferred,
 }
 
 /// Result of routing an error-terminated persistent worker turn before the
@@ -28336,11 +29348,13 @@ enum LiveWorkerFallbackRoute {
     NotInstalled,
     Activated,
     Settled,
+    Deferred,
 }
 
 async fn route_live_worker_provider_failure(
     config: &ServeConfig,
     slot: &mut SlotState,
+    profile_cooldown: &mut ProfileCooldown,
 ) -> Result<LiveWorkerFallbackRoute> {
     if !slot_is_live_provider_fallback_candidate(slot) {
         return Ok(LiveWorkerFallbackRoute::NotCandidate);
@@ -28353,10 +29367,11 @@ async fn route_live_worker_provider_failure(
     let currency = load_worker_fallback_currency(&conn, slot, observed_at)?;
     drop(conn);
     Ok(
-        match activate_worker_fallback(config, slot, &failure, &currency).await? {
+        match activate_worker_fallback(config, slot, &failure, &currency, profile_cooldown).await? {
             WorkerFallbackActivation::NotInstalled => LiveWorkerFallbackRoute::NotInstalled,
             WorkerFallbackActivation::Activated => LiveWorkerFallbackRoute::Activated,
             WorkerFallbackActivation::Settled => LiveWorkerFallbackRoute::Settled,
+            WorkerFallbackActivation::Deferred => LiveWorkerFallbackRoute::Deferred,
         },
     )
 }
@@ -28490,6 +29505,39 @@ async fn activate_worker_fallback(
     slot: &mut SlotState,
     failure: &runner::RunnerFailure,
     expected_currency: &fallback_preflight::ManagedTurnCurrency,
+    profile_cooldown: &mut ProfileCooldown,
+) -> Result<WorkerFallbackActivation> {
+    activate_worker_fallback_with(
+        config,
+        slot,
+        failure,
+        expected_currency,
+        profile_cooldown,
+        true,
+        true,
+    )
+    .await
+}
+
+/// `honour_cooldown = false` still records the failing profile's cooldown but
+/// neither skips a cooling alternate nor defers. Startup fallback resumption
+/// uses it: a fresh daemon holds no pre-restart cooldown evidence, and its
+/// committed intent has no live slot that could be retained for a retry.
+///
+/// `allow_defer` is true only at the top of an activation chain, before any
+/// durable change. Once `fallback::install` has retired the failed run and
+/// created an alternate, the slot holds a failed process with no observed
+/// failure that a later tick would re-route, so a recursive step after a
+/// cooling skip or a failed alternate launch must continue or settle and
+/// never return `Deferred`.
+async fn activate_worker_fallback_with(
+    config: &ServeConfig,
+    slot: &mut SlotState,
+    failure: &runner::RunnerFailure,
+    expected_currency: &fallback_preflight::ManagedTurnCurrency,
+    profile_cooldown: &mut ProfileCooldown,
+    honour_cooldown: bool,
+    allow_defer: bool,
 ) -> Result<WorkerFallbackActivation> {
     let agent_run_id = slot
         .agent_run_id
@@ -28561,6 +29609,61 @@ async fn activate_worker_fallback(
         return Err(QuorumError::Io(
             "worker fallback slot does not match its durable route evidence".into(),
         ));
+    }
+    // Every classified worker unavailability funnels through here (launch,
+    // live, dead-turn, and resumed fallbacks), so this is the single place the
+    // failing worker profile starts its cooldown, before any rejection below.
+    if matches!(
+        failure.disposition(),
+        runner::FailureDisposition::ProviderUnavailable
+            | runner::FailureDisposition::ProfileUnavailable
+    ) {
+        let now = std::time::Instant::now();
+        // A retained Deferred slot re-enters here every tick with the same
+        // failed run. Only the first entry is a new failure observation; a
+        // re-entry must not renew the failed profile's window after it lapses,
+        // or two slots deferring on each other's profiles would keep each
+        // other cooling forever.
+        let first_deferred_at = slot
+            .worker_fallback_deferral
+            .filter(|(run_id, _)| *run_id == agent_run_id)
+            .map(|(_, at)| at);
+        if first_deferred_at.is_none() {
+            profile_cooldown.record(&failed_route.id, now);
+        }
+        // A slot defers for at most one cooldown window in total; after that
+        // it proceeds with the ordinary walk.
+        let deferral_budget_left = first_deferred_at.is_none_or(|at| {
+            now.saturating_duration_since(at) < profile_cooldown::profile_cooldown_duration()
+        });
+        // Defer instead of walking into a provider block when every route the
+        // failed one could fall back to is merely cooling. This runs before
+        // `fallback::install` retires the failed run, so no routing evidence,
+        // exclusion, intent, or provider block is written for a profile that
+        // was never contacted.
+        if honour_cooldown && allow_defer && deferral_budget_left {
+            let exclusions =
+                quorum_core::routing_attempts::exclusions(&conn, &assignment.responsibility_key)?;
+            if worker_fallback_alternates_all_cooling(
+                profile_cooldown,
+                &pool,
+                &exclusions,
+                &failed_route,
+                failure.disposition(),
+                std::time::Instant::now(),
+            ) {
+                if profile_cooldown.take_deferral_log_slot(std::time::Instant::now()) {
+                    log(&format!(
+                        "worker {} fallback for task #{} deferred — profile {} failed and every \
+                         eligible alternate is cooling down (further deferrals are rate-limited)",
+                        slot.agent_name, slot.task_id, failed_route.id
+                    ));
+                }
+                slot.worker_fallback_deferral =
+                    Some((agent_run_id, first_deferred_at.unwrap_or(now)));
+                return Ok(WorkerFallbackActivation::Deferred);
+            }
+        }
     }
     let responsibility = quorum_core::role_assignments::AssignmentIdentity {
         task_id: assignment.task_id,
@@ -28671,6 +29774,51 @@ async fn activate_worker_fallback(
         )
         .await;
     }
+    // The selected alternate may itself be cooling down. Retire it as a
+    // classified profile-unavailable launch without contacting the provider;
+    // each skip adds one durable profile exclusion, so this walk is bounded by
+    // the pool and ends on a non-cooling route or the existing provider block.
+    let alternate_profile_id: Option<String> = {
+        let conn = quorum_core::db::open(&config.db_path)?;
+        conn.query_row(
+            "SELECT configured_profile_id FROM agent_runs WHERE id=?1",
+            [intent.agent_run_id],
+            |row| row.get(0),
+        )?
+    };
+    if let Some(alternate_profile_id) = alternate_profile_id
+        .as_deref()
+        .filter(|id| honour_cooldown && profile_cooldown.is_cooling(id, std::time::Instant::now()))
+    {
+        log(&format!(
+            "worker {} fallback skips cooling profile {alternate_profile_id} for task #{}",
+            slot.agent_name, slot.task_id
+        ));
+        let skipped = cooling_profile_failure(alternate_profile_id);
+        let old = std::mem::replace(
+            &mut slot.proc,
+            SlotProcess::Failed {
+                kind: alternate_kind,
+            },
+        );
+        let old_output = old.kill_and_reap().await;
+        persist_terminal_output(&mut slot.session_log, old_output);
+        slot.model = intent.pending_turn.model;
+        slot.effort = intent.pending_turn.effort;
+        slot.agent_run_id = Some(intent.agent_run_id);
+        slot.cap_run_id = Some(intent.capability_run_id);
+        slot.continuation_id = None;
+        return Box::pin(activate_worker_fallback_with(
+            config,
+            slot,
+            &skipped,
+            expected_currency,
+            profile_cooldown,
+            honour_cooldown,
+            false,
+        ))
+        .await;
+    }
     let environment = managed_run_environment(
         config,
         &slot.agent_name,
@@ -28757,11 +29905,14 @@ async fn activate_worker_fallback(
                 slot.agent_run_id = Some(intent.agent_run_id);
                 slot.cap_run_id = Some(intent.capability_run_id);
                 slot.continuation_id = None;
-                return Box::pin(activate_worker_fallback(
+                return Box::pin(activate_worker_fallback_with(
                     config,
                     slot,
                     &error,
                     expected_currency,
+                    profile_cooldown,
+                    honour_cooldown,
+                    false,
                 ))
                 .await;
             }
@@ -28827,6 +29978,7 @@ async fn activate_worker_fallback(
 /// provider launch. Generic recovery preserves these rows and worktrees; this
 /// pass either installs a live slot, advances through another unavailable
 /// route, or settles the responsibility fail-safe.
+#[allow(clippy::too_many_arguments)]
 async fn resume_pending_fallbacks(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -28834,6 +29986,9 @@ async fn resume_pending_fallbacks(
     workers: &mut Vec<SlotState>,
     reviewers: &mut Vec<SlotState>,
     lifetime_roster: &mut LifetimeRoster,
+    unrecordable: &mut UnrecordableStrikes,
+    respawn_backoff: &mut ReviewerRespawnBackoff,
+    profile_cooldown: &mut ProfileCooldown,
 ) -> Result<()> {
     let recoveries = {
         let conn = quorum_core::db::open(&config.db_path)?;
@@ -28971,6 +30126,7 @@ async fn resume_pending_fallbacks(
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(intent.agent_run_id),
             cap_run_id: Some(intent.capability_run_id.clone()),
@@ -29057,14 +30213,25 @@ async fn resume_pending_fallbacks(
                         let conn = quorum_core::db::open(&config.db_path)?;
                         load_worker_fallback_currency(&conn, &slot, now_unix())?
                     };
-                    match activate_worker_fallback(config, &mut slot, &error, &currency).await? {
+                    match activate_worker_fallback_with(
+                        config,
+                        &mut slot,
+                        &error,
+                        &currency,
+                        profile_cooldown,
+                        false,
+                        false,
+                    )
+                    .await?
+                    {
                         WorkerFallbackActivation::Activated => workers.push(slot),
                         WorkerFallbackActivation::Settled => {
                             cleanup_slot(config, wt_mgr, name_pool, slot, None, "provider_blocked")
                                 .await;
                             continue;
                         }
-                        WorkerFallbackActivation::NotInstalled => {
+                        WorkerFallbackActivation::NotInstalled
+                        | WorkerFallbackActivation::Deferred => {
                             return Err(QuorumError::Io(
                                 "committed worker fallback could not advance".into(),
                             ));
@@ -29075,11 +30242,26 @@ async fn resume_pending_fallbacks(
                         let conn = quorum_core::db::open(&config.db_path)?;
                         load_reviewer_fallback_currency(&conn, &slot, now_unix())?
                     };
-                    match activate_reviewer_fallback(config, &mut slot, &error, &currency).await? {
+                    match activate_reviewer_fallback(
+                        config,
+                        &mut slot,
+                        &error,
+                        &currency,
+                        profile_cooldown,
+                    )
+                    .await?
+                    {
                         ReviewerFallbackActivation::Activated => reviewers.push(slot),
                         ReviewerFallbackActivation::Settled => {
-                            teardown_reviewer(config, wt_mgr, name_pool, slot, "provider_blocked")
-                                .await;
+                            let close_reason = strike_reviewer_provider_failure_teardown(
+                                config,
+                                unrecordable,
+                                respawn_backoff,
+                                "provider_blocked",
+                                &slot,
+                            )
+                            .await;
+                            teardown_reviewer(config, wt_mgr, name_pool, slot, close_reason).await;
                             continue;
                         }
                         ReviewerFallbackActivation::NotInstalled => {
@@ -30355,6 +31537,7 @@ async fn resume_recovered_dormant_reworks(
     wt_mgr: &WorktreeManager,
     name_pool: &mut Pool,
     workers: &mut Vec<SlotState>,
+    profile_cooldown: &mut ProfileCooldown,
 ) -> Result<()> {
     // A delivery can race the failed launch, in which case disposition must
     // retain the dormant slot for the mailbox phase later in this tick. Work
@@ -30408,6 +31591,7 @@ async fn resume_recovered_dormant_reworks(
                 workers,
                 worker_index,
                 &error,
+                profile_cooldown,
             )
             .await?
                 == DormantWorkerFeedFailureDisposition::LiveProcess
@@ -31639,6 +32823,7 @@ async fn spawn_remediation_worker(
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: None,
                 agent_run_id: worker_run_id,
                 cap_run_id: Some(cap_run_id),
@@ -32478,6 +33663,106 @@ mod tests {
         assert_eq!(config.graph_children_working_limit(), 6);
     }
 
+    #[test]
+    fn reviewer_slots_bound_fresh_claims_and_r2_inherits_the_r1_slot() {
+        assert_eq!(available_reviewer_slots(2, 0), 2);
+        assert_eq!(available_reviewer_slots(2, 2), 0);
+        assert_eq!(available_reviewer_slots(1, 3), 0, "overshoot saturates");
+
+        let none: Vec<SlotState> = Vec::new();
+        assert_eq!(reviewer_slots_free(1, &none, ReviewerSlotClaim::Fresh), 1);
+        let one_r1 = vec![make_dummy_slot()];
+        // reviewer_cap=1 with an R1 running: a new review must wait, but the
+        // R2 handoff from that R1 must not (it inherits the slot).
+        assert_eq!(reviewer_slots_free(1, &one_r1, ReviewerSlotClaim::Fresh), 0);
+        assert_eq!(
+            reviewer_slots_free(1, &one_r1, ReviewerSlotClaim::InheritR1),
+            1
+        );
+        let two = vec![make_dummy_slot(), make_dummy_slot()];
+        assert_eq!(
+            reviewer_slots_free(1, &two, ReviewerSlotClaim::InheritR1),
+            0,
+            "handoff still respects an overshoot beyond the replaced R1"
+        );
+    }
+
+    #[test]
+    fn reviewer_slot_queue_defers_without_spam_and_dispatches_oldest_r2_first() {
+        let mut queue = ReviewerSlotQueue::default();
+        queue.begin_pass();
+        // No free slot: three R1 reviews defer, each entering exactly once.
+        for task_id in [30, 10, 20] {
+            assert_eq!(
+                queue.admit(task_id, 100 + task_id, false, 0, 1),
+                ReviewerSlotAdmission::Deferred { entered: true }
+            );
+        }
+        assert_eq!(queue.waiting_task_ids(), vec![10, 20, 30]);
+
+        // A later tick with still no slot: deferred again, but not re-entered
+        // (so no second log line).
+        queue.begin_pass();
+        for task_id in [30, 10, 20] {
+            assert_eq!(
+                queue.admit(task_id, 100 + task_id, false, 0, 1),
+                ReviewerSlotAdmission::Deferred { entered: false }
+            );
+        }
+
+        // One slot frees. A younger task evaluated first must not take the
+        // slot reserved for the oldest waiter.
+        queue.begin_pass();
+        assert_eq!(
+            queue.admit(30, 130, false, 1, 1),
+            ReviewerSlotAdmission::Deferred { entered: false }
+        );
+        assert_eq!(
+            queue.admit(20, 120, false, 1, 1),
+            ReviewerSlotAdmission::Deferred { entered: false }
+        );
+        assert_eq!(
+            queue.admit(10, 110, false, 1, 1),
+            ReviewerSlotAdmission::AdmittedAfterDeferral
+        );
+        assert_eq!(queue.waiting_task_ids(), vec![20, 30]);
+
+        // An R2 of an already-reviewing task jumps every queued R1.
+        queue.begin_pass();
+        assert_eq!(
+            queue.admit(99, 199, true, 0, 1),
+            ReviewerSlotAdmission::Deferred { entered: true }
+        );
+        assert_eq!(
+            queue.admit(20, 120, false, 0, 1),
+            ReviewerSlotAdmission::Deferred { entered: false }
+        );
+        queue.begin_pass();
+        assert_eq!(
+            queue.admit(20, 120, false, 1, 1),
+            ReviewerSlotAdmission::Deferred { entered: false },
+            "the queued R2 is ahead of the oldest R1"
+        );
+        assert_eq!(
+            queue.admit(99, 199, true, 1, 1),
+            ReviewerSlotAdmission::AdmittedAfterDeferral
+        );
+
+        // Task 30 stopped reaching the gate (e.g. merged): it is pruned after
+        // one pass and no longer holds a slot for younger work.
+        queue.begin_pass();
+        assert_eq!(queue.waiting_task_ids(), vec![20]);
+        assert_eq!(
+            queue.admit(20, 120, false, 1, 1),
+            ReviewerSlotAdmission::AdmittedAfterDeferral
+        );
+        assert_eq!(
+            queue.admit(40, 140, false, 1, 1),
+            ReviewerSlotAdmission::Admitted
+        );
+        assert!(queue.waiting_task_ids().is_empty());
+    }
+
     fn pre_review_checks_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
         let profile = crate::serve_config::ModelProfile {
             runner: "codex".into(),
@@ -32530,9 +33815,11 @@ mod tests {
             r2_steady_state_p: 0.0,
             max_rework: quorum_core::lifecycle::REWORK_CAP,
             max_graph_children_working: None,
+            reviewer_cap: 32,
             codex_sandbox: "danger-full-access".into(),
             grok: Default::default(),
             pr_target_program: None,
+            max_active_graphs: 2,
         }
     }
 
@@ -34234,6 +35521,7 @@ mod tests {
             &mut name_pool,
             &mut workers,
             &mut roster,
+            &mut ProfileCooldown::new(),
             task_id,
             pr,
             "0123456789abcdef0123456789abcdef01234567",
@@ -34476,6 +35764,7 @@ mod tests {
             &mut name_pool,
             &mut workers,
             &mut roster,
+            &mut ProfileCooldown::new(),
             task_id,
             pr,
             head_sha,
@@ -34846,6 +36135,7 @@ mod tests {
             &mut name_pool,
             &mut workers,
             &mut roster,
+            &mut ProfileCooldown::new(),
             task_id,
             553,
             "0123456789abcdef0123456789abcdef01234567",
@@ -35403,6 +36693,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: None,
             cap_run_id: None,
@@ -35583,9 +36874,11 @@ mod tests {
             r2_steady_state_p: 0.0,
             max_rework: quorum_core::lifecycle::REWORK_CAP,
             max_graph_children_working: None,
+            reviewer_cap: 32,
             codex_sandbox: "danger-full-access".into(),
             grok: Default::default(),
             pr_target_program: None,
+            max_active_graphs: 2,
         }
     }
 
@@ -36078,6 +37371,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 1,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: Some("unmatched provider failure".into()),
             agent_run_id: Some(agent_run_id),
             cap_run_id: Some("initial-cap".into()),
@@ -36505,6 +37799,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -36545,7 +37840,7 @@ mod tests {
         );
         slot.pending_watchdog_breach = None;
         assert_eq!(
-            route_live_worker_provider_failure(&config, &mut slot)
+            route_live_worker_provider_failure(&config, &mut slot, &mut ProfileCooldown::new())
                 .await
                 .unwrap(),
             LiveWorkerFallbackRoute::Activated
@@ -36694,6 +37989,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -36712,9 +38008,15 @@ mod tests {
         );
 
         assert_eq!(
-            activate_worker_fallback(&config, &mut slot, &failure, &currency)
-                .await
-                .unwrap(),
+            activate_worker_fallback(
+                &config,
+                &mut slot,
+                &failure,
+                &currency,
+                &mut ProfileCooldown::new()
+            )
+            .await
+            .unwrap(),
             WorkerFallbackActivation::Settled
         );
 
@@ -36887,6 +38189,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -36899,6 +38202,7 @@ mod tests {
         let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
         drop(conn);
 
+        let mut cooldown = ProfileCooldown::new();
         for (failed, expected_next) in [
             ("primary profile unavailable", "gpt-5.6-terra"),
             ("first alternate unavailable", "gpt-5.5"),
@@ -36909,13 +38213,19 @@ mod tests {
                 std::io::ErrorKind::Other,
             );
             assert_eq!(
-                activate_worker_fallback(&config, &mut slot, &failure, &currency)
+                activate_worker_fallback(&config, &mut slot, &failure, &currency, &mut cooldown)
                     .await
                     .unwrap(),
                 WorkerFallbackActivation::Activated
             );
             assert_eq!(slot.model, expected_next);
         }
+        // Each classified worker failure starts its own profile's cooldown;
+        // the route that is now running is not cooling.
+        let checked_at = std::time::Instant::now();
+        assert!(cooldown.is_cooling("a-primary", checked_at));
+        assert!(cooldown.is_cooling("b-alternate", checked_at));
+        assert!(!cooldown.is_cooling("c-tertiary", checked_at));
 
         let conn = quorum_core::db::open(&config.db_path).unwrap();
         let evidence: (i64, i64, i64, i64) = conn
@@ -36932,6 +38242,1418 @@ mod tests {
         assert_eq!(evidence, (2, 2, 1, 1));
         drop(conn);
         let _ = slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_worker_fallback_defers_without_durable_change_while_every_alternate_cools() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let runner_program = live_fallback_runner(root.path());
+        let mut config = live_fallback_test_config(
+            root.path().join("worker-cooling-defer.db"),
+            root.path(),
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        config.model_profiles.insert(
+            "c-tertiary".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.5".into(),
+                effort: "medium".into(),
+            },
+        );
+        for pool in config.routing.worker.values_mut() {
+            pool.insert("a-primary".into(), 25);
+            pool.insert("c-tertiary".into(), 25);
+        }
+
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "worker fallback chain",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let observed_at = now_unix();
+        quorum_core::tasks::claim(
+            &mut conn,
+            "Fallback-Worker",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        let responsibility = worker_responsibility_key(task_id, 1);
+        let (assignment, initial_run, agent_name) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "worker",
+            None,
+            None,
+        );
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent_name.clone(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "initial-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("daemon/fallback-worker".into()),
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("daemon/fallback-worker".into()),
+            },
+        )
+        .unwrap();
+        let now = std::time::Instant::now();
+        let mut slot = SlotState {
+            agent_name,
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "initial-session".into(),
+            model: assignment.model.clone(),
+            effort: assignment.effort.clone(),
+            worktree_path: worktree,
+            branch: "daemon/fallback-worker".into(),
+            remote_branch: "daemon/fallback-worker".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: None,
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            last_provider_activity_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
+            last_error_text: None,
+            agent_run_id: Some(initial_run),
+            cap_run_id: Some("initial-cap".into()),
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: None,
+            pending_prompt: "exact initial prompt".into(),
+            pending_turn_kind: "initial".into(),
+        };
+        let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
+        drop(conn);
+
+        let initial_model = slot.model.clone();
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "primary profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+        let evidence = |config: &ServeConfig| -> (i64, i64, i64, bool) {
+            let conn = quorum_core::db::open(&config.db_path).unwrap();
+            let (attempts, intents, open_runs, refs): (i64, i64, i64, Option<String>) = conn
+                .query_row(
+                    "SELECT
+                         (SELECT count(*) FROM routing_attempts WHERE responsibility_key=?1),
+                         (SELECT count(*) FROM fallback_launch_intents WHERE responsibility_key=?1),
+                         (SELECT count(*) FROM agent_runs WHERE task_id=?2 AND ended_at IS NULL),
+                         (SELECT refs FROM tasks WHERE id=?2)",
+                    rusqlite::params![responsibility, task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            let blocked = refs
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .is_some_and(|refs| runner_state::provider_block(&refs).is_some());
+            (attempts, intents, open_runs, blocked)
+        };
+
+        // Both alternates are cooling: defer twice with no durable change —
+        // no routing evidence, intent, retired run, provider block, or spawn.
+        let mut cooldown = ProfileCooldown::new();
+        let now = std::time::Instant::now();
+        cooldown.record("b-alternate", now);
+        cooldown.record("c-tertiary", now);
+        for _ in 0..2 {
+            assert_eq!(
+                activate_worker_fallback(&config, &mut slot, &failure, &currency, &mut cooldown)
+                    .await
+                    .unwrap(),
+                WorkerFallbackActivation::Deferred
+            );
+            assert_eq!(slot.model, initial_model);
+            assert_eq!(slot.agent_run_id, Some(initial_run));
+            assert!(matches!(slot.proc, SlotProcess::Failed { .. }));
+            assert_eq!(evidence(&config), (0, 0, 1, false));
+        }
+        assert!(
+            cooldown.is_cooling("a-primary", std::time::Instant::now()),
+            "the deferred failure still starts the failed profile's cooldown"
+        );
+        // The decision is time-bounded: once the alternates' windows lapse the
+        // failed route has an eligible alternate again.
+        let pool = configured_routing_pool(&config, "worker", Some(3), None).unwrap();
+        let expired = now + profile_cooldown::profile_cooldown_duration();
+        assert!(!worker_fallback_alternates_all_cooling(
+            &cooldown,
+            &pool,
+            &quorum_core::routing_attempts::RouteExclusions::default(),
+            &assignment.profile_snapshot(),
+            runner::FailureDisposition::ProfileUnavailable,
+            expired,
+        ));
+
+        // After b-alternate's cooldown has expired (a fresh window holding
+        // only c-tertiary), the same failure installs b-alternate.
+        let mut expired_cooldown = ProfileCooldown::new();
+        expired_cooldown.record("c-tertiary", std::time::Instant::now());
+        assert_eq!(
+            activate_worker_fallback(
+                &config,
+                &mut slot,
+                &failure,
+                &currency,
+                &mut expired_cooldown
+            )
+            .await
+            .unwrap(),
+            WorkerFallbackActivation::Activated
+        );
+        assert_eq!(slot.model, "gpt-5.6-terra");
+        let installed = evidence(&config);
+        assert_eq!((installed.0, installed.1, installed.2), (1, 1, 1));
+        assert!(!installed.3);
+        let _ = slot.kill_and_reap().await;
+    }
+
+    /// One deferring worker slot on its own DB. `failed_on_alternate` attributes
+    /// the open run to b-alternate so its fallback walks back to a-primary.
+    #[cfg(unix)]
+    fn deferring_worker_slot(
+        root: &Path,
+        name: &str,
+        failed_on_alternate: bool,
+    ) -> (
+        ServeConfig,
+        SlotState,
+        fallback_preflight::ManagedTurnCurrency,
+        String,
+    ) {
+        let dir = root.join(name);
+        let worktree = dir.join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let runner_program = live_fallback_runner(&dir);
+        let config = live_fallback_test_config(
+            dir.join("worker.db"),
+            &dir,
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "worker fallback mutual cooldown",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let observed_at = now_unix();
+        quorum_core::tasks::claim(
+            &mut conn,
+            "Fallback-Worker",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        let responsibility = worker_responsibility_key(task_id, 1);
+        let (assignment, run, agent_name) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "worker",
+            None,
+            None,
+        );
+        assert_eq!(assignment.profile_id, "a-primary");
+        let (model, effort) = if failed_on_alternate {
+            conn.execute(
+                "UPDATE agent_runs SET model='gpt-5.6-terra',effort='high',
+                     configured_profile_id='b-alternate',configured_provider='codex',
+                     configured_model='gpt-5.6-terra',configured_effort='high'
+                 WHERE id=?1",
+                [run],
+            )
+            .unwrap();
+            ("gpt-5.6-terra".to_string(), "high".to_string())
+        } else {
+            (assignment.model.clone(), assignment.effort.clone())
+        };
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent_name.clone(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "initial-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("daemon/fallback-worker".into()),
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("daemon/fallback-worker".into()),
+            },
+        )
+        .unwrap();
+        let now = std::time::Instant::now();
+        let slot = SlotState {
+            agent_name,
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "initial-session".into(),
+            model,
+            effort,
+            worktree_path: worktree,
+            branch: "daemon/fallback-worker".into(),
+            remote_branch: "daemon/fallback-worker".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: None,
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            last_provider_activity_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
+            last_error_text: None,
+            agent_run_id: Some(run),
+            cap_run_id: Some("initial-cap".into()),
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: None,
+            pending_prompt: "exact initial prompt".into(),
+            pending_turn_kind: "initial".into(),
+        };
+        let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
+        (config, slot, currency, responsibility)
+    }
+
+    /// Two deferring slots in pool {a, b}: X failed on a and waits on b, Y
+    /// failed on b and waits on a. A deferred re-entry must not renew the
+    /// failed profile's lapsed window (else they keep each other cooling
+    /// forever), and a slot's total deferral is capped at one cooldown window.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_worker_fallback_reentry_neither_renews_cooldown_nor_defers_forever() {
+        let root = tempfile::tempdir().unwrap();
+        let (x_config, mut x, x_currency, x_responsibility) =
+            deferring_worker_slot(root.path(), "x", false);
+        let (y_config, mut y, y_currency, _) = deferring_worker_slot(root.path(), "y", true);
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+        let x_run = x.agent_run_id.unwrap();
+
+        // Both profiles were just observed failing, so both windows are live
+        // and each slot's only alternate is cooling: both defer.
+        let mut cooldown = ProfileCooldown::new();
+        cooldown.record("a-primary", std::time::Instant::now());
+        cooldown.record("b-alternate", std::time::Instant::now());
+        assert_eq!(
+            activate_worker_fallback(&x_config, &mut x, &failure, &x_currency, &mut cooldown)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Deferred
+        );
+        assert_eq!(
+            activate_worker_fallback(&y_config, &mut y, &failure, &y_currency, &mut cooldown)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Deferred
+        );
+        let now = std::time::Instant::now();
+        assert!(cooldown.is_cooling("a-primary", now));
+        assert!(cooldown.is_cooling("b-alternate", now));
+        assert!(matches!(x.worker_fallback_deferral, Some((run, _)) if run == x_run));
+
+        // a's window lapses while b's is still live (modelled by a cooldown
+        // holding only b). X re-enters: still deferred on b, but it must not
+        // reopen a's window for the same failure observation.
+        let mut cooldown = ProfileCooldown::new();
+        cooldown.record("b-alternate", std::time::Instant::now());
+        assert_eq!(
+            activate_worker_fallback(&x_config, &mut x, &failure, &x_currency, &mut cooldown)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Deferred
+        );
+        assert!(
+            !cooldown.is_cooling("a-primary", std::time::Instant::now()),
+            "a deferred re-entry renewed the failed profile's cooldown"
+        );
+        // So Y, waiting on a, makes progress instead of deferring again.
+        assert_eq!(
+            activate_worker_fallback(&y_config, &mut y, &failure, &y_currency, &mut cooldown)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Activated
+        );
+        assert_eq!(y.model, "gpt-5.6-sol");
+        let _ = y.kill_and_reap().await;
+
+        // Deferral is bounded: once X has deferred for a full cooldown window
+        // it proceeds with the walk even though b is still cooling. The walk
+        // skips cooling b and ends in the existing provider block, rather
+        // than deferring again.
+        let window = profile_cooldown::profile_cooldown_duration();
+        let started = std::time::Instant::now()
+            .checked_sub(window)
+            .expect("monotonic clock is past one cooldown window");
+        x.worker_fallback_deferral = Some((x_run, started));
+        assert!(cooldown.is_cooling("b-alternate", std::time::Instant::now()));
+        assert_eq!(
+            activate_worker_fallback(&x_config, &mut x, &failure, &x_currency, &mut cooldown)
+                .await
+                .unwrap(),
+            WorkerFallbackActivation::Settled
+        );
+        let conn = quorum_core::db::open(&x_config.db_path).unwrap();
+        let refs: Option<String> = conn
+            .query_row("SELECT refs FROM tasks WHERE id=?1", [x.task_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let blocked = refs
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .is_some_and(|refs| runner_state::provider_block(&refs).is_some());
+        assert!(
+            blocked,
+            "bounded deferral must settle into the provider block"
+        );
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM routing_attempts WHERE responsibility_key=?1",
+                [&x_responsibility],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(attempts >= 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_fallback_never_defers_after_an_installed_alternate_fails_to_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let runner_program = live_fallback_runner(root.path());
+        let mut config = live_fallback_test_config(
+            root.path().join("worker-cooling-no-late-defer.db"),
+            root.path(),
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        config.model_profiles.insert(
+            "c-tertiary".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.5".into(),
+                effort: "medium".into(),
+            },
+        );
+        for pool in config.routing.worker.values_mut() {
+            pool.insert("a-primary".into(), 25);
+            pool.insert("c-tertiary".into(), 25);
+        }
+
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "worker fallback chain",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let observed_at = now_unix();
+        quorum_core::tasks::claim(
+            &mut conn,
+            "Fallback-Worker",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        let responsibility = worker_responsibility_key(task_id, 1);
+        let (assignment, initial_run, agent_name) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "worker",
+            None,
+            None,
+        );
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent_name.clone(),
+                role: "worker".into(),
+                task_id: Some(task_id),
+                session_id: "initial-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("daemon/fallback-worker".into()),
+                phase: "working".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: None,
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("daemon/fallback-worker".into()),
+            },
+        )
+        .unwrap();
+        let now = std::time::Instant::now();
+        let mut slot = SlotState {
+            agent_name,
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "initial-session".into(),
+            model: assignment.model.clone(),
+            effort: assignment.effort.clone(),
+            worktree_path: worktree,
+            branch: "daemon/fallback-worker".into(),
+            remote_branch: "daemon/fallback-worker".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: None,
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            last_provider_activity_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
+            last_error_text: None,
+            agent_run_id: Some(initial_run),
+            cap_run_id: Some("initial-cap".into()),
+            r2_origin: false,
+            reviewed_head_sha: None,
+            continuation_id: None,
+            pending_prompt: "exact initial prompt".into(),
+            pending_turn_kind: "initial".into(),
+        };
+        let currency = load_worker_fallback_currency(&conn, &slot, observed_at).unwrap();
+        drop(conn);
+
+        // Pool [a,b,c] with only c cooling: a's failure has the eligible
+        // alternate b, so it installs b. b's real launch then fails with a
+        // classified unavailability after `fallback::install` already retired
+        // a and created b's run. The recursive step must not return Deferred
+        // (the slot would hold a failed process nobody re-routes); it
+        // continues past cooling c and settles through the provider block.
+        let mut cooldown = ProfileCooldown::new();
+        cooldown.record("c-tertiary", std::time::Instant::now());
+        FORCED_FALLBACK_LAUNCH_FAILURE.with(|forced| {
+            *forced.borrow_mut() = Some((
+                "gpt-5.6-terra".into(),
+                runner::RunnerFailure::classified(
+                    runner::FailureDisposition::ProfileUnavailable,
+                    "first alternate model unavailable at launch",
+                    std::io::ErrorKind::Other,
+                ),
+            ));
+        });
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "primary profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+        let outcome =
+            activate_worker_fallback(&config, &mut slot, &failure, &currency, &mut cooldown).await;
+        FORCED_FALLBACK_LAUNCH_FAILURE.with(|forced| forced.borrow_mut().take());
+        assert_eq!(outcome.unwrap(), WorkerFallbackActivation::Settled);
+        let checked_at = std::time::Instant::now();
+        assert!(cooldown.is_cooling("a-primary", checked_at));
+        assert!(cooldown.is_cooling("b-alternate", checked_at));
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let (open_runs, refs): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM agent_runs WHERE task_id=?1 AND ended_at IS NULL),
+                        (SELECT refs FROM tasks WHERE id=?1)",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(open_runs, 0, "no alternate run is left open on the slot");
+        let blocked = refs
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .is_some_and(|refs| runner_state::provider_block(&refs).is_some());
+        assert!(
+            blocked,
+            "the exhausted chain settles through the provider block"
+        );
+        let _ = slot.kill_and_reap().await;
+    }
+
+    /// Real git checkout, real DB, real (sleeping) Codex runner: a worker
+    /// whose every eligible profile is cooling is not claimed or launched,
+    /// and a cooling assignment is routed to the one eligible alternate —
+    /// past a second cooling alternate — through the fallback install.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_provisioning_skips_cooling_profiles_and_defers_when_none_eligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("state.txt"), "base\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["branch", "-M", "main"]);
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "main"]);
+        git(&["fetch", "-q", "origin"]);
+
+        let runner_program = live_fallback_runner(dir.path());
+        let mut config = live_fallback_test_config(
+            dir.path().join("worker-cooldown.db"),
+            &repo,
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        config.worktree_base = dir.path().join("worktrees");
+        config.model_profiles.insert(
+            "c-tertiary".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.5".into(),
+                effort: "medium".into(),
+            },
+        );
+        for pool in config.routing.worker.values_mut() {
+            pool.insert("a-primary".into(), 34);
+            pool.insert("b-alternate".into(), 33);
+            pool.insert("c-tertiary".into(), 33);
+        }
+        let task_id = {
+            let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+            tasks::create(
+                &mut conn,
+                "owner",
+                "worker cooldown routing",
+                Some("route around cooling worker profiles"),
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap()
+        };
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+        let counts = |db_path: &Path| -> (String, i64, i64) {
+            let conn = quorum_core::db::open(db_path).unwrap();
+            conn.query_row(
+                "SELECT (SELECT status FROM tasks WHERE id=?1),
+                        (SELECT count(*) FROM agent_runs WHERE task_id=?1),
+                        (SELECT count(*) FROM role_assignments WHERE task_id=?1)",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+        };
+
+        // Every eligible profile cooling: no name, claim, assignment, run, or
+        // process; the task stays open for a later tick.
+        let mut all_cooling = ProfileCooldown::new();
+        let now = std::time::Instant::now();
+        for profile in ["a-primary", "b-alternate", "c-tertiary"] {
+            all_cooling.record(profile, now);
+        }
+        for _ in 0..2 {
+            assert!(!spawn_admitted_worker(
+                &config,
+                &wt_mgr,
+                &mut names,
+                &mut workers,
+                &mut poison,
+                &mut skips,
+                &mut roster,
+                &mut all_cooling,
+            )
+            .await
+            .unwrap());
+        }
+        assert!(workers.is_empty());
+        assert_eq!(counts(&config.db_path), ("open".to_string(), 0, 0));
+        // The deferral ends with the earliest cooldown.
+        let task = {
+            let conn = quorum_core::db::open(&config.db_path).unwrap();
+            tasks::get(&conn, task_id).unwrap().unwrap()
+        };
+        let until = worker_cooldown_deferral(&config, &all_cooling, &task, now)
+            .await
+            .unwrap()
+            .expect("every eligible profile is cooling");
+        assert_eq!(
+            worker_cooldown_deferral(&config, &all_cooling, &task, until)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Cool the profile the responsibility is assigned plus one other: the
+        // only eligible route is the third profile.
+        let assignment = assign_role(
+            &config,
+            quorum_core::role_assignments::AssignmentRequest {
+                responsibility_key: worker_responsibility_key(task_id, task.revision),
+                task_id: Some(task_id),
+                pr_number: None,
+                role: "worker".into(),
+                review_stage: None,
+                complexity: Some("3".into()),
+            },
+            Some(3),
+        )
+        .unwrap();
+        let ids = ["a-primary", "b-alternate", "c-tertiary"];
+        let assigned = assignment.profile_id.as_str();
+        let others: Vec<&str> = ids.into_iter().filter(|id| *id != assigned).collect();
+        let (cooling_alternate, eligible) = (others[0], others[1]);
+        let eligible_model = config.model_profiles[eligible].model.clone();
+        let mut cooldown = ProfileCooldown::new();
+        let now = std::time::Instant::now();
+        cooldown.record(assigned, now);
+        cooldown.record(cooling_alternate, now);
+        assert!(spawn_admitted_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut poison,
+            &mut skips,
+            &mut roster,
+            &mut cooldown,
+        )
+        .await
+        .unwrap());
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].model, eligible_model);
+        assert!(matches!(workers[0].proc, SlotProcess::Running(_)));
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let live: (Option<String>, String) = conn
+            .query_row(
+                "SELECT configured_profile_id, model FROM agent_runs
+                 WHERE task_id=?1 AND ended_at IS NULL",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(live, (Some(eligible.to_string()), eligible_model));
+        let cooling_launches: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM agent_runs WHERE task_id=?1 AND ended_at IS NULL
+                   AND model IN (?2, ?3)",
+                rusqlite::params![
+                    task_id,
+                    config.model_profiles[assigned].model,
+                    config.model_profiles[cooling_alternate].model
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cooling_launches, 0, "no cooling profile is left running");
+        let status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id=?1", [task_id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "working");
+        drop(conn);
+        let _ = workers.pop().unwrap().kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    fn launch_test_git(repo: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// A real repo with a bare `origin` holding one `main` commit.
+    #[cfg(unix)]
+    fn launch_test_repo(root: &Path) -> PathBuf {
+        let repo = root.join("repo");
+        let remote = root.join("remote.git");
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| launch_test_git(&repo, args);
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("state.txt"), "base\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["branch", "-M", "main"]);
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "main"]);
+        git(&["fetch", "-q", "origin"]);
+        repo
+    }
+
+    /// Real git checkout and DB: a worker launch refused after the atomic
+    /// claim (here, a worker role assignment that cannot be resolved) parks
+    /// the task with that specific reason and releases the claim, checkout,
+    /// journal row and name, instead of escaping as a tick error that leaves
+    /// a phantom claimed task.
+    #[cfg(unix)]
+    async fn assert_post_claim_launch_refusal_parks(status: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = launch_test_repo(dir.path());
+        let git = |args: &[&str]| launch_test_git(&repo, args);
+
+        let runner_program = live_fallback_runner(dir.path());
+        let mut config = live_fallback_test_config(
+            dir.path().join("launch-refusal.db"),
+            &repo,
+            &runner_program,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        config.worktree_base = dir.path().join("worktrees");
+        // Without a worker pool for the task's complexity the durable role
+        // assignment fails only after the claim succeeded.
+        config.routing.worker.remove("3");
+        let refs = serde_json::json!({
+            "cx_est": 3,
+            "cx_size": "M",
+            "cx_ready": true,
+            "cx_not_ready_reason": null,
+            "cx_by": "test:v2",
+            "runner_retry": {
+                "provider": "codex",
+                "model": "gpt-5.6-retired",
+                "effort": "low",
+                "prompt": "continue the exact stored turn",
+                "turn_kind": if status == "rework" { "rework" } else { "initial" },
+                "continuation_id": "thread-stored",
+                "requested": true
+            }
+        })
+        .to_string();
+        let task_id = {
+            let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "refused worker launch",
+                Some("the stored retry no longer matches its assignment"),
+                0,
+                None,
+                Some(&refs),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status=?2 WHERE id=?1",
+                rusqlite::params![task_id, status],
+            )
+            .unwrap();
+            task_id
+        };
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+
+        // A second tick must not re-claim or loop on the refused assignment.
+        for _ in 0..2 {
+            assert!(!spawn_worker(
+                &config,
+                &wt_mgr,
+                &mut names,
+                &mut workers,
+                &mut poison,
+                &mut skips,
+                &mut roster,
+            )
+            .await
+            .expect("a post-claim launch refusal must not escape as a tick error"));
+        }
+        assert!(workers.is_empty(), "a refused launch holds no worker slot");
+        assert_eq!(names.in_use_count(), 0, "the worker name is released");
+
+        // Fresh connection: the durable state a restarted daemon observes.
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "failed", "the refused launch parks the task");
+        assert_eq!(task.assignee, None, "the claim's assignee is cleared");
+        let parked: serde_json::Value =
+            serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        let reason = parked[tasks::PARKED_REASON_REF]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            reason.contains("worker role assignment failed"),
+            "the park reason names the specific refusal: {parked}"
+        );
+        assert_eq!(parked[tasks::PARKED_RESUME_STATUS_REF], status);
+        let counts: (i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM claims WHERE target=?1 AND active=1),
+                        (SELECT count(*) FROM events WHERE subject=?1 AND kind='task_claimed'),
+                        (SELECT count(*) FROM agent_runs WHERE task_id=?2),
+                        (SELECT count(*) FROM journal WHERE task_id=?2),
+                        (SELECT count(*) FROM errors WHERE source='provisioning'
+                           AND detail LIKE '%worker role assignment failed%')",
+                rusqlite::params![tasks::lease_target(task_id), task_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            counts,
+            (0, 1, 0, 0, 1),
+            "(active claims, claims, runs, journal rows, logged refusals)"
+        );
+        let checkouts = std::fs::read_dir(&config.worktree_base)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(checkouts, 0, "the provisioned checkout is released");
+        assert!(
+            !git(&["branch", "--list", &format!("daemon/*-t{task_id}")])
+                .trim()
+                .is_empty(),
+            "the task branch is retained for the operator's retry"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_worker_launch_refused_after_claim_parks_resuming_open() {
+        assert_post_claim_launch_refusal_parks("open").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rework_worker_launch_refused_after_claim_parks_resuming_rework() {
+        assert_post_claim_launch_refusal_parks("rework").await;
+    }
+
+    const RETRY_TEST_CLAUDE_MODEL: &str = "claude-sonnet-4-6";
+    const RETRY_TEST_STORED_PROMPT: &str = "continue the exact stored turn";
+
+    /// A fake Claude runner that records its argv, then stays alive.
+    #[cfg(unix)]
+    fn retry_test_claude_runner(root: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let program = root.join("fake-claude");
+        let args = root.join("claude-args");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}.tmp'\nmv '{0}.tmp' '{0}'\nexec sleep 30\n",
+                args.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (program, args)
+    }
+
+    #[cfg(unix)]
+    async fn retry_test_wait_for_args(args: &Path) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(args) {
+                return text;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake Claude runner never recorded its arguments"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Claude-only routing: a single `c-claude` profile serves every role.
+    #[cfg(unix)]
+    fn claude_only_retry_test_config(root: &Path, repo: &Path, runner: &Path) -> ServeConfig {
+        let mut config = live_fallback_test_config(
+            root.join("retry-discard.db"),
+            repo,
+            runner,
+            Arc::new(TimedOutPreReviewChecks),
+        );
+        config.worktree_base = root.join("worktrees");
+        config.model_profiles = std::collections::BTreeMap::from([(
+            "c-claude".into(),
+            crate::serve_config::ModelProfile {
+                runner: "claude".into(),
+                model: RETRY_TEST_CLAUDE_MODEL.into(),
+                effort: "high".into(),
+            },
+        )]);
+        let pool = std::collections::BTreeMap::from([("c-claude".to_string(), 100)]);
+        config.routing = crate::serve_config::RoutingPolicy {
+            classifier: pool.clone(),
+            planner: pool.clone(),
+            arbiter: pool.clone(),
+            collector: pool.clone(),
+            worker: (1..=5)
+                .map(|level| (level.to_string(), pool.clone()))
+                .collect(),
+            reviewer: (1..=5)
+                .map(|level| (level.to_string(), pool.clone()))
+                .collect(),
+        };
+        config
+    }
+
+    #[cfg(unix)]
+    fn seed_retry_test_task(config: &ServeConfig, status: &str, retry: serde_json::Value) -> i64 {
+        let refs = serde_json::json!({
+            "cx_est": 3,
+            "cx_size": "M",
+            "cx_ready": true,
+            "cx_not_ready_reason": null,
+            "cx_by": "test:v2",
+            "runner_retry": retry,
+        })
+        .to_string();
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "retry dispatch task",
+            Some("dispatch the stored retry"),
+            0,
+            None,
+            Some(&refs),
+            None,
+            None,
+            now_unix(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status=?2 WHERE id=?1",
+            rusqlite::params![task_id, status],
+        )
+        .unwrap();
+        task_id
+    }
+
+    #[cfg(unix)]
+    async fn dispatch_retry_test_worker(config: &ServeConfig) -> (Vec<SlotState>, bool) {
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+        let spawned = spawn_worker(
+            config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut poison,
+            &mut skips,
+            &mut roster,
+        )
+        .await
+        .expect("dispatch must not escape as a tick error");
+        (workers, spawned)
+    }
+
+    /// Task #367 shape: a requested Codex retry carrying a provider thread
+    /// while only Claude profiles are configured. Dispatch drops the exact
+    /// turn and its continuation atomically and launches a fresh Claude worker
+    /// on the current assignment instead of refusing the launch.
+    #[cfg(unix)]
+    async fn assert_unresumable_codex_retry_launches_fresh_claude_worker(status: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = launch_test_repo(dir.path());
+        let (runner, args_path) = retry_test_claude_runner(dir.path());
+        let config = claude_only_retry_test_config(dir.path(), &repo, &runner);
+        let turn_kind = if status == "rework" {
+            "rework"
+        } else {
+            "initial"
+        };
+        let task_id = seed_retry_test_task(
+            &config,
+            status,
+            serde_json::json!({
+                "provider": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "medium",
+                "prompt": RETRY_TEST_STORED_PROMPT,
+                "turn_kind": turn_kind,
+                "continuation_id": "thread-stored",
+                "requested": true
+            }),
+        );
+        {
+            let conn = quorum_core::db::open(&config.db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET refs=json_set(refs, '$.runner_continuation',
+                     json_object('provider','codex','id','thread-stored'))
+                 WHERE id=?1",
+                [task_id],
+            )
+            .unwrap();
+        }
+
+        let (mut workers, spawned) = dispatch_retry_test_worker(&config).await;
+        assert!(spawned, "the unresumable retry launches a fresh worker");
+        assert_eq!(workers.len(), 1);
+        let slot = &workers[0];
+        assert!(matches!(slot.proc, SlotProcess::Running(_)));
+        assert_eq!(slot.model, RETRY_TEST_CLAUDE_MODEL);
+        assert_eq!(slot.process_kind(), runner::AgentKind::Claude);
+        assert_eq!(
+            slot.continuation_id, None,
+            "no stored continuation is spliced"
+        );
+        assert_eq!(slot.pending_turn_kind, "initial");
+        assert_ne!(slot.pending_prompt, RETRY_TEST_STORED_PROMPT);
+        assert!(
+            slot.pending_prompt.contains("retry dispatch task"),
+            "the fresh worker prompt is built on the current task: {}",
+            slot.pending_prompt
+        );
+        let args = retry_test_wait_for_args(&args_path).await;
+        assert!(
+            !args.contains("thread-stored"),
+            "the discarded Codex thread must never reach the Claude spawn: {args}"
+        );
+        assert!(
+            args.contains(&slot.session_id),
+            "fresh Claude session: {args}"
+        );
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        // A provider-retry rework claim keeps `rework`; an open claim works.
+        let held_status = if status == "rework" {
+            "rework"
+        } else {
+            "working"
+        };
+        assert_eq!(task.status, held_status);
+        assert_eq!(task.assignee.as_deref(), Some(slot.agent_name.as_str()));
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(runner_state::RETRY_REF).is_none(), "{refs}");
+        assert!(refs.get(runner_state::CONTINUATION_REF).is_none(), "{refs}");
+        assert_eq!(
+            daemon_rework_retry_requested(task.refs.as_deref()),
+            status == "rework",
+            "a rework discard stays a parked rework retry: {refs}"
+        );
+        let notes: Vec<String> = conn
+            .prepare("SELECT body FROM task_notes WHERE task_id=?1 AND agent='daemon'")
+            .unwrap()
+            .query_map([task_id], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("codex/gpt-5.6-sol") && notes[0].contains("c-claude"),
+            "{notes:?}"
+        );
+        let errors: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM errors WHERE detail LIKE '%runner retry%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(errors, 0);
+        drop(conn);
+        let _ = workers.pop().unwrap().kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_unresumable_codex_retry_launches_fresh_claude_worker() {
+        assert_unresumable_codex_retry_launches_fresh_claude_worker("open").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rework_unresumable_codex_retry_launches_fresh_claude_worker() {
+        assert_unresumable_codex_retry_launches_fresh_claude_worker("rework").await;
+    }
+
+    /// A stored Claude retry matching the assignment and a configured profile
+    /// still resumes its exact turn: same prompt, same continuation id, and
+    /// the stored retry is not discarded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn matching_claude_retry_resumes_exact_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = launch_test_repo(dir.path());
+        let (runner, _) = retry_test_claude_runner(dir.path());
+        let config = claude_only_retry_test_config(dir.path(), &repo, &runner);
+        let task_id = seed_retry_test_task(
+            &config,
+            "rework",
+            serde_json::json!({
+                "provider": "claude",
+                "model": RETRY_TEST_CLAUDE_MODEL,
+                "effort": "high",
+                "prompt": RETRY_TEST_STORED_PROMPT,
+                "turn_kind": "rework",
+                "continuation_id": "claude-session-stored",
+                "requested": true
+            }),
+        );
+
+        let (mut workers, spawned) = dispatch_retry_test_worker(&config).await;
+        assert!(spawned);
+        assert_eq!(workers.len(), 1);
+        let slot = &workers[0];
+        assert_eq!(slot.pending_prompt, RETRY_TEST_STORED_PROMPT);
+        assert_eq!(
+            slot.continuation_id.as_deref(),
+            Some("claude-session-stored")
+        );
+        assert_eq!(slot.pending_turn_kind, "rework");
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert!(refs.get(runner_state::RETRY_REF).is_some(), "{refs}");
+        let discard_notes: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM task_notes WHERE task_id=?1
+                   AND body LIKE 'runner retry discarded%'",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(discard_notes, 0);
+        drop(conn);
+        let _ = workers.pop().unwrap().kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retry_turn_resumable_requires_configured_profile_and_assignment_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = claude_only_retry_test_config(dir.path(), dir.path(), dir.path());
+        let assignment = quorum_core::role_assignments::RoleAssignment {
+            id: 1,
+            responsibility_key: "worker:1:r0".into(),
+            task_id: Some(1),
+            pr_number: None,
+            role: "worker".into(),
+            review_stage: None,
+            complexity: Some("3".into()),
+            profile_id: "c-claude".into(),
+            provider: "claude".into(),
+            runner: "claude".into(),
+            model: RETRY_TEST_CLAUDE_MODEL.into(),
+            effort: "high".into(),
+            pool_key: "worker.3".into(),
+            policy_generation: "g".into(),
+            created_at: 0,
+        };
+        let turn = |provider: &str, model: &str, effort: &str| PendingTurn {
+            provider: provider.into(),
+            model: model.into(),
+            effort: effort.into(),
+            prompt: "p".into(),
+            turn_kind: "rework".into(),
+            continuation_id: Some("c".into()),
+            requested: true,
+        };
+        assert!(retry_turn_resumable(
+            &config,
+            &assignment,
+            &turn("claude", RETRY_TEST_CLAUDE_MODEL, "high")
+        ));
+        // No configured profile carries the stored identity.
+        assert!(!retry_turn_resumable(
+            &config,
+            &assignment,
+            &turn("codex", "gpt-5.6-sol", "medium")
+        ));
+        // Effort mismatch with the assignment and every configured profile.
+        assert!(!retry_turn_resumable(
+            &config,
+            &assignment,
+            &turn("claude", RETRY_TEST_CLAUDE_MODEL, "low")
+        ));
+        // A configured profile matches, but the assignment's provider differs.
+        let mut config = config;
+        config.model_profiles.insert(
+            "x-codex".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.6-sol".into(),
+                effort: "medium".into(),
+            },
+        );
+        assert!(!retry_turn_resumable(
+            &config,
+            &assignment,
+            &turn("codex", "gpt-5.6-sol", "medium")
+        ));
+        // The assignment matches, but no configured profile does any more.
+        config.model_profiles.clear();
+        assert!(!retry_turn_resumable(
+            &config,
+            &assignment,
+            &turn("claude", RETRY_TEST_CLAUDE_MODEL, "high")
+        ));
     }
 
     #[cfg(unix)]
@@ -36977,6 +39699,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(agent_run_id),
             cap_run_id: Some(cap_run_id.into()),
@@ -37075,9 +39798,15 @@ mod tests {
             std::io::ErrorKind::Other,
         );
         assert_eq!(
-            activate_worker_fallback(config, &mut initial, &failure, &currency)
-                .await
-                .unwrap(),
+            activate_worker_fallback(
+                config,
+                &mut initial,
+                &failure,
+                &currency,
+                &mut ProfileCooldown::new()
+            )
+            .await
+            .unwrap(),
             WorkerFallbackActivation::Activated
         );
         assert_ne!(initial.model, assignment.model);
@@ -37215,9 +39944,15 @@ mod tests {
             std::io::ErrorKind::Other,
         );
         assert_eq!(
-            activate_worker_fallback(&config, &mut slot, &failure, &currency)
-                .await
-                .unwrap(),
+            activate_worker_fallback(
+                &config,
+                &mut slot,
+                &failure,
+                &currency,
+                &mut ProfileCooldown::new()
+            )
+            .await
+            .unwrap(),
             WorkerFallbackActivation::Activated
         );
         assert_ne!(slot.model, assigned_model);
@@ -37277,9 +40012,15 @@ mod tests {
             std::io::ErrorKind::Other,
         );
         assert_eq!(
-            activate_worker_fallback(&config, &mut slot, &failure, &currency)
-                .await
-                .unwrap(),
+            activate_worker_fallback(
+                &config,
+                &mut slot,
+                &failure,
+                &currency,
+                &mut ProfileCooldown::new()
+            )
+            .await
+            .unwrap(),
             WorkerFallbackActivation::Settled
         );
 
@@ -37402,6 +40143,398 @@ mod tests {
         fn merge_commit_status(&self, _pr: i64, _repo_dir: &Path) -> merge::MergeCommitStatus {
             merge::MergeCommitStatus::Open
         }
+    }
+
+    /// A live R1 reviewer on `a-primary` in a three-profile pool
+    /// (`a-primary` 25, `b-alternate` 50, `c-tertiary` 25) with a provider
+    /// script that records each launch in the returned marker file.
+    #[cfg(unix)]
+    struct CoolingReviewerFixture {
+        config: ServeConfig,
+        slot: SlotState,
+        currency: fallback_preflight::ManagedTurnCurrency,
+        started: PathBuf,
+        responsibility: String,
+    }
+
+    #[cfg(unix)]
+    fn cooling_reviewer_fallback_fixture(root: &Path) -> CoolingReviewerFixture {
+        use std::os::unix::fs::PermissionsExt;
+
+        let worktree = root.join("reviewer-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let started = root.join("reviewer-provider-started");
+        let runner_program = root.join("fallback-codex");
+        std::fs::write(
+            &runner_program,
+            format!(
+                "#!/bin/sh\nprintf started >> '{}'\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"fallback-thread\"}}'\nexec sleep 30\n",
+                started.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let head_sha = "a".repeat(40);
+        let mut config = live_fallback_test_config(
+            root.join("reviewer.db"),
+            root,
+            &runner_program,
+            Arc::new(FallbackHeadExecutor(head_sha.clone())),
+        );
+        config.model_profiles.insert(
+            "c-tertiary".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.5".into(),
+                effort: "medium".into(),
+            },
+        );
+        for pool in config.routing.reviewer.values_mut() {
+            pool.insert("a-primary".into(), 25);
+            pool.insert("c-tertiary".into(), 25);
+        }
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn,
+            "owner",
+            "reviewer cooldown",
+            None,
+            0,
+            None,
+            Some(r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let observed_at = now_unix();
+        quorum_core::tasks::claim(
+            &mut conn,
+            "Author",
+            Some(task_id),
+            &[],
+            3600,
+            observed_at - 2,
+        )
+        .unwrap()
+        .unwrap();
+        quorum_core::tasks::apply_event(
+            &mut conn,
+            "Author",
+            task_id,
+            &Event::SignaledDone { pr: "77".into() },
+            observed_at - 1,
+        )
+        .unwrap();
+        quorum_core::tasks::reserve_reviewer_provision(
+            &mut conn,
+            task_id,
+            "cooldown-review-reservation",
+            "r1",
+            observed_at,
+        )
+        .unwrap();
+        assert!(quorum_core::tasks::attach_reserved_reviewer(
+            &mut conn,
+            task_id,
+            "cooldown-review-reservation",
+            "r1",
+            "Fallback-Reviewer",
+            3600,
+            observed_at,
+        )
+        .unwrap());
+        let responsibility = format!("reviewer:task:{task_id}:r1");
+        let (assignment, initial_run, agent_name) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "reviewer",
+            Some(77),
+            Some("r1"),
+        );
+        assert_eq!(assignment.profile_id, "a-primary");
+        journal::upsert(
+            &mut conn,
+            &JournalEntry {
+                agent: agent_name.clone(),
+                role: "reviewer".into(),
+                task_id: Some(task_id),
+                session_id: "initial-review-session".into(),
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                branch: Some("review/pr-77".into()),
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(77),
+                rework_count: 0,
+                provider: Some("codex".into()),
+                continuation_id: None,
+                local_branch: Some("review/pr-77".into()),
+            },
+        )
+        .unwrap();
+        let now = std::time::Instant::now();
+        let slot = SlotState {
+            agent_name,
+            proc: SlotProcess::Failed {
+                kind: runner::AgentKind::Codex,
+            },
+            task_id,
+            session_id: "initial-review-session".into(),
+            model: assignment.model.clone(),
+            effort: assignment.effort.clone(),
+            worktree_path: worktree,
+            branch: "review/pr-77".into(),
+            remote_branch: "review/pr-77".into(),
+            draining: true,
+            pending_watchdog_breach: None,
+            pr: Some(77),
+            rework_count: 0,
+            cost_tokens: 0,
+            limit_tokens: 0,
+            token_usage: runner::TokenUsage::default(),
+            last_terminal_usage: runner::TokenUsage::default(),
+            last_terminal_cost_usd: None,
+            cost_usd: 0.0,
+            task_started_at: now,
+            turn_started_at: now,
+            last_event_at: now,
+            turn_ended_at: None,
+            last_provider_activity_at: None,
+            agent_state: None,
+            session_log: None,
+            live_stats: LiveStats::new(),
+            error_turn_count: 0,
+            fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
+            last_error_text: None,
+            agent_run_id: Some(initial_run),
+            cap_run_id: Some("initial-cap".into()),
+            r2_origin: false,
+            reviewed_head_sha: Some(head_sha),
+            continuation_id: None,
+            pending_prompt: "exact reviewer prompt".into(),
+            pending_turn_kind: "review".into(),
+        };
+        let currency = load_reviewer_fallback_currency(&conn, &slot, observed_at).unwrap();
+        CoolingReviewerFixture {
+            config,
+            slot,
+            currency,
+            started,
+            responsibility,
+        }
+    }
+
+    #[cfg(unix)]
+    fn routing_attempt_profiles(config: &ServeConfig, responsibility: &str) -> Vec<String> {
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        quorum_core::routing_attempts::list(&conn, responsibility)
+            .unwrap()
+            .into_iter()
+            .map(|attempt| attempt.profile.id)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewer_fallback_skips_a_cooling_alternate_and_cools_the_failed_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let mut fixture = cooling_reviewer_fallback_fixture(root.path());
+        // `b-alternate` is the highest-weight alternate, so without the
+        // cooldown it is the route the installer selects.
+        let mut cooldown = ProfileCooldown::new();
+        cooldown.record("b-alternate", std::time::Instant::now());
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "primary reviewer profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+        assert_eq!(
+            activate_reviewer_fallback(
+                &fixture.config,
+                &mut fixture.slot,
+                &failure,
+                &fixture.currency,
+                &mut cooldown,
+            )
+            .await
+            .unwrap(),
+            ReviewerFallbackActivation::Activated
+        );
+        assert_eq!(fixture.slot.model, "gpt-5.5", "c-tertiary runs");
+        assert!(
+            cooldown.is_cooling("a-primary", std::time::Instant::now()),
+            "the classified failure starts the failed profile's cooldown"
+        );
+        assert_eq!(
+            routing_attempt_profiles(&fixture.config, &fixture.responsibility),
+            vec!["a-primary".to_string(), "b-alternate".to_string()],
+            "the skip is ordinary routing evidence"
+        );
+        // Verdict authority stays with the existing attribution: the live run
+        // is the attributed alternate for the same assignment and participant.
+        let conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        let (profile, agent, active_runs): (String, String, i64) = conn
+            .query_row(
+                "SELECT configured_profile_id,agent_name,
+                        (SELECT count(*) FROM agent_runs
+                         WHERE task_id=?2 AND role='reviewer' AND ended_at IS NULL)
+                 FROM agent_runs WHERE id=?1",
+                rusqlite::params![fixture.slot.agent_run_id, fixture.slot.task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (profile.as_str(), agent.as_str(), active_runs),
+            ("c-tertiary", "Fallback-Reviewer", 1)
+        );
+        drop(conn);
+        assert_provider_started_once(&fixture.started).await;
+        let _ = fixture.slot.kill_and_reap().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewer_fallback_spawns_nothing_when_every_alternate_is_cooling() {
+        let root = tempfile::tempdir().unwrap();
+        let mut fixture = cooling_reviewer_fallback_fixture(root.path());
+        let mut cooldown = ProfileCooldown::new();
+        let now = std::time::Instant::now();
+        cooldown.record("b-alternate", now);
+        cooldown.record("c-tertiary", now);
+        let failure = runner::RunnerFailure::classified(
+            runner::FailureDisposition::ProfileUnavailable,
+            "primary reviewer profile unavailable",
+            std::io::ErrorKind::Other,
+        );
+        assert_eq!(
+            activate_reviewer_fallback(
+                &fixture.config,
+                &mut fixture.slot,
+                &failure,
+                &fixture.currency,
+                &mut cooldown,
+            )
+            .await
+            .unwrap(),
+            ReviewerFallbackActivation::Settled
+        );
+        assert!(
+            !fixture.started.exists(),
+            "no provider process may launch onto a cooling profile"
+        );
+        assert_eq!(
+            routing_attempt_profiles(&fixture.config, &fixture.responsibility).len(),
+            3,
+            "the walk is bounded by the pool"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewer_provision_plan_skips_cooling_assignment_or_defers_until_expiry() {
+        let root = tempfile::tempdir().unwrap();
+        let config = live_fallback_test_config(
+            root.path().join("plan.db"),
+            root.path(),
+            &root.path().join("unused-runner"),
+            Arc::new(FallbackHeadExecutor("a".repeat(40))),
+        );
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = quorum_core::tasks::create(
+            &mut conn, "owner", "plan", None, 0, None, None, None, None, 1,
+        )
+        .unwrap();
+        let responsibility = format!("reviewer:task:{task_id}:r1");
+        let (assignment, _, _) = seed_live_fallback_assignment(
+            &config,
+            &mut conn,
+            task_id,
+            &responsibility,
+            "reviewer",
+            Some(77),
+            Some("r1"),
+        );
+        assert_eq!(assignment.profile_id, "a-primary");
+        async fn plan_at(
+            config: &ServeConfig,
+            assignment: &quorum_core::role_assignments::RoleAssignment,
+            cooldown: &ProfileCooldown,
+            now: std::time::Instant,
+        ) -> CooldownPlan {
+            reviewer_cooldown_plan(config, cooldown, assignment, 3, &ReviewRole::R1, now)
+                .await
+                .unwrap()
+        }
+        let now = std::time::Instant::now();
+        let mut cooldown = ProfileCooldown::new();
+        assert_eq!(
+            plan_at(&config, &assignment, &cooldown, now).await,
+            CooldownPlan::Run
+        );
+
+        let a_until = cooldown.record("a-primary", now);
+        assert_eq!(
+            plan_at(&config, &assignment, &cooldown, now).await,
+            CooldownPlan::SkipAssigned
+        );
+
+        // Every eligible profile cooling: provisioning must wait, and the
+        // wait ends at the earliest relevant expiry.
+        let b_until = cooldown.record("b-alternate", now + Duration::from_millis(1));
+        assert_eq!(
+            plan_at(&config, &assignment, &cooldown, now).await,
+            CooldownPlan::Defer { until: a_until }
+        );
+        assert_eq!(
+            plan_at(&config, &assignment, &cooldown, a_until).await,
+            CooldownPlan::Run
+        );
+
+        // A non-cooling alternate excluded by this responsibility's durable
+        // routing evidence is not eligible either.
+        let pool = configured_routing_pool(&config, "reviewer", Some(3), Some("r1")).unwrap();
+        let alternate = pool
+            .profiles
+            .iter()
+            .find(|weighted| weighted.profile.id == "b-alternate")
+            .unwrap()
+            .profile
+            .clone();
+        quorum_core::routing_attempts::record(
+            &mut conn,
+            &quorum_core::routing_attempts::RecordRoutingAttempt {
+                role_assignment_id: assignment.id,
+                responsibility_key: &responsibility,
+                profile: &alternate,
+                failure_disposition: Some(
+                    quorum_core::routing_attempts::FailureDisposition::ProfileUnavailable,
+                ),
+                failed_agent_run_id: None,
+                recorded_at: 2,
+            },
+            &pool,
+        )
+        .unwrap();
+        let after_b = b_until + Duration::from_millis(1);
+        let mut only_assigned = ProfileCooldown::new();
+        let assigned_until = only_assigned.record("a-primary", after_b);
+        assert_eq!(
+            plan_at(&config, &assignment, &only_assigned, after_b).await,
+            CooldownPlan::Defer {
+                until: assigned_until
+            }
+        );
+        assert_eq!(
+            plan_at(&config, &assignment, &only_assigned, assigned_until).await,
+            CooldownPlan::Run
+        );
     }
 
     #[cfg(unix)]
@@ -37559,6 +40692,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -37587,9 +40721,15 @@ mod tests {
             std::io::ErrorKind::Other,
         );
         assert_eq!(
-            activate_reviewer_fallback(&config, &mut slot, &failure, &currency)
-                .await
-                .unwrap(),
+            activate_reviewer_fallback(
+                &config,
+                &mut slot,
+                &failure,
+                &currency,
+                &mut ProfileCooldown::new(),
+            )
+            .await
+            .unwrap(),
             ReviewerFallbackActivation::Activated
         );
         assert_eq!(slot.model, "gpt-5.6-terra");
@@ -37661,9 +40801,15 @@ mod tests {
             std::io::ErrorKind::Other,
         );
         assert_eq!(
-            activate_reviewer_fallback(&config, &mut slot, &failure, &second_currency)
-                .await
-                .unwrap(),
+            activate_reviewer_fallback(
+                &config,
+                &mut slot,
+                &failure,
+                &second_currency,
+                &mut ProfileCooldown::new(),
+            )
+            .await
+            .unwrap(),
             ReviewerFallbackActivation::Settled
         );
 
@@ -37990,6 +41136,8 @@ mod tests {
             &mut graph_skip_logs,
             &mut unrecordable,
             &mut reviewer_respawn_backoff,
+            &mut ProfileCooldown::new(),
+            &mut ReviewerSlotQueue::default(),
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
@@ -38522,6 +41670,8 @@ mod tests {
             &mut graph_skip_logs,
             &mut unrecordable,
             &mut reviewer_respawn_backoff,
+            &mut ProfileCooldown::new(),
+            &mut ReviewerSlotQueue::default(),
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
@@ -38948,6 +42098,7 @@ mod tests {
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(initial_run),
             cap_run_id: Some("initial-cap".into()),
@@ -39057,6 +42208,9 @@ mod tests {
             &mut workers,
             &mut reviewers,
             &mut roster,
+            &mut UnrecordableStrikes::new(),
+            &mut ReviewerRespawnBackoff::new(),
+            &mut ProfileCooldown::new(),
         )
         .await
         .unwrap();
@@ -39105,6 +42259,9 @@ mod tests {
             &mut workers,
             &mut reviewers,
             &mut roster,
+            &mut UnrecordableStrikes::new(),
+            &mut ReviewerRespawnBackoff::new(),
+            &mut ProfileCooldown::new(),
         )
         .await
         .unwrap();
@@ -40925,6 +44082,8 @@ mod tests {
                         &mut graph_skip_logs,
                         &mut unrecordable,
                         &mut reviewer_respawn_backoff,
+                        &mut ProfileCooldown::new(),
+                        &mut ReviewerSlotQueue::default(),
                         &mut drain_state,
                         &mut lifetime_roster,
                         &mut classifier_slot,
@@ -42782,6 +45941,7 @@ printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-session-te
                 live_stats: LiveStats::new(),
                 error_turn_count: 0,
                 fallback_install_error_count: 0,
+                worker_fallback_deferral: None,
                 last_error_text: None,
                 agent_run_id: Some(old_run_id),
                 cap_run_id: Some(old_capability.clone()),
@@ -43036,6 +46196,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &mut name_pool,
             &mut workers,
             task_id,
+            &mut ProfileCooldown::new(),
         )
         .await;
 
@@ -43124,6 +46285,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &mut name_pool,
             &mut workers,
             task_id,
+            &mut ProfileCooldown::new(),
         )
         .await;
 
@@ -43195,6 +46357,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &mut name_pool,
             &mut workers,
             task_id,
+            &mut ProfileCooldown::new(),
         )
         .await;
 
@@ -43587,6 +46750,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &mut graph_skip_logs,
             &mut unrecordable,
             &mut reviewer_respawn_backoff,
+            &mut ProfileCooldown::new(),
+            &mut ReviewerSlotQueue::default(),
             &mut drain_state,
             &mut lifetime_roster,
             &mut classifier_slot,
@@ -43874,6 +47039,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 &mut workers,
                 0,
                 &error,
+                &mut ProfileCooldown::new(),
             )
             .await
         );
@@ -43976,6 +47142,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &mut workers,
             worker_index,
             &std::io::Error::other("provider launch failed"),
+            &mut ProfileCooldown::new(),
         )
         .await
         .unwrap();
@@ -44028,6 +47195,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &mut workers,
             0,
             &std::io::Error::other("provider launch failed"),
+            &mut ProfileCooldown::new(),
         )
         .await
         .expect_err("durable disposition failure must abort recovered startup");
@@ -44619,9 +47787,374 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             r2_steady_state_p: 0.0,
             max_rework: quorum_core::lifecycle::REWORK_CAP,
             max_graph_children_working: None,
+            reviewer_cap: 32,
             codex_sandbox: "danger-full-access".into(),
             grok: Default::default(),
             pr_target_program: None,
+            max_active_graphs: 2,
+        }
+    }
+
+    /// A planning graph does not pause Phase 6 dispatch: an unrelated open,
+    /// classified task gets a worker while the graph holds the freeze, and the
+    /// planning source itself — classified and ready, with spare capacity — is
+    /// never dispatched as an implementation task.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_workers_starts_unrelated_work_while_a_graph_plans() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("state.txt"), "base\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["branch", "-M", "main"]);
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "main"]);
+
+        const READY: &str = r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#;
+        let db_path = dir.path().join("quorum.db");
+        let (source_id, unrelated_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            // The source outranks the unrelated task, so a dispatch that could
+            // select it would pick it first.
+            let source_id = tasks::create(
+                &mut conn,
+                "owner",
+                "planning source",
+                None,
+                10,
+                None,
+                Some(READY),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='planning' WHERE id=?1",
+                [source_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(
+                     source_task_id,state,active,freeze_active,planned_source_revision,
+                     created_at,updated_at)
+                 VALUES (?1,'planning',0,1,1,1,1)",
+                [source_id],
+            )
+            .unwrap();
+            let unrelated_id = tasks::create(
+                &mut conn,
+                "owner",
+                "unrelated work",
+                None,
+                0,
+                None,
+                Some(READY),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            (source_id, unrelated_id)
+        };
+
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo.clone());
+        config.worktree_base = dir.path().join("worktrees");
+        config.cap = 2;
+        config.agent_bin = Some(
+            fake_stdin_holding_agent(dir.path(), "hold-worker")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+        let mut cooldown = ProfileCooldown::new();
+
+        dispatch_workers(
+            &config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut poison,
+            &mut skips,
+            &mut roster,
+            &mut cooldown,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            workers.iter().map(|w| w.task_id).collect::<Vec<_>>(),
+            vec![unrelated_id],
+            "only the unrelated task may get a worker while the graph plans"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let unrelated = tasks::get(&conn, unrelated_id).unwrap().unwrap();
+        assert_eq!(unrelated.status, "working");
+        assert_eq!(
+            unrelated.assignee.as_deref(),
+            Some(workers[0].agent_name.as_str())
+        );
+        let source = tasks::get(&conn, source_id).unwrap().unwrap();
+        assert_eq!(source.status, "planning");
+        assert_eq!(source.assignee, None);
+        assert!(
+            quorum_core::agent_runs::runs_for_task(&conn, source_id)
+                .unwrap()
+                .is_empty(),
+            "the planning source must never get an implementation worker run"
+        );
+        let freeze_active: i64 = conn
+            .query_row(
+                "SELECT freeze_active FROM task_decompositions WHERE source_task_id=?1",
+                [source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            freeze_active, 1,
+            "dispatch must not disturb the planning graph"
+        );
+        drop(conn);
+
+        workers.pop().unwrap().kill_and_reap().await;
+    }
+
+    /// Every active graph advances in one dispatch pass: children of two
+    /// graphs share the worker `cap` without exceeding it, and each graph's
+    /// `max_graph_children_working` limit still applies. A hard-failed child
+    /// then holds only its own graph: with spare capacity, the other graph's
+    /// remaining child dispatches and the held graph's ready child does not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_workers_advances_every_active_graph_within_the_shared_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let remote = dir.path().join("remote.git");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.join("state.txt"), "base\n").unwrap();
+        git(&["add", "state.txt"]);
+        git(&["commit", "-qm", "base"]);
+        git(&["branch", "-M", "main"]);
+        git(&["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "main"]);
+
+        const READY: &str = r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#;
+        let db_path = dir.path().join("quorum.db");
+        let seed_graph = |conn: &mut rusqlite::Connection, name: &str, children: usize| {
+            let source = tasks::create(
+                conn,
+                "owner",
+                &format!("{name} source"),
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute("UPDATE tasks SET status='decomposed' WHERE id=?1", [source])
+                .unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                     planned_source_revision,plan_revision,accepted_plan_revision,
+                     created_at,updated_at)
+                 VALUES (?1,'active',1,0,1,1,1,1,1)",
+                [source],
+            )
+            .unwrap();
+            let graph = conn.last_insert_rowid();
+            let ids = (0..children)
+                .map(|index| {
+                    let id = tasks::create(
+                        conn,
+                        "owner",
+                        &format!("{name} child {index}"),
+                        None,
+                        0,
+                        None,
+                        Some(READY),
+                        None,
+                        None,
+                        now_unix(),
+                    )
+                    .unwrap();
+                    conn.execute("UPDATE tasks SET terminal_leaf=1 WHERE id=?1", [id])
+                        .unwrap();
+                    conn.execute(
+                        "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+                         VALUES (?1,?2,?3,1,1)",
+                        rusqlite::params![graph, id, format!("{name}{index}")],
+                    )
+                    .unwrap();
+                    id
+                })
+                .collect::<Vec<i64>>();
+            (graph, ids)
+        };
+        // Graph A has the lower ids, so a dispatcher that served one graph
+        // until it ran dry would fill the cap from A alone.
+        let ((graph_a, a), (graph_b, b)) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            (seed_graph(&mut conn, "a", 3), seed_graph(&mut conn, "b", 2))
+        };
+
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo.clone());
+        config.worktree_base = dir.path().join("worktrees");
+        config.cap = 3;
+        config.max_graph_children_working = Some(2);
+        config.agent_bin = Some(
+            fake_stdin_holding_agent(dir.path(), "hold-worker")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+        let mut cooldown = ProfileCooldown::new();
+
+        dispatch_workers(
+            &config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut poison,
+            &mut skips,
+            &mut roster,
+            &mut cooldown,
+        )
+        .await
+        .unwrap();
+
+        let working = |ids: &[i64]| {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            ids.iter()
+                .copied()
+                .filter(|id| tasks::get(&conn, *id).unwrap().unwrap().status == "working")
+                .collect::<Vec<i64>>()
+        };
+        let dispatched: Vec<i64> = workers.iter().map(|w| w.task_id).collect();
+        assert_eq!(dispatched.len(), 3, "the shared cap is filled exactly");
+        assert_eq!(
+            working(&a),
+            vec![a[0], a[1]],
+            "graph A stops at its working limit"
+        );
+        assert_eq!(
+            working(&b),
+            vec![b[0]],
+            "graph B dispatches in the same pass"
+        );
+
+        // Hard-fail A's first child: the claim/listing SQL holds graph A only.
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='failed',assignee=NULL,refs='{}' WHERE id=?1",
+                [a[0]],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE task_decompositions SET state='blocked',hold_code='generated-child-failed'
+                 WHERE id=?1",
+                [graph_a],
+            )
+            .unwrap();
+        }
+        config.cap = 6;
+        dispatch_workers(
+            &config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut poison,
+            &mut skips,
+            &mut roster,
+            &mut cooldown,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            workers.len(),
+            4,
+            "only graph B's remaining child is admitted despite spare capacity"
+        );
+        assert_eq!(working(&b), b, "graph B keeps dispatching");
+        assert_eq!(
+            working(&a[2..]),
+            Vec::<i64>::new(),
+            "the held graph's ready child never starts"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let state = |graph: i64| -> String {
+            conn.query_row(
+                "SELECT state FROM task_decompositions WHERE id=?1",
+                [graph],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(state(graph_a), "blocked");
+        assert_eq!(state(graph_b), "active", "graph B's state is unaffected");
+        drop(conn);
+
+        for worker in workers.drain(..) {
+            worker.kill_and_reap().await;
         }
     }
 
@@ -44833,6 +48366,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: None,
             cap_run_id: None,
@@ -45769,6 +49303,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         &mut graph_skip_logs,
                         &mut unrecordable_strikes,
                         &mut reviewer_respawn_backoff,
+                        &mut ProfileCooldown::new(),
+                        &mut ReviewerSlotQueue::default(),
                         &mut drain_state,
                         &mut lifetime_roster,
                         &mut classifier_slot,
@@ -45858,6 +49394,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         &mut graph_skip_logs,
                         &mut unrecordable_strikes,
                         &mut reviewer_respawn_backoff,
+                        &mut ProfileCooldown::new(),
+                        &mut ReviewerSlotQueue::default(),
                         &mut drain_state,
                         &mut lifetime_roster,
                         &mut classifier_slot,
@@ -46603,6 +50141,176 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             )
             .unwrap();
         assert_eq!(terminal_alerts, 0, "recorded cleanup must not alert");
+    }
+
+    /// Approved-merge gate executor: the reviewed head is current and the PR
+    /// is mergeable, but CI is still running.
+    struct PendingMergeGateChecks;
+
+    impl merge::MergeExecutor for PendingMergeGateChecks {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            panic!("merge must not be called while checks are pending");
+        }
+
+        fn head_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+            Some("reviewed-head".into())
+        }
+
+        fn wait_for_checks(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _timeout_secs: u64,
+            _poll_interval_secs: u64,
+        ) -> merge::ChecksOutcome {
+            merge::ChecksOutcome::TimedOut
+        }
+
+        fn pending_check_names(&self, _pr: i64, _repo_dir: &Path) -> Vec<String> {
+            vec!["shell-tests".into(), "lint".into()]
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approved_merge_gate_pending_checks_persist_merge_checks_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("approved-merge-gate-pending.db");
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "--quiet", &repo_dir.to_string_lossy()])
+            .status()
+            .unwrap();
+        let now = now_unix();
+        let (task_id, reviewer_run_id, mailbox_id) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "approved merge gate pending",
+                None,
+                0,
+                None,
+                Some(
+                    r#"{"branch":"daemon/reviewer-t1","cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "Author", Some(task_id), &[], 3600, now)
+                .unwrap()
+                .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "Author",
+                task_id,
+                &Event::SignaledDone { pr: "464".into() },
+                now + 1,
+            )
+            .unwrap();
+            tasks::claim(&mut conn, "GateReviewer", Some(task_id), &[], 3600, now + 2)
+                .unwrap()
+                .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "system",
+                task_id,
+                &Event::ReviewerAttached {
+                    agent: "GateReviewer".into(),
+                },
+                now + 2,
+            )
+            .unwrap();
+            tasks::apply_event(
+                &mut conn,
+                "GateReviewer",
+                task_id,
+                &Event::VerdictApprove,
+                now + 3,
+            )
+            .unwrap();
+            // R1-only head: the approval goes straight to the merge gate.
+            quorum_core::review_audits::record_r2_requirement(
+                &mut conn,
+                task_id,
+                464,
+                "reviewed-head",
+                false,
+            )
+            .unwrap();
+            let run_id = quorum_core::agent_runs::insert(
+                &conn,
+                task_id,
+                "GateReviewer",
+                "reviewer",
+                "gpt-5.6-terra",
+                "high",
+                "codex",
+                now + 2,
+            )
+            .unwrap();
+            let mailbox_id = mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: "GateReviewer".into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(task_id),
+                    pr: Some(464),
+                    verdict: Some("approved".into()),
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: Some(r#"{"blocking":0}"#.into()),
+                },
+            )
+            .unwrap();
+            (task_id, run_id, mailbox_id)
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo_dir.clone());
+        config.merge_executor = Arc::new(PendingMergeGateChecks);
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named("GateReviewer").unwrap();
+
+        let _ = tick_phase2_reviewer_fixture(
+            config,
+            name_pool,
+            Phase2ReviewerFixture {
+                dir: dir.path().to_path_buf(),
+                repo_dir,
+                task_id,
+                reviewer_run_id,
+                agent: "GateReviewer".into(),
+                reviewed_head_sha: Some("reviewed-head".into()),
+            },
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "merging", "pending CI keeps the merge wait");
+        let snap = tasks::merge_checks_of(task.refs.as_deref())
+            .expect("pending merge-gate poll must persist refs.merge_checks");
+        assert_eq!(snap.state, tasks::MergeChecksState::Pending);
+        assert_eq!(
+            snap.checks,
+            vec!["shell-tests".to_string(), "lint".to_string()]
+        );
+        assert!(snap.since >= now && snap.observed_at >= snap.since);
+        let consumed: bool = conn
+            .query_row(
+                "SELECT consumed_at IS NOT NULL FROM mailbox WHERE id=?1",
+                [mailbox_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!consumed, "merge wait retries from the unconsumed row");
     }
 
     #[cfg(unix)]
@@ -48031,6 +51739,212 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             next_needed_role(&conn, 42, "moved-head").unwrap(),
             Some("r1")
         );
+    }
+
+    fn merge_checks_snapshot_row(
+        conn: &quorum_core::Connection,
+        task_id: i64,
+    ) -> Option<tasks::MergeChecksSnapshot> {
+        let refs = tasks::get(conn, task_id).unwrap().unwrap().refs;
+        tasks::merge_checks_of(refs.as_deref())
+    }
+
+    /// Ready merge-retry executor whose merge call reads the durable
+    /// snapshot, proving what the gate persisted before the merge.
+    struct MergeChecksProbeExecutor {
+        db_path: PathBuf,
+        task_id: i64,
+        seen_at_merge: std::sync::Mutex<Option<Option<tasks::MergeChecksSnapshot>>>,
+    }
+
+    impl merge::MergeExecutor for MergeChecksProbeExecutor {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            let conn = quorum_core::db::open(&self.db_path).unwrap();
+            *self.seen_at_merge.lock().unwrap() =
+                Some(merge_checks_snapshot_row(&conn, self.task_id));
+            merge::MergeResult {
+                success: true,
+                message: "merged".into(),
+                failure_kind: None,
+            }
+        }
+
+        fn merge_commit_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+            Some("merge-42".into())
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn merge_retry_gate_records_passed_snapshot_then_merge_clears_it() {
+        let (dir, mut conn, task_id, live) = seeded_merge_retry_authority();
+        prepare_ready_approved_handoff(&conn, task_id, 1);
+        assert!(
+            request_ready_approved_merge(&mut conn, task_id, 42, &live.target.head_sha, 102,)
+                .unwrap()
+        );
+        // A prior gate poll observed pending checks.
+        assert!(tasks::set_merge_checks_snapshot(
+            &mut conn,
+            task_id,
+            tasks::MergeChecksState::Pending,
+            &["shell-tests".to_string()],
+            103,
+        )
+        .unwrap());
+        drop(conn);
+
+        let executor = Arc::new(MergeChecksProbeExecutor {
+            db_path: dir.path().join("q.db"),
+            task_id,
+            seen_at_merge: std::sync::Mutex::new(None),
+        });
+        let config =
+            merge_retry_test_config(&dir, &live, "gh-merge-checks-probe", executor.clone());
+        assert_eq!(config.db_path, executor.db_path);
+
+        reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+            .await
+            .unwrap();
+
+        let seen = executor
+            .seen_at_merge
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("merge must be called")
+            .expect("gate must persist a snapshot before merging");
+        assert_eq!(seen.state, tasks::MergeChecksState::Passed);
+        assert!(seen.checks.is_empty());
+        assert!(seen.since > 103, "state change resets since");
+        assert_eq!(seen.since, seen.observed_at);
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        assert_eq!(tasks::get(&conn, task_id).unwrap().unwrap().status, "done");
+        assert_eq!(merge_checks_snapshot_row(&conn, task_id), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn merge_retry_ci_failure_rework_clears_merge_checks_snapshot() {
+        let (dir, mut conn, task_id, live) = seeded_merge_retry_authority();
+        prepare_ready_approved_handoff(&conn, task_id, 1);
+        assert!(
+            request_ready_approved_merge(&mut conn, task_id, 42, &live.target.head_sha, 102,)
+                .unwrap()
+        );
+        assert!(tasks::set_merge_checks_snapshot(
+            &mut conn,
+            task_id,
+            tasks::MergeChecksState::Pending,
+            &["flaky-test".to_string()],
+            103,
+        )
+        .unwrap());
+        drop(conn);
+
+        let executor = Arc::new(FailingChecksMergeCounter {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let config = merge_retry_test_config(&dir, &live, "gh-merge-checks-fail", executor.clone());
+
+        assert_eq!(
+            reconcile_merge_retries(&config, &WorktreeManager::new(), false)
+                .await
+                .unwrap(),
+            Some(task_id)
+        );
+
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(merge_checks_snapshot_row(&conn, task_id), None);
+    }
+
+    #[tokio::test]
+    async fn merge_checks_observation_maps_outcomes_and_skips_non_merging_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut config = pre_review_checks_config(dir.path().join("q.db"), repo);
+        config.merge_executor = Arc::new(TimedOutPreReviewChecks);
+        let task_id = {
+            let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+            let id = tasks::create(
+                &mut conn,
+                "creator",
+                "merge checks observation",
+                None,
+                0,
+                None,
+                Some(r#"{"pr":42}"#),
+                None,
+                None,
+                100,
+            )
+            .unwrap();
+            conn.execute("UPDATE tasks SET status='merging' WHERE id=?1", [id])
+                .unwrap();
+            id
+        };
+        let read = || {
+            let conn = quorum_core::db::open(&config.db_path).unwrap();
+            merge_checks_snapshot_row(&conn, task_id).expect("snapshot")
+        };
+
+        // Rollup pending: names come from the provider lookup.
+        record_merge_checks_observation(&config, task_id, 42, &merge::ChecksOutcome::TimedOut)
+            .await;
+        let snap = read();
+        assert_eq!(snap.state, tasks::MergeChecksState::Pending);
+        assert_eq!(snap.checks, vec!["shell-tests".to_string()]);
+
+        // Required-job pending: names come from the gate outcome.
+        let required_pending = merge::apply_required_jobs_gate(
+            merge::ChecksOutcome::Ready,
+            merge::RequiredJobsOutcome::Pending {
+                pending_jobs: vec!["ci-gate".into()],
+            },
+        );
+        record_merge_checks_observation(&config, task_id, 42, &required_pending).await;
+        assert_eq!(read().checks, vec!["ci-gate".to_string()]);
+
+        // Failing checks are bounded to the core limit.
+        let failing: Vec<String> = (0..30).map(|i| format!("job-{i}")).collect();
+        record_merge_checks_observation(
+            &config,
+            task_id,
+            42,
+            &merge::ChecksOutcome::Failed {
+                failing_checks: failing.clone(),
+            },
+        )
+        .await;
+        let snap = read();
+        assert_eq!(snap.state, tasks::MergeChecksState::Failing);
+        assert_eq!(snap.checks, failing[..20].to_vec());
+
+        record_merge_checks_observation(&config, task_id, 42, &merge::ChecksOutcome::Ready).await;
+        let snap = read();
+        assert_eq!(snap.state, tasks::MergeChecksState::Passed);
+        assert!(snap.checks.is_empty());
+
+        // A task that left `merging` is a clean negative: no write, no panic.
+        {
+            let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+            assert!(tasks::clear_merge_checks_snapshot(&mut conn, task_id).unwrap());
+            conn.execute("UPDATE tasks SET status='in-review' WHERE id=?1", [task_id])
+                .unwrap();
+        }
+        record_merge_checks_observation(&config, task_id, 42, &merge::ChecksOutcome::TimedOut)
+            .await;
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        assert_eq!(merge_checks_snapshot_row(&conn, task_id), None);
     }
 
     #[cfg(unix)]
@@ -49986,7 +53900,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let mut backoff = ReviewerRespawnBackoff::new();
 
         for strike in 1..=MAX_REVIEWER_PROVISION_STRIKES as i64 {
-            strike_reviewer_unclassified_teardown(
+            strike_reviewer_provider_failure_teardown(
                 &config,
                 &mut unrecordable,
                 &mut backoff,
@@ -50071,7 +53985,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let mut unrecordable = UnrecordableStrikes::new();
         let mut backoff = ReviewerRespawnBackoff::new();
 
-        let close_reason = strike_reviewer_unclassified_teardown(
+        let close_reason = strike_reviewer_provider_failure_teardown(
             &config,
             &mut unrecordable,
             &mut backoff,
@@ -50206,7 +54120,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
         let mut unrecordable = UnrecordableStrikes::new();
         let mut backoff = ReviewerRespawnBackoff::new();
-        strike_reviewer_unclassified_teardown(
+        strike_reviewer_provider_failure_teardown(
             &config,
             &mut unrecordable,
             &mut backoff,
@@ -51505,6 +55419,329 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(
             claim_events, 1,
             "the regression must exercise post-claim cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manually_closed_dependency_without_merge_admits_dependent_on_current_base_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let remote = dir.path().join("remote.git");
+        let worker = dir.path().join("worker");
+        let git = |repo: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        assert!(std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-q"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "test"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "base"]);
+        git(&source, &["branch", "-M", "main"]);
+        git(
+            &source,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&source, &["push", "-q", "origin", "main"]);
+        assert!(std::process::Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                remote.to_str().unwrap(),
+                worker.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success());
+        // The base advances after the clone (a recorded-PR merge lands), so
+        // admission must use the freshly fetched head, not the clone's tip.
+        git(&source, &["checkout", "-q", "-b", "dependency"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "dependency"]);
+        git(&source, &["checkout", "-q", "main"]);
+        git(
+            &source,
+            &[
+                "merge",
+                "--no-ff",
+                "dependency",
+                "-m",
+                "Merge pull request #703 from dependency",
+            ],
+        );
+        let pr_merge = git(&source, &["rev-parse", "HEAD"]);
+        git(&source, &["commit", "--allow-empty", "-qm", "later work"]);
+        let base_head = git(&source, &["rev-parse", "HEAD"]);
+        git(&source, &["push", "-q", "origin", "main"]);
+
+        let db_path = dir.path().join("manual-close-dependency.db");
+        let spec = r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#;
+        let make_dependent = |conn: &mut rusqlite::Connection, depends_on: &[i64]| {
+            let id = tasks::create(
+                conn,
+                "owner",
+                "dependent",
+                None,
+                0,
+                None,
+                Some(spec),
+                Some(&serde_json::to_string(depends_on).unwrap()),
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            let task = tasks::claim(
+                conn,
+                "worker",
+                Some(id),
+                &[],
+                tasks::DEFAULT_LEASE_TTL_SECS,
+                now_unix(),
+            )
+            .unwrap()
+            .unwrap();
+            (id, task)
+        };
+        let failure_events = |conn: &rusqlite::Connection| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM events WHERE kind IN
+                 ('task_dependency_base_deferred','task_parked','task_graph_blocked')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let (no_pr, with_pr, dependent_id, dependent) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let no_pr = tasks::create(
+                &mut conn,
+                "owner",
+                "failed, closed by hand",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            let with_pr = tasks::create(
+                &mut conn,
+                "owner",
+                "failed, PR landed by hand",
+                None,
+                0,
+                None,
+                Some(r#"{"pr":703}"#),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            for id in [no_pr, with_pr] {
+                conn.execute("UPDATE tasks SET status='failed' WHERE id=?1", [id])
+                    .unwrap();
+                tasks::close_manual(&mut conn, "owner", id, "resolved by hand", None, now_unix())
+                    .unwrap()
+                    .unwrap();
+            }
+            let (dependent_id, dependent) = make_dependent(&mut conn, &[no_pr, with_pr]);
+            (no_pr, with_pr, dependent_id, dependent)
+        };
+        let mut config = pre_review_ci_test_config(db_path.clone(), worker.clone());
+        config.merge_executor = Arc::new(UnknownDependencyMergeStatusExecutor);
+
+        let admission = verify_dependency_base_before_allocation(
+            &config,
+            &db_path,
+            &WorktreeManager::new(),
+            &worker,
+            &dependent,
+            "worker",
+            "main",
+        )
+        .await
+        .unwrap();
+        match admission {
+            DependencyBaseAdmission::Verified {
+                base_sha,
+                merge_commits,
+            } => {
+                assert_eq!(base_sha, base_head, "admitted on the fetched base head");
+                assert_eq!(
+                    merge_commits,
+                    vec![pr_merge.clone()],
+                    "the recorded PR's merge is still verified; the PR-less close adds none"
+                );
+            }
+            DependencyBaseAdmission::NotRequired => panic!("dependencies require admission"),
+            DependencyBaseAdmission::Deferred => panic!("manual close must satisfy the wait"),
+        }
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            assert_eq!(failure_events(&conn), 0);
+            let dependent = tasks::get(&conn, dependent_id).unwrap().unwrap();
+            assert_eq!(dependent.status, "working");
+            let refs: serde_json::Value =
+                serde_json::from_str(dependent.refs.as_deref().unwrap_or("{}")).unwrap();
+            assert!(refs
+                .get(quorum_core::tasks::DEPENDENCY_BASE_WAIT_REASON_REF)
+                .is_none());
+            let stamped = |id: i64| -> Option<String> {
+                let refs: Option<String> = conn
+                    .query_row("SELECT refs FROM tasks WHERE id=?1", [id], |row| row.get(0))
+                    .unwrap();
+                refs.and_then(|refs| {
+                    serde_json::from_str::<serde_json::Value>(&refs).unwrap()["merge_commit_sha"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+            };
+            assert_eq!(stamped(with_pr), Some(pr_merge.clone()));
+            assert_eq!(stamped(no_pr), None, "no merge SHA is fabricated");
+        }
+
+        // Negative: a normally completed dependency without a merge SHA is not
+        // a manual close and keeps the existing fail-closed deferral.
+        let (plain, plain_dependent) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let plain = tasks::create(
+                &mut conn,
+                "owner",
+                "done without SHA",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='done',completion_provenance='merged' WHERE id=?1",
+                [plain],
+            )
+            .unwrap();
+            let (_, task) = make_dependent(&mut conn, &[no_pr, plain]);
+            (plain, task)
+        };
+        assert!(matches!(
+            verify_dependency_base_before_allocation(
+                &config,
+                &db_path,
+                &WorktreeManager::new(),
+                &worker,
+                &plain_dependent,
+                "worker",
+                "main",
+            )
+            .await
+            .unwrap(),
+            DependencyBaseAdmission::Deferred
+        ));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let refs: serde_json::Value = serde_json::from_str(
+            tasks::get(&conn, plain_dependent.id)
+                .unwrap()
+                .unwrap()
+                .refs
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            refs[quorum_core::tasks::DEPENDENCY_BASE_WAIT_REASON_REF],
+            format!("dependency #{plain} is done but has no recorded merge commit SHA")
+        );
+        let deferred: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE kind='task_dependency_base_deferred'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deferred, 1);
+        drop(conn);
+
+        // Negative: a manually closed dependency whose recorded PR cannot be
+        // resolved (GitHub `Unknown`, no merge on base — e.g. a transient `gh`
+        // failure on a still-open PR) must not fall open to the base head.
+        let (unmerged, unmerged_dependent) = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let unmerged = tasks::create(
+                &mut conn,
+                "owner",
+                "closed by hand, PR not merged",
+                None,
+                0,
+                None,
+                Some(r#"{"pr":704}"#),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap();
+            conn.execute("UPDATE tasks SET status='failed' WHERE id=?1", [unmerged])
+                .unwrap();
+            tasks::close_manual(
+                &mut conn,
+                "owner",
+                unmerged,
+                "closed by hand",
+                None,
+                now_unix(),
+            )
+            .unwrap()
+            .unwrap();
+            let (_, task) = make_dependent(&mut conn, &[no_pr, unmerged]);
+            (unmerged, task)
+        };
+        assert!(matches!(
+            verify_dependency_base_before_allocation(
+                &config,
+                &db_path,
+                &WorktreeManager::new(),
+                &worker,
+                &unmerged_dependent,
+                "worker",
+                "main",
+            )
+            .await
+            .unwrap(),
+            DependencyBaseAdmission::Deferred
+        ));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let refs: serde_json::Value = serde_json::from_str(
+            tasks::get(&conn, unmerged_dependent.id)
+                .unwrap()
+                .unwrap()
+                .refs
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            refs[quorum_core::tasks::DEPENDENCY_BASE_WAIT_REASON_REF],
+            format!(
+                "dependency #{unmerged} is done but PR #704 has no recoverable merge commit SHA"
+            )
         );
     }
 
@@ -55975,14 +60212,12 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
     }
 
-    /// Deadlock regression (task 410 / review-only 417): a review-only task
-    /// created while an unrelated decomposition freeze drains is `in-review`
-    /// and unclassified. The drain waits for it, and its reviewer cannot
-    /// dispatch until it is classified, so the freeze-time classifier queue
-    /// must admit it — while still withholding `open` work the freeze exists
-    /// to hold back.
+    /// A planning graph does not pause the classifier: an unrelated `open`
+    /// task created while a graph plans is classified in priority order, a
+    /// started review-only task (deadlock regression, task 410 / review-only
+    /// 417) still classifies, and the planning source itself is never queued.
     #[test]
-    fn freeze_time_classifier_queue_admits_started_review_only_task_only() {
+    fn classifier_queue_classifies_unrelated_work_while_a_graph_plans() {
         let dir = tempfile::tempdir().unwrap();
         let mut conn = open_test_db(dir.path());
         conn.execute(
@@ -55996,7 +60231,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "INSERT INTO task_decompositions(
                  source_task_id,state,active,freeze_active,planned_source_revision,
                  created_at,updated_at)
-             VALUES (?1,'draining',0,1,1,1,1)",
+             VALUES (?1,'planning',0,1,1,1,1)",
             [source_task_id],
         )
         .unwrap();
@@ -56019,56 +60254,33 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         .unwrap();
         let task = tasks::get(&conn, review_only).unwrap().unwrap();
         assert_eq!(task.status, "in-review");
-        assert!(
-            !tasks::classification_is_dispatchable_for_status(
-                &task.refs,
-                true,
-                None,
-                false,
-                "in-review"
-            ),
-            "an unclassified review-only task cannot dispatch its reviewer"
-        );
-        // The drain is held by exactly this task until it reaches terminal.
-        assert_eq!(
-            tasks::count_started_non_terminal_excluding(&conn, source_task_id).unwrap(),
-            1
-        );
 
-        let (frozen, dup_context) = classifier_queue(&conn, true).unwrap();
+        let (queue, dup_context) = classifier_queue(&conn).unwrap();
         assert_eq!(
-            frozen.iter().map(|task| task.id).collect::<Vec<_>>(),
-            vec![review_only],
-            "under a freeze only started work may be classified"
+            queue.iter().map(|task| task.id).collect::<Vec<_>>(),
+            vec![open_task, review_only],
+            "a planning graph must not withhold unrelated open or started work"
         );
+        assert!(
+            queue
+                .iter()
+                .chain(dup_context.iter())
+                .all(|task| task.id != source_task_id),
+            "the planning source must never be queued for classification"
+        );
+        assert!(dup_context.iter().all(|task| task.id != open_task));
         assert!(dup_context.iter().all(|task| task.id != review_only));
 
-        let (unfrozen, _) = classifier_queue(&conn, false).unwrap();
-        assert_eq!(
-            unfrozen.first().map(|task| task.id),
-            Some(open_task),
-            "without a freeze the full queue keeps priority order"
-        );
-
-        // Once classified, the review-only task becomes reviewer-dispatchable,
-        // so the drain can make progress.
+        // Once classified, both leave the queue, and the source stays out.
         conn.execute(
             "UPDATE tasks SET refs=json_set(COALESCE(refs,'{}'),
                  '$.cx_est',3,'$.cx_size','M','$.cx_ready',json('true'),
                  '$.cx_not_ready_reason',json('null'),'$.cx_by','test:v2')
-             WHERE id=?1",
-            [review_only],
+             WHERE id IN (?1,?2)",
+            [open_task, review_only],
         )
         .unwrap();
-        let task = tasks::get(&conn, review_only).unwrap().unwrap();
-        assert!(tasks::classification_is_dispatchable_for_status(
-            &task.refs,
-            true,
-            None,
-            false,
-            "in-review"
-        ));
-        assert!(classifier_queue(&conn, true).unwrap().0.is_empty());
+        assert!(classifier_queue(&conn).unwrap().0.is_empty());
     }
 
     #[test]
@@ -57576,6 +61788,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id,
             cap_run_id: Some(cap_run_id.into()),
@@ -58460,6 +62673,284 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(task_event_count(&conn, 1, "task_open"), 1);
         assert_eq!(task_event_count(&conn, 1, "task_reclaimed"), 0);
         assert_eq!(errors_with_source(&conn, "lifecycle"), 0);
+    }
+
+    /// A live persistent worker slot (a long-lived child that stays alive
+    /// after its turn ends) owning task #1 with an open worker run row.
+    async fn live_persistent_worker_slot(db_path: &Path, worktree: PathBuf) -> SlotState {
+        let run_id = {
+            let conn = quorum_core::db::open(db_path).unwrap();
+            conn.execute(
+                "INSERT INTO agent_runs (task_id, agent_name, role, model, effort, spawned_at)
+                 VALUES (1, ?1, 'worker', 'claude-sonnet-5', 'high', ?2)",
+                rusqlite::params![DRAIN_AUTHOR, now_unix()],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let mut slot =
+            drain_test_slot(DRAIN_AUTHOR, 1, worktree, DRAIN_AUTHOR_CAP, Some(run_id)).await;
+        slot.pr = None;
+        // Alive across the whole park/reap pass, like a persistent provider
+        // child between turns. Test-only `from_parts` children have no process
+        // group to kill, so teardown waits for this bounded exit.
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("2")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let short_lived = std::mem::replace(
+            &mut slot.proc,
+            SlotProcess::running(runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+                child,
+                stdin,
+                tokio::io::BufReader::new(stdout),
+            ))),
+        );
+        short_lived.kill_and_reap().await;
+        assert_eq!(
+            slot.process_kind().turn_mode(),
+            runner::TurnMode::PersistentChild
+        );
+        assert!(slot.try_wait().unwrap().is_none(), "the worker stays alive");
+        slot
+    }
+
+    fn append_worker_reaction_row(db_path: &Path, state: &str, reason: &str) -> i64 {
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        mailbox::append(
+            &mut conn,
+            &mailbox::MailboxRow {
+                agent: DRAIN_AUTHOR.into(),
+                kind: mailbox::MailboxKind::TaskUpdate,
+                task_id: Some(1),
+                pr: None,
+                verdict: None,
+                feedback: Some(reason.into()),
+                note: Some(state.into()),
+                to_agent: None,
+                payload: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn assert_parked_without_recovery(db_path: &Path, run_id: i64, state: &str) {
+        let conn = quorum_core::db::open(db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "failed", "{state}: parked, not reopened");
+        assert!(task.assignee.is_none(), "{state}");
+        assert_eq!(
+            task.recovery_attempts, 0,
+            "{state}: a park consumes no recovery attempt"
+        );
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs["daemon_parked_reason"], state, "{refs}");
+        assert_eq!(task_event_count(&conn, 1, "task_parked"), 1, "{state}");
+        assert_eq!(task_event_count(&conn, 1, "task_open"), 0, "{state}");
+        assert_eq!(task_event_count(&conn, 1, "task_reclaimed"), 0, "{state}");
+        assert_eq!(
+            agent_run_end_reason(&conn, run_id).as_deref(),
+            Some("parked"),
+            "{state}"
+        );
+        let unconsumed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mailbox WHERE kind='task_update' AND consumed_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            unconsumed, 0,
+            "{state}: reactions are consumed with the park"
+        );
+        // Nothing is left for Phase 6 to respawn on the unchanged contract.
+        let open: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE status='open'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(open, 0, "{state}: no open task to respawn");
+        assert_eq!(errors_with_source(&conn, "lifecycle"), 0, "{state}");
+    }
+
+    /// Task #222: a live Claude worker reacted `needs-info` and stayed alive;
+    /// the daemon logged the reaction and 900s later idle-reaped the worker
+    /// as a zombie, spending the recovery budget on respawns. Phase 2
+    /// projects the reaction (in-memory `agent_state`, journal, consumed
+    /// mailbox row); the very next Phase 4-react pass must park the task and
+    /// tear the slot down as `parked` — for every terminal reaction,
+    /// including `failed`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_persistent_worker_reaction_parks_within_one_tick() {
+        for state in ["needs-info", "blocked", "failed"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("persistent-react.db");
+            let worktree = dir.path().join("worker-wt");
+            std::fs::create_dir_all(&worktree).unwrap();
+            create_active_task(&db_path, DRAIN_AUTHOR, "working");
+            issue_test_run(&db_path, DRAIN_AUTHOR, DRAIN_AUTHOR_CAP);
+            let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+            let wt_mgr = WorktreeManager::new();
+            let mut name_pool = Pool::new_generated();
+            let mut slot = live_persistent_worker_slot(&db_path, worktree).await;
+            let run_id = slot.agent_run_id.unwrap();
+
+            // Phase 2 projection of the observed task_update row.
+            let row = append_worker_reaction_row(&db_path, state, "which config should I use?");
+            slot.agent_state = Some(state.into());
+            {
+                let mut conn = quorum_core::db::open(&db_path).unwrap();
+                journal::upsert(&mut conn, &slot_journal_entry(&slot, "worker", "working"))
+                    .unwrap();
+                mailbox::mark_consumed(&mut conn, row).unwrap();
+            }
+            assert!(slot_is_reaction_park_candidate(&slot), "{state}");
+
+            let mut workers = vec![slot];
+            park_reacted_persistent_workers(&config, &wt_mgr, &mut name_pool, &mut workers).await;
+
+            assert!(workers.is_empty(), "{state}: the parked slot is torn down");
+            assert_parked_without_recovery(&db_path, run_id, state);
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let note: String = conn
+                .query_row(
+                    "SELECT body FROM task_notes WHERE agent='daemon' AND body LIKE 'parked:%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(note.contains("which config should I use?"), "{note}");
+        }
+    }
+
+    /// The idle watchdog classifies a pending reaction (committed after the
+    /// tick's mailbox snapshot, so never projected) as a park, not a zombie.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_watchdog_parks_live_worker_with_pending_reaction() {
+        for state in ["needs-info", "failed"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("idle-pending-react.db");
+            let worktree = dir.path().join("worker-wt");
+            std::fs::create_dir_all(&worktree).unwrap();
+            create_active_task(&db_path, DRAIN_AUTHOR, "working");
+            issue_test_run(&db_path, DRAIN_AUTHOR, DRAIN_AUTHOR_CAP);
+            let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+            let wt_mgr = WorktreeManager::new();
+            let mut name_pool = Pool::new_generated();
+            let mut slot = live_persistent_worker_slot(&db_path, worktree).await;
+            let run_id = slot.agent_run_id.unwrap();
+            slot.turn_ended_at =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(901));
+            append_worker_reaction_row(&db_path, state, "which config should I use?");
+            assert!(slot_is_idle_zombie_candidate(&slot, 900, 3600), "{state}");
+
+            reap_idle_zombie_worker(&config, &wt_mgr, &mut name_pool, slot, 901, 900).await;
+
+            assert_parked_without_recovery(&db_path, run_id, state);
+        }
+    }
+
+    /// Negative paths: a live worker with no reaction (or only a `note`) is
+    /// not a park candidate, and the idle watchdog still reaps it as an idle
+    /// zombie with the unchanged `AgentFailed` recovery accounting.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_persistent_worker_without_parkable_reaction_is_still_idle_reaped() {
+        for state in [None, Some("note")] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("idle-no-react.db");
+            let worktree = dir.path().join("worker-wt");
+            std::fs::create_dir_all(&worktree).unwrap();
+            create_active_task(&db_path, DRAIN_AUTHOR, "working");
+            issue_test_run(&db_path, DRAIN_AUTHOR, DRAIN_AUTHOR_CAP);
+            let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+            let wt_mgr = WorktreeManager::new();
+            let mut name_pool = Pool::new_generated();
+            let mut slot = live_persistent_worker_slot(&db_path, worktree).await;
+            let run_id = slot.agent_run_id.unwrap();
+            if let Some(state) = state {
+                append_worker_reaction_row(&db_path, state, "progress");
+                slot.agent_state = Some(state.into());
+            }
+            assert!(!slot_is_reaction_park_candidate(&slot), "{state:?}");
+            let mut workers = vec![slot];
+            park_reacted_persistent_workers(&config, &wt_mgr, &mut name_pool, &mut workers).await;
+            assert_eq!(workers.len(), 1, "{state:?}: nothing to park");
+
+            let mut slot = workers.remove(0);
+            slot.turn_ended_at =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(901));
+            reap_idle_zombie_worker(&config, &wt_mgr, &mut name_pool, slot, 901, 900).await;
+
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let task = tasks::get(&conn, 1).unwrap().unwrap();
+            assert_eq!(task.status, "open", "{state:?}");
+            assert_eq!(task.recovery_attempts, 1, "{state:?}");
+            assert_eq!(task_event_count(&conn, 1, "task_open"), 1, "{state:?}");
+            assert_eq!(task_event_count(&conn, 1, "task_parked"), 0, "{state:?}");
+            assert_eq!(
+                agent_run_end_reason(&conn, run_id).as_deref(),
+                Some("idle_reaped"),
+                "{state:?}"
+            );
+        }
+    }
+
+    /// A recorded/pending delivery still outranks the reaction: the slot is
+    /// retained for mailbox delivery and the in-memory reaction is dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_delivery_outranks_live_persistent_worker_reaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("react-vs-done.db");
+        let worktree = dir.path().join("worker-wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        create_active_task(&db_path, DRAIN_AUTHOR, "working");
+        issue_test_run(&db_path, DRAIN_AUTHOR, DRAIN_AUTHOR_CAP);
+        let config = pre_review_ci_test_config(db_path.clone(), dir.path().to_path_buf());
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut slot = live_persistent_worker_slot(&db_path, worktree).await;
+        append_worker_reaction_row(&db_path, "failed", "gave up");
+        slot.agent_state = Some("failed".into());
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            mailbox::append(
+                &mut conn,
+                &mailbox::MailboxRow {
+                    agent: DRAIN_AUTHOR.into(),
+                    kind: mailbox::MailboxKind::Done,
+                    task_id: Some(1),
+                    pr: None,
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+        }
+        let mut workers = vec![slot];
+        park_reacted_persistent_workers(&config, &wt_mgr, &mut name_pool, &mut workers).await;
+
+        assert_eq!(workers.len(), 1, "the delivery keeps its slot");
+        assert!(workers[0].agent_state.is_none());
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, 1).unwrap().unwrap();
+        assert_eq!(task.status, "working");
+        assert_eq!(task_event_count(&conn, 1, "task_parked"), 0);
+        drop(conn);
+        workers.remove(0).kill_and_reap().await;
     }
 
     /// Negative path: a live-lease worker torn down at shutdown is still
@@ -60358,13 +64849,53 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
              VALUES ('review-large','open',99,'owner',1,1,
                '{\"cx_est\":4,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',1);"
         ).unwrap();
-        assert_eq!(planning_candidate(&conn).unwrap(), Some((4, 1)));
+        assert_eq!(planning_candidate(&conn, 1).unwrap(), Some((4, 1)));
         conn.execute("UPDATE tasks SET status='done' WHERE id=4", [])
             .unwrap();
-        assert_eq!(planning_candidate(&conn).unwrap(), Some((3, 1)));
+        assert_eq!(planning_candidate(&conn, 1).unwrap(), Some((3, 1)));
         conn.execute("UPDATE tasks SET status='done' WHERE id=3", [])
             .unwrap();
-        assert_eq!(planning_candidate(&conn).unwrap(), None);
+        assert_eq!(planning_candidate(&conn, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn planning_candidate_admits_by_priority_only_while_counted_graphs_below_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = quorum_core::db::open(&dir.path().join("counted.db")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('materialized source','decomposed',100,'owner',1,1,
+               '{\"cx_est\":5,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+             INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,accepted_plan_revision,created_at,updated_at)
+             VALUES (1,'active',1,0,1,1,1,1);
+             INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('large-low','open',1,'owner',1,1,
+               '{\"cx_est\":5,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);
+             INSERT INTO tasks(title,status,priority,created_by,created_at,updated_at,refs,review_only)
+             VALUES ('large-high','open',9,'owner',1,1,
+               '{\"cx_est\":5,\"cx_size\":\"XL\",\"cx_ready\":true,\"cx_not_ready_reason\":null}',0);",
+        )
+        .unwrap();
+        // One active graph fills a limit of 1; a limit of 2 admits the
+        // highest-priority eligible source.
+        assert_eq!(planning_candidate(&conn, 1).unwrap(), None);
+        assert_eq!(planning_candidate(&conn, 2).unwrap(), Some((3, 1)));
+        // A blocked graph still counts toward the limit.
+        conn.execute("UPDATE task_decompositions SET state='blocked'", [])
+            .unwrap();
+        assert_eq!(planning_candidate(&conn, 1).unwrap(), None);
+        assert_eq!(planning_candidate(&conn, 2).unwrap(), Some((3, 1)));
+        // A second counted graph fills a limit of 2.
+        conn.execute_batch(
+            "UPDATE tasks SET status='decomposed' WHERE id=3;
+             INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,accepted_plan_revision,created_at,updated_at)
+             VALUES (3,'active',1,0,1,1,1,1);",
+        )
+        .unwrap();
+        assert_eq!(planning_candidate(&conn, 2).unwrap(), None);
+        assert_eq!(planning_candidate(&conn, 3).unwrap(), Some((2, 1)));
     }
 
     #[test]
@@ -60391,12 +64922,12 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         // — the assertion is the entire regression: the ordinary task plans
         // while the branch-sync judgment task waits for the direct-dispatch
         // path.
-        assert_eq!(planning_candidate(&conn).unwrap(), Some((2, 1)));
+        assert_eq!(planning_candidate(&conn, 1).unwrap(), Some((2, 1)));
 
         conn.execute("UPDATE tasks SET status='done' WHERE id=2", [])
             .unwrap();
         assert_eq!(
-            planning_candidate(&conn).unwrap(),
+            planning_candidate(&conn, 1).unwrap(),
             None,
             "the branch-sync judgment task must never appear as a planner candidate"
         );
@@ -60416,7 +64947,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         )
         .unwrap();
 
-        assert_eq!(planning_candidate(&conn).unwrap(), Some((2, 1)));
+        assert_eq!(planning_candidate(&conn, 1).unwrap(), Some((2, 1)));
         let claimed = tasks::claim(&mut conn, "worker", Some(1), &[], 60, 2)
             .unwrap()
             .expect("continuation must dispatch directly");
@@ -60439,7 +64970,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         .unwrap();
 
         assert_eq!(
-            planning_candidate(&conn).unwrap(),
+            planning_candidate(&conn, 1).unwrap(),
             Some((2, 1)),
             "the terminal leaf must be excluded while the equivalent ordinary task plans"
         );
@@ -60483,7 +65014,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                         .unwrap();
                         tasks::park_classified_complexity_five(&mut conn, 2).unwrap();
 
-                        let planned = planning_candidate(&conn).unwrap().is_some();
+                        let planned = planning_candidate(&conn, 1).unwrap().is_some();
                         let claimed = tasks::claim(&mut conn, "worker", Some(1), &[], 60, 3)
                             .unwrap()
                             .is_some();
@@ -60544,6 +65075,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let graph = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "codex",
@@ -60599,6 +65131,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let older_graph = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: older_source,
                 expected_revision: 1,
                 provider: "codex",
@@ -60634,7 +65167,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 assert!(quorum_core::decomposition::reacquire_freeze(
                     &mut conn,
                     older_graph,
-                    5 + attempt * 3,
+                    1,
+                    5 + attempt * 3
                 )
                 .unwrap());
                 assert!(quorum_core::decomposition::set_frozen_phase(
@@ -60665,6 +65199,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let newer_graph = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: newer_source,
                 expected_revision: 1,
                 provider: "codex",
@@ -60703,16 +65238,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(startup_state.defers_lifecycle_recovery());
         assert_eq!(coordinator.graph_id, Some(newer_graph));
 
-        assert!(tick_decomposition(
-            &config,
-            &WorktreeManager::new(),
-            &mut coordinator,
-            &[],
-            &[],
-            DecompositionLiveWork::default(),
-        )
-        .await
-        .unwrap());
+        assert!(
+            tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap()
+        );
         assert_eq!(coordinator.graph_id, Some(newer_graph));
 
         let conn = quorum_core::db::open(&db_path).unwrap();
@@ -60737,6 +65267,62 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
     }
 
+    /// A startup recovery reset whose immediate reacquire lost the counted
+    /// admission guard sits in `freeze-requested` without planning authority.
+    /// The coordinator retries the guarded reacquire: refused while the limit
+    /// is full, admitted once a slot frees, never stranded.
+    #[tokio::test]
+    async fn unadmitted_reset_graph_reacquires_planning_authority_when_a_slot_frees() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("reset-reacquire.db");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (1,'a','decomposed','owner',1,1),(2,'b','decomposed','owner',1,1),
+                        (3,'reset','planning','owner',1,1);
+             INSERT INTO task_decompositions(id,source_task_id,state,active,freeze_active,
+                 planned_source_revision,accepted_plan_revision,created_at,updated_at)
+                 VALUES (10,1,'active',1,0,1,1,1,1),(11,2,'active',1,0,1,1,1,1);
+             INSERT INTO task_decompositions(id,source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+                 VALUES (12,3,'freeze-requested',0,0,1,1,1);",
+        )
+        .unwrap();
+        drop(conn);
+        let mut config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
+        config.max_active_graphs = 2;
+        let mut coordinator = DecompositionCoordinator::default();
+        let reset_row = || {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.query_row(
+                "SELECT state,freeze_active FROM task_decompositions WHERE id=12",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+        };
+
+        assert!(
+            !tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap()
+        );
+        assert_eq!(reset_row(), ("freeze-requested".into(), 0), "limit full");
+
+        config.max_active_graphs = 3;
+        assert!(
+            tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap()
+        );
+        assert_eq!(reset_row(), ("freeze-requested".into(), 1));
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let errors: i64 = conn
+            .query_row("SELECT count(*) FROM errors", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(errors, 0);
+    }
+
     #[test]
     fn oversized_planning_source_materializes_only_its_byte_count_and_cannot_build_prompt() {
         let dir = tempfile::tempdir().unwrap();
@@ -60758,6 +65344,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let graph = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "claude",
@@ -61684,6 +66271,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let graph = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "claude",
@@ -61826,6 +66414,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let graph = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "claude",
@@ -61938,6 +66527,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let graph = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "claude",
@@ -62027,6 +66617,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             let graph_id = quorum_core::decomposition::begin_planning(
                 &mut conn,
                 &quorum_core::decomposition::BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id: source_id,
                     expected_revision: 1,
                     provider: "claude",
@@ -62063,16 +66654,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             proposal: Some(proposal),
             ..DecompositionCoordinator::default()
         };
-        assert!(tick_decomposition(
-            &config,
-            &WorktreeManager::new(),
-            &mut coordinator,
-            &[],
-            &[],
-            DecompositionLiveWork::default(),
-        )
-        .await
-        .unwrap());
+        assert!(
+            tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap()
+        );
         assert!(coordinator.proposal.is_none());
 
         let conn = quorum_core::db::open(&db_path).unwrap();
@@ -62215,6 +66801,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let graph = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "codex",
@@ -62381,6 +66968,78 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         .unwrap()
     }
 
+    /// A `max_active_graphs` lowered below the counted set (across a restart
+    /// while this graph planned) refuses activation. The outcome is the
+    /// documented hold-and-fail under its own reason code, with no child row.
+    #[tokio::test]
+    async fn arbiter_approve_above_lowered_limit_holds_with_distinct_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("approve-limit.db");
+        let proposal = arbiter_gate_proposal();
+        let classifications = arbiter_gate_classifications();
+        let (source, graph) =
+            arbiter_validating_graph(&db_path, "large", Some("split me"), &proposal);
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            for title in ["other-a", "other-b"] {
+                conn.execute(
+                    "INSERT INTO tasks(title,status,created_by,created_at,updated_at)
+                     VALUES (?1,'decomposed','owner',1,1)",
+                    [title],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                         planned_source_revision,accepted_plan_revision,created_at,updated_at)
+                     VALUES (?1,'active',1,0,1,1,1,1)",
+                    [conn.last_insert_rowid()],
+                )
+                .unwrap();
+            }
+        }
+        let mut config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
+        config.max_active_graphs = 2;
+
+        let materialized = apply_arbiter_verdict(
+            &config,
+            graph,
+            arbiter_done(arbiter::ArbiterVerdict::Approve),
+            &proposal,
+            &classifications,
+        )
+        .await
+        .unwrap();
+        assert!(!materialized);
+        let (state, _, hold, status) = arbiter_gate_state(&db_path, graph);
+        assert_eq!(state, "held");
+        assert_eq!(hold.as_deref(), Some("max-active-graphs-reached"));
+        assert_eq!(status, "failed");
+        assert_eq!(
+            arbiter_gate_attempts(&db_path, graph),
+            vec![
+                ("verdict".to_string(), "arbiter-approve".to_string()),
+                (
+                    "blocker".to_string(),
+                    "max-active-graphs-reached".to_string()
+                ),
+            ]
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let (members, errors): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM task_graph_members WHERE graph_id=?1),
+                        (SELECT count(*) FROM errors)",
+                [graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (members, errors),
+            (0, 0),
+            "source {source}: no child, no errors row"
+        );
+    }
+
     #[tokio::test]
     async fn arbiter_approve_materializes_the_classified_proposal_exactly_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -62450,7 +67109,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
         // A restart that re-polls a fresh Arbiter cannot double-materialize:
         // the guarded materialization is keyed on the frozen planning phase
-        // and the one-active-graph index, and no budget-bearing row is
+        // and the counted activation guard, and no budget-bearing row is
         // recorded against an active graph.
         let again = apply_arbiter_verdict(
             &config,
@@ -62863,16 +67522,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             classifications: Some(arbiter_gate_classifications()),
             ..DecompositionCoordinator::default()
         };
-        tick_decomposition(
-            &config,
-            &WorktreeManager::new(),
-            &mut coordinator,
-            &[],
-            &[],
-            DecompositionLiveWork::default(),
-        )
-        .await
-        .unwrap();
+        tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+            .await
+            .unwrap();
 
         let attempts = arbiter_gate_attempts(&db_path, graph);
         assert!(
@@ -63135,7 +67787,6 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 &mut state.slot,
                 &mut state.errors,
                 &mut state.backoff,
-                false,
                 false,
                 &move |kind| match kind {
                     runner::AgentKind::Codex => Some(codex.to_string_lossy().into_owned()),
@@ -63543,6 +68194,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             let graph = quorum_core::decomposition::begin_planning(
                 &mut conn,
                 &quorum_core::decomposition::BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id: source,
                     expected_revision: 1,
                     provider: "codex",
@@ -63638,16 +68290,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         }
 
         async fn tick(&self, coordinator: &mut DecompositionCoordinator) -> bool {
-            tick_decomposition(
-                &self.config,
-                &WorktreeManager::new(),
-                coordinator,
-                &[],
-                &[],
-                DecompositionLiveWork::default(),
-            )
-            .await
-            .unwrap()
+            tick_decomposition(&self.config, &WorktreeManager::new(), coordinator)
+                .await
+                .unwrap()
         }
 
         /// Tick until the given slot predicate clears; the fake provider's exit
@@ -63674,10 +68319,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         }
     }
 
-    /// A provider failure clears the frozen SHA before the next drain. Its
-    /// graph-owned cache marker must be released too, or it would count as
-    /// durable in-flight work and prevent `draining` from capturing that new
-    /// SHA forever.
+    /// A provider failure clears the frozen SHA before the next freeze. Its
+    /// graph-owned cache and durable marker are released too, so the next
+    /// attempt archives the base head recorded when it starts planning.
     #[cfg(unix)]
     #[tokio::test]
     async fn provider_backoff_releases_cached_view_before_refreezing() {
@@ -63756,7 +68400,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(state, ("planning".into(), true, Some(expected_sha)));
     }
 
-    /// Durable freeze facts a provider-block release must change or preserve.
+    /// Durable freeze facts a decomposition tick must change or preserve.
     #[derive(Debug, PartialEq)]
     struct FreezeRow {
         state: String,
@@ -63769,13 +68413,14 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
     #[cfg(unix)]
     impl LifecycleHarness {
-        /// Return the graph to a pre-bind freeze phase with visible budgets and
-        /// a backdated `updated_at`.
+        /// Return the graph to a pre-bind freeze phase (no bound base) with
+        /// visible budgets and a backdated `updated_at`.
         fn enter_freeze_phase(&self, phase: &str) {
             let conn = quorum_core::db::open(&self.db_path).unwrap();
             conn.execute(
                 "UPDATE task_decompositions
-                 SET state=?2,provider_failures=1,proposal_attempts=1,updated_at=5
+                 SET state=?2,frozen_base_sha=NULL,provider_failures=1,
+                     proposal_attempts=1,updated_at=5
                  WHERE id=?1",
                 rusqlite::params![self.graph, phase],
             )
@@ -63831,7 +68476,6 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             .unwrap();
         }
 
-        /// Move a released graph past its backoff window.
         fn expire_backoff(&self) {
             let conn = quorum_core::db::open(&self.db_path).unwrap();
             conn.execute(
@@ -63862,44 +68506,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             .unwrap()
         }
 
-        fn claim_task(&self, task: i64) -> Option<tasks::Task> {
-            let mut conn = quorum_core::db::open(&self.db_path).unwrap();
-            tasks::claim(&mut conn, "next", Some(task), &[], 60, now_unix()).unwrap()
-        }
-
-        fn classifier_queue_ids(&self, frozen: bool) -> Vec<i64> {
-            let conn = quorum_core::db::open(&self.db_path).unwrap();
-            classifier_queue(&conn, frozen)
-                .unwrap()
-                .0
-                .iter()
-                .map(|task| task.id)
-                .collect()
-        }
-
-        async fn tick_with_slots(
-            &self,
-            coordinator: &mut DecompositionCoordinator,
-            workers: &[SlotState],
-            reviewers: &[SlotState],
-        ) -> bool {
-            tick_decomposition(
-                &self.config,
-                &WorktreeManager::new(),
-                coordinator,
-                workers,
-                reviewers,
-                DecompositionLiveWork::default(),
-            )
-            .await
-            .unwrap()
-        }
-
-        /// Walk a reacquired graph through a real drain into `planning`.
-        async fn assert_real_drain_reaches_planning(
-            &self,
-            coordinator: &mut DecompositionCoordinator,
-        ) {
+        /// Walk a reacquired graph through its freeze phases into `planning`.
+        async fn assert_freeze_reaches_planning(&self, coordinator: &mut DecompositionCoordinator) {
             assert_eq!(self.freeze_row().state, "freeze-requested");
             assert!(self.freeze_row().freeze_active);
             assert!(self.tick(coordinator).await);
@@ -64003,7 +68611,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let mut coordinator = DecompositionCoordinator::default();
         assert!(harness.tick(&mut coordinator).await);
         harness
-            .assert_real_drain_reaches_planning(&mut coordinator)
+            .assert_freeze_reaches_planning(&mut coordinator)
             .await;
         assert_eq!(
             harness.freeze_row().frozen_base_sha.as_deref(),
@@ -64307,12 +68915,99 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(row.frozen_base_sha, Some(merge_sha));
     }
 
-    /// A slot holding `task_id`, for live-worker and live-reviewer negatives.
+    /// A dependency closed by hand with `quorum task-close`, with no PR and no
+    /// merge SHA, imposes no merge commit to contain: exactly as in worker
+    /// admission, the drain handoff binds the fetched origin head instead of
+    /// holding the source in `draining`. A hand-closed dependency whose PR is
+    /// recorded but unrecoverable, or a PR-less dependency that is done by any
+    /// other route, still defers.
     #[cfg(unix)]
-    async fn live_slot_for(task_id: i64) -> SlotState {
-        let mut slot = make_dummy_slot_async().await;
-        slot.task_id = task_id;
-        slot
+    #[tokio::test]
+    async fn drain_handoff_binds_fetched_base_past_manually_closed_prless_dependency() {
+        let harness = lifecycle_harness("origin-manual-close-dependency");
+        let repo_dir = harness.config.repo_dir.clone();
+        let set_dependencies = |dependencies: &[i64]| {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET depends_on=?2 WHERE id=?1",
+                rusqlite::params![harness.source, serde_json::to_string(dependencies).unwrap()],
+            )
+            .unwrap();
+        };
+        let close_by_hand = |refs: Option<&str>| {
+            let task = harness.add_task("failed", refs);
+            let mut conn = quorum_core::db::open(&harness.db_path).unwrap();
+            tasks::close_manual(
+                &mut conn,
+                "owner",
+                task,
+                "resolved by hand",
+                None,
+                now_unix(),
+            )
+            .unwrap()
+            .expect("the failed task closes");
+            task
+        };
+
+        // Negative: hand-closed, PR recorded, merge unrecoverable — defers.
+        let unrecoverable = close_by_hand(Some(r#"{"pr":44}"#));
+        set_dependencies(&[unrecoverable]);
+        harness.enter_unbound_drain();
+        let held = harness.freeze_row();
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(harness.freeze_row(), held);
+        let events = harness.base_deferral_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            events[0].contains(&format!(
+                "dependency #{unrecoverable} is done but PR #44 has no recoverable merge commit SHA"
+            )),
+            "{events:?}"
+        );
+
+        // Negative: PR-less but done without manual provenance — defers.
+        // A changed reason is rate-limited, so clear the first one to observe it.
+        let plain = harness.add_task("done", None);
+        set_dependencies(&[plain]);
+        {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            conn.execute(
+                "DELETE FROM events WHERE kind=?1",
+                [DECOMPOSITION_BASE_DEFERRED_EVENT],
+            )
+            .unwrap();
+        }
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(harness.freeze_row().state, "draining");
+        assert_eq!(harness.freeze_row().frozen_base_sha, None);
+        let events = harness.base_deferral_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            events[0].contains(&format!(
+                "dependency #{plain} is done but has no recorded merge commit SHA"
+            )),
+            "{events:?}"
+        );
+
+        // Regression: hand-closed with no PR binds the fetched origin head,
+        // alongside a dependency whose merge is stamped and on that base.
+        let manual = close_by_hand(None);
+        let stamped = add_unstamped_pr_dependency(&harness, 45);
+        let merge_sha = push_remote_pr_merge(&repo_dir, 45);
+        set_dependencies(&[manual, stamped]);
+        assert!(harness.tick(&mut coordinator).await);
+        let row = harness.freeze_row();
+        assert_eq!(row.state, "planning");
+        assert!(row.freeze_active);
+        assert_eq!(row.frozen_base_sha.as_deref(), Some(merge_sha.as_str()));
+        assert_eq!(
+            stamped_merge_commit(&harness, manual),
+            None,
+            "no merge SHA is fabricated"
+        );
+        assert_eq!(harness.base_deferral_events().len(), 1, "no new deferral");
     }
 
     /// `tick` needs more stack than a default test thread provides, and the
@@ -64459,8 +69154,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             }
         }
 
-        /// Run one whole production tick, so `tick_decomposition`'s freeze result
-        /// reaches the real Phase 6 gate instead of a value the test passes in.
+        /// Run one whole production tick, so Phase 6 runs exactly as the daemon
+        /// runs it while a graph holds the freeze.
         async fn production_tick(
             &mut self,
             harness: &LifecycleHarness,
@@ -64494,6 +69189,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 &mut graph_skip_logs,
                 &mut unrecordable,
                 &mut reviewer_respawn_backoff,
+                &mut ProfileCooldown::new(),
+                &mut ReviewerSlotQueue::default(),
                 &mut drain_state,
                 &mut self.roster,
                 &mut classifier_slot,
@@ -64562,119 +69259,49 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         }
     }
 
-    /// The whole outcome for a true rework: after `task-retry` lifts the hold,
-    /// the freeze returns before the worker exists, so Phase 6 must attach that
-    /// worker under the freeze or the drain waits on it forever. The open task
-    /// would sort first and be refused, so it also proves the pass reaches the
-    /// rework without starting anything new.
+    /// Dispatch under a held freeze still attaches the worker for started work: a
+    /// retried provider-blocked rework gets its worker under the freeze, and
+    /// planning starts on the next tick while that rework and unrelated work
+    /// are still in flight. There is no drain.
     #[cfg(unix)]
     #[test]
-    fn retried_rework_gets_a_worker_under_the_reacquired_freeze_and_planning_proceeds() {
+    fn retried_rework_gets_a_worker_under_the_freeze_and_planning_does_not_wait() {
         run_on_tick_stack("retried-rework-", || async {
-            let mut harness = lifecycle_harness("provider-block-rework-dispatch");
-            harness.enter_freeze_phase("draining");
+            let mut harness = lifecycle_harness("provider-block-rework-freeze");
+            harness.enter_freeze_phase("freeze-requested");
             let mut fixture = BlockedReworkFixture::new(&mut harness).await;
             let mut coordinator = DecompositionCoordinator::default();
-            assert!(harness.tick(&mut coordinator).await);
-            assert_eq!(harness.freeze_row().state, "provider-backoff");
-
-            let open = harness.add_task(
-                "open",
-                Some(
-                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
-                ),
-            );
-            harness.expire_backoff();
-            assert!(
-                !harness.tick(&mut coordinator).await,
-                "the block still holds"
-            );
 
             harness.retry_provider_block(fixture.task);
             fixture.production_tick(&harness, &mut coordinator).await;
-            assert_eq!(harness.freeze_row().state, "freeze-requested");
+            assert_eq!(harness.freeze_row().state, "draining");
             fixture.assert_worker_attached(&harness);
-            let still_open = {
-                let conn = quorum_core::db::open(&harness.db_path).unwrap();
-                tasks::get(&conn, open).unwrap().unwrap()
-            };
-            assert_eq!(still_open.status, "open", "the freeze admits no new start");
-            assert_eq!(still_open.assignee, None);
 
-            // The attached worker is what the drain now waits for.
-            for _ in 0..2 {
-                assert!(
-                    harness
-                        .tick_with_slots(&mut coordinator, &fixture.workers, &[])
-                        .await
-                );
-                let row = harness.freeze_row();
-                assert_eq!(
-                    (row.state.as_str(), row.frozen_base_sha),
-                    ("draining", None)
-                );
-            }
-
-            fixture.complete_delivery(&harness).await;
             assert!(harness.tick(&mut coordinator).await);
             let expected = origin_main_head(&harness.config.repo_dir);
             let row = harness.freeze_row();
             assert_eq!(row.state, "planning");
             assert_eq!(row.frozen_base_sha, Some(expected));
             assert_eq!((row.provider_failures, row.proposal_attempts), (1, 1));
-        });
-    }
-
-    /// The same dispatch closes a retry that lands while another started task
-    /// keeps the freeze held, where no `provider-backoff` tick ever runs.
-    #[cfg(unix)]
-    #[test]
-    fn retried_rework_gets_a_worker_during_a_mixed_drain() {
-        run_on_tick_stack("retried-rework-", || async {
-            let mut harness = lifecycle_harness("provider-block-rework-mixed");
-            harness.enter_freeze_phase("draining");
-            // No release runs here to clear the harness's bound base, and the real
-            // bind below requires the unbound `draining` graph it would meet.
-            quorum_core::db::open(&harness.db_path)
-                .unwrap()
-                .execute(
-                    "UPDATE task_decompositions SET frozen_base_sha=NULL WHERE id=?1",
-                    [harness.graph],
-                )
-                .unwrap();
-            let mut fixture = BlockedReworkFixture::new(&mut harness).await;
-            let unrelated = harness.add_task("working", None);
-            let mut coordinator = DecompositionCoordinator::default();
-            assert!(harness.tick(&mut coordinator).await);
-            assert_eq!(harness.freeze_row().state, "draining");
-
-            harness.retry_provider_block(fixture.task);
-            fixture.production_tick(&harness, &mut coordinator).await;
-            assert_eq!(harness.freeze_row().state, "draining");
             fixture.assert_worker_attached(&harness);
-
             fixture.complete_delivery(&harness).await;
-            harness.finish_task(unrelated);
-            assert!(harness.tick(&mut coordinator).await);
-            let expected = origin_main_head(&harness.config.repo_dir);
-            let row = harness.freeze_row();
-            assert_eq!(row.state, "planning");
-            assert_eq!(row.frozen_base_sha, Some(expected));
         });
     }
 
-    /// A frozen pass is for work the drain is already waiting on. Rework with
-    /// no retry stays with its own recovery path and gets no worker here.
+    /// Rework with no retry stays with its own recovery path and gets no
+    /// worker from dispatch, freeze or not.
     #[cfg(unix)]
     #[test]
     fn frozen_dispatch_leaves_rework_without_a_retry_unclaimed() {
         run_on_tick_stack("frozen-dispatch", || async {
             let mut harness = lifecycle_harness("provider-block-no-retry");
-            harness.enter_freeze_phase("draining");
+            harness.enter_freeze_phase("freeze-requested");
             let mut fixture = BlockedReworkFixture::new(&mut harness).await;
             let mut coordinator = DecompositionCoordinator::default();
             fixture.production_tick(&harness, &mut coordinator).await;
-            assert_eq!(harness.freeze_row().state, "provider-backoff");
+            let row = harness.freeze_row();
+            assert_eq!(row.state, "draining");
+            assert!(row.freeze_active);
             assert!(fixture.workers.is_empty(), "still provider-blocked");
             let conn = quorum_core::db::open(&harness.db_path).unwrap();
             let task = tasks::get(&conn, fixture.task).unwrap().unwrap();
@@ -64682,102 +69309,304 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         });
     }
 
-    /// The owner-visible defect: a repository draining behind nothing but
-    /// provider-blocked work must unfreeze, from either pre-bind phase, without
-    /// spending a planning budget.
+    /// A production tick under a held planning freeze does not pause unrelated
+    /// daemon work: the classifier takes a new open task, the collector retry
+    /// queue reserves its next attempt, and the doctor spawns for a stalled
+    /// task, while the planning source stays `planning` with no worker.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn idle_provider_block_releases_freeze_and_reopens_dispatch() {
-        for phase in ["freeze-requested", "draining"] {
-            let harness = lifecycle_harness("provider-block-release");
-            harness.enter_freeze_phase(phase);
-            harness.add_provider_blocked_task("rework").await;
-            let unclassified = harness.add_task("open", None);
-            let classified = harness.add_task(
+    #[test]
+    fn planning_freeze_keeps_classifier_collector_and_doctor_running() {
+        run_on_tick_stack("planning-keeps-work-", || async {
+            let mut harness = lifecycle_harness("planning-keeps-work");
+            harness.enter_freeze_phase("freeze-requested");
+            let dir = harness._dir.path().to_path_buf();
+            // One Claude profile backed by a stdin-holding fake, so the
+            // classifier and doctor processes stay observable after the tick.
+            for profile in harness.config.model_profiles.values_mut() {
+                *profile = crate::serve_config::ModelProfile {
+                    runner: "claude".into(),
+                    model: "claude-sonnet-5".into(),
+                    effort: "high".into(),
+                };
+            }
+            harness.config.agent_bin = Some(
+                fake_stdin_holding_agent(&dir, "hold-daemon-work")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            harness.config.doctor_enabled = true;
+            harness.config.cap = 2;
+            harness.config.worktree_base = dir.join("worktrees");
+            let remote = dir.join("remote.git");
+            assert!(std::process::Command::new("git")
+                .args(["init", "--bare", "-q", "--initial-branch=main"])
+                .arg(&remote)
+                .status()
+                .unwrap()
+                .success());
+            // The lifecycle harness already has an origin; repoint it here.
+            for args in [
+                vec!["branch", "-M", "main"],
+                vec!["remote", "set-url", "origin", remote.to_str().unwrap()],
+                vec!["push", "-q", "origin", "main"],
+            ] {
+                let output = std::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(&harness.config.repo_dir)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "git {args:?} failed");
+            }
+
+            let ready_task = harness.add_task(
                 "open",
                 Some(
                     r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
                 ),
             );
-            assert!(!harness.classifier_queue_ids(true).contains(&unclassified));
-            assert!(harness.claim_task(classified).is_none(), "{phase} freezes");
+            let open_task = harness.add_task("open", None);
+            let stalled = harness.add_task("in-review", None);
+            const PR: i64 = 9421;
+            {
+                let mut conn = quorum_core::db::open(&harness.db_path).unwrap();
+                quorum_core::review_interpret_jobs::enqueue(
+                    &mut conn,
+                    PR,
+                    stalled,
+                    None,
+                    collector::COLLECTOR_VERSION,
+                )
+                .unwrap();
+                conn.execute(
+                    "UPDATE review_interpret_jobs SET created_at=?2 WHERE pr_number=?1",
+                    rusqlite::params![
+                        PR,
+                        now_unix() - quorum_core::review_interpret_jobs::INITIAL_GRACE_SECS - 60
+                    ],
+                )
+                .unwrap();
+            }
+            // A closed tracker keeps the retry from launching a real `gh`
+            // fetch; the durable reservation still proves the queue ran.
+            let collectors = collector::CollectorTracker::default();
+            collectors.drain(&harness.db_path).await;
 
+            let wt_mgr = WorktreeManager::new();
+            let mut names = Pool::new_generated();
+            let mut workers = Vec::new();
+            let mut reviewers = Vec::new();
+            let mut drain_state = DrainState::new();
+            let mut roster = LifetimeRoster::new();
+            let mut classifier_slot = None;
             let mut coordinator = DecompositionCoordinator::default();
-            assert!(harness.tick(&mut coordinator).await, "{phase}");
+            let mut classifier_consec_errors = 0;
+            let mut classifier_backoff_until = None;
+            let mut doctor_slot = None;
+            let mut doctored_tasks = std::collections::HashSet::new();
+            let signal_count = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+            tick(
+                &harness.config,
+                &wt_mgr,
+                &mut names,
+                &mut workers,
+                &mut reviewers,
+                &mut branch_sync::BranchSyncChecks::default(),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut PoisonTracker::new(),
+                &mut ClaimSkipLogLimiter::new(),
+                &mut ClaimSkipLogLimiter::new(),
+                &mut UnrecordableStrikes::new(),
+                &mut ReviewerRespawnBackoff::new(),
+                &mut ProfileCooldown::new(),
+                &mut ReviewerSlotQueue::default(),
+                &mut drain_state,
+                &mut roster,
+                &mut classifier_slot,
+                &mut coordinator,
+                &mut classifier_consec_errors,
+                &mut classifier_backoff_until,
+                &mut doctor_slot,
+                &mut doctored_tasks,
+                &collectors,
+                &signal_count,
+            )
+            .await
+            .unwrap();
+
             let row = harness.freeze_row();
-            assert_eq!(row.state, "provider-backoff", "{phase}");
-            assert!(!row.freeze_active, "{phase}");
-            assert_eq!(row.frozen_base_sha, None, "{phase}");
-            assert_eq!((row.provider_failures, row.proposal_attempts), (1, 1));
-            let attempts: i64 = quorum_core::db::open(&harness.db_path)
+            assert_eq!(row.state, "draining");
+            assert!(row.freeze_active, "the graph still holds its freeze");
+            assert_eq!(
+                workers.iter().map(|w| w.task_id).collect::<Vec<_>>(),
+                vec![ready_task],
+                "an unrelated classified open task must get a worker while a graph plans"
+            );
+            assert_eq!(
+                classifier_slot
+                    .as_ref()
+                    .map(|slot: &classifier::ClassifierSlot| slot.pending_task_ids.clone()),
+                Some(vec![open_task]),
+                "a new open task must be classified while a graph plans"
+            );
+            assert_eq!(
+                doctor_slot.as_ref().map(|slot| slot.task_id),
+                Some(stalled),
+                "the doctor must not pause while a graph plans"
+            );
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            let job = quorum_core::review_interpret_jobs::get(&conn, PR)
                 .unwrap()
+                .unwrap();
+            assert_eq!(job.attempts, 1, "the collector retry queue must run");
+            let collector_assignments: i64 = conn
                 .query_row(
-                    "SELECT count(*) FROM decomposition_attempts WHERE graph_id=?1",
-                    [harness.graph],
+                    "SELECT count(*) FROM role_assignments
+                     WHERE role='collector' AND pr_number=?1",
+                    [PR],
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(attempts, 0, "a release is a wait, not an attempt");
+            assert_eq!(collector_assignments, 1);
+            assert_eq!(
+                tasks::get(&conn, ready_task).unwrap().unwrap().status,
+                "working"
+            );
+            let source = tasks::get(&conn, harness.source).unwrap().unwrap();
+            assert_eq!(
+                (source.status.as_str(), source.assignee),
+                ("planning", None)
+            );
+            assert!(workers.iter().all(|w| w.task_id != harness.source));
+            drop(conn);
 
-            let frozen = harness.tick(&mut coordinator).await;
-            assert!(!frozen, "the next tick reports the repository unfrozen");
-            assert!(harness.classifier_queue_ids(frozen).contains(&unclassified));
-            assert_eq!(harness.claim_task(classified).unwrap().id, classified);
+            if let Some(slot) = classifier_slot.take() {
+                reap_classifier_with_usage(&harness.db_path, slot, None).await;
+            }
+            doctor::reap_doctor_slot(&harness.db_path, &mut doctor_slot).await;
+            for worker in workers {
+                worker.kill_and_reap().await;
+            }
+        });
+    }
+
+    /// Commit `name` on the harness repository's current branch.
+    #[cfg(unix)]
+    /// Commit `name` and publish it to origin's `main`, as a base merge would:
+    /// the planning base is the fetched origin head, not the clone's HEAD.
+    fn commit_file(repo: &Path, name: &str) {
+        std::fs::write(repo.join(name), name).unwrap();
+        for args in [
+            vec!["add", name],
+            vec!["commit", "-qm", name],
+            vec!["push", "-q", "origin", "HEAD:refs/heads/main"],
+        ] {
+            let output = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 
-    /// DECOMPOSITION_PROVIDER_BACKOFF_SECS is 5, so without the guard the
-    /// freeze would flap on every expiry. Unrelated started work must not hide
-    /// the block, and the waiting tick must not touch the graph.
+    /// No drain precondition: a graph moves from `freeze-requested` through
+    /// `draining` to `planning` while unrelated work is started in every
+    /// non-terminal status (including parked and provider-blocked work and a
+    /// live-agent journal row). The bound base is the fetched origin head at
+    /// planning start, not at freeze request, and the planner's archive of it
+    /// does not follow later base movement.
     #[cfg(unix)]
     #[tokio::test]
-    async fn provider_block_holds_reacquire_until_retry_then_a_real_drain_plans() {
-        let harness = lifecycle_harness("provider-block-hold");
-        harness.enter_freeze_phase("draining");
-        let blocked = harness.add_provider_blocked_task("rework").await;
-        let mut coordinator = DecompositionCoordinator::default();
-        assert!(harness.tick(&mut coordinator).await);
-        let unrelated = harness.add_task("working", None);
-
-        harness.expire_backoff();
-        let held = harness.freeze_row();
-        assert_eq!(held.state, "provider-backoff");
-        for _ in 0..3 {
-            assert!(!harness.tick(&mut coordinator).await);
-            assert_eq!(harness.freeze_row(), held);
+    async fn planning_starts_while_unrelated_work_is_started() {
+        let harness = lifecycle_harness("no-drain-planning");
+        harness.enter_freeze_phase("freeze-requested");
+        let mut started = vec![(harness.add_provider_blocked_task("rework").await, "rework")];
+        // Created first and started together: `create` sweeps would otherwise
+        // reclaim a lease-less `working` row before the ticks run.
+        let parked = r#"{"daemon_parked":true,"daemon_parked_reason":"held"}"#;
+        let pending: Vec<_> = [
+            ("working", None),
+            ("in-review", None),
+            ("rework", None),
+            ("merging", None),
+            ("working", Some(parked)),
+        ]
+        .into_iter()
+        .map(|(status, refs)| (harness.add_task("open", refs), status))
+        .collect();
+        {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            for (id, status) in &pending {
+                conn.execute(
+                    "UPDATE tasks SET status=?2 WHERE id=?1",
+                    rusqlite::params![id, status],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO journal(agent,role,session_id,phase,updated_at)
+                 VALUES ('Worker-a1','worker','run','working',1)",
+                [],
+            )
+            .unwrap();
         }
+        started.extend(pending);
 
-        harness.retry_provider_block(blocked);
-        assert!(harness.tick(&mut coordinator).await);
-        assert_eq!(harness.freeze_row().state, "freeze-requested");
+        let mut coordinator = DecompositionCoordinator::default();
         assert!(harness.tick(&mut coordinator).await);
         assert_eq!(harness.freeze_row().state, "draining");
 
-        // Started work still holds the drain, so the base is not captured yet.
+        // The base moves after the freeze request; the bind records the
+        // fetched origin head at planning start.
+        let repo = harness.config.repo_dir.clone();
+        commit_file(&repo, "before-planning.txt");
+        let planning_head = origin_main_head(&repo);
         assert!(harness.tick(&mut coordinator).await);
-        let row = harness.freeze_row();
-        assert_eq!(
-            (row.state.as_str(), row.frozen_base_sha),
-            ("draining", None)
-        );
-
-        harness.finish_task(blocked);
-        harness.finish_task(unrelated);
-        assert!(harness.tick(&mut coordinator).await);
-        let expected = origin_main_head(&harness.config.repo_dir);
         let row = harness.freeze_row();
         assert_eq!(row.state, "planning");
-        assert_eq!(row.frozen_base_sha, Some(expected));
+        assert!(row.freeze_active);
+        assert_eq!(row.frozen_base_sha.as_deref(), Some(planning_head.as_str()));
         assert_eq!((row.provider_failures, row.proposal_attempts), (1, 1));
+        {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            for (id, status) in &started {
+                assert_eq!(&tasks::get(&conn, *id).unwrap().unwrap().status, status);
+            }
+            let errors: i64 = conn
+                .query_row("SELECT count(*) FROM errors", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(errors, 0);
+        }
+
+        // An unrelated merge moves the base during planning. The planner's
+        // snapshot archive stays at the recorded SHA.
+        commit_file(&repo, "after-planning-start.txt");
+        assert_ne!(origin_main_head(&repo), planning_head);
+        let snapshot = {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            load_planning_snapshot(&conn).unwrap().unwrap()
+        };
+        assert_eq!(snapshot.frozen_base_sha, planning_head);
+        let view = retain_cached_frozen_planner_view(&harness.config, &mut coordinator, &snapshot)
+            .await
+            .unwrap();
+        assert!(view.join("before-planning.txt").exists());
+        assert!(!view.join("after-planning-start.txt").exists());
+        coordinator.release_frozen_view();
     }
 
-    /// The guard belongs to the state, not to this release: an ordinary planner
-    /// provider failure waits too, keeps its cached view while waiting, and
-    /// then runs the existing cleanup exactly once the block clears.
+    /// An ordinary planner provider failure backs off and then reacquires the
+    /// freeze even while unrelated provider-blocked work is idle: a provider
+    /// block elsewhere is no reason to stay out of planning.
     #[cfg(unix)]
     #[tokio::test]
-    async fn ordinary_provider_failure_backoff_also_waits_for_provider_block() {
-        let harness = lifecycle_harness("provider-failure-block-hold");
+    async fn provider_failure_backoff_does_not_wait_for_unrelated_provider_blocks() {
+        let harness = lifecycle_harness("provider-failure-no-block-hold");
         let snapshot = {
             let conn = quorum_core::db::open(&harness.db_path).unwrap();
             load_planning_snapshot(&conn).unwrap().unwrap()
@@ -64800,151 +69629,30 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             .unwrap()
             .is_some());
         }
-        let held = harness.freeze_row();
-        assert_eq!(held.state, "provider-backoff");
+        assert_eq!(harness.freeze_row().state, "provider-backoff");
 
-        assert!(!harness.tick(&mut coordinator).await);
-        assert_eq!(harness.freeze_row(), held);
-        assert!(view.exists());
-
-        harness.retry_provider_block(blocked);
-        harness.finish_task(blocked);
+        // `updated_at=5` is past the bounded backoff window.
         assert!(harness.tick(&mut coordinator).await);
         assert!(coordinator.frozen_view.is_none());
         assert!(!view.exists());
         harness
-            .assert_real_drain_reaches_planning(&mut coordinator)
+            .assert_freeze_reaches_planning(&mut coordinator)
             .await;
-    }
-
-    /// A provider-blocked task whose slot is still live may yet land work, so
-    /// it holds the drain like any other started task, and a slot on either
-    /// role counts. Once the last slot leaves, the same graph releases.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn provider_blocked_task_with_live_slot_keeps_holding_the_drain() {
-        let harness = lifecycle_harness("provider-block-live-slot");
-        harness.enter_freeze_phase("draining");
-        let blocked = harness.add_provider_blocked_task("rework").await;
-        let held = harness.freeze_row();
-        let slots = [live_slot_for(blocked).await];
-        let mut coordinator = DecompositionCoordinator::default();
-
-        assert!(harness.tick_with_slots(&mut coordinator, &slots, &[]).await);
-        assert_eq!(harness.freeze_row(), held);
-        assert!(harness.tick_with_slots(&mut coordinator, &[], &slots).await);
-        assert_eq!(harness.freeze_row(), held);
-
-        assert!(harness.tick(&mut coordinator).await);
-        assert_eq!(harness.freeze_row().state, "provider-backoff");
-    }
-
-    /// Only an idle provider block is a reason to stay out of the freeze: a
-    /// blocked task that still has a slot does not hold a reacquire.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn provider_backoff_reacquires_over_a_blocked_task_with_a_live_slot() {
-        let harness = lifecycle_harness("provider-block-live-slot-backoff");
-        harness.enter_freeze_phase("provider-backoff");
-        {
-            let conn = quorum_core::db::open(&harness.db_path).unwrap();
-            conn.execute(
-                "UPDATE task_decompositions SET freeze_active=0,frozen_base_sha=NULL WHERE id=?1",
-                [harness.graph],
-            )
-            .unwrap();
-        }
-        let blocked = harness.add_provider_blocked_task("rework").await;
-        let slots = [live_slot_for(blocked).await];
-        let mut coordinator = DecompositionCoordinator::default();
-
-        assert!(harness.tick_with_slots(&mut coordinator, &[], &slots).await);
-        let row = harness.freeze_row();
-        assert_eq!(row.state, "freeze-requested");
-        assert!(row.freeze_active);
-    }
-
-    /// Ordinary rework, a parked task, and a mix with one provider block can
-    /// all still finish or need another owner, so each keeps today's drain.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn drain_holders_other_than_provider_blocks_do_not_release_the_freeze() {
-        for (name, status, refs, with_block) in [
-            ("ordinary-rework", "rework", None, false),
-            (
-                "parked",
-                "working",
-                Some(r#"{"daemon_parked":true,"daemon_parked_reason":"held"}"#),
-                false,
-            ),
-            ("mixed", "rework", None, true),
-        ] {
-            let harness = lifecycle_harness(name);
-            harness.enter_freeze_phase("draining");
-            harness.add_task(status, refs);
-            if with_block {
-                harness.add_provider_blocked_task("rework").await;
-            }
-            let held = harness.freeze_row();
-            let mut coordinator = DecompositionCoordinator::default();
-            for _ in 0..2 {
-                assert!(harness.tick(&mut coordinator).await, "{name}");
-                assert_eq!(harness.freeze_row(), held, "{name}");
-            }
-        }
-
-        let harness = lifecycle_harness("freeze-requested-holder");
-        harness.enter_freeze_phase("freeze-requested");
-        harness.add_task("rework", None);
-        let mut coordinator = DecompositionCoordinator::default();
-        assert!(harness.tick(&mut coordinator).await);
-        let row = harness.freeze_row();
-        assert_eq!(row.state, "draining", "the ordinary advance is unchanged");
-        assert!(row.freeze_active);
-    }
-
-    /// The released state is fully durable: a restarted coordinator with empty
-    /// slots neither refreezes nor forgets the wait.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn released_provider_block_survives_restart_until_it_clears() {
-        let harness = lifecycle_harness("provider-block-restart");
-        harness.enter_freeze_phase("draining");
-        let blocked = harness.add_provider_blocked_task("rework").await;
-        let mut coordinator = DecompositionCoordinator::default();
-        assert!(harness.tick(&mut coordinator).await);
-        drop(coordinator);
-
-        harness.expire_backoff();
-        let held = harness.freeze_row();
-        let mut coordinator = DecompositionCoordinator::default();
-        let startup_state = reconcile_decomposition_startup(&harness.config, &mut coordinator)
-            .await
-            .unwrap();
-        assert_eq!(startup_state, StartupDecompositionState::None);
-        assert!(!startup_state.defers_lifecycle_recovery());
-        assert_eq!(coordinator.graph_id, Some(harness.graph));
-        for _ in 0..2 {
-            assert!(!harness.tick(&mut coordinator).await);
-            assert_eq!(harness.freeze_row(), held);
-        }
-
-        harness.retry_provider_block(blocked);
-        harness.finish_task(blocked);
-        assert!(harness.tick(&mut coordinator).await);
-        harness
-            .assert_real_drain_reaches_planning(&mut coordinator)
-            .await;
+        let conn = quorum_core::db::open(&harness.db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, blocked).unwrap().unwrap().status,
+            "rework",
+            "the provider-blocked task is untouched"
+        );
     }
 
     /// When the selected aggregate switches from graph A (now in provider
     /// backoff, freeze released) to graph B (which won the planning freeze),
     /// A's cached view, durable `frozen-view` marker, and cached proposal must
-    /// be settled. Before the fix the marker leaked and B sat in `draining`
-    /// forever because the drain counted it as in-flight work.
+    /// be settled before B binds its own base and reaches planning.
     #[cfg(unix)]
     #[tokio::test]
-    async fn graph_switch_releases_previous_graph_view_so_new_graph_drains() {
+    async fn graph_switch_releases_previous_graph_view_before_new_graph_plans() {
         let harness = lifecycle_harness("graph-switch-releases-view");
         let graph_a = harness.graph;
         let snapshot = {
@@ -64989,6 +69697,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             quorum_core::decomposition::begin_planning(
                 &mut conn,
                 &quorum_core::decomposition::BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id: source_b,
                     expected_revision: 1,
                     provider: "codex",
@@ -65030,40 +69739,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert_eq!(
             arbiter_gate_state(&harness.db_path, graph_b).0,
             "planning",
-            "B must drain and capture its frozen base"
+            "B must capture its frozen base"
         );
         assert_eq!(
             arbiter_gate_state(&harness.db_path, graph_a).0,
             "provider-backoff",
             "A keeps its durable state and resumes once B releases the freeze"
         );
-    }
-
-    /// A `frozen-view` row is a recovery marker for a cached archive, not live
-    /// work; only rows with a live agent behind them block a freeze drain.
-    #[test]
-    fn drain_journal_count_ignores_frozen_view_markers() {
-        let dir = tempfile::tempdir().unwrap();
-        let conn = open_test_db(dir.path());
-        for (agent, role) in [
-            ("decomposition-frozen-view-1", "frozen-view"),
-            ("decomposition-frozen-view-2", "frozen-view"),
-        ] {
-            conn.execute(
-                "INSERT INTO journal(agent,role,session_id,phase,updated_at)
-                 VALUES (?1,?2,'sha','frozen-view',1)",
-                rusqlite::params![agent, role],
-            )
-            .unwrap();
-        }
-        assert_eq!(count_drain_blocking_journal_rows(&conn).unwrap(), 0);
-        conn.execute(
-            "INSERT INTO journal(agent,role,session_id,phase,updated_at)
-             VALUES ('decomposition-planner-3','planner','run','planner',1)",
-            [],
-        )
-        .unwrap();
-        assert_eq!(count_drain_blocking_journal_rows(&conn).unwrap(), 1);
     }
 
     /// A classifier rejection returns the proposal to the planner retry path
@@ -65576,16 +70258,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
         let mut error = None;
         for _ in 0..200 {
-            match tick_decomposition(
-                &config,
-                &WorktreeManager::new(),
-                &mut coordinator,
-                &[],
-                &[],
-                DecompositionLiveWork::default(),
-            )
-            .await
-            {
+            match tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator).await {
                 Ok(_) if coordinator.arbiter_slot.is_some() => {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
@@ -65706,63 +70379,6 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     }
 
     #[test]
-    fn decomposition_drain_waits_for_every_tick_owned_live_slot_class() {
-        assert!(decomposition_drain_ready(
-            0,
-            0,
-            0,
-            0,
-            DecompositionLiveWork::default()
-        ));
-        assert!(!decomposition_drain_ready(
-            1,
-            0,
-            0,
-            0,
-            DecompositionLiveWork::default()
-        ));
-        assert!(!decomposition_drain_ready(
-            0,
-            1,
-            0,
-            0,
-            DecompositionLiveWork::default()
-        ));
-        assert!(!decomposition_drain_ready(
-            0,
-            0,
-            1,
-            0,
-            DecompositionLiveWork::default()
-        ));
-        // A started-but-not-terminal task (e.g. in-review with no reviewer
-        // yet) holds drain open even when every live slot is empty.
-        assert!(!decomposition_drain_ready(
-            0,
-            0,
-            0,
-            1,
-            DecompositionLiveWork::default()
-        ));
-        for live in [
-            DecompositionLiveWork {
-                ordinary_classifier: true,
-                ..Default::default()
-            },
-            DecompositionLiveWork {
-                doctor: true,
-                ..Default::default()
-            },
-            DecompositionLiveWork {
-                pre_review_checks: true,
-                ..Default::default()
-            },
-        ] {
-            assert!(!decomposition_drain_ready(0, 0, 0, 0, live));
-        }
-    }
-
-    #[test]
     fn decomposition_attempt_truncation_is_utf8_byte_safe() {
         let input = "é".repeat(2048);
         let truncated = truncate_utf8_bytes(&input, 2048);
@@ -65797,6 +70413,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             let graph = quorum_core::decomposition::begin_planning(
                 &mut conn,
                 &quorum_core::decomposition::BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id: source,
                     expected_revision: 1,
                     provider: "claude",
@@ -65909,6 +70526,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             let graph = quorum_core::decomposition::begin_planning(
                 &mut conn,
                 &quorum_core::decomposition::BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id: source,
                     expected_revision: 1,
                     provider: "claude",
@@ -65963,7 +70581,8 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     "proposal rejected by the prior binary",
                     quorum_core::decomposition::AttemptEligibility::structural(),
                     None,
-                    5 + attempt * 2,
+                    1,
+                    5 + attempt * 2
                 )
                 .unwrap());
             }
@@ -65986,16 +70605,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
             let config = pre_review_checks_config(db_path.clone(), dir.path().to_path_buf());
             let mut coordinator = DecompositionCoordinator::default();
-            assert!(tick_decomposition(
-                &config,
-                &WorktreeManager::new(),
-                &mut coordinator,
-                &[],
-                &[],
-                DecompositionLiveWork::default(),
-            )
-            .await
-            .unwrap());
+            assert!(
+                tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                    .await
+                    .unwrap()
+            );
 
             let conn = quorum_core::db::open(&db_path).unwrap();
             let state: (String, Option<String>, i64) = conn
@@ -66046,13 +70660,45 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             )
             .unwrap();
             let outcome =
-                quorum_core::decomposition::reconcile_startup_graphs(&mut conn, 3).unwrap();
+                quorum_core::decomposition::reconcile_startup_graphs(&mut conn, 1, 3).unwrap();
             assert_eq!(outcome.reset, 1);
             assert_eq!(
                 inspect_startup_decomposition(&conn).unwrap(),
                 StartupDecompositionState::Frozen
             );
         }
+    }
+
+    /// Startup inspection evaluates every non-terminal graph instead of the
+    /// lowest-id row: an unadmitted `freeze-requested` graph ahead of an
+    /// active graph must not hide the active one, and a planning freeze on a
+    /// later graph still defers lifecycle recovery.
+    #[test]
+    fn startup_inspection_considers_every_counted_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = quorum_core::db::open(&dir.path().join("graphs.db")).unwrap();
+        fn graph(conn: &mut rusqlite::Connection, state: &str, active: i64, freeze: i64) {
+            let source =
+                tasks::create(conn, "owner", state, None, 1, None, None, None, None, 1).unwrap();
+            conn.execute(
+                "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at) VALUES (?1,?2,?3,?4,1,2,2)",
+                rusqlite::params![source, state, active, freeze],
+            )
+            .unwrap();
+        }
+        graph(&mut conn, "freeze-requested", 0, 0);
+        graph(&mut conn, "blocked", 1, 0);
+        graph(&mut conn, "active", 1, 0);
+        assert_eq!(
+            inspect_startup_decomposition(&conn).unwrap(),
+            StartupDecompositionState::Active
+        );
+        graph(&mut conn, "draining", 0, 1);
+        assert_eq!(
+            inspect_startup_decomposition(&conn).unwrap(),
+            StartupDecompositionState::Frozen
+        );
     }
 
     #[test]
@@ -66438,6 +71084,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             let graph_id = quorum_core::decomposition::begin_planning(
                 &mut conn,
                 &quorum_core::decomposition::BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id,
                     expected_revision: 1,
                     provider: "codex",
@@ -66529,16 +71176,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         // The fake provider's exit is observed by the poll, not by the tick
         // count: under load its EOF can precede its reaped status by a tick.
         for _ in 0..200 {
-            tick_decomposition(
-                &config,
-                &WorktreeManager::new(),
-                &mut coordinator,
-                &[],
-                &[],
-                DecompositionLiveWork::default(),
-            )
-            .await
-            .unwrap();
+            tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap();
             if coordinator.planner_slot.is_none() {
                 break;
             }
@@ -66585,16 +71225,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         assert!(coordinator.arbiter_slot.is_none());
 
         for _ in 0..200 {
-            tick_decomposition(
-                &config,
-                &WorktreeManager::new(),
-                &mut coordinator,
-                &[],
-                &[],
-                DecompositionLiveWork::default(),
-            )
-            .await
-            .unwrap();
+            tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap();
             if coordinator.classifier_slot.is_none() {
                 break;
             }
@@ -66626,16 +71259,9 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         );
 
         for _ in 0..200 {
-            tick_decomposition(
-                &config,
-                &WorktreeManager::new(),
-                &mut coordinator,
-                &[],
-                &[],
-                DecompositionLiveWork::default(),
-            )
-            .await
-            .unwrap();
+            tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap();
             if coordinator.arbiter_slot.is_none() {
                 break;
             }
@@ -66790,6 +71416,7 @@ exec /bin/cat '{stdout}'
             let graph_id = quorum_core::decomposition::begin_planning(
                 &mut conn,
                 &quorum_core::decomposition::BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id,
                     expected_revision: 1,
                     provider: "codex",
@@ -66841,16 +71468,9 @@ exec /bin/cat '{stdout}'
         .await
         .unwrap();
 
-        tick_decomposition(
-            &config,
-            &WorktreeManager::new(),
-            &mut coordinator,
-            &[],
-            &[],
-            DecompositionLiveWork::default(),
-        )
-        .await
-        .unwrap();
+        tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+            .await
+            .unwrap();
         let run_id = coordinator
             .planner_run_id
             .clone()
@@ -66910,16 +71530,9 @@ exec /bin/cat '{stdout}'
             if coordinator.planner_slot.is_none() {
                 break;
             }
-            tick_decomposition(
-                &config,
-                &WorktreeManager::new(),
-                &mut coordinator,
-                &[],
-                &[],
-                DecompositionLiveWork::default(),
-            )
-            .await
-            .unwrap();
+            tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap();
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(
@@ -66993,6 +71606,7 @@ exec /bin/cat '{stdout}'
             let graph_id = quorum_core::decomposition::begin_planning(
                 &mut conn,
                 &quorum_core::decomposition::BeginPlanning {
+                    max_active_graphs: 1,
                     source_task_id,
                     expected_revision: 1,
                     provider: "codex",
@@ -67080,16 +71694,9 @@ exec /bin/cat '{stdout}'
         };
 
         for _ in 0..200 {
-            tick_decomposition(
-                &config,
-                &WorktreeManager::new(),
-                &mut coordinator,
-                &[],
-                &[],
-                DecompositionLiveWork::default(),
-            )
-            .await
-            .unwrap();
+            tick_decomposition(&config, &WorktreeManager::new(), &mut coordinator)
+                .await
+                .unwrap();
             if coordinator.planner_slot.is_none() {
                 break;
             }
@@ -67146,7 +71753,7 @@ exec /bin/cat '{stdout}'
     }
 
     #[tokio::test]
-    async fn planner_view_is_exactly_frozen_and_ignores_head_drift() {
+    async fn planner_view_is_exactly_frozen_while_the_base_head_moves() {
         let repo = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
             let output = std::process::Command::new("git")
@@ -67173,16 +71780,17 @@ exec /bin/cat '{stdout}'
         std::fs::write(repo.path().join("state.txt"), "drifted").unwrap();
         git(&["add", "state.txt"]);
         git(&["commit", "-qm", "drift"]);
-        let drained_head = git(&["rev-parse", "HEAD"]);
-        assert_ne!(drained_head, frozen);
-        // The view is addressed by the bound commit, never the clone's HEAD:
-        // a moved HEAD neither changes nor refuses the frozen tree.
+        let moved_head = git(&["rev-parse", "HEAD"]);
+        assert_ne!(moved_head, frozen);
+        // No drain holds the base still, so the view must not follow HEAD: it
+        // is addressed by the bound commit, never the clone's HEAD, and a moved
+        // HEAD neither changes nor refuses the frozen tree.
         let again = frozen_planner_view(repo.path(), &frozen).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(again.path().join("state.txt")).unwrap(),
             "frozen"
         );
-        // A base whose commit object is absent fails closed.
+        // An unknown frozen SHA (its commit object is absent) still fails closed.
         let absent = "0123456789abcdef0123456789abcdef01234567";
         let error = frozen_planner_view(repo.path(), absent)
             .await

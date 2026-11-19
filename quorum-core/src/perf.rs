@@ -2066,7 +2066,9 @@ fn load_non_managed_invocation_facts(
                 "blocker"
                     if !matches!(
                         reason_code.as_str(),
-                        "arbiter-reject-source" | "materialization-authority-lost"
+                        "arbiter-reject-source"
+                            | "materialization-authority-lost"
+                            | "max-active-graphs-reached"
                     ) =>
                 {
                     note_non_managed_invocation(snapshot, task_id, "planner")
@@ -6784,6 +6786,7 @@ mod tests {
         let graph = crate::decomposition::begin_planning(
             &mut c,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "codex",
@@ -6804,7 +6807,7 @@ mod tests {
         )
         .unwrap()
         .is_some());
-        assert!(crate::decomposition::reacquire_freeze(&mut c, graph, 1630).unwrap());
+        assert!(crate::decomposition::reacquire_freeze(&mut c, graph, 1, 1630).unwrap());
         assert!(crate::decomposition::set_frozen_phase(
             &mut c,
             graph,
@@ -6857,6 +6860,7 @@ mod tests {
         let graph = crate::decomposition::begin_planning(
             &mut c,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "codex",
@@ -6873,7 +6877,7 @@ mod tests {
         let mut now = 1620;
         for generation in 0..=crate::decomposition::MAX_OPERATOR_RETRIES {
             if generation > 0 {
-                assert!(crate::decomposition::reacquire_freeze(&mut c, graph, now).unwrap());
+                assert!(crate::decomposition::reacquire_freeze(&mut c, graph, 1, now).unwrap());
                 now += 10;
                 assert!(crate::decomposition::set_frozen_phase(
                     &mut c,
@@ -6897,7 +6901,7 @@ mod tests {
             .unwrap()
             .is_some());
             now += 10;
-            assert!(crate::decomposition::reacquire_freeze(&mut c, graph, now).unwrap());
+            assert!(crate::decomposition::reacquire_freeze(&mut c, graph, 1, now).unwrap());
             now += 10;
             assert!(crate::decomposition::set_frozen_phase(
                 &mut c,

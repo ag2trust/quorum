@@ -722,6 +722,7 @@ fn reconstruct_dormant_slots(
             live_stats: LiveStats::new(),
             error_turn_count: 0,
             fallback_install_error_count: 0,
+            worker_fallback_deferral: None,
             last_error_text: None,
             agent_run_id: Some(recovery.agent_run_id),
             cap_run_id: Some(recovery.cap_run_id.clone()),
@@ -1441,9 +1442,11 @@ mod tests {
             r2_steady_state_p: 0.0,
             max_rework: quorum_core::lifecycle::REWORK_CAP,
             max_graph_children_working: None,
+            reviewer_cap: 32,
             codex_sandbox: "danger-full-access".into(),
             grok: Default::default(),
             pr_target_program: None,
+            max_active_graphs: 2,
         }
     }
 
@@ -2474,6 +2477,7 @@ mod tests {
         quorum_core::decomposition::begin_planning(
             conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "claude",
@@ -2904,6 +2908,7 @@ exec sleep 30
             &WorktreeManager::new(),
             &mut names,
             &mut workers,
+            &mut super::super::ProfileCooldown::new(),
         )
         .await
         .expect("the next restart launches the preserved exact turn once");
@@ -3968,6 +3973,7 @@ exec sleep 30
         let graph_id = quorum_core::decomposition::begin_planning(
             &mut conn,
             &quorum_core::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 provider: "claude",

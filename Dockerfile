@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
 FROM rust:1.88.0-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS quorum-builder
 WORKDIR /src
@@ -58,7 +58,13 @@ RUN install --directory --owner=10001 --group=10001 \
     && install --directory /usr/share/doc/codex \
     && cp /opt/codex/LICENSE /opt/codex/NOTICE /usr/share/doc/codex/
 
+# Release builds pass the published version and the source commit; a plain
+# local build keeps the distinguishable defaults "dev" and "unknown".
+ARG QUORUM_VERSION=dev
+ARG QUORUM_REVISION=unknown
 LABEL org.opencontainers.image.source="https://github.com/ag2trust/quorum" \
+      org.opencontainers.image.version="${QUORUM_VERSION}" \
+      org.opencontainers.image.revision="${QUORUM_REVISION}" \
       org.opencontainers.image.licenses="MIT AND Apache-2.0" \
       org.opencontainers.image.description="Self-hostable Quorum runtime"
 

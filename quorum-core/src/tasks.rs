@@ -78,6 +78,14 @@ pub const RECOVERED_REMEDIATION_RETRY_REF: &str = "daemon_recovered_remediation_
 pub const MERGE_RETRY_REF: &str = "daemon_merge_retry";
 pub const MERGE_RETRY_REQUESTED: &str = "requested";
 pub const MERGE_RETRY_ATTEMPTING: &str = "attempting";
+/// Daemon-owned observation of a merging task's merge-gate checks. Written
+/// only while `status='merging'` and removed in the same transaction as every
+/// transition out of `merging`. Creators can neither set nor erase it.
+pub const MERGE_CHECKS_REF: &str = "merge_checks";
+/// Maximum check names retained in one merge-checks snapshot.
+pub const MERGE_CHECKS_MAX_NAMES: usize = 20;
+/// Maximum characters retained per check name in a merge-checks snapshot.
+pub const MERGE_CHECKS_MAX_NAME_CHARS: usize = 120;
 /// Maximum corrupt terminal retry rows reconciled in one daemon tick.  The
 /// bounded batch makes restart cleanup converge without turning one tick into
 /// an unbounded write transaction.
@@ -702,10 +710,10 @@ pub const BRANCH_SYNC_REF_PRESENT_SQL: &str = branch_sync_ref_present_sql!();
 /// review-only, terminal leaf, continuation, a branch-sync ref, and an
 /// existing decomposition or graph membership. `id` is qualified because the
 /// membership subqueries shadow it; the other `refs` checks stay unqualified
-/// and resolve to that same aliased row. The repository-wide one-active-graph
-/// exclusion is not part of this predicate. `planning_candidate` keeps that
-/// clause, and status uses this predicate only to explain a queued task that
-/// the clause is holding.
+/// and resolve to that same aliased row. The repository-wide counted
+/// `max_active_graphs` limit is not part of this predicate. `planning_candidate`
+/// applies that limit, and status uses this predicate only to explain a queued
+/// task that the limit is holding.
 ///
 /// A branch-sync judgment task bypasses planning exactly like continuation
 /// and review-only work. Selecting it would let routed planning reject it
@@ -920,7 +928,132 @@ pub fn validate_creator_refs(refs_json: Option<&str>) -> Result<()> {
             "refs key '{POISON_RETRY_GENERATION_REF}' is daemon-owned; use task-retry"
         )));
     }
+    if object.contains_key(MERGE_CHECKS_REF) {
+        return Err(QuorumError::Usage(format!(
+            "refs key '{MERGE_CHECKS_REF}' is daemon-owned merge-gate state"
+        )));
+    }
     Ok(())
+}
+
+/// Merge-gate check state recorded in [`MergeChecksSnapshot::state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeChecksState {
+    /// Required checks have not all completed.
+    Pending,
+    /// At least one required check failed.
+    Failing,
+    /// Checks passed; the task is awaiting its merge call.
+    Passed,
+}
+
+impl MergeChecksState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MergeChecksState::Pending => "pending",
+            MergeChecksState::Failing => "failing",
+            MergeChecksState::Passed => "passed",
+        }
+    }
+}
+
+/// Daemon-owned `refs.merge_checks` snapshot. `since` is when the current
+/// `state` was first observed; `observed_at` is the latest observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct MergeChecksSnapshot {
+    pub state: MergeChecksState,
+    pub checks: Vec<String>,
+    pub since: i64,
+    pub observed_at: i64,
+}
+
+/// Tolerant reader for `refs.merge_checks`. Absent, malformed, or
+/// non-object refs return `None` so readers can fall back.
+pub fn merge_checks_of(refs: Option<&str>) -> Option<MergeChecksSnapshot> {
+    let mut value: serde_json::Value = serde_json::from_str(refs?).ok()?;
+    let snapshot = value.as_object_mut()?.remove(MERGE_CHECKS_REF)?;
+    serde_json::from_value(snapshot).ok()
+}
+
+/// Bound check names for durable storage: drop NUL, replace other control
+/// characters, cap each name's length, skip blanks, and keep at most
+/// [`MERGE_CHECKS_MAX_NAMES`].
+fn bound_merge_check_names(checks: &[String]) -> Vec<String> {
+    checks
+        .iter()
+        .filter_map(|name| {
+            let bounded: String = name
+                .chars()
+                .filter(|ch| *ch != '\0')
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .take(MERGE_CHECKS_MAX_NAME_CHARS)
+                .collect();
+            let trimmed = bounded.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .take(MERGE_CHECKS_MAX_NAMES)
+        .collect()
+}
+
+/// Record the daemon's latest merge-gate check observation for a merging
+/// task in one short write transaction. `since` survives repeated writes of
+/// the same state and resets when the state changes; `observed_at` always
+/// advances to `now`. Returns `Ok(false)` — a clean negative — when the task
+/// is not `merging` (or its refs are not valid JSON).
+pub fn set_merge_checks_snapshot(
+    conn: &mut Connection,
+    id: i64,
+    state: MergeChecksState,
+    checks: &[String],
+    now: i64,
+) -> Result<bool> {
+    let checks_json = serde_json::to_string(&bound_merge_check_names(checks))
+        .map_err(|e| QuorumError::Io(format!("serialize merge checks: {e}")))?;
+    let tx = begin_immediate(conn)?;
+    let changed = tx.execute(
+        "UPDATE tasks
+         SET refs=json_set(
+             COALESCE(refs, '{}'),
+             '$.merge_checks',
+             json_object(
+                 'state', ?2,
+                 'checks', json(?3),
+                 'since', CASE
+                     WHEN json_extract(COALESCE(refs, '{}'), '$.merge_checks.state')=?2
+                      AND json_type(COALESCE(refs, '{}'), '$.merge_checks.since')='integer'
+                     THEN json_extract(COALESCE(refs, '{}'), '$.merge_checks.since')
+                     ELSE ?4
+                 END,
+                 'observed_at', ?4
+             )
+         )
+         WHERE id=?1 AND status='merging'
+           AND (refs IS NULL OR json_valid(refs))",
+        params![id, state.as_str(), checks_json, now],
+    )?;
+    tx.commit()?;
+    Ok(changed == 1)
+}
+
+/// Remove the daemon-owned merge-checks snapshot. Returns `Ok(false)` when
+/// no snapshot was present.
+pub fn clear_merge_checks_snapshot(conn: &mut Connection, id: i64) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let changed = clear_merge_checks_tx(&tx, id)?;
+    tx.commit()?;
+    Ok(changed)
+}
+
+/// In-transaction clear used by every core transition out of `merging`.
+fn clear_merge_checks_tx(conn: &Connection, id: i64) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE tasks SET refs=json_remove(refs, '$.merge_checks')
+         WHERE id=?1 AND json_valid(refs)
+           AND json_type(refs, '$.merge_checks') IS NOT NULL",
+        params![id],
+    )?;
+    Ok(changed == 1)
 }
 
 /// The daemon-owned review-only close outcome (`changes_requested`,
@@ -982,6 +1115,7 @@ fn preserve_protected_refs(
     // below survive.
     if preserve_recovery_provenance {
         strip_review_outcome_refs(next_map);
+        next_map.remove(MERGE_CHECKS_REF);
     }
     if let Some(existing_map) = existing
         .as_deref()
@@ -1009,7 +1143,10 @@ fn preserve_protected_refs(
             let recovery_provenance = preserve_recovery_provenance
                 && matches!(
                     key.as_str(),
-                    "source_task" | MERGE_COMMIT_SHA_REF | POISON_RETRY_GENERATION_REF
+                    "source_task"
+                        | MERGE_COMMIT_SHA_REF
+                        | POISON_RETRY_GENERATION_REF
+                        | MERGE_CHECKS_REF
                 );
             if classifier_or_pr
                 || runner_state
@@ -1071,25 +1208,6 @@ pub fn compute_ready(conn: &Connection, depends_on: &Option<String>) -> Result<b
         |r| r.get(0),
     )?;
     Ok(unmet == 0)
-}
-
-/// Count tasks that have already started but not yet reached a terminal
-/// state, excluding one task id (the planning source itself, which sits in
-/// `planning` while draining and is not "started work" for this predicate).
-///
-/// Used by the decomposition drain-readiness gate: draining must wait for
-/// every already-started task to run through review/rework/remediation/merge
-/// to `done`/`failed`/`cancelled` before capturing the frozen base and
-/// entering `planning`. `open` tasks never started; the freeze blocks new
-/// claims, so the counted set can only shrink under drain.
-pub fn count_started_non_terminal_excluding(conn: &Connection, exclude_id: i64) -> Result<i64> {
-    Ok(conn.query_row(
-        "SELECT count(*) FROM tasks
-         WHERE status IN ('working','in-review','rework','merging')
-           AND id != ?1",
-        params![exclude_id],
-        |r| r.get(0),
-    )?)
 }
 
 fn merge_pr_into_refs(existing: &Option<String>, pr: &str) -> String {
@@ -1913,16 +2031,19 @@ pub fn claim_with_graph_limit(
                AND (json_extract(owner.refs, '$.pr') = tasks.continue_pr
                     OR json_extract(owner.refs, '$.pr') = CAST(tasks.continue_pr AS TEXT))))
     ))";
-    // The decomposition freeze blocks only NEW implementation starts, so this
-    // clause is applied to the status='open' branch alone. Existing in-flight
-    // work — reviewer attachment (status='in-review') here, plus rework and
-    // remediation in claim_provider_retry_rework / claim_remediation_rework —
-    // must still complete under the freeze, because the freeze's drain
-    // predicate waits for workers==0 && reviewers==0 before capturing the
-    // frozen base. Gating continuation on the freeze would deadlock it against
-    // its own drain.
+    // A planning freeze blocks only its own source task: planning a
+    // decomposition must not block unrelated task starts (owner decision
+    // 2026-11-09). The clause sits on the status='open' branch alone, as
+    // defense in depth beside the source's own `planning` status, so the
+    // planning source is never claimed as an implementation task while
+    // unrelated open tasks and other graphs' ready children stay claimable.
+    // In-flight continuation — reviewer attachment (status='in-review') here,
+    // plus rework and remediation in claim_provider_retry_rework /
+    // claim_remediation_rework — is never gated by the freeze.
     const NO_PLANNING_FREEZE_CLAUSE: &str = "NOT EXISTS (
-        SELECT 1 FROM task_decompositions WHERE freeze_active=1
+        SELECT 1 FROM task_decompositions planning_freeze
+        WHERE planning_freeze.freeze_active=1
+          AND planning_freeze.source_task_id=tasks.id
     )";
     // Keep graph authority in this BEGIN IMMEDIATE transaction so sibling
     // claims, failures, and graph blockers cannot race provisioning.
@@ -2407,16 +2528,15 @@ pub fn claim_remediation_rework_with_feedback(
 /// external provision.
 ///
 /// This deliberately does NOT gate on the repository decomposition freeze. A
-/// freeze blocks only a new open-status worker start (see `claim`, where the
-/// freeze clause sits inside the status='open' branch); existing in-flight
+/// freeze blocks only a new open-status worker start of the planning graph's
+/// own source task (see `claim`, where the source-scoped freeze clause sits
+/// inside the status='open' branch); existing in-flight
 /// continuation — reviewer attachment, rework, and remediation — must still
 /// complete. An already-published PR still needs its reviewer to finish. The
-/// freeze's
-/// quiescence contract is enforced by `decomposition_drain_ready`, which waits
-/// for workers==0 && reviewers==0 before capturing the frozen base — a state
-/// only reachable if in-flight reviews are allowed to run. Gating reservation
-/// on the freeze would strand a retained worker awaiting review and deadlock the
-/// freeze against its own drain.
+/// planner never waits on that work: its base is the base-branch head recorded
+/// when planning starts, read through a read-only snapshot archive. Gating
+/// reservation on the freeze would strand a retained worker awaiting review for
+/// the whole planning attempt.
 pub fn reserve_reviewer_provision(
     conn: &mut Connection,
     task_id: i64,
@@ -2954,6 +3074,20 @@ fn resolve_dependency_merge_commits(
     })();
     visiting.remove(&task_id);
     outcome
+}
+
+/// Whether a dependency is `done` because the owner ran `quorum task-close`.
+/// `close_manual` is the only writer of the `manual` completion provenance,
+/// and the column is durable (unlike the swept `task_closed_manual` event), so
+/// dependency-base admission can trust it as the manual-close record when no
+/// merge commit is recoverable.
+pub fn dependency_closed_manually(conn: &Connection, task_id: i64) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tasks
+         WHERE id=?1 AND status='done' AND completion_provenance=?2)",
+        params![task_id, COMPLETION_PROVENANCE_MANUAL],
+        |row| row.get(0),
+    )?)
 }
 
 /// Persist a merge commit recovered for a completed dependency. The PR lookup
@@ -4341,6 +4475,12 @@ where
             completion_provenance,
         ],
     )?;
+    // The merge-gate observation is only meaningful while merging; every
+    // lifecycle exit (done, rework, in-review, failed, cancelled) drops it in
+    // this same transaction.
+    if status == Status::Merging && new_status != Status::Merging {
+        clear_merge_checks_tx(&tx, id)?;
+    }
 
     let event_kind = format!("task_{}", new_status_str.replace('-', "_"));
     crate::events::emit(
@@ -4665,6 +4805,9 @@ pub fn update(
                 ],
             )?;
             cancel_applied = rows > 0;
+            if cancel_applied {
+                clear_merge_checks_tx(&tx, id)?;
+            }
             rows
         }
         _ => {
@@ -5399,9 +5542,9 @@ fn latest_worker_reaction_tx(
     })
 }
 
-/// Park a worker-owned task on its explicit `blocked` / `needs-info`
-/// reaction. Shared by turn-oriented runner exits and persistent workers
-/// whose turn ended on such a reaction. The caller commits.
+/// Park a worker-owned task on its explicit reaction: `blocked` /
+/// `needs-info` for turn-oriented runner exits, and additionally `failed` for
+/// live persistent workers. The caller commits.
 fn park_worker_on_reaction_tx(
     tx: &rusqlite::Transaction<'_>,
     id: i64,
@@ -5456,12 +5599,23 @@ pub enum PersistentReactionDisposition {
     NotParked,
 }
 
+/// The explicit reactions that park a live persistent worker's task. A
+/// persistent child stays alive after reacting, so every terminal reaction —
+/// including `failed` — is honored as a park instead of leaving the slot to
+/// the idle reaper, whose `AgentFailed` would respawn a worker on the
+/// unchanged contract. `note` is informational and never parks.
+pub fn is_persistent_park_reaction(state: &str) -> bool {
+    matches!(state, "blocked" | "needs-info" | "failed")
+}
+
 /// A persistent (stream-json) worker ended its turn after an explicit
-/// `blocked` / `needs-info` reaction. Turn-oriented runners reach the same
-/// park through `dispose_dead_turn_runner` when their process exits; a
-/// persistent child stays alive between turns, so without this the reaction
-/// would only be projected and the worker later idle-reaped as `AgentFailed`.
-/// A recorded or pending delivery always wins over the reaction.
+/// `blocked` / `needs-info` / `failed` reaction. Turn-oriented runners reach
+/// the `blocked` / `needs-info` park through `dispose_dead_turn_runner` when
+/// their process exits (their `failed` exit keeps its `AgentFailed`
+/// classification); a persistent child stays alive between turns, so without
+/// this the reaction would only be projected and the worker later
+/// idle-reaped as `AgentFailed`. A recorded or pending delivery always wins
+/// over the reaction.
 pub fn park_persistent_worker_reaction(
     conn: &mut Connection,
     id: i64,
@@ -5501,7 +5655,10 @@ pub fn park_persistent_worker_reaction(
         return Ok(PersistentReactionDisposition::NotParked);
     }
     let reaction = latest_worker_reaction_tx(&tx, agent, id)?;
-    let Some(reason @ ("blocked" | "needs-info")) = reaction.as_deref() else {
+    let Some(reason) = reaction
+        .as_deref()
+        .filter(|state| is_persistent_park_reaction(state))
+    else {
         tx.commit()?;
         return Ok(PersistentReactionDisposition::NotParked);
     };
@@ -5560,6 +5717,9 @@ pub(crate) fn set_parked_refs(
     object.remove(PARKED_UNSATISFIABLE_REF);
     // A terminal task cannot retain an automatic replacement-worker intent.
     object.remove(RECOVERED_REMEDIATION_RETRY_REF);
+    // Every park leaves `merging` (if it was there); the merge-gate
+    // observation belongs only to a live merging task.
+    object.remove(MERGE_CHECKS_REF);
     // Reset the publication-failure classification on every park so a prior
     // pr-closed park cannot contaminate a subsequent generic park.
     match publication_failure_kind {
@@ -6464,8 +6624,8 @@ pub fn cancelled_dep_ids(conn: &Connection, id: i64) -> Result<Vec<i64>> {
 /// Both reviewer-cap park sites resume to `in-review`, where the next provision
 /// pass would re-park a task at the cap, so restoring one reports success for
 /// nothing. Parks that [`retry_parked`] settles before this gate (a merged
-/// publication, a classifier policy park, or any park under a decomposition
-/// freeze) return `None` so their outcomes stay unchanged. Side-effect free:
+/// publication, a classifier policy park, or the source task of a graph whose
+/// decomposition freeze is active) return `None` so their outcomes stay unchanged. Side-effect free:
 /// the CLI uses it to name the reason and `retry_parked` to enforce it.
 pub fn reviewer_cap_retry_refusal(conn: &Connection, id: i64) -> Result<Option<String>> {
     let cap_decides: bool = conn.query_row(
@@ -6476,7 +6636,10 @@ pub fn reviewer_cap_retry_refusal(conn: &Connection, id: i64) -> Result<Option<S
                AND json_extract(refs, '$.daemon_resume_status')='in-review'
                AND COALESCE(json_extract(refs, '$.classifier_policy_parked'), 0)<>1
                AND COALESCE(json_extract(refs, '$.daemon_publication_failure_kind'), '')<>?2
-         ) AND NOT EXISTS(SELECT 1 FROM task_decompositions WHERE freeze_active=1)",
+         ) AND NOT EXISTS(
+             SELECT 1 FROM task_decompositions
+             WHERE freeze_active=1 AND source_task_id=?1
+         )",
         params![id, PUBLICATION_FAILURE_KIND_PR_MERGED],
         |row| row.get(0),
     )?;
@@ -6571,21 +6734,23 @@ pub fn retry_parked(
         params![id],
         |row| row.get(0),
     )?;
-    // Non-growth under a decomposition freeze: restoring a parked task to a
-    // non-terminal status while `freeze_active=1` would add started work to
-    // the drain-quiescence set that the frozen-base capture waits on. Refuse
-    // the restore; the operator can rerun once planning materializes and the
-    // freeze clears. The policy-parked branch keeps status='failed', so it
-    // does not grow the counted set and is allowed under a freeze.
+    // A planning freeze guards only its own source task: restoring the source
+    // of a graph with `freeze_active=1` to a non-terminal status would let it
+    // start as implementation work while it is being planned. Refuse that
+    // restore; the operator can rerun once planning materializes and the
+    // freeze clears. Parked tasks unrelated to the planning graph retry
+    // normally (owner decision 2026-11-09). The policy-parked branch keeps
+    // status='failed', so it is allowed even for the source.
     if !policy_parked {
         let freeze_active: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM task_decompositions WHERE freeze_active=1",
-            [],
+            "SELECT COUNT(*) FROM task_decompositions
+             WHERE freeze_active=1 AND source_task_id=?1",
+            params![id],
             |row| row.get(0),
         )?;
         if freeze_active > 0 {
             return Err(QuorumError::Usage(format!(
-                "cannot retry task #{id}: a decomposition freeze is active; \
+                "cannot retry task #{id}: its decomposition freeze is active; \
                  wait for planning to materialize before retrying"
             )));
         }
@@ -7153,6 +7318,128 @@ pub fn retry_provider_blocked(
     Ok(Some(task))
 }
 
+/// Outcome of [`discard_unresumable_runner_retry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerRetryDiscard {
+    /// The exact pending turn was dropped and one daemon note was appended.
+    Discarded,
+    /// Clean negative: the task, holder, or stored turn no longer matches
+    /// (for example a concurrent `task-retry` won, or the turn was already
+    /// discarded). Nothing was written.
+    NoLongerMatching,
+}
+
+/// Upper bound for the holder and profile identities echoed into the note.
+const RUNNER_RETRY_DISCARD_IDENT_MAX_BYTES: usize = 256;
+
+fn validate_runner_retry_discard_ident(label: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > RUNNER_RETRY_DISCARD_IDENT_MAX_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(QuorumError::BadInput(format!(
+            "{label} must be 1..={RUNNER_RETRY_DISCARD_IDENT_MAX_BYTES} bytes without \
+             NUL or control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Atomically drop a requested runner retry turn that the task's current
+/// worker profile cannot resume.
+///
+/// In one `BEGIN IMMEDIATE` transaction this re-reads the task refs and
+/// requires the stored requested turn (neutral `runner_retry` or historical
+/// `codex_retry_*`) to equal `expected_turn` exactly. The guarded
+/// `UPDATE … RETURNING` then compares the whole refs text that was read, the
+/// status, and that `holder` is still the assignee or the live lease holder,
+/// so any concurrent change to the turn is a zero-row clean negative.
+///
+/// On success the retry, its provider block, and the worker continuation are
+/// removed in both representations (see
+/// [`runner_state::discard_provider_retry`]), and one daemon note names the
+/// dropped provider/model/effort and `new_profile_id`. A `rework` task also
+/// gains [`PARKED_REWORK_RETRY_REF`], which every predicate that admitted the
+/// requested `runner_retry` (`claim_provider_retry_rework`, the lapsed-lease
+/// sweep exemption) also admits, so the task stays claimable by a fresh worker
+/// after a daemon restart. A second call on the cleared turn no longer
+/// matches, so the discard happens at most once per stored turn.
+pub fn discard_unresumable_runner_retry(
+    conn: &mut Connection,
+    task_id: i64,
+    holder: &str,
+    expected_turn: &PendingTurn,
+    new_profile_id: &str,
+    now: i64,
+) -> Result<RunnerRetryDiscard> {
+    validate_runner_retry_discard_ident("holder", holder)?;
+    validate_runner_retry_discard_ident("new profile id", new_profile_id)?;
+    let tx = begin_immediate(conn)?;
+    let current = tx
+        .query_row(
+            "SELECT status, refs FROM tasks WHERE id=?1",
+            params![task_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let Some((status, Some(refs_raw))) = current else {
+        return Ok(RunnerRetryDiscard::NoLongerMatching);
+    };
+    let Ok(mut refs) = serde_json::from_str::<serde_json::Value>(&refs_raw) else {
+        return Ok(RunnerRetryDiscard::NoLongerMatching);
+    };
+    if !refs.is_object() || runner_state::requested_retry_any(&refs).as_ref() != Some(expected_turn)
+    {
+        return Ok(RunnerRetryDiscard::NoLongerMatching);
+    }
+    runner_state::discard_provider_retry(&mut refs);
+    if status == "rework" {
+        refs[PARKED_REWORK_RETRY_REF] = serde_json::Value::Bool(true);
+    }
+    let discarded = tx
+        .query_row(
+            "UPDATE tasks SET refs=?2, updated_at=?3
+             WHERE id=?1 AND status=?4 AND refs=?5
+               AND (
+                   assignee=?6
+                   OR EXISTS (
+                       SELECT 1 FROM claims c
+                       WHERE c.target=?7 AND c.holder=?6
+                         AND c.active=1 AND c.expires_at > ?3
+                   )
+               )
+             RETURNING id",
+            params![
+                task_id,
+                refs.to_string(),
+                now,
+                status,
+                refs_raw,
+                holder,
+                lease_target(task_id),
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if discarded.is_none() {
+        return Ok(RunnerRetryDiscard::NoLongerMatching);
+    }
+    let turn = expected_turn;
+    add_note_tx(
+        &tx,
+        "daemon",
+        task_id,
+        &format!(
+            "runner retry discarded: pending {} turn on {}/{} (effort {}) is not resumable \
+             by worker profile {new_profile_id}; the next worker turn starts fresh",
+            turn.turn_kind, turn.provider, turn.model, turn.effort,
+        ),
+        now,
+    )?;
+    tx.commit()?;
+    Ok(RunnerRetryDiscard::Discarded)
+}
+
 // ── target branch ────────────────────────────────────────────────────────────
 
 /// One-time resolution of a task's target branch. Succeeds only when the
@@ -7234,6 +7521,7 @@ fn close_after_merge_inner(
         tx.commit()?;
         return Ok(false);
     }
+    clear_merge_checks_tx(&tx, id)?;
     deactivate_lease(&tx, id, now)?;
     tx.execute(
         "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, 'daemon', ?3)",
@@ -7317,6 +7605,7 @@ pub fn close_manual(
         tx.commit()?;
         return Ok(None);
     }
+    clear_merge_checks_tx(&tx, id)?;
     // Mark this dependency done before the opportunistic failed-dependency
     // sweep. A recovered failed task can otherwise cause the same write to
     // park all of its dependents just before this manual resolution unblocks
@@ -9028,6 +9317,10 @@ mod tests {
             ("blocked", false),
             ("needs-info", false),
             ("needs-info", true),
+            // A live persistent worker stays alive after `failed`; parking it
+            // keeps the idle reaper from respawning on the unchanged contract.
+            ("failed", false),
+            ("failed", true),
         ] {
             let (_d, mut c) = open_tmp();
             let id = persistent_worker_task(&mut c);
@@ -9081,7 +9374,7 @@ mod tests {
 
     #[test]
     fn persistent_worker_without_parkable_reaction_is_untouched() {
-        for state in [None, Some("note"), Some("failed")] {
+        for state in [None, Some("note")] {
             let (_d, mut c) = open_tmp();
             let id = persistent_worker_task(&mut c);
             if let Some(state) = state {
@@ -9097,9 +9390,15 @@ mod tests {
 
     #[test]
     fn persistent_worker_pending_delivery_outranks_reaction() {
+        for state in ["blocked", "needs-info", "failed"] {
+            persistent_worker_pending_delivery_outranks(state);
+        }
+    }
+
+    fn persistent_worker_pending_delivery_outranks(state: &str) {
         let (_d, mut c) = open_tmp();
         let id = persistent_worker_task(&mut c);
-        worker_reacts(&mut c, id, "needs-info");
+        worker_reacts(&mut c, id, state);
         crate::mailbox::append(
             &mut c,
             &crate::mailbox::MailboxRow {
@@ -9116,8 +9415,22 @@ mod tests {
         )
         .unwrap();
         let disposition = park_persistent_worker_reaction(&mut c, id, "worker", 1001).unwrap();
-        assert_eq!(disposition, PersistentReactionDisposition::NotParked);
-        assert_eq!(get(&c, id).unwrap().unwrap().status, "working");
+        assert_eq!(
+            disposition,
+            PersistentReactionDisposition::NotParked,
+            "{state}"
+        );
+        assert_eq!(get(&c, id).unwrap().unwrap().status, "working", "{state}");
+    }
+
+    #[test]
+    fn persistent_park_reactions_are_exactly_the_terminal_reactions() {
+        for state in ["blocked", "needs-info", "failed"] {
+            assert!(is_persistent_park_reaction(state), "{state}");
+        }
+        for state in ["note", "", "done", "NEEDS-INFO"] {
+            assert!(!is_persistent_park_reaction(state), "{state}");
+        }
     }
 
     #[test]
@@ -10165,6 +10478,308 @@ mod tests {
         let r = apply_event(&mut c, "system", id, &Event::MergeSucceeded, 1004).unwrap();
         assert_eq!(r.task.status, "done");
         assert!(r.effects.contains(&Effect::ReleaseLease));
+    }
+
+    /// Walk a fresh task to `merging` through the real lifecycle.
+    fn merging_task(c: &mut Connection, now: i64) -> i64 {
+        let (worker, reviewer) = (format!("A{now}"), format!("R{now}"));
+        let id = create(c, "boss", "t", None, 0, None, None, None, None, now).unwrap();
+        claim(c, &worker, Some(id), &[], TTL, now + 1).unwrap();
+        apply_event(
+            c,
+            &worker,
+            id,
+            &Event::SignaledDone {
+                pr: "99".to_string(),
+            },
+            now + 2,
+        )
+        .unwrap();
+        claim(c, &reviewer, Some(id), &[], TTL, now + 3).unwrap();
+        let r = apply_event(c, &reviewer, id, &Event::VerdictApprove, now + 4).unwrap();
+        assert_eq!(r.task.status, "merging");
+        id
+    }
+
+    fn task_refs(c: &Connection, id: i64) -> Option<String> {
+        c.query_row("SELECT refs FROM tasks WHERE id=?1", [id], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn snapshot(c: &Connection, id: i64) -> Option<MergeChecksSnapshot> {
+        merge_checks_of(task_refs(c, id).as_deref())
+    }
+
+    fn has_merge_checks_key(c: &Connection, id: i64) -> bool {
+        task_refs(c, id)
+            .and_then(|r| serde_json::from_str::<serde_json::Value>(&r).ok())
+            .is_some_and(|v| v.get(MERGE_CHECKS_REF).is_some())
+    }
+
+    #[test]
+    fn merge_checks_snapshot_is_guarded_bounded_and_keeps_since_per_state() {
+        let (_d, mut c) = open_tmp();
+        let open_id = create(&mut c, "boss", "o", None, 0, None, None, None, None, 1000).unwrap();
+        let names = vec!["ci".to_string()];
+        assert!(
+            !set_merge_checks_snapshot(&mut c, open_id, MergeChecksState::Pending, &names, 1001)
+                .unwrap(),
+            "non-merging write is a clean negative"
+        );
+        assert!(!has_merge_checks_key(&c, open_id));
+        let errors: i64 = c
+            .query_row("SELECT count(*) FROM errors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(errors, 0, "a guarded miss never records an errors row");
+
+        let id = merging_task(&mut c, 1100);
+        let mut many: Vec<String> = (0..25).map(|i| format!("check-{i}")).collect();
+        many[0] = "nul\0name".to_string();
+        many[1] = "x".repeat(MERGE_CHECKS_MAX_NAME_CHARS * 3);
+        many[2] = "\0\0".to_string();
+        assert!(
+            set_merge_checks_snapshot(&mut c, id, MergeChecksState::Pending, &many, 2000).unwrap()
+        );
+        let snap = snapshot(&c, id).unwrap();
+        assert_eq!(snap.state, MergeChecksState::Pending);
+        assert_eq!(snap.checks.len(), MERGE_CHECKS_MAX_NAMES);
+        assert_eq!(snap.checks[0], "nulname");
+        assert_eq!(snap.checks[1].chars().count(), MERGE_CHECKS_MAX_NAME_CHARS);
+        assert_eq!(snap.checks[2], "check-3", "blank names are skipped");
+        assert!(snap.checks.iter().all(|n| !n.contains('\0')));
+        assert_eq!((snap.since, snap.observed_at), (2000, 2000));
+        // Unrelated refs survive the json_set.
+        let refs: serde_json::Value =
+            serde_json::from_str(task_refs(&c, id).as_deref().unwrap()).unwrap();
+        assert_eq!(refs["pr"], 99);
+
+        assert!(
+            set_merge_checks_snapshot(&mut c, id, MergeChecksState::Pending, &names, 2010).unwrap()
+        );
+        let snap = snapshot(&c, id).unwrap();
+        assert_eq!((snap.since, snap.observed_at), (2000, 2010));
+        assert_eq!(snap.checks, names);
+
+        assert!(
+            set_merge_checks_snapshot(&mut c, id, MergeChecksState::Failing, &names, 2020).unwrap()
+        );
+        let snap = snapshot(&c, id).unwrap();
+        assert_eq!(snap.state, MergeChecksState::Failing);
+        assert_eq!((snap.since, snap.observed_at), (2020, 2020));
+
+        assert!(
+            set_merge_checks_snapshot(&mut c, id, MergeChecksState::Passed, &[], 2030).unwrap()
+        );
+        let snap = snapshot(&c, id).unwrap();
+        assert_eq!(snap.state, MergeChecksState::Passed);
+        assert!(snap.checks.is_empty());
+        assert_eq!((snap.since, snap.observed_at), (2030, 2030));
+
+        assert!(clear_merge_checks_snapshot(&mut c, id).unwrap());
+        assert!(!has_merge_checks_key(&c, id));
+        assert!(!clear_merge_checks_snapshot(&mut c, id).unwrap());
+    }
+
+    #[test]
+    fn merge_checks_of_tolerates_absent_and_malformed_snapshots() {
+        assert!(merge_checks_of(None).is_none());
+        assert!(merge_checks_of(Some("not json")).is_none());
+        assert!(merge_checks_of(Some("[1]")).is_none());
+        assert!(merge_checks_of(Some(r#"{"pr":1}"#)).is_none());
+        assert!(merge_checks_of(Some(r#"{"merge_checks":"pending"}"#)).is_none());
+        assert!(merge_checks_of(Some(
+            r#"{"merge_checks":{"state":"weird","checks":[],"since":1,"observed_at":1}}"#
+        ))
+        .is_none());
+        assert!(merge_checks_of(Some(
+            r#"{"merge_checks":{"state":"pending","checks":[],"since":"x","observed_at":1}}"#
+        ))
+        .is_none());
+        assert_eq!(
+            merge_checks_of(Some(
+                r#"{"merge_checks":{"state":"passed","checks":["a"],"since":3,"observed_at":4}}"#
+            )),
+            Some(MergeChecksSnapshot {
+                state: MergeChecksState::Passed,
+                checks: vec!["a".into()],
+                since: 3,
+                observed_at: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn every_exit_from_merging_clears_merge_checks_in_the_transition() {
+        let (_d, mut c) = open_tmp();
+        let names = vec!["ci".to_string()];
+        type Exit = Box<dyn Fn(&mut Connection, i64, i64)>;
+        let exits: Vec<(&str, Exit)> = vec![
+            (
+                "done",
+                Box::new(|c, id, now| {
+                    apply_event(c, "daemon", id, &Event::MergeSucceeded, now).unwrap();
+                }),
+            ),
+            (
+                "rework",
+                Box::new(|c, id, now| {
+                    apply_event(c, "daemon", id, &Event::MergeConflict, now).unwrap();
+                }),
+            ),
+            (
+                "in-review",
+                Box::new(|c, id, now| {
+                    apply_event(
+                        c,
+                        "daemon",
+                        id,
+                        &Event::MergeFailed {
+                            reason: "gh".into(),
+                        },
+                        now,
+                    )
+                    .unwrap();
+                }),
+            ),
+            (
+                "cancelled",
+                Box::new(|c, id, now| {
+                    apply_event(
+                        c,
+                        "daemon",
+                        id,
+                        &Event::Cancelled { by: "boss".into() },
+                        now,
+                    )
+                    .unwrap();
+                }),
+            ),
+            (
+                "failed",
+                Box::new(|c, id, now| {
+                    park(c, id, "uncertain merge", "in-review", now)
+                        .unwrap()
+                        .unwrap();
+                }),
+            ),
+            (
+                "done",
+                Box::new(|c, id, now| {
+                    assert!(close_after_merge(c, id, "merged externally", now).unwrap());
+                }),
+            ),
+            (
+                "cancelled",
+                Box::new(|c, id, now| {
+                    let fields = TaskUpdate {
+                        status: Some("cancelled"),
+                        ..Default::default()
+                    };
+                    update(c, "boss", id, &fields, now).unwrap();
+                }),
+            ),
+        ];
+        for (offset, (expected, exit)) in exits.into_iter().enumerate() {
+            let base = 2000 + (offset as i64) * 100;
+            let id = merging_task(&mut c, base);
+            assert!(set_merge_checks_snapshot(
+                &mut c,
+                id,
+                MergeChecksState::Failing,
+                &names,
+                base + 10
+            )
+            .unwrap());
+            assert!(has_merge_checks_key(&c, id));
+            exit(&mut c, id, base + 20);
+            let status: String = c
+                .query_row("SELECT status FROM tasks WHERE id=?1", [id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(status, expected);
+            assert!(
+                !has_merge_checks_key(&c, id),
+                "{expected} exit must clear merge_checks"
+            );
+            assert!(
+                !set_merge_checks_snapshot(
+                    &mut c,
+                    id,
+                    MergeChecksState::Pending,
+                    &names,
+                    base + 21
+                )
+                .unwrap(),
+                "{expected}: writer is guarded once the task left merging"
+            );
+            assert!(!has_merge_checks_key(&c, id));
+        }
+    }
+
+    #[test]
+    fn controlled_shutdown_keeps_merge_checks_while_still_merging() {
+        let (_d, mut c) = open_tmp();
+        let id = merging_task(&mut c, 1000);
+        let names = vec!["ci".to_string()];
+        assert!(
+            set_merge_checks_snapshot(&mut c, id, MergeChecksState::Pending, &names, 1100).unwrap()
+        );
+        let r = apply_event(&mut c, "daemon", id, &Event::ControlledShutdown, 1101).unwrap();
+        assert_eq!(r.task.status, "merging");
+        assert_eq!(snapshot(&c, id).unwrap().since, 1100);
+    }
+
+    #[test]
+    fn creators_cannot_set_or_erase_merge_checks_but_daemon_refs_can() {
+        let err = validate_creator_refs(Some(
+            r#"{"merge_checks":{"state":"passed","checks":[],"since":1,"observed_at":1}}"#,
+        ))
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(format!("{err}").contains("'merge_checks' is daemon-owned"));
+
+        let (_d, mut c) = open_tmp();
+        let established = r#"{"state":"pending","checks":["ci"],"since":5,"observed_at":6}"#;
+        let id = create(
+            &mut c,
+            "boss",
+            "t",
+            None,
+            0,
+            None,
+            Some(&format!(r#"{{"merge_checks":{established}}}"#)),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        let expected: MergeChecksSnapshot = serde_json::from_str(established).unwrap();
+        // Replacement that omits the key cannot erase it.
+        let fields = TaskUpdate {
+            refs: Some(r#"{"ticket":"ABC"}"#),
+            expected_revision: Some(1),
+            ..Default::default()
+        };
+        update(&mut c, "boss", id, &fields, 1001).unwrap();
+        assert_eq!(snapshot(&c, id), Some(expected.clone()));
+        // Replacement that forges the key cannot rewrite it.
+        let fields = TaskUpdate {
+            refs: Some(
+                r#"{"merge_checks":{"state":"passed","checks":[],"since":9,"observed_at":9}}"#,
+            ),
+            expected_revision: Some(2),
+            ..Default::default()
+        };
+        update(&mut c, "boss", id, &fields, 1002).unwrap();
+        assert_eq!(snapshot(&c, id), Some(expected.clone()));
+        // Creator replacement cannot introduce it on a task that lacks it.
+        assert!(preserve_creator_protected_refs(
+            &Some(r#"{"ticket":"ABC"}"#.into()),
+            Some(r#"{"merge_checks":{"state":"passed"}}"#)
+        )
+        .is_some_and(|refs| !refs.contains(MERGE_CHECKS_REF)));
+        // The daemon-authoritative path may clear it.
+        update_refs_daemon(&mut c, id, r#"{"ticket":"ABC"}"#, 1003).unwrap();
+        assert!(snapshot(&c, id).is_none());
     }
 
     #[test]
@@ -11335,6 +11950,36 @@ mod tests {
             !events.iter().any(|e| e.kind == "task_done" && e.ts == 1001),
             "must NOT emit task_done"
         );
+    }
+
+    #[test]
+    fn dependency_closed_manually_requires_done_manual_provenance() {
+        let (_d, mut c) = open_tmp();
+        let manual = create(&mut c, "boss", "m", None, 0, None, None, None, None, 1000).unwrap();
+        let merged = create(&mut c, "boss", "d", None, 0, None, None, None, None, 1000).unwrap();
+        let open = create(&mut c, "boss", "o", None, 0, None, None, None, None, 1000).unwrap();
+        assert!(!dependency_closed_manually(&c, manual).unwrap());
+        c.execute("UPDATE tasks SET status='failed' WHERE id=?1", [manual])
+            .unwrap();
+        close_manual(&mut c, "owner", manual, "landed elsewhere", None, 1001).unwrap();
+        c.execute(
+            "UPDATE tasks SET status='done',completion_provenance=?2 WHERE id=?1",
+            params![merged, COMPLETION_PROVENANCE_MERGED],
+        )
+        .unwrap();
+
+        assert!(dependency_closed_manually(&c, manual).unwrap());
+        assert!(!dependency_closed_manually(&c, merged).unwrap());
+        assert!(!dependency_closed_manually(&c, open).unwrap());
+        assert!(!dependency_closed_manually(&c, 9_999).unwrap());
+        // The record must survive event expiry: provenance, not the event, is
+        // the durable manual-close witness.
+        c.execute("DELETE FROM events", []).unwrap();
+        assert!(dependency_closed_manually(&c, manual).unwrap());
+        // A task reopened out of `done` is no longer a satisfied dependency.
+        c.execute("UPDATE tasks SET status='open' WHERE id=?1", [manual])
+            .unwrap();
+        assert!(!dependency_closed_manually(&c, manual).unwrap());
     }
 
     // ── notes ───────────────────────────────────────────────────────────────
@@ -14407,6 +15052,7 @@ mod tests {
         let graph = crate::decomposition::begin_planning(
             &mut conn,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 provider: "codex",
@@ -14442,6 +15088,7 @@ mod tests {
             graph,
             1,
             &[child("a"), child("b")],
+            1,
             4,
         )
         .unwrap()
@@ -14631,6 +15278,7 @@ mod tests {
         let graph = crate::decomposition::begin_planning(
             &mut conn,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: 1,
                 expected_revision: 1,
                 provider: "codex",
@@ -14666,6 +15314,7 @@ mod tests {
             graph,
             1,
             &[child("a"), child("b")],
+            1,
             4,
         )
         .unwrap()
@@ -15988,6 +16637,341 @@ mod tests {
             .is_none());
     }
 
+    fn requested_codex_retry() -> PendingTurn {
+        PendingTurn {
+            provider: "codex".into(),
+            model: "gpt-5".into(),
+            effort: "high".into(),
+            prompt: "finish exact turn".into(),
+            turn_kind: "rework".into(),
+            continuation_id: Some("thread-neutral".into()),
+            requested: true,
+        }
+    }
+
+    fn discard_notes(conn: &Connection, id: i64) -> Vec<(String, String)> {
+        conn.prepare("SELECT agent, body FROM task_notes WHERE task_id=?1 ORDER BY id")
+            .unwrap()
+            .query_map(params![id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn error_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM errors", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn discard_refs(conn: &Connection, id: i64) -> serde_json::Value {
+        serde_json::from_str(get(conn, id).unwrap().unwrap().refs.as_deref().unwrap()).unwrap()
+    }
+
+    /// A claimed `working` task whose requested neutral Codex retry also left
+    /// historical Codex keys and a worker continuation behind.
+    fn claimed_task_with_requested_retry(conn: &mut Connection) -> i64 {
+        let id = create(conn, "owner", "task", None, 0, None, None, None, None, 10).unwrap();
+        claim(conn, "worker", Some(id), &[], TTL, 11).unwrap();
+        let mut refs = serde_json::json!({
+            "pr": 420,
+            crate::runner_state::CONTINUATION_REF: {"provider": "codex", "id": "thread-neutral"},
+            "codex_thread_id": "thread-old",
+            "codex_retry_requested": true,
+            "codex_retry_model": "gpt-5",
+            "codex_retry_effort": "high",
+            "codex_retry_prompt": "finish exact turn",
+            "codex_retry_turn_kind": "rework",
+            "codex_retry_thread_id": "thread-old"
+        });
+        refs[crate::runner_state::RETRY_REF] =
+            serde_json::to_value(requested_codex_retry()).unwrap();
+        update_refs_daemon(conn, id, &refs.to_string(), 12).unwrap();
+        id
+    }
+
+    fn assert_runner_retry_absent(refs: &serde_json::Value) {
+        for key in [
+            crate::runner_state::RETRY_REF,
+            crate::runner_state::CONTINUATION_REF,
+            crate::runner_state::PROVIDER_BLOCK_REF,
+            "codex_thread_id",
+            "codex_provider_blocked",
+            "codex_provider_error",
+            "codex_retry_requested",
+            "codex_retry_model",
+            "codex_retry_effort",
+            "codex_retry_prompt",
+            "codex_retry_turn_kind",
+            "codex_retry_thread_id",
+        ] {
+            assert!(refs.get(key).is_none(), "{key} survived discard: {refs}");
+        }
+    }
+
+    #[test]
+    fn unresumable_runner_retry_discard_clears_turn_and_notes_once() {
+        let (_dir, mut conn) = open_tmp();
+        let id = claimed_task_with_requested_retry(&mut conn);
+
+        let outcome = discard_unresumable_runner_retry(
+            &mut conn,
+            id,
+            "worker",
+            &requested_codex_retry(),
+            "worker.M.claude-opus",
+            13,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, RunnerRetryDiscard::Discarded);
+        let task = get(&conn, id).unwrap().unwrap();
+        assert_eq!(task.status, "working");
+        assert_eq!(task.assignee.as_deref(), Some("worker"));
+        let refs = discard_refs(&conn, id);
+        assert_runner_retry_absent(&refs);
+        assert_eq!(refs["pr"], 420);
+        assert!(refs.get(PARKED_REWORK_RETRY_REF).is_none());
+        let notes = discard_notes(&conn, id);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].0, "daemon");
+        for fragment in ["codex/gpt-5", "effort high", "worker.M.claude-opus"] {
+            assert!(notes[0].1.contains(fragment), "note {:?}", notes[0].1);
+        }
+
+        // Bounded: the cleared turn can never be discarded (or noted) again.
+        let again = discard_unresumable_runner_retry(
+            &mut conn,
+            id,
+            "worker",
+            &requested_codex_retry(),
+            "worker.M.claude-opus",
+            14,
+        )
+        .unwrap();
+        assert_eq!(again, RunnerRetryDiscard::NoLongerMatching);
+        assert_eq!(discard_notes(&conn, id).len(), 1);
+        assert_eq!(discard_refs(&conn, id), refs);
+        assert_eq!(error_rows(&conn), 0);
+    }
+
+    #[test]
+    fn unresumable_runner_retry_discard_mismatch_is_clean_negative() {
+        let (_dir, mut conn) = open_tmp();
+        let id = claimed_task_with_requested_retry(&mut conn);
+        let before = get(&conn, id).unwrap().unwrap();
+
+        let mut mismatches = Vec::new();
+        for (field, edit) in [
+            (
+                "provider",
+                (|t: &mut PendingTurn| t.provider = "claude".into()) as fn(&mut _),
+            ),
+            ("model", |t| t.model = "gpt-4".into()),
+            ("effort", |t| t.effort = "low".into()),
+            ("prompt", |t| t.prompt = "other".into()),
+            ("turn_kind", |t| t.turn_kind = "initial".into()),
+            ("continuation", |t| {
+                t.continuation_id = Some("thread-x".into())
+            }),
+            ("no continuation", |t| t.continuation_id = None),
+            ("not requested", |t| t.requested = false),
+        ] {
+            let mut turn = requested_codex_retry();
+            edit(&mut turn);
+            mismatches.push((field.to_string(), "worker", turn));
+        }
+        mismatches.push(("holder".into(), "other-worker", requested_codex_retry()));
+        for (label, holder, turn) in &mismatches {
+            let outcome =
+                discard_unresumable_runner_retry(&mut conn, id, holder, turn, "profile-b", 13)
+                    .unwrap();
+            assert_eq!(outcome, RunnerRetryDiscard::NoLongerMatching, "{label}");
+        }
+        assert_eq!(
+            discard_unresumable_runner_retry(
+                &mut conn,
+                id + 100,
+                "worker",
+                &requested_codex_retry(),
+                "profile-b",
+                13
+            )
+            .unwrap(),
+            RunnerRetryDiscard::NoLongerMatching
+        );
+
+        let after = get(&conn, id).unwrap().unwrap();
+        assert_eq!(after.refs, before.refs);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert!(discard_notes(&conn, id).is_empty());
+        assert_eq!(error_rows(&conn), 0);
+    }
+
+    #[test]
+    fn unresumable_runner_retry_discard_loses_to_prior_task_retry() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 10,
+        )
+        .unwrap();
+        claim(&mut conn, "worker", Some(id), &[], TTL, 11).unwrap();
+        // A provider block that coexists with a requested turn: both the
+        // operator retry and the discard are individually admissible.
+        let mut refs = serde_json::json!({
+            crate::runner_state::PROVIDER_BLOCK_REF: {"provider": "codex", "reason": "quota"},
+        });
+        refs[crate::runner_state::RETRY_REF] =
+            serde_json::to_value(requested_codex_retry()).unwrap();
+        update_refs_daemon(&mut conn, id, &refs.to_string(), 12).unwrap();
+
+        retry_provider_blocked(&mut conn, id, "operator", 13)
+            .unwrap()
+            .expect("task-retry wins first");
+        let after_retry = get(&conn, id).unwrap().unwrap();
+
+        let outcome = discard_unresumable_runner_retry(
+            &mut conn,
+            id,
+            "worker",
+            &requested_codex_retry(),
+            "profile-b",
+            14,
+        )
+        .unwrap();
+        assert_eq!(outcome, RunnerRetryDiscard::NoLongerMatching);
+        assert_eq!(get(&conn, id).unwrap().unwrap().refs, after_retry.refs);
+        assert!(discard_notes(&conn, id).is_empty());
+        assert_eq!(error_rows(&conn), 0);
+    }
+
+    #[test]
+    fn unresumable_runner_retry_discard_clears_legacy_only_codex_record() {
+        let (_dir, mut conn) = open_tmp();
+        let id = create(
+            &mut conn, "owner", "task", None, 0, None, None, None, None, 10,
+        )
+        .unwrap();
+        claim(&mut conn, "worker", Some(id), &[], TTL, 11).unwrap();
+        let legacy = serde_json::json!({
+            "codex_thread_id": "thread-old",
+            "codex_retry_requested": true,
+            "codex_retry_model": "gpt-5",
+            "codex_retry_effort": "medium",
+            "codex_retry_prompt": "finish",
+            "codex_retry_turn_kind": "rework",
+            "codex_retry_thread_id": "thread-old"
+        });
+        update_refs_daemon(&mut conn, id, &legacy.to_string(), 12).unwrap();
+        let turn = crate::runner_state::requested_retry_any(&legacy).unwrap();
+
+        let outcome =
+            discard_unresumable_runner_retry(&mut conn, id, "worker", &turn, "profile-b", 13)
+                .unwrap();
+
+        assert_eq!(outcome, RunnerRetryDiscard::Discarded);
+        let refs = discard_refs(&conn, id);
+        assert_runner_retry_absent(&refs);
+        assert!(
+            crate::runner_state::continuation(&refs, ContinuationSlot::Worker, "codex").is_none()
+        );
+        let notes = discard_notes(&conn, id);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].1.contains("codex/gpt-5 (effort medium)"));
+        assert!(notes[0].1.contains("profile-b"));
+    }
+
+    #[test]
+    fn unresumable_rework_retry_discard_stays_claimable_after_restart() {
+        let (_dir, mut conn) = open_tmp();
+        let mut refs = serde_json::json!({
+            "pr": 77,
+            "cx_est": 3, "cx_size": "M", "cx_ready": true,
+            "cx_not_ready_reason": null, "cx_by": "test:v2"
+        });
+        refs[crate::runner_state::RETRY_REF] =
+            serde_json::to_value(requested_codex_retry()).unwrap();
+        let id = create(
+            &mut conn,
+            "owner",
+            "rework retry",
+            None,
+            0,
+            None,
+            Some(&refs.to_string()),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='rework', assignee=NULL WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        claim_provider_retry_rework(&mut conn, "worker", id, TTL, 11)
+            .unwrap()
+            .expect("requested runner retry admits the first worker");
+
+        let outcome = discard_unresumable_runner_retry(
+            &mut conn,
+            id,
+            "worker",
+            &requested_codex_retry(),
+            "profile-b",
+            12,
+        )
+        .unwrap();
+        assert_eq!(outcome, RunnerRetryDiscard::Discarded);
+        let refs = discard_refs(&conn, id);
+        assert_runner_retry_absent(&refs);
+        assert_eq!(refs[PARKED_REWORK_RETRY_REF], true);
+
+        // Daemon restart: the dead worker's lease lapses and recovery drops
+        // its assignment. The sweep must not reap the task out of `rework`,
+        // and a fresh worker must still be admitted.
+        conn.execute("UPDATE tasks SET assignee=NULL WHERE id=?1", params![id])
+            .unwrap();
+        let later = 12 + TTL + crate::sweep::REWORK_PROVISIONING_GRACE_SECS;
+        {
+            let tx = begin_immediate(&mut conn).unwrap();
+            crate::sweep::sweep_on_write(&tx, later, SWEEP_LIMIT).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(get(&conn, id).unwrap().unwrap().status, "rework");
+        let fresh = claim_provider_retry_rework(&mut conn, "fresh-worker", id, TTL, later + 1)
+            .unwrap()
+            .expect("discarded rework retry must stay claimable by a fresh worker");
+        assert_eq!(fresh.status, "rework");
+        assert_eq!(fresh.assignee.as_deref(), Some("fresh-worker"));
+        assert_eq!(error_rows(&conn), 0);
+    }
+
+    #[test]
+    fn unresumable_runner_retry_discard_rejects_unsafe_identities() {
+        let (_dir, mut conn) = open_tmp();
+        let id = claimed_task_with_requested_retry(&mut conn);
+        for (holder, profile) in [
+            ("worker", "bad\0profile"),
+            ("worker", ""),
+            ("bad\nholder", "profile-b"),
+        ] {
+            let error = discard_unresumable_runner_retry(
+                &mut conn,
+                id,
+                holder,
+                &requested_codex_retry(),
+                profile,
+                13,
+            )
+            .unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+        }
+        assert!(discard_notes(&conn, id).is_empty());
+        assert!(discard_refs(&conn, id)
+            .get(crate::runner_state::RETRY_REF)
+            .is_some());
+    }
+
     #[test]
     fn malformed_persisted_retry_refs_are_internal_error() {
         let error = clear_runner_retry_refs(Some("{")).unwrap_err();
@@ -17257,6 +18241,7 @@ mod tests {
         crate::decomposition::begin_planning(
             &mut c,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "codex",
@@ -17269,10 +18254,9 @@ mod tests {
         .expect("planning source must acquire the freeze");
 
         // Deadlock regression: an in-flight PR's reviewer MUST still provision
-        // under an active decomposition freeze. The freeze's drain predicate
-        // (decomposition_drain_ready) waits for reviewers==0; blocking this
-        // reservation would strand the retained worker awaiting review and the
-        // freeze would never drain to capture its frozen base.
+        // under an active decomposition freeze; blocking this reservation would
+        // strand the retained worker awaiting review for the whole planning
+        // attempt.
         assert!(reserve_reviewer_provision(&mut c, frozen_review, "frozen", "r1", 1023,).unwrap());
         // Attaching that reviewer to the in-review PR is likewise allowed under
         // the freeze — reviewer attachment is in-flight continuation.
@@ -17288,7 +18272,7 @@ mod tests {
         .unwrap());
         // Existing rework/remediation, by contrast, MUST finish under the freeze
         // (same deadlock class as review): the retained worker's rework turn is
-        // in-flight work the drain waits on, not a new start.
+        // in-flight work, not a new start.
         apply_event(
             &mut c,
             "frozen",
@@ -17567,6 +18551,7 @@ mod tests {
         let graph = crate::decomposition::begin_planning(
             &mut c,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: id,
                 expected_revision: 1,
                 provider: "codex",
@@ -17621,6 +18606,7 @@ mod tests {
         let graph = crate::decomposition::begin_planning(
             &mut c,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "codex",
@@ -17651,10 +18637,16 @@ mod tests {
             source_dependency_ids: vec![],
         }
         };
-        let ids =
-            crate::decomposition::materialize_graph(&mut c, graph, 1, &[child("a"), child("b")], 4)
-                .unwrap()
-                .unwrap();
+        let ids = crate::decomposition::materialize_graph(
+            &mut c,
+            graph,
+            1,
+            &[child("a"), child("b")],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
 
         assert!(update(
             &mut c,
@@ -17689,6 +18681,7 @@ mod tests {
         let graph = crate::decomposition::begin_planning(
             &mut c,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "codex",
@@ -17719,10 +18712,16 @@ mod tests {
             source_dependency_ids: vec![],
         }
         };
-        let ids =
-            crate::decomposition::materialize_graph(&mut c, graph, 1, &[child("a"), child("b")], 4)
-                .unwrap()
-                .unwrap();
+        let ids = crate::decomposition::materialize_graph(
+            &mut c,
+            graph,
+            1,
+            &[child("a"), child("b")],
+            1,
+            4,
+        )
+        .unwrap()
+        .unwrap();
 
         let cancelled = update(
             &mut c,
@@ -17757,7 +18756,7 @@ mod tests {
     }
 
     #[test]
-    fn planning_freeze_blocks_new_open_claims_but_allows_existing_continuation() {
+    fn planning_freeze_blocks_only_its_source_and_allows_existing_continuation() {
         let (_dir, mut c) = open_tmp();
         let source = create(&mut c, "owner", "large", None, 1, None,
             Some(r#"{"cx_est":4,"cx_size":"XL","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#),
@@ -17774,6 +18773,7 @@ mod tests {
         crate::decomposition::begin_planning(
             &mut c,
             &crate::decomposition::BeginPlanning {
+                max_active_graphs: 1,
                 source_task_id: source,
                 expected_revision: 1,
                 provider: "codex",
@@ -17785,21 +18785,56 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        // A new open-status worker start stays blocked under the freeze — no
-        // new implementation work begins while draining.
-        assert!(claim(&mut c, "worker", Some(implementation), &[], 60, 3)
+        let freeze_active: i64 = c
+            .query_row(
+                "SELECT freeze_active FROM task_decompositions WHERE source_task_id=?1",
+                [source],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(freeze_active, 1, "planning graph must hold the freeze");
+
+        // The planning source itself is never claimed as implementation work,
+        // by id or by selector.
+        assert!(claim(&mut c, "worker", Some(source), &[], 60, 3)
             .unwrap()
             .is_none());
-        // But reviewer attachment to an existing in-review PR is allowed: review
-        // continuation is in-flight work the drain waits on, not a new start.
+        // An unrelated open standalone task is claimable while the source's
+        // graph plans: the freeze blocks only its own source (owner decision
+        // 2026-11-09). This failed against the former repo-wide clause.
+        let claimed = claim(&mut c, "worker", Some(implementation), &[], 60, 3)
+            .unwrap()
+            .expect("unrelated open task must be claimable under a planning freeze");
+        assert_eq!(claimed.status, "working");
+        assert_eq!(claimed.assignee.as_deref(), Some("worker"));
+        // Reviewer attachment to an existing in-review PR stays allowed.
         assert!(claim(&mut c, "reviewer", Some(review), &[], 60, 3)
             .unwrap()
             .is_some());
+        // The selector skips the planning source and wins the next unrelated
+        // open task.
+        let selected = claim(&mut c, "worker2", None, &[], 60, 3)
+            .unwrap()
+            .expect("selector must win an unrelated open task under a freeze");
+        assert_eq!(selected.id, remediation);
+        assert!(claim(&mut c, "worker3", None, &[], 60, 3)
+            .unwrap()
+            .is_none());
+        let source_status: String = c
+            .query_row("SELECT status FROM tasks WHERE id=?1", [source], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(source_status, "planning");
 
-        // Existing rework/remediation MUST still complete under the freeze:
-        // these are in-flight continuations the drain predicate waits on
-        // (workers==0 && reviewers==0). Blocking them would deadlock the freeze
-        // against its own drain — the incident this regression guards.
+        // Existing rework/remediation continuation is never gated by the
+        // freeze. Release the worker leases taken above, as a submit handoff
+        // would, before reattaching rework workers.
+        c.execute(
+            "UPDATE claims SET active=0 WHERE target IN (?1,?2)",
+            params![lease_target(implementation), lease_target(remediation)],
+        )
+        .unwrap();
         c.execute(
             "UPDATE tasks SET status='rework',assignee=NULL,
             refs=json_set(refs,'$.daemon_rework_retry_requested',json('true')) WHERE id=?1",
@@ -17820,6 +18855,135 @@ mod tests {
             claim_remediation_rework(&mut c, "remediation", remediation, 60, 4)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn planning_freeze_source_clause_excludes_only_the_source_and_keeps_other_graph_children() {
+        const READY: &str = r#"{"cx_est":2,"cx_size":"S","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#;
+        let (_dir, mut c) = open_tmp();
+        // An otherwise dispatchable open source whose graph holds the freeze:
+        // only the source-scoped freeze clause keeps it unclaimed.
+        let frozen_source = create(
+            &mut c,
+            "owner",
+            "frozen source",
+            None,
+            9,
+            None,
+            Some(READY),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let other_source = create(
+            &mut c,
+            "owner",
+            "active source",
+            None,
+            1,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let child = create(
+            &mut c,
+            "owner",
+            "other graph child",
+            None,
+            1,
+            None,
+            Some(READY),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        let standalone = create(
+            &mut c,
+            "owner",
+            "standalone",
+            None,
+            1,
+            None,
+            Some(READY),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+             VALUES (?1,'planning',0,1,1,1,1)",
+            [frozen_source],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='decomposed' WHERE id=?1",
+            [other_source],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,plan_revision,accepted_plan_revision,
+                 created_at,updated_at)
+             VALUES (?1,'active',1,0,1,1,1,1,1)",
+            [other_source],
+        )
+        .unwrap();
+        let other_graph = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO task_graph_members(graph_id,task_id,local_key,plan_revision,active)
+             VALUES (?1,?2,'a',1,1)",
+            params![other_graph, child],
+        )
+        .unwrap();
+
+        // Negative: the frozen source is never claimable, by id or selector.
+        assert!(claim(&mut c, "w0", Some(frozen_source), &[], 60, 2)
+            .unwrap()
+            .is_none());
+        // Selector prefers active graph children, then priority; the frozen
+        // source has the highest priority but must be skipped.
+        let first = claim(&mut c, "w1", None, &[], 60, 2).unwrap().unwrap();
+        assert_eq!(
+            first.id, child,
+            "another graph's ready child stays claimable"
+        );
+        assert_eq!(first.status, "working");
+        let second = claim(&mut c, "w2", None, &[], 60, 2).unwrap().unwrap();
+        assert_eq!(
+            second.id, standalone,
+            "unrelated standalone task stays claimable"
+        );
+        assert!(claim(&mut c, "w3", None, &[], 60, 2).unwrap().is_none());
+        let (status, assignee): (String, Option<String>) = c
+            .query_row(
+                "SELECT status,assignee FROM tasks WHERE id=?1",
+                [frozen_source],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), assignee), ("open", None));
+
+        // Once the freeze clears, the same source becomes claimable again —
+        // the clause, not some other predicate, was excluding it.
+        c.execute(
+            "UPDATE task_decompositions SET freeze_active=0,state='held'
+             WHERE source_task_id=?1",
+            [frozen_source],
+        )
+        .unwrap();
+        assert_eq!(
+            claim(&mut c, "w4", Some(frozen_source), &[], 60, 3)
+                .unwrap()
+                .map(|t| t.id),
+            Some(frozen_source)
         );
     }
 
@@ -17876,68 +19040,7 @@ mod tests {
     }
 
     #[test]
-    fn count_started_non_terminal_excludes_source_open_and_terminals() {
-        let (_d, mut c) = open_tmp();
-        let source = create(&mut c, "boss", "src", None, 0, None, None, None, None, 1000).unwrap();
-        let working = create(&mut c, "boss", "w", None, 0, None, None, None, None, 1000).unwrap();
-        let in_review = create(&mut c, "boss", "r", None, 0, None, None, None, None, 1000).unwrap();
-        let rework = create(&mut c, "boss", "k", None, 0, None, None, None, None, 1000).unwrap();
-        let open_task = create(&mut c, "boss", "o", None, 0, None, None, None, None, 1000).unwrap();
-        let merging = create(&mut c, "boss", "m", None, 0, None, None, None, None, 1000).unwrap();
-        let done = create(&mut c, "boss", "d", None, 0, None, None, None, None, 1000).unwrap();
-        let failed = create(&mut c, "boss", "f", None, 0, None, None, None, None, 1000).unwrap();
-        let cancelled = create(&mut c, "boss", "x", None, 0, None, None, None, None, 1000).unwrap();
-
-        for (id, status) in [
-            (working, "working"),
-            (in_review, "in-review"),
-            (rework, "rework"),
-            (merging, "merging"),
-            (done, "done"),
-            (failed, "failed"),
-            (cancelled, "cancelled"),
-        ] {
-            c.execute(
-                "UPDATE tasks SET status=?2 WHERE id=?1",
-                params![id, status],
-            )
-            .unwrap();
-        }
-        c.execute(
-            "UPDATE tasks SET refs=json_set(
-                 COALESCE(refs, '{}'), '$.daemon_merge_retry', 'requested'
-             ) WHERE id=?1",
-            params![merging],
-        )
-        .unwrap();
-
-        // Every started non-terminal phase blocks, including an orphan marked
-        // merge handoff; source, open, and terminals do not.
-        assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 4);
-
-        // Excluding an actual started task drops its count.
-        assert_eq!(
-            count_started_non_terminal_excluding(&c, in_review).unwrap(),
-            3
-        );
-
-        // Move the last blocker to done → predicate releases (returns 0).
-        for id in [working, rework, merging] {
-            c.execute("UPDATE tasks SET status='done' WHERE id=?1", params![id])
-                .unwrap();
-        }
-        c.execute(
-            "UPDATE tasks SET status='done' WHERE id=?1",
-            params![in_review],
-        )
-        .unwrap();
-        assert_eq!(count_started_non_terminal_excluding(&c, source).unwrap(), 0);
-
-        let _ = open_task; // silence "unused" — open row also present in DB
-    }
-
-    #[test]
-    fn retry_parked_refuses_under_a_decomposition_freeze() {
+    fn retry_parked_refuses_only_the_planning_source_under_a_decomposition_freeze() {
         let (_d, mut c) = open_tmp();
         let id = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
         // Park the task with a non-terminal resume status so restoration would
@@ -17962,37 +19065,57 @@ mod tests {
             .expect("parked task restored when no freeze");
         assert_eq!(restored.status, "in-review");
 
-        // Re-park then start a freeze; retry must fail Usage.
-        c.execute(
-            "UPDATE tasks SET status='failed',refs=json_set(
-                refs,
-                '$.daemon_parked', json('true'),
-                '$.daemon_resume_status','in-review'
-             ) WHERE id=?1",
-            params![id],
-        )
-        .unwrap();
+        // Re-park, then start a freeze on an unrelated source; retry of the
+        // unrelated parked task still restores (owner decision 2026-11-09).
+        let repark = |c: &mut Connection, id: i64| {
+            c.execute(
+                "UPDATE tasks SET status='failed',refs=json_set(
+                    refs,
+                    '$.daemon_parked', json('true'),
+                    '$.daemon_resume_status','in-review'
+                 ) WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
+        };
+        repark(&mut c, id);
         let source = create(&mut c, "boss", "src", None, 0, None, None, None, None, 1000).unwrap();
         c.execute(
             "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
                  planned_source_revision,created_at,updated_at)
-             VALUES (?1,'draining',0,1,1,1000,1000)",
+             VALUES (?1,'planning',0,1,1,1000,1000)",
             params![source],
         )
         .unwrap();
-        let err = retry_parked(&mut c, id, "operator", true, 1002).unwrap_err();
+        assert_eq!(reviewer_cap_retry_refusal(&c, id).unwrap(), None);
+        let restored = retry_parked(&mut c, id, "operator", true, 1002)
+            .unwrap()
+            .expect("unrelated parked task restores under another graph's freeze");
+        assert_eq!(restored.status, "in-review");
+
+        // The planning graph's own source stays guarded: a parked source is
+        // refused with Usage and remains failed.
+        let source_refs = r#"{"cx_est":2,"cx_size":"S","cx_ready":true,
+            "cx_not_ready_reason":null,"cx_by":"test:v2"}"#;
+        c.execute(
+            "UPDATE tasks SET refs=?2 WHERE id=?1",
+            params![source, source_refs],
+        )
+        .unwrap();
+        repark(&mut c, source);
+        let err = retry_parked(&mut c, source, "operator", true, 1003).unwrap_err();
         match err {
             QuorumError::Usage(msg) => {
                 assert!(msg.contains("decomposition freeze"), "unexpected: {msg}")
             }
             other => panic!("unexpected error variant: {other:?}"),
         }
-
-        // Task stays failed — non-growth invariant preserved.
         let status: String = c
-            .query_row("SELECT status FROM tasks WHERE id=?1", params![id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT status FROM tasks WHERE id=?1",
+                params![source],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(status, "failed");
     }
@@ -18172,15 +19295,23 @@ mod tests {
         let frozen = park_for_retry(&mut c, "in-review");
         add_reviewer_runs(&c, frozen, MAX_TOTAL_REVIEWER_RUNS);
         assert!(reviewer_cap_retry_refusal(&c, frozen).unwrap().is_some());
-        let source = create(&mut c, "boss", "src", None, 0, None, None, None, None, 1000).unwrap();
+        let unrelated = park_for_retry(&mut c, "in-review");
+        add_reviewer_runs(&c, unrelated, MAX_TOTAL_REVIEWER_RUNS);
+        // `frozen` is the source of the planning graph holding the freeze.
         c.execute(
             "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
                  planned_source_revision,created_at,updated_at)
-             VALUES (?1,'draining',0,1,1,1000,1000)",
-            params![source],
+             VALUES (?1,'planning',0,1,1,1000,1000)",
+            params![frozen],
         )
         .unwrap();
         assert_eq!(reviewer_cap_retry_refusal(&c, frozen).unwrap(), None);
+        // The freeze guards only its source: an unrelated capped task still
+        // reports the reviewer-cap refusal.
+        assert!(reviewer_cap_retry_refusal(&c, unrelated).unwrap().is_some());
+        assert!(retry_parked(&mut c, unrelated, "operator", true, 1002)
+            .unwrap()
+            .is_none());
         assert!(matches!(
             retry_parked(&mut c, frozen, "operator", true, 1002),
             Err(QuorumError::Usage(_))

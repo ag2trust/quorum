@@ -713,7 +713,11 @@ pub enum Command {
     /// which otherwise has no route to `done` and leaves dependents parked.
     /// Sets the task to `done` but emits a `task_closed_manual` event (never
     /// `task_done`), so the audit log distinguishes manual closes from the
-    /// reviewed+merged lifecycle. Reason via --reason-stdin or --reason-file.
+    /// reviewed+merged lifecycle. Dependents start from the closed task's
+    /// recovered PR merge commit; a closed task with no PR lets them start
+    /// from the current base branch head. A PR whose merge cannot be
+    /// recovered (still open, closed unmerged, or unavailable) keeps them waiting.
+    /// Reason via --reason-stdin or --reason-file.
     TaskClose {
         #[arg(long)]
         agent: String,

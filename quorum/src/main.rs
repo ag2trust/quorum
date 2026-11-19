@@ -132,6 +132,15 @@ primary = 100
 ## Decomposition: children of one graph that may be working at once. Unset
 ## defaults to cap; must be >= 1; values above cap are bounded by cap.
 # max_graph_children_working = 4
+
+## Concurrent reviewer processes (R1 + R2 + review-only). Unset defaults to
+## max(cap, 2); must be 1..=32. Excess review work waits for a free slot.
+# reviewer_cap = 4
+
+## Graphs that may be counted (active, blocked, or planning) at once across
+## the daemon. Unset defaults to 2; must be >= 1. Enforced atomically at
+## planning admission and activation; one graph still plans at a time.
+# max_active_graphs = 2
 ";
 
 fn run() -> Result<i32> {
@@ -210,10 +219,18 @@ fn command_source(cmd: &cli::Command) -> &'static str {
 fn status_snapshot(online_window: i64) -> Result<quorum_core::stats::Stats> {
     let now = quorum_core::clock::now();
     let db_path = paths::db_path()?;
+    let reviewer_cap = status_reviewer_cap();
+    let max_active_graphs = status_max_active_graphs();
     assemble_status_snapshot(
         || {
             let conn = quorum_core::db::open(&db_path)?;
-            let mut stats = quorum_core::stats::stats(&conn, now, online_window)?;
+            let mut stats = quorum_core::stats::stats_with_options(
+                &conn,
+                now,
+                online_window,
+                reviewer_cap,
+                max_active_graphs,
+            )?;
             stats.daemon =
                 quorum_core::daemon_lock::liveness(&conn, now, DAEMON_STALE_SECS, pid_is_alive)?;
             drop(conn); // load-bearing: close the short DB read before returning
@@ -221,6 +238,36 @@ fn status_snapshot(online_window: i64) -> Result<quorum_core::stats::Stats> {
         },
         || status_resources(&db_path, now),
     )
+}
+
+/// Best-effort reviewer cap for the read-only status path. Uses the same
+/// `serve_config::load` the `web` command relies on, so a missing `serve.toml` (the
+/// default, supported configuration) still resolves `file_reviewer_cap`'s default cap
+/// exactly like `quorum web` does, rather than silently reporting no cap (issue #415).
+/// `None` when no repo is resolvable or the file is unreadable/malformed, so `quorum
+/// status` keeps working before the daemon is fully configured; the daemon itself is
+/// the authority that validates and enforces `reviewer_cap` at `quorum serve` startup.
+fn status_reviewer_cap() -> Option<i64> {
+    let repo = paths::try_resolve_repo()?;
+    let path = serve_config::default_config_path(&repo).ok()?;
+    let file_cfg = serve_config::load(&path, false).ok()?;
+    serve_config::file_reviewer_cap(&file_cfg).ok()
+}
+
+/// Best-effort `max_active_graphs` for the read-only status path, mirroring
+/// `status_reviewer_cap`. `None` when no repo is resolvable or the file is
+/// unreadable/malformed (the same supported-but-unconfigured cases as the
+/// reviewer cap), so `quorum status` keeps working before the daemon is
+/// fully configured; a planner-routed hold reason is simply omitted rather
+/// than guessed. Falls back to `serve_config::DEFAULT_MAX_ACTIVE_GRAPHS` when
+/// the repo's config omits the key, exactly like daemon startup resolution.
+fn status_max_active_graphs() -> Option<i64> {
+    let repo = paths::try_resolve_repo()?;
+    let path = serve_config::default_config_path(&repo).ok()?;
+    let file_cfg = serve_config::load(&path, false).ok()?;
+    serve_config::resolve_max_active_graphs(file_cfg.max_active_graphs)
+        .ok()
+        .and_then(|limit| i64::try_from(limit).ok())
 }
 
 fn assemble_status_snapshot<Read, Sample>(
@@ -999,6 +1046,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
             let serve_config_path = serve_config::default_config_path(&repo)?;
             let file_cfg = serve_config::load(&serve_config_path, false)?;
             let graph_children_limit = serve_config::file_graph_children_working_limit(&file_cfg)?;
+            let reviewer_cap = serve_config::file_reviewer_cap(&file_cfg)?;
             web::serve(
                 paths::db_path()?,
                 resolve_web_log_dir(log_dir, file_cfg.log_dir, paths::home_dir()?),
@@ -1006,6 +1054,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 port,
                 load_cfg()?.online_window_secs,
                 graph_children_limit,
+                reviewer_cap,
             )?;
             Ok(0)
         }
@@ -1673,6 +1722,16 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 file_cfg.max_graph_children_working,
                 r_cap.value,
             )?;
+            let r_reviewer_cap = serve_config::Sourced {
+                value: serve_config::resolve_reviewer_cap(file_cfg.reviewer_cap, r_cap.value)?,
+                source: if file_cfg.reviewer_cap.is_some() {
+                    serve_config::Source::File
+                } else {
+                    serve_config::Source::Default
+                },
+            };
+            let r_max_active_graphs =
+                serve_config::resolve_max_active_graphs(file_cfg.max_active_graphs)?;
 
             let model_profiles = file_cfg.model_profiles.clone().ok_or_else(|| {
                 QuorumError::Usage("serve config requires [model_profiles]".into())
@@ -1701,6 +1760,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 base_branch: &r_base_branch,
                 self_update_branch: &r_self_update_branch,
                 cap: &r_cap,
+                reviewer_cap: &r_reviewer_cap,
                 model_profiles: &model_profiles,
                 routing: &routing,
                 log_dir: &r_log_dir,
@@ -1826,6 +1886,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 r2_steady_state_p: r_r2_steady_state_p,
                 max_rework: r_max_rework,
                 max_graph_children_working: Some(r_max_graph_children_working),
+                reviewer_cap: r_reviewer_cap.value,
+                max_active_graphs: r_max_active_graphs,
             };
             Ok(serve::run_serve(config)?)
         }

@@ -1,8 +1,8 @@
 use quorum_core::drift::{TwinPr, UnbackedPr};
 use quorum_core::stats::{
-    AlertMessage, BlockedTask, BranchSyncSummary, DaemonAgentView, DaemonLiveness,
-    DecompositionStatusView, DedupedError, HealthVerdict, HostResourcesView, MergeBlockerView,
-    PipelineTask, QueueTask, ResourceSeverity, ReviewingTask, Stats,
+    AlertMessage, BlockedTask, BranchSyncSummary, CountedGraphView, DaemonAgentView,
+    DaemonLiveness, DecompositionStatusView, DedupedError, HealthVerdict, HostResourcesView,
+    MergeBlockerView, PipelineTask, QueueTask, ResourceSeverity, ReviewingTask, Stats,
 };
 use std::io::Write;
 
@@ -139,7 +139,14 @@ fn render_with_style_at_width(s: &Stats, sty: &Style, w: &mut dyn Write, width: 
     render_blocked(&s.blocked, sty, w, width);
     render_reviewing(&s.reviewing, sty, w, width);
     render_pipeline(&s.pipeline, sty, w, width);
-    render_decomposition(s.decomposition.as_ref(), sty, w, width);
+    render_decomposition(
+        s.decomposition.as_ref(),
+        &s.counted_graphs,
+        s.max_active_graphs,
+        sty,
+        w,
+        width,
+    );
     render_merge_wait(&s.merge_blockers, sty, w, width);
     render_branch_syncs(&s.branch_syncs, sty, w, width);
     render_unbacked_prs(&s.unbacked_prs, &s.twin_prs, sty, w, width);
@@ -624,15 +631,38 @@ fn render_pipeline(pipeline: &[PipelineTask], sty: &Style, w: &mut dyn Write, wi
 
 fn render_decomposition(
     graph: Option<&DecompositionStatusView>,
+    counted: &[CountedGraphView],
+    max_active_graphs: Option<i64>,
     sty: &Style,
     w: &mut dyn Write,
     width: usize,
 ) {
+    if graph.is_none() && counted.is_empty() {
+        return;
+    }
+    let _ = writeln!(w);
+    let _ = writeln!(w, "{}", sty.section_rule("DECOMPOSITION", width));
+    if !counted.is_empty() {
+        let limit = max_active_graphs
+            .map(|limit| limit.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let _ = writeln!(
+            w,
+            "  graphs {}/{} counted toward max_active_graphs",
+            counted.len(),
+            limit,
+        );
+        for g in counted {
+            let _ = writeln!(
+                w,
+                "      #{:<5} source #{:<5} {}",
+                g.graph_id, g.source_task_id, g.state
+            );
+        }
+    }
     let Some(graph) = graph else {
         return;
     };
-    let _ = writeln!(w);
-    let _ = writeln!(w, "{}", sty.section_rule("DECOMPOSITION", width));
     let planner = match (&graph.planner_provider, &graph.planner_model) {
         (Some(provider), Some(model)) => format!("{provider}/{model}"),
         (Some(provider), None) => provider.clone(),
@@ -652,18 +682,6 @@ fn render_decomposition(
         planner,
         revision,
     );
-    if let Some(stall) = &graph.drain_stall {
-        let line = truncate(
-            &format!(
-                "drain stalled {}: {}",
-                fmt_age(stall.age_secs),
-                stall.blockers.join("; ")
-            ),
-            width.saturating_sub(6),
-        );
-        let rendered = if sty.color { sty.red(&line) } else { line };
-        let _ = writeln!(w, "      {rendered}");
-    }
     let planner_effort = graph.planner_effort.as_deref().unwrap_or("pending");
     let planner_log_dir = graph
         .planner_log_dir
@@ -868,6 +886,13 @@ fn render_merge_wait(blockers: &[MergeBlockerView], sty: &Style, w: &mut dyn Wri
                     "[!]".to_string()
                 }
             }
+            "ci_failing" => {
+                if sty.color {
+                    sty.red("✗")
+                } else {
+                    "[x]".to_string()
+                }
+            }
             _ => {
                 if sty.color {
                     "⏳".to_string()
@@ -887,6 +912,15 @@ fn render_merge_wait(blockers: &[MergeBlockerView], sty: &Style, w: &mut dyn Wri
             b.retry_count,
             pr_str,
         );
+        if let Some(summary) = &b.ci_summary {
+            let line = truncate(summary, width.saturating_sub(6));
+            let rendered = if sty.color && b.blocker_kind == "ci_failing" {
+                sty.red(&line)
+            } else {
+                line
+            };
+            let _ = writeln!(w, "      {rendered}");
+        }
     }
 }
 
@@ -1095,31 +1129,11 @@ mod tests {
                 status: "failed".into(),
                 prerequisites: vec![41],
             }],
-            drain_stall: None,
         });
         let mut buf = Vec::new();
         render_with_style(&s, &Style::plain(), &mut buf);
         let output = String::from_utf8(buf).unwrap();
         assert!(!output.contains("drain stalled"), "{output}");
-
-        let graph = s.decomposition.as_mut().unwrap();
-        graph.graph_state = "draining".into();
-        graph.drain_stall = Some(quorum_core::stats::DecompositionDrainStall {
-            age_secs: 59_400,
-            blockers: vec!["journal rows=1 (planner=1)".into()],
-        });
-        s.health = HealthVerdict::Stalled;
-        s.stalled_count = 1;
-        let mut buf = Vec::new();
-        render_with_style(&s, &Style::plain(), &mut buf);
-        let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("[X] stalled"), "{output}");
-        assert!(!output.contains("on track"), "{output}");
-        assert!(output.contains("1 stalled"), "{output}");
-        assert!(
-            output.contains("drain stalled 16h: journal rows=1 (planner=1)"),
-            "{output}"
-        );
         assert!(output.contains("DECOMPOSITION"));
         assert!(output.contains("source #40"));
         assert!(output.contains("children=1/2"));
@@ -1131,6 +1145,49 @@ mod tests {
         assert!(output.contains("hold: implementation dispatch held: graph state=blocked"));
         assert!(output.contains("#42") && output.contains("deps #41"));
         assert!(output.contains("blocker: child failed review"));
+    }
+
+    #[test]
+    fn decomposition_names_every_counted_graph_and_the_configured_limit() {
+        let mut s = default_stats();
+        s.counted_graphs = vec![
+            CountedGraphView {
+                graph_id: 74,
+                source_task_id: 697,
+                state: "active".into(),
+            },
+            CountedGraphView {
+                graph_id: 81,
+                source_task_id: 700,
+                state: "blocked".into(),
+            },
+        ];
+        s.max_active_graphs = Some(2);
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("DECOMPOSITION"), "{output}");
+        assert!(
+            output.contains("graphs 2/2 counted toward max_active_graphs"),
+            "{output}"
+        );
+        assert!(
+            output.contains("#74") && output.contains("source #697") && output.contains("active"),
+            "{output}"
+        );
+        assert!(
+            output.contains("#81") && output.contains("source #700") && output.contains("blocked"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn decomposition_section_hidden_when_no_graph_is_counted() {
+        let s = default_stats();
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(!output.contains("DECOMPOSITION"), "{output}");
     }
 
     #[test]
@@ -1595,6 +1652,26 @@ mod tests {
     }
 
     #[test]
+    fn reviewing_section_renders_awaiting_reviewer_slot_reason() {
+        let mut s = default_stats();
+        s.reviewing.push(ReviewingTask {
+            id: 13,
+            title: "waiting for a slot".into(),
+            pr: Some(403),
+            reviewer: None,
+            state: "awaiting reviewer".into(),
+            reason: Some("awaiting reviewer slot".into()),
+        });
+        let mut buf = Vec::new();
+        render_with_style(&s, &Style::plain(), &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("awaiting reviewer — awaiting reviewer slot"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn reviewing_section_renders_approved_merge_pending_state() {
         let mut s = default_stats();
         s.reviewing.push(ReviewingTask {
@@ -1618,6 +1695,23 @@ mod tests {
 
     // ── #177: MERGE WAIT section ────────────────────────────────────
 
+    fn ci_none() -> MergeBlockerView {
+        MergeBlockerView {
+            task_id: 0,
+            title: String::new(),
+            pr: None,
+            blocker_kind: String::new(),
+            status: String::new(),
+            waiting_secs: 0,
+            retry_count: 0,
+            ci_state: None,
+            ci_checks: Vec::new(),
+            ci_since: None,
+            ci_observed_at: None,
+            ci_summary: None,
+        }
+    }
+
     #[test]
     fn merge_wait_section_renders_when_present() {
         let mut s = default_stats();
@@ -1629,6 +1723,7 @@ mod tests {
             status: "in-review".into(),
             waiting_secs: 1800,
             retry_count: 1,
+            ..ci_none()
         });
         s.merge_blockers.push(MergeBlockerView {
             task_id: 50,
@@ -1638,6 +1733,7 @@ mod tests {
             status: "merging".into(),
             waiting_secs: 120,
             retry_count: 0,
+            ..ci_none()
         });
         let sty = Style::plain();
         let mut buf = Vec::new();
@@ -1657,6 +1753,53 @@ mod tests {
         );
         assert!(output.contains("#367"), "PR number visible: {output}");
         assert!(output.contains("#400"), "PR number visible: {output}");
+    }
+
+    #[test]
+    fn merge_wait_renders_snapshot_ci_state_and_check_names() {
+        let mut s = default_stats();
+        s.merge_blockers.push(MergeBlockerView {
+            task_id: 61,
+            title: "pending ci".into(),
+            pr: Some(610),
+            blocker_kind: "ci_pending".into(),
+            status: "merging".into(),
+            waiting_secs: 400,
+            retry_count: 0,
+            ci_state: Some("pending".into()),
+            ci_checks: vec!["unit".into(), "clippy".into()],
+            ci_since: Some(600),
+            ci_observed_at: Some(990),
+            ci_summary: Some("awaiting CI: unit, clippy (pending 6m)".into()),
+        });
+        s.merge_blockers.push(MergeBlockerView {
+            task_id: 62,
+            title: "failing ci".into(),
+            pr: Some(620),
+            blocker_kind: "ci_failing".into(),
+            status: "merging".into(),
+            waiting_secs: 400,
+            retry_count: 0,
+            ci_state: Some("failing".into()),
+            ci_checks: vec!["unit".into()],
+            ci_since: Some(900),
+            ci_observed_at: Some(990),
+            ci_summary: Some("CI failing: unit (failing 1m)".into()),
+        });
+        let sty = Style::plain();
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("      awaiting CI: unit, clippy (pending 6m)"),
+            "{output}"
+        );
+        assert!(
+            output.contains("      CI failing: unit (failing 1m)"),
+            "{output}"
+        );
+        let failing_row = output.lines().find(|l| l.contains("#62")).unwrap();
+        assert!(failing_row.contains("[x]") && failing_row.contains("ci_failing"));
     }
 
     #[test]
@@ -1683,6 +1826,7 @@ mod tests {
             status: "in-review".into(),
             waiting_secs: 600,
             retry_count: 2,
+            ..ci_none()
         });
         let sty = Style::plain();
         let mut buf = Vec::new();
@@ -1706,6 +1850,7 @@ mod tests {
             status: "in-review".into(),
             waiting_secs: 60,
             retry_count: 3,
+            ..ci_none()
         });
         let sty = Style::plain();
         let mut buf = Vec::new();

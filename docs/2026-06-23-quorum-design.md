@@ -36,6 +36,16 @@ non-persistent and fail-open; partial values and bounded sampling errors remain 
 warning or critical resource sample promotes only `OnTrack` to `Attention`, never replaces
 `Stalled`, and never throttles, kills, or transitions managed work.
 
+`merge_blockers` rows for `merging` tasks read the daemon-owned `refs.merge_checks`
+snapshot when one exists. `blocker_kind` becomes `ci_pending`, `ci_failing`, or
+`ci_passed` (passed, awaiting the merge call), with additive `ci_state`, `ci_checks`
+(sanitized, at most 20 names), `ci_since`, `ci_observed_at`, and a bounded `ci_summary`
+such as `awaiting CI: unit, clippy (pending 6m)`. The text cockpit prints that summary
+under the MERGE WAIT row, and task progress uses it as the merge-stage condition. With
+no snapshot, or one that does not parse, the row keeps the inferred `ci_pending` with
+none of the `ci_*` fields. Conflict-blocked rows do not change. Status only reads the
+snapshot; it never writes it.
+
 ### Product boundary: opinionated Git delivery
 
 Quorum is an opinionated local **agentic Git/GitHub coding pipeline**. It provisions
@@ -682,6 +692,15 @@ flag (see Text safety). **Output is JSON by default** (only `status` renders a h
   **`--watch` opens a fresh short read per ~1–2s tick (connect→read→close), then performs the OS
   sample — never holds a transaction across ticks or resource syscalls** (else it pins the WAL;
   verified). Read-only; never blocks writers under WAL.
+  `counted_graphs` (JSON) / the DECOMPOSITION section's `graphs N/limit` line (cockpit) names
+  every graph counted toward `max_active_graphs` — materialized (`active`/`blocked`) or holding
+  planning authority — not just one, reading the same `COUNTED_GRAPH_PREDICATE` the admission
+  guard uses. A queued task on the planner route carries `hold_reason` once those counted graphs
+  reach the resolved `max_active_graphs` limit, naming every graph filling it; below the limit
+  there is room for another graph, so nothing is held. The limit is resolved the same
+  best-effort way as the reviewer cap (repo config, else `DEFAULT_MAX_ACTIVE_GRAPHS`): when it
+  cannot be resolved, `counted_graphs` still lists every counted graph but no `hold_reason` is
+  computed, mirroring the existing `reviewer_cap: None` convention.
 - `quorum sweep` → unbounded physical reclamation + `wal_checkpoint(TRUNCATE)` (optional;
   sweep-on-write covers normal use)
 - `quorum init` → create `~/.quorum/`, DB, default config; open + migrate (idempotent)
@@ -846,9 +865,13 @@ feeding a turn, the daemon drains and discards the stale stdout backlog. Submiss
 arrive through the agent endpoint, so a self-continued worker that submits takes the
 normal delivery path.
 
-A persistent worker whose turn ends on an explicit `blocked`/`needs-info` reaction is
-parked through the same tasks-layer park as a turn-oriented runner exit
-(`park_persistent_worker_reaction`). It is not left to the idle reaper.
+A persistent worker whose turn ends on an explicit `blocked`/`needs-info`/`failed`
+reaction is parked through the same tasks-layer park as a turn-oriented runner exit
+(`park_persistent_worker_reaction`), and its slot is torn down as `parked` without an
+`AgentFailed` recovery attempt. It is not left to the idle reaper; the reaper itself
+re-checks for a pending reaction and parks instead of reaping. A turn-oriented runner's
+`failed` exit keeps its `AgentFailed` classification. A pending or recorded delivery
+outranks any reaction.
 
 `max_task_wall_secs` remains an optional hard wall-clock cap for one live worker,
 reviewer, or remediation slot. It spans all turns and continuations handled by that
@@ -1350,7 +1373,7 @@ differently:
   row) with JSON naming the cap; the task stays parked and no `task_retry` event or strike
   deletion is written. `reviewer_cap_retry_refusal` is the one side-effect-free predicate
   behind both the enforcement and the CLI reason. It is silent for the earlier merged-publication,
-  policy-park, and decomposition-freeze outcomes, so those keep their existing results, and for
+  policy-park, and planning-source decomposition-freeze outcomes, so those keep their existing results, and for
   other resume stages, which still have worker or merge work before any next review.
 
 Daemon startup also reconciles bounded batches of legacy/corrupt terminal rows carrying
@@ -1604,6 +1627,42 @@ provisioning and merge.
 The pre-merge checks wait remains as defense in depth for changes or check reruns that occur
 after reviewer provisioning.
 
+### Reviewer process bound (`reviewer_cap`)
+
+`reviewer_cap` is a runtime serve-config key that bounds the number of concurrent reviewer
+slots: R1, R2, and review-only reviews together. Unset resolves to `max(cap, 2)`. Values
+outside `1..=32` are a usage error (exit 2) and are never clamped. The startup banner prints
+the resolved value with its source. Worker `cap` and worker dispatch are unaffected.
+
+- One gate covers every reviewer spawn path. `provision_reviewer` checks
+  `available_reviewer_slots(reviewer_cap, reviewers.len())` before it takes the provisioning
+  reservation. That covers initial review of a live worker's PR (Phase 5), restart-orphaned
+  and review-only in-review tasks (Phase 5b), and the R1→R2 handoff. Phases 5 and 5b also
+  check the gate before CI-gate bookkeeping, through one admission queue.
+- Deferral writes nothing. When no slot is free, the task keeps its `in-review` status,
+  recovery attempts, provision strikes, and reservation state. Nothing is written, and the
+  task is retried on later ticks. The queue lives in daemon memory only, so a restart
+  rebuilds it from durable `in-review` rows.
+- Deferred work dispatches in a fixed order: R2 first, then oldest task id. A waiting task
+  keeps its place across ticks. A younger task is admitted only when the free slots exceed
+  the number of waiters ahead of it. An entry that stops reaching the gate (merged, closed,
+  held, or backed off) is pruned after one pass.
+- R2 policy: an R2 can never be deadlocked behind R1 slots.
+  - In the R1→R2 handoff, the R2 inherits the approving R1's slot. That R1 is still in the
+    reviewer set during the handoff and is torn down right after, so this R2 never waits
+    behind its own R1. The two processes overlap only while the R1 is torn down in that
+    same tick.
+  - An R2 re-dispatched later (after a failed handoff, a restart, or a lowered cap) shares
+    the bound. It is queued ahead of every R1, so queued R1 work cannot starve it. A held
+    reviewer slot never waits on another reviewer slot. A sticky R1 waiting through rework
+    waits only on its worker, and every slot ends through its verdict, teardown, or watchdog.
+- Logging is bounded. A task logs once when it enters deferral and once when it is
+  dispatched, never once per tick.
+- Fallback paths do not add reviewer slots. Provider fallback replaces the process inside an
+  existing slot. Startup `resume_pending_fallbacks` restores a slot that the previous daemon
+  had already admitted. If the cap was lowered across a restart, these restored slots can
+  briefly exceed it, and new admissions wait until the count falls below the cap.
+
 ### Daemon merge flow
 
 After VerdictApprove (InReview → Merging):
@@ -1794,9 +1853,7 @@ On daemon startup, before generic crash recovery:
    retained worker without changing either field, so restart can claim the replay instead of
    stranding its marker on an `in-review` task. Killing that worker demotes the task and removes
    an unconsumed `requested` marker in one transaction, so the retained approvals can queue a new
-   handoff. A decomposition freeze counts `merging` among started non-terminal work, in both the
-   tick gate and the atomic frozen-base bind; it cannot capture its frozen base while an orphan
-   handoff still awaits Phase 4e reconciliation.
+   handoff.
    Reviewer verdict persistence uses the task's durable author when no worker is live. When a
    repaired R1 returns and an exact task/author/head-bound R2 row was retained, that R2 is reused
    rather than provisioned again. Every persisted role remains bound to the launch-validated
@@ -2891,14 +2948,63 @@ filename. Runner-specific process options remain scoped under `[claude]`, `[code
 
 A non-continuation, admission-ready, non-terminal-leaf implementation task is a decomposition
 source only when it is L at `cx_est` 5 or XL at `cx_est` 4 or 5. After its dependencies are done,
-the daemon serializes decomposition per repository: it stops new managed delivery, lets active
-delivery finish, and plans against the resulting frozen base. S/M implementation tasks dispatch
+the daemon serializes planning per repository: one graph plans at a time, and at most the
+configured `max_active_graphs` (default 2) graphs are counted at once (see the admission limit
+below). There is no drain
+precondition: unrelated started work keeps running and merging while a graph plans. When the graph
+moves from `draining` to `planning`, the daemon fetches the source task's target branch and reads
+the fetched `origin/<target>` head (outside any DB transaction; see the planner view below) and
+binds it as `frozen_base_sha` in one guarded `BEGIN IMMEDIATE` update (state
+`draining`, freeze held, inactive, no base yet bound); a zero-row bind is an expected lost race.
+That recorded SHA is the planner's base for the whole attempt, served through the read-only
+snapshot archive described below, so later base movement is never visible to it. Generated
+children still branch from the latest base when they are dispatched. S/M implementation tasks dispatch
 normally regardless of complexity; non-continuation L tasks with `cx_est` 1–4 also dispatch
 directly to one worker. Every `continue_pr` task dispatches directly because only the source task carries authority
 to publish to the bound PR. Every review-only task dispatches directly to reviewer provisioning at
 any classified size because it has no implementation work to decompose. A non-continuation XL task
 with `cx_est` 1–3 violates the classification rubric and is parked with an explicit
 reclassify-or-rescope reason.
+
+**Counted admission limit (v84).** A graph is *counted* while it is `active` or `blocked` (or
+carries `active=1`) or holds planning authority (`freeze_active=1`); a blocked graph counts. The
+v35 global partial unique indexes `one_active_task_graph` and `one_planning_freeze` are dropped
+by the forward-only, idempotent v84 migration (`DROP INDEX IF EXISTS`, no table rebuild, every
+graph row preserved). In their place, every path that adds a graph to the counted set evaluates a
+guarded count inside its own `BEGIN IMMEDIATE` transaction: `begin_planning` /
+`begin_routed_planning` admit a source only while `(SELECT COUNT(*) … counted) < max_active_graphs`
+and no other graph holds planning authority; `reacquire_freeze` applies the same guard counting
+only *other* graphs; the materialization activation `UPDATE … RETURNING` counts only the other
+counted graphs, so activating an already-counted planning graph never double-counts it. A lost
+admission or activation race is zero guarded rows (or a false admission check) and maps to
+`Ok(None)`/`Ok(false)`: a clean negative with no `errors` row; post-timeout `SQLITE_BUSY` stays an
+internal failure. A limit lowered below the current counted set (for example across a restart
+while a graph plans) admits nothing new until the count falls. It also refuses that planning
+graph's activation: the transaction rolls back every child insert, and the daemon then holds the
+graph and fails its source like any other materialization blocker, under the distinct hold code
+`max-active-graphs-reached` (lost graph/source authority stays `materialization-authority-lost`).
+The Arbiter-approved plan is not kept; the operator raises the limit or lets graphs complete,
+then re-files or rescopes the source. Materialization checks the counted limit under the write
+lock before inserting any child, so a refusal never leaves partial children or member rows; the
+exhaustion-path terminal-leaf fallback, when refused the same way, therefore parks the graph as
+`proposal-attempts-exhausted` exactly as when no fallback applies. The daemon's
+`planning_candidate` selects sources by `priority DESC, id ASC` only while fewer than the limit
+are counted; the core guard remains the authority. `max_active_graphs` is daemon configuration
+threaded into each call, not stored in the database. `quorum status` reads the same
+`COUNTED_GRAPH_PREDICATE` read-only to list every counted graph and, once they fill the
+resolved limit, name all of them on the planner-routed queued task they hold (Ops, above).
+
+The planning freeze (`freeze_active=1`) remains the one-planner-run-at-a-time sentinel, now
+enforced by the guarded `NOT EXISTS (… freeze_active=1)` admission check rather than a unique
+index, but its claim and retry authority is scoped to its own source
+task (owner decision 2026-11-09). Inside the claim's `BEGIN IMMEDIATE` transaction, the
+`status='open'` branch of both the by-id claim and the selector excludes only a task that is the
+`source_task_id` of a graph with `freeze_active=1`; the source is additionally in `planning`, so
+it is never claimed as an implementation task. Unrelated open standalone tasks and another graph's
+ready children stay claimable while a graph plans, and lost races remain clean negatives with no `errors` row. Likewise
+`task-retry` (`retry_parked`) refuses with a usage error only when restoring that planning source
+to a non-terminal status; unrelated parked tasks retry normally. Reviewer attachment, rework, and
+remediation continuation are never gated by the freeze.
 
 Accepted plans materialize generated children as durable terminal leaves (`tasks.terminal_leaf=1`).
 The child admission policy intentionally differs from the root policy: a complete S, M, or L child
@@ -2919,13 +3025,17 @@ streamed-stdout backstop; no provider spend ceiling is set. The response remains
 bounded to 8 KiB per text field and 32 list items. A separate planner spawn boundary enforces
 those restrictions and accepts only one bounded, closed plan or blocker response; a provider whose
 transport cannot be separated from model-generated network or filesystem access is refused
-fail-closed. The view is an archive of the recorded frozen base SHA. At the drain-to-planning
-handoff that SHA is bound from the freshly fetched `origin/<target>` of the source task, verified
-to contain every dependency merge commit through the same fetch workers use, never the daemon
-clone's checked-out `HEAD`; a fetch or verification failure leaves the graph `draining` with no
-SHA, records a deduplicated `decomposition_base_deferred` event on the source, and retries on a
-later tick. The view is content-addressed by that commit and immutable for the attempt. A valid concrete blocker parks the source immediately
-with no second opinion.
+fail-closed. The view is an archive of the recorded frozen base SHA, built from the object store
+regardless of the repository's current HEAD, so the base does not move during one planning attempt
+even when unrelated merges advance the base branch. At planning start that SHA is bound from the
+freshly fetched `origin/<target>` of the source task, verified to contain every dependency merge
+commit through the same fetch workers use, never the daemon clone's checked-out `HEAD`; a fetch or
+verification failure leaves the graph `draining` with no SHA, records a deduplicated
+`decomposition_base_deferred` event on the source, and retries on a later tick. The view is
+content-addressed by that commit and immutable for the attempt. Source-revision drift is still
+rejected: an accepted source edit removes the pending aggregate, so the attempt's planner run no
+longer resolves to a live graph and cannot submit or be accepted. A valid concrete blocker parks
+the source immediately with no second opinion.
 
 The planner reports its plan by calling the daemon-owned `submit_plan` tool exactly once, over
 the same authorized agent endpoint workers and reviewers submit through; its transcript is never
@@ -3091,13 +3201,10 @@ self-attestation nor redesigns the worker filesystem sandbox.
 
 Semantic proposal rejections and provider/protocol failures have independent caps of three per
 unchanged source revision. Semantic retries keep the repository freeze. Provider failure releases
-the freeze during backoff, and retry drains again. Separately, a `freeze-requested` or `draining`
-graph whose started non-terminal tasks other than the source are all provider-blocked, with no such
-task holding a live slot, releases through `provider-backoff` with `freeze_active=0` and its frozen
-SHA cleared. That release is a wait rather than a planning failure: it records no attempt and
-increments neither `provider_failures` nor `proposal_attempts`. When backoff expires, reacquisition
-waits while an idle provider-blocked task remains; the same guard applies when an ordinary provider
-failure put the graph into backoff. Full prompts and transcripts are not persisted; only bounded
+the freeze during backoff and clears the frozen SHA; when backoff expires the graph reacquires the
+freeze through the ordinary guarded path and binds the then-current fetched base head at its next
+planning start. There is no provider-blocked release valve: unrelated provider-blocked work neither
+holds planning nor delays reacquisition. Full prompts and transcripts are not persisted; only bounded
 structured attempts, the accepted closed proposal and its accepted classification needed to resume
 preclassification or validation, and final reasons are durable. Restart inspection never consumes a
 semantic proposal attempt.
@@ -3109,21 +3216,22 @@ is held without active/freeze authority, the hold code and exhausted counter agr
 neither review-only nor a continuation, and no accepted plan, member/child, process, run, PR, or
 delivery/merge evidence exists. The winner restores the source to `planning`, clears only the
 retryable hold/session/base fields, resets the exhausted current-generation counter, and places the
-graph in provider backoff so the coordinator must reacquire `one_planning_freeze` through the
-ordinary guarded path. A planner blocker of category `external_constraint` (the frozen base has
-since moved, or the source names work not merged yet) is resumable the same way and under the
-same negative-evidence checks and operator retry cap: the replayed attempt history must end the
-current generation in exactly one matching blocker recorded after that generation's
-budget-bearing attempts. Because a blocker consumes neither budget, its retry resets no counter;
-it clears the hold, frozen base, and planner session so the re-drain binds a fresh base and a new
-attempt starts with its own immutable frozen view. The same transaction returns to `open` every
-dependent the cascade parked only because this source was terminal-not-done (`open` resumes only;
-a `rework` resume would add started work to the source's own drain); a resumed dependent stays
-unready until the source is `done`, and a renewed hold parks it again. The `ambiguous_scope`,
-`missing_decision`, and `no_safe_split` blockers, inconsistent holds, stale authority,
-materialization, delivery evidence, and racing callers are clean negatives.
+graph in provider backoff so the coordinator must reacquire planning authority through the
+ordinary guarded, counted `reacquire_freeze` path. A planner blocker of category
+`external_constraint` (the frozen base has since moved, or the source names work not merged yet)
+is resumable the same way and under the same negative-evidence checks and operator retry cap: the
+replayed attempt history must end the current generation in exactly one matching blocker recorded
+after that generation's budget-bearing attempts. Because a blocker consumes neither budget, its
+retry resets no counter; it clears the hold, frozen base, and planner session so the next planning
+start binds a fresh fetched base and a new attempt starts with its own immutable frozen view. The
+same transaction returns to `open` every dependent the cascade parked only because this source was
+terminal-not-done (`open` resumes only; a `rework` resume keeps waiting for an explicit
+`task-retry`); a resumed dependent stays unready until the source is `done`, and a renewed hold
+parks it again. The `ambiguous_scope`, `missing_decision`, and `no_safe_split` blockers,
+inconsistent holds, stale authority, materialization, delivery evidence, and racing callers are
+clean negatives.
 
-Coordinator snapshot selection always prioritizes the unique `freeze_active=1` aggregate before
+Coordinator snapshot selection always prioritizes the single `freeze_active=1` aggregate before
 older provider-backoff aggregates. An explicitly retried graph therefore cannot shadow, stall, or
 consume output from a later graph that already owns the planning freeze; backoff graphs resume in
 ID order only when no freeze owner remains. A live planner or classifier slot also pins its
@@ -3141,25 +3249,29 @@ retry count/cap without exposing planner transcripts.
 Reviewer provisioning reserves task authority in `BEGIN IMMEDIATE` before external resolution or
 process creation. The same transaction checks task phase, classification, and planning freeze;
 planning freeze acquisition excludes live reservations. The daemon releases the reservation only
-after reviewer attachment or complete failed-provision cleanup. Because the freeze drain waits for
-every already-started task, the ordinary classifier keeps running under a freeze for exactly that
-started set (`working`, `in-review`, `rework` — e.g. a review-only task created during the freeze,
-whose reviewer cannot dispatch unclassified); `open` tasks wait for the freeze to clear. A
-provider-blocked task remains in the started non-terminal drain count, so the frozen base is captured
-only after a real drain with zero started non-terminal tasks other than the source. Other blocked or
-parked tasks, as well as provider-blocked tasks that still hold a live slot, keep holding the drain.
-There is no automatic provider retry;
-progress requires an operator `task-retry`. After a provider-blocked release, status names the
-blocking task in decomposition reasons and reports it as an expected wait rather than a drain stall.
-The drain counts only journal rows with live work behind them, never a cached frozen-view marker, and
-the coordinator settles a previous graph's cached view, marker, and proposal whenever the selected
-aggregate changes.
+after reviewer attachment or complete failed-provision cleanup. A planning freeze pauses no
+daemon phase: worker dispatch admits every implementation-ready open task and retried rework,
+the ordinary classifier classifies every unclassified task (new `open` tasks included), and the
+doctor and the post-merge collector retry queue keep running. Only the self-update drain pauses
+those phases. The planning source stays non-dispatchable throughout: it is in `planning`, which
+neither the open-task selector nor the classifier queue selects, and the claim SQL's
+source-scoped freeze clause excludes it as defense in depth. Planning never waits on in-flight work, on
+blocked, parked, or provider-blocked tasks, or on live-agent journal rows. There is no automatic
+provider retry for a provider-blocked task; progress requires an operator `task-retry`. Status
+reports no repository-wide drain: it has no drain-stall projection, health does not count a
+freeze phase as stalled, and a classification-pending reviewer wait carries no freeze context. The
+coordinator settles a previous graph's cached view, marker, and proposal whenever the selected
+planning aggregate changes; materialized graphs are never the coordinator's selection (see
+*Multiple active graphs* below).
 
 One `BEGIN IMMEDIATE` transaction creates the entire graph: every generated task with
 `terminal_leaf=1`, classification, edge, membership/provenance row, source `planning ->
 decomposed` transition, and active-graph record. It then releases the freeze. Partial
-materialization is never visible. A partial unique index permits one materialized active or
-blocked graph per repository, and source uniqueness permits only one graph aggregate per source.
+materialization is never visible. The activation write's guarded count keeps materialized plus
+planning graphs within `max_active_graphs` per repository, and source uniqueness permits only one
+graph aggregate per source. A startup recovery reset re-enters planning through the same counted
+`reacquire_freeze`; when that loses, the graph waits in `freeze-requested` without authority and
+the coordinator retries the guarded reacquire each tick until a slot frees.
 Generated work is one level only and is immutable after materialization.
 
 Generated tasks inherit the source task's immutable `target_branch` at materialization; a NULL
@@ -3173,6 +3285,23 @@ the worker `cap`, must be `>= 1` (otherwise bad config, exit 2), and is effectiv
 `cap`; the dispatch listing and the claim transaction bind the same value. Eligible graph children sort before unrelated new work, but
 reserve no idle capacity and never interrupt active unrelated work. Active siblings may finish
 after another child hard-fails; no later child may start.
+
+**Multiple active graphs.** Up to `max_active_graphs` materialized graphs execute side by side.
+The decomposition coordinator owns only the single planning graph (one freeze); it never selects
+or caches "the" active graph. Execution has no per-graph daemon state: every dispatch pass
+re-reads one candidate listing on a short-lived connection (`priority DESC, id ASC`), and each
+admission's claim runs in its own `BEGIN IMMEDIATE` transaction, so no read transaction spans
+ticks and no provider call runs inside one. Graph scoping is per child: the listing, the claim,
+the hard-failure hold (`block_graph_if_child_failed`), the reviewer graph blocker (`block_graph`),
+and completion (`complete_graph_if_final_child` and its explicit-recovery variants) all resolve
+the graph through the child's own active membership row and evaluate holds, hard-failed siblings,
+the per-graph working limit, and final-child completion against that `graph_id` only. A held graph
+withholds only its own children; another graph keeps dispatching and can complete. Children of
+every graph share the worker `cap` and never exceed it in aggregate, which also bounds each pass
+to at most `cap` admissions; each graph's `max_graph_children_working` limit applies on top.
+Startup reconciliation likewise evaluates every `active`/`blocked` graph by its own id in
+`id ASC` order, each in its own short transaction, and startup inspection considers every
+non-terminal graph rather than one selected row.
 
 Only a hard child failure holds the graph (`generated-child-failed`). A retryable daemon park of a
 child — `status='failed'` with `refs.daemon_parked` and a `daemon_resume_status`, e.g. a
@@ -3326,7 +3455,7 @@ edited. Daemon-owned lifecycle evidence remains writable.
 Decomposition reconciliation runs before merged-continuation adoption, ordinary recovery, and
 provisioning. A durable freeze
 resumes first. Complete graphs resume without recreation. Incomplete or inconsistent graphs start
-nothing; an unstarted graph may reset and replan within budget through the normal freeze/drain
+nothing; an unstarted graph may reset and replan within budget through the normal freeze
 path, while any delivery evidence requires cancellation and replacement except for the
 evidence-complete exact-continuation case above. Its automatic daemon discovery is a bounded
 reconciliation action on a consistent live graph. On a blocked graph it may only settle that exact

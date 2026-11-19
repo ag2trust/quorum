@@ -1,0 +1,299 @@
+name: container-promote
+
+# Reusable, gated promotion of an already-pushed Quorum image. Nothing here builds
+# or pushes image layers. The caller passes the exact manifest digest it pushed
+# and the config/image ID it tested; this workflow then
+#
+#   verify  (fresh runner; read-only authority, no OIDC, no package write)
+#     docker/release-verify.sh by digest, first --anonymous on a clean runner
+#     state with a clean DOCKER_CONFIG (public availability), then authenticated
+#     after the anonymous pull is removed: manifest/config identity, linux/amd64,
+#     OCI labels, provenance and SBOM via the runner's `gh attestation verify`,
+#     and a bounded service check;
+#   promote (needs verify; packages: write + contents: write only)
+#     re-PUTs the verified manifest bytes under `sha-<revision>` and then the
+#     semantic-version tag (a registry-side tag: no layer is pushed), re-resolves
+#     each tag and fails unless it is exactly the verified digest, removes the
+#     optional staging tag, re-resolves again, and only then records the digest
+#     and pull-by-digest reference in the GitHub Release notes for `tag`.
+#
+# A verify failure skips promote, so no release tag is applied. A promote failure
+# stops before the release notes present the image as verified. An existing
+# release tag is never moved to a different digest.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release git tag, v<version> (e.g. v0.2.3); its version must equal `version`'
+        required: true
+        type: string
+      version:
+        description: 'Expected org.opencontainers.image.version label; becomes the image tag'
+        required: true
+        type: string
+      revision:
+        description: 'Expected 40-hex source commit (revision label, attestation source digest)'
+        required: true
+        type: string
+      digest:
+        description: 'Pushed image manifest digest, sha256:<64 hex>'
+        required: true
+        type: string
+      image_id:
+        description: 'Tested config/image ID, sha256:<64 hex>'
+        required: true
+        type: string
+      signer_workflow:
+        description: 'owner/repo/path of the workflow that signed the attestations; default: the calling workflow'
+        required: false
+        type: string
+        default: ''
+      staging_tag:
+        description: 'Optional staging tag the build pushed; removed after promotion'
+        required: false
+        type: string
+        default: ''
+
+permissions: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ag2trust/quorum
+
+jobs:
+  verify:
+    name: verify by digest (clean runner)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read      # checkout of the verification scripts
+      packages: read      # authenticated pull pass only
+      attestations: read  # gh attestation verify
+    env:
+      TAG: ${{ inputs.tag }}
+      VERSION: ${{ inputs.version }}
+      REVISION: ${{ inputs.revision }}
+      DIGEST: ${{ inputs.digest }}
+      IMAGE_ID: ${{ inputs.image_id }}
+      SIGNER_WORKFLOW_INPUT: ${{ inputs.signer_workflow }}
+      STAGING_TAG: ${{ inputs.staging_tag }}
+      SOURCE_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate inputs
+        id: inputs
+        run: |
+          set -eu
+          fail() { printf '::error::%s\n' "$1"; exit 1; }
+          printf '%s' "$TAG" | grep -Eqx 'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z][0-9A-Za-z.-]{0,63})?' \
+            || fail "tag '$TAG' is not v<semver>"
+          [ "$VERSION" = "${TAG#v}" ] || fail "version '$VERSION' != tag '$TAG' without the leading v"
+          printf '%s' "$REVISION" | grep -Eqx '[0-9a-f]{40}' || fail 'revision must be a 40-hex commit'
+          printf '%s' "$DIGEST" | grep -Eqx 'sha256:[0-9a-f]{64}' || fail 'digest must be sha256:<64 hex>'
+          printf '%s' "$IMAGE_ID" | grep -Eqx 'sha256:[0-9a-f]{64}' || fail 'image_id must be sha256:<64 hex>'
+          if [ -n "$STAGING_TAG" ]; then
+            printf '%s' "$STAGING_TAG" | grep -Eqx '[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}' \
+              || fail 'staging_tag is not a valid tag'
+            case "$STAGING_TAG" in
+              "$VERSION"|"sha-$REVISION") fail 'staging_tag must differ from the release tags' ;;
+            esac
+          fi
+          signer=$SIGNER_WORKFLOW_INPUT
+          [ -n "$signer" ] || signer=${GITHUB_WORKFLOW_REF%%@*}
+          printf '%s' "$signer" | grep -Eqx '[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+' \
+            || fail "signer workflow '$signer' is not owner/repo/path"
+          printf 'signer=%s\n' "$signer" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.revision }}
+          persist-credentials: false
+
+      # Anonymous first, on the fresh runner: nothing of the image is cached and no
+      # registry credential has ever been written, so this pull is the only
+      # evidence of public availability that is accepted.
+      - name: Assert clean image state
+        run: |
+          set -eu
+          ref=$REGISTRY/$IMAGE_NAME@$DIGEST
+          if docker image inspect "$ref" >/dev/null 2>&1; then
+            printf '::error::%s is already present; refusing to verify from a dirty state\n' "$ref"
+            exit 1
+          fi
+
+      - name: Verify anonymously (clean DOCKER_CONFIG)
+        env:
+          SIGNER_WORKFLOW: ${{ steps.inputs.outputs.signer }}
+        run: |
+          set -eu
+          unset DOCKER_AUTH_CONFIG REGISTRY_AUTH_FILE
+          docker/release-verify.sh --anonymous \
+            --repository "$REGISTRY/$IMAGE_NAME" --digest "$DIGEST" \
+            --image-id "$IMAGE_ID" --version "$VERSION" --revision "$REVISION" \
+            --source-repo "$SOURCE_REPO" --signer-workflow "$SIGNER_WORKFLOW"
+
+      - name: Remove anonymously pulled image
+        run: |
+          set -eu
+          ref=$REGISTRY/$IMAGE_NAME@$DIGEST
+          docker image rm -f "$ref" >/dev/null
+          if docker image inspect "$ref" >/dev/null 2>&1; then
+            printf '::error::%s still present after removal\n' "$ref"
+            exit 1
+          fi
+
+      - name: Verify authenticated
+        env:
+          SIGNER_WORKFLOW: ${{ steps.inputs.outputs.signer }}
+        run: |
+          set -eu
+          DOCKER_CONFIG=$(mktemp -d "$RUNNER_TEMP/docker-auth.XXXXXX")
+          export DOCKER_CONFIG
+          trap 'docker logout "$REGISTRY" >/dev/null 2>&1 || true; rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$GH_TOKEN" | docker login "$REGISTRY" -u "$GITHUB_ACTOR" --password-stdin >/dev/null
+          docker/release-verify.sh \
+            --repository "$REGISTRY/$IMAGE_NAME" --digest "$DIGEST" \
+            --image-id "$IMAGE_ID" --version "$VERSION" --revision "$REVISION" \
+            --source-repo "$SOURCE_REPO" --signer-workflow "$SIGNER_WORKFLOW"
+
+  promote:
+    name: promote verified digest
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: container-promote-${{ inputs.tag }}
+      cancel-in-progress: false
+    permissions:
+      packages: write  # registry-side tag apply/remove
+      contents: write  # GitHub Release notes
+    env:
+      TAG: ${{ inputs.tag }}
+      VERSION: ${{ inputs.version }}
+      REVISION: ${{ inputs.revision }}
+      DIGEST: ${{ inputs.digest }}
+      STAGING_TAG: ${{ inputs.staging_tag }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Apply and re-resolve release tags
+        run: |
+          set -eu
+          fail() { printf '::error::%s\n' "$1"; exit 1; }
+          work=$(mktemp -d "$RUNNER_TEMP/promote.XXXXXX")
+          trap 'rm -rf "$work"' EXIT
+          base=https://$REGISTRY/v2/$IMAGE_NAME
+          accept='application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+          scope=pull,push
+          [ -z "$STAGING_TAG" ] || scope=pull,push,delete
+
+          # Registry bearer token from the workflow token; credentials stay in
+          # 0600 curl config files, never on a command line.
+          umask 077
+          printf 'user = "%s:%s"\n' "$GITHUB_ACTOR" "$GH_TOKEN" >"$work/basic"
+          token=$(curl -fsS --max-time 60 --retry 3 -K "$work/basic" \
+            "https://$REGISTRY/token?service=$REGISTRY&scope=repository:$IMAGE_NAME:$scope" | jq -er .token) \
+            || fail 'cannot obtain a registry token'
+          printf '::add-mask::%s\n' "$token"
+          printf 'header = "Authorization: Bearer %s"\n' "$token" >"$work/auth"
+
+          # Usage: fetch <reference> <out-file>; prints the HTTP status.
+          fetch() {
+            curl -sS --max-time 60 --retry 3 -K "$work/auth" -H "Accept: $accept" \
+              -o "$2" -w '%{http_code}' "$base/manifests/$1"
+          }
+          sha_of() { printf 'sha256:%s' "$(sha256sum "$1" | cut -d' ' -f1)"; }
+
+          # The verified manifest bytes, bound to the digest by content.
+          [ "$(fetch "$DIGEST" "$work/manifest.json")" = 200 ] || fail "cannot read manifest $DIGEST"
+          [ "$(sha_of "$work/manifest.json")" = "$DIGEST" ] || fail "manifest bytes do not hash to $DIGEST"
+          media_type=$(jq -er .mediaType "$work/manifest.json") || fail 'manifest has no mediaType'
+          case "$media_type" in
+            application/vnd.oci.image.manifest.v1+json|application/vnd.docker.distribution.manifest.v2+json) ;;
+            *) fail "unexpected manifest media type $media_type" ;;
+          esac
+
+          # Usage: resolve <tag>; fails unless <tag> is exactly the verified digest.
+          resolve() {
+            [ "$(fetch "$1" "$work/resolved.json")" = 200 ] || fail "tag $1 does not resolve"
+            resolved=$(sha_of "$work/resolved.json")
+            [ "$resolved" = "$DIGEST" ] || fail "tag $1 resolves to $resolved, not verified $DIGEST"
+            printf 'resolved %s -> %s\n' "$1" "$resolved"
+          }
+
+          # Revision tag first; the user-facing semantic-version tag last.
+          for t in "sha-$REVISION" "$VERSION"; do
+            status=$(fetch "$t" "$work/existing.json") || status=000
+            case "$status" in
+              404) ;;
+              200)
+                existing=$(sha_of "$work/existing.json")
+                [ "$existing" = "$DIGEST" ] || fail "tag $t already points at $existing; refusing to move it"
+                ;;
+              *) fail "unexpected HTTP $status reading tag $t" ;;
+            esac
+            put=$(curl -sS --max-time 60 -K "$work/auth" -X PUT \
+              -H "Content-Type: $media_type" --data-binary "@$work/manifest.json" \
+              -D "$work/put.headers" -o "$work/put.body" -w '%{http_code}' "$base/manifests/$t") || put=000
+            [ "$put" = 201 ] || { sed -n '1,20p' "$work/put.body" >&2; fail "HTTP $put tagging $t"; }
+            put_digest=$(tr -d '\r' <"$work/put.headers" | awk 'tolower($1) == "docker-content-digest:" { print $2 }')
+            [ -z "$put_digest" ] || [ "$put_digest" = "$DIGEST" ] \
+              || fail "registry stored $t as $put_digest, not $DIGEST"
+            resolve "$t"
+          done
+
+          if [ -n "$STAGING_TAG" ]; then
+            del=$(curl -sS --max-time 60 -K "$work/auth" -X DELETE \
+              -o "$work/del.body" -w '%{http_code}' "$base/manifests/$STAGING_TAG") || del=000
+            case "$del" in
+              200|202|404) printf 'staging tag %s removed (HTTP %s)\n' "$STAGING_TAG" "$del" ;;
+              *) sed -n '1,20p' "$work/del.body" >&2; fail "HTTP $del removing staging tag $STAGING_TAG" ;;
+            esac
+            status=$(fetch "$STAGING_TAG" "$work/staging.json") || status=000
+            [ "$status" = 404 ] || fail "staging tag $STAGING_TAG still resolves (HTTP $status)"
+            # Removing the staging tag must not have removed the verified image.
+            [ "$(fetch "$DIGEST" "$work/after.json")" = 200 ] || fail "verified digest $DIGEST vanished"
+            resolve "sha-$REVISION"
+            resolve "$VERSION"
+          fi
+
+      - name: Record digest in release notes
+        run: |
+          set -eu
+          ref=$REGISTRY/$IMAGE_NAME
+          begin='<!-- quorum-container-image:begin -->'
+          end='<!-- quorum-container-image:end -->'
+          notes=$(mktemp "$RUNNER_TEMP/notes.XXXXXX")
+          section=$(cat <<EOF
+          $begin
+          ## Container image (linux/amd64)
+
+          Verified before tagging: image identity and labels, bounded service check,
+          SLSA provenance and SBOM attestations, and an anonymous pull by digest.
+
+          - Immutable digest: \`$DIGEST\`
+          - Pull by digest: \`docker pull $ref@$DIGEST\`
+          - Tags (mutable aliases of that digest): \`$ref:$VERSION\`, \`$ref:sha-$REVISION\`
+          - Source revision: \`$REVISION\`
+          $end
+          EOF
+          )
+          # Usage: edit_existing; fails if the release does not exist yet.
+          edit_existing() {
+            body=$(gh release view "$TAG" --json body -q .body 2>/dev/null) || return 1
+            # Replace any earlier section so a rerun stays idempotent.
+            printf '%s\n' "$body" | awk -v b="$begin" -v e="$end" '
+              $0 == b { skip = 1; next }
+              $0 == e { skip = 0; next }
+              !skip' >"$notes"
+            printf '\n%s\n' "$section" >>"$notes"
+            gh release edit "$TAG" --notes-file "$notes"
+          }
+          if ! edit_existing; then
+            printf '%s\n' "$section" >"$notes"
+            # A concurrent release job may create it first; then edit that one.
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$notes" \
+              || edit_existing
+          fi
+          gh release view "$TAG" --json body -q .body | grep -Fq "$ref@$DIGEST" \
+            || { printf '::error::release %s notes do not record %s\n' "$TAG" "$DIGEST"; exit 1; }

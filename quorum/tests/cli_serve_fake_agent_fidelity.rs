@@ -412,6 +412,17 @@ fn repeated_error_results_fire_agent_failed() {
 /// idle reaper, whose AgentFailed reopens the task for another worker.
 #[test]
 fn persistent_worker_needs_info_reaction_parks_task_at_turn_end() {
+    persistent_worker_reaction_parks_task_at_turn_end("needs-info");
+}
+
+/// Task #222 follow-up: a live persistent worker's `failed` reaction parks
+/// too, instead of idle-reaping and respawning on the unchanged contract.
+#[test]
+fn persistent_worker_failed_reaction_parks_task_at_turn_end() {
+    persistent_worker_reaction_parks_task_at_turn_end("failed");
+}
+
+fn persistent_worker_reaction_parks_task_at_turn_end(state: &str) {
     let home = tempfile::tempdir().unwrap();
     let repo_dir = tempfile::tempdir().unwrap();
     let wt_base = tempfile::tempdir().unwrap();
@@ -427,7 +438,7 @@ fn persistent_worker_needs_info_reaction_parks_task_at_turn_end() {
         .status()
         .unwrap();
 
-    seed_task(home.path(), "Needs-info park test");
+    seed_task(home.path(), "Reaction park test");
 
     let mut handle = ServeHandle::start(
         home.path(),
@@ -435,12 +446,12 @@ fn persistent_worker_needs_info_reaction_parks_task_at_turn_end() {
         wt_base.path(),
         &names_file,
         log_dir.path(),
-        &[("FAKE_AGENT_REACT", "needs-info")],
+        &[("FAKE_AGENT_REACT", state)],
     );
 
     assert!(
         handle.wait_for("on its explicit reaction", 45),
-        "daemon must park the task when the persistent worker's turn ends on needs-info. Lines: {:?}",
+        "daemon must park the task when the persistent worker's turn ends on {state}. Lines: {:?}",
         handle.lines
     );
     handle.stop();
@@ -457,7 +468,17 @@ fn persistent_worker_needs_info_reaction_parks_task_at_turn_end() {
     assert!(assignee.is_none());
     assert_eq!(attempts, 0, "no AgentFailed recovery attempt consumed");
     let refs: serde_json::Value = serde_json::from_str(refs.as_deref().unwrap()).unwrap();
-    assert_eq!(refs["daemon_parked_reason"], "needs-info", "{refs}");
+    assert_eq!(refs["daemon_parked_reason"], state, "{refs}");
+    let (worker_runs, reaped_runs): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE end_reason='idle_reaped')
+             FROM agent_runs WHERE role='worker'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(worker_runs, 1, "no replacement worker is spawned");
+    assert_eq!(reaped_runs, 0, "the reacting worker is not idle-reaped");
     let parked: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM events WHERE kind='task_parked'",

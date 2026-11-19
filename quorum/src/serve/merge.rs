@@ -131,9 +131,26 @@ pub fn apply_required_jobs_gate(
                 .collect(),
         },
         RequiredJobsOutcome::Pending { pending_jobs } => ChecksOutcome::Pending {
-            reason: format!("required jobs still pending: {}", pending_jobs.join(", ")),
+            reason: format!("{REQUIRED_JOBS_PENDING_PREFIX}{}", pending_jobs.join(", ")),
         },
     }
+}
+
+const REQUIRED_JOBS_PENDING_PREFIX: &str = "required jobs still pending: ";
+
+/// Pending required-job names recovered from a `Pending` reason produced by
+/// [`apply_required_jobs_gate`]. Returns `None` for any other pending reason
+/// (e.g. a timed-out rollup wait) so the caller can ask the provider instead.
+pub fn required_jobs_pending_names(reason: &str) -> Option<Vec<String>> {
+    let names = reason.strip_prefix(REQUIRED_JOBS_PENDING_PREFIX)?;
+    Some(
+        names
+            .split(", ")
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3149,6 +3166,26 @@ mod tests {
                 failing_checks: vec!["clippy".into()]
             },
             "required-job success must not erase a general check failure"
+        );
+    }
+
+    #[test]
+    fn required_jobs_pending_names_round_trips_only_gate_reasons() {
+        let ChecksOutcome::Pending { reason } = apply_required_jobs_gate(
+            ChecksOutcome::Ready,
+            RequiredJobsOutcome::Pending {
+                pending_jobs: vec!["test".into(), "lint".into()],
+            },
+        ) else {
+            panic!("required-job pending must stay pending");
+        };
+        assert_eq!(
+            required_jobs_pending_names(&reason),
+            Some(vec!["test".to_string(), "lint".to_string()])
+        );
+        assert_eq!(
+            required_jobs_pending_names("CI checks timed out after 60s for PR #7"),
+            None
         );
     }
 

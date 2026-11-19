@@ -254,9 +254,12 @@ pub struct QueueTask {
     pub tier_eff: String,
     pub priority: i64,
     pub pr: Option<i64>,
-    /// Why a planner-routed queued task is waiting on another graph, e.g.
-    /// `waiting for graph #74 (source #697) before planning`. Absent for
-    /// non-planner tasks and when no active or blocked graph holds planning.
+    /// Why a planner-routed queued task is waiting: the counted graphs
+    /// (`CountedGraphView`, see [`Stats::counted_graphs`]) that fill the
+    /// configured `max_active_graphs` limit, e.g. `waiting for
+    /// max_active_graphs limit 2/2: graph #74 (source #697, active), graph
+    /// #81 (source #700, blocked)`. Absent for non-planner tasks, when the
+    /// limit is unknown, and when fewer graphs are counted than the limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hold_reason: Option<String>,
 }
@@ -276,11 +279,11 @@ pub struct ReviewingTask {
     /// durably recorded PR head; the daemon still owns the merge (and any CI wait).
     pub state: String,
     /// Why an `awaiting reviewer` task has no live reviewer, when that is derivable from
-    /// durable DB state alone (classification pending, reviewer cap exhausted, provisioning
-    /// strikes exhausted, or an approval whose current head is not durably known). For
-    /// `approved, merge pending` it names the approved head. Absent means the cause is not
-    /// visible to a read-only status process (for example live CI state, which only the
-    /// daemon queries from GitHub).
+    /// durable DB state alone (classification pending, reviewer run cap exhausted,
+    /// provisioning strikes exhausted, awaiting reviewer slot, or an approval whose current
+    /// head is not durably known). For `approved, merge pending` it names the approved head.
+    /// Absent means the cause is not visible to a read-only status process (for example live
+    /// CI state, which only the daemon queries from GitHub).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -319,6 +322,18 @@ pub struct ArbiterVerdict {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub duration_ms: Option<i64>,
+}
+
+/// One graph counted toward the `max_active_graphs` admission limit:
+/// materialized (`active`/`blocked`, or the `active=1` scheduling slot) or
+/// currently holding planning authority (`freeze_active=1`). See
+/// `decomposition::COUNTED_GRAPH_PREDICATE`, the single source of truth this
+/// projection reads.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CountedGraphView {
+    pub graph_id: i64,
+    pub source_task_id: i64,
+    pub state: String,
 }
 
 /// Bounded child projection for the repository's current decomposition graph.
@@ -366,26 +381,6 @@ pub struct DecompositionStatusView {
     pub failed_children: Vec<i64>,
     pub reasons: Vec<String>,
     pub members: Vec<DecompositionMemberView>,
-    /// Set when the graph has sat in `freeze-requested`/`draining` longer than
-    /// [`DECOMPOSITION_DRAIN_STALL_SECS`]; counted as stalled by `stats`.
-    pub drain_stall: Option<DecompositionDrainStall>,
-}
-
-/// A graph that has been `freeze-requested` or `draining` longer than this is
-/// reported as stalled. Draining waits for already-started tasks to finish, so
-/// the bound sits well above one ordinary work + review cycle.
-pub const DECOMPOSITION_DRAIN_STALL_SECS: i64 = 2 * 3600;
-
-/// Provider-blocked tasks named in one status reason; the rest are counted.
-const PROVIDER_BLOCKED_REASON_TASKS: usize = 3;
-
-/// Durable view of which daemon drain-readiness condition is holding a graph.
-#[derive(Debug, Serialize, PartialEq, Eq)]
-pub struct DecompositionDrainStall {
-    /// Seconds since the graph last changed state.
-    pub age_secs: i64,
-    /// Human-readable false drain conditions, bounded and never empty.
-    pub blockers: Vec<String>,
 }
 
 /// The server-owned task journey. Consumers render this projection and do not
@@ -502,7 +497,9 @@ pub struct MergeBlockerView {
     pub task_id: i64,
     pub title: String,
     pub pr: Option<i64>,
-    /// "conflict", "ci_pending", "policy"
+    /// "conflict", "ci_pending", "ci_failing", "ci_passed", "policy".
+    /// A `merging` task without a daemon `refs.merge_checks` snapshot keeps
+    /// the inferred "ci_pending".
     pub blocker_kind: String,
     /// Current task status (e.g. "in-review", "merging").
     pub status: String,
@@ -510,6 +507,105 @@ pub struct MergeBlockerView {
     pub waiting_secs: i64,
     /// Rework rounds accumulated on this task.
     pub retry_count: i32,
+    /// Snapshot CI state (`pending`/`failing`/`passed`); absent without a snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_state: Option<String>,
+    /// Snapshot check names, sanitized and bounded to
+    /// [`crate::tasks::MERGE_CHECKS_MAX_NAMES`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ci_checks: Vec<String>,
+    /// When the current `ci_state` was first observed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_since: Option<i64>,
+    /// When the daemon last observed the checks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_observed_at: Option<i64>,
+    /// Bounded one-line summary, e.g. `awaiting CI: unit, clippy (pending 6m)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ci_summary: Option<String>,
+}
+
+/// Check names shown inline in a CI summary before collapsing to `+N more`.
+const MERGE_CI_SUMMARY_NAMES: usize = 3;
+
+/// Read the daemon-owned merge-gate snapshot from task refs, re-bounding the
+/// check names for display (the reader must not trust stored length/content).
+fn merge_ci_snapshot(refs: Option<&str>) -> Option<crate::tasks::MergeChecksSnapshot> {
+    let mut snap = crate::tasks::merge_checks_of(refs)?;
+    snap.checks = snap
+        .checks
+        .iter()
+        .filter_map(|name| {
+            let clean: String = name
+                .chars()
+                .filter(|ch| *ch != '\0')
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .take(crate::tasks::MERGE_CHECKS_MAX_NAME_CHARS)
+                .collect();
+            let trimmed = clean.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .take(crate::tasks::MERGE_CHECKS_MAX_NAMES)
+        .collect();
+    Some(snap)
+}
+
+fn fmt_elapsed(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
+}
+
+/// Bounded human summary of a merge-gate snapshot. At most
+/// [`MERGE_CI_SUMMARY_NAMES`] names are listed inline; the text is capped at
+/// the task-progress text limit.
+fn merge_ci_summary(snap: &crate::tasks::MergeChecksSnapshot, now: i64) -> String {
+    use crate::tasks::MergeChecksState;
+    let elapsed = fmt_elapsed(now - snap.since);
+    let mut names = snap
+        .checks
+        .iter()
+        .take(MERGE_CI_SUMMARY_NAMES)
+        .map(|name| truncate_chars(name, 40))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if snap.checks.len() > MERGE_CI_SUMMARY_NAMES {
+        names.push_str(&format!(
+            " +{} more",
+            snap.checks.len() - MERGE_CI_SUMMARY_NAMES
+        ));
+    }
+    let names = if names.is_empty() {
+        String::new()
+    } else {
+        format!(": {names}")
+    };
+    let text = match snap.state {
+        MergeChecksState::Pending => format!("awaiting CI{names} (pending {elapsed})"),
+        MergeChecksState::Failing => format!("CI failing{names} (failing {elapsed})"),
+        MergeChecksState::Passed => format!("CI passed, awaiting merge ({elapsed})"),
+    };
+    bounded_progress_text(&text)
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        format!(
+            "{}…",
+            head.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
+    } else {
+        head
+    }
 }
 
 /// True when `count` is 0 or a power of two — controls merge-wait alert dedup.
@@ -671,6 +767,15 @@ pub struct Stats {
     pub pipeline: Vec<PipelineTask>,
     /// Current planning cycle or active/held decomposition graph, if any.
     pub decomposition: Option<DecompositionStatusView>,
+    /// Every graph counted toward `max_active_graphs` admission (active,
+    /// blocked, or holding planning authority) — names all of them rather
+    /// than a single graph.
+    pub counted_graphs: Vec<CountedGraphView>,
+    /// The admission limit `counted_graphs` is measured against, when the
+    /// caller supplied one. `None` for a bare [`stats`] snapshot that did
+    /// not resolve a configured `max_active_graphs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_active_graphs: Option<i64>,
     /// #204: deduped errors from last hour.
     pub recent_errors: Vec<DedupedError>,
     /// #204: count of older errors silenced (>1h).
@@ -701,6 +806,44 @@ pub struct Stats {
 
 /// Gather a snapshot. Read-only.
 pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
+    stats_impl(conn, now, online_window, None, None)
+}
+
+/// Reviewer-cap-aware variant of [`stats`]. When `reviewer_cap` is supplied, an in-review
+/// task with no live reviewer and no more specific reason reports "awaiting reviewer slot"
+/// once live reviewer `daemon_agents` meet or exceed the cap (issue #415). `None` behaves
+/// exactly like [`stats`].
+pub fn stats_with_reviewer_cap(
+    conn: &Connection,
+    now: i64,
+    online_window: i64,
+    reviewer_cap: Option<i64>,
+) -> Result<Stats> {
+    stats_impl(conn, now, online_window, reviewer_cap, None)
+}
+
+/// Full-option variant of [`stats_with_reviewer_cap`] that also reports the configured
+/// `max_active_graphs` admission limit. When supplied, a planner-routed queued task that
+/// is waiting because the counted graphs (active/blocked/holding planning authority) have
+/// reached that limit names every one of them. `None` behaves exactly like
+/// [`stats_with_reviewer_cap`] — no hold reason is computed without a known limit.
+pub fn stats_with_options(
+    conn: &Connection,
+    now: i64,
+    online_window: i64,
+    reviewer_cap: Option<i64>,
+    max_active_graphs: Option<i64>,
+) -> Result<Stats> {
+    stats_impl(conn, now, online_window, reviewer_cap, max_active_graphs)
+}
+
+fn stats_impl(
+    conn: &Connection,
+    now: i64,
+    online_window: i64,
+    reviewer_cap: Option<i64>,
+    max_active_graphs: Option<i64>,
+) -> Result<Stats> {
     let one = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> Result<i64> {
         Ok(conn.query_row(sql, p, |r| r.get(0))?)
     };
@@ -764,25 +907,19 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
     // vec when no events recorded — section is suppressed in the renderer.
     let activity = crate::activity::activity_summary(conn, now)?;
     let daemon_agents = daemon_agents_view(conn, now)?;
-    let queue_tasks_list = queue_tasks(conn)?;
-    let reviewing = reviewing_tasks(conn, &daemon_agents)?;
+    let counted_graphs = counted_graphs(conn)?;
+    let queue_tasks_list = queue_tasks(conn, &counted_graphs, max_active_graphs)?;
+    let reviewing = reviewing_tasks(conn, &daemon_agents, reviewer_cap)?;
     let pipeline = pipeline_tasks(conn, now)?;
     let decomposition = decomposition_status(conn, now)?;
     let (recent_errors, older_errors_silenced) = deduped_errors(conn, now)?;
     let alerts = alert_messages(conn, now)?;
     let merge_blockers = merge_blockers(conn, now)?;
-    let drain_stalled = decomposition
-        .as_ref()
-        .is_some_and(|graph| graph.drain_stall.is_some());
-    let health = if drain_stalled {
-        HealthVerdict::Stalled
-    } else {
-        compute_health(
-            &daemon_agents,
-            !recent_errors.is_empty(),
-            !alerts.is_empty(),
-        )
-    };
+    let health = compute_health(
+        &daemon_agents,
+        !recent_errors.is_empty(),
+        !alerts.is_empty(),
+    );
     let stalled_count = daemon_agents
         .iter()
         .filter(|d| is_stall_eligible(d))
@@ -790,8 +927,7 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
             matches!(d.last_activity_age_secs, Some(age) if age > 180)
                 || d.last_activity_age_secs.is_none()
         })
-        .count() as i64
-        + i64::from(drain_stalled);
+        .count() as i64;
     let session_cost: f64 = daemon_agents.iter().map(|d| d.cost_usd).sum();
     let unbacked_prs = crate::drift::unbacked_pr_events(conn, now).unwrap_or_default();
     let twin_prs = crate::drift::twin_pr_events(conn, now).unwrap_or_default();
@@ -822,6 +958,8 @@ pub fn stats(conn: &Connection, now: i64, online_window: i64) -> Result<Stats> {
         reviewing,
         pipeline,
         decomposition,
+        counted_graphs,
+        max_active_graphs,
         recent_errors,
         older_errors_silenced,
         health,
@@ -930,7 +1068,15 @@ pub fn task_progress(conn: &Connection, task_id: i64, now: i64) -> Result<Option
                 decomposition_current_progress(&task, graph.as_ref(), &attempts, &live)
             }
             TaskJourney::DirectImplementation | TaskJourney::ReviewOnly => {
-                execution_current_progress(&task, journey, r2_required, &runs, &live, &dependencies)
+                execution_current_progress(
+                    &task,
+                    journey,
+                    r2_required,
+                    &runs,
+                    &live,
+                    &dependencies,
+                    now,
+                )
             }
         }
     };
@@ -949,7 +1095,6 @@ pub fn task_progress(conn: &Connection, task_id: i64, now: i64) -> Result<Option
     milestones.extend(future);
     milestones.truncate(TASK_PROGRESS_MILESTONE_LIMIT);
 
-    let _ = now; // Kept request-scoped for a stable public projection signature.
     Ok(Some(TaskProgress {
         task_id,
         journey,
@@ -1313,6 +1458,7 @@ fn execution_current_progress(
     runs: &[crate::agent_runs::AgentRun],
     live: &[ProgressLiveRun],
     dependencies: &DependencyProgress,
+    now: i64,
 ) -> (
     TaskProgressStage,
     Option<String>,
@@ -1424,14 +1570,13 @@ fn execution_current_progress(
                     role: None,
                     activity: "Merge is in progress".into(),
                 },
-                Some(
-                    if waiting_conflict {
-                        "Waiting for merge conflict resolution"
-                    } else {
-                        "Waiting for CI"
-                    }
-                    .into(),
-                ),
+                Some(if waiting_conflict {
+                    "Waiting for merge conflict resolution".into()
+                } else {
+                    merge_ci_snapshot(task.refs.as_deref())
+                        .map(|snap| merge_ci_summary(&snap, now))
+                        .unwrap_or_else(|| "Waiting for CI".into())
+                }),
                 Some(possible_next("CI and merge policy may permit completion")),
             )
         }
@@ -2757,7 +2902,11 @@ pub fn tier_eff_label(labels_json: Option<&str>) -> String {
 }
 
 /// Individual claimable tasks for the QUEUE section (#204).
-fn queue_tasks(conn: &Connection) -> Result<Vec<QueueTask>> {
+fn queue_tasks(
+    conn: &Connection,
+    counted: &[CountedGraphView],
+    max_active_graphs: Option<i64>,
+) -> Result<Vec<QueueTask>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, labels, priority, refs, depends_on FROM tasks WHERE status='open'
          ORDER BY priority DESC, id ASC",
@@ -2801,25 +2950,31 @@ fn queue_tasks(conn: &Connection) -> Result<Vec<QueueTask>> {
             hold_reason: None,
         });
     }
-    apply_planner_hold_reasons(conn, &mut result)?;
+    apply_planner_hold_reasons(conn, &mut result, counted, max_active_graphs)?;
     Ok(result)
 }
 
-/// The graph that withholds planner selection: `state` active or blocked, or
-/// the `active=1` scheduling slot. At most one row has `active=1`; a blocked
-/// row with `active=0` can match too, so the read picks one deterministically
-/// and prefers the scheduling slot.
-fn planner_holding_graph(conn: &Connection) -> Result<Option<(i64, i64)>> {
-    Ok(conn
-        .query_row(
-            "SELECT id, source_task_id FROM task_decompositions
-             WHERE state IN ('active','blocked') OR active=1
-             ORDER BY active DESC, id ASC
-             LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?)
+/// Every graph counted toward `max_active_graphs` admission, per
+/// `decomposition::COUNTED_GRAPH_PREDICATE`: materialized (`active`/`blocked`,
+/// or the `active=1` scheduling slot) or currently holding planning
+/// authority (`freeze_active=1`). Ordered by id for stable output.
+fn counted_graphs(conn: &Connection) -> Result<Vec<CountedGraphView>> {
+    let sql = format!(
+        "SELECT id, source_task_id, state FROM task_decompositions
+         WHERE {} ORDER BY id ASC",
+        crate::decomposition::COUNTED_GRAPH_PREDICATE
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(CountedGraphView {
+                graph_id: row.get(0)?,
+                source_task_id: row.get(1)?,
+                state: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 fn planner_eligible_task_ids(conn: &Connection) -> Result<std::collections::HashSet<i64>> {
@@ -2834,18 +2989,46 @@ fn planner_eligible_task_ids(conn: &Connection) -> Result<std::collections::Hash
     Ok(ids)
 }
 
-/// One holding-graph read per status snapshot. Only queued tasks that match
-/// the shared planner-eligibility predicate get a reason.
-fn apply_planner_hold_reasons(conn: &Connection, queue: &mut [QueueTask]) -> Result<()> {
-    if queue.is_empty() {
+/// Renders the hold reason naming every graph that fills the `max_active_graphs` limit.
+fn format_planner_hold_reason(counted: &[CountedGraphView], limit: i64) -> String {
+    let graphs = counted
+        .iter()
+        .map(|g| {
+            format!(
+                "graph #{} (source #{}, {})",
+                g.graph_id, g.source_task_id, g.state
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "waiting for max_active_graphs limit {}/{limit}: {graphs}",
+        counted.len(),
+    )
+}
+
+/// Only queued tasks that match the shared planner-eligibility predicate get a reason, and
+/// only once the counted graphs (active/blocked/holding planning authority) have reached
+/// the configured `max_active_graphs` limit — below the limit there is room to start
+/// planning a new graph, so nothing is held. `max_active_graphs: None` (the limit is
+/// unknown) never computes a reason, matching the `reviewer_cap: None` convention.
+fn apply_planner_hold_reasons(
+    conn: &Connection,
+    queue: &mut [QueueTask],
+    counted: &[CountedGraphView],
+    max_active_graphs: Option<i64>,
+) -> Result<()> {
+    if queue.is_empty() || counted.is_empty() {
         return Ok(());
     }
-    let Some((graph_id, source_task_id)) = planner_holding_graph(conn)? else {
+    let Some(limit) = max_active_graphs else {
         return Ok(());
     };
+    if (counted.len() as i64) < limit {
+        return Ok(());
+    }
     let eligible = planner_eligible_task_ids(conn)?;
-    let reason =
-        format!("waiting for graph #{graph_id} (source #{source_task_id}) before planning");
+    let reason = format_planner_hold_reason(counted, limit);
     for task in queue.iter_mut() {
         if eligible.contains(&task.id) {
             task.hold_reason = Some(reason.clone());
@@ -2868,6 +3051,7 @@ fn extract_pr_from_refs(refs_json: Option<&str>) -> Option<i64> {
 fn reviewing_tasks(
     conn: &Connection,
     daemon_agents: &[DaemonAgentView],
+    reviewer_cap: Option<i64>,
 ) -> Result<Vec<ReviewingTask>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, status, refs FROM (
@@ -2899,11 +3083,11 @@ fn reviewing_tasks(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let freeze_active: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM task_decompositions WHERE freeze_active=1)",
-        [],
-        |r| r.get(0),
-    )?;
+    let live_reviewer_count = daemon_agents
+        .iter()
+        .filter(|agent| agent.role == "reviewer")
+        .count() as i64;
+    let slot_full = reviewer_cap.is_some_and(|cap| live_reviewer_count >= cap);
     let mut out = Vec::with_capacity(rows.len());
     for (id, title, status, refs) in rows {
         let reviewer = daemon_agents
@@ -2924,15 +3108,13 @@ fn reviewing_tasks(
                     )),
                 ),
                 view => {
-                    let reason =
-                        awaiting_reviewer_reason(conn, id, refs.as_deref(), freeze_active)?
-                            .or_else(|| {
-                                (view == ApprovalView::HeadUnknown).then(|| {
-                                    "approval recorded but the current PR head is not \
-                                     durably known"
-                                        .to_string()
-                                })
-                            });
+                    let reason = awaiting_reviewer_reason_for_view(
+                        conn,
+                        id,
+                        refs.as_deref(),
+                        &view,
+                        slot_full,
+                    )?;
                     ("awaiting reviewer".to_string(), reason)
                 }
             }
@@ -3032,18 +3214,17 @@ fn classification_complete(refs: Option<&str>) -> bool {
 }
 
 /// Specific, DB-visible reason an in-review task has no live reviewer; `None` when unknown.
+/// `slot_full` is true when live reviewer `daemon_agents` meet or exceed a configured
+/// reviewer cap (issue #415); it is the lowest-precedence reason, checked last so the more
+/// specific durable reasons above still win; `reviewing_tasks` applies that lower
+/// precedence itself, below its own `ApprovalView::HeadUnknown` fallback.
 fn awaiting_reviewer_reason(
     conn: &Connection,
     task_id: i64,
     refs: Option<&str>,
-    freeze_active: bool,
 ) -> Result<Option<String>> {
     if !classification_complete(refs) {
-        return Ok(Some(if freeze_active {
-            "classification pending (a decomposition freeze is active)".to_string()
-        } else {
-            "classification pending".to_string()
-        }));
+        return Ok(Some("classification pending".to_string()));
     }
     // Same count the daemon uses. The no-work exclusion lives only in
     // `total_reviewer_runs`.
@@ -3061,6 +3242,54 @@ fn awaiting_reviewer_reason(
         )));
     }
     Ok(None)
+}
+
+/// Precedence applied once an in-review task's [`ApprovalView`] is known to be `HeadUnknown`
+/// or `NotApproved` (an `Approved` view is never passed here; its caller reports the approved
+/// reason itself, since that view means `awaiting reviewer` is not the task's state at all):
+/// the specific durable reasons from [`awaiting_reviewer_reason`] first, then an unknown
+/// approval head, then a full reviewer cap last as the lowest-precedence reason. Shared by
+/// `reviewing_tasks` and `task_awaiting_reviewer_reason` so the two surfaces cannot drift out
+/// of sync on this precedence (#415).
+fn awaiting_reviewer_reason_for_view(
+    conn: &Connection,
+    task_id: i64,
+    refs: Option<&str>,
+    view: &ApprovalView,
+    slot_full: bool,
+) -> Result<Option<String>> {
+    Ok(awaiting_reviewer_reason(conn, task_id, refs)?
+        .or_else(|| {
+            (*view == ApprovalView::HeadUnknown).then(|| {
+                "approval recorded but the current PR head is not durably known".to_string()
+            })
+        })
+        .or_else(|| slot_full.then(|| "awaiting reviewer slot".to_string())))
+}
+
+/// Reviewer-cap-aware reason an in-review task has no live reviewer, for read-only status
+/// surfaces that do not otherwise compute [`Stats`] (for example the web dashboard's
+/// lighter per-band query). Consults the same [`review_approval_view`] `reviewing_tasks`
+/// does: a fully-approved task reports its approval reason (the caller's task is
+/// `approved, merge pending`, not `awaiting reviewer`, matching `quorum status`/cockpit),
+/// an unknown approval head wins next, then the specific durable reasons from
+/// [`awaiting_reviewer_reason`], with "awaiting reviewer slot" as the lowest-precedence
+/// reason; `None` when the cause (if any) is not DB-visible.
+pub fn task_awaiting_reviewer_reason(
+    conn: &Connection,
+    task_id: i64,
+    refs: Option<&str>,
+    live_reviewer_count: i64,
+    reviewer_cap: Option<i64>,
+) -> Result<Option<String>> {
+    let slot_full = reviewer_cap.is_some_and(|cap| live_reviewer_count >= cap);
+    match review_approval_view(conn, task_id, extract_pr_from_refs(refs))? {
+        ApprovalView::Approved(head) => Ok(Some(format!(
+            "all required reviews approved at head {}",
+            short_sha(&head)
+        ))),
+        view => awaiting_reviewer_reason_for_view(conn, task_id, refs, &view, slot_full),
+    }
 }
 
 /// Task pipeline view: daemon-owned source stages + recently done/closed (#204).
@@ -3183,15 +3412,17 @@ pub fn arbiter_verdict(conn: &Connection, source_task_id: i64) -> Result<Option<
     }))
 }
 
-/// The schema guarantees at most one active graph/freeze. A held planning result is
-/// also useful owner-facing state, so fall back to the newest non-completed aggregate.
+/// Several graphs may be counted (up to `max_active_graphs`), with at most one
+/// planning freeze; this view shows the most relevant one (live first). A held
+/// planning result is also useful owner-facing state, so fall back to the newest
+/// non-completed aggregate.
 fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<DecompositionStatusView>> {
     let graph = conn
         .query_row(
             "SELECT d.id, d.source_task_id, t.title, t.status, d.state, d.active,
                     d.proposal_attempts, d.provider_failures, d.planner_provider,
                     d.planner_model, a.effort, d.accepted_plan_revision, d.hold_summary,
-                    d.hold_code,d.operator_retry_count,d.freeze_active,d.updated_at
+                    d.hold_code,d.operator_retry_count
              FROM task_decompositions d
              JOIN tasks t ON t.id=d.source_task_id
              LEFT JOIN role_assignments a ON a.id=d.planner_assignment_id AND a.role='planner'
@@ -3217,8 +3448,6 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
                     r.get::<_, Option<String>>(12)?,
                     r.get::<_, Option<String>>(13)?,
                     r.get::<_, i64>(14)?,
-                    r.get::<_, bool>(15)?,
-                    r.get::<_, i64>(16)?,
                 ))
             },
         )
@@ -3239,19 +3468,10 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
         hold_summary,
         hold_code,
         operator_retry_count,
-        freeze_active,
-        graph_updated_at,
     )) = graph
     else {
         return Ok(None);
     };
-    let drain_stall = decomposition_drain_stall(
-        conn,
-        source_task_id,
-        &graph_state,
-        freeze_active,
-        now - graph_updated_at,
-    )?;
     let retryable_planning_hold =
         crate::decomposition::exhausted_planning_retry_is_eligible(conn, source_task_id, now)?;
     let planner_log_dir: Option<String> = conn
@@ -3325,12 +3545,6 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
             reasons.push(reason);
         }
     }
-    // Prepended so the bound below can only drop older history, never the wait.
-    if let Some(wait) =
-        provider_blocked_wait_reason(conn, source_task_id, &graph_state, freeze_active)?
-    {
-        reasons.insert(0, wait);
-    }
     reasons.truncate(6);
 
     let dispatch_hold = if graph_state != "active" || !graph_active {
@@ -3373,91 +3587,7 @@ fn decomposition_status(conn: &Connection, now: i64) -> Result<Option<Decomposit
         failed_children,
         reasons,
         members,
-        drain_stall,
     }))
-}
-
-/// Name the tasks a released `provider-backoff` graph is waiting on and the
-/// operator action that clears them. This is an expected wait, not a stalled
-/// drain, so it is reported as a reason and never through `drain_stall`. Status
-/// runs outside the daemon, so this projects the durable block; whether a task
-/// still holds an in-memory slot is not inferred.
-fn provider_blocked_wait_reason(
-    conn: &Connection,
-    source_task_id: i64,
-    graph_state: &str,
-    freeze_active: bool,
-) -> Result<Option<String>> {
-    if graph_state != "provider-backoff" || freeze_active {
-        return Ok(None);
-    }
-    let blocked = crate::decomposition::provider_blocked_started_task_ids(conn, source_task_id)?;
-    if blocked.is_empty() {
-        return Ok(None);
-    }
-    let mut named = blocked
-        .iter()
-        .take(PROVIDER_BLOCKED_REASON_TASKS)
-        .map(|id| format!("#{id}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if blocked.len() > PROVIDER_BLOCKED_REASON_TASKS {
-        let omitted = blocked.len() - PROVIDER_BLOCKED_REASON_TASKS;
-        named.push_str(&format!(" +{omitted} more"));
-    }
-    Ok(Some(format!(
-        "planning waits on provider-blocked {named}; retry with task-retry"
-    )))
-}
-
-/// Project which durable `decomposition_drain_ready` input (serve/mod.rs) is
-/// still false for a graph stuck in its freeze/drain phase. Status runs outside
-/// the daemon, so in-memory work (classifier, doctor, pre-review checks) is
-/// named only as the residual when no durable condition is false.
-fn decomposition_drain_stall(
-    conn: &Connection,
-    source_task_id: i64,
-    graph_state: &str,
-    freeze_active: bool,
-    age_secs: i64,
-) -> Result<Option<DecompositionDrainStall>> {
-    if !matches!(graph_state, "freeze-requested" | "draining")
-        || age_secs <= DECOMPOSITION_DRAIN_STALL_SECS
-    {
-        return Ok(None);
-    }
-    let mut blockers = Vec::new();
-    if !freeze_active {
-        blockers.push("repository freeze not held".to_string());
-    } else if graph_state == "freeze-requested" {
-        blockers.push("daemon has not advanced freeze-requested to draining".to_string());
-    }
-    let mut role_stmt =
-        conn.prepare("SELECT role, count(*) FROM journal GROUP BY role ORDER BY role")?;
-    let roles = role_stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let journal_rows: i64 = roles.iter().map(|(_, count)| count).sum();
-    if journal_rows > 0 {
-        let roles = roles
-            .iter()
-            .map(|(role, count)| format!("{role}={count}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        blockers.push(format!("journal rows={journal_rows} ({roles})"));
-    }
-    let started = crate::tasks::count_started_non_terminal_excluding(conn, source_task_id)?;
-    if started > 0 {
-        blockers.push(format!("started non-terminal tasks={started}"));
-    }
-    if blockers.is_empty() {
-        blockers.push(
-            "no durable blocker; waiting on daemon in-memory work \
-             (worker, reviewer, classifier, doctor, or pre-review checks)"
-                .to_string(),
-        );
-    }
-    Ok(Some(DecompositionDrainStall { age_secs, blockers }))
 }
 
 /// Resolve only an explicit task tier into a display identity. Queue/blocked status
@@ -3630,6 +3760,11 @@ fn merge_blockers(conn: &Connection, now: i64) -> Result<Vec<MergeBlockerView>> 
             status,
             waiting_secs: (now - updated_at).max(0),
             retry_count: rework_round,
+            ci_state: None,
+            ci_checks: Vec::new(),
+            ci_since: None,
+            ci_observed_at: None,
+            ci_summary: None,
         });
     }
 
@@ -3655,14 +3790,26 @@ fn merge_blockers(conn: &Connection, now: i64) -> Result<Vec<MergeBlockerView>> 
         if result.iter().any(|b| b.task_id == id) {
             continue;
         }
+        let snap = merge_ci_snapshot(refs.as_deref());
+        let blocker_kind = match snap.as_ref().map(|s| s.state) {
+            Some(crate::tasks::MergeChecksState::Failing) => "ci_failing",
+            Some(crate::tasks::MergeChecksState::Passed) => "ci_passed",
+            Some(crate::tasks::MergeChecksState::Pending) | None => "ci_pending",
+        };
+        let ci_summary = snap.as_ref().map(|s| merge_ci_summary(s, now));
         result.push(MergeBlockerView {
             task_id: id,
             title,
             pr: extract_pr_from_refs(refs.as_deref()),
-            blocker_kind: "ci_pending".into(),
+            blocker_kind: blocker_kind.into(),
             status: "merging".into(),
             waiting_secs: (now - updated_at).max(0),
             retry_count: rework_round,
+            ci_state: snap.as_ref().map(|s| s.state.as_str().to_string()),
+            ci_since: snap.as_ref().map(|s| s.since),
+            ci_observed_at: snap.as_ref().map(|s| s.observed_at),
+            ci_checks: snap.map(|s| s.checks).unwrap_or_default(),
+            ci_summary,
         });
     }
 
@@ -4518,8 +4665,10 @@ mod tests {
         );
         insert_holding_graph(&c, 74, 697, "active", 1);
 
-        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
-        let reason = "waiting for graph #74 (source #697) before planning";
+        // `max_active_graphs=1`: the single active graph already fills the limit.
+        let s =
+            stats_with_options(&c, 200, crate::agents::ONLINE_WINDOW_SECS, None, Some(1)).unwrap();
+        let reason = "waiting for max_active_graphs limit 1/1: graph #74 (source #697, active)";
         for id in [planner, flagged] {
             let task = s.queue_tasks.iter().find(|task| task.id == id).unwrap();
             assert_eq!(task.hold_reason.as_deref(), Some(reason));
@@ -4575,7 +4724,8 @@ mod tests {
         );
         insert_holding_graph(&c, 74, 697, "blocked", 0);
 
-        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let s =
+            stats_with_options(&c, 200, crate::agents::ONLINE_WINDOW_SECS, None, Some(1)).unwrap();
         let task = s
             .queue_tasks
             .iter()
@@ -4583,8 +4733,94 @@ mod tests {
             .unwrap();
         assert_eq!(
             task.hold_reason.as_deref(),
-            Some("waiting for graph #74 (source #697) before planning")
+            Some("waiting for max_active_graphs limit 1/1: graph #74 (source #697, blocked)")
         );
+    }
+
+    #[test]
+    fn queue_names_every_counted_graph_once_the_limit_is_full() {
+        let (_d, mut c) = open_tmp();
+        c.execute(
+            "INSERT INTO tasks(id, title, status, priority, created_by, created_at, updated_at)
+             VALUES (697, 'graph source', 'decomposed', 0, 'boss', 100, 100),
+                    (700, 'other source', 'decomposed', 0, 'boss', 100, 100)",
+            [],
+        )
+        .unwrap();
+        let planner = classified_open(
+            &mut c,
+            "plan me",
+            r#"{"cx_est":5,"cx_size":"L","cx_ready":true}"#,
+        );
+        insert_holding_graph(&c, 74, 697, "active", 1);
+        insert_holding_graph(&c, 81, 700, "blocked", 0);
+
+        // Below the limit: two counted graphs, but room for a third — no hold.
+        let below =
+            stats_with_options(&c, 200, crate::agents::ONLINE_WINDOW_SECS, None, Some(3)).unwrap();
+        assert_eq!(
+            below
+                .queue_tasks
+                .iter()
+                .find(|task| task.id == planner)
+                .unwrap()
+                .hold_reason,
+            None
+        );
+        assert_eq!(below.counted_graphs.len(), 2);
+
+        // At the limit: both counted graphs are named, in id order.
+        let at =
+            stats_with_options(&c, 200, crate::agents::ONLINE_WINDOW_SECS, None, Some(2)).unwrap();
+        let task = at
+            .queue_tasks
+            .iter()
+            .find(|task| task.id == planner)
+            .unwrap();
+        assert_eq!(
+            task.hold_reason.as_deref(),
+            Some(
+                "waiting for max_active_graphs limit 2/2: \
+                 graph #74 (source #697, active), graph #81 (source #700, blocked)"
+            )
+        );
+        let json = serde_json::to_value(&at).unwrap();
+        assert_eq!(json["max_active_graphs"], serde_json::json!(2));
+        assert_eq!(
+            json["counted_graphs"],
+            serde_json::json!([
+                {"graph_id": 74, "source_task_id": 697, "state": "active"},
+                {"graph_id": 81, "source_task_id": 700, "state": "blocked"},
+            ])
+        );
+    }
+
+    #[test]
+    fn counted_graphs_lists_every_active_graph_without_requiring_a_known_limit() {
+        let (_d, c) = open_tmp();
+        c.execute(
+            "INSERT INTO tasks(id, title, status, priority, created_by, created_at, updated_at)
+             VALUES (697, 'graph source', 'decomposed', 0, 'boss', 100, 100),
+                    (700, 'other source', 'decomposed', 0, 'boss', 100, 100)",
+            [],
+        )
+        .unwrap();
+        insert_holding_graph(&c, 74, 697, "active", 1);
+        insert_holding_graph(&c, 81, 700, "blocked", 0);
+
+        // Bare `stats()` has no configured limit, but still names both graphs.
+        let s = stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(s.max_active_graphs, None);
+        assert_eq!(
+            s.counted_graphs
+                .iter()
+                .map(|g| g.graph_id)
+                .collect::<Vec<_>>(),
+            vec![74, 81]
+        );
+        let json = serde_json::to_value(&s).unwrap();
+        assert!(json.get("max_active_graphs").is_none(), "{json}");
+        assert_eq!(json["counted_graphs"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -5606,338 +5842,68 @@ mod tests {
     }
 
     #[test]
-    fn long_draining_graph_is_stalled_and_names_the_drain_blocker() {
+    fn freeze_graph_with_started_work_reports_no_repo_wide_drain() {
         let (_d, mut c) = open_tmp();
         let now = 1_000_000;
         let source =
             crate::tasks::create(&mut c, "A", "source", None, 0, None, None, None, None, 100)
                 .unwrap();
-        let other =
-            crate::tasks::create(&mut c, "A", "other", None, 0, None, None, None, None, 100)
-                .unwrap();
-        c.execute(
-            "UPDATE tasks SET status='planning' WHERE id=?1",
-            params![source],
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO task_decompositions
-             (source_task_id,state,active,freeze_active,planned_source_revision,
-              created_at,updated_at)
-             VALUES (?1,'draining',0,1,1,?2,?2)",
-            params![source, now - 60],
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO journal(agent,role,task_id,session_id,phase,updated_at)
-             VALUES ('decomposition-planner-1','planner',?1,'s','working',?2)",
-            params![source, now - 60],
-        )
-        .unwrap();
-
-        // A brief drain is ordinary progress.
-        let brief = stats(&c, now, 300).unwrap();
-        assert!(brief.decomposition.unwrap().drain_stall.is_none());
-        assert_eq!(brief.health, HealthVerdict::OnTrack);
-        assert_eq!(brief.stalled_count, 0);
-
-        // Exactly at the bound is still not stalled; one second past is.
-        c.execute(
-            "UPDATE task_decompositions SET updated_at=?1",
-            params![now - DECOMPOSITION_DRAIN_STALL_SECS],
-        )
-        .unwrap();
-        assert!(stats(&c, now, 300)
-            .unwrap()
-            .decomposition
-            .unwrap()
-            .drain_stall
-            .is_none());
-        c.execute(
-            "UPDATE task_decompositions SET updated_at=?1",
-            params![now - DECOMPOSITION_DRAIN_STALL_SECS - 1],
-        )
-        .unwrap();
-        let stalled = stats(&c, now, 300).unwrap();
-        assert_eq!(stalled.health, HealthVerdict::Stalled);
-        assert_eq!(stalled.stalled_count, 1);
-        let stall = stalled.decomposition.unwrap().drain_stall.unwrap();
-        assert_eq!(stall.age_secs, DECOMPOSITION_DRAIN_STALL_SECS + 1);
-        assert_eq!(stall.blockers, vec!["journal rows=1 (planner=1)"]);
-
-        // Started non-terminal work is named; the planning source is excluded.
-        c.execute("DELETE FROM journal", []).unwrap();
-        c.execute(
-            "UPDATE tasks SET status='in-review' WHERE id=?1",
-            params![other],
-        )
-        .unwrap();
-        let stall = stats(&c, now, 300)
-            .unwrap()
-            .decomposition
-            .unwrap()
-            .drain_stall
-            .unwrap();
-        assert_eq!(stall.blockers, vec!["started non-terminal tasks=1"]);
-
-        // With no durable blocker the residual in-memory conditions are named.
-        c.execute("UPDATE tasks SET status='done' WHERE id=?1", params![other])
-            .unwrap();
-        let stall = stats(&c, now, 300)
-            .unwrap()
-            .decomposition
-            .unwrap()
-            .drain_stall
-            .unwrap();
-        assert_eq!(stall.blockers.len(), 1);
-        assert!(stall.blockers[0].contains("classifier, doctor, or pre-review checks"));
-
-        // A graph that left the drain phase is never drain-stalled.
-        c.execute("UPDATE task_decompositions SET state='planning'", [])
-            .unwrap();
-        let planning = stats(&c, now, 300).unwrap();
-        assert!(planning.decomposition.unwrap().drain_stall.is_none());
-        assert_eq!(planning.stalled_count, 0);
-    }
-
-    const PROVIDER_BLOCKED_REFS: &str =
-        r#"{"runner_provider_block":{"provider":"codex","reason":"quota"}}"#;
-
-    /// A drain held by `blocked` provider-blocked workers, ids ascending.
-    fn provider_blocked_drain(
-        c: &mut Connection,
-        blocked: usize,
-        updated_at: i64,
-    ) -> (i64, i64, Vec<i64>) {
-        let source =
-            crate::tasks::create(c, "A", "source", None, 0, None, None, None, None, 100).unwrap();
-        c.execute(
-            "UPDATE tasks SET status='planning' WHERE id=?1",
-            params![source],
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO task_decompositions
-             (source_task_id,state,active,freeze_active,planned_source_revision,
-              created_at,updated_at)
-             VALUES (?1,'draining',0,1,1,?2,?2)",
-            params![source, updated_at],
-        )
-        .unwrap();
-        let graph = c.last_insert_rowid();
         // Created before any is started: `create` sweeps, reclaiming lease-less workers.
-        let tasks = (0..blocked)
+        let others = (0..2)
             .map(|_| {
-                crate::tasks::create(c, "A", "work", None, 0, None, None, None, None, 100).unwrap()
+                crate::tasks::create(&mut c, "A", "work", None, 0, None, None, None, None, 100)
+                    .unwrap()
             })
             .collect::<Vec<_>>();
-        for id in &tasks {
-            c.execute(
-                "UPDATE tasks SET status='working',refs=?2 WHERE id=?1",
-                params![id, PROVIDER_BLOCKED_REFS],
-            )
-            .unwrap();
-        }
-        (graph, source, tasks)
-    }
-
-    fn total_changes(c: &Connection) -> i64 {
-        c.query_row("SELECT total_changes()", [], |r| r.get(0))
-            .unwrap()
-    }
-
-    #[test]
-    fn released_graph_names_the_provider_blocked_wait_without_stalling() {
-        let (_d, mut c) = open_tmp();
-        let now = 1_000_000;
-        let released_at = now - DECOMPOSITION_DRAIN_STALL_SECS - 1;
-        let (graph, _source, tasks) = provider_blocked_drain(&mut c, 1, released_at);
-        assert!(crate::decomposition::release_freeze_for_provider_block(
-            &mut c,
-            graph,
-            &[],
-            released_at
-        )
-        .unwrap());
-
-        let writes_before = total_changes(&c);
-        let view = stats(&c, now, 300).unwrap();
-        assert_eq!(
-            total_changes(&c),
-            writes_before,
-            "the wait is computed on read"
-        );
-        assert_eq!(view.health, HealthVerdict::OnTrack);
-        assert_eq!(view.stalled_count, 0);
-        let status = view.decomposition.unwrap();
-        assert_eq!(status.graph_state, "provider-backoff");
-        assert!(status.drain_stall.is_none());
-        assert_eq!(
-            status.reasons,
-            vec![format!(
-                "planning waits on provider-blocked #{}; retry with task-retry",
-                tasks[0]
-            )]
-        );
-        assert_eq!(
-            status.dispatch_hold.as_deref(),
-            Some("implementation dispatch held: graph state=provider-backoff, active=0")
-        );
-    }
-
-    #[test]
-    fn provider_blocked_wait_survives_reason_truncation() {
-        let (_d, mut c) = open_tmp();
-        let (graph, _source, tasks) = provider_blocked_drain(&mut c, 1, 100);
-        assert!(
-            crate::decomposition::release_freeze_for_provider_block(&mut c, graph, &[], 100)
-                .unwrap()
-        );
         c.execute(
-            "UPDATE task_decompositions SET hold_summary='held' WHERE id=?1",
-            params![graph],
+            "UPDATE tasks SET status='planning' WHERE id=?1",
+            params![source],
         )
         .unwrap();
-        for ordinal in 1..=6 {
-            c.execute(
-                "INSERT INTO decomposition_attempts
-                 (graph_id,source_revision,kind,ordinal,reason_code,summary,created_at)
-                 VALUES (?1,1,'proposal',?2,'invalid',?3,100)",
-                params![graph, ordinal, format!("reason {ordinal}")],
-            )
-            .unwrap();
-        }
-
-        let reasons = decomposition_status(&c, 100).unwrap().unwrap().reasons;
-        assert_eq!(reasons.len(), 6, "owner-facing reasons stay bounded");
-        assert_eq!(
-            reasons[0],
-            format!(
-                "planning waits on provider-blocked #{}; retry with task-retry",
-                tasks[0]
-            )
-        );
-        assert_eq!(reasons[1], "held");
-    }
-
-    #[test]
-    fn provider_blocked_wait_names_three_tasks_and_counts_the_rest() {
-        let (_d, mut c) = open_tmp();
-        let (graph, _source, tasks) = provider_blocked_drain(&mut c, 5, 100);
-        assert!(
-            crate::decomposition::release_freeze_for_provider_block(&mut c, graph, &[], 100)
-                .unwrap()
-        );
-        let reason =
-            |c: &Connection| decomposition_status(c, 100).unwrap().unwrap().reasons[0].clone();
-        assert_eq!(
-            reason(&c),
-            format!(
-                "planning waits on provider-blocked #{}, #{}, #{} +2 more; \
-                 retry with task-retry",
-                tasks[0], tasks[1], tasks[2]
-            )
-        );
-
-        // Exactly three tasks are all named, so nothing is reported as omitted.
         c.execute(
-            "UPDATE tasks SET status='done' WHERE id IN (?1,?2)",
-            params![tasks[0], tasks[1]],
+            "UPDATE tasks SET status='in-review' WHERE id=?1",
+            params![others[0]],
         )
         .unwrap();
-        assert_eq!(
-            reason(&c),
-            format!(
-                "planning waits on provider-blocked #{}, #{}, #{}; retry with task-retry",
-                tasks[2], tasks[3], tasks[4]
-            )
-        );
-    }
-
-    #[test]
-    fn provider_backoff_without_a_blocked_started_task_adds_no_wait_reason() {
-        let (_d, mut c) = open_tmp();
-        let (graph, source, tasks) = provider_blocked_drain(&mut c, 1, 100);
-        assert!(
-            crate::decomposition::release_freeze_for_provider_block(&mut c, graph, &[], 100)
-                .unwrap()
-        );
-        let reasons = |c: &Connection| decomposition_status(c, 100).unwrap().unwrap().reasons;
-
-        // The task was retried: it is still started but no longer blocked.
-        c.execute("UPDATE tasks SET refs=NULL WHERE id=?1", params![tasks[0]])
-            .unwrap();
-        assert!(reasons(&c).is_empty());
-
-        // A block carried by a task that is no longer started does not hold planning.
         c.execute(
-            "UPDATE tasks SET status='done',refs=?2 WHERE id=?1",
-            params![tasks[0], PROVIDER_BLOCKED_REFS],
+            "UPDATE tasks SET status='working',
+                 refs='{\"runner_provider_block\":{\"provider\":\"codex\",\"reason\":\"quota\"}}'
+             WHERE id=?1",
+            params![others[1]],
         )
         .unwrap();
-        assert!(reasons(&c).is_empty());
-
-        // The planning source never waits on itself.
+        // Long-lived freeze phases: under the drain these reported a stall.
         c.execute(
-            "UPDATE tasks SET status='working',refs=?2 WHERE id=?1",
-            params![source, PROVIDER_BLOCKED_REFS],
+            "INSERT INTO task_decompositions
+             (source_task_id,state,active,freeze_active,planned_source_revision,
+              created_at,updated_at)
+             VALUES (?1,'draining',0,1,1,?2,?2)",
+            params![source, now - 3 * 24 * 3600],
         )
         .unwrap();
-        assert!(reasons(&c).is_empty());
-    }
 
-    #[test]
-    fn provider_blocked_wait_is_reported_only_for_a_released_backoff() {
-        let (_d, mut c) = open_tmp();
-        let now = 1_000_000;
-        let old = now - DECOMPOSITION_DRAIN_STALL_SECS - 1;
-        let (_graph, _source, _tasks) = provider_blocked_drain(&mut c, 1, old);
-
-        // A freeze-owning graph keeps today's drain_stall output and no wait reason.
-        for (state, expected_blockers) in [
-            (
-                "freeze-requested",
-                vec![
-                    "daemon has not advanced freeze-requested to draining",
-                    "started non-terminal tasks=1",
-                ],
-            ),
-            ("draining", vec!["started non-terminal tasks=1"]),
+        for (state, freeze_active) in [
+            ("freeze-requested", 1),
+            ("draining", 1),
+            ("planning", 1),
+            ("provider-backoff", 0),
         ] {
-            c.execute("UPDATE task_decompositions SET state=?1", params![state])
-                .unwrap();
-            let view = stats(&c, now, 300).unwrap();
-            assert_eq!(view.health, HealthVerdict::Stalled, "{state}");
-            assert_eq!(view.stalled_count, 1, "{state}");
-            let status = view.decomposition.unwrap();
-            assert_eq!(
-                status.drain_stall.unwrap().blockers,
-                expected_blockers,
-                "{state}"
-            );
-            assert!(status.reasons.is_empty(), "{state}");
-        }
-
-        // Still frozen in provider-backoff: the release has not happened.
-        c.execute(
-            "UPDATE task_decompositions SET state='provider-backoff'",
-            [],
-        )
-        .unwrap();
-        let status = decomposition_status(&c, now).unwrap().unwrap();
-        assert_eq!(status.graph_state, "provider-backoff");
-        assert!(status.reasons.is_empty());
-
-        // Every other unfrozen graph state stays silent despite the blocked task.
-        for state in ["planning", "blocked"] {
             c.execute(
-                "UPDATE task_decompositions SET state=?1,freeze_active=0",
-                params![state],
+                "UPDATE task_decompositions SET state=?1,freeze_active=?2",
+                params![state, freeze_active],
             )
             .unwrap();
-            let status = decomposition_status(&c, now).unwrap().unwrap();
+            let view = stats(&c, now, 300).unwrap();
+            assert_eq!(view.health, HealthVerdict::OnTrack, "{state}");
+            assert_eq!(view.stalled_count, 0, "{state}");
+            let json = serde_json::to_value(&view).unwrap();
+            assert!(
+                json["decomposition"].get("drain_stall").is_none(),
+                "{state}: no drain projection"
+            );
+            let status = view.decomposition.unwrap();
             assert_eq!(status.graph_state, state);
-            assert!(status.reasons.is_empty(), "{state}");
+            assert!(status.reasons.is_empty(), "{state}: {:?}", status.reasons);
         }
     }
 
@@ -6414,7 +6380,7 @@ mod tests {
             "unknown cause keeps the generic label with no reason"
         );
 
-        // A freeze is surfaced as context on a classification gap only.
+        // A freeze is not a drain: it adds no context to a classification gap.
         c.execute(
             "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,planned_source_revision,created_at,updated_at)
              VALUES (?1,'planning',1,1,0,100,100)",
@@ -6431,11 +6397,260 @@ mod tests {
                 .unwrap()["reason"]
                 .clone()
         };
-        assert_eq!(
-            reason(unclassified),
-            "classification pending (a decomposition freeze is active)"
-        );
+        assert_eq!(reason(unclassified), "classification pending");
         assert!(reason(unknown).is_null());
+    }
+
+    #[test]
+    fn awaiting_reviewer_reports_slot_full_only_at_or_above_reviewer_cap() {
+        let (_d, mut c) = open_tmp();
+        let classified = r#""cx_est":2,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null"#;
+        let mut mk = |title: &str, pr: i64| {
+            let id = crate::tasks::create(&mut c, "A", title, None, 0, None, None, None, None, 100)
+                .unwrap();
+            c.execute(
+                "UPDATE tasks SET status='in-review', refs=?1 WHERE id=?2",
+                params![format!(r#"{{"pr":{pr},{classified}}}"#), id],
+            )
+            .unwrap();
+            id
+        };
+        let live = mk("live reviewer", 1);
+        let waiting = mk("waiting for a slot", 2);
+        let row = |json: &serde_json::Value, id: i64| {
+            json["reviewing"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap()
+                .clone()
+        };
+
+        // Zero live reviewers never reports "awaiting reviewer slot", no matter the cap.
+        let json = serde_json::to_value(
+            stats_with_reviewer_cap(&c, 200, crate::agents::ONLINE_WINDOW_SECS, Some(1)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            row(&json, waiting).get("reason").is_none(),
+            "zero live reviewers: unknown cause keeps the generic label"
+        );
+
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "R1".into(),
+                role: "reviewer".into(),
+                task_id: Some(live),
+                session_id: "reviewer-session".into(),
+                worktree: None,
+                branch: None,
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(1),
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+
+        // Below the cap: one live reviewer against a cap of 2 still leaves a free slot.
+        let json = serde_json::to_value(
+            stats_with_reviewer_cap(&c, 200, crate::agents::ONLINE_WINDOW_SECS, Some(2)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            row(&json, waiting).get("reason").is_none(),
+            "below the cap: no slot-full reason"
+        );
+
+        // At the cap: the one live reviewer fills the single slot.
+        let json = serde_json::to_value(
+            stats_with_reviewer_cap(&c, 200, crate::agents::ONLINE_WINDOW_SECS, Some(1)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(row(&json, live)["state"], "reviewing");
+        assert_eq!(row(&json, waiting)["state"], "awaiting reviewer");
+        assert_eq!(row(&json, waiting)["reason"], "awaiting reviewer slot");
+
+        // No reviewer_cap supplied (plain `stats`) never reports the slot-full reason.
+        let json = serde_json::to_value(stats(&c, 200, crate::agents::ONLINE_WINDOW_SECS).unwrap())
+            .unwrap();
+        assert!(
+            row(&json, waiting).get("reason").is_none(),
+            "no cap supplied: unknown cause keeps the generic label"
+        );
+    }
+
+    #[test]
+    fn classification_pending_outranks_reviewer_slot_full() {
+        let (_d, mut c) = open_tmp();
+        let classified = r#""cx_est":2,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null"#;
+        let live = {
+            let id = crate::tasks::create(
+                &mut c,
+                "A",
+                "live reviewer",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                100,
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE tasks SET status='in-review', refs=?1 WHERE id=?2",
+                params![format!(r#"{{"pr":1,{classified}}}"#), id],
+            )
+            .unwrap();
+            id
+        };
+        let unclassified = {
+            let id = crate::tasks::create(
+                &mut c,
+                "A",
+                "unclassified",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                100,
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE tasks SET status='in-review', refs=?1 WHERE id=?2",
+                params![r#"{"pr":2}"#, id],
+            )
+            .unwrap();
+            id
+        };
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "R1".into(),
+                role: "reviewer".into(),
+                task_id: Some(live),
+                session_id: "reviewer-session".into(),
+                worktree: None,
+                branch: None,
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(1),
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+
+        let json = serde_json::to_value(
+            stats_with_reviewer_cap(&c, 200, crate::agents::ONLINE_WINDOW_SECS, Some(1)).unwrap(),
+        )
+        .unwrap();
+        let reason = json["reviewing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == unclassified)
+            .unwrap()["reason"]
+            .clone();
+        assert_eq!(
+            reason, "classification pending",
+            "classification pending keeps precedence over a full reviewer slot"
+        );
+    }
+
+    #[test]
+    fn approval_head_unknown_outranks_reviewer_slot_full() {
+        let (_d, mut c) = open_tmp();
+        let classified = r#""cx_est":2,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null"#;
+        let mut mk = |title: &str, pr: i64| {
+            let id = crate::tasks::create(&mut c, "A", title, None, 0, None, None, None, None, 100)
+                .unwrap();
+            c.execute(
+                "UPDATE tasks SET status='in-review', refs=?1 WHERE id=?2",
+                params![format!(r#"{{"pr":{pr},{classified}}}"#), id],
+            )
+            .unwrap();
+            id
+        };
+        let live = mk("live reviewer", 1);
+        let unknown = mk("head unknown", 2);
+
+        // Both required roles are approved, but no pr_targets/agent_runs row records a
+        // durable head, so `review_approval_view` reports `HeadUnknown`.
+        for role in ["r1", "r2"] {
+            crate::approvals::record(
+                &mut c,
+                &crate::approvals::Approval {
+                    pr_number: 2,
+                    review_role: role.into(),
+                    task_id: unknown,
+                    author: "W".into(),
+                    reviewer: format!("Rev-{role}"),
+                    verdict: "approved".into(),
+                    blocking_count: 0,
+                    approved_head_sha: "head-a".into(),
+                },
+            )
+            .unwrap();
+        }
+        crate::journal::upsert(
+            &mut c,
+            &crate::journal::JournalEntry {
+                agent: "R1".into(),
+                role: "reviewer".into(),
+                task_id: Some(live),
+                session_id: "reviewer-session".into(),
+                worktree: None,
+                branch: None,
+                phase: "reviewing".into(),
+                cost_tokens: 0,
+                agent_state: None,
+                cost_usd: 0.0,
+                log_dir: None,
+                pid: None,
+                pr: Some(1),
+                rework_count: 0,
+                provider: None,
+                continuation_id: None,
+                local_branch: None,
+            },
+        )
+        .unwrap();
+
+        let json = serde_json::to_value(
+            stats_with_reviewer_cap(&c, 200, crate::agents::ONLINE_WINDOW_SECS, Some(1)).unwrap(),
+        )
+        .unwrap();
+        let row = json["reviewing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == unknown)
+            .unwrap()
+            .clone();
+        assert_eq!(row["state"], "awaiting reviewer");
+        assert_eq!(
+            row["reason"], "approval recorded but the current PR head is not durably known",
+            "an unknown approval head keeps precedence over a full reviewer slot"
+        );
     }
 
     #[test]
@@ -6905,6 +7120,171 @@ mod tests {
         assert_eq!(b.pr, Some(99));
     }
 
+    fn merging_task(c: &mut Connection, pr: i64) -> i64 {
+        let t = crate::tasks::create(
+            c,
+            "boss",
+            "merge me",
+            None,
+            0,
+            None,
+            None,
+            None,
+            Some(pr),
+            100,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status = 'merging', updated_at = 800 WHERE id = ?1",
+            rusqlite::params![t],
+        )
+        .unwrap();
+        t
+    }
+
+    #[test]
+    fn merge_blocker_pending_snapshot_surfaces_state_names_and_since() {
+        use crate::tasks::{set_merge_checks_snapshot, MergeChecksState};
+        let (_d, mut c) = open_tmp();
+        let t = merging_task(&mut c, 99);
+        let names: Vec<String> = ["unit", "clippy"].iter().map(|n| n.to_string()).collect();
+        assert!(
+            set_merge_checks_snapshot(&mut c, t, MergeChecksState::Pending, &names, 640).unwrap()
+        );
+        // A later observation keeps `since` and advances `observed_at`.
+        assert!(
+            set_merge_checks_snapshot(&mut c, t, MergeChecksState::Pending, &names, 900).unwrap()
+        );
+
+        let s = stats(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        assert_eq!(s.merge_blockers.len(), 1);
+        let b = &s.merge_blockers[0];
+        assert_eq!(b.blocker_kind, "ci_pending");
+        assert_eq!(b.ci_state.as_deref(), Some("pending"));
+        assert_eq!(b.ci_checks, names);
+        assert_eq!(b.ci_since, Some(640));
+        assert_eq!(b.ci_observed_at, Some(900));
+        assert_eq!(
+            b.ci_summary.as_deref(),
+            Some("awaiting CI: unit, clippy (pending 6m)")
+        );
+
+        let json = serde_json::to_value(&s).unwrap();
+        let jb = &json["merge_blockers"][0];
+        assert_eq!(jb["blocker_kind"], "ci_pending");
+        assert_eq!(jb["ci_state"], "pending");
+        assert_eq!(jb["ci_checks"], serde_json::json!(["unit", "clippy"]));
+        assert_eq!(jb["ci_since"], 640);
+        assert_eq!(jb["ci_observed_at"], 900);
+        assert_eq!(jb["ci_summary"], "awaiting CI: unit, clippy (pending 6m)");
+    }
+
+    #[test]
+    fn merge_blocker_failing_and_passed_snapshots_render_distinctly() {
+        use crate::tasks::{set_merge_checks_snapshot, MergeChecksState};
+        let (_d, mut c) = open_tmp();
+        let failing = merging_task(&mut c, 10);
+        let passed = merging_task(&mut c, 11);
+        let names: Vec<String> = (0..25).map(|i| format!("check-{i}")).collect();
+        assert!(
+            set_merge_checks_snapshot(&mut c, failing, MergeChecksState::Failing, &names, 880)
+                .unwrap()
+        );
+        assert!(
+            set_merge_checks_snapshot(&mut c, passed, MergeChecksState::Passed, &[], 970).unwrap()
+        );
+
+        let s = stats(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let f = s
+            .merge_blockers
+            .iter()
+            .find(|b| b.task_id == failing)
+            .unwrap();
+        assert_eq!(f.blocker_kind, "ci_failing");
+        assert_eq!(f.ci_state.as_deref(), Some("failing"));
+        assert_eq!(f.ci_checks.len(), crate::tasks::MERGE_CHECKS_MAX_NAMES);
+        assert_eq!(
+            f.ci_summary.as_deref(),
+            Some("CI failing: check-0, check-1, check-2 +17 more (failing 2m)")
+        );
+        let p = s
+            .merge_blockers
+            .iter()
+            .find(|b| b.task_id == passed)
+            .unwrap();
+        assert_eq!(p.blocker_kind, "ci_passed");
+        assert_eq!(p.ci_state.as_deref(), Some("passed"));
+        assert!(p.ci_checks.is_empty());
+        assert_eq!(
+            p.ci_summary.as_deref(),
+            Some("CI passed, awaiting merge (30s)")
+        );
+    }
+
+    #[test]
+    fn merge_blocker_malformed_or_missing_snapshot_keeps_inferred_ci_pending() {
+        let (_d, mut c) = open_tmp();
+        let missing = merging_task(&mut c, 20);
+        let malformed = merging_task(&mut c, 21);
+        c.execute(
+            "UPDATE tasks SET refs = json_object('pr', 21, 'merge_checks', json_object('state', 'bogus')) WHERE id = ?1",
+            [malformed],
+        )
+        .unwrap();
+        let s = stats(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        for id in [missing, malformed] {
+            let b = s.merge_blockers.iter().find(|b| b.task_id == id).unwrap();
+            assert_eq!(b.blocker_kind, "ci_pending");
+            assert_eq!(b.ci_state, None);
+            assert!(b.ci_checks.is_empty());
+            assert_eq!(b.ci_since, None);
+            assert_eq!(b.ci_observed_at, None);
+            assert_eq!(b.ci_summary, None);
+        }
+        let json = serde_json::to_value(&s).unwrap();
+        let jb = json["merge_blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["task_id"] == missing)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        let mut keys: Vec<_> = jb.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "blocker_kind",
+                "pr",
+                "retry_count",
+                "status",
+                "task_id",
+                "title",
+                "waiting_secs"
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_blocker_snapshot_names_are_sanitized_on_read() {
+        let (_d, mut c) = open_tmp();
+        let t = merging_task(&mut c, 30);
+        // Bypass the bounded writer: a hostile/legacy snapshot with control chars.
+        c.execute(
+            "UPDATE tasks SET refs = json_object('pr', 30, 'merge_checks', json_object(
+                'state', 'pending', 'checks', json_array('evil' || char(27) || '[31m', '   '),
+                'since', 990, 'observed_at', 995)) WHERE id = ?1",
+            [t],
+        )
+        .unwrap();
+        let s = stats(&c, 1000, crate::agents::ONLINE_WINDOW_SECS).unwrap();
+        let b = &s.merge_blockers[0];
+        assert_eq!(b.ci_checks, vec!["evil [31m".to_string()]);
+        assert!(!b.ci_summary.as_deref().unwrap().contains('\u{1b}'));
+    }
+
     #[test]
     fn merge_blocker_not_counted_as_terminal_or_active_agent_work() {
         let (_d, mut c) = open_tmp();
@@ -7243,6 +7623,31 @@ mod tests {
         assert_eq!(
             merge_progress.next_action.as_ref().unwrap().label,
             "Possible next"
+        );
+        let names = vec!["unit".to_string(), "clippy".to_string()];
+        assert!(crate::tasks::set_merge_checks_snapshot(
+            &mut c,
+            merge,
+            crate::tasks::MergeChecksState::Pending,
+            &names,
+            140,
+        )
+        .unwrap());
+        assert_eq!(
+            projection(&c, merge).condition.as_deref(),
+            Some("awaiting CI: unit, clippy (pending 1m)")
+        );
+        assert!(crate::tasks::set_merge_checks_snapshot(
+            &mut c,
+            merge,
+            crate::tasks::MergeChecksState::Failing,
+            &names[..1],
+            170,
+        )
+        .unwrap());
+        assert_eq!(
+            projection(&c, merge).condition.as_deref(),
+            Some("CI failing: unit (failing 30s)")
         );
 
         let failed = progress_task(&mut c, "failed after review");

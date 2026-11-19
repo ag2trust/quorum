@@ -27,11 +27,14 @@ pub enum Operation {
     ClaimCleanup,
     MaterializeAssessment,
     AcquireDaemonLock,
+    AdmitGraph,
+    RetryProviderBlocked,
+    DiscardRunnerRetry,
     ClaimGithubOp,
 }
 
 impl Operation {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 12] = [
         Self::AllocateRole,
         Self::ClaimTask,
         Self::ClaimProviderRetryRework,
@@ -40,6 +43,9 @@ impl Operation {
         Self::ClaimCleanup,
         Self::MaterializeAssessment,
         Self::AcquireDaemonLock,
+        Self::AdmitGraph,
+        Self::RetryProviderBlocked,
+        Self::DiscardRunnerRetry,
         Self::ClaimGithubOp,
     ];
 
@@ -53,6 +59,9 @@ impl Operation {
             Self::ClaimCleanup => "claim-cleanup",
             Self::MaterializeAssessment => "materialize-assessment",
             Self::AcquireDaemonLock => "acquire-daemon-lock",
+            Self::AdmitGraph => "admit-graph",
+            Self::RetryProviderBlocked => "retry-provider-blocked",
+            Self::DiscardRunnerRetry => "discard-runner-retry",
             Self::ClaimGithubOp => "claim-github-operation",
         }
     }
@@ -112,6 +121,42 @@ pub struct ClaimProviderRetryReworkInput {
     pub barrier: Barrier,
 }
 
+/// The core `task-retry` path: activate a provider-blocked pending turn.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryProviderBlockedInput {
+    pub db_path: PathBuf,
+    pub task_id: i64,
+    pub by: String,
+    pub now: i64,
+    pub barrier: Barrier,
+}
+
+/// Exact pending turn identity, mirroring `quorum_core::runner_state::PendingTurn`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingTurnInput {
+    pub provider: String,
+    pub model: String,
+    pub effort: String,
+    pub prompt: String,
+    pub turn_kind: String,
+    pub continuation_id: Option<String>,
+    pub requested: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscardRunnerRetryInput {
+    pub db_path: PathBuf,
+    pub task_id: i64,
+    pub holder: String,
+    pub expected_turn: PendingTurnInput,
+    pub new_profile_id: String,
+    pub now: i64,
+    pub barrier: Barrier,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CancelSourceGraphInput {
@@ -167,6 +212,29 @@ pub struct MaterializeAssessmentInput {
     pub scope_id: i64,
     pub source_task_id: i64,
     pub artifact_ids: Vec<i64>,
+    pub now: i64,
+    pub barrier: Barrier,
+}
+
+/// One counted-graph admission path raced by `admit-graph`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GraphAdmission {
+    /// `begin_planning` for an open source task (`target_id` = source task id).
+    BeginPlanning,
+    /// `reacquire_freeze` for a provider-backoff graph (`target_id` = graph id).
+    ReacquireFreeze,
+    /// Two-child materialization activating a planning graph (`target_id` = graph id).
+    Activate,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmitGraphInput {
+    pub db_path: PathBuf,
+    pub admission: GraphAdmission,
+    pub target_id: i64,
+    pub max_active_graphs: usize,
     pub now: i64,
     pub barrier: Barrier,
 }
