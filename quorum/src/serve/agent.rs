@@ -4,7 +4,7 @@ use super::runner::{
     capture_diagnostics, gated_command, tool_summary, ActivityKind, AdapterConfig, AgentEvent,
     AgentKind, AgentMcpServer, CapturedOutput, DiagnosticBuffer, FailureDisposition,
     FailureObservation, FailureTracker, LaunchGate, LaunchMode, LaunchRequest, NormalizedLine,
-    RunnerFailure, TokenUsage,
+    RunnerFailure, TokenUsage, AGENT_MCP_URL_ENV,
 };
 use super::stream::{self, Event};
 use std::path::PathBuf;
@@ -72,16 +72,73 @@ pub fn user_turn(content: &str) -> String {
     .to_string()
 }
 
-fn claude_mcp_config(server: AgentMcpServer) -> String {
-    serde_json::json!({
+/// Environment name of the managed run capability, which is also the agent
+/// MCP bearer.
+const RUN_CAPABILITY_ENV: &str = "QUORUM_RUN_ID";
+/// Claude expands `${NAME}` in `--mcp-config` headers from its own process
+/// environment, so the capability reaches the HTTP request without ever
+/// entering argv (process listings).
+const CLAUDE_MCP_AUTHORIZATION: &str = "Bearer ${QUORUM_RUN_ID}";
+
+/// The effective (last, as `Command::env` applies them) non-empty value of
+/// `name` in a managed launch environment.
+fn managed_env<'a>(environment: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    environment
+        .iter()
+        .rev()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+        .filter(|value| !value.is_empty())
+}
+
+fn agent_mcp_configuration_error(detail: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "Claude agent MCP configuration error: {detail}; refusing to spawn \
+             (there is no stdio fallback)"
+        ),
+    )
+}
+
+/// The `--mcp-config` for a run attached to the daemon-embedded agent MCP:
+/// one Streamable HTTP server named `quorum` at the run's
+/// `QUORUM_AGENT_MCP_URL`, authenticated by its `QUORUM_RUN_ID` bearer via
+/// env expansion. The stdio `{command, args}` shape is never rendered.
+fn claude_mcp_config(environment: &[(String, String)]) -> std::io::Result<String> {
+    let url = managed_env(environment, AGENT_MCP_URL_ENV).ok_or_else(|| {
+        agent_mcp_configuration_error(&format!("{AGENT_MCP_URL_ENV} is missing or empty"))
+    })?;
+    if managed_env(environment, RUN_CAPABILITY_ENV).is_none() {
+        return Err(agent_mcp_configuration_error(&format!(
+            "{RUN_CAPABILITY_ENV} is missing or empty"
+        )));
+    }
+    Ok(serde_json::json!({
         "mcpServers": {
             "quorum": {
-                "command": server.command,
-                "args": server.args,
+                "type": "http",
+                "url": url,
+                "headers": { "Authorization": CLAUDE_MCP_AUTHORIZATION },
             }
         }
     })
-    .to_string()
+    .to_string())
+}
+
+/// The attach decision for a `Normal` launch. A run capability without the
+/// agent MCP URL is a broken managed envelope and fails loudly rather than
+/// launching a run that cannot signal.
+fn normal_launch_agent_mcp(request: &LaunchRequest<'_>) -> std::io::Result<Option<AgentMcpServer>> {
+    if managed_env(request.environment, RUN_CAPABILITY_ENV).is_some()
+        && managed_env(request.environment, AGENT_MCP_URL_ENV).is_none()
+    {
+        return Err(agent_mcp_configuration_error(&format!(
+            "a managed run carries {RUN_CAPABILITY_ENV} but {AGENT_MCP_URL_ENV} is missing \
+             or empty"
+        )));
+    }
+    Ok(request.agent_mcp_server())
 }
 
 impl AgentProc {
@@ -121,7 +178,7 @@ impl AgentProc {
                 &spec,
                 config.executable,
                 RestrictedMode::None,
-                request.agent_mcp_server(),
+                normal_launch_agent_mcp(request)?,
             )?,
             LaunchMode::Restricted => Self::spawn_configured_gated(
                 &spec,
@@ -174,7 +231,7 @@ impl AgentProc {
                 &spec,
                 config.executable,
                 RestrictedMode::None,
-                request.agent_mcp_server(),
+                normal_launch_agent_mcp(request)?,
             )?,
             LaunchMode::Restricted => Self::spawn_restricted(&spec, config.executable)?,
         };
@@ -475,6 +532,11 @@ impl AgentProc {
         restricted: RestrictedMode,
         agent_mcp: Option<AgentMcpServer>,
     ) -> std::io::Result<Self> {
+        // Rendered before anything is built so a broken envelope spawns
+        // nothing.
+        let mcp_config = agent_mcp
+            .map(|_| claude_mcp_config(&spec.env_vars))
+            .transpose()?;
         let bin = agent_bin.unwrap_or("claude");
         let mut cmd = Command::new(bin);
         cmd.arg("-p")
@@ -490,9 +552,9 @@ impl AgentProc {
 
         cmd.arg("--session-id").arg(&spec.session_id);
 
-        if let Some(server) = agent_mcp {
+        if let Some(config) = &mcp_config {
             cmd.arg("--mcp-config")
-                .arg(claude_mcp_config(server))
+                .arg(config)
                 .arg("--strict-mcp-config");
         }
 
@@ -566,8 +628,8 @@ impl AgentProc {
         }
         // A planner without an MCP server holds no endpoint authority at all,
         // so every coordination name is removed. A planner with one must keep
-        // its run envelope: `claude_mcp_config` carries no `env` block, so the
-        // stdio MCP child inherits these names from this process. GitHub and
+        // its run envelope: Claude expands the `${QUORUM_RUN_ID}` bearer in
+        // `claude_mcp_config` from this process environment. GitHub and
         // daemon-home authority is still stripped above.
         if restricted == RestrictedMode::Planner && agent_mcp.is_none() {
             strip_coordination_env(&mut cmd);
@@ -596,6 +658,9 @@ impl AgentProc {
         restricted: RestrictedMode,
         agent_mcp: Option<AgentMcpServer>,
     ) -> std::io::Result<(Self, LaunchGate)> {
+        let mcp_config = agent_mcp
+            .map(|_| claude_mcp_config(&spec.env_vars))
+            .transpose()?;
         let bin = agent_bin.unwrap_or("claude");
         let (mut cmd, gate) = gated_command(AgentKind::Claude, bin)?;
         cmd.arg("-p")
@@ -611,9 +676,9 @@ impl AgentProc {
 
         cmd.arg("--session-id").arg(&spec.session_id);
 
-        if let Some(server) = agent_mcp {
+        if let Some(config) = &mcp_config {
             cmd.arg("--mcp-config")
-                .arg(claude_mcp_config(server))
+                .arg(config)
                 .arg("--strict-mcp-config");
         }
 
@@ -1200,10 +1265,10 @@ enum RestrictedMode {
     Planner,
 }
 
-/// The daemon endpoint is capability-scoped by the four QUORUM_* run fields.
-/// Do not let the provider forward unrelated operator credentials to its
-/// nested stdio child: the endpoint must never acquire ambient GitHub or
-/// Quorum-home authority merely because Claude happens to inherit it.
+/// The agent MCP is capability-scoped by the run bearer. Do not let a
+/// managed provider inherit unrelated operator credentials: the run must
+/// never acquire ambient GitHub or Quorum-home authority merely because the
+/// daemon happens to hold it.
 fn strip_managed_mcp_authority(cmd: &mut Command) {
     for name in [
         "GH_TOKEN",
@@ -1349,6 +1414,261 @@ mod tests {
         }
     }
 
+    const TEST_MCP_URL: &str = "http://127.0.0.1:4100/mcp";
+    const TEST_CAPABILITY: &str = "run-capability-7f3a9c";
+
+    /// A complete managed run envelope, agent MCP URL included.
+    fn managed_mcp_env() -> Vec<(String, String)> {
+        vec![
+            ("QUORUM_REPO".into(), "owner/repo".into()),
+            ("QUORUM_AGENT".into(), "Worker-test".into()),
+            ("QUORUM_RUN_ID".into(), TEST_CAPABILITY.into()),
+            (
+                "QUORUM_AGENT_ENDPOINT".into(),
+                "/tmp/quorum-agent.sock".into(),
+            ),
+            (AGENT_MCP_URL_ENV.into(), TEST_MCP_URL.into()),
+        ]
+    }
+
+    /// The single HTTP server every attached Claude spawn must describe.
+    fn assert_http_mcp_config(args: &[String]) {
+        assert!(
+            args.iter().any(|arg| arg == "--strict-mcp-config"),
+            "{args:?}"
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(flag_value(args, "--mcp-config")).expect("mcp config is JSON");
+        assert_eq!(
+            config,
+            serde_json::json!({"mcpServers": {"quorum": {
+                "type": "http",
+                "url": TEST_MCP_URL,
+                "headers": {"Authorization": "Bearer ${QUORUM_RUN_ID}"},
+            }}}),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg.contains(TEST_CAPABILITY)),
+            "the run capability leaked into argv: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|arg| arg.contains("agent-mcp")),
+            "a stdio agent-mcp server is still configured: {args:?}"
+        );
+    }
+
+    /// Capture the exact argv one spawn path hands the Claude CLI, plus a
+    /// marker proving whether any process ran at all.
+    #[cfg(unix)]
+    fn recording_claude(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let args_path = dir.join("claude-args");
+        let fake = dir.join("claude");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\n\
+                 while IFS= read -r _line; do :; done\n",
+                args_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (fake, args_path)
+    }
+
+    #[cfg(unix)]
+    async fn read_recorded_args(args_path: &std::path::Path) -> Vec<String> {
+        for _ in 0..200 {
+            if args_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        std::fs::read_to_string(args_path)
+            .expect("fake claude did not capture its argument surface")
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Worker/reviewer/rework spawn paths, ungated and gated, both describe
+    /// the HTTP server and keep the capability out of argv.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_claude_spawns_render_http_mcp_without_capability_in_argv() {
+        for gated in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (fake, args_path) = recording_claude(tmp.path());
+            let mut spec = classifier_spec(tmp.path(), true);
+            spec.allowed_tools = ALLOWED_TOOLS.into();
+            spec.env_vars = managed_mcp_env();
+            let server = Some(crate::serve::runner::AGENT_MCP_SERVER);
+            let proc = if gated {
+                let (proc, gate) = AgentProc::spawn_configured_gated(
+                    &spec,
+                    fake.to_str(),
+                    RestrictedMode::None,
+                    server,
+                )
+                .unwrap();
+                gate.release(crate::serve::runner::RunnerProc::Claude(proc))
+                    .await
+                    .unwrap()
+            } else {
+                crate::serve::runner::RunnerProc::Claude(
+                    AgentProc::spawn_configured(&spec, fake.to_str(), RestrictedMode::None, server)
+                        .unwrap(),
+                )
+            };
+            let args = read_recorded_args(&args_path).await;
+            let _ = proc.kill_and_reap().await;
+            assert_http_mcp_config(&args);
+            assert!(args.iter().any(|arg| arg == "--bare"), "{args:?}");
+            assert!(
+                flag_value(&args, "--allowedTools")
+                    .split(',')
+                    .any(|tool| tool == AGENT_MCP_ALLOWED_TOOL),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// An attach decision without a complete HTTP envelope is a loud
+    /// configuration error on every spawn path, and nothing is spawned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attached_claude_spawn_without_url_or_capability_spawns_nothing() {
+        for missing in [AGENT_MCP_URL_ENV, "QUORUM_RUN_ID"] {
+            for empty in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (fake, args_path) = recording_claude(tmp.path());
+                let mut spec = classifier_spec(tmp.path(), false);
+                spec.env_vars = managed_mcp_env();
+                if empty {
+                    spec.env_vars
+                        .iter_mut()
+                        .filter(|(name, _)| name == missing)
+                        .for_each(|(_, value)| value.clear());
+                } else {
+                    spec.env_vars.retain(|(name, _)| name != missing);
+                }
+                let server = Some(crate::serve::runner::AGENT_MCP_SERVER);
+                let errors = [
+                    AgentProc::spawn_configured(&spec, fake.to_str(), RestrictedMode::None, server)
+                        .err(),
+                    AgentProc::spawn_configured_gated(
+                        &spec,
+                        fake.to_str(),
+                        RestrictedMode::None,
+                        server,
+                    )
+                    .err(),
+                    AgentProc::spawn_planner(&spec, fake.to_str(), server).err(),
+                ];
+                for error in errors {
+                    let error = error.expect("an incomplete HTTP envelope must refuse to spawn");
+                    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+                    let message = error.to_string();
+                    assert!(message.contains(missing), "{message}");
+                    assert!(message.contains("no stdio fallback"), "{message}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                assert!(!args_path.exists(), "a refused spawn ran a provider");
+            }
+        }
+    }
+
+    fn launch_request<'a>(
+        worktree: &'a std::path::Path,
+        environment: &'a [(String, String)],
+        mode: LaunchMode,
+    ) -> LaunchRequest<'a> {
+        LaunchRequest {
+            model: "claude-opus-4-6",
+            effort: "high",
+            worktree,
+            prompt: "ping",
+            environment,
+            mode,
+            continuation_id: None,
+        }
+    }
+
+    fn adapter_config(executable: Option<&str>) -> AdapterConfig<'_> {
+        AdapterConfig {
+            executable,
+            claude_bare: true,
+            claude_allowed_tools: ALLOWED_TOOLS,
+            codex_sandbox: "workspace-write",
+            grok: Default::default(),
+        }
+    }
+
+    /// A Normal launch carrying a run capability but no agent MCP URL fails
+    /// loudly on both launch paths — even when the rest of the envelope is
+    /// too incomplete for the attach decision — and spawns nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_launch_with_capability_but_no_url_fails_loudly() {
+        for complete_envelope in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (fake, args_path) = recording_claude(tmp.path());
+            let mut environment = managed_mcp_env();
+            environment.retain(|(name, _)| name != AGENT_MCP_URL_ENV);
+            if !complete_envelope {
+                environment.retain(|(name, _)| name != "QUORUM_AGENT");
+            }
+            let request = launch_request(tmp.path(), &environment, LaunchMode::Normal);
+            let config = adapter_config(fake.to_str());
+            let errors = [
+                AgentProc::launch(&request, &config).await.err(),
+                AgentProc::launch_gated(&request, &config).await.err(),
+            ];
+            for error in errors {
+                let error = error.expect("a capability without a URL must refuse to launch");
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+                assert!(error.to_string().contains(AGENT_MCP_URL_ENV), "{error}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(!args_path.exists(), "a refused launch ran a provider");
+        }
+    }
+
+    /// Closed-book launches and runs without a capability attach no MCP, and
+    /// a Normal managed launch attaches the HTTP server.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_attaches_http_mcp_only_for_managed_normal_runs() {
+        for (mode, environment, attached) in [
+            (LaunchMode::Normal, managed_mcp_env(), true),
+            (LaunchMode::Restricted, managed_mcp_env(), false),
+            (
+                LaunchMode::Normal,
+                vec![(AGENT_MCP_URL_ENV.into(), TEST_MCP_URL.into())],
+                false,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (fake, args_path) = recording_claude(tmp.path());
+            let request = launch_request(tmp.path(), &environment, mode);
+            let config = adapter_config(fake.to_str());
+            let proc = AgentProc::launch(&request, &config).await.unwrap();
+            let args = read_recorded_args(&args_path).await;
+            let _ = proc.kill_and_reap().await;
+            assert!(args.iter().any(|arg| arg == "--bare"), "{args:?}");
+            if attached {
+                assert_http_mcp_config(&args);
+            } else {
+                for absent in ["--mcp-config", "--strict-mcp-config"] {
+                    assert!(!args.iter().any(|arg| arg == absent), "{mode:?}: {args:?}");
+                }
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn managed_mcp_claude_child_scrubs_ambient_authority() {
@@ -1388,57 +1708,38 @@ mod tests {
         let _orchestrator = EnvRestore::poison("QUORUM_ORCHESTRATOR_TOKEN", "ambient-token");
 
         let root = tempfile::tempdir().unwrap();
-        let capture = root.path().join("mcp-child-environment.log");
-        let fake_quorum = root.path().join("quorum");
+        let capture = root.path().join("claude-environment.log");
         // Publish the capture with rename: the poll below treats existence as
         // completion, so a truncating `>` redirect would expose partial lines.
+        // With HTTP MCP there is no stdio child: the managed provider process
+        // itself is what must hold no ambient authority.
+        let fake_claude = root.path().join("claude");
         std::fs::write(
-            &fake_quorum,
+            &fake_claude,
             format!(
                 "#!/bin/sh\n\\
                  {{\n\\
-                   printf 'arg=%s\\n' \"$1\"\n\\
                    printf 'repo=%s\\n' \"$QUORUM_REPO\"\n\\
                    printf 'agent=%s\\n' \"$QUORUM_AGENT\"\n\\
                    printf 'run=%s\\n' \"$QUORUM_RUN_ID\"\n\\
                    printf 'endpoint=%s\\n' \"$QUORUM_AGENT_ENDPOINT\"\n\\
+                   printf 'mcp_url=%s\\n' \"$QUORUM_AGENT_MCP_URL\"\n\\
                    printf 'gh=%s\\n' \"$GH_TOKEN\"\n\\
                    printf 'github=%s\\n' \"$GITHUB_TOKEN\"\n\\
                    printf 'quorum_home=%s\\n' \"$QUORUM_HOME\"\n\\
                    printf 'gh_config=%s\\n' \"$GH_CONFIG_DIR\"\n\\
                    printf 'orchestrator=%s\\n' \"$QUORUM_ORCHESTRATOR_TOKEN\"\n\\
-                 }} > '{capture}.partial' && mv '{capture}.partial' '{capture}'\n",
+                   printf 'arg=%s\\n' \"$@\"\n\\
+                 }} > '{capture}.partial' && mv '{capture}.partial' '{capture}'\n\\
+                 while IFS= read -r _line; do :; done\n",
                 capture = capture.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake_quorum, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let fake_claude = root.path().join("claude");
-        std::fs::write(
-            &fake_claude,
-            "#!/bin/sh\nquorum agent-mcp\nprintf '%s\\n' '{\"type\":\"result\",\"result\":\"done\",\"is_error\":false}'\nwhile IFS= read -r _line; do :; done\n",
         )
         .unwrap();
         std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut spec = classifier_spec(root.path(), true);
-        spec.env_vars = vec![
-            (
-                "PATH".into(),
-                format!(
-                    "{}:{}",
-                    root.path().display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            ),
-            ("QUORUM_REPO".into(), "owner/repo".into()),
-            ("QUORUM_AGENT".into(), "Worker-test".into()),
-            ("QUORUM_RUN_ID".into(), "run-capability".into()),
-            (
-                "QUORUM_AGENT_ENDPOINT".into(),
-                "/tmp/quorum-agent.sock".into(),
-            ),
-        ];
+        spec.env_vars = managed_mcp_env();
         let proc = AgentProc::spawn_configured(
             &spec,
             fake_claude.to_str(),
@@ -1455,11 +1756,23 @@ mod tests {
         let _ = proc.kill_and_reap().await;
 
         let captured = std::fs::read_to_string(&capture)
-            .expect("managed Claude did not launch its configured MCP child");
-        assert!(captured.contains("arg=agent-mcp\n"), "{captured}");
+            .expect("managed Claude did not report its environment");
+        assert!(!captured.contains("arg=agent-mcp\n"), "{captured}");
+        assert!(captured.contains("arg=--bare\n"), "{captured}");
+        assert!(
+            captured.contains(&format!("mcp_url={TEST_MCP_URL}\n")),
+            "{captured}"
+        );
         assert!(captured.contains("repo=owner/repo\n"), "{captured}");
         assert!(captured.contains("agent=Worker-test\n"), "{captured}");
-        assert!(captured.contains("run=run-capability\n"), "{captured}");
+        assert!(
+            captured.contains(&format!("run={TEST_CAPABILITY}\n")),
+            "{captured}"
+        );
+        assert!(
+            !captured.contains(&format!("arg={TEST_CAPABILITY}")),
+            "{captured}"
+        );
         assert!(
             captured.contains("endpoint=/tmp/quorum-agent.sock\n"),
             "{captured}"
@@ -1582,17 +1895,10 @@ mod tests {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
+        let probe = AuthorizationProbe::bind();
         let mut spec = classifier_spec(tmp.path(), true);
         spec.env_vars = no_auth_env(tmp.path());
-        spec.env_vars.extend([
-            ("QUORUM_REPO".into(), "owner/repo".into()),
-            ("QUORUM_AGENT".into(), "Keel-test".into()),
-            ("QUORUM_RUN_ID".into(), "run-capability".into()),
-            (
-                "QUORUM_AGENT_ENDPOINT".into(),
-                "/tmp/quorum-agent-mcp-boundary.sock".into(),
-            ),
-        ]);
+        spec.env_vars.extend(probe.managed_env());
 
         let mut proc = AgentProc::spawn_configured(
             &spec,
@@ -1605,7 +1911,13 @@ mod tests {
         let event = tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event())
             .await
             .expect("claude produced no event within 60s — args may hang the CLI");
+        let authorization = probe.first_authorization().await;
         let _terminal_output = proc.kill_and_reap().await;
+        assert_eq!(
+            authorization.as_deref(),
+            Some(format!("Bearer {TEST_CAPABILITY}").as_str()),
+            "the real CLI must expand the env bearer in the HTTP MCP request"
+        );
         assert!(
             event.is_some(),
             "claude exited without emitting any stream event — the AgentSpec \
@@ -1667,76 +1979,103 @@ mod tests {
         );
     }
 
-    /// Pins the bug this PR fixes: `--safe-mode` accepted `--mcp-config`
-    /// without error but silently never spawned the inline MCP server, so
-    /// `submit_plan` never existed in the planner's session. This spawns the
-    /// REAL claude CLI with the planner+MCP arg set (now
-    /// `--setting-sources ""` based) and a marker-script MCP server, and
-    /// asserts the marker file appears — proving the server actually
-    /// spawns under the new flag set. Zero-token: credentials are blanked,
-    /// so if MCP spawn turns out to be gated behind auth in this
-    /// environment, this falls back to asserting the full new arg set is
-    /// accepted by the CLI (reaches the auth stage) rather than rejected at
-    /// argument parsing.
+    /// A loopback HTTP listener that records the `Authorization` header of
+    /// every request and answers 503, standing in for the agent MCP so a
+    /// real CLI test can observe what Claude actually sends.
+    struct AuthorizationProbe {
+        url: String,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    impl AuthorizationProbe {
+        fn bind() -> Self {
+            use std::io::{BufRead, Write};
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = std::sync::Arc::clone(&seen);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { return };
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut authorization = None;
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("authorization") {
+                                authorization = Some(value.trim().to_string());
+                            }
+                        }
+                        line.clear();
+                    }
+                    recorded.lock().unwrap().push(authorization);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+            });
+            Self { url, seen }
+        }
+
+        /// The managed envelope pointed at this probe.
+        fn managed_env(&self) -> Vec<(String, String)> {
+            let mut environment = managed_mcp_env();
+            for (name, value) in &mut environment {
+                if name == AGENT_MCP_URL_ENV {
+                    value.clone_from(&self.url);
+                }
+            }
+            environment
+        }
+
+        /// The first request's `Authorization`, waiting briefly for Claude
+        /// to connect; `None` if no request arrived or it had no header.
+        async fn first_authorization(&self) -> Option<String> {
+            for _ in 0..400 {
+                if let Some(first) = self.seen.lock().unwrap().first() {
+                    return first.clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            None
+        }
+    }
+
+    /// Real-CLI planner boundary: the planner flag set (`--setting-sources
+    /// ""`, read-only `--tools`) must not suppress the attached MCP server
+    /// (`--safe-mode` once silently did). The real CLI dials the HTTP server
+    /// with the env-expanded bearer before any model call, so blanked
+    /// credentials keep this zero-token.
     #[cfg(unix)]
     #[tokio::test]
-    async fn real_cli_spawns_planner_mcp_server_under_new_flags() {
-        use std::os::unix::fs::PermissionsExt;
-
+    async fn real_cli_planner_dials_http_mcp_with_env_bearer() {
         if !claude_available() {
             eprintln!("skipped: no claude binary on PATH");
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
-        let marker = tmp.path().join("mcp-spawned");
-        let marker_script = tmp.path().join("mcp-marker.sh");
-        std::fs::write(
-            &marker_script,
-            format!("#!/bin/sh\ntouch '{}'\nexec cat\n", marker.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&marker_script, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // AgentMcpServer's fields are 'static str/slice; leaking is the
-        // simplest way to hand it a tempdir-scoped command path in a test.
-        let command: &'static str = Box::leak(marker_script.display().to_string().into_boxed_str());
-        let server = AgentMcpServer {
-            command,
-            args: &[],
-            env_vars: &[],
-        };
-
-        let mut spec = classifier_spec(tmp.path(), false);
-        spec.model = "claude-opus-4-6".into();
-        spec.effort = "high".into();
-        spec.allowed_tools = "Read,Glob,Grep".into();
+        let probe = AuthorizationProbe::bind();
+        let mut spec = planner_spec(tmp.path());
         spec.env_vars = no_auth_env(tmp.path());
+        spec.env_vars.extend(probe.managed_env());
 
-        let mut proc = AgentProc::spawn_planner(&spec, None, Some(server))
-            .expect("spawn planner claude with mcp marker server");
+        let mut proc =
+            AgentProc::spawn_planner(&spec, None, Some(crate::serve::runner::AGENT_MCP_SERVER))
+                .expect("spawn planner claude with HTTP MCP");
         proc.feed_turn(&user_turn("return an empty JSON object"))
             .await
             .expect("feed planner turn");
-        let event =
-            tokio::time::timeout(std::time::Duration::from_secs(60), proc.next_event()).await;
+        let authorization = probe.first_authorization().await;
         let _ = proc.kill_and_reap().await;
-
-        if marker.exists() {
-            // Best outcome: proves the inline MCP server actually spawned
-            // under the new --setting-sources flag set.
-            return;
-        }
-        // Documented fallback: MCP server spawn may be gated behind auth in
-        // a no-auth environment. Confirm the CLI at least accepted the full
-        // new arg set (reached the auth stage) instead of rejecting it at
-        // argument validation.
-        match event {
-            Ok(Some(_)) => {}
-            other => panic!(
-                "claude neither spawned the MCP marker nor emitted a stream event \
-                 (arg set may have been rejected at CLI validation): {other:?}"
-            ),
-        }
+        assert_eq!(
+            authorization.as_deref(),
+            Some(format!("Bearer {TEST_CAPABILITY}").as_str()),
+            "the planner never reached its HTTP MCP server with the run bearer"
+        );
     }
 
     fn planner_spec(worktree: &std::path::Path) -> AgentSpec {
@@ -1756,32 +2095,11 @@ mod tests {
         spec: &AgentSpec,
         agent_mcp: Option<AgentMcpServer>,
     ) -> Vec<String> {
-        use std::os::unix::fs::PermissionsExt;
-
-        let args_path = dir.join("planner-args");
-        let fake = dir.join("claude");
-        std::fs::write(
-            &fake,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{0}.tmp'\nmv '{0}.tmp' '{0}'\n\
-                 while IFS= read -r _line; do :; done\n",
-                args_path.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-
+        let (fake, args_path) = recording_claude(dir);
         let proc = AgentProc::spawn_planner(spec, fake.to_str(), agent_mcp).unwrap();
-        for _ in 0..200 {
-            if args_path.exists() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        let captured = std::fs::read_to_string(&args_path)
-            .expect("fake planner did not capture its bounded argument surface");
+        let captured = read_recorded_args(&args_path).await;
         let _ = proc.kill_and_reap().await;
-        captured.lines().map(str::to_string).collect()
+        captured
     }
 
     fn flag_value<'a>(args: &'a [String], flag: &str) -> &'a str {
@@ -1810,7 +2128,8 @@ mod tests {
     #[tokio::test]
     async fn claude_planner_with_mcp_allows_only_submit_plan() {
         let tmp = tempfile::tempdir().unwrap();
-        let spec = planner_spec(tmp.path());
+        let mut spec = planner_spec(tmp.path());
+        spec.env_vars = managed_mcp_env();
         let args = capture_planner_args(
             tmp.path(),
             &spec,
@@ -1818,17 +2137,8 @@ mod tests {
         )
         .await;
 
-        assert!(
-            args.iter().any(|arg| arg == "--strict-mcp-config"),
-            "{args:?}"
-        );
-        let config: serde_json::Value =
-            serde_json::from_str(flag_value(&args, "--mcp-config")).expect("mcp config is JSON");
-        assert_eq!(config["mcpServers"]["quorum"]["command"], "quorum");
-        assert_eq!(
-            config["mcpServers"]["quorum"]["args"],
-            serde_json::json!(["agent-mcp"])
-        );
+        // The planner path renders the same HTTP server, capability-free argv.
+        assert_http_mcp_config(&args);
         assert_eq!(
             crate::serve::runner::PLANNER_MCP_ALLOWED_TOOL,
             "mcp__quorum__submit_plan"
@@ -1927,9 +2237,10 @@ mod tests {
         );
     }
 
-    /// The stdio MCP child inherits the planner process environment, so the run
-    /// envelope must survive exactly when the tool is attached — and never when
-    /// it is not. GitHub credentials never survive either way.
+    /// Claude expands the `${QUORUM_RUN_ID}` bearer from the planner process
+    /// environment, so the run envelope must survive exactly when the tool is
+    /// attached — and never when it is not. GitHub credentials never survive
+    /// either way.
     #[cfg(unix)]
     #[tokio::test]
     async fn claude_planner_run_envelope_survives_only_with_mcp() {
@@ -1962,6 +2273,7 @@ while IFS= read -r _line; do :; done
                 "QUORUM_AGENT_ENDPOINT".to_string(),
                 "/tmp/quorum-planner.sock".to_string(),
             ),
+            (AGENT_MCP_URL_ENV.to_string(), TEST_MCP_URL.to_string()),
             ("QUORUM_HOME".to_string(), "home-authority".to_string()),
             ("GH_TOKEN".to_string(), "gh-authority".to_string()),
         ];
