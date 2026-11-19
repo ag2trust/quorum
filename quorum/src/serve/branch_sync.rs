@@ -952,7 +952,7 @@ async fn resolve_pr_target(config: &ServeConfig, pr: i64) -> std::result::Result
         pr,
         &config.repo_dir,
         (!config.repo.is_empty()).then_some(config.repo.as_str()),
-        &config.merge_executor.github_credentials(),
+        &config.merge_executor.publication_credentials(),
         super::PUBLICATION_GH_TIMEOUT,
         program,
     )
@@ -972,7 +972,7 @@ async fn run_branch_sync_gh(
     command.args(args).current_dir(&config.repo_dir);
     run_credentialed_gh_command(
         command,
-        &config.merge_executor.github_credentials(),
+        &config.merge_executor.publication_credentials(),
         super::PUBLICATION_GH_TIMEOUT,
         label,
     )

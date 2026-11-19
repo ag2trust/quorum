@@ -309,6 +309,17 @@ pub trait MergeExecutor: Send + Sync {
             Arc::new(LocalDefaultCredentialSource::new(None))
         }
     }
+
+    /// The daemon's PR-authoring (publishing) identity: publication,
+    /// PR-target lookup, drift, branch-sync, and cleanup `gh` children. This
+    /// must differ from the merge-authority source when a merge token file is
+    /// configured — daemon PRs authored by the merge account would make the
+    /// daemon's own approve/request-changes reviews self-reviews, which
+    /// GitHub rejects. The default is the merge default (both are the local
+    /// default source with no token file).
+    fn publication_credentials(&self) -> Arc<dyn GithubCredentialSource> {
+        self.github_credentials()
+    }
 }
 
 /// Merge failure for a credential source that produced no token. No `gh`
@@ -646,7 +657,13 @@ pub fn parse_default_branch_ci(json: &str) -> DefaultBranchStatus {
 /// it via `GH_TOKEN` on that child only; a source failure returns before any
 /// child spawns. The token is never exposed to agent processes.
 pub struct GhMergeExecutor {
+    /// Merge-authority source (`--merge-token-file`): approve, request
+    /// changes, merge, and other merge-gate `gh` children.
     pub credentials: Arc<dyn GithubCredentialSource>,
+    /// PR-authoring source (local default, no merge token file), returned by
+    /// [`MergeExecutor::publication_credentials`]. Never the merge token, so
+    /// daemon-authored PRs stay reviewable by the merge account.
+    pub publication_credentials: Arc<dyn GithubCredentialSource>,
     /// `owner/repo` slug for `-R` flag — avoids cwd git dependency.
     pub gh_repo: Option<String>,
     /// Long-lived daemon branches that must never be deleted after a merge.
@@ -1222,6 +1239,10 @@ fn parse_is_draft(jq_out: &str) -> bool {
 impl MergeExecutor for GhMergeExecutor {
     fn github_credentials(&self) -> Arc<dyn GithubCredentialSource> {
         Arc::clone(&self.credentials)
+    }
+
+    fn publication_credentials(&self) -> Arc<dyn GithubCredentialSource> {
+        Arc::clone(&self.publication_credentials)
     }
 
     fn merge(&self, pr: i64, repo_dir: &Path, ctx: &MergeContext) -> MergeResult {
@@ -2556,6 +2577,7 @@ mod tests {
     ) -> GhMergeExecutor {
         GhMergeExecutor {
             credentials,
+            publication_credentials: Arc::new(FakeCredentialSource::token("publication-fixture")),
             gh_repo,
             base_branch: "main".into(),
             self_update_branch: "main".into(),

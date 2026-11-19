@@ -1322,6 +1322,9 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     credentials: std::sync::Arc::new(
                         github_credentials::LocalDefaultCredentialSource::new(None),
                     ),
+                    publication_credentials: std::sync::Arc::new(
+                        github_credentials::LocalDefaultCredentialSource::new(None),
+                    ),
                     gh_repo: Some(repo),
                     // task-close only queries PR state; these merge-policy
                     // fields are not consulted by merge_commit_status.
@@ -1744,6 +1747,13 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                             github_credentials::LocalDefaultCredentialSource::new(
                                 r_merge_token.value.map(std::path::PathBuf::from),
                             ),
+                        ),
+                        // PR authoring stays on the publishing identity (the
+                        // token gh itself would use), never the merge token:
+                        // a merge-account-authored PR cannot be approved by
+                        // the merge account.
+                        publication_credentials: std::sync::Arc::new(
+                            github_credentials::LocalDefaultCredentialSource::new(None),
                         ),
                         gh_repo: resolve_gh_repo(&r_repo_dir.value),
                         base_branch: r_base_branch.value.clone(),

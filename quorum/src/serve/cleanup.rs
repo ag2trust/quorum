@@ -402,7 +402,7 @@ async fn close_cleanup_pr(config: &ServeConfig, pr: i64) -> std::result::Result<
         &config.repo_dir,
         &config.repo,
         pr,
-        &config.merge_executor.github_credentials(),
+        &config.merge_executor.publication_credentials(),
         Path::new("gh"),
     )
     .await
@@ -485,7 +485,7 @@ async fn resolve_cleanup_pr(
     let out = super::run_publication_gh(
         &args,
         &config.repo_dir,
-        &config.merge_executor.github_credentials(),
+        &config.merge_executor.publication_credentials(),
         "gh api cleanup PR",
     )
     .await?;

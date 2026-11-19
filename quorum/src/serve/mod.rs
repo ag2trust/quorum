@@ -2404,7 +2404,7 @@ async fn publish_worker_completion(
             pr,
             &config.repo_dir,
             Some(&config.repo),
-            &config.merge_executor.github_credentials(),
+            &config.merge_executor.publication_credentials(),
             config
                 .pr_target_program
                 .as_deref()
@@ -2448,7 +2448,7 @@ async fn publish_worker_completion(
     intent.stage = "pushed".into();
     persist_publication_intent(&config.db_path, task_id, &intent).await?;
 
-    let credentials = config.merge_executor.github_credentials();
+    let credentials = config.merge_executor.publication_credentials();
     let pr = match find_initial_pr(&config.repo_dir, &config.repo, branch, &credentials).await? {
         Some(pr) => pr,
         None => {
@@ -2472,7 +2472,7 @@ async fn publish_worker_completion(
         pr,
         &config.repo_dir,
         Some(&config.repo),
-        &config.merge_executor.github_credentials(),
+        &config.merge_executor.publication_credentials(),
     )
     .await?;
     validate_initial_pr_target(&target, branch, &pushed_sha, &publication_base_branch)?;
@@ -3324,7 +3324,7 @@ async fn resolve_and_persist_continue_pr_target(
         pr,
         &config.repo_dir,
         Some(&config.repo),
-        &config.merge_executor.github_credentials(),
+        &config.merge_executor.publication_credentials(),
         config
             .pr_target_program
             .as_deref()
@@ -3380,7 +3380,7 @@ async fn resolve_and_persist_reclaimed_reserved_pr_target(
         pr,
         &config.repo_dir,
         Some(&config.repo),
-        &config.merge_executor.github_credentials(),
+        &config.merge_executor.publication_credentials(),
         config
             .pr_target_program
             .as_deref()
@@ -3422,7 +3422,7 @@ async fn resolve_and_persist_parked_rework_target(
         pr,
         &config.repo_dir,
         Some(&config.repo),
-        &config.merge_executor.github_credentials(),
+        &config.merge_executor.publication_credentials(),
         config
             .pr_target_program
             .as_deref()
@@ -11140,7 +11140,7 @@ async fn resume_reviewer_after_ci(
         pr,
         &config.repo_dir,
         Some(&config.repo),
-        &config.merge_executor.github_credentials(),
+        &config.merge_executor.publication_credentials(),
     )
     .await
     {
@@ -12076,7 +12076,7 @@ async fn reconcile_merge_retries(
             pr,
             &config.repo_dir,
             Some(&config.repo),
-            &config.merge_executor.github_credentials(),
+            &config.merge_executor.publication_credentials(),
             PUBLICATION_GH_TIMEOUT,
             config
                 .pr_target_program
@@ -13254,7 +13254,7 @@ async fn tick_loop_owning_doctor(
             last_drift_check = Some(std::time::Instant::now());
             let db = config.db_path.clone();
             let repo = config.repo.clone();
-            let credentials = config.merge_executor.github_credentials();
+            let credentials = config.merge_executor.publication_credentials();
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = run_drift_check(&db, &repo, credentials.as_ref()) {
                     log(&format!("drift check failed (fail-open): {e}"));
@@ -14021,7 +14021,7 @@ async fn tick(
                                         &config.db_path,
                                         &config.repo_dir,
                                         Some(&config.repo),
-                                        &config.merge_executor.github_credentials(),
+                                        &config.merge_executor.publication_credentials(),
                                     )
                                     .await
                                     .ok()
@@ -18773,7 +18773,7 @@ async fn tick(
                                 &config.db_path,
                                 &config.repo_dir,
                                 Some(&config.repo),
-                                &config.merge_executor.github_credentials(),
+                                &config.merge_executor.publication_credentials(),
                             )
                             .await
                             .ok()
@@ -23697,7 +23697,7 @@ async fn provision_reviewer_reserved(
         &config.db_path,
         &config.repo_dir,
         Some(&config.repo),
-        &config.merge_executor.github_credentials(),
+        &config.merge_executor.publication_credentials(),
     )
     .await?;
     if let Some(resolved) = &resolved_target {
@@ -30407,7 +30407,7 @@ async fn bind_sticky_remediation_pr_baseline(
             pr,
             &config.repo_dir,
             Some(&config.repo),
-            &config.merge_executor.github_credentials(),
+            &config.merge_executor.publication_credentials(),
             PUBLICATION_GH_TIMEOUT,
             program,
         )
@@ -30788,7 +30788,7 @@ async fn spawn_remediation_worker(
         db_path,
         &config.repo_dir,
         Some(&config.repo),
-        &config.merge_executor.github_credentials(),
+        &config.merge_executor.publication_credentials(),
     )
     .await
     {
@@ -53450,6 +53450,73 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "{error}"
         );
         assert!(!marker.exists());
+    }
+
+    /// A merge token file must not become the PR author: publication gh
+    /// children use the executor's publication source, while merge-authority
+    /// calls keep the merge source. If daemon PRs were authored by the merge
+    /// account, its own approve/request-changes reviews would be self-reviews.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn publication_gh_uses_publication_source_not_merge_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let merge_source = Arc::new(crate::github_credentials::FakeCredentialSource::token(
+            "merge-account-secret",
+        ));
+        let publication_source = Arc::new(crate::github_credentials::FakeCredentialSource::token(
+            "publisher-secret",
+        ));
+        let executor = merge::GhMergeExecutor {
+            credentials: merge_source.clone(),
+            publication_credentials: publication_source.clone(),
+            gh_repo: Some("o/r".into()),
+            base_branch: "main".into(),
+            self_update_branch: "main".into(),
+        };
+        let executor: Arc<dyn merge::MergeExecutor> = Arc::new(executor);
+
+        let (gh, seen) = token_recording_gh(dir.path(), "https://github.com/o/r/pull/9");
+        let args = vec!["pr".to_string(), "create".to_string()];
+        run_publication_gh_with_program(
+            &args,
+            dir.path(),
+            &executor.publication_credentials(),
+            &gh,
+            "gh pr create",
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), "publisher-secret");
+        assert_eq!(publication_source.calls(), 1);
+        assert_eq!(merge_source.calls(), 0, "merge token must not author PRs");
+
+        let shared = executor.github_credentials();
+        assert_eq!(
+            shared.token().unwrap().expose_secret(),
+            "merge-account-secret"
+        );
+    }
+
+    /// Regression guard: every daemon PR-authoring / PR-target / drift /
+    /// branch-sync / cleanup gh call site routes through
+    /// `publication_credentials()`. The only `github_credentials()` consumer
+    /// outside merge.rs is the read-only collector.
+    #[test]
+    fn publication_call_sites_never_use_merge_credentials() {
+        let needle = ["merge_executor", ".github_credentials()"].concat();
+        let sources = [
+            ("mod.rs", include_str!("mod.rs")),
+            ("branch_sync.rs", include_str!("branch_sync.rs")),
+            ("cleanup.rs", include_str!("cleanup.rs")),
+        ];
+        for (name, src) in sources {
+            for line in src.lines().filter(|l| l.contains(&needle)) {
+                assert!(
+                    name == "mod.rs" && line.contains(".with_credentials("),
+                    "{name}: PR-authoring gh must use publication_credentials(): {line}"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
