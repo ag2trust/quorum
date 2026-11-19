@@ -7330,7 +7330,9 @@ async fn kill_and_reap_planner_view_processes(
 /// daemon's repo-dir `HEAD` is never a planning base.
 ///
 /// Done dependencies with a PR but no stamped SHA are first recovered through
-/// the worker path's shared `recover_missing_dependency_merge_commits`.
+/// the worker path's shared `recover_missing_dependency_merge_commits`. A
+/// PR-less dependency closed by hand imposes no merge commit, per the worker
+/// path's shared `manually_closed_dependencies_without_merge`.
 ///
 /// `Ok(Err(reason))` is an expected deferral (fetch/resolve failure, an open or
 /// unmerged dependency PR, unrecoverable dependency provenance, or a dependency
@@ -7419,10 +7421,15 @@ async fn capture_decomposition_frozen_base(
             }
         };
     }
+    // A hand-closed, PR-less dependency imposes no merge commit to contain,
+    // exactly as in worker admission: planning proceeds on the fetched base.
+    let manually_closed =
+        manually_closed_dependencies_without_merge(&config.db_path, &dependencies).await?;
     let mut merge_commits = Vec::with_capacity(dependencies.len());
     for dependency in dependencies {
         match dependency.merge_commit_sha {
             Some(sha) => merge_commits.push(sha),
+            None if manually_closed.contains(&dependency.task_id) => {}
             None => {
                 return Ok(Err(match dependency.pr_number {
                     Some(pr) => format!(
@@ -25528,6 +25535,41 @@ async fn recover_missing_dependency_merge_commits(
     Ok(DependencyMergeRecovery::Recovered)
 }
 
+/// The done dependencies that impose no merge commit to contain: no stamped
+/// merge SHA, no recorded PR, and closed by the owner with `quorum task-close`.
+/// Callers run this after `recover_missing_dependency_merge_commits`, so a
+/// dependency with a PR is never exempt: a recovered merge is already stamped,
+/// and an unrecoverable one keeps the caller's fail-closed deferral. Shared by
+/// worker admission and the planner's frozen-base capture.
+async fn manually_closed_dependencies_without_merge(
+    db_path: &Path,
+    dependencies: &[tasks::DependencyMergeCommit],
+) -> Result<std::collections::HashSet<i64>> {
+    let candidates = dependencies
+        .iter()
+        .filter(|dependency| {
+            dependency.merge_commit_sha.is_none() && dependency.pr_number.is_none()
+        })
+        .map(|dependency| dependency.task_id)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let db_path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<std::collections::HashSet<i64>> {
+        let conn = quorum_core::db::open(&db_path)?;
+        let mut closed = std::collections::HashSet::new();
+        for task_id in candidates {
+            if tasks::dependency_closed_manually(&conn, task_id)? {
+                closed.insert(task_id);
+            }
+        }
+        Ok(closed)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("dependency manual-close join: {error}")))?
+}
+
 /// Spawn a worker for the next highest-priority ready task.
 /// Returns true if a worker was spawned, false if no ready tasks or names available.
 enum DependencyBaseAdmission {
@@ -25624,30 +25666,7 @@ async fn verify_dependency_base_before_allocation(
     // `Some`, and an unrecoverable one (e.g. `Unknown` from a transient `gh`
     // failure on a still-open PR) keeps the fail-closed deferral below.
     let manually_closed = if unresolved_reason.is_none() {
-        let candidates = dependencies
-            .iter()
-            .filter(|dependency| {
-                dependency.merge_commit_sha.is_none() && dependency.pr_number.is_none()
-            })
-            .map(|dependency| dependency.task_id)
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            std::collections::HashSet::new()
-        } else {
-            let db_path = db_path.to_path_buf();
-            tokio::task::spawn_blocking(move || -> Result<std::collections::HashSet<i64>> {
-                let conn = quorum_core::db::open(&db_path)?;
-                let mut closed = std::collections::HashSet::new();
-                for task_id in candidates {
-                    if tasks::dependency_closed_manually(&conn, task_id)? {
-                        closed.insert(task_id);
-                    }
-                }
-                Ok(closed)
-            })
-            .await
-            .map_err(|error| QuorumError::Io(format!("dependency manual-close join: {error}")))??
-        }
+        manually_closed_dependencies_without_merge(db_path, &dependencies).await?
     } else {
         std::collections::HashSet::new()
     };
@@ -68798,6 +68817,101 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let row = harness.freeze_row();
         assert_eq!(row.state, "planning");
         assert_eq!(row.frozen_base_sha, Some(merge_sha));
+    }
+
+    /// A dependency closed by hand with `quorum task-close`, with no PR and no
+    /// merge SHA, imposes no merge commit to contain: exactly as in worker
+    /// admission, the drain handoff binds the fetched origin head instead of
+    /// holding the source in `draining`. A hand-closed dependency whose PR is
+    /// recorded but unrecoverable, or a PR-less dependency that is done by any
+    /// other route, still defers.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_handoff_binds_fetched_base_past_manually_closed_prless_dependency() {
+        let harness = lifecycle_harness("origin-manual-close-dependency");
+        let repo_dir = harness.config.repo_dir.clone();
+        let set_dependencies = |dependencies: &[i64]| {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET depends_on=?2 WHERE id=?1",
+                rusqlite::params![harness.source, serde_json::to_string(dependencies).unwrap()],
+            )
+            .unwrap();
+        };
+        let close_by_hand = |refs: Option<&str>| {
+            let task = harness.add_task("failed", refs);
+            let mut conn = quorum_core::db::open(&harness.db_path).unwrap();
+            tasks::close_manual(
+                &mut conn,
+                "owner",
+                task,
+                "resolved by hand",
+                None,
+                now_unix(),
+            )
+            .unwrap()
+            .expect("the failed task closes");
+            task
+        };
+
+        // Negative: hand-closed, PR recorded, merge unrecoverable — defers.
+        let unrecoverable = close_by_hand(Some(r#"{"pr":44}"#));
+        set_dependencies(&[unrecoverable]);
+        harness.enter_unbound_drain();
+        let held = harness.freeze_row();
+        let mut coordinator = DecompositionCoordinator::default();
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(harness.freeze_row(), held);
+        let events = harness.base_deferral_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            events[0].contains(&format!(
+                "dependency #{unrecoverable} is done but PR #44 has no recoverable merge commit SHA"
+            )),
+            "{events:?}"
+        );
+
+        // Negative: PR-less but done without manual provenance — defers.
+        // A changed reason is rate-limited, so clear the first one to observe it.
+        let plain = harness.add_task("done", None);
+        set_dependencies(&[plain]);
+        {
+            let conn = quorum_core::db::open(&harness.db_path).unwrap();
+            conn.execute(
+                "DELETE FROM events WHERE kind=?1",
+                [DECOMPOSITION_BASE_DEFERRED_EVENT],
+            )
+            .unwrap();
+        }
+        assert!(harness.tick(&mut coordinator).await);
+        assert_eq!(harness.freeze_row().state, "draining");
+        assert_eq!(harness.freeze_row().frozen_base_sha, None);
+        let events = harness.base_deferral_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            events[0].contains(&format!(
+                "dependency #{plain} is done but has no recorded merge commit SHA"
+            )),
+            "{events:?}"
+        );
+
+        // Regression: hand-closed with no PR binds the fetched origin head,
+        // alongside a dependency whose merge is stamped and on that base.
+        let manual = close_by_hand(None);
+        let stamped = add_unstamped_pr_dependency(&harness, 45);
+        let merge_sha = push_remote_pr_merge(&repo_dir, 45);
+        set_dependencies(&[manual, stamped]);
+        assert!(harness.tick(&mut coordinator).await);
+        let row = harness.freeze_row();
+        assert_eq!(row.state, "planning");
+        assert!(row.freeze_active);
+        assert_eq!(row.frozen_base_sha.as_deref(), Some(merge_sha.as_str()));
+        assert_eq!(
+            stamped_merge_commit(&harness, manual),
+            None,
+            "no merge SHA is fabricated"
+        );
+        assert_eq!(harness.base_deferral_events().len(), 1, "no new deferral");
     }
 
     /// `tick` needs more stack than a default test thread provides, and the
