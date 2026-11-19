@@ -7,7 +7,7 @@ use super::merge::{self, MergeCommitStatus};
 use super::worktree::{SyncMerge, WorktreeManager};
 use super::{
     log, parse_created_pr_number, parse_initial_pr_list, resolve_pr_target_with_program,
-    run_publication_gh_command, validate_initial_pr_target, PrTarget, ServeConfig,
+    run_credentialed_gh_command, validate_initial_pr_target, PrTarget, ServeConfig,
 };
 use quorum_core::branch_sync::{self, BranchSync, CiFailureFixOutcome, ConflictJudgmentOutcome};
 use quorum_core::error::{QuorumError, Result};
@@ -952,6 +952,7 @@ async fn resolve_pr_target(config: &ServeConfig, pr: i64) -> std::result::Result
         pr,
         &config.repo_dir,
         (!config.repo.is_empty()).then_some(config.repo.as_str()),
+        &config.merge_executor.publication_credentials(),
         super::PUBLICATION_GH_TIMEOUT,
         program,
     )
@@ -969,7 +970,13 @@ async fn run_branch_sync_gh(
         .unwrap_or(Path::new("gh"));
     let mut command = tokio::process::Command::new(program);
     command.args(args).current_dir(&config.repo_dir);
-    run_publication_gh_command(command, super::PUBLICATION_GH_TIMEOUT, label).await
+    run_credentialed_gh_command(
+        command,
+        &config.merge_executor.publication_credentials(),
+        super::PUBLICATION_GH_TIMEOUT,
+        label,
+    )
+    .await
 }
 
 async fn fail(config: &ServeConfig, sync: &BranchSync, error: &str) -> Result<()> {
@@ -1110,11 +1117,7 @@ mod tests {
             worktree_base,
             names_file: None,
             agent_bin: None,
-            merge_executor: Arc::new(super::super::merge::CommandMergeExecutor {
-                command: "true".into(),
-                checks_cmd: None,
-                mergeability_cmd: None,
-            }),
+            merge_executor: super::super::tests::hermetic_command_executor(),
             bare_agent: true,
             limits: super::super::CostLimits::default(),
             log_dir: None,
@@ -1145,6 +1148,69 @@ mod tests {
             pr_target_program: Some(gh),
             max_active_graphs: 2,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn branch_sync_gh_sets_gh_token_and_fails_before_spawn_without_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let gh = dir.path().join("fake-gh");
+        let seen = dir.path().join("token");
+        std::fs::write(
+            &gh,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$GH_TOKEN\" > '{}'\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = sync_test_config(
+            dir.path().join("q.db"),
+            dir.path().to_path_buf(),
+            dir.path().join("wt"),
+            gh,
+        );
+        let args = vec!["pr".to_string(), "list".to_string()];
+        config.merge_executor = Arc::new(super::super::tests::CredentialedExecutor {
+            inner: Arc::clone(&config.merge_executor),
+            credentials: Arc::new(crate::github_credentials::FakeCredentialSource::token(
+                "sync-secret",
+            )),
+        });
+        let output = run_branch_sync_gh(&config, &args, "gh pr list")
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), "sync-secret");
+
+        std::fs::remove_file(&seen).unwrap();
+        config.merge_executor = Arc::new(super::super::tests::CredentialedExecutor {
+            inner: Arc::clone(&config.merge_executor),
+            credentials: Arc::new(crate::github_credentials::FakeCredentialSource::failing(
+                crate::github_credentials::GithubCredentialError::LookupFailed {
+                    reason: "not logged in".into(),
+                },
+            )),
+        });
+        let error = run_branch_sync_gh(&config, &args, "gh pr list")
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("gh pr list: GitHub credential unavailable (gh not run)"),
+            "{error}"
+        );
+        assert!(
+            !seen.exists(),
+            "gh must not be spawned on credential failure"
+        );
+        let error = resolve_pr_target(&config, 5).await.unwrap_err();
+        assert!(
+            error.contains("gh pr view: GitHub credential unavailable (gh not run)"),
+            "{error}"
+        );
+        assert!(!seen.exists());
     }
 
     struct SyncExecutor {
