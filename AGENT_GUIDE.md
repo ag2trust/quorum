@@ -82,15 +82,16 @@ same PR and provide concurrency/runtime evidence appropriate to the invariant.
 
 ## Git and delivery workflow
 
-- Never edit the shared `~/dev/quorum` checkout. By default, create a worktree from
-  `origin/main`:
+- Never edit the shared `~/dev/quorum` checkout. Feature work branches from and targets
+  `develop`; create a worktree from `origin/develop`:
 
   ```bash
-  git worktree add -b <branch> ~/dev/quorum-wt/<branch> origin/main
+  git worktree add -b <branch> ~/dev/quorum-wt/<branch> origin/develop
   ```
 
-- `develop` still exists as a dormant branch; do not delete it and do not target it with
-  new work.
+- Hotfixes only, which means fixes the running daemon needs now, branch from and target
+  `main`. Say so in the task or PR. Each hotfix is merged back into `develop` right away.
+  `develop` is promoted to `main` on demand. The self-updating daemon tracks `main`.
 - Never branch from another feature branch. Do not rebase solely to become current;
   up-to-date-before-merge is disabled, while a push dismisses prior approvals.
 - Commit, push, and open PRs with the default `ag2trust-dev` identity. Never override the

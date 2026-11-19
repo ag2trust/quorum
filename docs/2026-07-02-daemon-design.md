@@ -263,7 +263,7 @@ headroom for transitions. Names are acquired on spawn and released on teardown.
 - Workers: branch `daemon/{name}-t{task_id}`, path `{base}/{Name}-t{task_id}`
 - Reviewers: branch `review/pr-{pr}-{name}`, path `{base}/pr-{pr}-{Name}`
 
-Worker worktrees are provisioned from `origin/main`. Reviewer worktrees are
+Worker worktrees are provisioned from `origin/<target branch>` (the task's target, defaulting to `base_branch`). Reviewer worktrees are
 provisioned from the PR head branch (the worker's branch) so the reviewer has
 the code under review checked out locally. The `WorktreeManager` serializes
 these operations.
