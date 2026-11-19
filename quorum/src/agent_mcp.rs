@@ -73,7 +73,7 @@ const HTTP_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// One request, from its head to the start of its response, including
 /// reading its body and waiting for the daemon endpoint.
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-/// After SIGINT/SIGTERM, open connections get this long to finish.
+/// After shutdown starts, open connections get this long to finish.
 const HTTP_SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 /// Where a request's run capability comes from.
@@ -1379,36 +1379,171 @@ fn run_stdio() -> Result<()> {
 ///
 /// The listener holds no run: it needs only the daemon endpoint locator and
 /// the repository identity, and deliberately never reads `QUORUM_RUN_ID`.
+/// It is the embeddable [`AgentMcpListener`] driven by process signals.
 fn run_http(addr: SocketAddr) -> Result<()> {
     validate_loopback(addr)?;
     let endpoint = required_env("QUORUM_AGENT_ENDPOINT", MAX_ENV_BYTES)?;
     let repository = required_env("QUORUM_REPO", 255)?;
-    let server = QuorumServer {
-        endpoint: PathBuf::from(endpoint),
-        authority: Authority::Bearer,
-        repository,
-        advertised_phase: Arc::default(),
-        endpoint_slots: Some(Arc::new(tokio::sync::Semaphore::new(
-            MAX_ENDPOINT_EXCHANGES,
-        ))),
-    };
-    // The default allowed hosts are the loopback names.
-    serve_http(
-        HttpListener {
-            command: "agent-mcp",
-            title: "agent MCP",
-            max_connections: MAX_HTTP_CONNECTIONS,
-            header_read_timeout: HTTP_HEADER_READ_TIMEOUT,
-            max_admitted_requests: None,
-        },
-        addr,
-        stateless_http_config(),
-        server,
-        |headers: &HeaderMap| match bearer_capability(headers) {
-            Some(_) => Ok(()),
-            None => Err(StatusCode::UNAUTHORIZED),
-        },
-    )
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| QuorumError::Io("failed to start agent MCP runtime".into()))?;
+    runtime.block_on(async move {
+        let shutdown = termination_signal()?;
+        // The default allowed hosts are the loopback names.
+        let listener = AgentMcpListener::bind(addr, Vec::new()).await?;
+        announce(AGENT_HTTP_LISTENER.command, listener.local_addr());
+        listener
+            .serve(PathBuf::from(endpoint), repository, shutdown)
+            .await;
+        Ok(())
+    })
+}
+
+/// The bounds of the agent MCP HTTP listener, shared by `agent-mcp --listen`
+/// and the daemon-embedded listener.
+const AGENT_HTTP_LISTENER: HttpListener = HttpListener {
+    command: "agent-mcp",
+    title: "agent MCP",
+    max_connections: MAX_HTTP_CONNECTIONS,
+    header_read_timeout: HTTP_HEADER_READ_TIMEOUT,
+    max_admitted_requests: None,
+};
+
+/// Bound on configured allowed hosts. Mirrors orchestrator MCP's
+/// `--allowed-host` cap.
+const MAX_ALLOWED_HOSTS: usize = 16;
+
+/// Why an embeddable agent MCP listener could not start.
+#[derive(Debug)]
+pub(crate) enum AgentMcpListenError {
+    /// The address or allowed-host list was refused; nothing was bound.
+    Config(String),
+    /// The address was accepted but could not be bound (in use, denied).
+    Bind(std::io::Error),
+}
+
+impl std::fmt::Display for AgentMcpListenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Config(message) => f.write_str(message),
+            Self::Bind(error) => write!(f, "failed to bind agent MCP listener: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for AgentMcpListenError {}
+
+impl From<AgentMcpListenError> for QuorumError {
+    fn from(error: AgentMcpListenError) -> Self {
+        match error {
+            AgentMcpListenError::Config(_) => QuorumError::Usage(error.to_string()),
+            AgentMcpListenError::Bind(_) => QuorumError::Io(error.to_string()),
+        }
+    }
+}
+
+/// The `Host` names an agent MCP request may carry, by the same rules as
+/// orchestrator MCP's `--allowed-host`: at most [`MAX_ALLOWED_HOSTS`] values,
+/// each a `host` or `host:port` authority. A loopback bind accepts the
+/// loopback names plus any configured ones. A non-loopback bind has no safe
+/// default, so it is refused unless at least one host is named.
+pub(crate) fn agent_allowed_hosts(
+    addr: SocketAddr,
+    configured: Vec<String>,
+) -> std::result::Result<Vec<String>, AgentMcpListenError> {
+    if configured.len() > MAX_ALLOWED_HOSTS {
+        return Err(AgentMcpListenError::Config(format!(
+            "at most {MAX_ALLOWED_HOSTS} agent MCP allowed hosts are accepted"
+        )));
+    }
+    for host in &configured {
+        if host.is_empty()
+            || host.len() > 255
+            || host.parse::<axum::http::uri::Authority>().is_err()
+        {
+            return Err(AgentMcpListenError::Config(format!(
+                "an agent MCP allowed host must be a host or host:port (got {host:?})"
+            )));
+        }
+    }
+    if addr.ip().is_loopback() {
+        let mut hosts = vec!["localhost".to_string(), "127.0.0.1".into(), "::1".into()];
+        hosts.extend(configured);
+        return Ok(hosts);
+    }
+    if configured.is_empty() {
+        return Err(AgentMcpListenError::Config(
+            "agent MCP on a non-loopback address requires an explicit allowed host: name each \
+             host (or host:port) that clients use to reach it"
+                .into(),
+        ));
+    }
+    Ok(configured)
+}
+
+/// A bound, not yet serving, agent MCP Streamable HTTP listener that runs on
+/// its caller's tokio runtime and stops only when its caller says so.
+#[derive(Debug)]
+pub(crate) struct AgentMcpListener {
+    listener: tokio::net::TcpListener,
+    local_addr: SocketAddr,
+    allowed_hosts: Vec<String>,
+}
+
+impl AgentMcpListener {
+    /// Validate `addr` and `allowed_hosts` with [`agent_allowed_hosts`], then
+    /// bind. A refused address binds nothing; a port already in use is
+    /// [`AgentMcpListenError::Bind`].
+    pub(crate) async fn bind(
+        addr: SocketAddr,
+        allowed_hosts: Vec<String>,
+    ) -> std::result::Result<Self, AgentMcpListenError> {
+        let allowed_hosts = agent_allowed_hosts(addr, allowed_hosts)?;
+        let (listener, local_addr) = bind_http(addr).await.map_err(AgentMcpListenError::Bind)?;
+        Ok(Self {
+            listener,
+            local_addr,
+            allowed_hosts,
+        })
+    }
+
+    /// The bound address; for a port-0 bind it carries the assigned port.
+    pub(crate) fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Serve the bearer-authorized agent MCP server at `/mcp` until
+    /// `shutdown` completes, then stop accepting and drain open connections
+    /// for a bounded time. Installs no signal handlers: `shutdown` is the
+    /// only stop condition. A request without a well-formed
+    /// `Authorization: Bearer <run capability>` is refused with 401.
+    pub(crate) async fn serve<F>(self, endpoint: PathBuf, repository: String, shutdown: F)
+    where
+        F: Future<Output = ()> + Send,
+    {
+        let server = QuorumServer {
+            endpoint,
+            authority: Authority::Bearer,
+            repository,
+            advertised_phase: Arc::default(),
+            endpoint_slots: Some(Arc::new(tokio::sync::Semaphore::new(
+                MAX_ENDPOINT_EXCHANGES,
+            ))),
+        };
+        serve_bound(
+            AGENT_HTTP_LISTENER,
+            self.listener,
+            stateless_http_config().with_allowed_hosts(self.allowed_hosts),
+            server,
+            |headers: &HeaderMap| match bearer_capability(headers) {
+                Some(_) => Ok(()),
+                None => Err(StatusCode::UNAUTHORIZED),
+            },
+            shutdown,
+        )
+        .await;
+    }
 }
 
 /// Stateless Streamable HTTP: no sessions, no server-initiated stream, one
@@ -1459,94 +1594,136 @@ where
     G: Fn(&HeaderMap) -> std::result::Result<(), StatusCode> + Clone + Send + Sync + 'static,
 {
     let HttpListener { command, title, .. } = listener_bounds;
-    let admitted = listener_bounds
-        .max_admitted_requests
-        .map(|requests| Arc::new(tokio::sync::Semaphore::new(requests)));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|_| QuorumError::Io(format!("failed to start {title} runtime")))?;
     runtime.block_on(async move {
-        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .map_err(|e| QuorumError::Io(format!("failed to register SIGINT handler: {e}")))?;
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .map_err(|e| QuorumError::Io(format!("failed to register SIGTERM handler: {e}")))?;
-        let listener = tokio::net::TcpListener::bind(addr)
+        let shutdown = termination_signal()?;
+        let (listener, local) = bind_http(addr)
             .await
             .map_err(|e| QuorumError::Io(format!("failed to bind {title} listener: {e}")))?;
-        let local = listener
-            .local_addr()
-            .map_err(|e| QuorumError::Io(format!("failed to bind {title} listener: {e}")))?;
-        let cancel = config.cancellation_token.clone();
-        let app = axum::Router::new()
-            .route(
-                HTTP_MCP_PATH,
-                axum::routing::any(move |request: axum::extract::Request| {
-                    // A fresh rmcp service per request. rmcp caches one tool
-                    // schema entry per distinct `tools/call` name for the
-                    // life of a service and never evicts, so a shared service
-                    // would let any caller grow memory without bound. Nothing
-                    // else in a stateless service outlives a request.
-                    let service = StreamableHttpService::new(
-                        {
-                            let server = server.clone();
-                            move || Ok(server.clone())
-                        },
-                        Arc::new(NeverSessionManager::default()),
-                        config.clone(),
-                    );
-                    async move { service.handle(request).await }
-                }),
-            )
-            .layer(axum::middleware::from_fn(
-                move |request: axum::extract::Request, next: axum::middleware::Next| {
-                    let gate = gate.clone();
-                    let admitted = admitted.clone();
-                    async move { bound_request(gate, admitted, request, next).await }
-                },
-            ));
-        // The one line a launcher needs to learn a port-0 bind.
-        eprintln!("quorum {command} listening on http://{local}{HTTP_MCP_PATH}");
+        announce(command, local);
+        serve_bound(listener_bounds, listener, config, server, gate, shutdown).await;
+        Ok(())
+    })
+}
 
-        let slots = Arc::new(tokio::sync::Semaphore::new(listener_bounds.max_connections));
-        let (shutdown, _) = tokio::sync::watch::channel(false);
-        let mut connections = tokio::task::JoinSet::new();
-        loop {
-            tokio::select! {
-                // Signals first, then reaping, so finished connections never
-                // accumulate behind a steady stream of new ones.
-                biased;
-                _ = sigint.recv() => break,
-                _ = sigterm.recv() => break,
-                Some(_) = connections.join_next(), if !connections.is_empty() => {}
-                accepted = accept_with_slot(&listener, &slots) => {
-                    if let Some((stream, slot)) = accepted {
-                        connections.spawn(serve_http_connection(
-                            stream,
-                            listener_bounds.header_read_timeout,
-                            app.clone(),
-                            shutdown.subscribe(),
-                            slot,
-                        ));
-                    }
+/// A future that completes on the first SIGINT or SIGTERM. Registration
+/// happens here, before it is polled, so a signal is never missed.
+fn termination_signal() -> Result<impl Future<Output = ()> + Send> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigint = signal(SignalKind::interrupt())
+        .map_err(|e| QuorumError::Io(format!("failed to register SIGINT handler: {e}")))?;
+    let mut sigterm = signal(SignalKind::terminate())
+        .map_err(|e| QuorumError::Io(format!("failed to register SIGTERM handler: {e}")))?;
+    Ok(async move {
+        // Both `recv` calls are cancel-safe.
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+    })
+}
+
+/// Bind a TCP listener and report the address it actually bound.
+async fn bind_http(addr: SocketAddr) -> std::io::Result<(tokio::net::TcpListener, SocketAddr)> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let local = listener.local_addr()?;
+    Ok((listener, local))
+}
+
+/// The one line a launcher needs to learn a port-0 bind.
+fn announce(command: &str, local: SocketAddr) {
+    eprintln!("quorum {command} listening on http://{local}{HTTP_MCP_PATH}");
+}
+
+/// Serve `server` on an already bound `listener` at `/mcp` until `stop`
+/// completes, with `listener_bounds` and this module's time and body bounds,
+/// then drain open connections for at most [`HTTP_SHUTDOWN_DRAIN`].
+///
+/// `stop` is polled in place by reference and never recreated, so a
+/// losing branch of the accept loop's `select!` never loses its progress.
+async fn serve_bound<S, G, F>(
+    listener_bounds: HttpListener,
+    listener: tokio::net::TcpListener,
+    config: StreamableHttpServerConfig,
+    server: S,
+    gate: G,
+    stop: F,
+) where
+    S: ServerHandler + Clone + Send + Sync + 'static,
+    G: Fn(&HeaderMap) -> std::result::Result<(), StatusCode> + Clone + Send + Sync + 'static,
+    F: Future<Output = ()>,
+{
+    let admitted = listener_bounds
+        .max_admitted_requests
+        .map(|requests| Arc::new(tokio::sync::Semaphore::new(requests)));
+    let cancel = config.cancellation_token.clone();
+    let app = axum::Router::new()
+        .route(
+            HTTP_MCP_PATH,
+            axum::routing::any(move |request: axum::extract::Request| {
+                // A fresh rmcp service per request. rmcp caches one tool
+                // schema entry per distinct `tools/call` name for the
+                // life of a service and never evicts, so a shared service
+                // would let any caller grow memory without bound. Nothing
+                // else in a stateless service outlives a request.
+                let service = StreamableHttpService::new(
+                    {
+                        let server = server.clone();
+                        move || Ok(server.clone())
+                    },
+                    Arc::new(NeverSessionManager::default()),
+                    config.clone(),
+                );
+                async move { service.handle(request).await }
+            }),
+        )
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let gate = gate.clone();
+                let admitted = admitted.clone();
+                async move { bound_request(gate, admitted, request, next).await }
+            },
+        ));
+    tokio::pin!(stop);
+    let slots = Arc::new(tokio::sync::Semaphore::new(listener_bounds.max_connections));
+    let (shutdown, _) = tokio::sync::watch::channel(false);
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            // Shutdown first, then reaping, so finished connections never
+            // accumulate behind a steady stream of new ones.
+            biased;
+            () = &mut stop => break,
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            accepted = accept_with_slot(&listener, &slots) => {
+                if let Some((stream, slot)) = accepted {
+                    connections.spawn(serve_http_connection(
+                        stream,
+                        listener_bounds.header_read_timeout,
+                        app.clone(),
+                        shutdown.subscribe(),
+                        slot,
+                    ));
                 }
             }
         }
-        // Signals only start shutdown. Stop accepting, tell rmcp and every
-        // connection to finish, and wait a bounded time. A connection still
-        // open after that (a half-sent request, a stalled peer) is dropped:
-        // an operation already in flight is one atomic operation whose
-        // outcome its owner alone decides.
-        drop(listener);
-        cancel.cancel();
-        let _ = shutdown.send(true);
-        let _ = tokio::time::timeout(HTTP_SHUTDOWN_DRAIN, async {
-            while connections.join_next().await.is_some() {}
-        })
-        .await;
-        connections.shutdown().await;
-        Ok(())
+    }
+    // Shutdown only stops intake. Stop accepting, tell rmcp and every
+    // connection to finish, and wait a bounded time. A connection still
+    // open after that (a half-sent request, a stalled peer) is dropped:
+    // an operation already in flight is one atomic operation whose
+    // outcome its owner alone decides.
+    drop(listener);
+    cancel.cancel();
+    let _ = shutdown.send(true);
+    let _ = tokio::time::timeout(HTTP_SHUTDOWN_DRAIN, async {
+        while connections.join_next().await.is_some() {}
     })
+    .await;
+    connections.shutdown().await;
 }
 
 /// Accept one connection, but only once a connection slot is free, so the
@@ -1721,5 +1898,131 @@ mod tests {
 
         server.record_advertised_phase(RunPhase::ReworkWorker);
         assert!(!server.phase_changed_since_advertisement(RunPhase::ReworkWorker));
+    }
+
+    fn loopback(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// One raw HTTP/1.1 exchange; returns the status line's code.
+    async fn post_tools_list(addr: SocketAddr, authorization: Option<&str>) -> u16 {
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+        let mut request = format!(
+            "POST {HTTP_MCP_PATH} HTTP/1.1\r\nHost: {addr}\r\n\
+             Content-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\n\
+             Content-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        if let Some(value) = authorization {
+            request.push_str(&format!("Authorization: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        request.push_str(body);
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
+            .await
+            .expect("response within bound")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response);
+        response
+            .strip_prefix("HTTP/1.1 ")
+            .and_then(|rest| rest.get(..3))
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("not an HTTP response: {response:?}"))
+    }
+
+    #[test]
+    fn allowed_hosts_default_to_loopback_and_require_explicit_hosts_otherwise() {
+        let defaults = ["localhost", "127.0.0.1", "::1"];
+        assert_eq!(agent_allowed_hosts(loopback(0), vec![]).unwrap(), defaults);
+        let v6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0));
+        assert_eq!(agent_allowed_hosts(v6, vec![]).unwrap(), defaults);
+        assert_eq!(
+            agent_allowed_hosts(loopback(0), vec!["agent.internal".into()]).unwrap(),
+            ["localhost", "127.0.0.1", "::1", "agent.internal"]
+        );
+
+        let any = SocketAddr::from(([0, 0, 0, 0], 0));
+        assert!(matches!(
+            agent_allowed_hosts(any, vec![]),
+            Err(AgentMcpListenError::Config(_))
+        ));
+        assert_eq!(
+            agent_allowed_hosts(any, vec!["agent.internal:8812".into()]).unwrap(),
+            ["agent.internal:8812"]
+        );
+        for bad in ["", "bad host", "a/b"] {
+            assert!(
+                matches!(
+                    agent_allowed_hosts(any, vec![bad.into()]),
+                    Err(AgentMcpListenError::Config(_))
+                ),
+                "{bad:?} must be refused"
+            );
+        }
+        let too_many = (0..=MAX_ALLOWED_HOSTS).map(|i| format!("h{i}")).collect();
+        assert!(matches!(
+            agent_allowed_hosts(loopback(0), too_many),
+            Err(AgentMcpListenError::Config(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_loopback_bind_without_allowed_hosts_is_refused_before_binding() {
+        let error = AgentMcpListener::bind(SocketAddr::from(([0, 0, 0, 0], 0)), vec![])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentMcpListenError::Config(_)), "{error:?}");
+        assert_eq!(QuorumError::from(error).exit_code(), 2);
+    }
+
+    #[tokio::test]
+    async fn binding_a_taken_port_is_a_bind_error() {
+        let taken = std::net::TcpListener::bind(loopback(0)).unwrap();
+        let error = AgentMcpListener::bind(taken.local_addr().unwrap(), vec![])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentMcpListenError::Bind(_)), "{error:?}");
+        assert_eq!(QuorumError::from(error).exit_code(), 3);
+    }
+
+    #[tokio::test]
+    async fn embedded_listener_reports_its_port_gates_bearer_and_stops_on_shutdown() {
+        let listener = AgentMcpListener::bind(loopback(0), vec![]).await.unwrap();
+        let addr = listener.local_addr();
+        assert!(addr.ip().is_loopback());
+        assert_ne!(addr.port(), 0, "port-0 bind must report its assigned port");
+
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let serving = tokio::spawn(listener.serve(
+            PathBuf::from("/nonexistent/quorum-agent-endpoint.sock"),
+            "owner/repository".into(),
+            async move {
+                let _ = stopped.await;
+            },
+        ));
+
+        assert_eq!(post_tools_list(addr, None).await, 401);
+        assert_eq!(post_tools_list(addr, Some("Bearer")).await, 401);
+        assert_eq!(post_tools_list(addr, Some("Basic run-1")).await, 401);
+        // A well-formed bearer passes the gate and reaches MCP, which answers
+        // even though the endpoint is unreachable.
+        assert_ne!(post_tools_list(addr, Some("Bearer run-1")).await, 401);
+
+        // An idle open connection must not hold the server past its drain.
+        let _idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        assert!(!serving.is_finished());
+        stop.send(()).unwrap();
+        tokio::time::timeout(HTTP_SHUTDOWN_DRAIN + Duration::from_secs(5), serving)
+            .await
+            .expect("serving future returns after shutdown")
+            .unwrap();
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "listener must be closed after shutdown"
+        );
     }
 }
