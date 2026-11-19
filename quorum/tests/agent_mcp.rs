@@ -631,7 +631,10 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
     reviewer.initialize();
     let reviewer_owned = read(&mut reviewer, 20, "attempt-r", "op-r");
     // A settled failure is a typed tool error carrying its closed code.
-    assert_eq!(reviewer_owned["result"]["isError"], true, "{reviewer_owned:#}");
+    assert_eq!(
+        reviewer_owned["result"]["isError"], true,
+        "{reviewer_owned:#}"
+    );
     assert_eq!(
         serde_json::from_str::<Value>(tool_text(&reviewer_owned)).unwrap(),
         json!({

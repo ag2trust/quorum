@@ -2466,7 +2466,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(attempt, ("revoked".to_string(), None, 23));
-        assert_eq!(live_attempts(&conn, 23), 0, "a dead run consumes no capacity");
+        assert_eq!(
+            live_attempts(&conn, 23),
+            0,
+            "a dead run consumes no capacity"
+        );
         let ops = |conn: &Connection| -> Vec<(String, String)> {
             conn.prepare(
                 "SELECT operation_id,state FROM github_agent_operations ORDER BY operation_id",
