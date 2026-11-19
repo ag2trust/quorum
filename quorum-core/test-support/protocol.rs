@@ -27,10 +27,11 @@ pub enum Operation {
     ClaimCleanup,
     MaterializeAssessment,
     AcquireDaemonLock,
+    ClaimGithubOp,
 }
 
 impl Operation {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::AllocateRole,
         Self::ClaimTask,
         Self::ClaimProviderRetryRework,
@@ -39,6 +40,7 @@ impl Operation {
         Self::ClaimCleanup,
         Self::MaterializeAssessment,
         Self::AcquireDaemonLock,
+        Self::ClaimGithubOp,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -51,6 +53,7 @@ impl Operation {
             Self::ClaimCleanup => "claim-cleanup",
             Self::MaterializeAssessment => "materialize-assessment",
             Self::AcquireDaemonLock => "acquire-daemon-lock",
+            Self::ClaimGithubOp => "claim-github-operation",
         }
     }
 }
@@ -164,6 +167,14 @@ pub struct MaterializeAssessmentInput {
     pub scope_id: i64,
     pub source_task_id: i64,
     pub artifact_ids: Vec<i64>,
+    pub now: i64,
+    pub barrier: Barrier,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimGithubOperationInput {
+    pub db_path: PathBuf,
     pub now: i64,
     pub barrier: Barrier,
 }
