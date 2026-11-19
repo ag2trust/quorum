@@ -657,10 +657,8 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
         ]
     );
     let pull_request_read = &tool(&reviewer_tools, "pull_request_read")["inputSchema"];
-    assert_eq!(
-        pull_request_read["properties"]["after"],
-        json!({"type":"string","minLength":1,"maxLength":512})
-    );
+    // Paging is page/perPage only; no cursor is advertised.
+    assert!(pull_request_read["properties"].get("after").is_none());
     assert_eq!(
         pull_request_read["properties"]["page"],
         json!({"type":"integer","minimum":1,"maximum":100})

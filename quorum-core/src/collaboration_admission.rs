@@ -863,14 +863,27 @@ pub fn issue_attempt(
             return Ok(CollaborationAttemptAdmissionResult::Rejected(rejection));
         }
     };
+    let result = insert_attempt_in_tx(&tx, request, &authority, now)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+/// The issuance checks and insert shared by [`issue_attempt`] and
+/// [`ensure_run_attempt`]. The caller holds `BEGIN IMMEDIATE` and has already
+/// resolved `authority` for `request` in that same transaction; the caller
+/// commits whatever this returns, including a typed rejection.
+fn insert_attempt_in_tx(
+    tx: &Transaction<'_>,
+    request: &CreateCollaborationAttemptRequest,
+    authority: &LiveCollaborationContext,
+    now: i64,
+) -> Result<CollaborationAttemptAdmissionResult> {
     if request.expires_at() <= now {
-        tx.commit()?;
         return Ok(CollaborationAttemptAdmissionResult::Rejected(
             CollaborationAdmissionError::AttemptExpired,
         ));
     }
-
-    if let Some(existing) = get_attempt(&tx, request.attempt_id())? {
+    if let Some(existing) = get_attempt(tx, request.attempt_id())? {
         let result = if existing.expires_at <= now {
             CollaborationAttemptAdmissionResult::Rejected(
                 CollaborationAdmissionError::AttemptExpired,
@@ -878,7 +891,7 @@ pub fn issue_attempt(
         } else if request_matches_attempt(request, &existing)
             && existing.state == CollaborationAttemptState::Active
             && existing.active_run_id.as_deref() == Some(request.active_run_id().as_str())
-            && attempt_matches_turn(&existing, &authority)
+            && attempt_matches_turn(&existing, authority)
         {
             CollaborationAttemptAdmissionResult::Existing(CollaborationAttemptStatus {
                 attempt_id: request.attempt_id().clone(),
@@ -891,17 +904,15 @@ pub fn issue_attempt(
                 CollaborationAdmissionError::AttemptBindingMismatch,
             )
         };
-        tx.commit()?;
         return Ok(result);
     }
 
-    if logical_attempt_exists(&tx, request, now)? {
-        tx.commit()?;
+    if logical_attempt_exists(tx, request, now)? {
         return Ok(CollaborationAttemptAdmissionResult::Rejected(
             CollaborationAdmissionError::ActiveAttemptExists,
         ));
     }
-    release_expired_run_binding(&tx, request.active_run_id(), now)?;
+    release_expired_run_binding(tx, request.active_run_id(), now)?;
     let run_already_bound: bool = tx.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM github_collaboration_attempts
@@ -911,13 +922,11 @@ pub fn issue_attempt(
         |row| row.get(0),
     )?;
     if run_already_bound {
-        tx.commit()?;
         return Ok(CollaborationAttemptAdmissionResult::Rejected(
             CollaborationAdmissionError::ActiveAttemptExists,
         ));
     }
-    if let Some(rejection) = capacity_rejection(&tx, request.task_id(), now)? {
-        tx.commit()?;
+    if let Some(rejection) = capacity_rejection(tx, request.task_id(), now)? {
         return Ok(CollaborationAttemptAdmissionResult::Rejected(rejection));
     }
 
@@ -945,8 +954,182 @@ pub fn issue_attempt(
         ],
         row_to_status,
     )?;
-    tx.commit()?;
     Ok(CollaborationAttemptAdmissionResult::Created(created))
+}
+
+/// Closed outcome of [`ensure_run_attempt`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RunAttemptResolution {
+    /// The attempt currently bound to the live run for its exact logical turn.
+    Bound(CollaborationAttemptStatus),
+    Rejected(CollaborationAdmissionError),
+}
+
+/// Resolve the one active collaboration attempt for a live run, issuing it on
+/// the run's first collaboration call. Every binding field — task, agent,
+/// role, PR, reviewer launch SHA, lifecycle generation, and provider turn — is
+/// derived from daemon-owned state in this one `BEGIN IMMEDIATE` transaction;
+/// the caller supplies only the role it authorizes as, a fresh daemon-minted
+/// `new_attempt_id` used only when an attempt must be issued, and the
+/// retention bound.
+///
+/// - An unexpired attempt already bound to `run_id` is returned only when it
+///   is `active` for the run's current logical turn. A binding left from an
+///   earlier lifecycle generation or launch SHA is rejected as
+///   `AttemptBindingMismatch`: it is never silently reused for a new turn.
+/// - Otherwise, `active` attempts of the same task/agent/role whose bound
+///   capability has been revoked are orphans (their run can never call
+///   again). They are revoked here and their queued, provably unsent rows are
+///   cancelled, so a replacement run is not blocked by a dead binding. A
+///   claimed or possibly-sent row keeps its disposition.
+/// - Then a new attempt is issued through the same checks as
+///   [`issue_attempt`].
+pub fn ensure_run_attempt(
+    conn: &mut Connection,
+    run_id: &RunCapabilityId,
+    role: CollaborationRole,
+    new_attempt_id: &CollaborationAttemptId,
+    retention_secs: i64,
+    now: i64,
+) -> Result<RunAttemptResolution> {
+    if now < 0 || retention_secs <= 0 {
+        return Err(QuorumError::Usage(
+            "collaboration attempt resolution bounds are invalid".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let authority = match capabilities::resolve_live_collaboration_context_for_admission(
+        &tx,
+        run_id.as_str(),
+        role.as_str(),
+    )? {
+        LiveCollaborationContextResolution::Live(context) => *context,
+        LiveCollaborationContextResolution::Rejected => {
+            tx.commit()?;
+            return Ok(RunAttemptResolution::Rejected(
+                CollaborationAdmissionError::CapabilityRejected,
+            ));
+        }
+    };
+    let run = &authority.run;
+    let Some(pr_number) = run.pr.filter(|pr| *pr > 0) else {
+        tx.commit()?;
+        return Ok(RunAttemptResolution::Rejected(
+            CollaborationAdmissionError::InvalidField {
+                field: CollaborationAdmissionField::PrNumber,
+            },
+        ));
+    };
+    let reviewer_head_sha = match role {
+        CollaborationRole::Reviewer => match run.review_revision.clone() {
+            Some(sha) => Some(ReviewerHeadSha::new(sha)?),
+            None => {
+                tx.commit()?;
+                return Ok(RunAttemptResolution::Rejected(
+                    CollaborationAdmissionError::InvalidField {
+                        field: CollaborationAdmissionField::ReviewerHeadSha,
+                    },
+                ));
+            }
+        },
+        CollaborationRole::Worker => None,
+    };
+
+    let bound: Option<(String, StoredAttempt)> = tx
+        .query_row(
+            "SELECT attempt_id FROM github_collaboration_attempts
+             WHERE active_run_id=?1 AND expires_at>?2",
+            params![run_id.as_str(), now],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|attempt_id| {
+            let id = CollaborationAttemptId::new(attempt_id.clone())?;
+            Ok::<_, QuorumError>(get_attempt(&tx, &id)?.map(|stored| (attempt_id, stored)))
+        })
+        .transpose()?
+        .flatten();
+    if let Some((attempt_id, stored)) = bound {
+        let current = stored.state == CollaborationAttemptState::Active
+            && stored.task_id == run.task_id
+            && stored.agent == run.agent
+            && stored.role == run.role
+            && stored.pr_number == pr_number
+            && stored.head_sha.as_deref()
+                == reviewer_head_sha.as_ref().map(ReviewerHeadSha::as_str)
+            && stored.lifecycle_generation == authority.lifecycle_generation;
+        let result = if current {
+            RunAttemptResolution::Bound(CollaborationAttemptStatus {
+                attempt_id: CollaborationAttemptId::new(attempt_id)?,
+                state: stored.state,
+                lifecycle_generation: stored.lifecycle_generation,
+                expires_at: stored.expires_at,
+            })
+        } else {
+            RunAttemptResolution::Rejected(CollaborationAdmissionError::AttemptBindingMismatch)
+        };
+        tx.commit()?;
+        return Ok(result);
+    }
+
+    let orphans: Vec<String> = {
+        let mut statement = tx.prepare(
+            "UPDATE github_collaboration_attempts
+             SET state='revoked', active_run_id=NULL, updated_at=?4
+             WHERE task_id=?1 AND agent=?2 AND role=?3 AND state='active'
+               AND active_run_id IS NOT NULL AND active_run_id<>?5
+               AND EXISTS (
+                   SELECT 1 FROM run_capabilities c
+                   WHERE c.run_id=github_collaboration_attempts.active_run_id
+                     AND c.revoked_at IS NOT NULL
+               )
+             RETURNING attempt_id",
+        )?;
+        let rows = statement
+            .query_map(
+                params![run.task_id, run.agent, run.role, now, run_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for attempt_id in &orphans {
+        tx.execute(
+            "UPDATE github_agent_operations
+             SET state='cancelled', next_attempt_at=NULL, error_kind='attempt_revoked',
+                 error_summary='collaboration attempt revoked before the send started',
+                 updated_at=?2
+             WHERE attempt_id=?1 AND state='queued' AND active=0
+               AND execution_started_at IS NULL
+               AND send_state IN ('not_started','definitely_unsent')",
+            params![attempt_id, now],
+        )?;
+    }
+
+    let request = CreateCollaborationAttemptRequest::new(
+        new_attempt_id.clone(),
+        run.task_id,
+        CollaborationAgent::new(run.agent.clone())?,
+        role,
+        pr_number,
+        reviewer_head_sha,
+        authority.lifecycle_generation,
+        run_id.clone(),
+        now,
+        now.saturating_add(retention_secs),
+    )?;
+    let result = match insert_attempt_in_tx(&tx, &request, &authority, now)? {
+        CollaborationAttemptAdmissionResult::Created(status)
+        | CollaborationAttemptAdmissionResult::Existing(status) => {
+            RunAttemptResolution::Bound(status)
+        }
+        CollaborationAttemptAdmissionResult::Rejected(rejection) => {
+            RunAttemptResolution::Rejected(rejection)
+        }
+    };
+    tx.commit()?;
+    Ok(result)
 }
 
 /// Adopt an interrupted attempt only for a freshly issued live capability that
@@ -1186,6 +1369,25 @@ pub fn derive_operation_id(
     ]);
     GithubOperationId::new(format!("op-{digest:032x}"))
         .expect("derived operation id is bounded ASCII")
+}
+
+/// Derive the client request id for a mutation whose caller supplied none:
+/// a stable digest of the operation kind and its canonical closed request.
+/// An identical retry, including one from a fresh-capability resume of the
+/// same attempt, therefore collides with the original durable operation; a
+/// caller that intentionally repeats identical content supplies its own id.
+pub fn derive_client_request_id(
+    kind: GithubOperationKind,
+    request_json: &GithubOperationRequestJson,
+) -> ClientRequestId {
+    let digest = fnv1a_128(&[
+        b"quorum-client-request\x00",
+        kind.as_str().as_bytes(),
+        b"\x00",
+        request_json.as_str().as_bytes(),
+    ]);
+    ClientRequestId::new(format!("auto-{digest:032x}"))
+        .expect("derived client request id is bounded ASCII")
 }
 
 /// Deterministically derive the hidden GitHub marker attached to a mutation
@@ -1999,6 +2201,205 @@ mod tests {
         );
         assert!("unknown".parse::<GithubOperationKind>().is_err());
         assert_eq!(MAX_OPERATION_ATTEMPTS, 8);
+    }
+
+    fn ensure(
+        conn: &mut Connection,
+        run: &str,
+        role: CollaborationRole,
+        new_id: &str,
+        now: i64,
+    ) -> RunAttemptResolution {
+        ensure_run_attempt(
+            conn,
+            &RunCapabilityId::new(run).unwrap(),
+            role,
+            &CollaborationAttemptId::new(new_id).unwrap(),
+            1_000,
+            now,
+        )
+        .unwrap()
+    }
+
+    fn bound_id(resolution: &RunAttemptResolution) -> &str {
+        match resolution {
+            RunAttemptResolution::Bound(status) => status.attempt_id.as_str(),
+            other => panic!("expected a bound attempt: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_run_attempt_issues_once_and_reuses_the_run_binding() {
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "Worker", WORKER_PR);
+        insert_live_worker(&mut conn, 1, "Worker", "run-a", 10);
+        let first = ensure(
+            &mut conn,
+            "run-a",
+            CollaborationRole::Worker,
+            "att-new-1",
+            20,
+        );
+        assert_eq!(bound_id(&first), "att-new-1");
+        // A second call never mints another attempt for the same run.
+        let second = ensure(
+            &mut conn,
+            "run-a",
+            CollaborationRole::Worker,
+            "att-new-2",
+            21,
+        );
+        assert_eq!(bound_id(&second), "att-new-1");
+        let (pr, sha, generation, expires): (i64, Option<String>, i64, i64) = conn
+            .query_row(
+                "SELECT pr_number,head_sha,lifecycle_generation,expires_at
+                 FROM github_collaboration_attempts WHERE attempt_id='att-new-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((pr, sha, generation, expires), (WORKER_PR, None, 0, 1_020));
+        // The wrong role is a clean capability rejection, writing nothing.
+        assert_eq!(
+            ensure(&mut conn, "run-a", CollaborationRole::Reviewer, "att-x", 22),
+            RunAttemptResolution::Rejected(CollaborationAdmissionError::CapabilityRejected)
+        );
+        // A later lifecycle generation never reuses the earlier binding.
+        conn.execute("UPDATE tasks SET rework_round=1 WHERE id=1", [])
+            .unwrap();
+        assert_eq!(
+            ensure(
+                &mut conn,
+                "run-a",
+                CollaborationRole::Worker,
+                "att-new-3",
+                23
+            ),
+            RunAttemptResolution::Rejected(CollaborationAdmissionError::AttemptBindingMismatch)
+        );
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM github_collaboration_attempts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn ensure_run_attempt_binds_the_reviewer_launch_sha() {
+        let (_dir, mut conn) = open_tmp();
+        insert_live_reviewer(&mut conn, "run-review");
+        let resolution = ensure(
+            &mut conn,
+            "run-review",
+            CollaborationRole::Reviewer,
+            "att-r",
+            20,
+        );
+        assert_eq!(bound_id(&resolution), "att-r");
+        let sha: Option<String> = conn
+            .query_row(
+                "SELECT head_sha FROM github_collaboration_attempts WHERE attempt_id='att-r'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sha.as_deref(), Some(REVIEW_SHA));
+    }
+
+    #[test]
+    fn ensure_run_attempt_revokes_a_dead_runs_orphan_and_cancels_only_unsent_rows() {
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "Worker", WORKER_PR);
+        insert_live_worker(&mut conn, 1, "Worker", "run-old", 10);
+        assert_eq!(
+            bound_id(&ensure(
+                &mut conn,
+                "run-old",
+                CollaborationRole::Worker,
+                "att-old",
+                20
+            )),
+            "att-old"
+        );
+        for (op, state, send, started) in [
+            ("op-queued", "queued", "not_started", None),
+            ("op-ambiguous", "failed", "ambiguous", Some(21)),
+        ] {
+            conn.execute(
+                "INSERT INTO github_agent_operations(
+                     operation_id,client_request_id,attempt_id,created_by_run_id,task_id,agent,
+                     role,pr_number,kind,request_json,state,send_state,attempts,deadline_at,
+                     github_marker,execution_started_at,created_at,updated_at,expires_at)
+                 VALUES (?1,?1,'att-old','run-old',1,'Worker','worker',?2,'add_issue_comment',
+                         '{\"kind\":\"add_issue_comment\",\"body\":\"x\"}',?3,?4,0,900,'m',?5,
+                         20,20,1020)",
+                params![op, WORKER_PR, state, send, started],
+            )
+            .unwrap();
+        }
+        crate::capabilities::revoke(&mut conn, "run-old", 22).unwrap();
+        conn.execute("UPDATE agent_runs SET ended_at=22 WHERE task_id=1", [])
+            .unwrap();
+        insert_live_worker(&mut conn, 1, "Worker", "run-new", 30);
+        let resolution = ensure(
+            &mut conn,
+            "run-new",
+            CollaborationRole::Worker,
+            "att-new",
+            31,
+        );
+        assert_eq!(bound_id(&resolution), "att-new");
+        let old: (String, Option<String>) = conn
+            .query_row(
+                "SELECT state,active_run_id FROM github_collaboration_attempts
+                 WHERE attempt_id='att-old'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(old, ("revoked".to_string(), None));
+        let ops: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT operation_id,state,send_state FROM github_agent_operations
+                 ORDER BY operation_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            ops,
+            vec![
+                ("op-ambiguous".into(), "failed".into(), "ambiguous".into()),
+                ("op-queued".into(), "cancelled".into(), "not_started".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn derived_client_request_id_is_stable_per_kind_and_content() {
+        let a = GithubOperationRequestJson::new(r#"{"body":"a"}"#).unwrap();
+        let b = GithubOperationRequestJson::new(r#"{"body":"b"}"#).unwrap();
+        let kind = GithubOperationKind::AddIssueComment;
+        assert_eq!(
+            derive_client_request_id(kind, &a),
+            derive_client_request_id(kind, &a)
+        );
+        assert_ne!(
+            derive_client_request_id(kind, &a),
+            derive_client_request_id(kind, &b)
+        );
+        assert_ne!(
+            derive_client_request_id(kind, &a),
+            derive_client_request_id(GithubOperationKind::PullRequestReviewWrite, &a)
+        );
+        assert!(derive_client_request_id(kind, &a)
+            .as_str()
+            .starts_with("auto-"));
     }
 
     #[test]

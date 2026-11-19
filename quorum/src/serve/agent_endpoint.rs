@@ -5,16 +5,21 @@
 //! all authority from the supplied run capability, and exposes only the
 //! closed operations below. Repository identity is daemon configuration.
 
+use super::repository_service::{RepositoryRequest, MAX_COMMENT_BODY_BYTES};
 use quorum_core::capabilities::{LiveRunContext, LiveRunPhase};
 use quorum_core::collaboration_admission::{
-    self, CollaborationAttemptId, GithubOperationId, GithubOperationReadResult,
-    GithubOperationState, GithubSendState,
+    self, ClientRequestId, CollaborationAdmissionError, CollaborationAgent, CollaborationAttemptId,
+    CollaborationRole, EnqueueGithubOperationRequest, GithubOperationAdmissionResult,
+    GithubOperationId, GithubOperationKind, GithubOperationReadResult, GithubOperationRequestJson,
+    GithubOperationState, GithubOperationStatus, GithubSendState, ReviewerHeadSha,
+    RunAttemptResolution, RunCapabilityId,
 };
 use quorum_core::db::begin_immediate;
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::planner_submissions::{self, CallOutcome, RejectionCategory, SubmitOutcome};
 use rusqlite::{params, Transaction};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
@@ -113,6 +118,10 @@ enum Operation {
         attempt_id: Option<String>,
         #[serde(default)]
         operation_id: Option<String>,
+        /// The tool's own arguments object for `pull_request_read` and
+        /// `add_issue_comment`, decoded here against each closed schema.
+        #[serde(default)]
+        arguments: Option<serde_json::Value>,
     },
 }
 
@@ -194,12 +203,16 @@ enum ResponseResult {
     /// The closed, bounded view of one operation owned by the caller's run.
     /// Request JSON, the hidden marker, and credentials are never included.
     GithubOperation {
+        attempt_id: String,
         operation_id: String,
         state: GithubOperationState,
         send_state: GithubSendState,
         remote_object_id: Option<String>,
         result: Option<serde_json::Value>,
         error_summary: Option<String>,
+        /// Typed failure class once the operation failed or a retry is
+        /// pending after a GitHub failure; `None` while healthy or done.
+        error_code: Option<&'static str>,
     },
 }
 
@@ -294,6 +307,7 @@ impl EndpointFailure {
             | "operation_unavailable"
             | "operation_not_found"
             | "operation_rejected"
+            | "operation_limit_reached"
             | "invalid_plan"
             | "already_submitted"
             | "submit_budget_exhausted" => false,
@@ -635,6 +649,22 @@ async fn process_request_with_timeout(
     // the shared blocking path that opens `BEGIN IMMEDIATE` up front. This
     // branch validates with no write transaction open and records afterwards.
     let request = match request.operation {
+        Operation::Protocol {
+            operation:
+                operation @ (ProtocolOperation::PullRequestRead | ProtocolOperation::AddIssueComment),
+            arguments,
+            ..
+        } => {
+            // Admission is several short guarded transactions (attempt, then
+            // operation), each idempotent under retry, so it runs to
+            // completion rather than being abandoned at a deadline.
+            let capability = request.capability;
+            return tokio::task::spawn_blocking(move || {
+                admit_github_operation(&db_path, &repository, &capability, operation, arguments)
+            })
+            .await
+            .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+        }
         Operation::SubmitPlan { response } => {
             return submit_plan(
                 db_path,
@@ -878,6 +908,7 @@ fn process_request_blocking(
             operation,
             attempt_id,
             operation_id,
+            ..
         } => {
             let context = resolve_any_role(&tx, &request.capability)?;
             if !operation.allowed_in(context.phase) {
@@ -939,24 +970,7 @@ fn github_operation_read(
         collaboration_admission::read_operation(conn, &context.run_id, &attempt_id, &operation_id)
             .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
     match read {
-        GithubOperationReadResult::Found(status) => {
-            let result = status
-                .response_json
-                .as_ref()
-                .map(|json| serde_json::from_str(json.as_str()))
-                .transpose()
-                .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
-            Ok(Response::success(ResponseResult::GithubOperation {
-                operation_id: status.operation_id.as_str().to_owned(),
-                state: status.state,
-                send_state: status.send_state,
-                remote_object_id: status
-                    .remote_object_id
-                    .map(|value| value.as_str().to_owned()),
-                result,
-                error_summary: status.error_summary.map(|value| value.as_str().to_owned()),
-            }))
-        }
+        GithubOperationReadResult::Found(status) => operation_response(conn, &attempt_id, status),
         GithubOperationReadResult::NotFound => Err(EndpointFailure::new(
             "operation_not_found",
             "operation not found",
@@ -966,6 +980,457 @@ fn github_operation_read(
             "operation read rejected",
         )),
     }
+}
+
+/// The fixed shared retention of one collaboration attempt and its rows.
+const ATTEMPT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+/// Wall-clock bound on one operation, from admission.
+const OPERATION_DEADLINE_SECS: i64 = 60 * 60;
+/// GitHub's own default page size, used when `perPage` is absent.
+const DEFAULT_READ_PER_PAGE: u32 = 30;
+
+/// Closed `pull_request_read` arguments. `owner`, `repo`, and `pullNumber`
+/// are assertions only: the daemon derives the target and rejects any
+/// mismatch.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PullRequestReadArguments {
+    method: String,
+    owner: String,
+    repo: String,
+    #[serde(rename = "pullNumber")]
+    pull_number: i64,
+    #[serde(default)]
+    page: Option<u32>,
+    #[serde(default, rename = "perPage")]
+    per_page: Option<u32>,
+}
+
+/// Closed `add_issue_comment` arguments; the target fields are assertions.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddIssueCommentArguments {
+    owner: String,
+    repo: String,
+    issue_number: i64,
+    body: String,
+    #[serde(default, rename = "clientRequestId")]
+    client_request_id: Option<String>,
+}
+
+fn decode_arguments<T: serde::de::DeserializeOwned>(
+    tool: &str,
+    arguments: Option<serde_json::Value>,
+) -> std::result::Result<T, EndpointFailure> {
+    let arguments = arguments.ok_or_else(|| {
+        EndpointFailure::detailed("invalid_operation", format!("{tool} requires arguments"))
+    })?;
+    serde_json::from_value(arguments).map_err(|error| {
+        let mut message = format!("invalid {tool} arguments: {error}");
+        message.truncate(200);
+        EndpointFailure::detailed("invalid_operation", message)
+    })
+}
+
+/// The agent-named target must be exactly the run's daemon-derived one.
+fn check_target(
+    repository: &str,
+    owner: &str,
+    repo: &str,
+    number: i64,
+    pr: i64,
+) -> std::result::Result<(), EndpointFailure> {
+    let same_repository = repository
+        .split_once('/')
+        .is_some_and(|(o, r)| o.eq_ignore_ascii_case(owner) && r.eq_ignore_ascii_case(repo));
+    if same_repository && number == pr {
+        Ok(())
+    } else {
+        Err(EndpointFailure::new(
+            "forbidden_operation",
+            "target is not the pull request bound to this run",
+        ))
+    }
+}
+
+/// True when the Markdown leaves a fenced code block open, which would
+/// swallow the appended daemon marker into authored code.
+fn has_unclosed_fence(body: &str) -> bool {
+    let mut open: Option<(char, usize)> = None;
+    for line in body.lines() {
+        let rest = line.trim_start_matches(' ');
+        if line.len() - rest.len() > 3 {
+            continue;
+        }
+        let Some(fence) = rest.chars().next().filter(|c| matches!(c, '`' | '~')) else {
+            continue;
+        };
+        let run = rest.chars().take_while(|c| *c == fence).count();
+        if run < 3 {
+            continue;
+        }
+        let info = &rest[run..];
+        match open {
+            None if fence == '`' && info.contains('`') => {}
+            None => open = Some((fence, run)),
+            Some((open_fence, open_run))
+                if fence == open_fence && run >= open_run && info.trim().is_empty() =>
+            {
+                open = None;
+            }
+            Some(_) => {}
+        }
+    }
+    open.is_some()
+}
+
+/// Validate one tool call against its closed schema and the run's target,
+/// and build the stored closed Repository Service request.
+fn prepare_github_request(
+    repository: &str,
+    pr: i64,
+    operation: ProtocolOperation,
+    arguments: Option<serde_json::Value>,
+) -> std::result::Result<
+    (
+        GithubOperationKind,
+        GithubOperationRequestJson,
+        Option<ClientRequestId>,
+    ),
+    EndpointFailure,
+> {
+    let (kind, request, client_request_id) = match operation {
+        ProtocolOperation::PullRequestRead => {
+            let arguments: PullRequestReadArguments =
+                decode_arguments("pull_request_read", arguments)?;
+            check_target(
+                repository,
+                &arguments.owner,
+                &arguments.repo,
+                arguments.pull_number,
+                pr,
+            )?;
+            let page = arguments.page.unwrap_or(1);
+            let per_page = arguments.per_page.unwrap_or(DEFAULT_READ_PER_PAGE);
+            let paged = |kind: &str| json!({"kind": kind, "page": page, "per_page": per_page});
+            let request = match arguments.method.as_str() {
+                "get" => json!({"kind": "get_pull_request"}),
+                "get_diff" => json!({"kind": "get_diff", "page": page}),
+                "get_files" => paged("get_files"),
+                "get_review_comments" => paged("get_review_comments"),
+                "get_reviews" => paged("get_reviews"),
+                "get_comments" => paged("get_comments"),
+                _ => {
+                    return Err(EndpointFailure::new(
+                        "invalid_operation",
+                        "unsupported pull_request_read method",
+                    ))
+                }
+            };
+            (GithubOperationKind::PullRequestRead, request, None)
+        }
+        ProtocolOperation::AddIssueComment => {
+            let arguments: AddIssueCommentArguments =
+                decode_arguments("add_issue_comment", arguments)?;
+            check_target(
+                repository,
+                &arguments.owner,
+                &arguments.repo,
+                arguments.issue_number,
+                pr,
+            )?;
+            let body = arguments.body;
+            if body.trim().is_empty() || body.contains('\0') {
+                return Err(EndpointFailure::new(
+                    "invalid_operation",
+                    "comment body must be non-empty text without NUL",
+                ));
+            }
+            if body.len() > MAX_COMMENT_BODY_BYTES {
+                return Err(EndpointFailure::detailed(
+                    "invalid_operation",
+                    format!("comment body exceeds {MAX_COMMENT_BODY_BYTES} bytes"),
+                ));
+            }
+            if has_unclosed_fence(&body) {
+                return Err(EndpointFailure::new(
+                    "invalid_operation",
+                    "comment body leaves a fenced code block open",
+                ));
+            }
+            let client_request_id = arguments
+                .client_request_id
+                .map(|value| {
+                    ClientRequestId::new(value)
+                        .ok()
+                        .filter(|id| id.as_str().chars().all(|c| c.is_ascii_graphic()))
+                        .ok_or_else(|| {
+                            EndpointFailure::new(
+                                "invalid_operation",
+                                "clientRequestId must be 1-128 printable ASCII characters",
+                            )
+                        })
+                })
+                .transpose()?;
+            (
+                GithubOperationKind::AddIssueComment,
+                json!({"kind": "add_issue_comment", "body": body}),
+                client_request_id,
+            )
+        }
+        _ => {
+            return Err(EndpointFailure::new(
+                "internal",
+                "request processing failed",
+            ))
+        }
+    };
+    // The executor decodes exactly this document; refuse here anything it
+    // would refuse there, so a bad request is never admitted.
+    let text = request.to_string();
+    RepositoryRequest::decode_agent_json(text.as_bytes()).map_err(|_| {
+        EndpointFailure::new(
+            "invalid_operation",
+            "request is outside the supported bounds",
+        )
+    })?;
+    let request_json = GithubOperationRequestJson::new(&text).map_err(|_| {
+        EndpointFailure::new(
+            "invalid_operation",
+            "request is outside the supported bounds",
+        )
+    })?;
+    Ok((kind, request_json, client_request_id))
+}
+
+fn admission_code(error: CollaborationAdmissionError) -> String {
+    serde_json::to_value(error)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("code")
+                .and_then(|code| code.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "rejected".to_owned())
+}
+
+/// Admit one `pull_request_read` or `add_issue_comment` call into the
+/// durable outbox for the daemon executor. Authority, phase, the target, and
+/// the run's collaboration attempt all come from daemon state; nothing here
+/// contacts GitHub. The answer is the operation's current bounded status.
+fn admit_github_operation(
+    db_path: &Path,
+    repository: &str,
+    capability: &str,
+    operation: ProtocolOperation,
+    arguments: Option<serde_json::Value>,
+) -> std::result::Result<Response, EndpointFailure> {
+    let internal = || EndpointFailure::new("internal", "request processing failed");
+    let mut conn = quorum_core::db::open(db_path).map_err(|_| internal())?;
+    let context = {
+        // A short read: every write below re-derives authority in its own
+        // guarded transaction.
+        let tx = conn.transaction().map_err(|_| internal())?;
+        resolve_any_role(&tx, capability)?
+    };
+    if !operation.allowed_in(context.phase) {
+        return Err(EndpointFailure::new(
+            "forbidden_operation",
+            "operation is not available to this run",
+        ));
+    }
+    let pr = context.pr.ok_or(EndpointFailure::new(
+        "forbidden_operation",
+        "this run has no bound pull request",
+    ))?;
+    let (kind, request_json, client_request_id) =
+        prepare_github_request(repository, pr, operation, arguments)?;
+
+    let role: CollaborationRole = context.role.parse().map_err(|_| internal())?;
+    let run_id = RunCapabilityId::new(context.run_id.clone()).map_err(|_| internal())?;
+    let now = quorum_core::clock::now();
+    let fresh_attempt = CollaborationAttemptId::new(format!("att-{}", uuid::Uuid::new_v4()))
+        .map_err(|_| internal())?;
+    let attempt = match collaboration_admission::ensure_run_attempt(
+        &mut conn,
+        &run_id,
+        role,
+        &fresh_attempt,
+        ATTEMPT_RETENTION_SECS,
+        now,
+    )
+    .map_err(|_| internal())?
+    {
+        RunAttemptResolution::Bound(status) => status,
+        RunAttemptResolution::Rejected(CollaborationAdmissionError::CapabilityRejected) => {
+            return Err(EndpointFailure::new(
+                "unauthorized",
+                "run authority rejected",
+            ))
+        }
+        RunAttemptResolution::Rejected(rejection) => {
+            return Err(EndpointFailure::detailed(
+                "operation_unavailable",
+                format!(
+                    "no collaboration attempt is available for this run: {}",
+                    admission_code(rejection)
+                ),
+            ))
+        }
+    };
+
+    // Reads are side-effect free, so each call is its own operation. A write
+    // without a caller id derives one from its content, so an identical retry
+    // returns the original operation instead of posting twice.
+    let client_request_id = match client_request_id {
+        Some(id) => id,
+        None if kind == GithubOperationKind::PullRequestRead => {
+            ClientRequestId::new(format!("read-{}", uuid::Uuid::new_v4()))
+                .map_err(|_| internal())?
+        }
+        None => collaboration_admission::derive_client_request_id(kind, &request_json),
+    };
+    let reviewer_head_sha = match role {
+        CollaborationRole::Reviewer => Some(
+            context
+                .review_revision
+                .clone()
+                .and_then(|sha| ReviewerHeadSha::new(sha).ok())
+                .ok_or_else(internal)?,
+        ),
+        CollaborationRole::Worker => None,
+    };
+    let operation_id =
+        collaboration_admission::derive_operation_id(&attempt.attempt_id, &client_request_id);
+    let marker = collaboration_admission::derive_github_marker(
+        &attempt.attempt_id,
+        &client_request_id,
+        kind,
+    );
+    let request = EnqueueGithubOperationRequest::new(
+        operation_id,
+        client_request_id,
+        attempt.attempt_id.clone(),
+        run_id,
+        context.task_id,
+        CollaborationAgent::new(context.agent.clone()).map_err(|_| internal())?,
+        role,
+        pr,
+        reviewer_head_sha,
+        kind,
+        request_json,
+        marker,
+        now.saturating_add(OPERATION_DEADLINE_SECS)
+            .min(attempt.expires_at),
+        now,
+        attempt.expires_at,
+    )
+    .map_err(|_| internal())?;
+    match collaboration_admission::admit_operation(&mut conn, &context.run_id, &request, now)
+        .map_err(|_| internal())?
+    {
+        GithubOperationAdmissionResult::Enqueued(status)
+        | GithubOperationAdmissionResult::Existing(status) => {
+            operation_response(&conn, &attempt.attempt_id, status)
+        }
+        GithubOperationAdmissionResult::Rejected(
+            CollaborationAdmissionError::CapabilityRejected,
+        ) => Err(EndpointFailure::new(
+            "unauthorized",
+            "run authority rejected",
+        )),
+        GithubOperationAdmissionResult::Rejected(
+            CollaborationAdmissionError::RunOperationLimitReached
+            | CollaborationAdmissionError::AttemptOperationLimitReached
+            | CollaborationAdmissionError::TaskOperationLimitReached
+            | CollaborationAdmissionError::RepositoryOperationLimitReached,
+        ) => Err(EndpointFailure::new(
+            "operation_limit_reached",
+            "the retained GitHub operation limit for this run is reached",
+        )),
+        GithubOperationAdmissionResult::Rejected(rejection) => Err(EndpointFailure::detailed(
+            "operation_rejected",
+            format!(
+                "operation admission rejected: {}",
+                admission_code(rejection)
+            ),
+        )),
+    }
+}
+
+/// The closed status answer for one operation the caller is authorized to
+/// see, with its typed failure class.
+fn operation_response(
+    conn: &rusqlite::Connection,
+    attempt_id: &CollaborationAttemptId,
+    status: GithubOperationStatus,
+) -> std::result::Result<Response, EndpointFailure> {
+    let internal = || EndpointFailure::new("internal", "request processing failed");
+    let result = status
+        .response_json
+        .as_ref()
+        .map(|json| serde_json::from_str(json.as_str()))
+        .transpose()
+        .map_err(|_| internal())?;
+    let error_kind: Option<String> = conn
+        .query_row(
+            "SELECT error_kind FROM github_agent_operations WHERE operation_id=?1",
+            [status.operation_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|_| internal())?;
+    let error_code = github_error_code(status.state, status.send_state, error_kind.as_deref());
+    Ok(Response::success(ResponseResult::GithubOperation {
+        attempt_id: attempt_id.as_str().to_owned(),
+        operation_id: status.operation_id.as_str().to_owned(),
+        state: status.state,
+        send_state: status.send_state,
+        remote_object_id: status
+            .remote_object_id
+            .map(|value| value.as_str().to_owned()),
+        result,
+        error_summary: status.error_summary.map(|value| value.as_str().to_owned()),
+        error_code,
+    }))
+}
+
+/// Classify a failed (or failing-and-retrying) operation into the closed
+/// error vocabulary agents see. Outages and rate limits are distinct from
+/// GitHub's definitive rejections and from a write whose effect is unknown.
+fn github_error_code(
+    state: GithubOperationState,
+    send_state: GithubSendState,
+    error_kind: Option<&str>,
+) -> Option<&'static str> {
+    match state {
+        GithubOperationState::Succeeded => return None,
+        GithubOperationState::Cancelled => return Some("github_operation_cancelled"),
+        GithubOperationState::Failed if send_state == GithubSendState::Ambiguous => {
+            return Some("github_outcome_unknown")
+        }
+        GithubOperationState::Failed => {}
+        GithubOperationState::Queued | GithubOperationState::Running => {
+            error_kind?;
+        }
+    }
+    Some(match error_kind {
+        Some("rate_limited") => "github_rate_limited",
+        Some(
+            "transient_failure"
+            | "timed_out"
+            | "spawn_failed"
+            | "credential_unavailable"
+            | "deadline_exceeded"
+            | "attempts_exhausted"
+            | "interrupted",
+        ) => "github_unavailable",
+        Some("permanent_failure") => "github_rejected",
+        Some("response_too_large" | "invalid_response" | "result_too_large" | "invalid_result") => {
+            "github_invalid_response"
+        }
+        _ => "github_operation_failed",
+    })
 }
 
 /// Authoritative facts a plan submission needs before it can be validated.
@@ -2108,6 +2573,7 @@ mod tests {
                 operation: ProtocolOperation::PullRequestRead,
                 attempt_id: None,
                 operation_id: None,
+                arguments: None,
             },
         ] {
             let error = fixture.call("planner-cap", operation).await.unwrap_err();
@@ -2967,6 +3433,7 @@ mod tests {
             "operation_unavailable",
             "operation_not_found",
             "operation_rejected",
+            "operation_limit_reached",
             "invalid_plan",
             "already_submitted",
             "submit_budget_exhausted",
@@ -2987,6 +3454,8 @@ mod tests {
         assert_eq!(result.to_string().len(), MAX_OPERATION_JSON_BYTES);
         let escaped = |len| "\u{1}".repeat(len);
         let response = Response::success(ResponseResult::GithubOperation {
+            attempt_id: escaped(MAX_COLLABORATION_ID_BYTES),
+            error_code: Some("github_invalid_response"),
             operation_id: escaped(MAX_COLLABORATION_ID_BYTES),
             state: GithubOperationState::Succeeded,
             send_state: GithubSendState::Confirmed,
@@ -3090,5 +3559,516 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM mailbox", [], |row| row.get(0))
             .unwrap();
         assert_eq!(mailbox_count, 0);
+    }
+
+    use crate::serve::github_outbox::{compose_comment_body, OutboxExecutor};
+    use crate::serve::repository_service::{
+        CreatedComment, FakeOutcome, FakeRepositoryService, PullRequestNumber, RepositoryFuture,
+        RepositoryResponse, RepositoryService, RepositoryTarget,
+    };
+
+    /// Answers every request by kind and records each daemon-supplied call.
+    #[derive(Default)]
+    struct KindService {
+        calls: std::sync::Mutex<Vec<(RepositoryTarget, PullRequestNumber, RepositoryRequest)>>,
+    }
+
+    impl RepositoryService for KindService {
+        fn execute<'a>(
+            &'a self,
+            target: &'a RepositoryTarget,
+            pr: PullRequestNumber,
+            request: &'a RepositoryRequest,
+        ) -> RepositoryFuture<'a> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((target.clone(), pr, request.clone()));
+            let response = match request {
+                RepositoryRequest::AddIssueComment { .. } => {
+                    RepositoryResponse::IssueComment(CreatedComment {
+                        id: 555,
+                        html_url: "https://github.com/test/repo/pull/77#issuecomment-555".into(),
+                    })
+                }
+                _ => RepositoryResponse::PullRequestRead(json!({
+                    "method": "get_files", "items": [], "truncated": false
+                })),
+            };
+            Box::pin(async move { Ok(response) })
+        }
+    }
+
+    fn github(operation: ProtocolOperation, arguments: serde_json::Value) -> Operation {
+        Operation::Protocol {
+            operation,
+            attempt_id: None,
+            operation_id: None,
+            arguments: Some(arguments),
+        }
+    }
+
+    fn read_operation_request(attempt_id: &str, operation_id: &str) -> Operation {
+        Operation::Protocol {
+            operation: ProtocolOperation::GithubOperationRead,
+            attempt_id: Some(attempt_id.into()),
+            operation_id: Some(operation_id.into()),
+            arguments: None,
+        }
+    }
+
+    #[derive(Debug)]
+    struct OperationAnswer {
+        attempt_id: String,
+        operation_id: String,
+        state: GithubOperationState,
+        send_state: GithubSendState,
+        remote_object_id: Option<String>,
+        result: Option<serde_json::Value>,
+        error_code: Option<&'static str>,
+    }
+
+    fn answer(response: Response) -> OperationAnswer {
+        match response.result {
+            Some(ResponseResult::GithubOperation {
+                attempt_id,
+                operation_id,
+                state,
+                send_state,
+                remote_object_id,
+                result,
+                error_code,
+                ..
+            }) => OperationAnswer {
+                attempt_id,
+                operation_id,
+                state,
+                send_state,
+                remote_object_id,
+                result,
+                error_code,
+            },
+            other => panic!("expected an operation answer: {other:?}"),
+        }
+    }
+
+    const MARKDOWN: &str = "## Finding `one`\n\nSaid \"quoted\" and 'single' \\ back\\slash.\n\n\
+        ```rust\nlet x = \"y\"; // `tick`\n```\n\n- item\n  - nested `code`\n\n> quote\n\
+        | a | b |\n|---|---|\n| 1 | 2 |\n\n~~~suggestion\nfixed();\n~~~\ntrailing spaces  \n";
+
+    fn comment_arguments(body: &str) -> serde_json::Value {
+        json!({"owner":"Test","repo":"Repo","issue_number":77,"body":body})
+    }
+
+    async fn run_executor(fixture: &PlannerFixture, service: Arc<dyn RepositoryService>) {
+        let target =
+            RepositoryTarget::new(fixture.plan_validation.repo_dir.clone(), Some("test/repo"))
+                .unwrap();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executor = OutboxExecutor::new(fixture.db_path.clone(), target, service)
+            .with_timing(Duration::from_millis(20), Duration::from_secs(5));
+        let handle = tokio::spawn(executor.run(shutdown.clone()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let pending: i64 = quorum_core::db::open(&fixture.db_path)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM github_agent_operations
+                     WHERE state='running' OR (state='queued' AND attempts=0)",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if pending == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "executor did not settle");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        shutdown.store(true, Ordering::SeqCst);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_bound_read_and_comment_execute_through_the_outbox() {
+        let fixture = live_run_fixture();
+        let read = answer(
+            fixture
+                .call(
+                    "live-reviewer",
+                    github(
+                        ProtocolOperation::PullRequestRead,
+                        json!({"method":"get_files","owner":"test","repo":"repo",
+                               "pullNumber":77,"page":2,"perPage":5}),
+                    ),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(read.state, GithubOperationState::Queued);
+        assert!(read.attempt_id.starts_with("att-"));
+        let comment = answer(
+            fixture
+                .call(
+                    "live-reviewer",
+                    github(
+                        ProtocolOperation::AddIssueComment,
+                        comment_arguments(MARKDOWN),
+                    ),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(comment.attempt_id, read.attempt_id, "one attempt per run");
+        assert_eq!(comment.state, GithubOperationState::Queued);
+
+        let service = Arc::new(KindService::default());
+        run_executor(&fixture, service.clone()).await;
+
+        let calls = service.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        let marker: String = quorum_core::db::open(&fixture.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT github_marker FROM github_agent_operations WHERE operation_id=?1",
+                [&comment.operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(marker.starts_with("<!-- quorum-op:"));
+        for (target, pr, request) in &calls {
+            assert_eq!(target.gh_repo(), Some("test/repo"));
+            assert_eq!(pr.get(), 77);
+            match request {
+                RepositoryRequest::GetFiles { page, per_page } => {
+                    assert_eq!((*page, *per_page), (2, 5));
+                }
+                RepositoryRequest::AddIssueComment { body } => {
+                    // Authored Markdown survives byte for byte, then the marker.
+                    assert!(body.starts_with(MARKDOWN));
+                    assert_eq!(body, &compose_comment_body(MARKDOWN, &marker));
+                    assert_eq!(body, &format!("{MARKDOWN}\n{marker}"));
+                }
+                other => panic!("unexpected request {other:?}"),
+            }
+        }
+
+        let settled = answer(
+            fixture
+                .call(
+                    "live-reviewer",
+                    read_operation_request(&comment.attempt_id, &comment.operation_id),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(settled.state, GithubOperationState::Succeeded);
+        assert_eq!(settled.send_state, GithubSendState::Confirmed);
+        assert_eq!(settled.remote_object_id.as_deref(), Some("555"));
+        assert_eq!(settled.result.unwrap()["id"], 555);
+        assert_eq!(settled.error_code, None);
+        // An identical retry returns the original comment, never a second post.
+        let retried = answer(
+            fixture
+                .call(
+                    "live-reviewer",
+                    github(
+                        ProtocolOperation::AddIssueComment,
+                        comment_arguments(MARKDOWN),
+                    ),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(retried.operation_id, comment.operation_id);
+        assert_eq!(retried.state, GithubOperationState::Succeeded);
+        assert_eq!(count(&fixture, "github_agent_operations"), 2);
+        assert_eq!(count(&fixture, "github_collaboration_attempts"), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outages_and_unknown_write_outcomes_are_typed_errors() {
+        let fixture = live_run_fixture();
+        let comment = answer(
+            fixture
+                .call(
+                    "live-reviewer",
+                    github(
+                        ProtocolOperation::AddIssueComment,
+                        comment_arguments("hello"),
+                    ),
+                )
+                .await
+                .unwrap(),
+        );
+        run_executor(
+            &fixture,
+            Arc::new(FakeRepositoryService::scripted([FakeOutcome::ambiguous()])),
+        )
+        .await;
+        let settled = answer(
+            fixture
+                .call(
+                    "live-reviewer",
+                    read_operation_request(&comment.attempt_id, &comment.operation_id),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(settled.state, GithubOperationState::Failed);
+        assert_eq!(settled.send_state, GithubSendState::Ambiguous);
+        assert_eq!(settled.error_code, Some("github_outcome_unknown"));
+
+        let read = answer(
+            fixture
+                .call(
+                    "live-reviewer",
+                    github(
+                        ProtocolOperation::PullRequestRead,
+                        json!({"method":"get","owner":"test","repo":"repo","pullNumber":77}),
+                    ),
+                )
+                .await
+                .unwrap(),
+        );
+        run_executor(
+            &fixture,
+            Arc::new(FakeRepositoryService::scripted([FakeOutcome::Fail(
+                crate::serve::repository_service::RepositoryErrorKind::RateLimited,
+            )])),
+        )
+        .await;
+        let retrying = answer(
+            fixture
+                .call(
+                    "live-reviewer",
+                    read_operation_request(&read.attempt_id, &read.operation_id),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(retrying.state, GithubOperationState::Queued);
+        assert_eq!(retrying.error_code, Some("github_rate_limited"));
+    }
+
+    #[tokio::test]
+    async fn foreign_targets_bad_bodies_and_wrong_phases_admit_nothing() {
+        let fixture = live_run_fixture();
+        let read =
+            |arguments: serde_json::Value| github(ProtocolOperation::PullRequestRead, arguments);
+        let comment =
+            |arguments: serde_json::Value| github(ProtocolOperation::AddIssueComment, arguments);
+        let cases: Vec<(&str, Operation, &str)> = vec![
+            (
+                "live-reviewer",
+                read(json!({"method":"get","owner":"test","repo":"repo","pullNumber":78})),
+                "forbidden_operation",
+            ),
+            (
+                "live-reviewer",
+                read(json!({"method":"get","owner":"evil","repo":"repo","pullNumber":77})),
+                "forbidden_operation",
+            ),
+            (
+                "live-reviewer",
+                read(json!({"method":"get","owner":"test","repo":"other","pullNumber":77})),
+                "forbidden_operation",
+            ),
+            (
+                "live-reviewer",
+                comment(json!({"owner":"test","repo":"repo","issue_number":1,"body":"x"})),
+                "forbidden_operation",
+            ),
+            (
+                "live-reviewer",
+                comment(json!({"owner":"evil","repo":"repo","issue_number":77,"body":"x"})),
+                "forbidden_operation",
+            ),
+            (
+                "live-reviewer",
+                comment(comment_arguments(&"x".repeat(MAX_COMMENT_BODY_BYTES + 1))),
+                "invalid_operation",
+            ),
+            (
+                "live-reviewer",
+                comment(comment_arguments("a\0b")),
+                "invalid_operation",
+            ),
+            (
+                "live-reviewer",
+                comment(comment_arguments("   \n")),
+                "invalid_operation",
+            ),
+            (
+                "live-reviewer",
+                comment(comment_arguments("```\nunclosed")),
+                "invalid_operation",
+            ),
+            (
+                "live-reviewer",
+                comment(
+                    json!({"owner":"test","repo":"repo","issue_number":77,"body":"x","clientRequestId":"has space"}),
+                ),
+                "invalid_operation",
+            ),
+            (
+                "live-reviewer",
+                comment(
+                    json!({"owner":"test","repo":"repo","issue_number":77,"body":"x","repo_override":"evil/x"}),
+                ),
+                "invalid_operation",
+            ),
+            (
+                "live-reviewer",
+                read(
+                    json!({"method":"get_check_runs","owner":"test","repo":"repo","pullNumber":77}),
+                ),
+                "invalid_operation",
+            ),
+            (
+                "live-reviewer",
+                read(
+                    json!({"method":"get_files","owner":"test","repo":"repo","pullNumber":77,"perPage":101}),
+                ),
+                "invalid_operation",
+            ),
+            (
+                "live-reviewer",
+                read(
+                    json!({"method":"get","owner":"test","repo":"repo","pullNumber":77,"after":"cursor"}),
+                ),
+                "invalid_operation",
+            ),
+            (
+                "live-reviewer",
+                Operation::Protocol {
+                    operation: ProtocolOperation::PullRequestRead,
+                    attempt_id: None,
+                    operation_id: None,
+                    arguments: None,
+                },
+                "invalid_operation",
+            ),
+            (
+                "live-worker",
+                read(json!({"method":"get","owner":"test","repo":"repo","pullNumber":77})),
+                "forbidden_operation",
+            ),
+            (
+                "revoked-reviewer",
+                read(json!({"method":"get","owner":"test","repo":"repo","pullNumber":78})),
+                "unauthorized",
+            ),
+        ];
+        for (capability, operation, code) in cases {
+            let error = fixture.call(capability, operation).await.unwrap_err();
+            assert_eq!(error.code, code, "{capability}: {}", error.message);
+        }
+        assert_eq!(count(&fixture, "github_agent_operations"), 0);
+        assert_eq!(count(&fixture, "github_collaboration_attempts"), 0);
+        assert_eq!(count(&fixture, "errors"), 0);
+        // A body at the bound is accepted.
+        let at_bound = fixture
+            .call(
+                "live-reviewer",
+                comment(comment_arguments(&"x".repeat(MAX_COMMENT_BODY_BYTES))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(answer(at_bound).state, GithubOperationState::Queued);
+    }
+
+    #[test]
+    fn unclosed_fences_are_detected() {
+        for open in [
+            "```\nx",
+            "~~~~\nx\n~~~",
+            "  ```rust\nx\n``` trailing",
+            "```\nx\n~~~",
+        ] {
+            assert!(has_unclosed_fence(open), "{open:?}");
+        }
+        for closed in [
+            "plain",
+            "```\nx\n```",
+            "~~~~\nx\n~~~~~",
+            "inline ``` not a fence",
+            "``` `inline` ```",
+            "    ```\nindented code",
+            "```a\n```\n~~~\n~~~",
+        ] {
+            assert!(!has_unclosed_fence(closed), "{closed:?}");
+        }
+    }
+
+    #[test]
+    fn github_error_codes_are_a_closed_classification() {
+        use GithubOperationState::*;
+        use GithubSendState::*;
+        for (state, send, kind, code) in [
+            (Succeeded, Confirmed, None, None),
+            (Queued, NotStarted, None, None),
+            (Running, Ambiguous, None, None),
+            (
+                Queued,
+                NotStarted,
+                Some("rate_limited"),
+                Some("github_rate_limited"),
+            ),
+            (
+                Queued,
+                NotStarted,
+                Some("transient_failure"),
+                Some("github_unavailable"),
+            ),
+            (
+                Failed,
+                NotStarted,
+                Some("timed_out"),
+                Some("github_unavailable"),
+            ),
+            (
+                Failed,
+                NotStarted,
+                Some("deadline_exceeded"),
+                Some("github_unavailable"),
+            ),
+            (
+                Failed,
+                DefinitelyUnsent,
+                Some("permanent_failure"),
+                Some("github_rejected"),
+            ),
+            (
+                Failed,
+                Ambiguous,
+                Some("timed_out"),
+                Some("github_outcome_unknown"),
+            ),
+            (
+                Failed,
+                NotStarted,
+                Some("response_too_large"),
+                Some("github_invalid_response"),
+            ),
+            (
+                Failed,
+                NotStarted,
+                Some("unsupported_request"),
+                Some("github_operation_failed"),
+            ),
+            (
+                Cancelled,
+                NotStarted,
+                Some("attempt_revoked"),
+                Some("github_operation_cancelled"),
+            ),
+        ] {
+            assert_eq!(
+                github_error_code(state, send, kind),
+                code,
+                "{state:?}/{send:?}/{kind:?}"
+            );
+        }
     }
 }

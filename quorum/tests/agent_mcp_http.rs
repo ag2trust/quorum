@@ -85,7 +85,22 @@ struct Daemon {
 
 impl Daemon {
     fn start(home: &Path, repo: &Path, worktrees: &Path, names: &Path, config: &Path) -> Self {
-        let mut child = Command::new(quorum_bin())
+        Self::start_with_env(home, repo, worktrees, names, config, &[])
+    }
+
+    fn start_with_env(
+        home: &Path,
+        repo: &Path,
+        worktrees: &Path,
+        names: &Path,
+        config: &Path,
+        env: &[(&str, String)],
+    ) -> Self {
+        let mut command = Command::new(quorum_bin());
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let mut child = command
             .env("QUORUM_HOME", home)
             .env("QUORUM_REPO", "test/repo")
             .args(["serve", "--config"])
@@ -1516,4 +1531,160 @@ fn stalled_requests_are_cut_off_at_their_time_bounds() {
         "stalled body ended after {body_elapsed:?}"
     );
     shell.stop();
+}
+
+/// A `gh` stand-in for the daemon's Repository Service: it answers the
+/// credential lookup, one files page for PR 77, and one comment POST whose
+/// stdin it records. Anything else fails like an unsupported call.
+fn install_fake_gh(dir: &Path) {
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = auth ] && [ "$2" = token ]; then echo fake-gh-token; exit 0; fi
+[ "$GH_TOKEN" = fake-gh-token ] || {{ echo "missing token" >&2; exit 7; }}
+echo "$@" >> '{dir}/gh-args.log'
+if [ "$1" = api ] && [ "$2" = --method ] && [ "$4" = repos/test/repo/issues/77/comments ]; then
+  cat > '{dir}/comment-stdin.json'
+  printf '%s' '{{"id":4242,"html_url":"https://github.com/test/repo/pull/77#issuecomment-4242"}}'
+  exit 0
+fi
+if [ "$1" = api ] && [ "$2" = 'repos/test/repo/pulls/77/files?per_page=10&page=1' ]; then
+  printf '%s' '[{{"filename":"src/lib.rs","status":"modified","additions":1,"deletions":0,"changes":1,"patch":"@@ -1 +1 @@\n+x"}}]'
+  exit 0
+fi
+echo "fake gh: unsupported $*" >&2
+exit 1
+"#,
+        dir = dir.display()
+    );
+    let path = dir.join("gh");
+    std::fs::write(&path, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn pull_request_read_and_comment_run_through_the_daemon_executor() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    let worktrees = root.path().join("worktrees");
+    let bin = root.path().join("bin");
+    for dir in [&home, &repo, &worktrees, &bin] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    init_git_repo(&repo);
+    install_fake_gh(&bin);
+    let names = root.path().join("names.txt");
+    std::fs::write(&names, "AgentOne\nAgentTwo\n").unwrap();
+    let config = root.path().join("serve.toml");
+    write_config(&config);
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let daemon =
+        Daemon::start_with_env(&home, &repo, &worktrees, &names, &config, &[("PATH", path)]);
+    daemon.wait_for("serving (cap=1)");
+    let db = home.join("repos/test__repo/quorum.db");
+    let endpoint = endpoint_path(&db);
+    install_fixtures(&db);
+    // The adapter holds no credential and never runs `gh` itself.
+    let shell = HttpShell::start(&endpoint, &[("GH_TOKEN", "must-not-be-used")]);
+    let addr = shell.addr;
+
+    let (is_error, read) = call(
+        addr,
+        "reviewer-cap",
+        "pull_request_read",
+        json!({"method":"get_files","owner":"test","repo":"repo","pullNumber":77,
+               "page":1,"perPage":10}),
+    );
+    assert!(!is_error, "{read:#}");
+    assert_eq!(read["state"], "succeeded", "{read:#}");
+    assert_eq!(read["result"]["method"], "get_files");
+    assert_eq!(read["result"]["items"][0]["filename"], "src/lib.rs");
+    assert_eq!(read["result"]["items"][0]["patch"], "@@ -1 +1 @@\n+x");
+    assert_eq!(read["result"]["truncated"], false);
+
+    let markdown = "## Finding\n\n`code` with \"quotes\" and 'single' $HOME $(id)\n\n\
+                    ```rust\nlet x = \"y\";\n```\n\n- one\n  - two\n";
+    let arguments = json!({"owner":"test","repo":"repo","issue_number":77,"body":markdown});
+    let (is_error, comment) = call(addr, "reviewer-cap", "add_issue_comment", arguments.clone());
+    assert!(!is_error, "{comment:#}");
+    assert_eq!(comment["state"], "succeeded", "{comment:#}");
+    assert_eq!(comment["send_state"], "confirmed");
+    assert_eq!(comment["remote_object_id"], "4242");
+    assert_eq!(comment["result"]["id"], 4242);
+
+    let (marker, operations, attempts): (String, i64, i64) = {
+        let conn = quorum_core::db::open(&db).unwrap();
+        (
+            conn.query_row(
+                "SELECT github_marker FROM github_agent_operations WHERE kind='add_issue_comment'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM github_agent_operations", [], |row| {
+                row.get(0)
+            })
+            .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM github_collaboration_attempts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        )
+    };
+    let sent: Value =
+        serde_json::from_slice(&std::fs::read(bin.join("comment-stdin.json")).unwrap()).unwrap();
+    assert_eq!(sent, json!({"body": format!("{markdown}\n{marker}")}));
+    assert!(marker.starts_with("<!-- quorum-op:"));
+    let args = std::fs::read_to_string(bin.join("gh-args.log")).unwrap();
+    assert!(
+        !args.contains("Finding") && !args.contains("quotes"),
+        "{args}"
+    );
+    assert_eq!((operations, attempts), (2, 1));
+
+    // An identical retry returns the posted comment without a second POST.
+    let (is_error, again) = call(addr, "reviewer-cap", "add_issue_comment", arguments);
+    assert!(!is_error, "{again:#}");
+    assert_eq!(again["operation_id"], comment["operation_id"]);
+    let posts = std::fs::read_to_string(bin.join("gh-args.log"))
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("--method POST"))
+        .count();
+    assert_eq!(posts, 1);
+
+    // A foreign target is refused by the daemon before anything is queued.
+    let (is_error, foreign) = call(
+        addr,
+        "reviewer-cap",
+        "pull_request_read",
+        json!({"method":"get","owner":"test","repo":"repo","pullNumber":78}),
+    );
+    assert!(is_error);
+    assert_eq!(foreign["code"], "forbidden_operation", "{foreign:#}");
+    let (is_error, initial) = call(
+        addr,
+        "worker-cap",
+        "add_issue_comment",
+        json!({"owner":"test","repo":"repo","issue_number":77,"body":"x"}),
+    );
+    assert!(is_error);
+    assert_eq!(initial["code"], "forbidden_operation", "{initial:#}");
+    let operations: i64 = quorum_core::db::open(&db)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM github_agent_operations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(operations, 2);
+
+    shell.stop();
+    daemon.stop();
 }
