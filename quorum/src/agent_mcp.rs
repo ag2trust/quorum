@@ -3,7 +3,8 @@
 //! This process has no database or GitHub execution path. Every inventory and
 //! known tool call is authorized by the daemon endpoint using only the injected
 //! run capability. Tool arguments deliberately stop at this shell until the
-//! durable operation slices implement their closed endpoint schemas.
+//! durable operation slices implement their closed endpoint schemas; only
+//! `github_operation_read` forwards its closed `attemptId`/`operationId` pair.
 //!
 //! Two transports share this shell. Over stdio it serves the one run whose
 //! capability was injected into its environment. With `--listen` it serves
@@ -40,6 +41,9 @@ use tokio::net::UnixStream;
 
 const PROTOCOL_VERSION: u8 = 1;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
+/// Mirrors the endpoint's `MAX_RESPONSE_BYTES`, which is sized so one bounded
+/// `github_operation_read` answer fits a single response frame.
+const MAX_RESPONSE_FRAME_BYTES: usize = 96 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// The MCP adapter is a credentialless child of a persistent provider, so it
 /// learns daemon phase transitions by asking the endpoint for its derived
@@ -222,8 +226,11 @@ impl ProtocolOperation {
             Self::GithubOperationRead => (
                 "Read the bounded status of a GitHub operation owned by this exact managed run.",
                 github_schema(
-                    json!({"operationId": bounded_string(1, 128)}),
-                    &["operationId"],
+                    json!({
+                        "attemptId": bounded_string(1, 128),
+                        "operationId": bounded_string(1, 128)
+                    }),
+                    &["attemptId", "operationId"],
                 ),
                 true,
             ),
@@ -608,7 +615,24 @@ struct EndpointRequest<'a> {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum EndpointOperation {
     Inventory,
-    Protocol { operation: ProtocolOperation },
+    Protocol {
+        operation: ProtocolOperation,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attempt_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+    },
+}
+
+/// The closed `github_operation_read` arguments. Bounds are enforced again by
+/// the endpoint; this shell only refuses unknown or mistyped fields.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GithubOperationReadArguments {
+    #[serde(rename = "attemptId")]
+    attempt_id: String,
+    #[serde(rename = "operationId")]
+    operation_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -633,6 +657,14 @@ enum EndpointResult {
         review_revision: Option<String>,
         phase: RunPhase,
         operations: Vec<ProtocolOperation>,
+    },
+    GithubOperation {
+        operation_id: String,
+        state: String,
+        send_state: String,
+        remote_object_id: Option<String>,
+        result: Option<Value>,
+        error_summary: Option<String>,
     },
 }
 
@@ -712,7 +744,13 @@ impl QuorumServer {
             review_revision,
             phase,
             operations,
-        } = response;
+        } = response
+        else {
+            return Err(McpError::internal_error(
+                "agent endpoint returned invalid inventory",
+                None,
+            ));
+        };
         if repository != self.repository
             || repository.len() > 255
             || task_id <= 0
@@ -774,7 +812,7 @@ impl QuorumServer {
             let mut prefix = [0_u8; 4];
             stream.read_exact(&mut prefix).await?;
             let length = u32::from_be_bytes(prefix) as usize;
-            if length == 0 || length > MAX_FRAME_BYTES {
+            if length == 0 || length > MAX_RESPONSE_FRAME_BYTES {
                 return Err(std::io::Error::other("invalid response frame"));
             }
             let mut response_body = vec![0; length];
@@ -1099,6 +1137,8 @@ fn tool_error(code: &str) -> CallToolResult {
         "unauthorized" => "run authority rejected",
         "forbidden_operation" => "tool is forbidden for the current run phase",
         "operation_unavailable" => "tool execution is not available in this delivery",
+        "operation_not_found" => "operation not found",
+        "operation_rejected" => "operation read rejected",
         "invalid_operation" => "tool request rejected",
         _ => "agent endpoint rejected the tool request",
     };
@@ -1178,10 +1218,46 @@ impl ServerHandler for QuorumServer {
         }
         let operation = ProtocolOperation::from_name(&request.name)
             .ok_or_else(|| McpError::new(ErrorCode::METHOD_NOT_FOUND, "unknown tool", None))?;
+        let (attempt_id, operation_id) = if operation == ProtocolOperation::GithubOperationRead {
+            let arguments: GithubOperationReadArguments =
+                match signal_arguments(operation.name(), request.arguments) {
+                    Ok(arguments) => arguments,
+                    Err(result) => return Ok(result.into()),
+                };
+            (Some(arguments.attempt_id), Some(arguments.operation_id))
+        } else {
+            (None, None)
+        };
         match self
-            .exchange(&capability, EndpointOperation::Protocol { operation })
+            .exchange(
+                &capability,
+                EndpointOperation::Protocol {
+                    operation,
+                    attempt_id,
+                    operation_id,
+                },
+            )
             .await
         {
+            Ok(EndpointResult::GithubOperation {
+                operation_id,
+                state,
+                send_state,
+                remote_object_id,
+                result,
+                error_summary,
+            }) if operation == ProtocolOperation::GithubOperationRead => Ok(json_result(
+                json!({
+                    "operation_id": operation_id,
+                    "state": state,
+                    "send_state": send_state,
+                    "remote_object_id": remote_object_id,
+                    "result": result,
+                    "error_summary": error_summary,
+                }),
+                false,
+            )
+            .into()),
             Ok(_) => Err(McpError::internal_error(
                 "agent endpoint returned invalid tool response",
                 None,

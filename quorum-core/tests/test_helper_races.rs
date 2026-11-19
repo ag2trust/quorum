@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use support::protocol::{
     AcquireDaemonLockInput, AllocateRoleInput, Barrier, ClaimCleanupInput,
-    ClaimProviderRetryReworkInput, DiscardRunnerRetryInput, Operation, PendingTurnInput,
-    RetryProviderBlockedInput, EXIT_NEGATIVE, EXIT_SUCCESS,
+    ClaimGithubOperationInput, ClaimProviderRetryReworkInput, DiscardRunnerRetryInput, Operation,
+    PendingTurnInput, RetryProviderBlockedInput, EXIT_NEGATIVE, EXIT_SUCCESS,
 };
 
 const BARRIER_TIMEOUT_MS: u64 = 30_000;
@@ -368,6 +368,122 @@ fn render_provider_retry_outcomes(outcomes: &[(&String, support::HelperOutput)])
 fn stress_repeats_real_process_helper_races() {
     real_process_allocations_are_atomic(3, 8);
     real_process_cleanup_claim_has_exactly_one_winner(8);
+    real_process_github_operation_claim_has_exactly_one_winner(20, 8);
+}
+
+fn seed_github_operation(conn: &mut rusqlite::Connection) {
+    conn.execute_batch(
+        "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+         VALUES (1,'src','working','owner',1,1);
+         INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+         VALUES ('run-1',1,'Worker','worker',1);
+         INSERT INTO github_collaboration_attempts(
+             attempt_id,task_id,agent,role,pr_number,lifecycle_generation,
+             active_run_id,state,created_at,updated_at,expires_at
+         ) VALUES ('att-1',1,'Worker','worker',7,3,'run-1','active',1,1,999);",
+    )
+    .unwrap();
+    let request = quorum_core::github_operations::NewGithubOperation {
+        operation_id: "op-race",
+        client_request_id: "req-race",
+        attempt_id: "att-1",
+        created_by_run_id: "run-1",
+        task_id: 1,
+        agent: "Worker",
+        role: "worker",
+        pr_number: 7,
+        head_sha: None,
+        reviewer_launch_sha: None,
+        lifecycle_generation: Some(3),
+        kind: "add_issue_comment",
+        request_json: r#"{"body":"hi"}"#,
+        deadline_at: 500,
+        review_sequence: None,
+        group_key: None,
+        github_marker: None,
+        created_at: 1,
+        expires_at: 999,
+    };
+    assert!(quorum_core::github_operations::enqueue(conn, &request).unwrap());
+}
+
+/// Cross-process GitHub-operation claim canary: `racers` OS processes race
+/// `github_operations::claim_next` on one queued write behind a start
+/// barrier. Exactly one claims, starts, and settles it (exit 0); every other
+/// racer observes a clean negative (exit 1) and no `errors` row is written.
+fn real_process_github_operation_claim_has_exactly_one_winner(iterations: usize, racers: usize) {
+    const NOW: i64 = 100;
+    for iteration in 0..iterations {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(format!("quorum-{iteration}.db"));
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        seed_github_operation(&mut conn);
+        drop(conn);
+
+        let go_path = dir.path().join("go");
+        let ready_paths = (0..racers)
+            .map(|index| dir.path().join(format!("ready-{index}")))
+            .collect::<Vec<_>>();
+        let helpers = ready_paths
+            .iter()
+            .map(|ready_path| {
+                support::spawn(
+                    Operation::ClaimGithubOp,
+                    &ClaimGithubOperationInput {
+                        db_path: db_path.clone(),
+                        now: NOW,
+                        barrier: barrier(ready_path.clone(), &go_path),
+                    },
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        release_when_ready(&ready_paths, &go_path);
+        let outputs = helpers
+            .into_iter()
+            .map(|helper| helper.wait(PARENT_TIMEOUT).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            outputs.iter().all(|output| output.stderr.is_empty()),
+            "iteration {iteration}: {outputs:?}"
+        );
+        let winners = outputs
+            .iter()
+            .filter(|output| output.status.code() == Some(EXIT_SUCCESS))
+            .collect::<Vec<_>>();
+        assert_eq!(winners.len(), 1, "iteration {iteration}: {outputs:?}");
+        let winner = winners[0].json();
+        assert_eq!(winner["won"], true);
+        assert_eq!(winner["operation_id"], "op-race");
+        assert_eq!(winner["attempt"], 1);
+        assert_eq!(winner["started"], true);
+        assert_eq!(winner["settled"], true);
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|output| output.status.code() == Some(EXIT_NEGATIVE)
+                    && output.json()["won"] == false)
+                .count(),
+            racers - 1,
+            "iteration {iteration}: {outputs:?}"
+        );
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let row = quorum_core::github_operations::get_by_operation_id(&conn, "op-race")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.attempts, 1, "iteration {iteration}");
+        assert_eq!(row.state, "succeeded");
+        assert_eq!(row.send_state, "confirmed");
+        assert!(!row.active);
+        assert_eq!(count(&conn, "errors"), 0);
+    }
+}
+
+#[test]
+fn real_process_github_operation_claim_smoke_has_exactly_one_winner() {
+    real_process_github_operation_claim_has_exactly_one_winner(2, 4);
 }
 
 /// Cross-process daemon-lock canary. Each round has `racers` distinct OS

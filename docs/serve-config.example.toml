@@ -115,7 +115,8 @@ base_branch = "main"
 # Directed source/target pairs eligible for daemon-internal branch sync.
 # Each pair is one-way; configure both directions explicitly when two
 # branches should each receive the other's changes. Omit or set [] to
-# disable. `develop` is dormant and is not a sync target for new work.
+# disable. Example for a develop/main workflow: [["main", "develop"]] merges
+# hotfixes back; [["develop", "main"]] promotes on demand.
 # The clean path is task-less: pin → prepare → publish → checks → merge; a
 # conflict or CI failure creates one judgment task with R1-only scoped review.
 # Inspect active syncs with `quorum status` or `quorum branch-sync --list`;

@@ -30,10 +30,11 @@ pub enum Operation {
     AdmitGraph,
     RetryProviderBlocked,
     DiscardRunnerRetry,
+    ClaimGithubOp,
 }
 
 impl Operation {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::AllocateRole,
         Self::ClaimTask,
         Self::ClaimProviderRetryRework,
@@ -45,6 +46,7 @@ impl Operation {
         Self::AdmitGraph,
         Self::RetryProviderBlocked,
         Self::DiscardRunnerRetry,
+        Self::ClaimGithubOp,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -60,6 +62,7 @@ impl Operation {
             Self::AdmitGraph => "admit-graph",
             Self::RetryProviderBlocked => "retry-provider-blocked",
             Self::DiscardRunnerRetry => "discard-runner-retry",
+            Self::ClaimGithubOp => "claim-github-operation",
         }
     }
 }
@@ -232,6 +235,14 @@ pub struct AdmitGraphInput {
     pub admission: GraphAdmission,
     pub target_id: i64,
     pub max_active_graphs: usize,
+    pub now: i64,
+    pub barrier: Barrier,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimGithubOperationInput {
+    pub db_path: PathBuf,
     pub now: i64,
     pub barrier: Barrier,
 }

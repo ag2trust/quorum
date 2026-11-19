@@ -14,6 +14,8 @@ use std::time::Duration;
 const ENDPOINT_ENV: &str = "QUORUM_AGENT_ENDPOINT";
 const PROTOCOL_VERSION: u8 = 1;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
+/// Mirrors the endpoint's `MAX_RESPONSE_BYTES`; responses may exceed a request frame.
+const MAX_RESPONSE_FRAME_BYTES: usize = 96 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Serialize)]
@@ -307,7 +309,7 @@ fn exchange_at(
     let mut prefix = [0_u8; 4];
     stream.read_exact(&mut prefix).map_err(endpoint_io)?;
     let length = u32::from_be_bytes(prefix) as usize;
-    if length == 0 || length > MAX_FRAME_BYTES {
+    if length == 0 || length > MAX_RESPONSE_FRAME_BYTES {
         return Err(QuorumError::Io(
             "agent endpoint returned malformed response frame".into(),
         ));
