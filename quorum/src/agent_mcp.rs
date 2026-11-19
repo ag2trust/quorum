@@ -1442,26 +1442,20 @@ impl ServerHandler for QuorumServer {
             )
             .await
         {
-            Ok(EndpointResult::GithubOperation {
-                operation_id,
-                state,
-                send_state,
-                remote_object_id,
-                result,
-                error_summary,
-                ..
-            }) if operation == ProtocolOperation::GithubOperationRead => Ok(json_result(
-                json!({
-                    "operation_id": operation_id,
-                    "state": state,
-                    "send_state": send_state,
-                    "remote_object_id": remote_object_id,
-                    "result": result,
-                    "error_summary": error_summary,
-                }),
-                false,
-            )
-            .into()),
+            // A later read renders exactly as the admitting call would have:
+            // a settled failure (timeout, rate limit, ambiguous write) is a
+            // typed `isError` result carrying its `error_code`, never success.
+            Ok(result @ EndpointResult::GithubOperation { .. })
+                if operation == ProtocolOperation::GithubOperationRead =>
+            {
+                match OperationView::from_result(result) {
+                    Some(view) => Ok(view.render().into()),
+                    None => Err(McpError::internal_error(
+                        "agent endpoint returned invalid tool response",
+                        None,
+                    )),
+                }
+            }
             Ok(_) => Err(McpError::internal_error(
                 "agent endpoint returned invalid tool response",
                 None,

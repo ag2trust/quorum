@@ -862,6 +862,13 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     // predicate. It never deletes an operation independently: `operation_id`
     // is the outbox idempotency key, so early deletion could repost a side
     // effect. Runs before task reclamation so a freed task is GC-able now.
+    // A dead run's still-`active` attempt is terminalized first, so its group
+    // becomes reclaimable here instead of pinning capacity and task GC.
+    crate::collaboration_admission::revoke_dead_run_attempts(
+        conn,
+        now,
+        i64::try_from(limit).unwrap_or(i64::MAX),
+    )?;
     crate::collaboration_admission::sweep_expired_terminal_groups(
         conn,
         now,
@@ -914,6 +921,11 @@ pub fn sweep_all(conn: &Connection, now: i64) -> Result<()> {
     // See sweep_on_write: only whole executor-proven terminal groups. Each
     // batch is bounded; explicit sweep drains every ready group, like the
     // dependency-reconciliation loop above.
+    crate::collaboration_admission::revoke_dead_run_attempts(
+        &tx,
+        now,
+        crate::collaboration_admission::UNBOUNDED_GROUP_SWEEP,
+    )?;
     while crate::collaboration_admission::sweep_expired_terminal_groups(
         &tx,
         now,

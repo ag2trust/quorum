@@ -835,6 +835,18 @@ fn http_listener_derives_authority_per_request_and_signals_the_daemon() {
             [FAR],
         )
         .unwrap();
+        // A write whose send timed out after it may have reached GitHub.
+        conn.execute(
+            "INSERT INTO github_agent_operations(
+                 operation_id,client_request_id,attempt_id,created_by_run_id,task_id,agent,
+                 role,pr_number,kind,request_json,state,send_state,attempts,deadline_at,
+                 error_kind,error_summary,created_at,updated_at,expires_at)
+             VALUES ('op-rw-timeout','op-rw-timeout','attempt-rw','rework-cap',204,'Rework',
+                     'worker',42,'add_issue_comment','{\"body\":\"b\"}','failed',
+                     'ambiguous',1,?1,'timed_out','write timed out',1001,1001,?1)",
+            [FAR],
+        )
+        .unwrap();
     }
     let read_arguments = json!({"attemptId":"attempt-rw","operationId":"op-rw"});
     let (is_error, owned) = call(
@@ -847,15 +859,30 @@ fn http_listener_derives_authority_per_request_and_signals_the_daemon() {
     assert_eq!(
         owned,
         json!({
+            "attempt_id":"attempt-rw",
             "operation_id":"op-rw",
             "state":"succeeded",
             "send_state":"confirmed",
             "remote_object_id":"IC_rework",
-            "result":{"id":9},
-            "error_summary":null
+            "result":{"id":9}
         })
     );
     assert!(!owned.to_string().contains("must-not-leak"));
+    // A settled failure read later is a typed tool error, never success: the
+    // pending path of a write that outlived the admitting call's wait.
+    let (is_error, timed_out) = call(
+        addr,
+        "rework-cap",
+        "github_operation_read",
+        json!({"attemptId":"attempt-rw","operationId":"op-rw-timeout"}),
+    );
+    assert!(is_error, "{timed_out:#}");
+    assert_eq!(timed_out["code"], "github_outcome_unknown", "{timed_out:#}");
+    assert_eq!(timed_out["operation_id"], "op-rw-timeout");
+    assert_eq!(timed_out["state"], "failed");
+    assert_eq!(timed_out["send_state"], "ambiguous");
+    assert_eq!(timed_out["retrying"], false);
+    assert_eq!(timed_out["error_summary"], "write timed out");
     for (capability, arguments, message) in [
         (
             "reviewer-cap",

@@ -589,12 +589,12 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
     assert_eq!(
         serde_json::from_str::<Value>(owned_text).unwrap(),
         json!({
+            "attempt_id":"attempt-w",
             "operation_id":"op-w",
             "state":"succeeded",
             "send_state":"confirmed",
             "remote_object_id":"IC_worker",
-            "result":{"id":7,"url":"https://example.invalid/7"},
-            "error_summary":null
+            "result":{"id":7,"url":"https://example.invalid/7"}
         })
     );
     assert!(!owned_text.contains("must-not-leak"), "{owned_text}");
@@ -630,14 +630,18 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
     let mut reviewer = McpProcess::start(&endpoint, "reviewer-cap", "Reviewer");
     reviewer.initialize();
     let reviewer_owned = read(&mut reviewer, 20, "attempt-r", "op-r");
+    // A settled failure is a typed tool error carrying its closed code.
+    assert_eq!(reviewer_owned["result"]["isError"], true, "{reviewer_owned:#}");
     assert_eq!(
         serde_json::from_str::<Value>(tool_text(&reviewer_owned)).unwrap(),
         json!({
+            "code":"github_operation_failed",
+            "message":"the GitHub operation failed",
+            "attempt_id":"attempt-r",
             "operation_id":"op-r",
             "state":"failed",
             "send_state":"definitely_unsent",
-            "remote_object_id":null,
-            "result":null,
+            "retrying":false,
             "error_summary":"validation failed"
         })
     );

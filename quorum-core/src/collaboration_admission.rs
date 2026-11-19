@@ -978,11 +978,11 @@ pub enum RunAttemptResolution {
 ///   is `active` for the run's current logical turn. A binding left from an
 ///   earlier lifecycle generation or launch SHA is rejected as
 ///   `AttemptBindingMismatch`: it is never silently reused for a new turn.
-/// - Otherwise, `active` attempts of the same task/agent/role whose bound
-///   capability has been revoked are orphans (their run can never call
-///   again). They are revoked here and their queued, provably unsent rows are
-///   cancelled, so a replacement run is not blocked by a dead binding. A
-///   claimed or possibly-sent row keeps its disposition.
+/// - Otherwise, every `active` attempt whose bound capability is revoked or
+///   gone is an orphan (its run can never call again). Orphans are revoked
+///   here through [`revoke_dead_run_attempts`] and their queued, provably
+///   unsent rows are cancelled, so a replacement run is not blocked by a dead
+///   binding. A claimed or possibly-sent row keeps its disposition.
 /// - Then a new attempt is issued through the same checks as
 ///   [`issue_attempt`].
 pub fn ensure_run_attempt(
@@ -1073,39 +1073,9 @@ pub fn ensure_run_attempt(
         return Ok(result);
     }
 
-    let orphans: Vec<String> = {
-        let mut statement = tx.prepare(
-            "UPDATE github_collaboration_attempts
-             SET state='revoked', active_run_id=NULL, updated_at=?4
-             WHERE task_id=?1 AND agent=?2 AND role=?3 AND state='active'
-               AND active_run_id IS NOT NULL AND active_run_id<>?5
-               AND EXISTS (
-                   SELECT 1 FROM run_capabilities c
-                   WHERE c.run_id=github_collaboration_attempts.active_run_id
-                     AND c.revoked_at IS NOT NULL
-               )
-             RETURNING attempt_id",
-        )?;
-        let rows = statement
-            .query_map(
-                params![run.task_id, run.agent, run.role, now, run_id.as_str()],
-                |row| row.get::<_, String>(0),
-            )?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        rows
-    };
-    for attempt_id in &orphans {
-        tx.execute(
-            "UPDATE github_agent_operations
-             SET state='cancelled', next_attempt_at=NULL, error_kind='attempt_revoked',
-                 error_summary='collaboration attempt revoked before the send started',
-                 updated_at=?2
-             WHERE attempt_id=?1 AND state='queued' AND active=0
-               AND execution_started_at IS NULL
-               AND send_state IN ('not_started','definitely_unsent')",
-            params![attempt_id, now],
-        )?;
-    }
+    // Terminalize every dead run's binding before capacity is counted, so a
+    // replacement run is never blocked by an attempt nobody can use again.
+    revoke_dead_run_attempts(&tx, now, UNBOUNDED_GROUP_SWEEP)?;
 
     let request = CreateCollaborationAttemptRequest::new(
         new_attempt_id.clone(),
@@ -1596,6 +1566,64 @@ pub(crate) fn sweep_expired_terminal_groups(
     Ok(reclaimed)
 }
 
+/// Terminalize `active` attempts whose bound run can never call again: its
+/// capability is revoked, or its capability row no longer exists. Any path
+/// that revokes a capability (task transition, retirement, agent reset) is
+/// covered here without each one knowing about collaboration attempts.
+///
+/// Each such attempt becomes `revoked` with its run binding cleared and its
+/// retention ended (`expires_at = MIN(expires_at, now)`): no caller can ever
+/// read its operations again, and operation ids are attempt-scoped, so a
+/// replacement run cannot collide with them. Its queued, provably unsent rows
+/// are cancelled in the same transaction so the executor never sends them.
+/// A claimed, started, or possibly-sent row keeps its disposition and keeps
+/// pinning the group until the executor settles it.
+///
+/// Callers hold the write transaction. At most `limit` attempts per call
+/// (negative = unbounded). Returns the number of attempts terminalized.
+pub(crate) fn revoke_dead_run_attempts(tx: &Connection, now: i64, limit: i64) -> Result<usize> {
+    let attempt_ids: Vec<String> = {
+        let mut statement = tx.prepare(
+            "SELECT a.attempt_id FROM github_collaboration_attempts a
+             WHERE a.state='active' AND a.active_run_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM run_capabilities c
+                   WHERE c.run_id=a.active_run_id AND c.revoked_at IS NULL
+               )
+             LIMIT ?1",
+        )?;
+        let rows = statement
+            .query_map([limit], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for attempt_id in &attempt_ids {
+        tx.execute(
+            "UPDATE github_collaboration_attempts
+             SET state='revoked', active_run_id=NULL, expires_at=MIN(expires_at, ?2),
+                 updated_at=?2
+             WHERE attempt_id=?1 AND state='active'",
+            params![attempt_id, now],
+        )?;
+        cancel_unsent_operations(tx, attempt_id, now)?;
+    }
+    Ok(attempt_ids.len())
+}
+
+/// Cancel an attempt's queued rows that provably never reached GitHub.
+fn cancel_unsent_operations(tx: &Connection, attempt_id: &str, now: i64) -> Result<usize> {
+    Ok(tx.execute(
+        "UPDATE github_agent_operations
+         SET state='cancelled', next_attempt_at=NULL, error_kind='attempt_revoked',
+             error_summary='collaboration attempt revoked before the send started',
+             updated_at=?2
+         WHERE attempt_id=?1 AND state='queued' AND active=0
+           AND execution_started_at IS NULL
+           AND send_state IN ('not_started','definitely_unsent')",
+        params![attempt_id, now],
+    )?)
+}
+
 /// Group bound for `admit_operation`: SQLite treats a negative `LIMIT` as no
 /// limit, preserving admission's sweep-everything-before-counting behavior.
 pub(crate) const UNBOUNDED_GROUP_SWEEP: i64 = -1;
@@ -1803,6 +1831,9 @@ pub fn admit_operation(
 
     let tx = begin_immediate(conn)?;
 
+    // A dead run's attempt is terminalized first so its now-reclaimable group
+    // is swept before capacity is counted.
+    revoke_dead_run_attempts(&tx, now, UNBOUNDED_GROUP_SWEEP)?;
     sweep_expired_terminal_groups(&tx, now, UNBOUNDED_GROUP_SWEEP)?;
 
     let context = match capabilities::resolve_live_run_context_for_admission(
@@ -2378,6 +2409,103 @@ mod tests {
                 ("op-queued".into(), "cancelled".into(), "not_started".into()),
             ]
         );
+    }
+
+    #[test]
+    fn revoked_capability_attempt_is_terminalized_and_reclaimed_without_a_replacement_run() {
+        let (_dir, mut conn) = open_tmp();
+        insert_worker_task(&conn, 1, "Worker", WORKER_PR);
+        insert_live_worker(&mut conn, 1, "Worker", "run-old", 10);
+        assert_eq!(
+            bound_id(&ensure(
+                &mut conn,
+                "run-old",
+                CollaborationRole::Worker,
+                "att-old",
+                20
+            )),
+            "att-old"
+        );
+        for (op, state, active, send, started) in [
+            ("op-queued", "queued", 0, "not_started", None),
+            ("op-running", "running", 1, "ambiguous", Some(21)),
+        ] {
+            conn.execute(
+                "INSERT INTO github_agent_operations(
+                     operation_id,client_request_id,attempt_id,created_by_run_id,task_id,agent,
+                     role,pr_number,kind,request_json,state,active,send_state,attempts,
+                     deadline_at,github_marker,execution_started_at,created_at,updated_at,
+                     expires_at)
+                 VALUES (?1,?1,'att-old','run-old',1,'Worker','worker',?2,'add_issue_comment',
+                         '{\"kind\":\"add_issue_comment\",\"body\":\"x\"}',?3,?4,?5,1,900,'m',
+                         ?6,20,20,1020)",
+                params![op, WORKER_PR, state, active, send, started],
+            )
+            .unwrap();
+        }
+        let live_attempts = |conn: &Connection, now: i64| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM github_collaboration_attempts WHERE expires_at>?1",
+                [now],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(live_attempts(&conn, 22), 1);
+
+        // Revocation alone (no later run of this task/agent/role) must free
+        // the binding: generic sweep terminalizes it.
+        crate::capabilities::revoke(&mut conn, "run-old", 22).unwrap();
+        crate::sweep::sweep_on_write(&conn, 23, 100).unwrap();
+        let attempt: (String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT state,active_run_id,expires_at FROM github_collaboration_attempts
+                 WHERE attempt_id='att-old'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(attempt, ("revoked".to_string(), None, 23));
+        assert_eq!(live_attempts(&conn, 23), 0, "a dead run consumes no capacity");
+        let ops = |conn: &Connection| -> Vec<(String, String)> {
+            conn.prepare(
+                "SELECT operation_id,state FROM github_agent_operations ORDER BY operation_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        // The unsent row is cancelled; the in-flight send keeps its claim and
+        // pins the group until the executor settles it.
+        assert_eq!(
+            ops(&conn),
+            vec![
+                ("op-queued".into(), "cancelled".into()),
+                ("op-running".into(), "running".into()),
+            ]
+        );
+
+        // Once the in-flight send settles provably unsent, the whole group
+        // is reclaimed and no longer pins the task.
+        conn.execute(
+            "UPDATE github_agent_operations
+             SET state='failed', active=0, send_state='definitely_unsent'
+             WHERE operation_id='op-running'",
+            [],
+        )
+        .unwrap();
+        crate::sweep::sweep_on_write(&conn, 24, 100).unwrap();
+        assert!(ops(&conn).is_empty());
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM github_collaboration_attempts",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempts, 0);
     }
 
     #[test]

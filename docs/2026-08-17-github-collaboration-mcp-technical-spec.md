@@ -314,9 +314,12 @@ is its own operation. Failures surface as typed tool errors: `github_rate_limite
 
 Until provisioning-bound attempt issuance lands, the endpoint resolves the run's attempt on its
 first collaboration call (`ensure_run_attempt`): an attempt bound to the run is reused only for
-the same lifecycle generation and launch SHA; otherwise active attempts of the same
-task/agent/role whose capability is revoked are revoked, their queued unsent rows cancelled, and
-a new attempt is issued under the ordinary issuance checks.
+the same lifecycle generation and launch SHA; otherwise a new attempt is issued under the
+ordinary issuance checks. An active attempt whose run capability is revoked (by any path) or
+missing is terminal: generic sweep, attempt issuance, operation admission, and executor claim
+each revoke it, end its retention, and cancel its queued provably unsent rows; the executor
+neither claims nor starts a send for it. A claimed or possibly-sent row keeps its disposition and
+pins the group until settled, after which the group is reclaimed.
 
 ### `pull_request_review_write`
 
