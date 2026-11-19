@@ -80,6 +80,11 @@ primary = 100
 # sync_pairs = [[\"main\", \"develop\"], [\"develop\", \"main\"]] # disabled when omitted
 # self_update_branch = \"main\" # daemon update poll; defaults to resolved base_branch
 
+## Agent MCP (Streamable HTTP at http://<addr>/mcp, bearer = QUORUM_RUN_ID)
+# agent_mcp_listen = \"127.0.0.1:0\"     # default: loopback, ephemeral port
+# agent_mcp_allowed_hosts = [\"host:port\"] # required for a non-loopback bind
+# orchestrator_mcp_listen = \"127.0.0.1:8811\" # declared only; must differ from agent_mcp_listen
+
 ## Grok Build settings for managed worker roles only.
 # [grok]
 # sandbox = \"off\"                        # off|workspace (default: off)
@@ -1750,6 +1755,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 .and_then(|c| c.sandbox.clone())
                 .unwrap_or_else(|| "danger-full-access".to_string());
             let grok = serve_config::resolve_grok_adapter(file_cfg.grok.as_ref())?;
+            let agent_mcp = serve_config::resolve_agent_mcp(&file_cfg)?;
 
             // Print the resolved config banner.
             let banner_text = banner(&BannerData {
@@ -1888,8 +1894,10 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 max_graph_children_working: Some(r_max_graph_children_working),
                 reviewer_cap: r_reviewer_cap.value,
                 max_active_graphs: r_max_active_graphs,
+                // Set by `run_serve` once the agent MCP listener is bound.
+                agent_mcp_url: None,
             };
-            Ok(serve::run_serve(config)?)
+            Ok(serve::run_serve(config, agent_mcp)?)
         }
         cli::Command::Tail { agent, follow, raw } => {
             let conn = quorum_core::db::open(&paths::db_path()?)?;

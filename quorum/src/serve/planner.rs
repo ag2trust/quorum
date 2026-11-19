@@ -1650,9 +1650,10 @@ pub fn planner_outcome(
 }
 
 /// The managed run envelope of one planner turn. Present only once the daemon
-/// has issued the run's `planner` capability; the four names it produces are
-/// exactly `runner::AGENT_MCP_ENV_VARS`, which is what the stdio `submit_plan`
-/// MCP child reads to reach the daemon endpoint.
+/// has issued the run's `planner` capability. It produces the four
+/// `runner::AGENT_MCP_ENV_VARS` names the stdio `submit_plan` MCP child reads
+/// to reach the daemon endpoint, then `runner::AGENT_MCP_URL_ENV`, the
+/// daemon's agent MCP HTTP listener.
 #[derive(Debug, Clone)]
 pub struct PlannerRunEnvelope {
     pub run_id: String,
@@ -1661,6 +1662,8 @@ pub struct PlannerRunEnvelope {
     pub repo: String,
     /// Agent endpoint socket path.
     pub endpoint: PathBuf,
+    /// The daemon's agent MCP Streamable HTTP URL, `http://<addr>/mcp`.
+    pub agent_mcp_url: String,
 }
 
 impl PlannerRunEnvelope {
@@ -1675,6 +1678,10 @@ impl PlannerRunEnvelope {
             (
                 "QUORUM_AGENT_ENDPOINT".to_string(),
                 self.endpoint.display().to_string(),
+            ),
+            (
+                crate::serve::runner::AGENT_MCP_URL_ENV.to_string(),
+                self.agent_mcp_url.clone(),
             ),
         ];
         if let Some((name, _)) = environment.iter().find(|(_, value)| value.is_empty()) {
@@ -2133,7 +2140,7 @@ mod tests {
     }
 
     /// The envelope produces exactly the names the stdio MCP child reads, in
-    /// the order `runner::AGENT_MCP_ENV_VARS` pins.
+    /// the order `runner::AGENT_MCP_ENV_VARS` pins, then the agent MCP URL.
     #[test]
     fn planner_run_envelope_produces_the_agent_mcp_env_vars() {
         let envelope = PlannerRunEnvelope {
@@ -2141,10 +2148,12 @@ mod tests {
             agent: "Planner-test".into(),
             repo: "owner/repo".into(),
             endpoint: PathBuf::from("/tmp/quorum-agent.sock"),
+            agent_mcp_url: "http://127.0.0.1:4100/mcp".into(),
         };
         let environment = envelope.environment().expect("complete envelope");
         let names: Vec<&str> = environment.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(names, crate::serve::runner::AGENT_MCP_ENV_VARS);
+        assert_eq!(names[..4], *crate::serve::runner::AGENT_MCP_ENV_VARS);
+        assert_eq!(names[4..], ["QUORUM_AGENT_MCP_URL"]);
         assert_eq!(
             environment
                 .iter()
@@ -2154,7 +2163,8 @@ mod tests {
                 "owner/repo",
                 "Planner-test",
                 "run-capability",
-                "/tmp/quorum-agent.sock"
+                "/tmp/quorum-agent.sock",
+                "http://127.0.0.1:4100/mcp"
             ]
         );
     }
@@ -2164,22 +2174,30 @@ mod tests {
     /// had already burned its turn.
     #[test]
     fn planner_run_envelope_rejects_an_incomplete_name() {
-        for missing in ["run_id", "agent", "repo"] {
+        for missing in ["run_id", "agent", "repo", "agent_mcp_url"] {
             let mut envelope = PlannerRunEnvelope {
                 run_id: "run-capability".into(),
                 agent: "Planner-test".into(),
                 repo: "owner/repo".into(),
                 endpoint: PathBuf::from("/tmp/quorum-agent.sock"),
+                agent_mcp_url: "http://127.0.0.1:4100/mcp".into(),
             };
             match missing {
                 "run_id" => envelope.run_id.clear(),
                 "agent" => envelope.agent.clear(),
-                _ => envelope.repo.clear(),
+                "repo" => envelope.repo.clear(),
+                _ => envelope.agent_mcp_url.clear(),
             }
             let error = envelope
                 .environment()
                 .expect_err("incomplete envelope must be refused");
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            if missing == "agent_mcp_url" {
+                assert!(
+                    error.to_string().contains("QUORUM_AGENT_MCP_URL"),
+                    "{error}"
+                );
+            }
         }
     }
 
@@ -2194,8 +2212,9 @@ mod tests {
             dir.path(),
             "codex",
             &format!(
-                "printf 'run=%s\\nrepo=%s\\nendpoint=%s\\nargs=%s\\n' \
-                 \"$QUORUM_RUN_ID\" \"$QUORUM_REPO\" \"$QUORUM_AGENT_ENDPOINT\" \"$*\" > '{0}.tmp'\n\
+                "printf 'run=%s\\nrepo=%s\\nendpoint=%s\\nmcp_url=%s\\nargs=%s\\n' \
+                 \"$QUORUM_RUN_ID\" \"$QUORUM_REPO\" \"$QUORUM_AGENT_ENDPOINT\" \
+                 \"$QUORUM_AGENT_MCP_URL\" \"$*\" > '{0}.tmp'\n\
                  mv '{0}.tmp' '{0}'",
                 capture.display()
             ),
@@ -2205,6 +2224,7 @@ mod tests {
             agent: "Planner-test".into(),
             repo: "owner/repo".into(),
             endpoint: PathBuf::from("/tmp/quorum-agent.sock"),
+            agent_mcp_url: "http://127.0.0.1:4100/mcp".into(),
         };
 
         let slot = spawn_planner(
@@ -2233,6 +2253,10 @@ mod tests {
         assert!(observed.contains("repo=owner/repo\n"), "{observed}");
         assert!(
             observed.contains("endpoint=/tmp/quorum-agent.sock\n"),
+            "{observed}"
+        );
+        assert!(
+            observed.contains("mcp_url=http://127.0.0.1:4100/mcp\n"),
             "{observed}"
         );
         assert!(observed.contains("mcp_servers.quorum="), "{observed}");
