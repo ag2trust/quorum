@@ -2735,7 +2735,8 @@ fn routed_collector_request(
         profile.model,
         profile.effort,
         config.codex_sandbox.clone(),
-    );
+    )
+    .with_credentials(config.merge_executor.github_credentials());
     request.role_assignment_id = route
         .links_assignment(&responsibility_key)
         .then_some(route.assignment.id);

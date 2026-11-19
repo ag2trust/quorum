@@ -294,7 +294,6 @@ pub trait MergeExecutor: Send + Sync {
     /// daemon modules through `ServeConfig.merge_executor`. The default is the
     /// local default source with no token file (the token `gh` would use);
     /// the GitHub executor returns its injected source.
-    #[allow(dead_code)] // consumed by sibling migrations of non-merge gh call sites
     fn github_credentials(&self) -> Arc<dyn GithubCredentialSource> {
         // Test builds hand every mock executor a fixed fake token so unit
         // fixtures never depend on ambient `gh auth` on the test host (CI
