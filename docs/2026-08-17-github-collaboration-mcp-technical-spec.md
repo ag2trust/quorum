@@ -150,9 +150,12 @@ from a cached old turn from being reinterpreted under a new attempt that happens
 live capability. Public CLI requests are not attempt-scoped and use the compatibility path below.
 
 The initial endpoint is a local framed-JSON IPC channel, implemented as an owner-only Unix-domain
-socket on supported runtimes. The daemon endpoint itself does not listen on TCP; the separate
-`quorum agent-mcp --listen` adapter described below is the only TCP listener in front of it,
-and it is a client of this socket. Each bounded request carries the run
+socket on supported runtimes. The daemon endpoint itself does not listen on TCP. Two TCP
+listeners can sit in front of it as clients of this socket: `quorum serve`'s own embedded
+Streamable HTTP listener (`agent_mcp_listen`, described under "MCP process and provider
+injection" below) that it binds for every managed run since the 2026-11-16 owner decision, and
+the separate, manually started `quorum agent-mcp --listen` adapter also described below. Each
+bounded request carries the run
 capability and one closed operation; responses use closed bounded schemas. The daemon exposes
 the existing `submit`/`react` signals, the role-scoped MCP operations, and the established public
 CLI compatibility family through this channel—no SQL, daemon filesystem path, arbitrary command,
@@ -298,10 +301,20 @@ configuration or protocol-level inventory handling fails outside their protocol.
 The server advertises only tools valid for the derived live run, current collaboration attempt,
 and lifecycle generation. An agent cannot discover a forbidden mutation and cannot enable a
 larger toolset through arguments or environment. On a phase change, the old list becomes invalid
-immediately; there is no acknowledgement or relist step gating the handoff, since the transport
-(see "MCP process and provider injection" above) is stateless and resolves inventory fresh from
-the bearer on every request. Endpoint authorization remains authoritative even if a client
-invokes a cached tool name.
+immediately, and endpoint authorization is authoritative from that instant even if a client still
+holds or invokes a cached tool name.
+
+What gates a client's actual handoff differs by transport (see "MCP process and provider
+injection" above). On the HTTP transport (Claude's managed launches, and the manual `--listen`
+adapter), there is no acknowledgement or relist step: the transport is stateless and resolves
+inventory fresh from the bearer on every request, so a phase change is simply reflected the next
+time the client lists or calls tools, with no push notification. On the stdio transport (Codex,
+Grok, and `quorum agent-mcp` run manually without `--listen`), the server instead pushes
+`notifications/tools/list_changed` once it observes the phase change, via the `notify_phase_changes`
+background task (`quorum/src/agent_mcp.rs:1313-1330`, exercised by `quorum/tests/agent_mcp.rs:557`).
+That push is a liveness aid for a long-lived stdio client, not an authorization gate — the
+endpoint re-checks every call against the live phase regardless of whether the client has
+relisted.
 
 | Tool | Reviewer | Rework worker | Initial worker |
 |---|---:|---:|---:|
