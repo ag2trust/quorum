@@ -795,6 +795,82 @@ fn http_listener_derives_authority_per_request_and_signals_the_daemon() {
         "a refused call must write no mailbox, note, or message row"
     );
 
+    // github_operation_read: the bearer's own run reads its operation; any
+    // other run is refused without content, whatever transport carried it.
+    {
+        const FAR: i64 = 4_102_444_800;
+        let conn = quorum_core::db::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO github_collaboration_attempts(
+                 attempt_id,task_id,agent,role,pr_number,lifecycle_generation,
+                 active_run_id,state,created_at,updated_at,expires_at)
+             VALUES ('attempt-rw',204,'Rework','worker',42,0,'rework-cap','active',1001,1001,?1)",
+            [FAR],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO github_agent_operations(
+                 operation_id,client_request_id,attempt_id,created_by_run_id,task_id,agent,
+                 role,pr_number,kind,request_json,state,send_state,attempts,deadline_at,
+                 github_marker,remote_object_id,response_json,created_at,updated_at,expires_at)
+             VALUES ('op-rw','op-rw','attempt-rw','rework-cap',204,'Rework','worker',42,
+                     'add_issue_comment','{\"body\":\"must-not-leak\"}','succeeded',
+                     'confirmed',1,?1,'marker-must-not-leak','IC_rework','{\"id\":9}',
+                     1001,1001,?1)",
+            [FAR],
+        )
+        .unwrap();
+    }
+    let read_arguments = json!({"attemptId":"attempt-rw","operationId":"op-rw"});
+    let (is_error, owned) = call(
+        addr,
+        "rework-cap",
+        "github_operation_read",
+        read_arguments.clone(),
+    );
+    assert!(!is_error, "{owned:#}");
+    assert_eq!(
+        owned,
+        json!({
+            "operation_id":"op-rw",
+            "state":"succeeded",
+            "send_state":"confirmed",
+            "remote_object_id":"IC_rework",
+            "result":{"id":9},
+            "error_summary":null
+        })
+    );
+    assert!(!owned.to_string().contains("must-not-leak"));
+    for (capability, arguments, message) in [
+        (
+            "reviewer-cap",
+            read_arguments.clone(),
+            "operation read rejected",
+        ),
+        (
+            "worker-cap",
+            read_arguments.clone(),
+            "tool is forbidden for the current run phase",
+        ),
+        (
+            "rework-cap",
+            json!({"attemptId":"attempt-rw","operationId":"op-unknown"}),
+            "operation not found",
+        ),
+    ] {
+        let refused = rpc(
+            addr,
+            capability,
+            "tools/call",
+            json!({"name":"github_operation_read","arguments":arguments}),
+        );
+        assert_eq!(refused["result"]["isError"], true, "{refused:#}");
+        assert_eq!(
+            refused["result"]["content"][0]["text"], message,
+            "{capability}: {refused:#}"
+        );
+    }
+
     // task_note: each run's note lands on its own task as its own agent.
     for (capability, task_id, agent) in [
         ("worker-cap", 200, "Worker"),
