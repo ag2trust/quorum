@@ -102,8 +102,14 @@ bounded, run-authorized GitHub operation requests through a narrow local daemon 
 daemon alone writes SQLite and performs the remote operation. The MCP process never receives the
 Quorum database, GitHub credentials, or lifecycle authority. An operator may instead run the
 same adapter with `--listen` as a loopback-only Streamable HTTP server authorized per request by
-the run capability; nothing launches it automatically (see the GitHub collaboration MCP
-technical spec). A separate, operator-started `quorum orchestrator-mcp`
+the run capability (see the GitHub collaboration MCP technical spec). `quorum serve` also embeds
+that HTTP adapter on its own listener: `agent_mcp_listen` (default `127.0.0.1:0`) is bound at
+startup, and every managed run, planners included, receives `QUORUM_AGENT_MCP_URL`
+(`http://<bound addr>/mcp`) beside `QUORUM_RUN_ID`, which is its bearer. A non-loopback bind
+requires `agent_mcp_allowed_hosts`; an address equal to the declared `orchestrator_mcp_listen`
+is refused with exit 2. If the listener cannot bind, serve logs it, writes an `errors` row,
+alerts the owner, and exits without launching any managed run; nothing falls back to stdio. The
+listener stops through a flag after the tick loop's drain. A separate, operator-started `quorum orchestrator-mcp`
 listener exposes the coordinator commands to an outside agent behind an operator token (see
 "Orchestrator MCP" below).
 
