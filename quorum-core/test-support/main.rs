@@ -2,10 +2,11 @@ mod protocol;
 
 use protocol::{
     AcquireDaemonLockInput, AdmitGraphInput, AllocateRoleInput, ApplyGraphEventInput, Barrier,
-    CancelSourceGraphInput, ClaimCleanupInput, ClaimProviderRetryReworkInput, ClaimTaskInput,
-    DiscardRunnerRetryInput, GraphAdmission, GraphEvent, MaterializeAssessmentInput, Operation,
-    RetryProviderBlockedInput, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE,
-    MAX_BARRIER_WAIT_MS, MAX_INPUT_BYTES, MAX_PATH_BYTES, MAX_TEXT_BYTES,
+    CancelSourceGraphInput, ClaimCleanupInput, ClaimGithubOperationInput,
+    ClaimProviderRetryReworkInput, ClaimTaskInput, DiscardRunnerRetryInput, GraphAdmission,
+    GraphEvent, MaterializeAssessmentInput, Operation, RetryProviderBlockedInput, EXIT_INTERNAL,
+    EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE, MAX_BARRIER_WAIT_MS, MAX_INPUT_BYTES, MAX_PATH_BYTES,
+    MAX_TEXT_BYTES,
 };
 use quorum_core::decomposition::SourceCancellation;
 use quorum_core::error::QuorumError;
@@ -78,6 +79,7 @@ fn run() -> Result<i32, HelperError> {
         Operation::AdmitGraph => admit_graph(parse(&input)?)?,
         Operation::RetryProviderBlocked => retry_provider_blocked(parse(&input)?)?,
         Operation::DiscardRunnerRetry => discard_runner_retry(parse(&input)?)?,
+        Operation::ClaimGithubOp => claim_github_operation(parse(&input)?)?,
     };
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -368,6 +370,37 @@ fn claim_cleanup(input: ClaimCleanupInput) -> Result<OperationResult, HelperErro
         })),
         None => OperationResult::race(json!({"won": false}), false),
     })
+}
+
+/// Claim one due GitHub operation and, on a win, run it through the guarded
+/// start + settle primitives so the parent can assert exactly one execution.
+fn claim_github_operation(
+    input: ClaimGithubOperationInput,
+) -> Result<OperationResult, HelperError> {
+    use quorum_core::github_operations::{self, Settlement};
+    validate_path("database", &input.db_path)?;
+    wait_at_barrier(&input.barrier)?;
+    let mut conn = quorum_core::db::open(&input.db_path)?;
+    let Some(won) = github_operations::claim_next(&mut conn, input.now)? else {
+        return Ok(OperationResult::race(json!({"won": false}), false));
+    };
+    let started = github_operations::mark_execution_started(&mut conn, &won.claim, input.now)?;
+    let settled = github_operations::settle(
+        &mut conn,
+        &won.claim,
+        Settlement::Succeeded {
+            response_json: None,
+            remote_object_id: None,
+        },
+        input.now,
+    )?;
+    Ok(OperationResult::positive(json!({
+        "won": true,
+        "operation_id": won.operation.operation_id,
+        "attempt": won.claim.attempt,
+        "started": started,
+        "settled": settled,
+    })))
 }
 
 fn materialize_assessment(

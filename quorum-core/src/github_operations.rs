@@ -4,8 +4,25 @@
 //! `github_agent_operations` table. The higher-level admission surface added in
 //! task #104 (`collaboration_admission::admit_operation`) enforces caller /
 //! attempt / capacity checks on top of the same table; the primitives here are
-//! deliberately narrower: they persist one queued row and read it back, with
-//! no daemon loop, no claim, no retry scheduling, and no reconciliation.
+//! deliberately narrower: they persist and read rows, and (task #435) expose
+//! the storage-level executor primitives — claim, execution start, settle,
+//! retry scheduling, and startup reconciliation — with no daemon loop and no
+//! network I/O. Every primitive here is one short `BEGIN IMMEDIATE`; callers
+//! perform GitHub I/O only *between* primitives, never inside one.
+//!
+//! State vocabulary (no schema extension needed): a claim is
+//! `queued -> running` with `active = 1`; terminal states are `succeeded`
+//! (always with `send_state = confirmed`) and `failed`. A failed write whose
+//! remote disposition is unknown keeps `send_state = ambiguous` — the closed
+//! "settled ambiguous" form the technical spec permits — and is never
+//! re-queued by these primitives. Reads (`pull_request_read`) produce no
+//! remote effect, so their `send_state` stays `not_started` until success.
+//!
+//! Claim fencing: [`OperationClaim`] pairs the row id with the post-claim
+//! `attempts` value. Every follow-up primitive is guarded on
+//! `active = 1 AND state = 'running' AND attempts = claim.attempt`, so a stale
+//! claimant (e.g. one superseded by restart reconciliation and a re-claim)
+//! affects zero rows and observes a clean negative.
 //!
 //! Idempotency: every row is keyed on the deterministic `operation_id`
 //! (`derive_operation_id` in `collaboration_admission`). [`enqueue`] runs
@@ -19,7 +36,12 @@
 //! validation (JSON shape, kind vocabulary, etc.) belongs to the admission
 //! layer above — this module does not re-invent it.
 
-use crate::db::begin_immediate;
+use crate::claims::is_unique_violation_pub;
+use crate::collaboration_admission::{
+    GithubOperationKind, GithubOperationResponseJson, OperationErrorSummary, RemoteObjectId,
+    MAX_OPERATION_ATTEMPTS,
+};
+use crate::db::{begin_immediate, map_sql_err};
 use crate::error::{QuorumError, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -270,6 +292,445 @@ pub fn list_all(conn: &Connection) -> Result<Vec<GithubAgentOperation>> {
     Ok(out)
 }
 
+/// Hard cap on claims per operation. A claim increments `attempts`, so an
+/// operation is executed at most this many times before it settles `failed`.
+pub const MAX_OPERATION_CLAIMS: i64 = MAX_OPERATION_ATTEMPTS as i64;
+
+/// Byte cap on the closed `error_kind` token recorded at settle/retry.
+pub const MAX_OPERATION_ERROR_KIND_BYTES: usize = 64;
+
+/// The only kind with no remote effect. Every other kind (including any kind
+/// this binary does not recognise) is treated as a write: fail-safe toward
+/// "never blindly re-send".
+const READ_KIND: &str = GithubOperationKind::PullRequestRead.as_str();
+
+/// `send_state` expression for an ambiguous settle: writes become ambiguous,
+/// reads keep their (effect-free) send state. Must stay in lock-step with
+/// [`READ_KIND`].
+const AMBIGUOUS_SEND_SQL: &str =
+    "CASE WHEN kind='pull_request_read' THEN send_state ELSE 'ambiguous' END";
+
+const ERR_DEADLINE: &str = "deadline_exceeded";
+const ERR_ATTEMPTS: &str = "attempts_exhausted";
+const ERR_INTERRUPTED: &str = "interrupted";
+const ERR_INTERRUPTED_AMBIGUOUS: &str = "interrupted_ambiguous";
+
+/// Fencing token for one claim. `attempt` is the row's `attempts` value
+/// immediately after this claim incremented it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct OperationClaim {
+    pub id: i64,
+    pub attempt: i64,
+}
+
+/// A won claim: the fencing token plus the row as it stood after the claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClaimedOperation {
+    pub claim: OperationClaim,
+    pub operation: GithubAgentOperation,
+}
+
+/// Terminal result recorded by [`settle`].
+#[derive(Debug, Clone, Copy)]
+pub enum Settlement<'a> {
+    /// The requested effect is confirmed (or the read completed):
+    /// `succeeded` with `send_state = confirmed`.
+    Succeeded {
+        response_json: Option<&'a GithubOperationResponseJson>,
+        remote_object_id: Option<&'a RemoteObjectId>,
+    },
+    /// Terminal failure with a closed proof that no request was handed off.
+    /// A write whose send had started moves `ambiguous -> definitely_unsent`.
+    FailedUnsent {
+        error_kind: &'a str,
+        error_summary: &'a OperationErrorSummary,
+    },
+    /// Terminal failure whose remote disposition is unknown (timeout, lost
+    /// response, unrecognised result). Writes keep/enter `send_state =
+    /// ambiguous`; reads have no remote effect and keep their send state.
+    Ambiguous {
+        error_kind: &'a str,
+        error_summary: &'a OperationErrorSummary,
+    },
+}
+
+/// Outcome of [`release_for_retry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryOutcome {
+    /// Claim released; the row is `queued` and due at `next_attempt_at`.
+    Requeued { next_attempt_at: i64 },
+    /// Attempt cap or deadline reached; the row settled `failed` instead.
+    Exhausted,
+    /// The claim is no longer current (settled, reconciled, or stale token).
+    Lost,
+}
+
+/// Counts from [`reconcile_on_start`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ReconcileReport {
+    /// Reads and never-sent writes returned to `queued`.
+    pub requeued: usize,
+    /// Writes whose send may have reached GitHub, settled `failed/ambiguous`.
+    pub ambiguous: usize,
+    /// Never-sent rows that were out of attempts or past deadline.
+    pub failed: usize,
+}
+
+fn validate_error_kind(kind: &str) -> Result<()> {
+    if kind.is_empty()
+        || kind.len() > MAX_OPERATION_ERROR_KIND_BYTES
+        || !kind
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return Err(QuorumError::Usage(
+            "invalid bounded GitHub operation error kind".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Claim the oldest due queued operation.
+///
+/// One `BEGIN IMMEDIATE`: first terminalize queued rows that can never run
+/// (deadline passed or claim cap reached) as `failed`, then pick the oldest
+/// due candidate whose parent collaboration attempt is `active`, and flip it
+/// `queued -> running`, `active 0 -> 1`, stamping `claimed_at` and
+/// incrementing `attempts` via a guarded `UPDATE ... RETURNING`.
+///
+/// `Ok(None)` is the clean negative: nothing due, a lost race (zero guarded
+/// rows), or `SQLITE_CONSTRAINT_UNIQUE` on `github_agent_operations_one_active`.
+/// A post-timeout `SQLITE_BUSY` surfaces as [`QuorumError::Busy`].
+///
+/// A queued row with `send_state = ambiguous` may still be claimed; it is
+/// reconciliation-only and [`mark_execution_started`] refuses to start a send
+/// for it.
+pub fn claim_next(conn: &mut Connection, now: i64) -> Result<Option<ClaimedOperation>> {
+    let tx = begin_immediate(conn)?;
+    tx.execute(
+        "UPDATE github_agent_operations
+         SET state='failed', next_attempt_at=NULL, error_kind=?2,
+             error_summary='operation deadline passed before claim', updated_at=?1
+         WHERE state='queued' AND active=0 AND deadline_at<=?1",
+        params![now, ERR_DEADLINE],
+    )
+    .map_err(map_sql_err)?;
+    tx.execute(
+        "UPDATE github_agent_operations
+         SET state='failed', next_attempt_at=NULL, error_kind=?2,
+             error_summary='operation claim limit reached before claim', updated_at=?1
+         WHERE state='queued' AND active=0 AND attempts>=?3",
+        params![now, ERR_ATTEMPTS, MAX_OPERATION_CLAIMS],
+    )
+    .map_err(map_sql_err)?;
+    let candidate: Option<i64> = tx
+        .query_row(
+            "SELECT o.id FROM github_agent_operations o
+             JOIN github_collaboration_attempts a ON a.attempt_id = o.attempt_id
+             WHERE o.state='queued' AND o.active=0
+               AND (o.next_attempt_at IS NULL OR o.next_attempt_at<=?1)
+               AND o.deadline_at>?1 AND o.attempts<?2
+               AND a.state='active'
+             ORDER BY COALESCE(o.next_attempt_at, o.created_at), o.id
+             LIMIT 1",
+            params![now, MAX_OPERATION_CLAIMS],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_sql_err)?;
+    let Some(id) = candidate else {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(None);
+    };
+    let sql = format!(
+        "UPDATE github_agent_operations
+         SET state='running', active=1, claimed_at=?2, execution_started_at=NULL,
+             attempts=attempts+1, next_attempt_at=NULL, updated_at=?2
+         WHERE id=?1 AND state='queued' AND active=0
+         RETURNING {SELECT_COLUMNS}"
+    );
+    let claimed = match tx
+        .query_row(&sql, params![id, now], row_from_sql)
+        .optional()
+    {
+        Ok(row) => row,
+        Err(e) if is_unique_violation_pub(&e) => None,
+        Err(e) => return Err(map_sql_err(e)),
+    };
+    let Some(operation) = claimed else {
+        // Lost race: drop the transaction (rollback) — the terminalization
+        // sweeps above are idempotent and will re-run on the next claim.
+        return Ok(None);
+    };
+    tx.commit().map_err(map_sql_err)?;
+    Ok(Some(ClaimedOperation {
+        claim: OperationClaim {
+            id: operation.id,
+            attempt: operation.attempts,
+        },
+        operation,
+    }))
+}
+
+/// Record that execution is about to begin, *before* any network send.
+///
+/// Stamps `execution_started_at` and, for writes, moves
+/// `not_started|definitely_unsent -> ambiguous`, so a crash after this point
+/// is reconciled as "may have reached GitHub". Guarded on the current claim
+/// and on a not-yet-started, sendable row: `Ok(false)` is the clean negative
+/// (stale/lost claim, already started, or a reconciliation-only ambiguous
+/// row that must not be re-sent).
+pub fn mark_execution_started(
+    conn: &mut Connection,
+    claim: &OperationClaim,
+    now: i64,
+) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let changed = tx
+        .execute(
+            "UPDATE github_agent_operations
+             SET execution_started_at=?3,
+                 send_state=CASE WHEN kind=?4 THEN send_state ELSE 'ambiguous' END,
+                 updated_at=?3
+             WHERE id=?1 AND attempts=?2 AND active=1 AND state='running'
+               AND execution_started_at IS NULL
+               AND send_state IN ('not_started','definitely_unsent')",
+            params![claim.id, claim.attempt, now, READ_KIND],
+        )
+        .map_err(map_sql_err)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(changed > 0)
+}
+
+/// Record the terminal result of the current claim exactly once and clear
+/// `active`. `Ok(false)` is the clean negative: the claim is stale, the row
+/// was already settled, or reconciliation already resolved it. Text inputs
+/// arrive as bounded, NUL-free newtypes; `error_kind` is a closed
+/// `[a-z0-9_]` token of at most [`MAX_OPERATION_ERROR_KIND_BYTES`].
+pub fn settle(
+    conn: &mut Connection,
+    claim: &OperationClaim,
+    settlement: Settlement<'_>,
+    now: i64,
+) -> Result<bool> {
+    let (state, send_sql, response, remote, error_kind, error_summary) = match settlement {
+        Settlement::Succeeded {
+            response_json,
+            remote_object_id,
+        } => (
+            "succeeded",
+            "'confirmed'",
+            response_json.map(GithubOperationResponseJson::as_str),
+            remote_object_id.map(|r| r.as_str()),
+            None,
+            None,
+        ),
+        Settlement::FailedUnsent {
+            error_kind,
+            error_summary,
+        } => {
+            validate_error_kind(error_kind)?;
+            (
+                "failed",
+                "CASE WHEN send_state='ambiguous' THEN 'definitely_unsent' ELSE send_state END",
+                None,
+                None,
+                Some(error_kind),
+                Some(error_summary.as_str()),
+            )
+        }
+        Settlement::Ambiguous {
+            error_kind,
+            error_summary,
+        } => {
+            validate_error_kind(error_kind)?;
+            (
+                "failed",
+                AMBIGUOUS_SEND_SQL,
+                None,
+                None,
+                Some(error_kind),
+                Some(error_summary.as_str()),
+            )
+        }
+    };
+    let sql = format!(
+        "UPDATE github_agent_operations
+         SET state=?3, send_state={send_sql}, active=0, next_attempt_at=NULL,
+             response_json=?4, remote_object_id=?5, error_kind=?6, error_summary=?7,
+             updated_at=?8
+         WHERE id=?1 AND attempts=?2 AND active=1 AND state='running'"
+    );
+    let tx = begin_immediate(conn)?;
+    let changed = tx
+        .execute(
+            &sql,
+            params![
+                claim.id,
+                claim.attempt,
+                state,
+                response,
+                remote,
+                error_kind,
+                error_summary,
+                now
+            ],
+        )
+        .map_err(map_sql_err)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(changed > 0)
+}
+
+/// Release the current claim back to `queued`, due at `retry_at`.
+///
+/// A write whose send has started (`send_state = ambiguous`) may be retried
+/// only with `proven_unsent = true` — a closed transport proof that no
+/// request was handed off — which records `definitely_unsent`. Without that
+/// proof the call is refused with a usage error and the claim is left
+/// untouched: the caller must [`settle`] it [`Settlement::Ambiguous`].
+///
+/// When the claim cap is already reached or `retry_at` is at/after the
+/// deadline, the row settles `failed` ([`RetryOutcome::Exhausted`]).
+pub fn release_for_retry(
+    conn: &mut Connection,
+    claim: &OperationClaim,
+    retry_at: i64,
+    error_kind: &str,
+    error_summary: &OperationErrorSummary,
+    proven_unsent: bool,
+    now: i64,
+) -> Result<RetryOutcome> {
+    validate_error_kind(error_kind)?;
+    if retry_at < now {
+        return Err(QuorumError::Usage(
+            "GitHub operation retry must not be scheduled in the past".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let current: Option<(String, String, i64)> = tx
+        .query_row(
+            "SELECT kind, send_state, deadline_at FROM github_agent_operations
+             WHERE id=?1 AND attempts=?2 AND active=1 AND state='running'",
+            params![claim.id, claim.attempt],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(map_sql_err)?;
+    let Some((kind, send_state, deadline_at)) = current else {
+        tx.commit().map_err(map_sql_err)?;
+        return Ok(RetryOutcome::Lost);
+    };
+    let is_read = kind == READ_KIND;
+    let send_ambiguous =
+        !is_read && send_state != "not_started" && send_state != "definitely_unsent";
+    if send_ambiguous && !proven_unsent {
+        return Err(QuorumError::Usage(
+            "GitHub write whose send may have reached GitHub cannot be retried without unsent proof"
+                .into(),
+        ));
+    }
+    let next_send_state = if send_ambiguous {
+        "definitely_unsent"
+    } else {
+        send_state.as_str()
+    };
+    let exhausted = claim.attempt >= MAX_OPERATION_CLAIMS || retry_at >= deadline_at;
+    let changed = if exhausted {
+        tx.execute(
+            "UPDATE github_agent_operations
+             SET state='failed', send_state=?3, active=0, next_attempt_at=NULL,
+                 error_kind=?4, error_summary=?5, updated_at=?6
+             WHERE id=?1 AND attempts=?2 AND active=1 AND state='running'",
+            params![
+                claim.id,
+                claim.attempt,
+                next_send_state,
+                error_kind,
+                error_summary.as_str(),
+                now
+            ],
+        )
+    } else {
+        tx.execute(
+            "UPDATE github_agent_operations
+             SET state='queued', send_state=?3, active=0, next_attempt_at=?7,
+                 error_kind=?4, error_summary=?5, updated_at=?6
+             WHERE id=?1 AND attempts=?2 AND active=1 AND state='running'",
+            params![
+                claim.id,
+                claim.attempt,
+                next_send_state,
+                error_kind,
+                error_summary.as_str(),
+                now,
+                retry_at
+            ],
+        )
+    }
+    .map_err(map_sql_err)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(match (changed > 0, exhausted) {
+        (false, _) => RetryOutcome::Lost,
+        (true, true) => RetryOutcome::Exhausted,
+        (true, false) => RetryOutcome::Requeued {
+            next_attempt_at: retry_at,
+        },
+    })
+}
+
+/// Resolve every claim left `active = 1` by a previous daemon. Call once at
+/// startup while holding `daemon_lock`, before the first [`claim_next`].
+///
+/// One `BEGIN IMMEDIATE`:
+/// - writes whose send may have reached GitHub (`execution_started_at` set or
+///   `send_state` past `not_started|definitely_unsent`) settle
+///   `failed` with `send_state = ambiguous` and are never re-queued;
+/// - reads and never-sent writes return to `queued`, due now, unless their
+///   claim cap or deadline is spent, in which case they settle `failed`.
+pub fn reconcile_on_start(conn: &mut Connection, now: i64) -> Result<ReconcileReport> {
+    let tx = begin_immediate(conn)?;
+    let ambiguous = tx
+        .execute(
+            "UPDATE github_agent_operations
+             SET state='failed', send_state='ambiguous', active=0, next_attempt_at=NULL,
+                 error_kind=?2,
+                 error_summary='daemon restarted after the send may have reached GitHub',
+                 updated_at=?1
+             WHERE active=1 AND kind<>?3
+               AND (execution_started_at IS NOT NULL
+                    OR send_state NOT IN ('not_started','definitely_unsent'))",
+            params![now, ERR_INTERRUPTED_AMBIGUOUS, READ_KIND],
+        )
+        .map_err(map_sql_err)?;
+    let failed = tx
+        .execute(
+            "UPDATE github_agent_operations
+             SET state='failed', active=0, next_attempt_at=NULL, error_kind=?2,
+                 error_summary='daemon restarted with no remaining attempts or deadline',
+                 updated_at=?1
+             WHERE active=1 AND (attempts>=?3 OR deadline_at<=?1)",
+            params![now, ERR_INTERRUPTED, MAX_OPERATION_CLAIMS],
+        )
+        .map_err(map_sql_err)?;
+    let requeued = tx
+        .execute(
+            "UPDATE github_agent_operations
+             SET state='queued', active=0, next_attempt_at=?1, error_kind=?2,
+                 error_summary='daemon restarted before the send started',
+                 updated_at=?1
+             WHERE active=1",
+            params![now, ERR_INTERRUPTED],
+        )
+        .map_err(map_sql_err)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(ReconcileReport {
+        requeued,
+        ambiguous,
+        failed,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +882,434 @@ mod tests {
             matches!(err, QuorumError::Usage(_)),
             "expected Usage: {err:?}"
         );
+    }
+
+    // ---- task #435: claim / start / settle / retry / reconcile ----
+
+    fn enqueue_op(conn: &mut Connection, operation_id: &str, kind: &str) {
+        let mut req = sample_request();
+        req.operation_id = operation_id;
+        req.client_request_id = operation_id;
+        req.kind = kind;
+        req.group_key = None;
+        assert!(enqueue(conn, &req).unwrap());
+    }
+
+    const WRITE: &str = "add_issue_comment";
+
+    fn summary(text: &str) -> OperationErrorSummary {
+        OperationErrorSummary::new(text).unwrap()
+    }
+
+    fn claim(conn: &mut Connection, now: i64) -> ClaimedOperation {
+        claim_next(conn, now).unwrap().expect("a due operation")
+    }
+
+    fn get(conn: &Connection, op: &str) -> GithubAgentOperation {
+        get_by_operation_id(conn, op).unwrap().unwrap()
+    }
+
+    fn errors_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM errors", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn ambiguous_send_sql_tracks_read_kind() {
+        assert!(AMBIGUOUS_SEND_SQL.contains(&format!("'{READ_KIND}'")));
+    }
+
+    #[test]
+    fn claim_sets_running_active_and_second_claim_is_clean_negative() {
+        let (mut conn, _dir) = test_conn();
+        enqueue_op(&mut conn, "op-w", WRITE);
+        let won = claim(&mut conn, 110);
+        assert_eq!(won.claim.attempt, 1);
+        assert_eq!(won.operation.state, "running");
+        assert!(won.operation.active);
+        assert_eq!(won.operation.claimed_at, Some(110));
+        assert_eq!(won.operation.attempts, 1);
+        assert_eq!(won.operation.send_state, "not_started");
+        assert_eq!(get(&conn, "op-w"), won.operation);
+        // Already claimed: nothing else is due.
+        assert!(claim_next(&mut conn, 111).unwrap().is_none());
+        assert_eq!(errors_rows(&conn), 0);
+    }
+
+    #[test]
+    fn claim_skips_not_due_and_inactive_attempts_and_fails_overdue() {
+        let (mut conn, _dir) = test_conn();
+        enqueue_op(&mut conn, "op-later", WRITE);
+        conn.execute(
+            "UPDATE github_agent_operations SET next_attempt_at=200 WHERE operation_id='op-later'",
+            [],
+        )
+        .unwrap();
+        assert!(claim_next(&mut conn, 150).unwrap().is_none());
+        assert_eq!(claim(&mut conn, 200).operation.operation_id, "op-later");
+
+        // Parent attempt not active: never claimable.
+        let (mut conn, _dir) = test_conn();
+        enqueue_op(&mut conn, "op-w", WRITE);
+        conn.execute(
+            "UPDATE github_collaboration_attempts SET state='awaiting_resume', active_run_id=NULL",
+            [],
+        )
+        .unwrap();
+        assert!(claim_next(&mut conn, 150).unwrap().is_none());
+        assert_eq!(get(&conn, "op-w").state, "queued");
+
+        // Deadline passed (deadline_at=500): settles failed, never claimed.
+        assert!(claim_next(&mut conn, 500).unwrap().is_none());
+        let row = get(&conn, "op-w");
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.error_kind.as_deref(), Some(ERR_DEADLINE));
+        assert_eq!(row.attempts, 0);
+        assert!(!row.active);
+    }
+
+    #[test]
+    fn settle_records_result_exactly_once() {
+        let (mut conn, _dir) = test_conn();
+        enqueue_op(&mut conn, "op-w", WRITE);
+        let won = claim(&mut conn, 110);
+        assert!(mark_execution_started(&mut conn, &won.claim, 111).unwrap());
+        let response = GithubOperationResponseJson::new(r#"{"id":9}"#).unwrap();
+        let remote = RemoteObjectId::new("IC_9").unwrap();
+        let ok = Settlement::Succeeded {
+            response_json: Some(&response),
+            remote_object_id: Some(&remote),
+        };
+        assert!(settle(&mut conn, &won.claim, ok, 112).unwrap());
+        let row = get(&conn, "op-w");
+        assert_eq!(row.state, "succeeded");
+        assert_eq!(row.send_state, "confirmed");
+        assert_eq!(row.response_json.as_deref(), Some(r#"{"id":9}"#));
+        assert_eq!(row.remote_object_id.as_deref(), Some("IC_9"));
+        assert!(!row.active);
+
+        // Second settle (any variant) on the same claim: zero rows, no change.
+        let s = summary("late");
+        assert!(!settle(&mut conn, &won.claim, ok, 113).unwrap());
+        assert!(!settle(
+            &mut conn,
+            &won.claim,
+            Settlement::Ambiguous {
+                error_kind: "timeout",
+                error_summary: &s
+            },
+            113
+        )
+        .unwrap());
+        assert_eq!(get(&conn, "op-w"), row);
+        assert!(!mark_execution_started(&mut conn, &won.claim, 113).unwrap());
+        assert_eq!(
+            release_for_retry(&mut conn, &won.claim, 120, "timeout", &s, false, 113).unwrap(),
+            RetryOutcome::Lost
+        );
+        assert_eq!(errors_rows(&conn), 0);
+    }
+
+    #[test]
+    fn settle_by_stale_or_never_claimed_token_is_clean_negative() {
+        let (mut conn, _dir) = test_conn();
+        enqueue_op(&mut conn, "op-w", WRITE);
+        let id = get(&conn, "op-w").id;
+        let s = summary("x");
+        let fail = Settlement::FailedUnsent {
+            error_kind: "rejected",
+            error_summary: &s,
+        };
+        // Inactive (never claimed) row.
+        let phantom = OperationClaim { id, attempt: 0 };
+        assert!(!settle(&mut conn, &phantom, fail, 110).unwrap());
+        assert!(!mark_execution_started(&mut conn, &phantom, 110).unwrap());
+        assert_eq!(get(&conn, "op-w").state, "queued");
+
+        let won = claim(&mut conn, 110);
+        let stale = OperationClaim {
+            id,
+            attempt: won.claim.attempt + 1,
+        };
+        assert!(!settle(&mut conn, &stale, fail, 111).unwrap());
+        assert!(get(&conn, "op-w").active);
+        assert!(settle(&mut conn, &won.claim, fail, 111).unwrap());
+        let row = get(&conn, "op-w");
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.send_state, "not_started");
+        assert_eq!(row.error_kind.as_deref(), Some("rejected"));
+    }
+
+    #[test]
+    fn execution_start_marks_writes_ambiguous_and_leaves_reads_unsent() {
+        let (mut conn, _dir) = test_conn();
+        enqueue_op(&mut conn, "op-w", WRITE);
+        let w = claim(&mut conn, 110);
+        assert!(mark_execution_started(&mut conn, &w.claim, 111).unwrap());
+        let row = get(&conn, "op-w");
+        assert_eq!(row.send_state, "ambiguous");
+        assert_eq!(row.execution_started_at, Some(111));
+        // Started once only.
+        assert!(!mark_execution_started(&mut conn, &w.claim, 112).unwrap());
+
+        enqueue_op(&mut conn, "op-r", READ_KIND);
+        let r = claim(&mut conn, 113);
+        assert!(mark_execution_started(&mut conn, &r.claim, 114).unwrap());
+        assert_eq!(get(&conn, "op-r").send_state, "not_started");
+        assert!(!mark_execution_started(&mut conn, &r.claim, 115).unwrap());
+
+        // A failed-unsent settle with proof records definitely_unsent.
+        let s = summary("connect refused");
+        assert!(settle(
+            &mut conn,
+            &w.claim,
+            Settlement::FailedUnsent {
+                error_kind: "connect_refused",
+                error_summary: &s
+            },
+            116
+        )
+        .unwrap());
+        assert_eq!(get(&conn, "op-w").send_state, "definitely_unsent");
+        // An ambiguous settle on a read keeps its effect-free send state.
+        assert!(settle(
+            &mut conn,
+            &r.claim,
+            Settlement::Ambiguous {
+                error_kind: "timeout",
+                error_summary: &s
+            },
+            116
+        )
+        .unwrap());
+        let read = get(&conn, "op-r");
+        assert_eq!(
+            (read.state.as_str(), read.send_state.as_str()),
+            ("failed", "not_started")
+        );
+    }
+
+    #[test]
+    fn reconcile_settles_started_writes_ambiguous_and_requeues_reads_and_unsent_writes() {
+        let (mut conn, _dir) = test_conn();
+        enqueue_op(&mut conn, "op-sent", WRITE);
+        enqueue_op(&mut conn, "op-unsent", WRITE);
+        enqueue_op(&mut conn, "op-read", READ_KIND);
+        enqueue_op(&mut conn, "op-idle", WRITE);
+        let sent = claim(&mut conn, 110);
+        assert_eq!(sent.operation.operation_id, "op-sent");
+        assert!(mark_execution_started(&mut conn, &sent.claim, 110).unwrap());
+        let unsent = claim(&mut conn, 110);
+        assert_eq!(unsent.operation.operation_id, "op-unsent");
+        let read = claim(&mut conn, 110);
+        assert_eq!(read.operation.operation_id, "op-read");
+        assert!(mark_execution_started(&mut conn, &read.claim, 110).unwrap());
+
+        let report = reconcile_on_start(&mut conn, 120).unwrap();
+        assert_eq!(
+            report,
+            ReconcileReport {
+                requeued: 2,
+                ambiguous: 1,
+                failed: 0
+            }
+        );
+        let row = get(&conn, "op-sent");
+        assert_eq!(
+            (row.state.as_str(), row.send_state.as_str(), row.active),
+            ("failed", "ambiguous", false)
+        );
+        assert_eq!(row.error_kind.as_deref(), Some(ERR_INTERRUPTED_AMBIGUOUS));
+        for op in ["op-unsent", "op-read"] {
+            let row = get(&conn, op);
+            assert_eq!((row.state.as_str(), row.active), ("queued", false), "{op}");
+            assert_eq!(row.send_state, "not_started", "{op}");
+            assert_eq!(row.next_attempt_at, Some(120), "{op}");
+        }
+        assert_eq!(get(&conn, "op-idle").state, "queued");
+        // Idempotent: nothing left active.
+        assert_eq!(
+            reconcile_on_start(&mut conn, 121).unwrap(),
+            ReconcileReport::default()
+        );
+
+        // The ambiguous write is never re-claimed; the others are.
+        let mut reclaimed = Vec::new();
+        while let Some(won) = claim_next(&mut conn, 130).unwrap() {
+            reclaimed.push(won.operation.operation_id);
+        }
+        reclaimed.sort();
+        assert_eq!(reclaimed, ["op-idle", "op-read", "op-unsent"]);
+        // The pre-restart claimant of the read is stale now.
+        let s = summary("late");
+        assert!(!settle(
+            &mut conn,
+            &read.claim,
+            Settlement::Ambiguous {
+                error_kind: "timeout",
+                error_summary: &s
+            },
+            131
+        )
+        .unwrap());
+        assert_eq!(get(&conn, "op-read").attempts, 2);
+        assert_eq!(errors_rows(&conn), 0);
+    }
+
+    #[test]
+    fn reconcile_fails_unsent_rows_with_no_attempts_or_deadline_left() {
+        let (mut conn, _dir) = test_conn();
+        enqueue_op(&mut conn, "op-r", READ_KIND);
+        claim(&mut conn, 110);
+        // deadline_at=500 has passed by the restart.
+        let report = reconcile_on_start(&mut conn, 600).unwrap();
+        assert_eq!(report.failed, 1);
+        let row = get(&conn, "op-r");
+        assert_eq!((row.state.as_str(), row.active), ("failed", false));
+        assert_eq!(row.error_kind.as_deref(), Some(ERR_INTERRUPTED));
+    }
+
+    #[test]
+    fn retry_requeues_until_attempt_cap_then_settles_failed() {
+        let (mut conn, _dir) = test_conn();
+        enqueue_op(&mut conn, "op-r", READ_KIND);
+        let s = summary("gh api 502");
+        let mut now = 110;
+        for attempt in 1..MAX_OPERATION_CLAIMS {
+            let won = claim(&mut conn, now);
+            assert_eq!(won.claim.attempt, attempt);
+            assert!(mark_execution_started(&mut conn, &won.claim, now).unwrap());
+            let outcome =
+                release_for_retry(&mut conn, &won.claim, now + 5, "transient", &s, false, now)
+                    .unwrap();
+            assert_eq!(
+                outcome,
+                RetryOutcome::Requeued {
+                    next_attempt_at: now + 5
+                }
+            );
+            let row = get(&conn, "op-r");
+            assert_eq!((row.state.as_str(), row.active), ("queued", false));
+            // Not due until the scheduled time.
+            assert!(claim_next(&mut conn, now + 4).unwrap().is_none());
+            now += 5;
+        }
+        let last = claim(&mut conn, now);
+        assert_eq!(last.claim.attempt, MAX_OPERATION_CLAIMS);
+        assert_eq!(
+            release_for_retry(&mut conn, &last.claim, now + 5, "transient", &s, false, now)
+                .unwrap(),
+            RetryOutcome::Exhausted
+        );
+        let row = get(&conn, "op-r");
+        assert_eq!((row.state.as_str(), row.active), ("failed", false));
+        assert_eq!(row.attempts, MAX_OPERATION_CLAIMS);
+        assert!(claim_next(&mut conn, now + 10).unwrap().is_none());
+    }
+
+    #[test]
+    fn retry_past_deadline_settles_failed() {
+        let (mut conn, _dir) = test_conn();
+        enqueue_op(&mut conn, "op-r", READ_KIND);
+        let won = claim(&mut conn, 110);
+        let s = summary("slow");
+        assert_eq!(
+            release_for_retry(&mut conn, &won.claim, 500, "transient", &s, false, 110).unwrap(),
+            RetryOutcome::Exhausted
+        );
+        assert_eq!(get(&conn, "op-r").state, "failed");
+        // Scheduling in the past is a usage error.
+        enqueue_op(&mut conn, "op-r2", READ_KIND);
+        let won = claim(&mut conn, 120);
+        let err =
+            release_for_retry(&mut conn, &won.claim, 119, "transient", &s, false, 120).unwrap_err();
+        assert!(matches!(err, QuorumError::Usage(_)), "{err:?}");
+    }
+
+    #[test]
+    fn retry_of_started_write_requires_unsent_proof() {
+        let (mut conn, _dir) = test_conn();
+        enqueue_op(&mut conn, "op-w", WRITE);
+        let won = claim(&mut conn, 110);
+        assert!(mark_execution_started(&mut conn, &won.claim, 111).unwrap());
+        let s = summary("timeout");
+        let err =
+            release_for_retry(&mut conn, &won.claim, 120, "timeout", &s, false, 112).unwrap_err();
+        assert!(matches!(err, QuorumError::Usage(_)), "{err:?}");
+        let row = get(&conn, "op-w");
+        assert_eq!(
+            (row.state.as_str(), row.send_state.as_str(), row.active),
+            ("running", "ambiguous", true)
+        );
+        assert_eq!(
+            release_for_retry(&mut conn, &won.claim, 120, "connect_refused", &s, true, 112)
+                .unwrap(),
+            RetryOutcome::Requeued {
+                next_attempt_at: 120
+            }
+        );
+        let row = get(&conn, "op-w");
+        assert_eq!(
+            (row.state.as_str(), row.send_state.as_str()),
+            ("queued", "definitely_unsent")
+        );
+        // The next send must re-enter ambiguous before I/O.
+        let again = claim(&mut conn, 120);
+        assert!(mark_execution_started(&mut conn, &again.claim, 121).unwrap());
+        assert_eq!(get(&conn, "op-w").send_state, "ambiguous");
+    }
+
+    #[test]
+    fn settle_text_is_bounded_and_nul_free() {
+        use crate::collaboration_admission::{MAX_OPERATION_ERROR_BYTES, MAX_OPERATION_JSON_BYTES};
+        assert!(OperationErrorSummary::new("x".repeat(MAX_OPERATION_ERROR_BYTES)).is_ok());
+        assert!(matches!(
+            OperationErrorSummary::new("x".repeat(MAX_OPERATION_ERROR_BYTES + 1)),
+            Err(QuorumError::Usage(_))
+        ));
+        assert!(matches!(
+            OperationErrorSummary::new("bad\0summary"),
+            Err(QuorumError::Usage(_))
+        ));
+        let big = format!(r#"{{"b":"{}"}}"#, "x".repeat(MAX_OPERATION_JSON_BYTES));
+        assert!(matches!(
+            GithubOperationResponseJson::new(&big),
+            Err(QuorumError::Usage(_))
+        ));
+        assert!(matches!(
+            GithubOperationResponseJson::new("{\"a\":\"\\u0000\"}"),
+            Err(QuorumError::Usage(_))
+        ));
+        assert!(matches!(
+            RemoteObjectId::new("x".repeat(129)),
+            Err(QuorumError::Usage(_))
+        ));
+
+        let (mut conn, _dir) = test_conn();
+        enqueue_op(&mut conn, "op-w", WRITE);
+        let won = claim(&mut conn, 110);
+        let s = summary("ok");
+        let oversize_kind = "k".repeat(MAX_OPERATION_ERROR_KIND_BYTES + 1);
+        for kind in ["", "bad\0kind", "Upper", oversize_kind.as_str()] {
+            let err = settle(
+                &mut conn,
+                &won.claim,
+                Settlement::Ambiguous {
+                    error_kind: kind,
+                    error_summary: &s,
+                },
+                111,
+            )
+            .unwrap_err();
+            assert!(matches!(err, QuorumError::Usage(_)), "{kind:?}: {err:?}");
+            let err =
+                release_for_retry(&mut conn, &won.claim, 120, kind, &s, false, 111).unwrap_err();
+            assert!(matches!(err, QuorumError::Usage(_)), "{kind:?}: {err:?}");
+        }
+        // Rejected input left the claim untouched.
+        let row = get(&conn, "op-w");
+        assert!(row.active);
+        assert_eq!(row.state, "running");
+        assert!(row.error_kind.is_none());
     }
 }

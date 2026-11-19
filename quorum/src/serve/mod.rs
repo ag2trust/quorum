@@ -20,6 +20,7 @@ pub mod fallback;
 pub mod fallback_establish;
 pub mod fallback_preflight;
 pub mod fallback_retire;
+pub mod github_outbox;
 pub mod grok_agent;
 pub mod merge;
 pub mod merged_continuation;
@@ -28,6 +29,7 @@ pub mod planner;
 mod profile_cooldown;
 pub mod recovery;
 pub mod render;
+pub mod repository_service;
 pub mod rereview_builder;
 pub mod review_cycle_context;
 pub mod review_ledger;
@@ -1836,11 +1838,71 @@ where
 }
 
 async fn run_publication_gh_command_with_limit(
-    mut command: tokio::process::Command,
+    command: tokio::process::Command,
     timeout: Duration,
     pipe_limit: usize,
     label: &str,
 ) -> std::result::Result<std::process::Output, String> {
+    run_bounded_gh_command(command, timeout, pipe_limit)
+        .await
+        .map_err(|error| error.describe(label, timeout, pipe_limit))
+}
+
+/// Typed failure of one bounded `gh` child. `Spawn` is the only variant that
+/// proves the child never ran; every other variant happened after spawn.
+#[derive(Debug)]
+enum BoundedGhError {
+    /// The child could not be spawned; no request was handed to `gh`.
+    Spawn(String),
+    /// A pipe, wait, join, or read failure after the child was spawned.
+    Io(String),
+    /// A stdout/stderr pipe exceeded the byte cap.
+    PipeOverflow {
+        pipe: &'static str,
+        kill_error: Option<String>,
+    },
+    /// The child did not exit within the deadline and was killed.
+    TimedOut { kill_error: Option<String> },
+    /// The child exited but pipe collection did not finish by the deadline.
+    CollectionTimedOut,
+}
+
+impl BoundedGhError {
+    fn describe(&self, label: &str, timeout: Duration, pipe_limit: usize) -> String {
+        match self {
+            Self::Spawn(error) | Self::Io(error) => format!("{label}: {error}"),
+            Self::PipeOverflow {
+                pipe,
+                kill_error: Some(error),
+            } => format!(
+                "{label}: {pipe} exceeded {pipe_limit}-byte limit and kill/reap failed: {error}"
+            ),
+            Self::PipeOverflow {
+                pipe,
+                kill_error: None,
+            } => format!("{label}: {pipe} exceeded {pipe_limit}-byte limit"),
+            Self::TimedOut {
+                kill_error: Some(error),
+            } => format!(
+                "{label}: timed out after {}s and kill/reap failed: {error}",
+                timeout.as_secs()
+            ),
+            Self::TimedOut { kill_error: None } => {
+                format!("{label}: timed out after {}s", timeout.as_secs())
+            }
+            Self::CollectionTimedOut => format!(
+                "{label}: output collection timed out after {}s",
+                timeout.as_secs()
+            ),
+        }
+    }
+}
+
+async fn run_bounded_gh_command(
+    mut command: tokio::process::Command,
+    timeout: Duration,
+    pipe_limit: usize,
+) -> std::result::Result<std::process::Output, BoundedGhError> {
     command
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -1849,15 +1911,15 @@ async fn run_publication_gh_command_with_limit(
         .stderr(Stdio::piped());
     let mut child = command
         .spawn()
-        .map_err(|error| format!("{label}: {error}"))?;
+        .map_err(|error| BoundedGhError::Spawn(error.to_string()))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| format!("{label}: stdout pipe unavailable"))?;
+        .ok_or_else(|| BoundedGhError::Io("stdout pipe unavailable".to_string()))?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| format!("{label}: stderr pipe unavailable"))?;
+        .ok_or_else(|| BoundedGhError::Io("stderr pipe unavailable".to_string()))?;
     let (overflow_tx, mut overflow_rx) = tokio::sync::mpsc::channel(2);
     let mut stdout_reader = tokio::spawn(drain_publication_pipe(
         stdout,
@@ -1880,62 +1942,54 @@ async fn run_publication_gh_command_with_limit(
                 let _ = child.kill().await;
                 stdout_reader.abort();
                 stderr_reader.abort();
-                return Err(format!("{label}: {error}"));
+                return Err(BoundedGhError::Io(error.to_string()));
             }
         },
-        Some(pipe_name) = overflow_rx.recv() => {
-            let kill_error = child.kill().await.err();
+        Some(pipe) = overflow_rx.recv() => {
+            let kill_error = child.kill().await.err().map(|error| error.to_string());
             stdout_reader.abort();
             stderr_reader.abort();
-            return Err(match kill_error {
-                Some(error) => format!(
-                    "{label}: {pipe_name} exceeded {pipe_limit}-byte limit and kill/reap failed: {error}"
-                ),
-                None => format!("{label}: {pipe_name} exceeded {pipe_limit}-byte limit"),
-            });
+            return Err(BoundedGhError::PipeOverflow { pipe, kill_error });
         },
         _ = tokio::time::sleep_until(deadline) => {
             // `kill` waits for process exit, so the child is reaped before the
             // daemon resumes this tick or begins shutdown cleanup.
-            let kill_error = child.kill().await.err();
+            let kill_error = child.kill().await.err().map(|error| error.to_string());
             stdout_reader.abort();
             stderr_reader.abort();
-            return Err(match kill_error {
-                Some(error) => format!(
-                    "{label}: timed out after {}s and kill/reap failed: {error}",
-                    timeout.as_secs()
-                ),
-                None => format!("{label}: timed out after {}s", timeout.as_secs()),
-            });
+            return Err(BoundedGhError::TimedOut { kill_error });
         }
     };
     let readers = async {
         let stdout = (&mut stdout_reader)
             .await
-            .map_err(|error| format!("{label}: stdout join: {error}"))?
-            .map_err(|error| format!("{label}: stdout read: {error}"))?;
+            .map_err(|error| BoundedGhError::Io(format!("stdout join: {error}")))?
+            .map_err(|error| BoundedGhError::Io(format!("stdout read: {error}")))?;
         let stderr = (&mut stderr_reader)
             .await
-            .map_err(|error| format!("{label}: stderr join: {error}"))?
-            .map_err(|error| format!("{label}: stderr read: {error}"))?;
-        Ok::<_, String>((stdout, stderr))
+            .map_err(|error| BoundedGhError::Io(format!("stderr join: {error}")))?
+            .map_err(|error| BoundedGhError::Io(format!("stderr read: {error}")))?;
+        Ok::<_, BoundedGhError>((stdout, stderr))
     };
     let (stdout, stderr) = match tokio::time::timeout_at(deadline, readers).await {
         Ok(result) => result?,
         Err(_) => {
             stdout_reader.abort();
             stderr_reader.abort();
-            return Err(format!(
-                "{label}: output collection timed out after {}s",
-                timeout.as_secs()
-            ));
+            return Err(BoundedGhError::CollectionTimedOut);
         }
     };
     if stdout.exceeded_limit {
-        return Err(format!("{label}: stdout exceeded {pipe_limit}-byte limit"));
+        return Err(BoundedGhError::PipeOverflow {
+            pipe: "stdout",
+            kill_error: None,
+        });
     }
     if stderr.exceeded_limit {
-        return Err(format!("{label}: stderr exceeded {pipe_limit}-byte limit"));
+        return Err(BoundedGhError::PipeOverflow {
+            pipe: "stderr",
+            kill_error: None,
+        });
     }
     Ok(std::process::Output {
         status,
@@ -4963,6 +5017,11 @@ pub fn run_serve(config: ServeConfig) -> Result<i32> {
             writable_path_resolver.clone(),
         )
         .await?;
+        // The one GitHub outbox executor for this daemon. It reconciles
+        // claims left by a previous daemon before its first claim; the
+        // daemon_lock acquired above makes it the only executor on this DB.
+        let outbox_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let outbox = start_github_outbox(&config, outbox_shutdown.clone());
         let result = tick_loop(
             &config,
             daemon_pid,
@@ -4970,6 +5029,16 @@ pub fn run_serve(config: ServeConfig) -> Result<i32> {
             writable_path_resolver,
         )
         .await;
+        // Flag only: the executor stops claiming and drains in-flight work
+        // within its bounded grace; leftovers reconcile on the next start.
+        outbox_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(outbox) = outbox {
+            match outbox.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => log(&format!("github outbox: stopped with error: {error}")),
+                Err(error) => log(&format!("github outbox: executor task failed: {error}")),
+            }
+        }
         endpoint.shutdown().await;
         result
     });
@@ -4986,6 +5055,33 @@ pub fn run_serve(config: ServeConfig) -> Result<i32> {
     rt.shutdown_timeout(std::time::Duration::from_secs(1));
 
     result
+}
+
+/// Spawn the daemon's GitHub outbox executor. The target repository comes
+/// from daemon config only. An invalid configured repository disables the
+/// executor loudly; queued operations then stay unsent and fail at deadline.
+fn start_github_outbox(
+    config: &ServeConfig,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) -> Option<tokio::task::JoinHandle<Result<()>>> {
+    let target = match repository_service::RepositoryTarget::new(
+        config.repo_dir.clone(),
+        Some(&config.repo),
+    ) {
+        Ok(target) => target,
+        Err(error) => {
+            log(&format!(
+                "github outbox: disabled; configured repository {:?} is invalid: {error}",
+                config.repo
+            ));
+            return None;
+        }
+    };
+    let service = Arc::new(repository_service::GhRepositoryService::new(
+        config.merge_executor.publication_credentials(),
+    ));
+    let executor = github_outbox::OutboxExecutor::new(config.db_path.clone(), target, service);
+    Some(tokio::spawn(executor.run(shutdown)))
 }
 
 pub(crate) struct LiveStats {
