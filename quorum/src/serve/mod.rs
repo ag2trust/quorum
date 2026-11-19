@@ -20,6 +20,7 @@ pub mod fallback;
 pub mod fallback_establish;
 pub mod fallback_preflight;
 pub mod fallback_retire;
+pub mod github_outbox;
 pub mod grok_agent;
 pub mod merge;
 pub mod merged_continuation;
@@ -4728,6 +4729,11 @@ pub fn run_serve(config: ServeConfig) -> Result<i32> {
             writable_path_resolver.clone(),
         )
         .await?;
+        // The one GitHub outbox executor for this daemon. It reconciles
+        // claims left by a previous daemon before its first claim; the
+        // daemon_lock acquired above makes it the only executor on this DB.
+        let outbox_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let outbox = start_github_outbox(&config, outbox_shutdown.clone());
         let result = tick_loop(
             &config,
             daemon_pid,
@@ -4735,6 +4741,16 @@ pub fn run_serve(config: ServeConfig) -> Result<i32> {
             writable_path_resolver,
         )
         .await;
+        // Flag only: the executor stops claiming and drains in-flight work
+        // within its bounded grace; leftovers reconcile on the next start.
+        outbox_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(outbox) = outbox {
+            match outbox.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => log(&format!("github outbox: stopped with error: {error}")),
+                Err(error) => log(&format!("github outbox: executor task failed: {error}")),
+            }
+        }
         endpoint.shutdown().await;
         result
     });
@@ -4751,6 +4767,33 @@ pub fn run_serve(config: ServeConfig) -> Result<i32> {
     rt.shutdown_timeout(std::time::Duration::from_secs(1));
 
     result
+}
+
+/// Spawn the daemon's GitHub outbox executor. The target repository comes
+/// from daemon config only. An invalid configured repository disables the
+/// executor loudly; queued operations then stay unsent and fail at deadline.
+fn start_github_outbox(
+    config: &ServeConfig,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) -> Option<tokio::task::JoinHandle<Result<()>>> {
+    let target = match repository_service::RepositoryTarget::new(
+        config.repo_dir.clone(),
+        Some(&config.repo),
+    ) {
+        Ok(target) => target,
+        Err(error) => {
+            log(&format!(
+                "github outbox: disabled; configured repository {:?} is invalid: {error}",
+                config.repo
+            ));
+            return None;
+        }
+    };
+    let service = Arc::new(repository_service::GhRepositoryService::new(
+        config.merge_executor.publication_credentials(),
+    ));
+    let executor = github_outbox::OutboxExecutor::new(config.db_path.clone(), target, service);
+    Some(tokio::spawn(executor.run(shutdown)))
 }
 
 pub(crate) struct LiveStats {
