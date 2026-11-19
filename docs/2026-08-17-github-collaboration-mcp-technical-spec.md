@@ -182,18 +182,47 @@ managed-run public surface.
 
 ## MCP process and provider injection
 
-`quorum agent-mcp` is a managed-provider-process-scoped, tools-only MCP server over stdio. It uses
-the official Rust MCP SDK's stdio server transport at a Cargo.lock-pinned version and forwards
-typed operations to the daemon through the injected local agent endpoint. A persistent Claude
-child retains this same MCP process and connection across its stdin-fed turns; providers that
-respawn per turn receive a new process. The endpoint is not a Repository Service or arbitrary
-database channel. Stdout is protocol-only; bounded diagnostics go to stderr and never include
-request bodies, responses, or capabilities.
+`quorum agent-mcp` is a managed-provider-process-scoped, tools-only MCP adapter. It uses the
+official Rust MCP SDK at a Cargo.lock-pinned version and forwards typed operations to the daemon
+through the injected local agent endpoint. The endpoint is not a Repository Service or arbitrary
+database channel.
+
+Per the 2026-11-16 owner decision, `quorum serve` binds this adapter in-process as a Streamable
+HTTP server on its own loopback listener (`agent_mcp_listen`, default `127.0.0.1:0`) and exports
+`QUORUM_AGENT_MCP_URL` (`http://<bound addr>/mcp`) beside the run's `QUORUM_RUN_ID` bearer to
+every managed run, planners included. This is the generic runner contract for the default
+Claude-compatible binary and any `agent_bin` substituted for it: Claude attaches with an explicit
+`--mcp-config` entry of `"type": "http"`, its `url` taken from `QUORUM_AGENT_MCP_URL`, and an
+`Authorization: Bearer ${QUORUM_RUN_ID}` header Claude itself expands from its process
+environment, so the bearer never enters argv. There is no stdio fallback: if the listener cannot
+bind or either env var is missing from a capability-bearing launch, the daemon refuses to spawn
+rather than falling back to a stdio child. The transport is stateless — no sessions, no
+server-initiated stream — so every `tools/list` and tool call is authorized and its inventory
+resolved from the bearer alone on that one request; a live phase change (e.g., worker to rework)
+is simply reflected the next time the client lists or calls tools, and needs no push notification
+or control-frame handoff. This supersedes the earlier split of stdio injection for in-container
+agents and a separately started HTTP listener for agents outside the container, described below.
+
+Codex and Grok's own provider-native MCP configuration formats are unaffected by this decision.
+Their own config entry (`mcp_servers.quorum = {command, args, env_vars}` for Codex; the
+equivalent home-directory config for Grok) still names `quorum agent-mcp` as a stdio child that
+each provider's own runtime spawns and feeds the named environment variables into, exactly as
+before. That stdio adapter is unchanged by this section and is documented here because it is the
+same binary and endpoint-forwarding code as the HTTP form.
+
+`quorum agent-mcp` without `--listen` is a managed-provider-process-scoped, tools-only MCP server
+over stdio. It uses the official Rust MCP SDK's stdio server transport and forwards typed
+operations to the daemon through the injected local agent endpoint. A persistent Claude child
+would retain this same MCP process and connection across its stdin-fed turns, but Claude no
+longer uses this form (see above); Codex and Grok, which respawn per turn, each receive a new
+stdio process per launch. Stdout is protocol-only; bounded diagnostics go to stderr and never
+include request bodies, responses, or capabilities.
 
 `quorum agent-mcp --listen <SOCKETADDR>` runs the same adapter as a separate Streamable HTTP
-server at `/mcp` instead of stdio. It is not part of the daemon and nothing launches it
-automatically: an operator starts it with `QUORUM_AGENT_ENDPOINT` and `QUORUM_REPO`, and it
-reaches the daemon only through the endpoint socket. Its limits are:
+server at `/mcp` instead of stdio, sharing its implementation with `quorum serve`'s embedded
+listener above. It is not part of the daemon and nothing launches it automatically: an operator
+starts it with `QUORUM_AGENT_ENDPOINT` and `QUORUM_REPO`, and it reaches the daemon only through
+the endpoint socket. Its limits are:
 
 - Loopback addresses only, plain HTTP. A non-loopback address is a usage error, and a request
   whose `Host` is not a loopback name is refused.
@@ -226,39 +255,43 @@ reaches the daemon only through the endpoint socket. Its limits are:
   schema cache, which never evicts, is confined to one request by building a fresh service for
   each one.
 - The role-scoped GitHub operations remain unimplemented on this transport as on stdio.
-- Worker and reviewer prompts still instruct the shell commands, and managed launches still
-  inject the stdio server; this transport changes neither.
+- Worker and reviewer prompts still instruct the shell commands. Managed Claude launches (and any
+  `agent_bin` substituted for Claude) use this HTTP transport exclusively, through `quorum
+  serve`'s own embedded listener rather than a separately started one (see above); Codex and Grok
+  launches still inject the stdio server, unaffected by this transport or the decision that added
+  it.
 
 The logical MCP server name is `quorum`, yielding client-visible names such as
 `mcp__quorum__pull_request_read`. The daemon injects only this per-run server into ordinary worker
 and reviewer launches:
 
 - Claude receives an explicit generated `--mcp-config` plus `--strict-mcp-config`; this remains
-  explicit when `--bare` is active.
-- Codex receives an invocation-local MCP configuration override. It MUST NOT mutate the operator's
-  persistent Codex configuration and MUST preserve the provider-issued thread ID on resume.
+  explicit when `--bare` is active. Since the 2026-11-16 owner decision the one entry in that
+  config is the HTTP form above (`"type": "http"`, `url` from `QUORUM_AGENT_MCP_URL`, bearer
+  header expanding `QUORUM_RUN_ID`), not a stdio `{command, args}` entry.
+- Codex receives an invocation-local MCP configuration override naming `quorum agent-mcp` as a
+  stdio child, as before. It MUST NOT mutate the operator's persistent Codex configuration and
+  MUST preserve the provider-issued thread ID on resume.
 - Restricted classifiers, planners, collectors, and doctors receive no GitHub MCP.
 
-Claude keeps its established one persistent child and MCP connection across stdin-fed turns. Its
-MCP process keeps one authenticated duplex session to the local endpoint; ordinary CLI proxy
-requests remain independent bounded exchanges. After the same-capability handoff commits, the
-daemon sends that session a bounded `inventory_changed` control frame containing the new
-adapter-only descriptor and inventory hash. The control frame is never forwarded to the model. If
-the session is absent or the frame cannot be delivered, the pending turn remains unfed.
+Claude keeps its established one persistent child across stdin-fed turns, and that child reuses
+the one `QUORUM_AGENT_MCP_URL` and `QUORUM_RUN_ID` bearer for every turn — but the HTTP transport
+itself is stateless (`get_info` advertises no `tools/list_changed` capability over HTTP, and every
+`list_tools` result carries `ttlMs: 0` and a private cache scope), so there is no persistent MCP
+session, control frame, or server-initiated notification to track. Each `tools/list` and tool call
+is answered from the live inventory the daemon endpoint resolves for that one request. A rework or
+other phase handoff is therefore visible the next time the client calls `tools/list` or a tool
+outside the current phase's set, which the daemon-authorized capability alone enforces; there is
+no separate relist acknowledgement step gating the pending turn. Because Claude is expected to
+re-list rather than cache across turns, a client that ignores `ttlMs`/`cacheScope` and serves a
+stale cached inventory is a provider/client defect this transport cannot detect or correct from
+the server side.
 
-On that frame, `quorum agent-mcp` invalidates its old collaboration descriptor, refuses
-collaboration calls as `stale_inventory`, and emits MCP `notifications/tools/list_changed`. The
-next client `tools/list` uses the new descriptor, returns the phase-scoped inventory, and
-acknowledges that exact inventory to the daemon. The daemon does not feed the rework prompt until
-that acknowledgement arrives within the existing bounded provider startup window. Failure to
-relist is a loud provider/configuration failure that preserves the exact pending rework turn; it
-never falls back to direct `gh` or exposes the union of both phase toolsets.
-
-Provider CLI syntax is covered by real installed-binary argument tests. The installed Claude
-boundary test also proves that the pinned client honors `tools/list_changed` and relists between
-two stdin turns. Fake runners are insufficient because malformed MCP configuration or a client
-that caches the first inventory fails outside their protocol. Rollout for warm Claude is blocked
-if that real-client inventory transition is not supported.
+Provider CLI syntax is covered by real installed-binary argument tests, including that Claude's
+generated `--mcp-config` carries the HTTP entry and never the stdio `{command, args}` shape, and
+that a managed launch refuses to start rather than falling back to stdio when the capability or
+`QUORUM_AGENT_MCP_URL` is missing. Fake runners are insufficient because malformed MCP
+configuration or protocol-level inventory handling fails outside their protocol.
 
 ## Role-scoped tool inventory
 
