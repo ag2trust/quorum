@@ -2356,6 +2356,7 @@ mod tests {
         let claude_bin = recording_runner(claude_dir.path());
         let mut claude_environment = managed_environment();
         claude_environment.push(("QUORUM_ADAPTER_TEST".into(), "managed-claude".into()));
+        claude_environment.push((AGENT_MCP_URL_ENV.into(), "http://127.0.0.1:4100/mcp".into()));
         let claude_session = "00000000-0000-4000-8000-000000000042";
         let mut claude = launch_recording_runner(
             &LaunchRequest {
@@ -2402,10 +2403,16 @@ mod tests {
             config,
             serde_json::json!({
                 "mcpServers": {
-                    "quorum": {"command": "quorum", "args": ["agent-mcp"]}
+                    "quorum": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:4100/mcp",
+                        "headers": {"Authorization": "Bearer ${QUORUM_RUN_ID}"}
+                    }
                 }
             })
         );
+        assert!(!claude_args.contains("agent-mcp"), "{claude_args}");
+        assert!(!claude_args.contains("run-capability"), "{claude_args}");
         let turn = std::fs::read_to_string(claude_dir.path().join("turn.log")).unwrap();
         let turn: serde_json::Value = serde_json::from_str(turn.trim()).unwrap();
         assert_eq!(turn["message"]["content"], "exact claude pending turn");
