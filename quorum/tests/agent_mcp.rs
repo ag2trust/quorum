@@ -227,6 +227,81 @@ fn install_fixtures(db: &Path) {
     tx.commit().unwrap();
 }
 
+/// One settled operation per live run: the rework worker's (task 200, PR 42)
+/// and the reviewer's (task 201, PR 77). Request JSON and markers carry a
+/// sentinel that no read may return.
+fn install_operations(db: &Path) {
+    const FAR: i64 = 4_102_444_800;
+    let conn = quorum_core::db::open(db).unwrap();
+    for (attempt, task, agent, role, pr, head, run) in [
+        ("attempt-w", 200, "Worker", "worker", 42, None, "worker-cap"),
+        (
+            "attempt-r",
+            201,
+            "Reviewer",
+            "reviewer",
+            77,
+            Some("a".repeat(40)),
+            "reviewer-cap",
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO github_collaboration_attempts(
+                 attempt_id,task_id,agent,role,pr_number,head_sha,lifecycle_generation,
+                 active_run_id,state,created_at,updated_at,expires_at)
+             VALUES (?1,?2,?3,?4,?5,?6,0,?7,'active',1001,1001,?8)",
+            params![attempt, task, agent, role, pr, head, run, FAR],
+        )
+        .unwrap();
+    }
+    for (operation, attempt, run, task, agent, role, pr, state, send, remote, response, error) in [
+        (
+            "op-w",
+            "attempt-w",
+            "worker-cap",
+            200,
+            "Worker",
+            "worker",
+            42,
+            "succeeded",
+            "confirmed",
+            Some("IC_worker"),
+            Some(r#"{"id":7,"url":"https://example.invalid/7"}"#),
+            None,
+        ),
+        (
+            "op-r",
+            "attempt-r",
+            "reviewer-cap",
+            201,
+            "Reviewer",
+            "reviewer",
+            77,
+            "failed",
+            "definitely_unsent",
+            None,
+            None,
+            Some("validation failed"),
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO github_agent_operations(
+                 operation_id,client_request_id,attempt_id,created_by_run_id,task_id,agent,
+                 role,pr_number,kind,request_json,state,send_state,attempts,deadline_at,
+                 github_marker,remote_object_id,response_json,error_summary,
+                 created_at,updated_at,expires_at)
+             VALUES (?1,?1,?2,?3,?4,?5,?6,?7,'add_issue_comment',
+                     '{\"body\":\"must-not-leak\"}',?8,?9,1,?10,'marker-must-not-leak',
+                     ?11,?12,?13,1001,1001,?10)",
+            params![
+                operation, attempt, run, task, agent, role, pr, state, send, FAR, remote, response,
+                error
+            ],
+        )
+        .unwrap();
+    }
+}
+
 struct McpProcess {
     child: Child,
     input: Option<ChildStdin>,
@@ -439,6 +514,15 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
         json!({"name":"pull_request_review_write","arguments":{}}),
     );
     assert_tool_error(&forbidden, "tool is forbidden for the current run phase");
+    let initial_read = worker.request(
+        10,
+        "tools/call",
+        json!({
+            "name":"github_operation_read",
+            "arguments":{"attemptId":"attempt-w","operationId":"op-w"}
+        }),
+    );
+    assert_tool_error(&initial_read, "tool is forbidden for the current run phase");
 
     let unknown = worker.request(
         5,
@@ -484,8 +568,81 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
         ]
     );
 
+    let read_schema = &tool(&rework, "github_operation_read")["inputSchema"];
+    assert_eq!(read_schema["required"], json!(["attemptId", "operationId"]));
+    assert_eq!(read_schema["additionalProperties"], false);
+
+    install_operations(&db);
+    let read = |process: &mut McpProcess, id: i64, attempt: &str, operation: &str| {
+        process.request(
+            id,
+            "tools/call",
+            json!({
+                "name":"github_operation_read",
+                "arguments":{"attemptId":attempt,"operationId":operation}
+            }),
+        )
+    };
+    let owned = read(&mut worker, 11, "attempt-w", "op-w");
+    assert_eq!(owned["result"]["isError"], false, "{owned:#}");
+    let owned_text = tool_text(&owned);
+    assert_eq!(
+        serde_json::from_str::<Value>(owned_text).unwrap(),
+        json!({
+            "operation_id":"op-w",
+            "state":"succeeded",
+            "send_state":"confirmed",
+            "remote_object_id":"IC_worker",
+            "result":{"id":7,"url":"https://example.invalid/7"},
+            "error_summary":null
+        })
+    );
+    assert!(!owned_text.contains("must-not-leak"), "{owned_text}");
+
+    let foreign = read(&mut worker, 12, "attempt-r", "op-r");
+    assert_tool_error(&foreign, "operation read rejected");
+    let missing = read(&mut worker, 13, "attempt-w", "op-missing");
+    assert_tool_error(&missing, "operation not found");
+    let mismatched = read(&mut worker, 14, "attempt-w", "op-r");
+    assert_tool_error(&mismatched, "operation read rejected");
+    for (id, arguments) in [
+        (15, json!({"operationId":"op-w"})),
+        (
+            16,
+            json!({"attemptId":"attempt-w","operationId":"op-w","extra":1}),
+        ),
+        (17, json!({"attemptId":"attempt-w","operationId":""})),
+        (
+            18,
+            json!({"attemptId":"attempt-w","operationId":"x".repeat(129)}),
+        ),
+        (19, json!({"attemptId":"attempt-w","operationId":"op\0w"})),
+    ] {
+        let rejected = worker.request(
+            id,
+            "tools/call",
+            json!({"name":"github_operation_read","arguments":arguments}),
+        );
+        assert_eq!(rejected["result"]["isError"], true, "{rejected:#}");
+        assert!(!tool_text(&rejected).contains("succeeded"), "{rejected:#}");
+    }
+
     let mut reviewer = McpProcess::start(&endpoint, "reviewer-cap", "Reviewer");
     reviewer.initialize();
+    let reviewer_owned = read(&mut reviewer, 20, "attempt-r", "op-r");
+    assert_eq!(
+        serde_json::from_str::<Value>(tool_text(&reviewer_owned)).unwrap(),
+        json!({
+            "operation_id":"op-r",
+            "state":"failed",
+            "send_state":"definitely_unsent",
+            "remote_object_id":null,
+            "result":null,
+            "error_summary":"validation failed"
+        })
+    );
+    let reviewer_foreign = read(&mut reviewer, 21, "attempt-w", "op-w");
+    assert_tool_error(&reviewer_foreign, "operation read rejected");
     let reviewer_tools = reviewer.request(2, "tools/list", json!({}));
     assert_eq!(
         tool_names(&reviewer_tools),

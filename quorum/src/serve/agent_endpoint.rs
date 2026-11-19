@@ -6,6 +6,10 @@
 //! closed operations below. Repository identity is daemon configuration.
 
 use quorum_core::capabilities::{LiveRunContext, LiveRunPhase};
+use quorum_core::collaboration_admission::{
+    self, CollaborationAttemptId, GithubOperationId, GithubOperationReadResult,
+    GithubOperationState, GithubSendState,
+};
 use quorum_core::db::begin_immediate;
 use quorum_core::error::{QuorumError, Result};
 use quorum_core::planner_submissions::{self, CallOutcome, RejectionCategory, SubmitOutcome};
@@ -28,7 +32,10 @@ use tokio::task::{JoinHandle, JoinSet};
 
 /// Four-byte big-endian length prefix followed by at most one JSON document.
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
-pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+/// Larger than a request so one `github_operation_read` answer fits: a
+/// retained result is at most `MAX_OPERATION_JSON_BYTES` of canonical JSON,
+/// plus a fully escaped error summary and the fixed envelope.
+pub const MAX_RESPONSE_BYTES: usize = 96 * 1024;
 /// Bound on one submitted plan document. Deliberately below
 /// `MAX_REQUEST_BYTES` so a plan at the limit still fits its request frame:
 /// the bound is the operative one, rejecting the payload as `invalid_plan`
@@ -100,6 +107,12 @@ enum Operation {
     Inventory,
     Protocol {
         operation: ProtocolOperation,
+        /// Required by `github_operation_read`; ignored by every operation
+        /// that is still unavailable.
+        #[serde(default)]
+        attempt_id: Option<String>,
+        #[serde(default)]
+        operation_id: Option<String>,
     },
 }
 
@@ -177,6 +190,16 @@ enum ResponseResult {
         review_revision: Option<String>,
         phase: InventoryPhase,
         operations: Vec<ProtocolOperation>,
+    },
+    /// The closed, bounded view of one operation owned by the caller's run.
+    /// Request JSON, the hidden marker, and credentials are never included.
+    GithubOperation {
+        operation_id: String,
+        state: GithubOperationState,
+        send_state: GithubSendState,
+        remote_object_id: Option<String>,
+        result: Option<serde_json::Value>,
+        error_summary: Option<String>,
     },
 }
 
@@ -269,6 +292,8 @@ impl EndpointFailure {
             | "invalid_operation"
             | "forbidden_operation"
             | "operation_unavailable"
+            | "operation_not_found"
+            | "operation_rejected"
             | "invalid_plan"
             | "already_submitted"
             | "submit_budget_exhausted" => false,
@@ -849,7 +874,11 @@ fn process_request_blocking(
                 }
             }
         }
-        Operation::Protocol { operation } => {
+        Operation::Protocol {
+            operation,
+            attempt_id,
+            operation_id,
+        } => {
             let context = resolve_any_role(&tx, &request.capability)?;
             if !operation.allowed_in(context.phase) {
                 return Err(EndpointFailure::new(
@@ -857,10 +886,13 @@ fn process_request_blocking(
                     "operation is not available to this run",
                 ));
             }
-            return Err(EndpointFailure::new(
-                "operation_unavailable",
-                "operation is not implemented",
-            ));
+            if operation != ProtocolOperation::GithubOperationRead {
+                return Err(EndpointFailure::new(
+                    "operation_unavailable",
+                    "operation is not implemented",
+                ));
+            }
+            github_operation_read(&tx, &context, attempt_id, operation_id)?
         }
     };
     if Instant::now() >= deadline {
@@ -878,6 +910,62 @@ fn process_request_blocking(
     }
     state.store(COMPLETE, Ordering::Release);
     Ok(response)
+}
+
+/// Answer `github_operation_read` for the caller's own run.
+///
+/// Ownership is decided by `read_operation` from the run id the capability
+/// resolved to, never from anything the caller names. Every rejection maps to
+/// one fixed code so a non-owner learns nothing about the operation.
+fn github_operation_read(
+    conn: &rusqlite::Connection,
+    context: &LiveRunContext,
+    attempt_id: Option<String>,
+    operation_id: Option<String>,
+) -> std::result::Result<Response, EndpointFailure> {
+    let invalid = || {
+        EndpointFailure::new(
+            "invalid_operation",
+            "github_operation_read requires a bounded attempt_id and operation_id",
+        )
+    };
+    let attempt_id = attempt_id
+        .and_then(|value| CollaborationAttemptId::new(value).ok())
+        .ok_or_else(invalid)?;
+    let operation_id = operation_id
+        .and_then(|value| GithubOperationId::new(value).ok())
+        .ok_or_else(invalid)?;
+    let read =
+        collaboration_admission::read_operation(conn, &context.run_id, &attempt_id, &operation_id)
+            .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+    match read {
+        GithubOperationReadResult::Found(status) => {
+            let result = status
+                .response_json
+                .as_ref()
+                .map(|json| serde_json::from_str(json.as_str()))
+                .transpose()
+                .map_err(|_| EndpointFailure::new("internal", "request processing failed"))?;
+            Ok(Response::success(ResponseResult::GithubOperation {
+                operation_id: status.operation_id.as_str().to_owned(),
+                state: status.state,
+                send_state: status.send_state,
+                remote_object_id: status
+                    .remote_object_id
+                    .map(|value| value.as_str().to_owned()),
+                result,
+                error_summary: status.error_summary.map(|value| value.as_str().to_owned()),
+            }))
+        }
+        GithubOperationReadResult::NotFound => Err(EndpointFailure::new(
+            "operation_not_found",
+            "operation not found",
+        )),
+        GithubOperationReadResult::Rejected(_) => Err(EndpointFailure::new(
+            "operation_rejected",
+            "operation read rejected",
+        )),
+    }
 }
 
 /// Authoritative facts a plan submission needs before it can be validated.
@@ -2018,6 +2106,8 @@ mod tests {
             },
             Operation::Protocol {
                 operation: ProtocolOperation::PullRequestRead,
+                attempt_id: None,
+                operation_id: None,
             },
         ] {
             let error = fixture.call("planner-cap", operation).await.unwrap_err();
@@ -2875,6 +2965,8 @@ mod tests {
             "invalid_operation",
             "forbidden_operation",
             "operation_unavailable",
+            "operation_not_found",
+            "operation_rejected",
             "invalid_plan",
             "already_submitted",
             "submit_budget_exhausted",
@@ -2882,6 +2974,28 @@ mod tests {
             assert!(!EndpointFailure::new(code, "expected rejection").is_abnormal());
         }
         assert!(EndpointFailure::new("internal", "processing failed").is_abnormal());
+    }
+
+    #[test]
+    fn largest_operation_read_fits_one_response_frame() {
+        use quorum_core::collaboration_admission::{
+            MAX_COLLABORATION_ID_BYTES, MAX_OPERATION_ERROR_BYTES, MAX_OPERATION_JSON_BYTES,
+        };
+        // A canonical retained result at its bound re-serializes byte for
+        // byte; every other string is maximally escaped control characters.
+        let result = serde_json::Value::String("x".repeat(MAX_OPERATION_JSON_BYTES - 2));
+        assert_eq!(result.to_string().len(), MAX_OPERATION_JSON_BYTES);
+        let escaped = |len| "\u{1}".repeat(len);
+        let response = Response::success(ResponseResult::GithubOperation {
+            operation_id: escaped(MAX_COLLABORATION_ID_BYTES),
+            state: GithubOperationState::Succeeded,
+            send_state: GithubSendState::Confirmed,
+            remote_object_id: Some(escaped(MAX_COLLABORATION_ID_BYTES)),
+            result: Some(result),
+            error_summary: Some(escaped(MAX_OPERATION_ERROR_BYTES)),
+        });
+        let body = serde_json::to_vec(&response).unwrap();
+        assert!(body.len() <= MAX_RESPONSE_BYTES, "{}", body.len());
     }
 
     #[test]
