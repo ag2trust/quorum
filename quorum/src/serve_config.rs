@@ -603,24 +603,76 @@ pub const DEFAULT_AGENT_MCP_LISTEN: std::net::SocketAddr =
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentMcpServeConfig {
     pub listen: std::net::SocketAddr,
-    /// Operator-configured hosts only; the loopback names are added at bind.
+    /// Operator-configured hosts, plus the IP literal of
+    /// [`agent_mcp_client_addr`] when the bind would not otherwise admit it,
+    /// so the exported `QUORUM_AGENT_MCP_URL` always passes the listener's
+    /// `Host` check. The loopback names are added at bind for a loopback
+    /// address.
     pub allowed_hosts: Vec<String>,
+}
+
+/// The address managed runs dial to reach an agent MCP listener bound at
+/// `bound`. A wildcard (unspecified) bind is reached over the loopback
+/// address of the same family; any other bind is reached at its own address.
+pub fn agent_mcp_client_addr(bound: std::net::SocketAddr) -> std::net::SocketAddr {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let ip = match bound.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    std::net::SocketAddr::new(ip, bound.port())
+}
+
+/// The `QUORUM_AGENT_MCP_URL` exported to managed runs for a listener bound
+/// at `bound`. Its authority is [`agent_mcp_client_addr`], which
+/// [`resolve_agent_mcp`] guarantees the listener's allowed hosts admit.
+pub fn agent_mcp_url(bound: std::net::SocketAddr) -> String {
+    format!("http://{}/mcp", agent_mcp_client_addr(bound))
+}
+
+/// An IP as a `Host` authority without a port (IPv6 bracketed).
+fn ip_host_literal(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+    }
 }
 
 /// Resolve the agent MCP listener settings. Refused with a usage error (exit
 /// 2): an address equal to the declared orchestrator MCP address, since the
 /// two listeners never share a socket, and a non-loopback bind without an
 /// explicit allowed host. There is no implicit wildcard bind.
+///
+/// The operator's hosts are what opt a non-loopback bind in; the daemon then
+/// also admits the IP literal its own managed runs dial, so the exported URL
+/// is never refused with 403. An IP literal is not a DNS-rebinding vector,
+/// and the run capability bearer, not the `Host` header, is the authority.
 pub fn resolve_agent_mcp(cfg: &ServeFileConfig) -> Result<AgentMcpServeConfig> {
     let listen = cfg.agent_mcp_listen.unwrap_or(DEFAULT_AGENT_MCP_LISTEN);
-    let allowed_hosts = cfg.agent_mcp_allowed_hosts.clone().unwrap_or_default();
+    let mut allowed_hosts = cfg.agent_mcp_allowed_hosts.clone().unwrap_or_default();
     if cfg.orchestrator_mcp_listen == Some(listen) {
         return Err(QuorumError::Usage(format!(
             "agent_mcp_listen {listen} equals orchestrator_mcp_listen: the agent MCP and \
              orchestrator MCP must use separate listeners"
         )));
     }
-    crate::agent_mcp::agent_allowed_hosts(listen, allowed_hosts.clone())?;
+    let admitted = crate::agent_mcp::agent_allowed_hosts(listen, allowed_hosts.clone())?;
+    let client_ip = agent_mcp_client_addr(listen).ip();
+    let client_host = ip_host_literal(client_ip);
+    let normalized = |host: &str| host.trim_matches(['[', ']']).to_ascii_lowercase();
+    if !admitted
+        .iter()
+        .any(|host| normalized(host) == normalized(&client_host))
+    {
+        allowed_hosts.push(client_host.clone());
+        crate::agent_mcp::agent_allowed_hosts(listen, allowed_hosts.clone()).map_err(|error| {
+            QuorumError::Usage(format!(
+                "{error}; the daemon also admits {client_host}, the address its managed runs \
+                 use to reach agent_mcp_listen {listen}"
+            ))
+        })?;
+    }
     Ok(AgentMcpServeConfig {
         listen,
         allowed_hosts,
@@ -1789,12 +1841,129 @@ mod tests {
             "agent_mcp_listen = \"0.0.0.0:8812\"\nagent_mcp_allowed_hosts = [\"quorum.internal:8812\"]\n",
         )
         .unwrap();
-        assert_eq!(resolved.allowed_hosts, ["quorum.internal:8812"]);
+        // The operator's host opts the bind in; the daemon adds the loopback
+        // literal its managed runs dial for a wildcard bind.
+        assert_eq!(resolved.allowed_hosts, ["quorum.internal:8812", "127.0.0.1"]);
         let error = agent_mcp_config(
             "agent_mcp_listen = \"0.0.0.0:8812\"\nagent_mcp_allowed_hosts = [\"bad host\"]\n",
         )
         .unwrap_err();
         assert_eq!(error.exit_code(), 2, "{error}");
+    }
+
+    #[test]
+    fn exported_agent_mcp_authority_is_always_admitted() {
+        let addr = |s: &str| s.parse::<std::net::SocketAddr>().unwrap();
+        assert_eq!(agent_mcp_url(addr("0.0.0.0:8812")), "http://127.0.0.1:8812/mcp");
+        assert_eq!(agent_mcp_url(addr("[::]:8812")), "http://[::1]:8812/mcp");
+        assert_eq!(agent_mcp_url(addr("192.0.2.7:8812")), "http://192.0.2.7:8812/mcp");
+        assert_eq!(agent_mcp_url(addr("127.0.0.1:4100")), "http://127.0.0.1:4100/mcp");
+
+        let hosts = |listen: &str| {
+            agent_mcp_config(&format!(
+                "agent_mcp_listen = \"{listen}\"\nagent_mcp_allowed_hosts = [\"quorum.internal\"]\n"
+            ))
+            .unwrap()
+            .allowed_hosts
+        };
+        assert_eq!(hosts("[::]:8812"), ["quorum.internal", "[::1]"]);
+        assert_eq!(hosts("192.0.2.7:8812"), ["quorum.internal", "192.0.2.7"]);
+        // Loopback binds already admit 127.0.0.1 and ::1 at bind time.
+        assert_eq!(hosts("127.0.0.1:8812"), ["quorum.internal"]);
+        assert_eq!(hosts("[::1]:8812"), ["quorum.internal"]);
+        // Other 127/8 addresses are loopback but not default names.
+        assert_eq!(hosts("127.0.0.2:8812"), ["quorum.internal", "127.0.0.2"]);
+
+        // A full operator list leaves no room for the client literal: refused
+        // at startup (exit 2), never a listener whose URL answers 403.
+        let full: Vec<String> = (0..16).map(|i| format!("\"h{i}\"")).collect();
+        let error = agent_mcp_config(&format!(
+            "agent_mcp_listen = \"0.0.0.0:8812\"\nagent_mcp_allowed_hosts = [{}]\n",
+            full.join(",")
+        ))
+        .unwrap_err();
+        assert_eq!(error.exit_code(), 2, "{error}");
+    }
+
+    /// One raw HTTP/1.1 `tools/list` exchange against `url` with the URL's
+    /// own authority as `Host`; returns the status code and body.
+    async fn post_tools_list(url: &str, bearer: &str, host: Option<&str>) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let rest = url.strip_prefix("http://").expect("http URL");
+        let (authority, path) = rest.split_at(rest.find('/').expect("URL path"));
+        let target: std::net::SocketAddr = authority.parse().expect("socket authority");
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {}\r\n\
+             Authorization: Bearer {bearer}\r\n\
+             Content-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            host.unwrap_or(authority),
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(target).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_end(&mut response),
+        )
+        .await
+        .expect("response within bound")
+        .unwrap();
+        let response = String::from_utf8_lossy(&response).into_owned();
+        let code = response
+            .strip_prefix("HTTP/1.1 ")
+            .and_then(|rest| rest.get(..3))
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("not an HTTP response: {response:?}"));
+        (code, response)
+    }
+
+    /// The supported non-loopback opt-in: a wildcard bind with an operator
+    /// host. The URL the daemon exports must be served (200), not refused by
+    /// the Host allowlist, while an unlisted Host is still refused.
+    #[tokio::test]
+    async fn non_loopback_opt_in_exports_a_url_the_listener_serves() {
+        let resolved = agent_mcp_config(
+            "agent_mcp_listen = \"0.0.0.0:0\"\nagent_mcp_allowed_hosts = [\"quorum.internal:8812\"]\n",
+        )
+        .unwrap();
+        let listener =
+            crate::agent_mcp::AgentMcpListener::bind(resolved.listen, resolved.allowed_hosts)
+                .await
+                .unwrap();
+        let bound = listener.local_addr();
+        assert!(bound.ip().is_unspecified());
+        let url = agent_mcp_url(bound);
+        assert_eq!(url, format!("http://127.0.0.1:{}/mcp", bound.port()));
+
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let serving = tokio::spawn(listener.serve(
+            std::path::PathBuf::from("/nonexistent/quorum-agent-endpoint.sock"),
+            "owner/repository".into(),
+            async move {
+                let _ = stopped.await;
+            },
+        ));
+
+        let (code, response) = post_tools_list(&url, "run-1", None).await;
+        assert_eq!(code, 200, "{response}");
+        assert!(response.contains("\"jsonrpc\""), "{response}");
+        // The operator's configured authority is still admitted.
+        let (code, response) = post_tools_list(&url, "run-1", Some("quorum.internal:8812")).await;
+        assert_eq!(code, 200, "{response}");
+        // An unlisted Host is still refused: the allowlist was not widened
+        // beyond the client literal.
+        let (code, response) = post_tools_list(&url, "run-1", Some("evil.example")).await;
+        assert_eq!(code, 403, "{response}");
+
+        stop.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(30), serving)
+            .await
+            .expect("serving future returns after shutdown")
+            .unwrap();
     }
 
     const VALID_ROUTING: &str = r#"

@@ -5029,8 +5029,13 @@ pub fn run_serve(
             Err(QuorumError::from(error))
         }
         Ok(listener) => {
-            let url = format!("http://{}/mcp", listener.local_addr());
-            log(&format!("agent MCP: listening at {url}"));
+            // The exported authority is one the listener's Host check admits
+            // (resolve_agent_mcp adds it), never a raw wildcard address.
+            let url = crate::serve_config::agent_mcp_url(listener.local_addr());
+            log(&format!(
+                "agent MCP: bound {}, managed runs use {url}",
+                listener.local_addr()
+            ));
             config.agent_mcp_url = Some(url);
             serve_with_agent_mcp(&rt, &config, listener, daemon_pid, &daemon_instance)
         }
