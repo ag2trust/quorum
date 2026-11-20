@@ -32,6 +32,7 @@ pub mod recovery;
 pub mod render;
 pub mod repository_service;
 pub mod rereview_builder;
+pub mod review_cleanup;
 pub mod review_cycle_context;
 pub mod review_ledger;
 pub mod reviewer;
@@ -1150,6 +1151,13 @@ enum ReviewerProvisionOutcome {
     /// provider/profile-unavailable classification. No reviewer name,
     /// worktree, run, or process was created; retry once a cooldown expires.
     ProfilesCoolingDown,
+    /// The PR's pending-review publication slot is held by cleanup, backoff,
+    /// or a live owner. Nothing was allocated or charged; retry later.
+    PublicationSlotWait,
+    /// The PR's pending-review publication slot is blocked (foreign or
+    /// ambiguous draft, or bounded recovery exhausted). No reviewer may be
+    /// provisioned; the caller parks the task through the durable path.
+    PublicationSlotBlocked(String),
 }
 
 /// The R1 terminal telemetry for an attempted mandatory-R2 handoff. These
@@ -1185,7 +1193,9 @@ fn r2_provision_disposition(
             ReviewerProvisionOutcome::Unavailable
             | ReviewerProvisionOutcome::HeadMoved { .. }
             | ReviewerProvisionOutcome::Deferred
-            | ReviewerProvisionOutcome::ProfilesCoolingDown,
+            | ReviewerProvisionOutcome::ProfilesCoolingDown
+            | ReviewerProvisionOutcome::PublicationSlotWait
+            | ReviewerProvisionOutcome::PublicationSlotBlocked(_),
         ) => R2ProvisionDisposition::Unavailable,
         Ok(ReviewerProvisionOutcome::Failed(_)) => R2ProvisionDisposition::Error,
         Err(_) => R2ProvisionDisposition::Error,
@@ -4228,6 +4238,30 @@ fn managed_run_environment(
     environment
 }
 
+/// The managed-launch declaration every capability-bearing worker or reviewer
+/// launch carries, so the runner applies its agent MCP wiring check and
+/// records a refusal in this daemon's `errors` table.
+fn managed_launch(
+    config: &ServeConfig,
+    role: runner::AgentMcpRole,
+) -> Option<runner::ManagedLaunch<'_>> {
+    Some(runner::ManagedLaunch {
+        role,
+        db_path: &config.db_path,
+    })
+}
+
+/// A durable responsibility role as a managed launch role. Like the
+/// surrounding fallback branches, anything but `worker` is a reviewer, which
+/// is also the stricter tool requirement.
+fn managed_role(role: &str) -> runner::AgentMcpRole {
+    if role == "worker" {
+        runner::AgentMcpRole::Worker
+    } else {
+        runner::AgentMcpRole::Reviewer
+    }
+}
+
 #[cfg(test)]
 fn configured_reviewer_selection<'a>(
     provider_explicit: bool,
@@ -4990,6 +5024,11 @@ pub struct ServeConfig {
     /// sets it only after the listener is bound; `tick_loop`, which makes
     /// every managed launch, refuses to start while it is `None`.
     pub agent_mcp_url: Option<String>,
+    /// Daemon-owned pending-review publication barrier and cleanup driver.
+    /// `run_serve` sets it with the agent MCP listener; `None` (tests, or an
+    /// invalid configured repository) provisions reviewers without slot
+    /// ownership, so they can never publish a pending review.
+    pub review_publication: Option<Arc<review_cleanup::ReviewPublication>>,
 }
 
 impl ServeConfig {
@@ -5076,6 +5115,7 @@ pub fn run_serve(
                 listener.local_addr()
             ));
             config.agent_mcp_url = Some(url);
+            config.review_publication = review_cleanup::ReviewPublication::from_config(&config);
             serve_with_agent_mcp(&rt, &config, listener, daemon_pid, &daemon_instance)
         }
     };
@@ -5187,6 +5227,15 @@ fn serve_with_agent_mcp(
         // daemon_lock acquired above makes it the only executor on this DB.
         let outbox_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let outbox = start_github_outbox(config, outbox_shutdown.clone());
+        // The pending-review cleanup driver. It claims nothing until crash
+        // recovery has reconciled publication slots.
+        let cleanup_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup = config.review_publication.clone().map(|publication| {
+            tokio::spawn(publication.run_cleanup(
+                cleanup_shutdown.clone(),
+                review_cleanup::CLEANUP_POLL_INTERVAL,
+            ))
+        });
         let result = tick_loop(
             config,
             daemon_pid,
@@ -5203,6 +5252,21 @@ fn serve_with_agent_mcp(
         // Flag only: the executor stops claiming and drains in-flight work
         // within its bounded grace; leftovers reconcile on the next start.
         outbox_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Flag only: the driver stops claiming and stops its current claim
+        // before the next remote call. Past the grace it is aborted, which
+        // kills and reaps an in-flight `gh` child; the slot stays claimed
+        // for startup reconciliation and lifecycle is untouched.
+        cleanup_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(mut cleanup) = cleanup {
+            if tokio::time::timeout(review_cleanup::CLEANUP_SHUTDOWN_GRACE, &mut cleanup)
+                .await
+                .is_err()
+            {
+                log("review cleanup: shutdown grace elapsed; aborting the in-flight cycle");
+                cleanup.abort();
+                let _ = cleanup.await;
+            }
+        }
         if let Some(outbox) = outbox {
             match outbox.await {
                 Ok(Ok(())) => {}
@@ -14698,6 +14762,16 @@ async fn tick(
                                         (false, "r2-graph-held")
                                     }
                                     PreReviewChecksGate::Ready => {
+                                        // R1 is torn down on every path below.
+                                        // End its publication authority first so
+                                        // the R2 barrier can clean its slot
+                                        // instead of waiting on a live owner.
+                                        if let (Some(publication), Some(run_id)) = (
+                                            config.review_publication.as_ref(),
+                                            reviewers[ri].cap_run_id.clone(),
+                                        ) {
+                                            publication.retire_for_handoff(&run_id).await;
+                                        }
                                         let reviewer_count_before = reviewers.len();
                                         let r2_provision = provision_reviewer(
                                             config,
@@ -19169,7 +19243,9 @@ async fn tick(
                         ReviewerProvisionOutcome::Unavailable
                         | ReviewerProvisionOutcome::Failed(_)
                         | ReviewerProvisionOutcome::Deferred
-                        | ReviewerProvisionOutcome::ProfilesCoolingDown => {}
+                        | ReviewerProvisionOutcome::ProfilesCoolingDown
+                        | ReviewerProvisionOutcome::PublicationSlotWait
+                        | ReviewerProvisionOutcome::PublicationSlotBlocked(_) => {}
                     }
                 }
                 Err(e) => {
@@ -19632,7 +19708,9 @@ async fn tick(
                         ReviewerProvisionOutcome::Unavailable
                         | ReviewerProvisionOutcome::Failed(_)
                         | ReviewerProvisionOutcome::Deferred
-                        | ReviewerProvisionOutcome::ProfilesCoolingDown => {}
+                        | ReviewerProvisionOutcome::ProfilesCoolingDown
+                        | ReviewerProvisionOutcome::PublicationSlotWait
+                        | ReviewerProvisionOutcome::PublicationSlotBlocked(_) => {}
                     }
                 }
                 Err(e) => {
@@ -20698,6 +20776,7 @@ async fn feed_worker_turn(
                     &slot.session_id,
                     slot.continuation_id_for_launch(),
                 ),
+                managed: managed_launch(config, runner::AgentMcpRole::Worker),
             },
             &runner_adapter_config(config, config.agent_bin.as_deref()),
         )
@@ -24505,6 +24584,7 @@ async fn provision_reviewer(
         return Ok(ReviewerProvisionOutcome::Unavailable);
     }
     let task_id = worker.task_id;
+    let mut publication_probe = None;
     let result = provision_reviewer_reserved(
         config,
         wt_mgr,
@@ -24520,8 +24600,16 @@ async fn provision_reviewer(
         head_sha,
         recover_interrupted,
         &reservation,
+        &mut publication_probe,
     )
     .await;
+    // A provision that cleared the pending-review barrier but never bound
+    // its reviewer gives the never-owned probe slot back for a fresh probe.
+    if let (Some(claim), Some(publication)) =
+        (publication_probe.take(), config.review_publication.as_ref())
+    {
+        publication.abandon(claim).await;
+    }
     let path = config.db_path.clone();
     let release = tokio::task::spawn_blocking(move || -> Result<bool> {
         let mut conn = quorum_core::db::open(&path)?;
@@ -24533,6 +24621,21 @@ async fn provision_reviewer(
         return Err(QuorumError::Io(format!(
             "reviewer reservation release lost token authority for task #{task_id}"
         )));
+    }
+    // A blocked publication slot never provisions a reviewer: the task waits
+    // on the existing durable parking path. Cleanup itself never parks,
+    // transitions, or charges anything.
+    if let Ok(ReviewerProvisionOutcome::PublicationSlotBlocked(reason)) = &result {
+        park_task_result(
+            &config.db_path,
+            task_id,
+            &format!(
+                "{} reviewer for PR #{pr} not provisioned: {reason}",
+                role.as_str().to_uppercase()
+            ),
+            "in-review",
+        )
+        .await?;
     }
     result
 }
@@ -24553,6 +24656,7 @@ async fn provision_reviewer_reserved(
     head_sha: &str,
     recover_interrupted: bool,
     reservation: &str,
+    publication_probe: &mut Option<quorum_core::review_publication_slots::ProbeClaim>,
 ) -> Result<ReviewerProvisionOutcome> {
     // The check result is meaningful only for the exact PR head that was
     // gated. Re-resolve through the configured executor immediately before
@@ -24739,6 +24843,29 @@ async fn provision_reviewer_reserved(
             return Ok(ReviewerProvisionOutcome::ProfilesCoolingDown);
         }
     };
+    // Pending-review publication barrier (first review, re-review, R1, R2,
+    // and restart recovery alike): no reviewer resource exists until the
+    // PR's publication slot is probed and the publisher has no pending draft.
+    if let Some(publication) = config.review_publication.as_ref() {
+        match publication
+            .probe_before_provision(worker.task_id, pr)
+            .await?
+        {
+            review_cleanup::Barrier::Clear(claim) => *publication_probe = Some(claim),
+            // Logged by the barrier once per distinct reason.
+            review_cleanup::Barrier::Wait(_) => {
+                return Ok(ReviewerProvisionOutcome::PublicationSlotWait);
+            }
+            review_cleanup::Barrier::Blocked(reason) => {
+                log(&format!(
+                    "{}: task #{} PR #{pr} reviewer not provisioned: {reason}",
+                    role.as_str().to_uppercase(),
+                    worker.task_id
+                ));
+                return Ok(ReviewerProvisionOutcome::PublicationSlotBlocked(reason));
+            }
+        }
+    }
     let reviewer_name = if let Some(recovery) = &recovery {
         // Restart recovery deliberately reuses the interrupted reviewer's
         // durable identity. Normal provisioning below excludes every prior
@@ -25373,6 +25500,21 @@ async fn provision_reviewer_reserved(
         }
     }
 
+    // The reviewer run is live: issue its collaboration attempt and make it
+    // the owner of the probed publication slot in one transaction, before
+    // the process can make its first collaboration call.
+    if let (Some(claim), Some(publication)) =
+        (publication_probe.take(), config.review_publication.as_ref())
+    {
+        if let Err(error) = publication.bind(claim, &cap_run_id).await {
+            log(&format!(
+                "{}: task #{} PR #{pr} publication slot bind failed: {error}; \
+                 the reviewer cannot publish a pending review",
+                role.as_str().to_uppercase(),
+                worker.task_id
+            ));
+        }
+    }
     let reviewer_env = managed_run_environment(config, &reviewer_name, Some(cap_run_id.as_str()));
     let reviewer_agent_bin = agent_bin_for_kind(config, reviewer_kind);
     let continuation_id = runner_continuation_id(
@@ -25395,6 +25537,7 @@ async fn provision_reviewer_reserved(
                 environment: &reviewer_env,
                 mode: runner::LaunchMode::Normal,
                 continuation_id,
+                managed: managed_launch(config, runner::AgentMcpRole::Reviewer),
             },
             &runner_adapter_config(config, reviewer_agent_bin),
         )
@@ -27640,6 +27783,7 @@ async fn spawn_admitted_worker(
         environment: &worker_env_vars,
         mode: runner::LaunchMode::Normal,
         continuation_id,
+        managed: managed_launch(config, runner::AgentMcpRole::Worker),
     };
     let responsibility_key = worker_responsibility_key(task.id, task.revision);
     let worker_run_id = {
@@ -29302,6 +29446,7 @@ async fn activate_reviewer_fallback(
         // Cross-provider continuations are forbidden. The alternate gets
         // the exact pending turn in a new provider session.
         continuation_id: runner_continuation_id(alternate_kind, &session_id, None),
+        managed: managed_launch(config, runner::AgentMcpRole::Reviewer),
     };
     let proc = match launch_and_commit_fallback(
         config,
@@ -30005,6 +30150,7 @@ async fn activate_worker_fallback_with(
         mode: runner::LaunchMode::Normal,
         // Cross-provider continuation is never valid.
         continuation_id: runner_continuation_id(alternate_kind, &session_id, None),
+        managed: managed_launch(config, runner::AgentMcpRole::Worker),
     };
     let grok_worker_request =
         (alternate_kind == runner::AgentKind::Grok).then(|| runner::WorkerTurnRequest {
@@ -30321,6 +30467,7 @@ async fn resume_pending_fallbacks(
             environment: &environment,
             mode: runner::LaunchMode::Normal,
             continuation_id: runner_continuation_id(kind, &slot.session_id, None),
+            managed: managed_launch(config, managed_role(&intent.role)),
         };
         let pending_turn = PendingTurn {
             provider: intent.pending_turn.provider.clone(),
@@ -32862,6 +33009,7 @@ async fn spawn_remediation_worker(
         environment: &remediation_env,
         mode: runner::LaunchMode::Normal,
         continuation_id: launch_continuation_id,
+        managed: managed_launch(config, runner::AgentMcpRole::Worker),
     };
     let spawn_result = if fresh_grok_handoff {
         // A workerless review-only task begins its first managed Grok turn in
@@ -33993,6 +34141,7 @@ mod tests {
             pr_target_program: None,
             max_active_graphs: 2,
             agent_mcp_url: Some("http://127.0.0.1:9/mcp".into()),
+            review_publication: None,
         }
     }
 
@@ -37079,6 +37228,7 @@ mod tests {
             pr_target_program: None,
             max_active_graphs: 2,
             agent_mcp_url: Some("http://127.0.0.1:9/mcp".into()),
+            review_publication: None,
         }
     }
 
@@ -37208,6 +37358,7 @@ mod tests {
                     environment: &environment,
                     mode: runner::LaunchMode::Normal,
                     continuation_id: None,
+                    managed: None,
                 },
                 None,
                 gated_fallback_journal(&config.db_path, &worktree),
@@ -37319,6 +37470,7 @@ mod tests {
                 environment: &environment,
                 mode: runner::LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             None,
             gated_fallback_journal(&config.db_path, &worktree),
@@ -37379,6 +37531,7 @@ mod tests {
                 environment: &environment,
                 mode: runner::LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             None,
             gated_fallback_journal(&config.db_path, &worktree),
@@ -37960,6 +38113,7 @@ mod tests {
                         environment: &[],
                         mode: runner::LaunchMode::Normal,
                         continuation_id: None,
+                        managed: None,
                     },
                     &runner::AdapterConfig {
                         executable: primary_runner.to_str(),
@@ -41261,6 +41415,7 @@ mod tests {
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             &runner::AdapterConfig {
                 executable: provider.to_str(),
@@ -43422,6 +43577,7 @@ mod tests {
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id,
+                managed: None,
             },
             &runner::AdapterConfig {
                 executable: Some("true"),
@@ -43520,6 +43676,7 @@ mod tests {
                     environment: &[],
                     mode: runner::LaunchMode::Normal,
                     continuation_id: None,
+                    managed: None,
                 },
                 task_id,
                 role_assignment_id: assignment_id,
@@ -43794,6 +43951,7 @@ mod tests {
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id: retry_after_restart.continuation_id.as_deref(),
+                managed: None,
             },
             &runner::AdapterConfig {
                 executable: resumed_program.to_str(),
@@ -44353,6 +44511,7 @@ mod tests {
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id: retry_turn.continuation_id.as_deref(),
+                managed: None,
             },
             &runner::AdapterConfig {
                 executable: resume_program.to_str(),
@@ -45327,6 +45486,7 @@ printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-session-te
                 environment: &initial_environment,
                 mode: runner::LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             task_id: 1,
             role_assignment_id: 1,
@@ -45367,6 +45527,7 @@ printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-session-te
                 environment: &resumed_environment,
                 mode: runner::LaunchMode::Normal,
                 continuation_id: Some("grok-session-initial"),
+                managed: None,
             },
             &runner_adapter_config(&config, program.to_str()),
         )
@@ -45409,6 +45570,7 @@ printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-session-te
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id: Some("grok-session-initial"),
+                managed: None,
             },
             &runner::AdapterConfig {
                 executable: program.to_str(),
@@ -47538,6 +47700,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             &runner::AdapterConfig {
                 executable: runner.to_str(),
@@ -47993,6 +48156,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             pr_target_program: None,
             max_active_graphs: 2,
             agent_mcp_url: Some("http://127.0.0.1:9/mcp".into()),
+            review_publication: None,
         }
     }
 
@@ -49401,6 +49565,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             &runner::AdapterConfig {
                 executable: fixture.to_str(),
@@ -50612,6 +50777,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             &runner::AdapterConfig {
                 executable: fixture.to_str(),
@@ -64011,6 +64177,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             Some(runner::WorkerTurnRequest {
                 task_id: 1,

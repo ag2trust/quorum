@@ -1761,6 +1761,7 @@ async fn spawn_and_run_classifier(
             environment: &request.env_vars,
             mode: LaunchMode::Normal,
             continuation_id: None,
+            managed: None,
         },
         &AdapterConfig {
             executable: request.agent_bin.as_deref(),
@@ -5509,6 +5510,7 @@ esac
             pr_target_program: None,
             max_active_graphs: 2,
             agent_mcp_url: Some("http://127.0.0.1:9/mcp".into()),
+            review_publication: None,
         };
         (config, instance)
     }

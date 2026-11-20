@@ -1750,7 +1750,18 @@ async fn spawn_planner_with_timeout(
         ));
     }
     let env_vars = match run {
-        Some(envelope) => envelope.environment()?,
+        Some(envelope) => {
+            let environment = envelope.environment()?;
+            // The same launch contract as worker and reviewer runs: a planner
+            // whose wiring cannot offer `submit_plan` never spawns.
+            crate::serve::runner::check_agent_mcp_wiring(
+                provider,
+                crate::serve::runner::AgentMcpRole::Planner,
+                &environment,
+                crate::agent_mcp::advertised_tool_names,
+            )?;
+            environment
+        }
         None => Vec::new(),
     };
     let agent_mcp = run.map(|_| crate::serve::runner::AGENT_MCP_SERVER);

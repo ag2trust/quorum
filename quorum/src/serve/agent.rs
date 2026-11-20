@@ -54,6 +54,9 @@ pub struct AgentProc {
     /// Outstanding tool/background work and exact attribution of `result`
     /// lines to daemon-fed turns (see `stream::ClaudeTurnTracker`).
     turns: stream::ClaudeTurnTracker,
+    /// Keeps the run-private `GH_CONFIG_DIR` alive for the child's lifetime;
+    /// `None` only for test-constructed processes.
+    _run_env: Option<crate::serve::runner::ManagedRunEnv>,
 }
 
 /// Tool allowlist for spawned agents (dontAsk auto-denies everything else).
@@ -626,18 +629,16 @@ impl AgentProc {
             cmd.env(k, v);
         }
 
-        crate::serve::runner::strip_operator_secrets(&mut cmd);
-        if agent_mcp.is_some() {
-            strip_managed_mcp_authority(&mut cmd);
-        }
         // A planner without an MCP server holds no endpoint authority at all,
         // so every coordination name is removed. A planner with one must keep
         // its run envelope: Claude expands the `${QUORUM_RUN_ID}` bearer in
         // `claude_mcp_config` from this process environment. GitHub and
-        // daemon-home authority is still stripped above.
+        // daemon-home authority is stripped by the shared run policy below.
         if restricted == RestrictedMode::Planner && agent_mcp.is_none() {
             strip_coordination_env(&mut cmd);
         }
+        let run_env = crate::serve::runner::ManagedRunEnv::create()?;
+        run_env.apply(&mut cmd);
         // After every env strip, which would otherwise drop the marker.
         let tree = crate::serve::proctree::apply(&mut cmd);
 
@@ -655,7 +656,7 @@ impl AgentProc {
             });
         }
 
-        Self::from_child(cmd.spawn()?, tree)
+        Self::from_child(cmd.spawn()?, tree, Some(run_env))
     }
 
     fn spawn_configured_gated(
@@ -738,13 +739,11 @@ impl AgentProc {
             cmd.env(k, v);
         }
 
-        crate::serve::runner::strip_operator_secrets(&mut cmd);
-        if agent_mcp.is_some() {
-            strip_managed_mcp_authority(&mut cmd);
-        }
         if restricted == RestrictedMode::Planner && agent_mcp.is_none() {
             strip_coordination_env(&mut cmd);
         }
+        let run_env = crate::serve::runner::ManagedRunEnv::create()?;
+        run_env.apply(&mut cmd);
         // After every env strip, which would otherwise drop the marker.
         let tree = crate::serve::proctree::apply(&mut cmd);
 
@@ -762,7 +761,7 @@ impl AgentProc {
             });
         }
 
-        let proc = Self::from_child(cmd.spawn()?, tree)?;
+        let proc = Self::from_child(cmd.spawn()?, tree, Some(run_env))?;
         let gate = gate.bind(proc.process_group_id());
         Ok((proc, gate))
     }
@@ -770,6 +769,7 @@ impl AgentProc {
     fn from_child(
         mut child: Child,
         mut tree: crate::serve::proctree::TreeHandle,
+        run_env: Option<crate::serve::runner::ManagedRunEnv>,
     ) -> std::io::Result<Self> {
         // `Child::id()` becomes `None` after `try_wait()` observes leader
         // exit, but descendants may still hold the process group's pipes.
@@ -803,6 +803,7 @@ impl AgentProc {
             diagnostics,
             failures,
             stderr_task: Some(stderr_task),
+            _run_env: run_env,
         })
     }
 
@@ -1062,6 +1063,7 @@ impl AgentProc {
             diagnostics,
             failures,
             stderr_task: None,
+            _run_env: None,
         }
     }
 
@@ -1297,32 +1299,11 @@ enum RestrictedMode {
     Planner,
 }
 
-/// The agent MCP is capability-scoped by the run bearer. Do not let a
-/// managed provider inherit unrelated operator credentials: the run must
-/// never acquire ambient GitHub or Quorum-home authority merely because the
-/// daemon happens to hold it.
-fn strip_managed_mcp_authority(cmd: &mut Command) {
-    for name in [
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "QUORUM_HOME",
-        "GH_CONFIG_DIR",
-        "QUORUM_ORCHESTRATOR_TOKEN",
-    ] {
-        cmd.env_remove(name);
-    }
-}
-
+/// A tool-less planner holds no run envelope at all. GitHub, Quorum-home and
+/// operator authority is removed for every managed spawn by
+/// `runner::ManagedRunEnv`; this removes the remaining coordination names.
 fn strip_coordination_env(cmd: &mut Command) {
-    for name in [
-        "QUORUM_AGENT",
-        "QUORUM_HOME",
-        "QUORUM_REPO",
-        "QUORUM_RUN_ID",
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "QUORUM_ORCHESTRATOR_TOKEN",
-    ] {
+    for name in ["QUORUM_AGENT", "QUORUM_REPO", "QUORUM_RUN_ID"] {
         cmd.env_remove(name);
     }
 }
@@ -1370,7 +1351,7 @@ mod tests {
         }
         // Marked exactly like the production spawn paths.
         let tree = crate::serve::proctree::apply(&mut command);
-        AgentProc::from_child(command.spawn().unwrap(), tree).unwrap()
+        AgentProc::from_child(command.spawn().unwrap(), tree, None).unwrap()
     }
 
     /// The claude CLI rejects any non-UUID --session-id before the first turn;
@@ -1606,6 +1587,7 @@ mod tests {
             environment,
             mode,
             continuation_id: None,
+            managed: None,
         }
     }
 
@@ -1789,15 +1771,10 @@ mod tests {
             captured.contains("endpoint=/tmp/quorum-agent.sock\n"),
             "{captured}"
         );
-        for absent in [
-            "gh=\n",
-            "github=\n",
-            "quorum_home=\n",
-            "gh_config=\n",
-            "orchestrator=\n",
-        ] {
+        for absent in ["gh=\n", "github=\n", "quorum_home=\n", "orchestrator=\n"] {
             assert!(captured.contains(absent), "{captured}");
         }
+        crate::serve::runner::assert_run_private_gh_config(&captured, "/ambient/gh-config");
     }
 
     #[tokio::test]

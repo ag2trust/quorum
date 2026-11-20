@@ -487,7 +487,12 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
     assert_eq!(capabilities["tools"]["listChanged"], true);
 
     let initial = worker.request(2, "tools/list", json!({}));
-    assert_eq!(tool_names(&initial), vec!["delivery_report_write"]);
+    // stdio advertises the same signalling tools as HTTP, so a stdio
+    // provider never needs a shell fallback for a signal its role relies on.
+    assert_eq!(
+        tool_names(&initial),
+        vec!["delivery_report_write", "submit_work", "react", "task_note"]
+    );
     let schema = &initial["result"]["tools"][0]["inputSchema"];
     assert_eq!(schema["additionalProperties"], false);
     assert_eq!(
@@ -546,6 +551,14 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
     );
     assert_eq!(not_a_planner["error"]["code"], -32601);
     assert_eq!(not_a_planner["error"]["message"], "unknown tool");
+    // A signalling tool outside the listed phase inventory is unknown too.
+    let not_a_reviewer = worker.request(
+        22,
+        "tools/call",
+        json!({"name":"alert_owner","arguments":{"body":"must not post"}}),
+    );
+    assert_eq!(not_a_reviewer["error"]["code"], -32601);
+    assert_eq!(not_a_reviewer["error"]["message"], "unknown tool");
 
     let resources = worker.request(6, "resources/list", json!({}));
     assert_eq!(resources["error"]["code"], -32601);
@@ -569,7 +582,10 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
             "add_issue_comment",
             "add_reply_to_pull_request_comment",
             "github_operation_read",
-            "delivery_report_write"
+            "delivery_report_write",
+            "submit_work",
+            "react",
+            "task_note"
         ]
     );
 
@@ -665,8 +681,33 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
             "add_comment_to_pending_review",
             "add_reply_to_pull_request_comment",
             "resolve_review_thread",
-            "github_operation_read"
+            "github_operation_read",
+            "submit_review",
+            "task_note",
+            "alert_owner"
         ]
+    );
+    // A stdio provider signals through the endpoint exactly as over HTTP.
+    let noted = reviewer.request(
+        23,
+        "tools/call",
+        json!({"name":"task_note","arguments":{"note":"stdio reviewer note"}}),
+    );
+    assert_eq!(noted["result"]["isError"], false, "{noted:#}");
+    let note_id = serde_json::from_str::<Value>(tool_text(&noted)).unwrap()["note_id"]
+        .as_i64()
+        .expect("task_note answers its note id");
+    let (task_id, author, body): (i64, String, String) = quorum_core::db::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT task_id, agent, body FROM task_notes WHERE id = ?1",
+            [note_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (task_id, author.as_str(), body.as_str()),
+        (201, "Reviewer", "stdio reviewer note")
     );
     let pull_request_read = &tool(&reviewer_tools, "pull_request_read")["inputSchema"];
     // Paging is page/perPage only; no cursor is advertised.

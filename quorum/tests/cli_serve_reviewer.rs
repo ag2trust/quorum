@@ -245,6 +245,18 @@ impl ServeHandle {
         merge_cmd: &str,
         mergeability_cmd: Option<&str>,
     ) -> Self {
+        Self::start_with_env(home, repo, wt_base, names, merge_cmd, mergeability_cmd, &[])
+    }
+
+    fn start_with_env(
+        home: &std::path::Path,
+        repo: &std::path::Path,
+        wt_base: &std::path::Path,
+        names: &std::path::Path,
+        merge_cmd: &str,
+        mergeability_cmd: Option<&str>,
+        extra_env: &[(&str, String)],
+    ) -> Self {
         let sentinel = tempfile::tempdir().unwrap();
         let sentinel_path = sentinel.path().to_string_lossy().to_string();
         let gh_shim = tempfile::tempdir().unwrap();
@@ -286,11 +298,40 @@ elif [ "$cmd" = "pr view" ]; then
   if [ -f "$force_after_view" ]; then
     next_sha="$(cat "$force_after_view")"
     rm "$force_after_view"
-    printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
+    printf '{"number":%s,"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$pr" "$branch" "$sha"
     git -C "$QUORUM_TEST_REPO" update-ref "refs/heads/$branch" "$next_sha"
     exit 0
   fi
-  printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
+  printf '{"number":%s,"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$pr" "$branch" "$sha"
+elif [ "${1:-}" = "api" ] && [ "${2:-}" = "--method" ]; then
+  # Agent MCP collaboration writes, as the daemon executor sends them.
+  printf '%s\n' "$*" >> "$QUORUM_TEST_GH_STATE/mcp-writes.log"
+  case "${4:-}" in
+    repos/test/repo/issues/*/comments)
+      cat > "$QUORUM_TEST_GH_STATE/issue-comment.json"
+      printf '{"id":4242,"html_url":"https://github.com/test/repo/pull/1#issuecomment-4242"}'
+      ;;
+    repos/test/repo/pulls/*/reviews)
+      cat > "$QUORUM_TEST_GH_STATE/review-create.json"
+      printf '{"id":9001,"node_id":"PRR_kwDOfake9001","pull_request_url":"https://api.github.com/repos/test/repo/pulls/1","state":"PENDING",'
+      tail -c +2 "$QUORUM_TEST_GH_STATE/review-create.json"
+      ;;
+    repos/test/repo/pulls/*/reviews/9001/events)
+      cat > "$QUORUM_TEST_GH_STATE/review-submit.json"
+      commit="$(sed -n 's/.*"commit_id":"\([0-9a-f]*\)".*/\1/p' "$QUORUM_TEST_GH_STATE/review-create.json")"
+      printf '{"id":9001,"node_id":"PRR_kwDOfake9001","pull_request_url":"https://api.github.com/repos/test/repo/pulls/1","commit_id":"%s","state":"COMMENTED",' "$commit"
+      tail -c +2 "$QUORUM_TEST_GH_STATE/review-submit.json"
+      ;;
+    *) printf 'unsupported gh invocation: %s\n' "$*" >&2; exit 1 ;;
+  esac
+elif [ "${1:-}" = "api" ] && [ "${2:-}" = "repos/test/repo/pulls/1/files?per_page=10&page=1" ]; then
+  printf '[]'
+elif [ "${1:-} ${2:-}" = "api --paginate" ]; then
+  # The daemon's pending-review probe: the publisher holds no draft.
+  case "${3:-}" in
+    repos/*/pulls/*/reviews\?per_page=100) ;;
+    *) printf 'unsupported gh invocation: %s\n' "$*" >&2; exit 1 ;;
+  esac
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1
@@ -334,6 +375,11 @@ fi
             .env("PATH", path)
             .env("QUORUM_TEST_GH_STATE", &gh_state)
             .env("QUORUM_TEST_REPO", repo)
+            .envs(
+                extra_env
+                    .iter()
+                    .map(|(name, value)| (*name, value.as_str())),
+            )
             .args(&args)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -2054,5 +2100,295 @@ fn already_merged_pr_closes_task_without_reviewer() {
         "task must be done after PrFoundMerged, got: {stdout}"
     );
 
+    handle.stop();
+}
+
+/// One JSON-RPC request to the daemon-served agent MCP, authorized by a run
+/// capability as its bearer, over a fresh HTTP/1.1 connection.
+fn agent_mcp_rpc(
+    addr: &str,
+    capability: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    use std::io::Read;
+    let body =
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string();
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nAccept: application/json, text/event-stream\r\n\
+         Authorization: Bearer {capability}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    let (head, body) = raw
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("malformed HTTP response: {raw:?}"));
+    assert!(head.starts_with("HTTP/1.1 200"), "{method}: {raw}");
+    serde_json::from_str(body).unwrap_or_else(|error| panic!("{method}: {error}: {body:?}"))
+}
+
+/// Call one agent MCP tool and decode its single JSON text result.
+fn agent_mcp_call(
+    addr: &str,
+    capability: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> (bool, serde_json::Value) {
+    let response = agent_mcp_rpc(
+        addr,
+        capability,
+        "tools/call",
+        serde_json::json!({"name": name, "arguments": arguments}),
+    );
+    let result = &response["result"];
+    let text = result["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{name}: no tool result: {response:#}"));
+    (
+        result["isError"] == true,
+        serde_json::from_str(text).unwrap_or_else(|error| panic!("{name}: {error}: {text:?}")),
+    )
+}
+
+fn active_run_capability(home: &std::path::Path, agent: &str) -> String {
+    let conn = quorum_core::db::open(&home.join("repos/test__repo/quorum.db")).unwrap();
+    quorum_core::capabilities::active_for_agent(&conn, agent)
+        .unwrap()
+        .unwrap_or_else(|| panic!("{agent} holds no active run capability"))
+        .run_id
+}
+
+/// The rendered prompt a managed reviewer received, from fake-agent's log.
+fn logged_prompt(log: &std::path::Path, needle: &str) -> String {
+    std::fs::read_to_string(log)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|turn| turn["message"]["content"].as_str().map(str::to_owned))
+        .rfind(|content| content.contains(needle))
+        .unwrap_or_else(|| panic!("no logged prompt contains {needle:?}"))
+}
+
+/// Task #458: a managed review on a fixture PR completes using only agent MCP
+/// tools. The rendered R1/R2 prompts name the MCP tools and no `gh`/`quorum`
+/// command; the worker and both reviewers then act only through the
+/// daemon-served agent MCP (backed by a fake `gh` repository service), and
+/// the daemon alone merges.
+#[test]
+fn managed_review_completes_using_only_agent_mcp_tools() {
+    const REVIEWER_TOOLS: &[&str] = &[
+        "pull_request_read",
+        "add_issue_comment",
+        "pull_request_review_write",
+        "add_comment_to_pending_review",
+        "add_reply_to_pull_request_comment",
+        "resolve_review_thread",
+        "github_operation_read",
+        "submit_review",
+        "alert_owner",
+    ];
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+    assert!(Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap()
+        .success());
+    seed_task(home.path(), "Task for MCP-only review");
+    let prompt_log = home.path().join("prompts.jsonl");
+    let mut handle = ServeHandle::start_with_env(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        None,
+        &[(
+            "FAKE_AGENT_PROMPT_LOG",
+            prompt_log.to_string_lossy().into_owned(),
+        )],
+    );
+    assert!(
+        handle.wait_for("managed runs use http://", 15),
+        "agent MCP listener not bound: {:?}",
+        handle.lines
+    );
+    let addr = handle
+        .lines
+        .iter()
+        .find_map(|line| line.split("managed runs use http://").nth(1))
+        .and_then(|rest| rest.strip_suffix("/mcp"))
+        .expect("agent MCP URL")
+        .to_string();
+
+    assert!(handle.wait_for("spawning agent", 15), "{:?}", handle.lines);
+    assert!(handle.wait_for("result", 15), "{:?}", handle.lines);
+    let worker = handle.extract_agent_name("spawning agent ").unwrap();
+    let (is_error, signal) = agent_mcp_call(
+        &addr,
+        &active_run_capability(home.path(), &worker),
+        "submit_work",
+        serde_json::json!({}),
+    );
+    assert!(!is_error, "submit_work: {signal}");
+
+    // R1: the rendered prompt, then a full review through MCP tools only.
+    assert!(
+        handle.wait_for("spawning reviewer", 15),
+        "{:?}",
+        handle.lines
+    );
+    let r1 = handle.extract_agent_name("spawning reviewer ").unwrap();
+    assert!(handle.wait_for("result", 15), "{:?}", handle.lines);
+    let r1_prompt = logged_prompt(&prompt_log, &format!("You are reviewer agent {r1}"));
+    let r1_cap = active_run_capability(home.path(), &r1);
+    let tools = agent_mcp_rpc(&addr, &r1_cap, "tools/list", serde_json::json!({}));
+    let advertised: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no tool list: {tools:#}"))
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    for tool in REVIEWER_TOOLS {
+        assert!(
+            advertised.contains(tool),
+            "{tool} not advertised: {advertised:?}"
+        );
+        assert!(
+            r1_prompt.contains(&format!("`{tool}`")),
+            "R1 prompt must name `{tool}`: {r1_prompt}"
+        );
+    }
+    for forbidden in [
+        "`gh ",
+        "`quorum ",
+        "quorum submit",
+        "quorum post",
+        "--verdict",
+    ] {
+        assert!(
+            !r1_prompt.contains(forbidden),
+            "R1 prompt embeds {forbidden:?}: {r1_prompt}"
+        );
+    }
+
+    let target = serde_json::json!({"owner":"test","repo":"repo","pullNumber":1});
+    let with = |extra: serde_json::Value| {
+        let mut arguments = target.clone();
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        arguments
+    };
+    let (is_error, read) = agent_mcp_call(
+        &addr,
+        &r1_cap,
+        "pull_request_read",
+        with(serde_json::json!({"method":"get_files","page":1,"perPage":10})),
+    );
+    assert!(!is_error && read["state"] == "succeeded", "{read:#}");
+    let head_sha: String = quorum_core::db::open(&home.path().join("repos/test__repo/quorum.db"))
+        .unwrap()
+        .query_row(
+            "SELECT review_head_sha FROM agent_runs WHERE review_cap_run_id=?1",
+            [&r1_cap],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let (is_error, create) = agent_mcp_call(
+        &addr,
+        &r1_cap,
+        "pull_request_review_write",
+        with(serde_json::json!({"method":"create","commitID":head_sha})),
+    );
+    assert!(!is_error && create["state"] == "succeeded", "{create:#}");
+    let (is_error, comment) = agent_mcp_call(
+        &addr,
+        &r1_cap,
+        "add_issue_comment",
+        serde_json::json!({"owner":"test","repo":"repo","issue_number":1,
+                           "body":"FOLLOW-UP: none."}),
+    );
+    assert!(!is_error && comment["state"] == "succeeded", "{comment:#}");
+    let (is_error, submit) = agent_mcp_call(
+        &addr,
+        &r1_cap,
+        "pull_request_review_write",
+        with(
+            serde_json::json!({"method":"submit_pending","event":"COMMENT",
+                                "body":"BLOCKING: 0\nFOLLOW-UP: 0"}),
+        ),
+    );
+    assert!(!is_error && submit["state"] == "succeeded", "{submit:#}");
+    assert_eq!(submit["result"]["state"], "COMMENTED", "{submit:#}");
+    let (is_error, verdict) = agent_mcp_call(
+        &addr,
+        &r1_cap,
+        "submit_review",
+        serde_json::json!({"verdict":"approved","blocking":0}),
+    );
+    assert!(!is_error, "R1 submit_review: {verdict}");
+
+    // R2: its rendered prompt is MCP-only too, and its verdict is an MCP call.
+    assert!(
+        handle.wait_for("R2: pre-merge reviewer", 15),
+        "{:?}",
+        handle.lines
+    );
+    let r2 = handle
+        .extract_agent_name("R2: pre-merge reviewer ")
+        .expect("R2 reviewer name");
+    assert!(handle.wait_for("result", 15), "{:?}", handle.lines);
+    let r2_prompt = logged_prompt(&prompt_log, &format!("You are R2 reviewer {r2}"));
+    for tool in REVIEWER_TOOLS {
+        assert!(
+            r2_prompt.contains(&format!("`{tool}`")),
+            "R2 prompt must name `{tool}`: {r2_prompt}"
+        );
+    }
+    assert!(!r2_prompt.contains("`gh ") && !r2_prompt.contains("`quorum "));
+    let (is_error, verdict) = agent_mcp_call(
+        &addr,
+        &active_run_capability(home.path(), &r2),
+        "submit_review",
+        serde_json::json!({"verdict":"approved","blocking":0}),
+    );
+    assert!(!is_error, "R2 submit_review: {verdict}");
+
+    assert!(handle.wait_for("merged", 15), "{:?}", handle.lines);
+    assert!(wait_for_task_status(home.path(), 1, "done", 15));
+
+    // The only GitHub writes were the reviewer's COMMENT review and comment,
+    // sent by the daemon executor; no agent issued a formal review or merge.
+    let writes = std::fs::read_to_string(
+        handle
+            ._gh_shim
+            .as_ref()
+            .unwrap()
+            .path()
+            .join("state/mcp-writes.log"),
+    )
+    .unwrap();
+    assert_eq!(
+        writes.lines().collect::<Vec<_>>(),
+        [
+            "api --method POST repos/test/repo/pulls/1/reviews --input -",
+            "api --method POST repos/test/repo/issues/1/comments --input -",
+            "api --method POST repos/test/repo/pulls/1/reviews/9001/events --input -",
+        ]
+    );
     handle.stop();
 }
