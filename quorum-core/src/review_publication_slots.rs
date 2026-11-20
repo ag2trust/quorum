@@ -1131,6 +1131,10 @@ pub enum CleanupOutcome {
     Lost,
 }
 
+/// `(pending_review_id, create_send_state, review_owner_marker,
+/// cleanup_deadline_at)` of a still-held cleanup claim.
+type HeldCleanup = (Option<String>, String, Option<String>, Option<i64>);
+
 /// Apply one cleanup observation to the current claim.
 ///
 /// Release proofs are exactly: a marker-verified exact delete or exact-ID
@@ -1158,7 +1162,7 @@ pub fn complete_cleanup(
     let tx = begin_immediate(conn)?;
     let scope = claim.publisher_scope.as_str();
     let pr_number = claim.pr_number;
-    let held: Option<(Option<String>, String, Option<String>, Option<i64>)> = tx
+    let held: Option<HeldCleanup> = tx
         .query_row(
             "SELECT pending_review_id, create_send_state, review_owner_marker,
                     cleanup_deadline_at
