@@ -37,6 +37,11 @@ pub const MAX_NONEXPIRED_OPERATIONS_PER_ATTEMPT: i64 = 128;
 pub const MAX_NONEXPIRED_OPERATIONS_PER_TASK: i64 = 512;
 /// Fixed cap on retained GitHub operations in the repository database.
 pub const MAX_NONEXPIRED_OPERATIONS_PER_REPOSITORY: i64 = 4_096;
+/// Fixed cap on inline findings in one reviewer attempt's pending review.
+pub const MAX_REVIEW_INLINE_COMMENTS: i64 = 50;
+/// Fixed byte cap on every pending-review body: each inline finding and the
+/// review summary (create and `submit_pending`).
+pub const MAX_REVIEW_BODY_BYTES: usize = 32 * 1024;
 
 macro_rules! bounded_text {
     ($name:ident, $label:literal, $max:expr) => {
@@ -202,7 +207,9 @@ pub enum CollaborationAdmissionField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum CollaborationAdmissionError {
-    InvalidField { field: CollaborationAdmissionField },
+    InvalidField {
+        field: CollaborationAdmissionField,
+    },
     CapabilityRejected,
     AttemptNotFound,
     AttemptNotActive,
@@ -222,6 +229,31 @@ pub enum CollaborationAdmissionError {
     RepositoryOperationLimitReached,
     OperationDeadlineInvalid,
     OperationNotFound,
+    /// A pending-review operation was requested outside a reviewer attempt.
+    ReviewRoleRejected,
+    /// An inline finding or summary body exceeds [`MAX_REVIEW_BODY_BYTES`].
+    ReviewBodyTooLarge,
+    /// The pending review already holds [`MAX_REVIEW_INLINE_COMMENTS`] findings.
+    ReviewInlineLimitReached,
+    /// An inline finding or submit arrived before the review's `create`.
+    ReviewNotCreated,
+    /// A second `create` for an attempt whose review already exists.
+    ReviewAlreadyCreated,
+    /// An inline finding or second submit after the review was sealed.
+    ReviewSealed,
+    /// Verdict proof: the attempt's review has not been sealed by a submit.
+    ReviewNotSealed,
+    /// Verdict proof: the final review-sequence row is not `submit_pending`.
+    ReviewFinalOperationInvalid,
+    /// Verdict proof: some sequence through the final submit is missing, not
+    /// yet succeeded, failed, cancelled, or completed after revocation.
+    ReviewSequenceIncomplete,
+    /// Verdict proof: the launch SHA differs from the freshly fetched PR head.
+    ReviewHeadMismatch,
+    /// Publication-failed verdict: a review-sequence row is still in flight.
+    ReviewPublicationPending,
+    /// Publication-failed verdict: no review-sequence row has failed.
+    ReviewPublicationNotFailed,
 }
 
 /// JSON text valid for a closed `github_agent_operations` request. The value is
@@ -1218,10 +1250,23 @@ fn transition_active_attempt(
         ));
     }
     let tx = begin_immediate(conn)?;
-    let authority = match resolve_attempt_authority(&tx, request)? {
+    let result = transition_active_attempt_in_tx(&tx, request, target, now)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+/// The guarded terminal/suspend transition shared by the lifecycle wrappers
+/// and [`admit_review_verdict_in_tx`]. The caller holds `BEGIN IMMEDIATE` and
+/// commits whatever this returns, including a typed rejection.
+fn transition_active_attempt_in_tx(
+    tx: &Connection,
+    request: &CreateCollaborationAttemptRequest,
+    target: CollaborationAttemptState,
+    now: i64,
+) -> Result<CollaborationAttemptTransitionResult> {
+    let authority = match resolve_attempt_authority(tx, request)? {
         AttemptAuthority::Authorized(authority) => *authority,
         AttemptAuthority::Rejected(rejection) => {
-            tx.commit()?;
             return Ok(CollaborationAttemptTransitionResult::Rejected(rejection));
         }
     };
@@ -1253,12 +1298,11 @@ fn transition_active_attempt(
         )
         .optional()?;
     if let Some(transitioned) = transitioned {
-        tx.commit()?;
         return Ok(CollaborationAttemptTransitionResult::Transitioned(
             transitioned,
         ));
     }
-    let rejection = match get_attempt(&tx, request.attempt_id())? {
+    let rejection = match get_attempt(tx, request.attempt_id())? {
         Some(existing) if existing.expires_at <= now => CollaborationAdmissionError::AttemptExpired,
         Some(existing) if !request_matches_attempt(request, &existing) => {
             CollaborationAdmissionError::AttemptBindingMismatch
@@ -1266,8 +1310,165 @@ fn transition_active_attempt(
         Some(_) => CollaborationAdmissionError::AttemptNotActive,
         None => CollaborationAdmissionError::AttemptNotFound,
     };
-    tx.commit()?;
     Ok(CollaborationAttemptTransitionResult::Rejected(rejection))
+}
+
+closed_text_enum!(ReviewPublicationFailure, "review publication failure", {
+    OperationFailed => "operation_failed",
+});
+
+/// What a reviewer verdict asserts about its attempt's COMMENT review.
+#[derive(Debug, Clone, Copy)]
+pub enum ReviewVerdictEvidence<'a> {
+    /// The review is fully published. `fetched_head_sha` is the remote PR head
+    /// the daemon fetched, outside any transaction, immediately before proof.
+    Published {
+        fetched_head_sha: &'a ReviewerHeadSha,
+    },
+    /// Publication failed. The reason must be borne out by durable outbox
+    /// state: nothing in the sequence is still in flight and a row failed.
+    PublicationFailed { reason: ReviewPublicationFailure },
+}
+
+/// Admit a reviewer verdict for the exact current attempt and complete it, in
+/// one `BEGIN IMMEDIATE`. See [`admit_review_verdict_in_tx`].
+pub fn admit_review_verdict(
+    conn: &mut Connection,
+    request: &CreateCollaborationAttemptRequest,
+    evidence: ReviewVerdictEvidence<'_>,
+    now: i64,
+) -> Result<CollaborationAttemptTransitionResult> {
+    if now < 0 {
+        return Err(QuorumError::Usage(
+            "review verdict admission timestamp is invalid".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let result = admit_review_verdict_in_tx(&tx, request, evidence, now)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+/// The reviewer verdict guard. The caller holds `BEGIN IMMEDIATE` (so a
+/// lifecycle submit can record its verdict in the same transaction) and
+/// commits whatever this returns; no network call happens here.
+///
+/// The exact attempt must still be the live, authority-revalidated binding of
+/// `request`. For [`ReviewVerdictEvidence::Published`] the attempt must be
+/// sealed, its final sequence must be `submit_pending`, every sequence from
+/// `0` through that final submit must have `succeeded` without
+/// `completed_after_revocation`, and the immutable launch SHA must equal the
+/// freshly fetched head. For [`ReviewVerdictEvidence::PublicationFailed`] no
+/// review-sequence row may be queued or running and at least one must have
+/// failed. On success the attempt becomes `completed` with `active_run_id`
+/// cleared — the transition that releases its live retention pin. Every
+/// refusal, including a lost race, is a typed clean negative.
+pub fn admit_review_verdict_in_tx(
+    tx: &Connection,
+    request: &CreateCollaborationAttemptRequest,
+    evidence: ReviewVerdictEvidence<'_>,
+    now: i64,
+) -> Result<CollaborationAttemptTransitionResult> {
+    let reject = |rejection| Ok(CollaborationAttemptTransitionResult::Rejected(rejection));
+    if request.role() != CollaborationRole::Reviewer {
+        return reject(CollaborationAdmissionError::ReviewRoleRejected);
+    }
+    if let AttemptAuthority::Rejected(rejection) = resolve_attempt_authority(tx, request)? {
+        return reject(rejection);
+    }
+    let Some(existing) = get_attempt(tx, request.attempt_id())? else {
+        return reject(CollaborationAdmissionError::AttemptNotFound);
+    };
+    if existing.expires_at <= now {
+        return reject(CollaborationAdmissionError::AttemptExpired);
+    }
+    if !request_matches_attempt(request, &existing) {
+        return reject(CollaborationAdmissionError::AttemptBindingMismatch);
+    }
+    if existing.state != CollaborationAttemptState::Active {
+        return reject(CollaborationAdmissionError::AttemptNotActive);
+    }
+    if existing.active_run_id.as_deref() != Some(request.active_run_id().as_str()) {
+        return reject(CollaborationAdmissionError::CapabilityRejected);
+    }
+    if let Some(rejection) = review_verdict_proof_rejection(
+        tx,
+        request.attempt_id(),
+        existing.head_sha.as_deref(),
+        evidence,
+    )? {
+        return reject(rejection);
+    }
+    transition_active_attempt_in_tx(tx, request, CollaborationAttemptState::Completed, now)
+}
+
+fn review_verdict_proof_rejection(
+    tx: &Connection,
+    attempt_id: &CollaborationAttemptId,
+    launch_sha: Option<&str>,
+    evidence: ReviewVerdictEvidence<'_>,
+) -> Result<Option<CollaborationAdmissionError>> {
+    match evidence {
+        ReviewVerdictEvidence::Published { fetched_head_sha } => {
+            let (sealed, next) = review_sequence_state(tx, attempt_id.as_str())?;
+            if !sealed {
+                return Ok(Some(CollaborationAdmissionError::ReviewNotSealed));
+            }
+            let final_row: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT kind, request_json FROM github_agent_operations
+                     WHERE attempt_id=?1 AND review_sequence=?2",
+                    params![attempt_id.as_str(), next - 1],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let final_is_submit = final_row.is_some_and(|(kind, json)| {
+                kind == GithubOperationKind::PullRequestReviewWrite.as_str()
+                    && review_method(&json).as_deref() == Some("submit_pending")
+            });
+            if !final_is_submit {
+                return Ok(Some(
+                    CollaborationAdmissionError::ReviewFinalOperationInvalid,
+                ));
+            }
+            // UNIQUE(attempt_id, review_sequence): `next` proven rows in
+            // [0, next) means every sequence through the submit is present
+            // and succeeded before any revocation.
+            let proven: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM github_agent_operations
+                 WHERE attempt_id=?1 AND review_sequence>=0 AND review_sequence<?2
+                   AND state='succeeded' AND completed_after_revocation=0",
+                params![attempt_id.as_str(), next],
+                |row| row.get(0),
+            )?;
+            if proven != next {
+                return Ok(Some(CollaborationAdmissionError::ReviewSequenceIncomplete));
+            }
+            if launch_sha != Some(fetched_head_sha.as_str()) {
+                return Ok(Some(CollaborationAdmissionError::ReviewHeadMismatch));
+            }
+            Ok(None)
+        }
+        ReviewVerdictEvidence::PublicationFailed {
+            reason: ReviewPublicationFailure::OperationFailed,
+        } => {
+            let (pending, failed): (i64, i64) = tx.query_row(
+                "SELECT COALESCE(SUM(state IN ('queued','running')),0),
+                        COALESCE(SUM(state='failed'),0)
+                 FROM github_agent_operations
+                 WHERE attempt_id=?1 AND review_sequence IS NOT NULL",
+                [attempt_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            Ok(if pending > 0 {
+                Some(CollaborationAdmissionError::ReviewPublicationPending)
+            } else if failed == 0 {
+                Some(CollaborationAdmissionError::ReviewPublicationNotFailed)
+            } else {
+                None
+            })
+        }
+    }
 }
 
 /// Suspend a live logical turn after interruption. The active capability is
@@ -1713,9 +1914,129 @@ fn live_context_matches_attempt(context: &LiveRunContext, attempt: &AttemptBindi
         && context.review_revision.as_deref() == attempt.head_sha.as_deref()
 }
 
+/// One position in a reviewer attempt's durable pending-review sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewStep {
+    Create,
+    Inline,
+    Submit,
+}
+
+fn review_method(request_json: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(request_json).ok()?;
+    parsed.get("method")?.as_str().map(str::to_owned)
+}
+
+/// Classify and bound a pending-review request. `Ok(None)` is an operation
+/// outside the review sequence. Pure: runs before the admission transaction.
+fn review_step(
+    request: &EnqueueGithubOperationRequest,
+) -> std::result::Result<Option<ReviewStep>, CollaborationAdmissionError> {
+    let invalid = CollaborationAdmissionError::InvalidField {
+        field: CollaborationAdmissionField::RequestJson,
+    };
+    let kind = request.kind();
+    if !matches!(
+        kind,
+        GithubOperationKind::PullRequestReviewWrite
+            | GithubOperationKind::AddCommentToPendingReview
+    ) {
+        return Ok(None);
+    }
+    if request.role() != CollaborationRole::Reviewer {
+        return Err(CollaborationAdmissionError::ReviewRoleRejected);
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(request.request_json().as_str()).map_err(|_| invalid)?;
+    let object = parsed.as_object().ok_or(invalid)?;
+    let text = |key: &str| object.get(key).and_then(serde_json::Value::as_str);
+    let step = if kind == GithubOperationKind::AddCommentToPendingReview {
+        ReviewStep::Inline
+    } else {
+        match text("method") {
+            Some("create") => ReviewStep::Create,
+            Some("submit_pending") if text("event") == Some("COMMENT") => ReviewStep::Submit,
+            _ => return Err(invalid),
+        }
+    };
+    match (step, object.get("body")) {
+        (_, Some(serde_json::Value::String(body))) => {
+            if body.trim().is_empty() {
+                return Err(invalid);
+            }
+            if body.len() > MAX_REVIEW_BODY_BYTES {
+                return Err(CollaborationAdmissionError::ReviewBodyTooLarge);
+            }
+        }
+        (ReviewStep::Create, None) => {}
+        _ => return Err(invalid),
+    }
+    Ok(Some(step))
+}
+
+/// `(review_sealed, next_review_sequence)` of one attempt.
+fn review_sequence_state(tx: &Connection, attempt_id: &str) -> Result<(bool, i64)> {
+    Ok(tx.query_row(
+        "SELECT review_sealed, next_review_sequence FROM github_collaboration_attempts
+         WHERE attempt_id=?1",
+        [attempt_id],
+        |row| Ok((row.get::<_, i64>(0)? != 0, row.get(1)?)),
+    )?)
+}
+
+/// The sequence the next accepted `step` receives, or its typed refusal.
+fn next_review_sequence(
+    tx: &Connection,
+    attempt_id: &str,
+    step: ReviewStep,
+) -> Result<std::result::Result<i64, CollaborationAdmissionError>> {
+    let (sealed, next) = review_sequence_state(tx, attempt_id)?;
+    Ok(match step {
+        _ if sealed => Err(CollaborationAdmissionError::ReviewSealed),
+        ReviewStep::Create if next != 0 => Err(CollaborationAdmissionError::ReviewAlreadyCreated),
+        ReviewStep::Inline | ReviewStep::Submit if next == 0 => {
+            Err(CollaborationAdmissionError::ReviewNotCreated)
+        }
+        // Sequence 0 is the create, so `next - 1` inline findings exist.
+        ReviewStep::Inline if next > MAX_REVIEW_INLINE_COMMENTS => {
+            Err(CollaborationAdmissionError::ReviewInlineLimitReached)
+        }
+        _ => Ok(next),
+    })
+}
+
+/// Advance the attempt past `sequence`, sealing it for a submit. Guarded on
+/// the exact value read in this same transaction.
+fn advance_review_sequence(
+    tx: &Connection,
+    attempt_id: &str,
+    sequence: i64,
+    step: ReviewStep,
+    now: i64,
+) -> Result<()> {
+    let changed = tx.execute(
+        "UPDATE github_collaboration_attempts
+         SET next_review_sequence=?2+1, review_sealed=?3, updated_at=?4
+         WHERE attempt_id=?1 AND next_review_sequence=?2 AND review_sealed=0",
+        params![
+            attempt_id,
+            sequence,
+            i64::from(step == ReviewStep::Submit),
+            now
+        ],
+    )?;
+    if changed != 1 {
+        return Err(QuorumError::Io(
+            "review sequence changed inside its admission transaction".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn insert_operation(
     tx: &Transaction<'_>,
     request: &EnqueueGithubOperationRequest,
+    review_sequence: Option<i64>,
     attempt_expires_at: i64,
     now: i64,
 ) -> Result<GithubOperationStatus> {
@@ -1724,9 +2045,9 @@ fn insert_operation(
              operation_id, client_request_id, attempt_id, created_by_run_id,
              task_id, agent, role, pr_number, head_sha, kind, request_json,
              state, send_state, attempts, deadline_at, github_marker,
-             created_at, updated_at, expires_at
+             created_at, updated_at, expires_at, review_sequence
          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'queued','not_started',
-                   0,?12,?13,?14,?14,?15)",
+                   0,?12,?13,?14,?14,?15,?16)",
         params![
             request.operation_id().as_str(),
             request.client_request_id().as_str(),
@@ -1743,6 +2064,7 @@ fn insert_operation(
             request.github_marker().map(GithubMarker::as_str),
             now,
             attempt_expires_at,
+            review_sequence,
         ],
     )?;
     Ok(GithubOperationStatus {
@@ -1778,9 +2100,15 @@ fn insert_operation(
 ///  6. Return the existing row if one already matches the deterministic
 ///     `(attempt_id, client_request_id)` identity: identical retries are
 ///     idempotent by design.
-///  7. Enforce per-run, per-attempt, per-task and per-repository retained
+///  7. For pending-review kinds (validated and body-bounded before the
+///     transaction; reviewer attempts only), assign the next durable review
+///     sequence: `create` gets 0, each inline finding the next value (at most
+///     [`MAX_REVIEW_INLINE_COMMENTS`]), and `submit_pending` the final value.
+///     After sealing, inline findings and a second submit are typed refusals.
+///  8. Enforce per-run, per-attempt, per-task and per-repository retained
 ///     operation caps and reject with a typed capacity outcome if any fires.
-///  8. Insert the durable row.
+///  9. Insert the durable row and, for a review step, advance the attempt's
+///     `next_review_sequence` (setting `review_sealed=1` for the submit).
 pub fn admit_operation(
     conn: &mut Connection,
     caller_run_id: &str,
@@ -1828,6 +2156,10 @@ pub fn admit_operation(
             CollaborationAdmissionError::OperationIdentityMismatch,
         ));
     }
+    let review = match review_step(request) {
+        Ok(review) => review,
+        Err(rejection) => return Ok(GithubOperationAdmissionResult::Rejected(rejection)),
+    };
 
     let tx = begin_immediate(conn)?;
 
@@ -1903,12 +2235,30 @@ pub fn admit_operation(
         return Ok(GithubOperationAdmissionResult::Existing(existing));
     }
 
+    let review_sequence = match review {
+        None => None,
+        Some(step) => match next_review_sequence(&tx, request.attempt_id().as_str(), step)? {
+            Ok(sequence) => Some((step, sequence)),
+            Err(rejection) => {
+                tx.commit()?;
+                return Ok(GithubOperationAdmissionResult::Rejected(rejection));
+            }
+        },
+    };
+
     if let Some(rejection) = operation_capacity_rejection(&tx, request)? {
         tx.commit()?;
         return Ok(GithubOperationAdmissionResult::Rejected(rejection));
     }
 
-    let status = match insert_operation(&tx, request, attempt.expires_at, now) {
+    let inserted = insert_operation(
+        &tx,
+        request,
+        review_sequence.map(|(_, sequence)| sequence),
+        attempt.expires_at,
+        now,
+    );
+    let status = match inserted {
         Ok(status) => status,
         Err(QuorumError::Db(rusqlite::Error::SqliteFailure(failure, _)))
             if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
@@ -1928,6 +2278,9 @@ pub fn admit_operation(
         }
         Err(error) => return Err(error),
     };
+    if let Some((step, sequence)) = review_sequence {
+        advance_review_sequence(&tx, request.attempt_id().as_str(), sequence, step, now)?;
+    }
     tx.commit()?;
     Ok(GithubOperationAdmissionResult::Enqueued(status))
 }
@@ -4288,6 +4641,608 @@ mod tests {
                 "round {round} task lifecycle must not move"
             );
         }
+    }
+
+    // ---- task #446: pending-review sequence, seal, and verdict proof ----
+
+    const REVIEW_RUN: &str = "run-review";
+    const REVIEW_ATTEMPT: &str = "att-review";
+    const REVIEW_NOW: i64 = 30;
+
+    fn setup_review() -> (
+        tempfile::TempDir,
+        Connection,
+        CreateCollaborationAttemptRequest,
+    ) {
+        let (dir, mut conn) = open_tmp();
+        insert_live_reviewer(&mut conn, REVIEW_RUN);
+        let attempt = reviewer_request(REVIEW_ATTEMPT, REVIEW_RUN, REVIEW_SHA);
+        assert!(matches!(
+            issue_attempt(&mut conn, &attempt, 20).unwrap(),
+            CollaborationAttemptAdmissionResult::Created(_)
+        ));
+        (dir, conn, attempt)
+    }
+
+    fn review_op(
+        client_request_id: &str,
+        kind: GithubOperationKind,
+        json: &str,
+    ) -> EnqueueGithubOperationRequest {
+        let attempt = CollaborationAttemptId::new(REVIEW_ATTEMPT).unwrap();
+        let client = ClientRequestId::new(client_request_id).unwrap();
+        EnqueueGithubOperationRequest::new(
+            derive_operation_id(&attempt, &client),
+            client.clone(),
+            attempt.clone(),
+            RunCapabilityId::new(REVIEW_RUN).unwrap(),
+            3,
+            CollaborationAgent::new("Reviewer").unwrap(),
+            CollaborationRole::Reviewer,
+            WORKER_PR,
+            Some(ReviewerHeadSha::new(REVIEW_SHA).unwrap()),
+            kind,
+            GithubOperationRequestJson::new(json).unwrap(),
+            derive_github_marker(&attempt, &client, kind),
+            999,
+            REVIEW_NOW,
+            1_000,
+        )
+        .unwrap()
+    }
+
+    fn create_op(client: &str) -> EnqueueGithubOperationRequest {
+        review_op(
+            client,
+            GithubOperationKind::PullRequestReviewWrite,
+            &format!(r#"{{"method":"create","commitID":"{REVIEW_SHA}"}}"#),
+        )
+    }
+
+    fn inline_op(client: &str, body: &str) -> EnqueueGithubOperationRequest {
+        let json = serde_json::json!({"path":"src/lib.rs","line":1,"side":"RIGHT","body":body});
+        review_op(
+            client,
+            GithubOperationKind::AddCommentToPendingReview,
+            &json.to_string(),
+        )
+    }
+
+    fn submit_op(client: &str, body: &str) -> EnqueueGithubOperationRequest {
+        let json = serde_json::json!({"method":"submit_pending","event":"COMMENT","body":body});
+        review_op(
+            client,
+            GithubOperationKind::PullRequestReviewWrite,
+            &json.to_string(),
+        )
+    }
+
+    fn admit_review(
+        conn: &mut Connection,
+        request: &EnqueueGithubOperationRequest,
+    ) -> GithubOperationAdmissionResult {
+        admit_operation(conn, REVIEW_RUN, request, REVIEW_NOW).unwrap()
+    }
+
+    fn assert_review_rejected(
+        conn: &mut Connection,
+        request: &EnqueueGithubOperationRequest,
+        expected: CollaborationAdmissionError,
+    ) {
+        let before = count_operations(conn);
+        assert_eq!(
+            admit_review(conn, request),
+            GithubOperationAdmissionResult::Rejected(expected)
+        );
+        assert_eq!(count_operations(conn), before, "{expected:?} wrote a row");
+    }
+
+    fn sequence_of(conn: &Connection, client: &str) -> Option<i64> {
+        conn.query_row(
+            "SELECT review_sequence FROM github_agent_operations WHERE client_request_id=?1",
+            [client],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn review_state(conn: &Connection) -> (bool, i64) {
+        review_sequence_state(conn, REVIEW_ATTEMPT).unwrap()
+    }
+
+    /// Admit create, one inline finding per entry of `inline`, and (when
+    /// `submit`) the sealing submit.
+    fn admit_review_sequence(conn: &mut Connection, inline: usize, submit: bool) {
+        assert!(matches!(
+            admit_review(conn, &create_op("create")),
+            GithubOperationAdmissionResult::Enqueued(_)
+        ));
+        for n in 0..inline {
+            assert!(matches!(
+                admit_review(conn, &inline_op(&format!("inline-{n}"), "finding")),
+                GithubOperationAdmissionResult::Enqueued(_)
+            ));
+        }
+        if submit {
+            assert!(matches!(
+                admit_review(conn, &submit_op("submit", "summary")),
+                GithubOperationAdmissionResult::Enqueued(_)
+            ));
+        }
+    }
+
+    /// Execute every claimable row to `succeeded` through the real executor
+    /// primitives, returning the claimed operation order by client id.
+    fn publish_all(conn: &mut Connection, now: i64) -> Vec<String> {
+        let mut order = Vec::new();
+        while let Some(won) = crate::github_operations::claim_next(conn, now).unwrap() {
+            assert!(
+                crate::github_operations::mark_execution_started(conn, &won.claim, now).unwrap()
+            );
+            let ok = crate::github_operations::Settlement::Succeeded {
+                response_json: None,
+                remote_object_id: None,
+            };
+            assert!(crate::github_operations::settle(conn, &won.claim, ok, now).unwrap());
+            order.push(won.operation.client_request_id);
+        }
+        order
+    }
+
+    fn published(sha: &str) -> ReviewerHeadSha {
+        ReviewerHeadSha::new(sha).unwrap()
+    }
+
+    fn verdict(
+        conn: &mut Connection,
+        attempt: &CreateCollaborationAttemptRequest,
+        evidence: ReviewVerdictEvidence<'_>,
+    ) -> CollaborationAttemptTransitionResult {
+        admit_review_verdict(conn, attempt, evidence, 40).unwrap()
+    }
+
+    fn assert_verdict_rejected(
+        conn: &mut Connection,
+        attempt: &CreateCollaborationAttemptRequest,
+        evidence: ReviewVerdictEvidence<'_>,
+        expected: CollaborationAdmissionError,
+    ) {
+        assert_eq!(
+            verdict(conn, attempt, evidence),
+            CollaborationAttemptTransitionResult::Rejected(expected)
+        );
+        assert_eq!(attempt_state_and_run(conn).0, "active");
+    }
+
+    fn attempt_state_and_run(conn: &Connection) -> (String, Option<String>) {
+        conn.query_row(
+            "SELECT state, active_run_id FROM github_collaboration_attempts WHERE attempt_id=?1",
+            [REVIEW_ATTEMPT],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn review_sequence_orders_create_inline_submit_and_seal_rejects_later_writes() {
+        let (_dir, mut conn, _attempt) = setup_review();
+        use CollaborationAdmissionError as E;
+        assert_review_rejected(&mut conn, &inline_op("early", "x"), E::ReviewNotCreated);
+        assert_review_rejected(&mut conn, &submit_op("early-s", "x"), E::ReviewNotCreated);
+        assert_eq!(review_state(&conn), (false, 0));
+
+        admit_review_sequence(&mut conn, 2, false);
+        assert_eq!(sequence_of(&conn, "create"), Some(0));
+        assert_eq!(sequence_of(&conn, "inline-0"), Some(1));
+        assert_eq!(sequence_of(&conn, "inline-1"), Some(2));
+        assert_eq!(review_state(&conn), (false, 3));
+        assert_review_rejected(&mut conn, &create_op("create-2"), E::ReviewAlreadyCreated);
+        // An identical retry is the existing row, not a new sequence.
+        assert!(matches!(
+            admit_review(&mut conn, &inline_op("inline-0", "finding")),
+            GithubOperationAdmissionResult::Existing(_)
+        ));
+        assert_eq!(review_state(&conn), (false, 3));
+
+        assert!(matches!(
+            admit_review(&mut conn, &submit_op("submit", "summary")),
+            GithubOperationAdmissionResult::Enqueued(_)
+        ));
+        assert_eq!(sequence_of(&conn, "submit"), Some(3));
+        assert_eq!(review_state(&conn), (true, 4));
+
+        assert_review_rejected(&mut conn, &inline_op("late", "x"), E::ReviewSealed);
+        assert_review_rejected(&mut conn, &submit_op("submit-2", "again"), E::ReviewSealed);
+        assert_review_rejected(&mut conn, &create_op("create-3"), E::ReviewSealed);
+        assert!(matches!(
+            admit_review(&mut conn, &submit_op("submit", "summary")),
+            GithubOperationAdmissionResult::Existing(_)
+        ));
+        assert_eq!(review_state(&conn), (true, 4));
+        assert_eq!(count_operations(&conn), 4);
+        assert_eq!(count_errors(&conn), 0);
+        // Executed strictly in sequence order through the real executor.
+        assert_eq!(
+            publish_all(&mut conn, 31),
+            ["create", "inline-0", "inline-1", "submit"]
+        );
+    }
+
+    #[test]
+    fn review_admission_bounds_body_size_inline_count_and_shape() {
+        use CollaborationAdmissionError as E;
+        let (_dir, mut conn, _attempt) = setup_review();
+        let max = "x".repeat(MAX_REVIEW_BODY_BYTES);
+        let over = "x".repeat(MAX_REVIEW_BODY_BYTES + 1);
+        assert_review_rejected(
+            &mut conn,
+            &create_op_with_body(&over),
+            E::ReviewBodyTooLarge,
+        );
+        admit_review_sequence(&mut conn, 0, false);
+        assert_review_rejected(&mut conn, &inline_op("big", &over), E::ReviewBodyTooLarge);
+        assert_review_rejected(&mut conn, &submit_op("big-s", &over), E::ReviewBodyTooLarge);
+        let invalid = E::InvalidField {
+            field: CollaborationAdmissionField::RequestJson,
+        };
+        assert_review_rejected(&mut conn, &inline_op("blank", " \n\t"), invalid);
+        assert_review_rejected(
+            &mut conn,
+            &review_op(
+                "no-body",
+                GithubOperationKind::AddCommentToPendingReview,
+                r#"{"path":"a","line":1}"#,
+            ),
+            invalid,
+        );
+        assert_review_rejected(
+            &mut conn,
+            &review_op(
+                "delete",
+                GithubOperationKind::PullRequestReviewWrite,
+                r#"{"method":"delete"}"#,
+            ),
+            invalid,
+        );
+        assert_review_rejected(
+            &mut conn,
+            &review_op(
+                "approve",
+                GithubOperationKind::PullRequestReviewWrite,
+                r#"{"method":"submit_pending","event":"APPROVE","body":"ok"}"#,
+            ),
+            invalid,
+        );
+        assert_eq!(review_state(&conn), (false, 1));
+
+        // Exactly the cap of inline findings (one at the body cap) is accepted.
+        assert!(matches!(
+            admit_review(&mut conn, &inline_op("inline-max", &max)),
+            GithubOperationAdmissionResult::Enqueued(_)
+        ));
+        for n in 1..MAX_REVIEW_INLINE_COMMENTS {
+            assert!(matches!(
+                admit_review(&mut conn, &inline_op(&format!("inline-{n}"), "f")),
+                GithubOperationAdmissionResult::Enqueued(_)
+            ));
+        }
+        assert_review_rejected(
+            &mut conn,
+            &inline_op("inline-over", "f"),
+            E::ReviewInlineLimitReached,
+        );
+        // The submit still seals after the inline cap.
+        assert!(matches!(
+            admit_review(&mut conn, &submit_op("submit", &max)),
+            GithubOperationAdmissionResult::Enqueued(_)
+        ));
+        assert_eq!(review_state(&conn), (true, MAX_REVIEW_INLINE_COMMENTS + 2));
+        assert_eq!(count_errors(&conn), 0);
+    }
+
+    fn create_op_with_body(body: &str) -> EnqueueGithubOperationRequest {
+        let json = serde_json::json!({"method":"create","commitID":REVIEW_SHA,"body":body});
+        review_op(
+            "create-big",
+            GithubOperationKind::PullRequestReviewWrite,
+            &json.to_string(),
+        )
+    }
+
+    #[test]
+    fn review_operations_are_rejected_for_a_worker_attempt() {
+        let (_dir, mut conn, run) = setup_authorized_worker(1);
+        let request = build_op_request(
+            "attempt-1",
+            "req-review",
+            run,
+            1,
+            "Worker",
+            WORKER_PR,
+            GithubOperationKind::AddCommentToPendingReview,
+            r#"{"body":"x"}"#,
+            OP_NOW,
+            OP_EXPIRES,
+        );
+        assert_eq!(
+            admit_operation(&mut conn, run, &request, OP_NOW).unwrap(),
+            GithubOperationAdmissionResult::Rejected(
+                CollaborationAdmissionError::ReviewRoleRejected
+            )
+        );
+        assert_eq!(count_operations(&conn), 0);
+    }
+
+    #[test]
+    fn review_verdict_requires_a_sealed_fully_published_sequence_and_fresh_head() {
+        use CollaborationAdmissionError as E;
+        let (_dir, mut conn, attempt) = setup_review();
+        let head = published(REVIEW_SHA);
+        let ok = ReviewVerdictEvidence::Published {
+            fetched_head_sha: &head,
+        };
+        assert_verdict_rejected(&mut conn, &attempt, ok, E::ReviewNotSealed);
+        admit_review_sequence(&mut conn, 2, false);
+        assert_verdict_rejected(&mut conn, &attempt, ok, E::ReviewNotSealed);
+        assert!(matches!(
+            admit_review(&mut conn, &submit_op("submit", "summary")),
+            GithubOperationAdmissionResult::Enqueued(_)
+        ));
+        // Sealed but every row still queued.
+        assert_verdict_rejected(&mut conn, &attempt, ok, E::ReviewSequenceIncomplete);
+
+        // Partially published: create succeeded, first inline running.
+        let create = crate::github_operations::claim_next(&mut conn, 31)
+            .unwrap()
+            .unwrap();
+        assert_eq!(create.operation.review_sequence, Some(0));
+        let succeeded = crate::github_operations::Settlement::Succeeded {
+            response_json: None,
+            remote_object_id: None,
+        };
+        assert!(crate::github_operations::settle(&mut conn, &create.claim, succeeded, 31).unwrap());
+        let running = crate::github_operations::claim_next(&mut conn, 31)
+            .unwrap()
+            .unwrap();
+        assert_verdict_rejected(&mut conn, &attempt, ok, E::ReviewSequenceIncomplete);
+        assert!(
+            crate::github_operations::settle(&mut conn, &running.claim, succeeded, 31).unwrap()
+        );
+        assert_eq!(publish_all(&mut conn, 32), ["inline-1", "submit"]);
+
+        // A post-revocation completion anywhere in the sequence never counts.
+        conn.execute(
+            "UPDATE github_agent_operations SET completed_after_revocation=1
+             WHERE review_sequence=1",
+            [],
+        )
+        .unwrap();
+        assert_verdict_rejected(&mut conn, &attempt, ok, E::ReviewSequenceIncomplete);
+        conn.execute(
+            "UPDATE github_agent_operations SET completed_after_revocation=0",
+            [],
+        )
+        .unwrap();
+
+        // A moved head refuses the verdict; a fully published sequence does
+        // not satisfy the publication-failed path either.
+        let moved = published("ffffffffffffffffffffffffffffffffffffffff");
+        assert_verdict_rejected(
+            &mut conn,
+            &attempt,
+            ReviewVerdictEvidence::Published {
+                fetched_head_sha: &moved,
+            },
+            E::ReviewHeadMismatch,
+        );
+        let failed = ReviewVerdictEvidence::PublicationFailed {
+            reason: ReviewPublicationFailure::OperationFailed,
+        };
+        assert_verdict_rejected(&mut conn, &attempt, failed, E::ReviewPublicationNotFailed);
+
+        let admitted = verdict(&mut conn, &attempt, ok);
+        assert!(
+            matches!(
+                &admitted,
+                CollaborationAttemptTransitionResult::Transitioned(status)
+                    if status.state == CollaborationAttemptState::Completed
+            ),
+            "{admitted:?}"
+        );
+        assert_eq!(attempt_state_and_run(&conn), ("completed".into(), None));
+        // Exactly once: a second verdict is a clean negative.
+        assert_eq!(
+            verdict(&mut conn, &attempt, ok),
+            CollaborationAttemptTransitionResult::Rejected(E::AttemptNotActive)
+        );
+        assert_eq!(count_errors(&conn), 0);
+        assert_eq!(task_status(&conn, 3), "in-review");
+    }
+
+    #[test]
+    fn review_verdict_refuses_a_missing_predecessor_or_non_submit_final_row() {
+        use CollaborationAdmissionError as E;
+        let head = published(REVIEW_SHA);
+        let ok = ReviewVerdictEvidence::Published {
+            fetched_head_sha: &head,
+        };
+
+        // Sealed without a submit (storage-forced): the final row is an inline.
+        let (_dir, mut conn, attempt) = setup_review();
+        admit_review_sequence(&mut conn, 1, false);
+        publish_all(&mut conn, 31);
+        conn.execute(
+            "UPDATE github_collaboration_attempts SET review_sealed=1",
+            [],
+        )
+        .unwrap();
+        assert_verdict_rejected(&mut conn, &attempt, ok, E::ReviewFinalOperationInvalid);
+
+        // A predecessor row missing from a published, sealed sequence.
+        let (_dir, mut conn, attempt) = setup_review();
+        admit_review_sequence(&mut conn, 2, true);
+        publish_all(&mut conn, 31);
+        conn.execute(
+            "DELETE FROM github_agent_operations WHERE review_sequence=1",
+            [],
+        )
+        .unwrap();
+        assert_verdict_rejected(&mut conn, &attempt, ok, E::ReviewSequenceIncomplete);
+
+        // Not a reviewer attempt.
+        let worker = worker_request("attempt-w", "run-w", 1, "Worker", 0);
+        assert_eq!(
+            verdict(&mut conn, &worker, ok),
+            CollaborationAttemptTransitionResult::Rejected(E::ReviewRoleRejected)
+        );
+    }
+
+    #[test]
+    fn review_verdict_publication_failed_path_requires_a_settled_durable_failure() {
+        use CollaborationAdmissionError as E;
+        let (_dir, mut conn, attempt) = setup_review();
+        let failed = ReviewVerdictEvidence::PublicationFailed {
+            reason: ReviewPublicationFailure::OperationFailed,
+        };
+        // Nothing published or failed yet.
+        assert_verdict_rejected(&mut conn, &attempt, failed, E::ReviewPublicationNotFailed);
+        admit_review_sequence(&mut conn, 2, true);
+        assert_verdict_rejected(&mut conn, &attempt, failed, E::ReviewPublicationPending);
+
+        let create = crate::github_operations::claim_next(&mut conn, 31)
+            .unwrap()
+            .unwrap();
+        let summary = OperationErrorSummary::new("rejected").unwrap();
+        assert!(crate::github_operations::settle(
+            &mut conn,
+            &create.claim,
+            crate::github_operations::Settlement::FailedUnsent {
+                error_kind: "github_rejected",
+                error_summary: &summary,
+            },
+            31
+        )
+        .unwrap());
+        // Dependents are still queued until the executor fails them unsent.
+        assert_verdict_rejected(&mut conn, &attempt, failed, E::ReviewPublicationPending);
+        assert!(crate::github_operations::claim_next(&mut conn, 32)
+            .unwrap()
+            .is_none());
+        let unsent: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM github_agent_operations
+                 WHERE review_sequence>0 AND state='failed' AND send_state='not_started'
+                   AND attempts=0 AND error_kind='review_predecessor_failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unsent, 3);
+        let head = published(REVIEW_SHA);
+        assert_verdict_rejected(
+            &mut conn,
+            &attempt,
+            ReviewVerdictEvidence::Published {
+                fetched_head_sha: &head,
+            },
+            E::ReviewSequenceIncomplete,
+        );
+        assert!(matches!(
+            verdict(&mut conn, &attempt, failed),
+            CollaborationAttemptTransitionResult::Transitioned(_)
+        ));
+        assert_eq!(attempt_state_and_run(&conn), ("completed".into(), None));
+        assert_eq!(count_errors(&conn), 0);
+    }
+
+    #[test]
+    fn concurrent_review_verdicts_have_one_clean_winner() {
+        use std::sync::{Arc, Barrier};
+        for round in 0..5 {
+            let (dir, mut conn, attempt) = setup_review();
+            admit_review_sequence(&mut conn, 1, true);
+            publish_all(&mut conn, 31);
+            drop(conn);
+            let path = dir.path().join("q.db");
+            let barrier = Arc::new(Barrier::new(3));
+            let handles: Vec<_> = (0..3)
+                .map(|_| {
+                    let (path, attempt, barrier) =
+                        (path.clone(), attempt.clone(), Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        let mut conn = crate::db::open(&path).unwrap();
+                        let head = published(REVIEW_SHA);
+                        barrier.wait();
+                        admit_review_verdict(
+                            &mut conn,
+                            &attempt,
+                            ReviewVerdictEvidence::Published {
+                                fetched_head_sha: &head,
+                            },
+                            40,
+                        )
+                        .unwrap()
+                    })
+                })
+                .collect();
+            let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let winners = results
+                .iter()
+                .filter(|r| matches!(r, CollaborationAttemptTransitionResult::Transitioned(_)))
+                .count();
+            assert_eq!(winners, 1, "round {round}: {results:?}");
+            assert!(results.iter().all(|r| matches!(
+                r,
+                CollaborationAttemptTransitionResult::Transitioned(_)
+                    | CollaborationAttemptTransitionResult::Rejected(
+                        CollaborationAdmissionError::AttemptNotActive
+                    )
+            )));
+            let conn = crate::db::open(&path).unwrap();
+            assert_eq!(count_errors(&conn), 0, "round {round}");
+        }
+    }
+
+    #[test]
+    fn review_sequence_rows_survive_sweep_until_verdict_admission_or_revocation() {
+        let head = published(REVIEW_SHA);
+        let ok = ReviewVerdictEvidence::Published {
+            fetched_head_sha: &head,
+        };
+        let group = |conn: &Connection| group_rows(conn, REVIEW_ATTEMPT);
+
+        // Live attempt: pinned past its nominal expiry, before admission.
+        let (_dir, mut conn, _) = setup_review();
+        admit_review_sequence(&mut conn, 2, true);
+        publish_all(&mut conn, 31);
+        crate::sweep::sweep_all(&conn, 5_000).unwrap();
+        assert_eq!(group(&conn), (1, 4));
+        assert_eq!(review_state(&conn), (true, 4));
+
+        // Verdict admitted: retained through the shared window, then whole.
+        let (_dir, mut conn, attempt2) = setup_review();
+        admit_review_sequence(&mut conn, 2, true);
+        publish_all(&mut conn, 31);
+        assert!(matches!(
+            verdict(&mut conn, &attempt2, ok),
+            CollaborationAttemptTransitionResult::Transitioned(_)
+        ));
+        crate::sweep::sweep_all(&conn, 999).unwrap();
+        assert_eq!(group(&conn), (1, 4));
+        crate::sweep::sweep_all(&conn, 1_000).unwrap();
+        assert_eq!(group(&conn), (0, 0));
+
+        // Revocation makes the verdict impossible; only then is it reclaimable.
+        let (_dir, mut conn, attempt3) = setup_review();
+        admit_review_sequence(&mut conn, 2, true);
+        publish_all(&mut conn, 31);
+        crate::capabilities::revoke(&mut conn, REVIEW_RUN, 50).unwrap();
+        crate::sweep::sweep_all(&conn, 60).unwrap();
+        assert_eq!(group(&conn), (0, 0));
+        assert!(matches!(
+            verdict(&mut conn, &attempt3, ok),
+            CollaborationAttemptTransitionResult::Rejected(_)
+        ));
     }
 
     // ---- Generic sweep reclamation of whole terminal attempt groups ----
