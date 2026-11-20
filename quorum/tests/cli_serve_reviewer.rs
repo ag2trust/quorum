@@ -291,6 +291,12 @@ elif [ "$cmd" = "pr view" ]; then
     exit 0
   fi
   printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
+elif [ "${1:-} ${2:-}" = "api --paginate" ]; then
+  # The daemon's pending-review probe: the publisher holds no draft.
+  case "${3:-}" in
+    repos/*/pulls/*/reviews\?per_page=100) ;;
+    *) printf 'unsupported gh invocation: %s\n' "$*" >&2; exit 1 ;;
+  esac
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1

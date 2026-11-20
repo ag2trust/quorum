@@ -149,6 +149,7 @@ fn render_with_style_at_width(s: &Stats, sty: &Style, w: &mut dyn Write, width: 
     );
     render_merge_wait(&s.merge_blockers, sty, w, width);
     render_branch_syncs(&s.branch_syncs, sty, w, width);
+    render_review_publication_slots(&s.review_publication_slots, sty, w, width);
     render_unbacked_prs(&s.unbacked_prs, &s.twin_prs, sty, w, width);
     render_alerts(&s.alerts, sty, w, width);
     render_errors(&s.recent_errors, s.older_errors_silenced, sty, w, width);
@@ -862,6 +863,31 @@ fn render_branch_syncs(syncs: &[BranchSyncSummary], sty: &Style, w: &mut dyn Wri
     }
 }
 
+/// Pending-review publication slots that hold a PR's reviewer barrier.
+fn render_review_publication_slots(
+    slots: &[quorum_core::review_publication_slots::SlotStatus],
+    sty: &Style,
+    w: &mut dyn Write,
+    width: usize,
+) {
+    if slots.is_empty() {
+        return;
+    }
+    let _ = writeln!(w);
+    let _ = writeln!(w, "{}", sty.section_rule("REVIEW DRAFT SLOTS", width));
+    for slot in slots {
+        let _ = writeln!(
+            w,
+            "  task#{:<5} PR #{:<6} {:<16} {:<24} cycles {}",
+            slot.task_id,
+            slot.pr_number,
+            slot.state.as_str(),
+            truncate(slot.error_kind.as_deref().unwrap_or("—"), 24),
+            slot.cleanup_attempts,
+        );
+    }
+}
+
 fn render_merge_wait(blockers: &[MergeBlockerView], sty: &Style, w: &mut dyn Write, width: usize) {
     if blockers.is_empty() {
         return;
@@ -1500,6 +1526,40 @@ mod tests {
             1,
             "reviewer must not also appear in WORKING: {output}"
         );
+    }
+
+    #[test]
+    fn render_review_publication_slots_section() {
+        use quorum_core::collaboration_admission::GithubSendState;
+        use quorum_core::review_publication_slots::{SlotState, SlotStatus};
+        let mut s = default_stats();
+        let sty = Style::plain();
+        let mut empty = Vec::new();
+        render_with_style(&s, &sty, &mut empty);
+        assert!(!String::from_utf8(empty)
+            .unwrap()
+            .contains("REVIEW DRAFT SLOTS"));
+        s.review_publication_slots.push(SlotStatus {
+            publisher_scope: "repository-service".into(),
+            pr_number: 77,
+            task_id: 12,
+            attempt_id: None,
+            state: SlotState::Blocked,
+            pending_review_id: None,
+            create_send_state: GithubSendState::NotStarted,
+            cleanup_attempts: 1,
+            next_cleanup_at: None,
+            cleanup_deadline_at: None,
+            error_kind: Some("foreign_draft".into()),
+        });
+        let mut buf = Vec::new();
+        render_with_style(&s, &sty, &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("REVIEW DRAFT SLOTS"), "{output}");
+        assert!(output.contains("task#12"), "{output}");
+        assert!(output.contains("PR #77"), "{output}");
+        assert!(output.contains("blocked"), "{output}");
+        assert!(output.contains("foreign_draft"), "{output}");
     }
 
     #[test]

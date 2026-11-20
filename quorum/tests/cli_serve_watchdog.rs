@@ -93,6 +93,12 @@ elif [ "$cmd" = "pr view" ]; then
   fi
   sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
   printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
+elif [ "${1:-} ${2:-}" = "api --paginate" ]; then
+  # The daemon's pending-review probe: the publisher holds no draft.
+  case "${3:-}" in
+    repos/*/pulls/*/reviews\?per_page=100) ;;
+    *) exit 1 ;;
+  esac
 else
   exit 1
 fi
@@ -178,6 +184,12 @@ elif [ "$cmd" = "pr view" ]; then
   branch="$(cat "$QUORUM_TEST_GH_STATE/$pr")"
   sha="$(git -C "$QUORUM_TEST_REPO" rev-parse "refs/heads/$branch")"
   printf '{"headRefName":"%s","headRefOid":"%s","isCrossRepository":false,"baseRefName":"main","state":"OPEN"}\n' "$branch" "$sha"
+elif [ "${1:-} ${2:-}" = "api --paginate" ]; then
+  # The daemon's pending-review probe: the publisher holds no draft.
+  case "${3:-}" in
+    repos/*/pulls/*/reviews\?per_page=100) ;;
+    *) printf 'unsupported gh invocation: %s\n' "$*" >&2; exit 1 ;;
+  esac
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1

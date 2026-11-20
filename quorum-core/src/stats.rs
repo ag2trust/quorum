@@ -797,6 +797,11 @@ pub struct Stats {
     /// Active daemon-internal branch synchronizations. Bounded projection —
     /// the durable row is read via `branch-sync --list` or inspect helpers.
     pub branch_syncs: Vec<BranchSyncSummary>,
+    /// Pending-review publication slots that are not a live reviewer's
+    /// `owned` slot: blocked slots (no reviewer is provisioned for that PR)
+    /// and orphan-draft cleanup still pending for a terminal owner. Bounded;
+    /// the owner marker is never projected.
+    pub review_publication_slots: Vec<crate::review_publication_slots::SlotStatus>,
     /// #115: daemon liveness from daemon_lock (populated by binary crate).
     pub daemon: DaemonLiveness,
     /// Live host memory/swap and filesystem telemetry. Populated after the
@@ -935,6 +940,7 @@ fn stats_impl(
         .iter()
         .map(BranchSyncSummary::from)
         .collect::<Vec<_>>();
+    let review_publication_slots = crate::review_publication_slots::status_blockers(conn)?;
 
     Ok(Stats {
         agents_total,
@@ -970,6 +976,7 @@ fn stats_impl(
         alerts,
         merge_blockers,
         branch_syncs,
+        review_publication_slots,
         daemon: DaemonLiveness::default(),
         resources: None,
     })

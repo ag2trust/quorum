@@ -177,6 +177,12 @@ elif [ "$cmd" = "pr review" ] || [ "$cmd" = "pr merge" ]; then
   exit 0
 elif [ "$cmd" = "repo view" ]; then
   printf '{"defaultBranchRef":{"name":"main"}}\n'
+elif [ "${1:-} ${2:-}" = "api --paginate" ]; then
+  # The daemon's pending-review probe: the publisher holds no draft.
+  case "${3:-}" in
+    repos/*/pulls/*/reviews\?per_page=100) ;;
+    *) printf 'unsupported gh invocation: %s\n' "$*" >&2; exit 1 ;;
+  esac
 else
   printf 'unsupported gh invocation: %s\n' "$*" >&2
   exit 1

@@ -1232,7 +1232,7 @@ fn github_operation_read(
 }
 
 /// The fixed shared retention of one collaboration attempt and its rows.
-const ATTEMPT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+pub(crate) const ATTEMPT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 /// Wall-clock bound on one operation, from admission.
 const OPERATION_DEADLINE_SECS: i64 = 60 * 60;
 /// GitHub's own default page size, used when `perPage` is absent.

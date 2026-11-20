@@ -972,6 +972,114 @@ pub fn require_cleanup(conn: &mut Connection, attempt_id: &str, now: i64) -> Res
     Ok(changed > 0)
 }
 
+/// R1→R2 handoff: end a live reviewer run's publication authority before the
+/// next reviewer's barrier probes, so its `owned` slot can be cleaned instead
+/// of making the handoff wait on an owner that is about to be torn down.
+///
+/// One `BEGIN IMMEDIATE`: revoke the run capability (fencing every later
+/// endpoint call of that run), terminalize its live collaboration attempt
+/// (cancelling its provably unsent rows), and move that attempt's `owned` slot
+/// to `cleanup_required` with a fresh bounded generation. A started or
+/// possibly-sent row keeps its disposition and pins the slot until settled.
+/// Returns `true` when the run's slot now requires cleanup; `false` (clean
+/// negative) when the run owned no slot. Never touches a task or verdict.
+pub fn retire_owner_for_handoff(conn: &mut Connection, run_id: &str, now: i64) -> Result<bool> {
+    validate_now(now)?;
+    let tx = begin_immediate(conn)?;
+    let attempts: Vec<String> = {
+        let mut statement = tx
+            .prepare(
+                "SELECT attempt_id FROM github_collaboration_attempts
+                 WHERE active_run_id=?1 AND state IN ('active','awaiting_resume')",
+            )
+            .map_err(map_sql_err)?;
+        let rows = statement
+            .query_map([run_id], |row| row.get::<_, String>(0))
+            .map_err(map_sql_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_sql_err)?;
+        rows
+    };
+    crate::capabilities::revoke_tx(&tx, run_id, now)?;
+    crate::collaboration_admission::revoke_dead_run_attempts(
+        &tx,
+        now,
+        crate::collaboration_admission::UNBOUNDED_GROUP_SWEEP,
+    )?;
+    sync_in_tx(&tx, now)?;
+    let mut requires_cleanup = false;
+    for attempt_id in &attempts {
+        let state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM github_review_publication_slots WHERE attempt_id=?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_sql_err)?;
+        requires_cleanup |= state.as_deref() == Some(SlotState::CleanupRequired.as_str());
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(requires_cleanup)
+}
+
+/// Operator-authorized retry of a parked task (technical spec, "An
+/// operator-authorized retry of a later parked task may reset the same
+/// slot's cleanup generation and rebind only its waiting-task pointer").
+///
+/// Within the caller's write transaction, a `blocked` slot on the task's PR
+/// starts one fresh bounded recovery generation and points at this task: a
+/// slot that never had an owner returns to a due `probing` (the next
+/// provision repeats the fresh probe), and one with an owner attempt returns
+/// to a due `cleanup_required` keeping its exact marker, review ID, launch
+/// attempt, and create send state. No slot, marker, attempt, review, or
+/// verdict is created; every core guard (marker, send-state, exhaustion)
+/// re-applies, so a foreign draft re-blocks and the next generation is again
+/// bounded. Returns the number of slots reset.
+pub(crate) fn reset_blocked_for_retry_in_tx(
+    tx: &Connection,
+    task_id: i64,
+    now: i64,
+) -> Result<usize> {
+    validate_now(now)?;
+    let changed = tx
+        .execute(
+            "UPDATE github_review_publication_slots
+             SET task_id=?1,
+                 state=CASE WHEN attempt_id IS NULL THEN 'probing' ELSE 'cleanup_required' END,
+                 cleanup_attempts=0, next_cleanup_at=?2, cleanup_deadline_at=?3,
+                 error_kind=NULL, error_summary=NULL, updated_at=?2
+             WHERE state='blocked' AND pr_number=(
+                 SELECT CAST(json_extract(t.refs, '$.pr') AS INTEGER) FROM tasks t
+                 WHERE t.id=?1 AND json_valid(t.refs)
+                   AND json_type(t.refs, '$.pr') IN ('integer','text'))",
+            params![task_id, now, now.saturating_add(SLOT_RECOVERY_WINDOW_SECS)],
+        )
+        .map_err(map_sql_err)?;
+    Ok(changed)
+}
+
+/// Give back a probe claim whose empty observation was never turned into
+/// ownership (the provision failed before its reviewer run could bind).
+/// The slot was never `owned` and no attempt holds its marker, so no create
+/// can have been claimed for it: the row is deleted, and the next distinct
+/// attempt repeats the fresh probe. Guarded on the exact in-flight claim;
+/// `false` (clean negative) when the claim is no longer current.
+pub fn release_unbound_probe(conn: &mut Connection, claim: &ProbeClaim) -> Result<bool> {
+    let tx = begin_immediate(conn)?;
+    let deleted = tx
+        .execute(
+            "DELETE FROM github_review_publication_slots
+             WHERE publisher_scope=?1 AND pr_number=?2 AND state='probing'
+               AND cleanup_attempts=?3 AND next_cleanup_at IS NULL
+               AND attempt_id IS NULL AND review_owner_marker IS NULL",
+            params![claim.publisher_scope.as_str(), claim.pr_number, claim.cycle],
+        )
+        .map_err(map_sql_err)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(deleted > 0)
+}
+
 /// A successful `submit_pending` released the review from pending: delete the
 /// attempt's slot while it is still `owned`. Called in the settle transaction.
 pub(crate) fn release_after_submit_in_tx(tx: &Connection, attempt_id: &str) -> Result<bool> {
@@ -1004,15 +1112,48 @@ pub struct CleanupClaim {
 
 /// Claim the oldest due `cleanup_required` slot as `cleanup_running`.
 ///
-/// One `BEGIN IMMEDIATE`: run [`sync_in_tx`], block every slot whose
+/// One `BEGIN IMMEDIATE`: terminalize every attempt whose run capability is
+/// revoked or gone (so a torn-down reviewer's `owned` slot needs cleanup
+/// without waiting for an unrelated outbox claim), run [`sync_in_tx`], block
+/// every slot whose
 /// generation is exhausted or that lacks a marker/launch SHA, then pick a due
 /// slot whose attempt has no running or reconciliation-only operation, cancel
 /// every still-queued, provably unsent review-sequence row of that attempt
 /// (create, inline comments, `submit_pending`; retaining their send
 /// disposition), and increment the cycle. `Ok(None)` is the clean negative.
 pub fn claim_cleanup(conn: &mut Connection, now: i64) -> Result<Option<CleanupClaim>> {
+    claim_cleanup_inner(conn, None, now)
+}
+
+/// [`claim_cleanup`] restricted to the one `(scope, PR)` slot, for a
+/// provisioning barrier that must clean up exactly the slot it waits on
+/// rather than the oldest due slot of another PR. Same housekeeping and
+/// guards; `Ok(None)` when that slot is not claimable now.
+pub fn claim_cleanup_for(
+    conn: &mut Connection,
+    scope: &PublisherScope,
+    pr_number: i64,
+    now: i64,
+) -> Result<Option<CleanupClaim>> {
+    claim_cleanup_inner(conn, Some((scope.as_str(), pr_number)), now)
+}
+
+fn claim_cleanup_inner(
+    conn: &mut Connection,
+    only: Option<(&str, i64)>,
+    now: i64,
+) -> Result<Option<CleanupClaim>> {
     validate_now(now)?;
+    let (only_scope, only_pr) = match only {
+        Some((scope, pr)) => (Some(scope), Some(pr)),
+        None => (None, None),
+    };
     let tx = begin_immediate(conn)?;
+    crate::collaboration_admission::revoke_dead_run_attempts(
+        &tx,
+        now,
+        crate::collaboration_admission::UNBOUNDED_GROUP_SWEEP,
+    )?;
     sync_in_tx(&tx, now)?;
     let reason = SlotBlockReason::RetryExhausted;
     tx.execute(
@@ -1044,13 +1185,14 @@ pub fn claim_cleanup(conn: &mut Connection, now: i64) -> Result<Option<CleanupCl
              FROM github_review_publication_slots s
              WHERE s.state='cleanup_required'
                AND (s.next_cleanup_at IS NULL OR s.next_cleanup_at<=?1)
+               AND (?2 IS NULL OR (s.publisher_scope=?2 AND s.pr_number=?3))
                AND NOT EXISTS (
                    SELECT 1 FROM github_agent_operations o
                    WHERE o.attempt_id=s.attempt_id
                      AND (o.state='running' OR (o.state='queued' AND o.send_state='ambiguous')))
              ORDER BY COALESCE(s.next_cleanup_at, s.updated_at), s.publisher_scope, s.pr_number
              LIMIT 1",
-            [now],
+            params![now, only_scope, only_pr],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
@@ -1320,6 +1462,48 @@ pub fn reconcile_in_tx(tx: &Connection, now: i64) -> Result<usize> {
         )
         .map_err(map_sql_err)?;
     Ok(probing + cleanup + sync_in_tx(tx, now)?)
+}
+
+/// Daemon-startup slot reconciliation in its own `BEGIN IMMEDIATE`, run by
+/// crash recovery after it revokes the previous daemon's run capabilities and
+/// before any reviewer is provisioned: terminalize every attempt whose run can
+/// never call again (so its `owned` slot becomes `cleanup_required` now, not
+/// on a later outbox tick), then [`reconcile_in_tx`]. Makes no remote call and
+/// releases nothing. Returns the number of slots changed.
+pub fn reconcile_on_start(conn: &mut Connection, now: i64) -> Result<usize> {
+    validate_now(now)?;
+    let tx = begin_immediate(conn)?;
+    crate::collaboration_admission::revoke_dead_run_attempts(
+        &tx,
+        now,
+        crate::collaboration_admission::UNBOUNDED_GROUP_SWEEP,
+    )?;
+    let changed = reconcile_in_tx(&tx, now)?;
+    tx.commit().map_err(map_sql_err)?;
+    Ok(changed)
+}
+
+/// Upper bound on slots one status snapshot reports.
+pub const MAX_STATUS_SLOTS: i64 = 32;
+
+/// Read-only status projection: every slot that is not a live reviewer's
+/// `owned` slot — `blocked` slots and pending cleanup for a terminal owner
+/// attempt, plus in-flight probes — newest first, bounded by
+/// [`MAX_STATUS_SLOTS`]. Never includes the owner marker.
+pub fn status_blockers(conn: &Connection) -> Result<Vec<SlotStatus>> {
+    let sql = format!(
+        "SELECT {STATUS_COLUMNS} FROM github_review_publication_slots
+         WHERE state<>'owned'
+         ORDER BY updated_at DESC, publisher_scope, pr_number
+         LIMIT ?1"
+    );
+    let mut statement = conn.prepare(&sql).map_err(map_sql_err)?;
+    let rows = statement
+        .query_map([MAX_STATUS_SLOTS], status_from_row)
+        .map_err(map_sql_err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(map_sql_err)?;
+    rows.into_iter().map(SlotStatusRaw::into_status).collect()
 }
 
 #[cfg(test)]
