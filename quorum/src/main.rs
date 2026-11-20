@@ -1317,6 +1317,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 feedback: feedback.as_deref(),
                 feedback_json: feedback_json.as_deref(),
                 blocking,
+                publication_failure: None,
             })?;
             output::emit(&serde_json::json!({ "ok": true, "mailbox_id": id }));
             Ok(0)

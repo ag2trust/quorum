@@ -424,13 +424,24 @@ This is a non-binding view of ongoing directions, not a release schedule:
   owner-only file, speaks plain HTTP, needs `--allowed-host` for a non-loopback bind, and is
   started by the operator, not automatically. The design record's "Orchestrator MCP" section
   states its trust model and limits.
-- `quorum agent-mcp --listen <SOCKETADDR>` serves the managed-run MCP adapter over
-  Streamable HTTP at `/mcp`, so a managed worker or reviewer can signal the daemon without
-  the `quorum` binary or its socket. It is separate from the server above: it binds
-  loopback only, speaks plain HTTP, authorizes each request by its run capability sent as
-  a bearer token, and sends no tool-list-changed notification. Nothing starts it
-  automatically, agent prompts still instruct the shell commands, and its GitHub tools
-  remain unimplemented.
+- `quorum agent-mcp` serves the managed-run MCP adapter that lets a managed worker or reviewer
+  signal the daemon without the `quorum` binary or a database mount; its GitHub collaboration
+  tools remain unimplemented, and a `planner` run receives only the plan-submission tool, no
+  GitHub MCP. Since the 2026-11-16 owner decision, `quorum serve` binds this
+  adapter itself as a Streamable HTTP server on its own loopback listener and exports
+  `QUORUM_AGENT_MCP_URL` (`http://<bound addr>/mcp`) alongside the run's `QUORUM_RUN_ID` bearer
+  to every managed run; this is the env-var contract any `agent_bin` must honor, and there is no
+  stdio fallback for that generic contract. Codex and Grok's own provider-native MCP
+  configuration formats are unaffected by this decision: they still declare `quorum agent-mcp`
+  as their own stdio child on every launch (see the GitHub collaboration MCP technical spec).
+  Running `quorum agent-mcp` directly (optionally with `--listen <SOCKETADDR>`,
+  loopback addresses only, for the same Streamable HTTP form) remains for manual, attended
+  operator use and is not what `quorum serve` spawns for that contract; agent prompts still
+  instruct the shell commands. It is separate from the
+  orchestrator server above: it authorizes each request by its run capability sent as a bearer
+  token, not an operator token. `agent_mcp_listen` binds loopback only by default; a non-loopback
+  bind is refused unless `agent_mcp_allowed_hosts` explicitly opts it in, and a config that gives
+  `agent_mcp_listen` the same socket address as `orchestrator_mcp_listen` exits 2.
 
 ## Working on Quorum
 

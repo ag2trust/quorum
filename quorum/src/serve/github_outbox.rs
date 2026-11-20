@@ -298,6 +298,20 @@ fn decode_stored(
         | RepositoryRequest::GetReviews { .. }
         | RepositoryRequest::GetComments { .. } => GithubOperationKind::PullRequestRead,
         RepositoryRequest::AddIssueComment { .. } => GithubOperationKind::AddIssueComment,
+        // Pending-review publication needs the slot/sequence executor, which
+        // has not landed: refuse before any send. Housekeeping variants are
+        // daemon-only and never decode from a stored agent request.
+        RepositoryRequest::CreatePendingReview { .. }
+        | RepositoryRequest::AddPendingReviewComment { .. }
+        | RepositoryRequest::SubmitPendingReview { .. }
+        | RepositoryRequest::ListPendingReviews {}
+        | RepositoryRequest::GetReview { .. }
+        | RepositoryRequest::DeletePendingReview { .. } => {
+            return Err(Disposition::FailedUnsent {
+                error_kind: "unsupported_request",
+                summary: "pending-review operations are not executable yet".to_string(),
+            })
+        }
     };
     let matches_kind = kind == expected.as_str();
     if !matches_kind {
@@ -451,7 +465,35 @@ fn response_json(response: &RepositoryResponse) -> serde_json::Value {
             "id": id,
             "html_url": html_url,
         }),
+        // Never produced by an executable request yet (decode_stored refuses
+        // pending-review kinds); rendered without the body, which carries the
+        // hidden marker.
+        RepositoryResponse::Review(review) => review_json(review),
+        RepositoryResponse::PendingReviews(reviews) => serde_json::json!({
+            "kind": "pending_reviews",
+            "reviews": reviews.iter().map(review_json).collect::<Vec<_>>(),
+        }),
+        RepositoryResponse::ReviewAbsent { review_id } => serde_json::json!({
+            "kind": "review_absent",
+            "id": review_id,
+        }),
+        RepositoryResponse::PendingReviewComment(comment) => serde_json::json!({
+            "kind": "pending_review_comment",
+            "id": comment.id,
+            "node_id": comment.node_id,
+            "thread_node_id": comment.thread_node_id,
+        }),
     }
+}
+
+fn review_json(review: &super::repository_service::ReviewRecord) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "review",
+        "id": review.id,
+        "node_id": review.node_id,
+        "state": review.state.as_str(),
+        "commit_id": review.commit_id,
+    })
 }
 
 /// The body actually posted for a general comment: the authored Markdown,

@@ -212,7 +212,7 @@ async fn run_git(
     run_git_with_limit(cmd, timeout, GIT_PIPE_LIMIT, label).await
 }
 
-async fn run_git_with_limit(
+pub(super) async fn run_git_with_limit(
     mut cmd: Command,
     timeout: Duration,
     pipe_limit: usize,
