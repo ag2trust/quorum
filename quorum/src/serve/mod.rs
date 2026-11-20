@@ -26,6 +26,7 @@ pub mod merge;
 pub mod merged_continuation;
 pub mod names;
 pub mod planner;
+mod proctree;
 mod profile_cooldown;
 pub mod recovery;
 pub mod render;

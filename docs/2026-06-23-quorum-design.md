@@ -906,6 +906,48 @@ setting is not an end-to-end wall-clock cap for the full task lifecycle.
 limit. Existing configurations may retain it as a compatibility alias for the idle
 setting, but new configurations must use `max_idle_secs`.
 
+### Managed process trees (`serve/proctree.rs`)
+
+Every managed agent runs in its own process group, and per-agent teardown is an
+immediate `killpg(SIGKILL)` of the spawn-time group. A descendant that calls `setsid` or
+`setpgid` escapes that group. The process-tree module closes the gap without extra
+privileges.
+
+- **Marker.** Each spawn gets a fresh random tree token (a v4 UUID, lowercase hex),
+  exported as `QUORUM_PROC_TREE`. Descendants inherit it across `fork`/`exec`,
+  `setsid`/`setpgid`, and reparenting. The value is a `:`-separated list. An inherited
+  marker keeps its valid tokens and the new token is appended, bounded at 16 entries with
+  the outermost dropped first, so agents of a nested daemon stay attributable to the
+  outer agent. A process belongs to a tree only when one list element equals the token
+  exactly.
+- **Discovery** is a bounded same-uid scan. Linux reads `/proc/<pid>/environ`, plus
+  `/proc/<pid>/stat` for state and `ppid`. macOS uses `proc_listallpids`,
+  `proc_pidinfo(PROC_PIDTBSDINFO)`, and `sysctl(KERN_PROCARGS2)`. Zombies are not members.
+  `ppid` ancestry from a marked member is a reporting-only secondary signal: those
+  processes are waited for or reported, but they are never signalled individually.
+- **Kill.** `kill_tree_now` is synchronous, with no sleep and no wait. It `SIGKILL`s the
+  spawn-time group only when the caller asks (the existing pgid-reuse guard stays with
+  the caller). It then `SIGKILL`s every member whose marker re-verifies immediately
+  before the signal. On Linux the check and the signal go through one pidfd, so a reused
+  pid is never hit. It never signals the daemon pid, the daemon's process group,
+  pid/pgid `<= 1`, or a process without this exact token, which covers every other
+  agent.
+- **Reap.** `reap_tree` repeats the marker kill and polls until no member remains. It is
+  bounded by the caller's deadline and by `TREE_REAP_TIMEOUT` (5 s), the only post-kill
+  wait bound. On timeout it logs the token, pgid, and survivor count and returns
+  `TimedOut { survivors }` instead of an error.
+- **No SIGTERM stage.** There is no per-agent grace delay. The daemon-level grace is
+  unchanged: the first `SIGINT`/`SIGTERM` enters drain, then `drain_timeout_secs`, then
+  force-kill.
+- **Rejected alternatives.** A per-agent cgroup or systemd scope is exact but Linux-only
+  and needs user-systemd delegation. A daemon-wide `PR_SET_CHILD_SUBREAPER` is
+  Linux-only and loses per-agent attribution, because orphans reparent to the daemon
+  anonymously.
+- **Limitations.** A descendant that scrubs its entire environment **and** leaves the
+  process group is not found once its marked ancestors are gone. A descendant whose
+  environment the same uid cannot read (set-uid or non-dumpable) is neither found nor
+  signalled. That is the fail-safe direction: an unverifiable process is never killed.
+
 ### Cutover recipe (lifecycle refactor)
 
 The lifecycle refactor (parts 1–3) changed the task status vocabulary and eliminated
