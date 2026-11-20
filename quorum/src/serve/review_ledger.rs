@@ -52,7 +52,7 @@ pub fn required_cumulative_disposition_contract(pr: i64) -> String {
          ordering above and append exactly `TRUNCATED: additional ledger history omitted; read PR \
          #{pr} discussion for authoritative history.` The marker is not a ledger entry. Omitted \
          findings remain part of the authoritative PR discussion and, when currently BLOCKING, \
-         still count in `--blocking`.\n"
+         still count in the `submit_review` `blocking` count.\n"
     )
 }
 
@@ -115,6 +115,6 @@ mod tests {
         assert!(contract.contains("author claim or pushed commit alone is never enough"));
         assert!(contract.contains("new BLOCKING finding in unchanged behavior"));
         assert!(contract.contains("not reasonably discoverable in the prior complete audit"));
-        assert!(contract.contains("still count in `--blocking`"));
+        assert!(contract.contains("still count in the `submit_review` `blocking` count"));
     }
 }

@@ -65,7 +65,7 @@ pub fn build_rereview_turn_with_context(
         complete_review_contract = COMPLETE_REVIEW_CONTRACT,
         finding_contract = REVIEW_FINDING_CONTRACT,
         delivery_contract = review_delivery_contract(reviewer_name, pr),
-        graph_contract = graph_review_contract(reviewer_name, pr, graph_context),
+        graph_contract = graph_review_contract(graph_context),
         review_round_contract = review_round_contract(pr, review_cycle),
     ))
 }
