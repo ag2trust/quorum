@@ -2082,6 +2082,101 @@ impl WorktreeManager {
         }
     }
 
+    /// Remove a stale directory occupying a worktree path that git does not
+    /// register (e.g. a teardown whose `git worktree remove` failed midway),
+    /// so provisioning can reuse the deterministic path. Returns `Ok(false)`
+    /// when nothing is at the path.
+    ///
+    /// Refuses (destroying nothing) unless the path is a real directory that
+    /// is a direct child of `worktree_base`, is not a registered worktree,
+    /// is not named by `active_worktrees`, and holds no `.git` directory or
+    /// `.git` file whose gitdir still exists. A stale directory holds no git
+    /// state, so there is nothing left to snapshot; committed work lives in
+    /// the branch and `refs/quorum-recover/*`, which this never touches.
+    pub async fn remove_stale_unregistered_dir(
+        &self,
+        repo_dir: &Path,
+        worktree_base: &Path,
+        path: &Path,
+        active_worktrees: &[String],
+    ) -> Result<bool, String> {
+        let _guard = self.lock.lock().await;
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
+        };
+        if !metadata.file_type().is_dir() {
+            return Err(format!(
+                "refusing to remove {}: not a directory",
+                path.display()
+            ));
+        }
+        if !is_direct_child_of(worktree_base, path) {
+            return Err(format!(
+                "refusing to remove {}: outside worktree root {}",
+                path.display(),
+                worktree_base.display()
+            ));
+        }
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|error| format!("cannot canonicalize {}: {error}", path.display()))?;
+        if active_worktrees.iter().any(|active| {
+            Path::new(active) == path
+                || std::fs::canonicalize(active).ok().as_ref() == Some(&canonical)
+        }) {
+            return Err(format!(
+                "refusing to remove {}: worktree of an active agent",
+                path.display()
+            ));
+        }
+        if self
+            .list_worktrees_unlocked(repo_dir)
+            .await?
+            .iter()
+            .any(|registration| {
+                std::fs::canonicalize(&registration.path).ok().as_ref() == Some(&canonical)
+            })
+        {
+            return Err(format!(
+                "refusing to remove {}: registered worktree",
+                path.display()
+            ));
+        }
+        let dot_git = path.join(".git");
+        match std::fs::symlink_metadata(&dot_git) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot inspect {}: {error}", dot_git.display())),
+            Ok(meta) if meta.file_type().is_file() => {
+                let contents = std::fs::read_to_string(&dot_git)
+                    .map_err(|error| format!("cannot read {}: {error}", dot_git.display()))?;
+                let gitdir = contents
+                    .lines()
+                    .find_map(|line| line.strip_prefix("gitdir:"))
+                    .map(|value| path.join(value.trim()));
+                if gitdir.is_none_or(|gitdir| gitdir.exists()) {
+                    return Err(format!(
+                        "refusing to remove {}: .git file names a live git directory",
+                        path.display()
+                    ));
+                }
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "refusing to remove {}: contains a .git directory",
+                    path.display()
+                ))
+            }
+        }
+        std::fs::remove_dir_all(path).map_err(|error| {
+            format!(
+                "cannot remove stale unregistered directory {}: {error}",
+                path.display()
+            )
+        })?;
+        Ok(true)
+    }
+
     pub async fn remove(&self, repo_dir: &Path, worktree_dir: &Path) -> Result<(), String> {
         let _guard = self.lock.lock().await;
 
@@ -3572,6 +3667,198 @@ mod tests {
             !git_worktree_list(repo_dir.path()).contains(foreign.to_string_lossy().as_ref()),
             "foreign path must remain absent from this repository's registration"
         );
+    }
+
+    /// Reproduce a teardown whose `git worktree remove` failed midway: the
+    /// `.git` file is gone and git pruned the registration, but the directory
+    /// and some contents remain at the deterministic path.
+    async fn half_deleted_worktree(mgr: &WorktreeManager, repo: &Path, wt: &Path, branch: &str) {
+        mgr.provision(repo, branch, wt, "main").await.unwrap();
+        std::fs::write(wt.join("kept.rs"), "pub fn kept() {}\n").unwrap();
+        assert!(git_output(wt, &["add", "kept.rs"]).status.success());
+        assert!(git_output(wt, &["commit", "-qm", "kept"]).status.success());
+        std::fs::create_dir_all(wt.join("target/debug")).unwrap();
+        std::fs::write(wt.join("target/debug/leftover"), "x").unwrap();
+        std::fs::remove_file(wt.join(".git")).unwrap();
+        assert!(git_output(repo, &["worktree", "prune"]).status.success());
+        assert!(!git_worktree_list(repo).contains(wt.to_string_lossy().as_ref()));
+        assert!(wt.exists());
+    }
+
+    #[tokio::test]
+    async fn stale_unregistered_directory_is_removed_and_provision_reuses_branch() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let wt_base = tempfile::tempdir().unwrap();
+        let wt = wt_base.path().join("Ingot-4a78-t447");
+        let branch = "daemon/ingot-4a78-t447";
+        let mgr = WorktreeManager::new();
+        half_deleted_worktree(&mgr, repo_dir.path(), &wt, branch).await;
+        let tip =
+            String::from_utf8(git_output(repo_dir.path(), &["rev-parse", branch]).stdout).unwrap();
+
+        let blocked = mgr.provision(repo_dir.path(), branch, &wt, "main").await;
+        assert!(
+            blocked
+                .as_ref()
+                .is_err_and(|e| e.contains("already exists")),
+            "fixture must reproduce the observed failure: {blocked:?}"
+        );
+
+        assert_eq!(
+            mgr.remove_stale_unregistered_dir(repo_dir.path(), wt_base.path(), &wt, &[])
+                .await,
+            Ok(true)
+        );
+        assert!(!wt.exists());
+        mgr.provision(repo_dir.path(), branch, &wt, "main")
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(git_output(&wt, &["rev-parse", "HEAD"]).stdout).unwrap(),
+            tip,
+            "the reused branch keeps its commits"
+        );
+        assert!(wt.join("kept.rs").exists());
+        assert!(!wt.join("target").exists());
+        assert_eq!(
+            mgr.remove_stale_unregistered_dir(
+                repo_dir.path(),
+                wt_base.path(),
+                &wt_base.path().join("absent"),
+                &[]
+            )
+            .await,
+            Ok(false)
+        );
+        mgr.remove(repo_dir.path(), &wt).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_directory_removal_never_removes_registered_worktree() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let wt_base = tempfile::tempdir().unwrap();
+        let wt = wt_base.path().join("registered");
+        let mgr = WorktreeManager::new();
+        mgr.provision(repo_dir.path(), "registered", &wt, "main")
+            .await
+            .unwrap();
+
+        let result = mgr
+            .remove_stale_unregistered_dir(repo_dir.path(), wt_base.path(), &wt, &[])
+            .await;
+
+        assert!(
+            result
+                .as_ref()
+                .is_err_and(|e| e.contains("registered worktree")),
+            "{result:?}"
+        );
+        assert!(wt.join(".git").exists());
+        assert!(git_worktree_list(repo_dir.path()).contains(wt.to_string_lossy().as_ref()));
+        mgr.remove(repo_dir.path(), &wt).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_directory_removal_never_removes_active_agent_worktree() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let wt_base = tempfile::tempdir().unwrap();
+        let wt = wt_base.path().join("Active-t1");
+        let mgr = WorktreeManager::new();
+        half_deleted_worktree(&mgr, repo_dir.path(), &wt, "daemon/active-t1").await;
+
+        let result = mgr
+            .remove_stale_unregistered_dir(
+                repo_dir.path(),
+                wt_base.path(),
+                &wt,
+                &[wt.to_string_lossy().into_owned()],
+            )
+            .await;
+
+        assert!(
+            result.as_ref().is_err_and(|e| e.contains("active agent")),
+            "{result:?}"
+        );
+        assert!(wt.join("target/debug/leftover").exists());
+    }
+
+    #[tokio::test]
+    async fn stale_directory_removal_never_removes_path_outside_worktree_root() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let wt_base = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let mgr = WorktreeManager::new();
+        let outside = elsewhere.path().join("Stray-t2");
+        half_deleted_worktree(&mgr, repo_dir.path(), &outside, "daemon/stray-t2").await;
+        // A nested path under the root is not a direct child either.
+        let nested = wt_base.path().join("a/Nested-t3");
+        std::fs::create_dir_all(nested.join("junk")).unwrap();
+
+        for path in [&outside, &nested] {
+            let result = mgr
+                .remove_stale_unregistered_dir(repo_dir.path(), wt_base.path(), path, &[])
+                .await;
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|e| e.contains("outside worktree root")),
+                "{result:?}"
+            );
+            assert!(path.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_directory_removal_keeps_directories_holding_git_state() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let wt_base = tempfile::tempdir().unwrap();
+        let mgr = WorktreeManager::new();
+
+        // A foreign repository (a `.git` directory) is never stale.
+        let foreign = wt_base.path().join("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        init_git_repo(&foreign);
+        // A `.git` file naming a live gitdir is never stale either.
+        let linked = wt_base.path().join("linked");
+        std::fs::create_dir(&linked).unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", foreign.join(".git").display()),
+        )
+        .unwrap();
+        // A symlink at the path is refused without following it.
+        let link = wt_base.path().join("link");
+        std::os::unix::fs::symlink(&foreign, &link).unwrap();
+
+        for path in [&foreign, &linked, &link] {
+            let result = mgr
+                .remove_stale_unregistered_dir(repo_dir.path(), wt_base.path(), path, &[])
+                .await;
+            assert!(result.is_err(), "{}: {result:?}", path.display());
+            assert!(path.exists());
+        }
+        assert!(foreign.join(".git").is_dir());
+
+        // A `.git` file whose gitdir is gone is a half-deleted checkout.
+        let dangling = wt_base.path().join("dangling");
+        std::fs::create_dir(&dangling).unwrap();
+        std::fs::write(
+            dangling.join(".git"),
+            format!("gitdir: {}\n", wt_base.path().join("missing").display()),
+        )
+        .unwrap();
+        assert_eq!(
+            mgr.remove_stale_unregistered_dir(repo_dir.path(), wt_base.path(), &dangling, &[])
+                .await,
+            Ok(true)
+        );
+        assert!(!dangling.exists());
     }
 
     #[tokio::test]
