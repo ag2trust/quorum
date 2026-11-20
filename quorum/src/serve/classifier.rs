@@ -140,6 +140,7 @@ async fn spawn_classifier_configured_with_timeout(
             environment: &[],
             mode: LaunchMode::Restricted,
             continuation_id: None,
+            managed: None,
         },
         &AdapterConfig {
             executable: agent_bin,

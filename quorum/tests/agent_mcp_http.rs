@@ -760,13 +760,13 @@ fn http_listener_derives_authority_per_request_and_signals_the_daemon() {
         .0,
         "request_too_large"
     );
-    // The same runs over stdio keep exactly their pre-existing inventories:
-    // no signalling tool is advertised or routed there.
+    // The same runs over stdio list the same inventories, signalling tools
+    // included, so a stdio provider never needs a shell fallback.
     assert_stdio_inventory(
         &endpoint,
         "worker-cap",
         "Worker",
-        &["delivery_report_write"],
+        &["delivery_report_write", "submit_work", "react", "task_note"],
     );
     assert_stdio_inventory(
         &endpoint,
@@ -780,6 +780,9 @@ fn http_listener_derives_authority_per_request_and_signals_the_daemon() {
             "add_reply_to_pull_request_comment",
             "resolve_review_thread",
             "github_operation_read",
+            "submit_review",
+            "task_note",
+            "alert_owner",
         ],
     );
     // The stub operations still answer exactly as they do over stdio.
@@ -1312,7 +1315,7 @@ const SIGNAL_TOOLS: [&str; 5] = [
 
 /// Drive one stdio shell for `capability`: it must advertise
 /// `tools/list_changed`, list exactly `expected`, and treat every signalling
-/// tool name as unknown.
+/// tool name outside that list as unknown.
 fn assert_stdio_inventory(endpoint: &Path, capability: &str, agent: &str, expected: &[&str]) {
     let mut child = Command::new(quorum_bin())
         .arg("agent-mcp")
@@ -1358,7 +1361,11 @@ fn assert_stdio_inventory(endpoint: &Path, capability: &str, agent: &str, expect
     );
     let listed = request(2, "tools/list", json!({}));
     assert_eq!(tool_names(&listed), expected, "{capability}");
-    for (id, name) in SIGNAL_TOOLS.into_iter().enumerate() {
+    for (id, name) in SIGNAL_TOOLS
+        .into_iter()
+        .filter(|name| !expected.contains(name))
+        .enumerate()
+    {
         let response = request(
             10 + id as i64,
             "tools/call",
@@ -1371,12 +1378,12 @@ fn assert_stdio_inventory(endpoint: &Path, capability: &str, agent: &str, expect
     assert!(child.wait().unwrap().success());
 }
 
-/// The signalling tools exist only over HTTP. A stdio planner shell
-/// advertises exactly its pre-existing inventory and treats the new names as
+/// A planner holds no signalling tool on either transport. A stdio planner
+/// shell advertises exactly `submit_plan` and treats the signalling names as
 /// unknown. The worker and reviewer stdio inventories are asserted against
 /// the real daemon in the listener test above.
 #[test]
-fn stdio_inventory_and_routing_are_unchanged() {
+fn stdio_planner_inventory_excludes_signalling_tools() {
     let endpoint = FakeEndpoint::start();
     assert_stdio_inventory(&endpoint.path, "planner-cap", "Planner", &["submit_plan"]);
 }
