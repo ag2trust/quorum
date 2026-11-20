@@ -959,7 +959,11 @@ Required tests include:
   live run capability but distinct attempt IDs and lifecycle generations; the guarded handoff
   cancels old queued work, waits for claimed/ambiguous work to reach a safe disposition, and
   rejects stale-descriptor operations without inserting them into the new attempt;
-- the real installed Claude client receives only the initial inventory on turn one, honors
+- the real installed Claude client, on its stateless HTTP transport, receives only the initial
+  inventory on turn one and, after a phase change, receives only the rework inventory the next
+  time it lists or calls tools, with no acknowledgement or relist step gating that turn;
+- the real installed Codex/Grok client (and `quorum agent-mcp` run manually without `--listen`),
+  on the stdio transport, receives only the initial inventory on turn one, honors
   `tools/list_changed`, relists, and receives only the rework inventory before its stdin-fed turn;
   a missing relist prevents that turn from being fed and preserves it for recovery;
 - crash after pending-review create, cancellation/head movement racing create, and a failed or
