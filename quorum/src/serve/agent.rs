@@ -39,6 +39,10 @@ pub struct AgentProc {
     // A successful wait releases the pid namespace entry. Do not signal that
     // numeric process group again after it could have been recycled.
     process_group_reaped: bool,
+    // Marker-based tree (`proctree`) reaching descendants that left the
+    // spawn-time process group via `setsid`/`setpgid`. `None` only for
+    // test-only `from_parts` processes, which carry no marker.
+    tree: Option<crate::serve::proctree::TreeHandle>,
     #[cfg(test)]
     killpg_calls: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     stdin: tokio::process::ChildStdin,
@@ -634,6 +638,8 @@ impl AgentProc {
         if restricted == RestrictedMode::Planner && agent_mcp.is_none() {
             strip_coordination_env(&mut cmd);
         }
+        // After every env strip, which would otherwise drop the marker.
+        let tree = crate::serve::proctree::apply(&mut cmd);
 
         cmd.current_dir(&spec.worktree);
         cmd.stdin(Stdio::piped())
@@ -649,7 +655,7 @@ impl AgentProc {
             });
         }
 
-        Self::from_child(cmd.spawn()?)
+        Self::from_child(cmd.spawn()?, tree)
     }
 
     fn spawn_configured_gated(
@@ -739,6 +745,8 @@ impl AgentProc {
         if restricted == RestrictedMode::Planner && agent_mcp.is_none() {
             strip_coordination_env(&mut cmd);
         }
+        // After every env strip, which would otherwise drop the marker.
+        let tree = crate::serve::proctree::apply(&mut cmd);
 
         cmd.current_dir(&spec.worktree);
         cmd.stdin(Stdio::piped())
@@ -754,18 +762,23 @@ impl AgentProc {
             });
         }
 
-        let proc = Self::from_child(cmd.spawn()?)?;
+        let proc = Self::from_child(cmd.spawn()?, tree)?;
         let gate = gate.bind(proc.process_group_id());
         Ok((proc, gate))
     }
 
-    fn from_child(mut child: Child) -> std::io::Result<Self> {
+    fn from_child(
+        mut child: Child,
+        mut tree: crate::serve::proctree::TreeHandle,
+    ) -> std::io::Result<Self> {
         // `Child::id()` becomes `None` after `try_wait()` observes leader
         // exit, but descendants may still hold the process group's pipes.
         // Persist the group ID before any caller can reap the leader.
-        let process_group_id = child.id().ok_or_else(|| {
+        let leader_pid = child.id().ok_or_else(|| {
             std::io::Error::other("spawned Claude process has no process-group ID")
-        })? as libc::pid_t;
+        })?;
+        tree.bind_leader(leader_pid);
+        let process_group_id = leader_pid as libc::pid_t;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
         let reader = BufReader::new(stdout);
@@ -780,6 +793,7 @@ impl AgentProc {
             child,
             process_group_id,
             process_group_reaped: false,
+            tree: Some(tree),
             #[cfg(test)]
             killpg_calls: None,
             stdin,
@@ -872,8 +886,9 @@ impl AgentProc {
 
         // The leader was reaped by `try_wait`, so `child.id()` is now None.
         // The spawn-time group ID still reaches any launcher or MCP
-        // descendant holding the pipes open.
-        self.kill_process_group();
+        // descendant holding the pipes open, and the tree marker reaches
+        // descendants that left that group.
+        self.kill_tree();
         // `try_wait` above reaped the leader, and this signal covered every
         // remaining member of its spawn-time group. A later Drop must not
         // signal a process group whose numeric ID may now be reused.
@@ -985,16 +1000,24 @@ impl AgentProc {
         self.process_group_id
     }
 
-    fn kill_process_group(&self) {
-        if self.process_group_id == 0 {
-            return;
-        }
+    /// Immediate, synchronous `SIGKILL` of the whole agent tree: the
+    /// spawn-time process group (only while `process_group_reaped` is false,
+    /// so a possibly recycled numeric pgid is never signalled) plus every
+    /// marker-verified descendant. Never sleeps or waits, so `Drop` uses it.
+    fn kill_tree(&self) {
+        let include_pgid = !self.process_group_reaped && self.process_group_id != 0;
         #[cfg(test)]
-        if let Some(calls) = &self.killpg_calls {
-            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if include_pgid {
+            if let Some(calls) = &self.killpg_calls {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
-        unsafe {
-            libc::killpg(self.process_group_id, libc::SIGKILL);
+        match &self.tree {
+            Some(tree) => crate::serve::proctree::kill_tree_now(tree, include_pgid),
+            None if include_pgid => unsafe {
+                libc::killpg(self.process_group_id, libc::SIGKILL);
+            },
+            None => {}
         }
     }
 
@@ -1029,6 +1052,8 @@ impl AgentProc {
             // Test-only callers do not create a process group.
             process_group_id: 0,
             process_group_reaped: false,
+            // Nor do they carry a tree marker: the inert handle kills nothing.
+            tree: None,
             killpg_calls: None,
             stdin,
             reader,
@@ -1043,11 +1068,18 @@ impl AgentProc {
     pub async fn kill_and_reap(mut self) -> Vec<CapturedOutput> {
         // Always target the spawn-time process group, even when `try_wait`
         // already observed and reaped the leader. Descendants can otherwise
-        // retain stdout/stderr and make the drains below wait forever.
-        self.kill_process_group();
+        // retain stdout/stderr and make the drains below wait forever. The
+        // tree marker also reaches descendants that called setsid/setpgid.
+        self.kill_tree();
         // Reap the child to avoid zombie accumulation
         if self.child.wait().await.is_ok() {
             self.process_group_reaped = true;
+        }
+        // Callers release the agent worktree only after this returns, so wait
+        // (bounded and logged by proctree) until the marked tree is gone.
+        if let Some(tree) = &self.tree {
+            let deadline = tokio::time::Instant::now() + crate::serve::proctree::TREE_REAP_TIMEOUT;
+            let _ = crate::serve::proctree::reap_tree(tree, deadline).await;
         }
         let mut terminal = Vec::new();
         while let Ok(Some(line)) = self.read_raw_line(None).await {
@@ -1064,9 +1096,9 @@ impl AgentProc {
 
 impl Drop for AgentProc {
     fn drop(&mut self) {
-        if !self.process_group_reaped {
-            self.kill_process_group();
-        }
+        // Synchronous and non-blocking. After a reaped leader the numeric
+        // pgid is skipped; marker-verified survivors are still killed.
+        self.kill_tree();
     }
 }
 
@@ -1336,29 +1368,9 @@ mod tests {
                 Ok(())
             });
         }
-        let mut child = command.spawn().unwrap();
-        let process_group_id = child.id().unwrap() as libc::pid_t;
-        let stdin = child.stdin.take().unwrap();
-        let reader = BufReader::new(child.stdout.take().unwrap());
-        let stderr = BufReader::new(child.stderr.take().unwrap());
-        let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Claude);
-        let failures = diagnostics.failures();
-        let stderr_diagnostics = diagnostics.clone();
-        let stderr_task =
-            tokio::spawn(async move { capture_diagnostics(stderr, stderr_diagnostics).await });
-        AgentProc {
-            child,
-            process_group_id,
-            process_group_reaped: false,
-            killpg_calls: None,
-            stdin,
-            reader,
-            line_buffer: Vec::new(),
-            turns: stream::ClaudeTurnTracker::with_implicit_turn(),
-            diagnostics,
-            failures,
-            stderr_task: Some(stderr_task),
-        }
+        // Marked exactly like the production spawn paths.
+        let tree = crate::serve::proctree::apply(&mut command);
+        AgentProc::from_child(command.spawn().unwrap(), tree).unwrap()
     }
 
     /// The claude CLI rejects any non-UUID --session-id before the first turn;
@@ -2434,10 +2446,22 @@ while IFS= read -r _line; do :; done
             "fixture descendant must still hold the process group"
         );
 
-        let feed_error = proc
-            .feed_turn(&user_turn("first turn after CLI exit"))
-            .await
-            .expect_err("fixture accepted a turn after its leader exited");
+        // A sibling test forking concurrently can briefly inherit the stdin
+        // read end (until its exec closes the CLOEXEC copy), so one write may
+        // still land. Retry, bounded, until the pipe reports the closed reader.
+        let feed_error = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match proc
+                    .feed_turn(&user_turn("first turn after CLI exit"))
+                    .await
+                {
+                    Err(error) => return error,
+                    Ok(()) => tokio::time::sleep(FIRST_TURN_EXIT_POLL_INTERVAL).await,
+                }
+            }
+        })
+        .await
+        .expect("fixture kept accepting turns after its leader exited");
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             proc.diagnose_first_turn_feed_failure(feed_error, None),
@@ -2496,6 +2520,174 @@ while IFS= read -r _line; do :; done
             calls.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "Drop must not signal a process group after kill_and_reap reaped its leader"
+        );
+    }
+
+    /// Spawn a marked Claude-shaped `AgentProc` whose leader starts a
+    /// `setsid` grandchild that appends to `<dir>/f` forever. Returns the
+    /// proc and the grandchild pid once the grandchild is running.
+    #[cfg(target_os = "linux")]
+    async fn setsid_writer_proc(dir: &std::path::Path) -> (AgentProc, libc::pid_t) {
+        let dir = dir.to_str().expect("utf-8 tempdir");
+        let pid_file = format!("{dir}/escaped.pid");
+        let script = format!(
+            "setsid sh -c 'echo $$ > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; \
+             while :; do echo x >> \"$2/f\"; sleep 0.05; done' sh '{pid_file}' '{dir}' & \
+             while [ ! -s '{pid_file}' ]; do sleep 0.01; done; printf 'ready\\n'; wait"
+        );
+        let mut proc = shell_proc(&script).await;
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(10), proc.next_raw_line())
+            .await
+            .expect("setsid fixture never became ready");
+        assert_eq!(ready.as_deref(), Some("ready"));
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The fixture is only meaningful if the grandchild really escaped the
+        // spawn-time process group that the old killpg-only path targeted.
+        assert_ne!(unsafe { libc::getpgid(pid) }, proc.process_group_id);
+        assert_ne!(unsafe { libc::getsid(pid) }, unsafe {
+            libc::getsid(proc.process_group_id)
+        });
+        (proc, pid)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pid_alive(pid: libc::pid_t) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Wait (bounded) for `kill(pid, 0)` to report ESRCH. Callers first assert
+    /// the tree has no live member, so this only covers init reaping the
+    /// already-dead, reparented zombie.
+    #[cfg(target_os = "linux")]
+    async fn wait_pid_esrch(pid: libc::pid_t) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if unsafe { libc::kill(pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn git(args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(["-c", "user.email=test@test.com", "-c", "user.name=Test"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn kill_and_reap_kills_setsid_grandchild_before_worktree_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let worktree = root.path().join("wt");
+        std::fs::create_dir(&repo).unwrap();
+        let repo_s = repo.to_str().unwrap();
+        let worktree_s = worktree.to_str().unwrap();
+        assert!(git(&["-C", repo_s, "init", "-b", "main"]).status.success());
+        assert!(
+            git(&["-C", repo_s, "commit", "--allow-empty", "-m", "init"])
+                .status
+                .success()
+        );
+        let add = git(&["-C", repo_s, "worktree", "add", "-b", "agent", worktree_s]);
+        assert!(
+            add.status.success(),
+            "{}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+
+        let (proc, grandchild) = setsid_writer_proc(&worktree).await;
+        let tree = proc.tree.clone().expect("spawned proc is marked");
+        assert!(pid_alive(grandchild));
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), proc.kill_and_reap())
+            .await
+            .expect("kill_and_reap hung on an escaped descendant");
+
+        assert!(
+            crate::serve::proctree::members(&tree).is_empty(),
+            "kill_and_reap returned while the agent tree still had live members"
+        );
+        assert!(
+            wait_pid_esrch(grandchild).await,
+            "setsid grandchild {grandchild} survived kill_and_reap"
+        );
+        let remove = git(&["-C", repo_s, "worktree", "remove", "--force", worktree_s]);
+        assert!(
+            remove.status.success(),
+            "git worktree remove failed: {}",
+            String::from_utf8_lossy(&remove.stderr)
+        );
+        assert!(!worktree.exists(), "worktree directory reappeared");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn kill_and_reap_spares_other_agent_trees_and_the_daemon() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let (proc_a, grandchild_a) = setsid_writer_proc(dir_a.path()).await;
+        let (proc_b, grandchild_b) = setsid_writer_proc(dir_b.path()).await;
+        let leader_b = proc_b.pid().expect("leader b running");
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), proc_a.kill_and_reap())
+            .await
+            .expect("kill_and_reap hung");
+        assert!(
+            wait_pid_esrch(grandchild_a).await,
+            "agent A grandchild survived"
+        );
+
+        assert!(pid_alive(unsafe { libc::getpid() }));
+        assert!(
+            pid_alive(leader_b),
+            "tearing down agent A killed agent B's leader"
+        );
+        assert!(
+            pid_alive(grandchild_b),
+            "tearing down agent A killed agent B's setsid grandchild"
+        );
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), proc_b.kill_and_reap())
+            .await
+            .expect("kill_and_reap hung");
+        assert!(
+            wait_pid_esrch(grandchild_b).await,
+            "agent B grandchild survived"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn drop_kills_setsid_grandchild_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let (proc, grandchild) = setsid_writer_proc(dir.path()).await;
+
+        let started = std::time::Instant::now();
+        drop(proc);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "Drop blocked for {elapsed:?}"
+        );
+        assert!(
+            wait_pid_esrch(grandchild).await,
+            "Drop did not kill the setsid grandchild {grandchild}"
         );
     }
 
