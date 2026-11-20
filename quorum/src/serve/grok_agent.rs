@@ -770,15 +770,8 @@ fn configure_managed_mcp_environment(
     home: &GrokMcpConfigHome,
     spec: &GrokSpec,
 ) -> std::io::Result<()> {
-    for name in [
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "QUORUM_HOME",
-        "GH_CONFIG_DIR",
-        "QUORUM_ORCHESTRATOR_TOKEN",
-    ] {
-        command.env_remove(name);
-    }
+    // GitHub, Quorum-home and operator authority is removed afterwards by the
+    // shared `runner::ManagedRunEnv` policy, which every Grok spawn applies.
     let real_home = real_home_for_child(spec)?;
     let rustup_home = inherited_env(spec, "RUSTUP_HOME")
         .map(PathBuf::from)
@@ -1137,6 +1130,9 @@ pub struct GrokProc {
     // Keeps the invocation-local full config layer alive until the child and
     // its MCP subprocess have been killed and reaped.
     _mcp_config_home: Option<GrokMcpConfigHome>,
+    /// Keeps the run-private `GH_CONFIG_DIR` alive for the child's lifetime;
+    /// `None` only for test-constructed processes.
+    _run_env: Option<crate::serve::runner::ManagedRunEnv>,
 }
 
 /// Provider evidence that a valid Grok session exhausted its configured turn
@@ -1237,7 +1233,6 @@ impl GrokProc {
         for (key, value) in &spec.env_vars {
             command.env(key, value);
         }
-        crate::serve::runner::strip_operator_secrets(&mut command);
         // `GROK_CONFIG` deliberately drops code-execution tables including
         // mcp_servers. Point this process at a private full config.toml layer.
         // Its custom workspace profile grants the original Grok state root,
@@ -1245,6 +1240,10 @@ impl GrokProc {
         if let Some(home) = &mcp_config_home {
             configure_managed_mcp_environment(&mut command, home, spec)?;
         }
+        // Last, so neither spec nor MCP-home environment can re-add a removed
+        // credential or override the run-private `GH_CONFIG_DIR`.
+        let run_env = crate::serve::runner::ManagedRunEnv::create()?;
+        run_env.apply(&mut command);
         command
             .current_dir(&spec.worktree)
             .stdin(Stdio::null())
@@ -1291,6 +1290,7 @@ impl GrokProc {
             terminal_exit_status: None,
             worker_request: None,
             _mcp_config_home: mcp_config_home,
+            _run_env: Some(run_env),
         })
     }
 
@@ -1318,10 +1318,11 @@ impl GrokProc {
         for (key, value) in &spec.env_vars {
             command.env(key, value);
         }
-        crate::serve::runner::strip_operator_secrets(&mut command);
         if let Some(home) = &mcp_config_home {
             configure_managed_mcp_environment(&mut command, home, spec)?;
         }
+        let run_env = crate::serve::runner::ManagedRunEnv::create()?;
+        run_env.apply(&mut command);
         command
             .current_dir(&spec.worktree)
             .stdin(Stdio::null())
@@ -1367,6 +1368,7 @@ impl GrokProc {
                 terminal_exit_status: None,
                 worker_request: None,
                 _mcp_config_home: mcp_config_home,
+                _run_env: Some(run_env),
             },
             gate,
         ))
@@ -2692,6 +2694,7 @@ mod tests {
             terminal_exit_status: None,
             worker_request: None,
             _mcp_config_home: None,
+            _run_env: None,
         }
     }
 
@@ -3096,15 +3099,10 @@ mod tests {
                 launch.contains("endpoint=/tmp/quorum-agent.sock\n"),
                 "{launch}"
             );
-            for absent in [
-                "gh=\n",
-                "github=\n",
-                "quorum_home=\n",
-                "gh_config=\n",
-                "orchestrator=\n",
-            ] {
+            for absent in ["gh=\n", "github=\n", "quorum_home=\n", "orchestrator=\n"] {
                 assert!(launch.contains(absent), "{launch}");
             }
+            crate::serve::runner::assert_run_private_gh_config(launch, "/ambient/gh-config");
             assert!(
                 !launch.contains(&format!("home={}\n", original_home.display())),
                 "managed child retained the operator home: {launch}"
