@@ -62,8 +62,8 @@ use tokio::task::JoinSet;
 use super::repository_service::{
     CreatedComment, Delivery, DiffSide, OperationEffect, OutcomeClass, PrMetadata, PrState,
     PullRequestNumber, RepositoryError, RepositoryRequest, RepositoryResponse, RepositoryService,
-    RepositoryTarget, ReviewRecord, ReviewState, ReviewSubjectType, DEFAULT_CALL_TIMEOUT,
-    MAX_AGENT_REQUEST_BYTES,
+    RepositoryTarget, ReviewRecord, ReviewState, ReviewSubjectType, ReviewThreadRecord,
+    DEFAULT_CALL_TIMEOUT, MAX_AGENT_REQUEST_BYTES,
 };
 use super::{log, now_unix};
 
@@ -313,6 +313,12 @@ fn decode_stored(
         | RepositoryRequest::GetReviews { .. }
         | RepositoryRequest::GetComments { .. } => GithubOperationKind::PullRequestRead,
         RepositoryRequest::AddIssueComment { .. } => GithubOperationKind::AddIssueComment,
+        // Executed only by `execute_thread_write`, which first resolves the
+        // target thread on the bound PR.
+        RepositoryRequest::ReplyToReviewComment { .. } => {
+            GithubOperationKind::AddReplyToPullRequestComment
+        }
+        RepositoryRequest::ResolveReviewThread { .. } => GithubOperationKind::ResolveReviewThread,
         // Pending-review steps are stored as endpoint requests and built by
         // `prepare_review` from daemon slot state; one stored in this closed
         // vocabulary is refused before any send. Housekeeping variants are
@@ -323,7 +329,9 @@ fn decode_stored(
         | RepositoryRequest::ListPendingReviews {}
         | RepositoryRequest::GetReview { .. }
         | RepositoryRequest::DeletePendingReview { .. }
-        | RepositoryRequest::ListReviewComments { .. } => {
+        | RepositoryRequest::ListReviewComments { .. }
+        | RepositoryRequest::ListReviewThreads {}
+        | RepositoryRequest::ListCommentReplies { .. } => {
             return Err(Disposition::FailedUnsent {
                 error_kind: "unsupported_request",
                 summary: "pending-review requests are executable only as review steps".to_string(),
@@ -510,7 +518,47 @@ fn response_json(response: &RepositoryResponse) -> serde_json::Value {
                 .map(|comment| serde_json::json!({"id": comment.id, "node_id": comment.node_id}))
                 .collect::<Vec<_>>(),
         }),
+        RepositoryResponse::ReviewThreads(threads) => serde_json::json!({
+            "kind": "review_threads",
+            "threads": threads.iter().map(thread_json).collect::<Vec<_>>(),
+        }),
+        // Rendered without bodies, which carry hidden operation markers.
+        RepositoryResponse::ReviewReply(reply) => serde_json::json!({
+            "kind": "review_reply",
+            "id": reply.id,
+            "node_id": reply.node_id,
+            "in_reply_to_id": reply.in_reply_to_id,
+        }),
+        RepositoryResponse::ReviewReplies(replies) => serde_json::json!({
+            "kind": "review_replies",
+            "ids": replies.iter().map(|reply| reply.id).collect::<Vec<_>>(),
+        }),
+        RepositoryResponse::ThreadResolved { thread_node_id } => serde_json::json!({
+            "kind": "review_thread_resolved",
+            "thread_id": thread_node_id,
+        }),
     }
+}
+
+/// The agent-facing view of one review thread: its node ID, anchor, the
+/// revision it applies to, nearby diff context, and GitHub's own resolved
+/// and outdated state.
+fn thread_json(thread: &ReviewThreadRecord) -> serde_json::Value {
+    serde_json::json!({
+        "id": thread.node_id,
+        "root_comment_id": thread.root_comment_id,
+        "path": thread.path,
+        "line": thread.line,
+        "start_line": thread.start_line,
+        "original_line": thread.original_line,
+        "side": thread.side,
+        "subject_type": thread.subject_type,
+        "revision": thread.commit_id,
+        "original_revision": thread.original_commit_id,
+        "context": thread.diff_hunk,
+        "resolved": thread.resolved,
+        "outdated": thread.outdated,
+    })
 }
 
 fn review_json(review: &super::repository_service::ReviewRecord) -> serde_json::Value {
@@ -565,6 +613,9 @@ async fn execute_claimed(ctx: &ExecContext, claimed: ClaimedOperation) -> Result
     let ClaimedOperation { claim, operation } = claimed;
     if is_review_kind(&operation.kind) {
         return execute_review(ctx, claim, operation).await;
+    }
+    if is_thread_kind(&operation.kind) {
+        return execute_thread_write(ctx, claim, operation).await;
     }
     let prepared = PullRequestNumber::new(operation.pr_number)
         .ok_or(Disposition::FailedUnsent {
@@ -1062,6 +1113,280 @@ async fn execute_review(
         Err(error) => (error_kind_token(&error), error.to_string()),
     };
     let disposition = match reconcile(ctx, pr, &plan).await {
+        Some(reconciled) => reconciled,
+        None => Disposition::Ambiguous {
+            error_kind,
+            summary,
+        },
+    };
+    record(&ctx.db_path, claim, disposition).await
+}
+
+// ---------------------------------------------------------------------------
+// Review-thread replies and resolution
+// ---------------------------------------------------------------------------
+
+const REPLY_KIND: &str = GithubOperationKind::AddReplyToPullRequestComment.as_str();
+const RESOLVE_KIND: &str = GithubOperationKind::ResolveReviewThread.as_str();
+
+fn is_thread_kind(kind: &str) -> bool {
+    kind == REPLY_KIND || kind == RESOLVE_KIND
+}
+
+/// The bound PR's review threads, from one Repository Service read.
+async fn list_threads(
+    ctx: &ExecContext,
+    pr: PullRequestNumber,
+) -> std::result::Result<Vec<ReviewThreadRecord>, RepositoryError> {
+    match ctx
+        .service
+        .execute(&ctx.target, pr, &RepositoryRequest::ListReviewThreads {})
+        .await?
+    {
+        RepositoryResponse::ReviewThreads(threads) => Ok(threads),
+        _ => Err(RepositoryError::new(
+            super::repository_service::RepositoryErrorKind::InvalidResponse,
+            "review thread listing returned another response",
+        )),
+    }
+}
+
+fn reply_json(
+    id: u64,
+    node_id: &str,
+    thread: &ReviewThreadRecord,
+    reconciled: bool,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "kind": "review_reply",
+        "id": id,
+        "node_id": node_id,
+        "in_reply_to_id": thread.root_comment_id,
+        "thread": thread_json(thread),
+    });
+    if reconciled {
+        value["reconciled"] = serde_json::json!(true);
+    }
+    value
+}
+
+fn resolved_json(
+    thread: &ReviewThreadRecord,
+    already_resolved: bool,
+    reconciled: bool,
+) -> serde_json::Value {
+    let mut thread = thread.clone();
+    thread.resolved = true;
+    let mut value = serde_json::json!({
+        "kind": "review_thread_resolved",
+        "already_resolved": already_resolved,
+        "thread": thread_json(&thread),
+    });
+    if reconciled {
+        value["reconciled"] = serde_json::json!(true);
+    }
+    value
+}
+
+/// After a possibly-sent reply or resolve, look for its effect with one
+/// exact read: the reply by its hidden marker among the thread root's
+/// replies, the resolution by GitHub's idempotent resolved state. `None`
+/// (absence or any read failure) leaves the write ambiguous; nothing here
+/// sends the mutation again.
+async fn reconcile_thread_write(
+    ctx: &ExecContext,
+    pr: PullRequestNumber,
+    request: &RepositoryRequest,
+    thread: &ReviewThreadRecord,
+    marker: &str,
+) -> Option<Disposition> {
+    match request {
+        RepositoryRequest::ReplyToReviewComment { comment_id, .. } => {
+            let read = RepositoryRequest::ListCommentReplies {
+                comment_id: *comment_id,
+            };
+            let RepositoryResponse::ReviewReplies(replies) =
+                ctx.service.execute(&ctx.target, pr, &read).await.ok()?
+            else {
+                return None;
+            };
+            let mut marked = replies
+                .iter()
+                .filter(|reply| !marker.is_empty() && reply.body.contains(marker));
+            let reply = marked.next()?;
+            if marked.next().is_some() {
+                return None;
+            }
+            Some(succeeded(
+                &reply_json(reply.id, &reply.node_id, thread, true),
+                Some(reply.id),
+            ))
+        }
+        RepositoryRequest::ResolveReviewThread { thread_node_id } => {
+            let threads = list_threads(ctx, pr).await.ok()?;
+            let current = threads
+                .iter()
+                .find(|current| current.node_id == *thread_node_id)?;
+            current
+                .resolved
+                .then(|| succeeded(&resolved_json(current, false, true), None))
+        }
+        _ => None,
+    }
+}
+
+/// Execute one claimed thread reply or resolution.
+///
+/// The target is resolved first, with one read of the bound PR's review
+/// threads and before execution starts, so a comment or thread on any other
+/// PR (or a general issue comment ID) fails closed with nothing sent. A reply
+/// goes to the thread's top-level comment through GitHub's reply endpoint and
+/// carries the operation marker; an already-resolved thread satisfies its
+/// resolve without a mutation. A possibly-sent result is reconciled by exact
+/// marker or resolved state and is otherwise left ambiguous, never re-sent.
+async fn execute_thread_write(
+    ctx: &ExecContext,
+    claim: OperationClaim,
+    operation: github_operations::GithubAgentOperation,
+) -> Result<()> {
+    let prepared = PullRequestNumber::new(operation.pr_number)
+        .ok_or_else(|| unsent("invalid_target", "operation has no valid pull request"))
+        .and_then(|pr| {
+            decode_stored(&operation.kind, &operation.request_json).map(|request| (pr, request))
+        });
+    let (pr, stored) = match prepared {
+        Ok(prepared) => prepared,
+        Err(disposition) => return record(&ctx.db_path, claim, disposition).await,
+    };
+    // A failed lookup is a read failure before any mutation was handed off:
+    // retryable within the claim cap or terminal, but always provably unsent.
+    let threads = match list_threads(ctx, pr).await {
+        Ok(threads) => threads,
+        Err(error) => {
+            let error_kind = error_kind_token(&error);
+            let summary = error.to_string();
+            let retryable = error.delivery() == Delivery::NotSent
+                || error.outcome(OperationEffect::Read) == OutcomeClass::Retryable;
+            let disposition = if retryable {
+                Disposition::Retry {
+                    error_kind,
+                    summary,
+                    proven_unsent: true,
+                }
+            } else {
+                Disposition::FailedUnsent {
+                    error_kind,
+                    summary,
+                }
+            };
+            return record(&ctx.db_path, claim, disposition).await;
+        }
+    };
+    let (thread, request, marker) = match stored {
+        RepositoryRequest::ReplyToReviewComment { comment_id, body } => {
+            let Some(thread) = threads
+                .into_iter()
+                .find(|thread| thread.comment_ids.contains(&comment_id))
+            else {
+                let summary = format!(
+                    "comment {comment_id} is not a review comment on pull request #{}",
+                    pr.get()
+                );
+                return record(
+                    &ctx.db_path,
+                    claim,
+                    unsent("review_comment_not_found", &summary),
+                )
+                .await;
+            };
+            let Some(marker) = operation.github_marker.clone().filter(|m| !m.is_empty()) else {
+                let disposition = unsent("missing_marker", "write operation has no daemon marker");
+                return record(&ctx.db_path, claim, disposition).await;
+            };
+            // GitHub replies only to a thread's top-level comment.
+            let request = RepositoryRequest::ReplyToReviewComment {
+                comment_id: thread.root_comment_id,
+                body: compose_comment_body(&body, &marker),
+            };
+            (thread, Some(request), marker)
+        }
+        RepositoryRequest::ResolveReviewThread { thread_node_id } => {
+            let Some(thread) = threads
+                .into_iter()
+                .find(|thread| thread.node_id == thread_node_id)
+            else {
+                let summary = format!("the review thread is not on pull request #{}", pr.get());
+                return record(
+                    &ctx.db_path,
+                    claim,
+                    unsent("review_thread_not_found", &summary),
+                )
+                .await;
+            };
+            // Resolution is idempotent: an already-resolved thread is the
+            // requested effect, confirmed without a mutation.
+            let request = (!thread.resolved)
+                .then_some(RepositoryRequest::ResolveReviewThread { thread_node_id });
+            (thread, request, String::new())
+        }
+        _ => {
+            let disposition = unsent("request_kind_mismatch", "not a review-thread write");
+            return record(&ctx.db_path, claim, disposition).await;
+        }
+    };
+
+    // Revalidates live authority; a revoked attempt is cancelled unsent.
+    let started = with_conn(&ctx.db_path, move |conn| {
+        github_operations::mark_execution_started(conn, &claim, now_unix())
+    })
+    .await?;
+    if !started {
+        return record_not_resent(&ctx.db_path, claim).await;
+    }
+    let Some(request) = request else {
+        let disposition = succeeded(&resolved_json(&thread, true, false), None);
+        return record(&ctx.db_path, claim, disposition).await;
+    };
+
+    let result = ctx.service.execute(&ctx.target, pr, &request).await;
+    let (error_kind, summary) = match (&request, result) {
+        (
+            RepositoryRequest::ReplyToReviewComment { comment_id, .. },
+            Ok(RepositoryResponse::ReviewReply(reply)),
+        ) if reply.in_reply_to_id == *comment_id && reply.body.contains(&marker) => {
+            let disposition = succeeded(
+                &reply_json(reply.id, &reply.node_id, &thread, false),
+                Some(reply.id),
+            );
+            return record(&ctx.db_path, claim, disposition).await;
+        }
+        (
+            RepositoryRequest::ResolveReviewThread { thread_node_id },
+            Ok(RepositoryResponse::ThreadResolved {
+                thread_node_id: resolved,
+            }),
+        ) if resolved == *thread_node_id => {
+            let disposition = succeeded(&resolved_json(&thread, false, false), None);
+            return record(&ctx.db_path, claim, disposition).await;
+        }
+        (_, Ok(_)) => (
+            "invalid_result",
+            "repository service result does not prove the requested thread effect".to_string(),
+        ),
+        // Closed transport proof: nothing was handed to GitHub.
+        (_, Err(error)) if error.delivery() == Delivery::NotSent => {
+            let disposition = Disposition::Retry {
+                error_kind: error_kind_token(&error),
+                summary: error.to_string(),
+                proven_unsent: true,
+            };
+            return record(&ctx.db_path, claim, disposition).await;
+        }
+        // Any answer after hand-off, even a rejection, is reconciled, never
+        // settled unsent.
+        (_, Err(error)) => (error_kind_token(&error), error.to_string()),
+    };
+    let disposition = match reconcile_thread_write(ctx, pr, &request, &thread, &marker).await {
         Some(reconciled) => reconciled,
         None => Disposition::Ambiguous {
             error_kind,
@@ -2214,5 +2539,328 @@ mod tests {
         assert!(bounded_summary(&"é".repeat(5_000)).as_str().len() <= MAX_OPERATION_ERROR_BYTES);
         assert_eq!(bounded_summary("a\0b").as_str(), "a b");
         assert_eq!(bounded_summary("").as_str(), "github operation failed");
+    }
+
+    // -----------------------------------------------------------------------
+    // Review-thread replies and resolution. Role gating is the endpoint's
+    // (covered there); these drive the executor for one admitted row.
+    // -----------------------------------------------------------------------
+
+    use crate::serve::repository_service::ReviewReplyRecord;
+
+    const REPLY_REQUEST: &str =
+        r#"{"kind":"reply_to_review_comment","comment_id":12,"body":"Fixed in `abc`."}"#;
+    const RESOLVE_REQUEST: &str = r#"{"kind":"resolve_review_thread","thread_node_id":"PRRT_a"}"#;
+
+    fn thread(id: &str, ids: &[u64], resolved: bool, outdated: bool) -> ReviewThreadRecord {
+        ReviewThreadRecord {
+            node_id: id.to_string(),
+            resolved,
+            outdated,
+            path: "src/lib.rs".to_string(),
+            line: (!outdated).then_some(3),
+            original_line: Some(3),
+            start_line: None,
+            side: Some("RIGHT".to_string()),
+            subject_type: Some("LINE".to_string()),
+            root_comment_id: ids[0],
+            comment_ids: ids.to_vec(),
+            commit_id: (!outdated).then(|| SHA.to_string()),
+            original_commit_id: Some(SHA.to_string()),
+            diff_hunk: "@@ -1,3 +1,3 @@\n a\n-b\n+c".to_string(),
+        }
+    }
+
+    fn listing(threads: Vec<ReviewThreadRecord>) -> FakeOutcome {
+        FakeOutcome::Succeed(RepositoryResponse::ReviewThreads(threads))
+    }
+
+    fn write_calls(fake: &FakeRepositoryService) -> usize {
+        fake.calls()
+            .iter()
+            .filter(|call| call.request.effect() == OperationEffect::Write)
+            .count()
+    }
+
+    fn result_json(row: &GithubAgentOperation) -> serde_json::Value {
+        serde_json::from_str(row.response_json.as_deref().expect("result recorded")).unwrap()
+    }
+
+    async fn run_once(h: &Harness, id: &GithubOperationId, fake: Arc<FakeRepositoryService>) {
+        let running = Running::start(h.executor(fake));
+        wait_for(h, id, terminal).await;
+        running.stop().await;
+    }
+
+    #[tokio::test]
+    async fn reply_targets_the_thread_root_on_the_bound_pr_and_returns_thread_state() {
+        let h = Harness::new();
+        let id = h.admit(
+            "req-reply",
+            GithubOperationKind::AddReplyToPullRequestComment,
+            REPLY_REQUEST,
+        );
+        let marker = h.row(&id).github_marker.unwrap();
+        let body = compose_comment_body("Fixed in `abc`.", &marker);
+        let fake = Arc::new(FakeRepositoryService::scripted([
+            listing(vec![
+                thread("PRRT_z", &[5], false, false),
+                thread("PRRT_a", &[11, 12], false, true),
+            ]),
+            FakeOutcome::Succeed(RepositoryResponse::ReviewReply(ReviewReplyRecord {
+                id: 77,
+                node_id: "PRRC_77".into(),
+                in_reply_to_id: 11,
+                body: body.clone(),
+            })),
+        ]));
+        run_once(&h, &id, fake.clone()).await;
+
+        let row = h.row(&id);
+        assert_eq!(
+            (row.state.as_str(), row.send_state.as_str()),
+            ("succeeded", "confirmed")
+        );
+        assert_eq!(row.remote_object_id.as_deref(), Some("77"));
+        let calls = fake.calls();
+        assert_eq!(calls[0].request, RepositoryRequest::ListReviewThreads {});
+        // The agent named a reply in the thread; GitHub's reply goes to its root.
+        assert_eq!(
+            calls[1].request,
+            RepositoryRequest::ReplyToReviewComment {
+                comment_id: 11,
+                body
+            }
+        );
+        assert!(calls.iter().all(|call| call.pr.get() == PR as u64));
+        let value = result_json(&row);
+        assert_eq!(value["id"], 77);
+        assert_eq!(value["in_reply_to_id"], 11);
+        let thread = &value["thread"];
+        assert_eq!(thread["id"], "PRRT_a");
+        assert_eq!(thread["path"], "src/lib.rs");
+        assert_eq!(thread["original_revision"], SHA);
+        assert_eq!(thread["revision"], serde_json::Value::Null);
+        assert_eq!(thread["context"], "@@ -1,3 +1,3 @@\n a\n-b\n+c");
+        assert_eq!(thread["resolved"], false);
+        assert_eq!(thread["outdated"], true);
+        assert!(!row.response_json.unwrap().contains(&marker));
+    }
+
+    #[tokio::test]
+    async fn reply_to_a_comment_outside_the_bound_pr_threads_sends_nothing() {
+        let h = Harness::new();
+        let id = h.admit(
+            "req-foreign",
+            GithubOperationKind::AddReplyToPullRequestComment,
+            REPLY_REQUEST,
+        );
+        // Comment 12 is on another PR (or is a general issue comment): it is
+        // in none of the bound PR's threads.
+        let fake = Arc::new(FakeRepositoryService::scripted([listing(vec![thread(
+            "PRRT_z",
+            &[5],
+            false,
+            false,
+        )])]));
+        run_once(&h, &id, fake.clone()).await;
+        let row = h.row(&id);
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.error_kind.as_deref(), Some("review_comment_not_found"));
+        assert_eq!(row.send_state, "not_started");
+        assert!(row.execution_started_at.is_none());
+        assert_eq!(write_calls(&fake), 0);
+        assert_eq!(h.errors(), 0);
+    }
+
+    #[tokio::test]
+    async fn lost_reply_is_reconciled_by_marker_and_absence_is_never_resent() {
+        let h = Harness::new();
+        let found = h.admit(
+            "req-lost-found",
+            GithubOperationKind::AddReplyToPullRequestComment,
+            REPLY_REQUEST,
+        );
+        let marker = h.row(&found).github_marker.unwrap();
+        let fake = Arc::new(FakeRepositoryService::scripted([
+            listing(vec![thread("PRRT_a", &[11, 12], false, false)]),
+            FakeOutcome::timeout(),
+            FakeOutcome::Succeed(RepositoryResponse::ReviewReplies(vec![
+                ReviewReplyRecord {
+                    id: 70,
+                    node_id: "PRRC_70".into(),
+                    in_reply_to_id: 11,
+                    body: "someone else".into(),
+                },
+                ReviewReplyRecord {
+                    id: 71,
+                    node_id: "PRRC_71".into(),
+                    in_reply_to_id: 11,
+                    body: format!("Fixed.\n\n{marker}"),
+                },
+            ])),
+        ]));
+        run_once(&h, &found, fake.clone()).await;
+        let row = h.row(&found);
+        assert_eq!(
+            (row.state.as_str(), row.send_state.as_str()),
+            ("succeeded", "confirmed")
+        );
+        assert_eq!(row.remote_object_id.as_deref(), Some("71"));
+        assert_eq!(result_json(&row)["reconciled"], true);
+        assert_eq!(write_calls(&fake), 1);
+        assert_eq!(
+            fake.calls()[2].request,
+            RepositoryRequest::ListCommentReplies { comment_id: 11 }
+        );
+
+        let absent = h.admit(
+            "req-lost-absent",
+            GithubOperationKind::AddReplyToPullRequestComment,
+            REPLY_REQUEST,
+        );
+        let fake = Arc::new(FakeRepositoryService::scripted([
+            listing(vec![thread("PRRT_a", &[11, 12], false, false)]),
+            FakeOutcome::timeout(),
+            FakeOutcome::Succeed(RepositoryResponse::ReviewReplies(Vec::new())),
+        ]));
+        run_once(&h, &absent, fake.clone()).await;
+        let row = h.row(&absent);
+        assert_eq!(
+            (row.state.as_str(), row.send_state.as_str()),
+            ("failed", "ambiguous")
+        );
+        assert_eq!(write_calls(&fake), 1);
+
+        // A later daemon never claims the ambiguous row for another send.
+        let restarted = Arc::new(FakeRepositoryService::scripted([]));
+        let running = Running::start(h.executor(restarted.clone()));
+        tokio::time::sleep(FAST_POLL * 10).await;
+        running.stop().await;
+        assert!(restarted.calls().is_empty(), "ambiguous reply was re-sent");
+        assert_eq!(h.row(&absent), row);
+        assert_eq!(h.errors(), 0);
+    }
+
+    #[tokio::test]
+    async fn reply_started_before_a_crash_is_ambiguous_after_restart_and_never_resent() {
+        let h = Harness::new();
+        let id = h.admit(
+            "req-crash",
+            GithubOperationKind::AddReplyToPullRequestComment,
+            REPLY_REQUEST,
+        );
+        let claimed = github_operations::claim_next(&mut h.conn(), now_unix())
+            .unwrap()
+            .unwrap();
+        assert!(github_operations::mark_execution_started(
+            &mut h.conn(),
+            &claimed.claim,
+            now_unix()
+        )
+        .unwrap());
+        let fake = Arc::new(FakeRepositoryService::scripted([]));
+        let running = Running::start(h.executor(fake.clone()));
+        let row = wait_for(&h, &id, terminal).await;
+        tokio::time::sleep(FAST_POLL * 10).await;
+        running.stop().await;
+        assert_eq!(
+            (row.state.as_str(), row.send_state.as_str()),
+            ("failed", "ambiguous")
+        );
+        assert!(fake.calls().is_empty(), "interrupted reply was re-sent");
+    }
+
+    #[tokio::test]
+    async fn resolve_is_bound_to_the_pr_idempotent_and_reconciled_by_state() {
+        let h = Harness::new();
+        // A thread that is not on the bound PR is refused before any send.
+        let foreign = h.admit(
+            "req-resolve-foreign",
+            GithubOperationKind::ResolveReviewThread,
+            RESOLVE_REQUEST,
+        );
+        let fake = Arc::new(FakeRepositoryService::scripted([listing(vec![thread(
+            "PRRT_z",
+            &[5],
+            false,
+            false,
+        )])]));
+        run_once(&h, &foreign, fake.clone()).await;
+        let row = h.row(&foreign);
+        assert_eq!(row.state, "failed");
+        assert_eq!(row.error_kind.as_deref(), Some("review_thread_not_found"));
+        assert_eq!(row.send_state, "not_started");
+        assert_eq!(write_calls(&fake), 0);
+
+        // A lost response is confirmed by GitHub's resolved state, once.
+        let lost = h.admit(
+            "req-resolve-lost",
+            GithubOperationKind::ResolveReviewThread,
+            RESOLVE_REQUEST,
+        );
+        let fake = Arc::new(FakeRepositoryService::scripted([
+            listing(vec![thread("PRRT_a", &[11], false, true)]),
+            FakeOutcome::timeout(),
+            listing(vec![thread("PRRT_a", &[11], true, true)]),
+        ]));
+        run_once(&h, &lost, fake.clone()).await;
+        let row = h.row(&lost);
+        assert_eq!(
+            (row.state.as_str(), row.send_state.as_str()),
+            ("succeeded", "confirmed")
+        );
+        let value = result_json(&row);
+        assert_eq!(value["reconciled"], true);
+        assert_eq!(value["thread"]["resolved"], true);
+        assert_eq!(value["thread"]["outdated"], true);
+        assert_eq!(
+            fake.calls()[1].request,
+            RepositoryRequest::ResolveReviewThread {
+                thread_node_id: "PRRT_a".into()
+            }
+        );
+        assert_eq!(write_calls(&fake), 1);
+
+        // An already-resolved thread satisfies the request without a mutation.
+        let again = h.admit(
+            "req-resolve-again",
+            GithubOperationKind::ResolveReviewThread,
+            RESOLVE_REQUEST,
+        );
+        let fake = Arc::new(FakeRepositoryService::scripted([listing(vec![thread(
+            "PRRT_a",
+            &[11],
+            true,
+            false,
+        )])]));
+        run_once(&h, &again, fake.clone()).await;
+        let row = h.row(&again);
+        assert_eq!(
+            (row.state.as_str(), row.send_state.as_str()),
+            ("succeeded", "confirmed")
+        );
+        assert_eq!(result_json(&row)["already_resolved"], true);
+        assert_eq!(write_calls(&fake), 0);
+        assert_eq!(h.errors(), 0);
+    }
+
+    #[tokio::test]
+    async fn thread_lookup_outage_retries_provably_unsent() {
+        let h = Harness::new();
+        let id = h.admit(
+            "req-outage",
+            GithubOperationKind::AddReplyToPullRequestComment,
+            REPLY_REQUEST,
+        );
+        let fake = Arc::new(FakeRepositoryService::scripted([FakeOutcome::ambiguous()]));
+        let running = Running::start(h.executor(fake.clone()));
+        let row = wait_for(&h, &id, |row| row.state == "queued" && row.attempts == 1).await;
+        running.stop().await;
+        // The lookup failed before any mutation was handed off.
+        assert_eq!(row.send_state, "not_started");
+        assert!(row.execution_started_at.is_none());
+        assert_eq!(row.error_kind.as_deref(), Some("transient_failure"));
+        assert_eq!(write_calls(&fake), 0);
     }
 }

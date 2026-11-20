@@ -1716,6 +1716,149 @@ fn pull_request_read_and_comment_run_through_the_daemon_executor() {
     daemon.stop();
 }
 
+/// A `gh` stand-in for review-thread work on PR 77: the credential lookup,
+/// the GraphQL thread listing (already projected, as `--jq` would emit it),
+/// the REST reply (echoing its stdin body the way GitHub does), and the
+/// GraphQL resolve. Request documents are recorded per step.
+fn install_fake_thread_gh(dir: &Path) {
+    let thread = r#"{"id":"PRRT_kwDOthread1","isResolved":false,"isOutdated":true,"path":"src/lib.rs","line":null,"originalLine":2,"startLine":null,"diffSide":"RIGHT","subjectType":"LINE","ids":[5001,5002],"root":{"databaseId":5001,"diffHunk":"@@ -1 +1,2 @@\n one\n+two","commit":null,"originalCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#;
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = auth ] && [ "$2" = token ]; then echo fake-gh-token; exit 0; fi
+[ "$GH_TOKEN" = fake-gh-token ] || {{ echo "missing token" >&2; exit 7; }}
+echo "$@" >> '{dir}/gh-args.log'
+if [ "$1" = api ] && [ "$2" = graphql ] && [ "$3" = --paginate ]; then
+  printf '%s\n' '{thread}'
+  exit 0
+fi
+if [ "$1" = api ] && [ "$2" = --method ] && [ "$4" = repos/test/repo/pulls/77/comments/5001/replies ]; then
+  cat > '{dir}/reply-stdin.json'
+  printf '%s' '{{"id":5003,"node_id":"PRRC_kwDOreply","in_reply_to_id":5001,"pull_request_url":"https://api.github.com/repos/test/repo/pulls/77",'
+  tail -c +2 '{dir}/reply-stdin.json'
+  exit 0
+fi
+if [ "$1" = api ] && [ "$2" = graphql ] && [ "$3" = --input ]; then
+  cat > '{dir}/resolve-stdin.json'
+  printf '%s' '{{"data":{{"resolveReviewThread":{{"thread":{{"id":"PRRT_kwDOthread1","isResolved":true,"pullRequest":{{"number":77}}}}}}}}}}'
+  exit 0
+fi
+echo "fake gh: unsupported $*" >&2
+exit 1
+"#,
+        dir = dir.display()
+    );
+    let path = dir.join("gh");
+    std::fs::write(&path, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn thread_reply_and_resolve_run_through_the_daemon_executor() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    let worktrees = root.path().join("worktrees");
+    let bin = root.path().join("bin");
+    for dir in [&home, &repo, &worktrees, &bin] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    init_git_repo(&repo);
+    install_fake_thread_gh(&bin);
+    let names = root.path().join("names.txt");
+    std::fs::write(&names, "AgentOne\nAgentTwo\n").unwrap();
+    let config = root.path().join("serve.toml");
+    write_config(&config);
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let daemon =
+        Daemon::start_with_env(&home, &repo, &worktrees, &names, &config, &[("PATH", path)]);
+    daemon.wait_for("serving (cap=1)");
+    let db = home.join("repos/test__repo/quorum.db");
+    let endpoint = endpoint_path(&db);
+    install_fixtures(&db);
+    // The worker's task now has the reviewer's PR: a rework worker.
+    quorum_core::db::open(&db)
+        .unwrap()
+        .execute(r#"UPDATE tasks SET refs='{"pr":77}' WHERE id=200"#, [])
+        .unwrap();
+    let shell = HttpShell::start(&endpoint, &[("GH_TOKEN", "must-not-be-used")]);
+    let addr = shell.addr;
+
+    // Workers cannot resolve threads; nothing is queued.
+    let (is_error, refused) = call(
+        addr,
+        "worker-cap",
+        "resolve_review_thread",
+        json!({"threadID":"PRRT_kwDOthread1"}),
+    );
+    assert!(is_error);
+    assert_eq!(refused["code"], "forbidden_operation", "{refused:#}");
+
+    // The worker replies to a reply (5002); it lands on the thread root.
+    let body = "Fixed in `abc` — see \"two\".\n\n- done";
+    let (is_error, reply) = call(
+        addr,
+        "worker-cap",
+        "add_reply_to_pull_request_comment",
+        json!({"owner":"test","repo":"repo","pullNumber":77,"commentId":5002,"body":body}),
+    );
+    assert!(!is_error, "{reply:#}");
+    assert_eq!(reply["state"], "succeeded", "{reply:#}");
+    assert_eq!(reply["remote_object_id"], "5003");
+    let thread = &reply["result"]["thread"];
+    assert_eq!(thread["id"], "PRRT_kwDOthread1");
+    assert_eq!(thread["outdated"], true);
+    assert_eq!(thread["resolved"], false);
+    assert_eq!(thread["path"], "src/lib.rs");
+    assert_eq!(thread["original_revision"], "a".repeat(40));
+    assert_eq!(thread["context"], "@@ -1 +1,2 @@\n one\n+two");
+    let marker: String = quorum_core::db::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT github_marker FROM github_agent_operations
+             WHERE kind='add_reply_to_pull_request_comment'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stdin_json(&bin, "reply-stdin.json"),
+        json!({"body": format!("{body}\n\n{marker}")})
+    );
+
+    // The reviewer resolves that thread of its bound PR.
+    let (is_error, resolved) = call(
+        addr,
+        "reviewer-cap",
+        "resolve_review_thread",
+        json!({"threadID":"PRRT_kwDOthread1"}),
+    );
+    assert!(!is_error, "{resolved:#}");
+    assert_eq!(resolved["state"], "succeeded", "{resolved:#}");
+    assert_eq!(resolved["result"]["thread"]["resolved"], true);
+    assert_eq!(
+        stdin_json(&bin, "resolve-stdin.json")["variables"],
+        json!({"threadId":"PRRT_kwDOthread1"})
+    );
+
+    // Authored text never reaches argv; each write was sent exactly once.
+    let args = std::fs::read_to_string(bin.join("gh-args.log")).unwrap();
+    assert!(!args.contains("Fixed"), "{args}");
+    assert_eq!(args.lines().filter(|l| l.contains("/replies")).count(), 1);
+    assert_eq!(
+        args.lines()
+            .filter(|l| l.starts_with("api graphql --input"))
+            .count(),
+        1
+    );
+    shell.stop();
+    daemon.stop();
+}
+
 /// A `gh` stand-in that holds one publisher's pending review on PR 77 at
 /// `sha`: it answers the credential lookup, a files page (which creates the
 /// run's collaboration attempt), the review create, the inline GraphQL

@@ -352,7 +352,7 @@ A mismatched `owner`/`repo`/PR number is `forbidden_operation`. Reads page with 
 clipped per field, items that do not fit are counted in `items_omitted`, `get_diff` returns
 newline-aligned pages of at most 40 KiB of escaped diff text, and `truncated` marks any clipping.
 Review comments report `outdated` from the missing current-diff line; thread node ID and resolved
-state need GraphQL and arrive with the thread slice. A comment body is at most 32 KiB, non-blank,
+state need GraphQL and arrive with the thread slice (see `resolve_review_thread`). A comment body is at most 32 KiB, non-blank,
 NUL-free, and must close every code fence; it is posted from a JSON stdin document followed by a
 blank line and the hidden marker. Without `clientRequestId`, a comment's client request ID is a
 digest of its canonical request, so an identical retry returns the original operation; each read
@@ -407,6 +407,23 @@ comment ID is rejected.
 Only the current reviewer may resolve a thread returned by `pull_request_read`. The thread must
 belong to the bound PR. Workers cannot resolve findings against themselves. Unresolve is deferred
 until a concrete workflow needs it.
+
+Implemented bounds (delivery slice 5). Both tools are admitted into the outbox like
+`add_issue_comment`; role/phase gating is the endpoint's (a worker's resolve is
+`forbidden_operation`). Before any mutation, the executor lists the bound PR's review threads
+with one paged GraphQL read (at most 1,000 threads, 100 comment IDs per thread, and a
+1,000-character diff-hunk tail per thread; a larger listing fails closed). A `commentId` in none
+of those threads, including a comment on another PR or a general issue comment, fails unsent as
+`review_comment_not_found`; a `threadID` not on the bound PR fails unsent as
+`review_thread_not_found`. A lookup outage is retried as provably unsent. The reply goes to the
+thread's top-level comment through `POST pulls/{n}/comments/{id}/replies` with the operation
+marker appended; its result carries the reply ID and the thread's node ID, path, line, revision,
+original revision, diff-hunk context, resolved state, and outdated state. A possibly-sent reply is
+reconciled only by its exact marker among the root's replies; a possibly-sent resolve only by
+GitHub's resolved state, which is idempotent, so an already-resolved thread succeeds without a
+mutation. Otherwise the write stays ambiguous and is never re-sent. `get_review_comments` now
+joins each comment to its thread, adding `thread_id` and `resolved` and taking `outdated` from
+GitHub's thread state.
 
 ### `delivery_report_write`
 

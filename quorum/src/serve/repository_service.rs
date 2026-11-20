@@ -75,6 +75,35 @@ pub const MAX_LISTED_PENDING_REVIEWS: usize = 10;
 const ADD_REVIEW_THREAD_MUTATION: &str = "mutation($input: AddPullRequestReviewThreadInput!) { \
 addPullRequestReviewThread(input: $input) { thread { id pullRequest { number } \
 comments(first: 1) { nodes { id databaseId body pullRequestReview { id databaseId } } } } } }";
+/// Fixed GraphQL document listing the target PR's review threads, paged by
+/// `gh --paginate` through `$endCursor`. Its variables carry only the
+/// daemon-derived repository and PR number.
+const REVIEW_THREADS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!, \
+$endCursor: String) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
+reviewThreads(first: 50, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { \
+id isResolved isOutdated path line originalLine startLine diffSide subjectType \
+ids: comments(first: 100) { nodes { databaseId } } \
+root: comments(first: 1) { nodes { databaseId diffHunk commit { oid } originalCommit { oid } } } \
+} } } } }";
+/// Fixed `--jq` projection streaming one compact object per thread: comment
+/// IDs flattened, the root comment unwrapped, and its diff hunk cut to the
+/// lines nearest the anchor so the listing stays within the response cap.
+const REVIEW_THREADS_FILTER: &str = ".data.repository.pullRequest.reviewThreads.nodes[] \
+| .ids = [.ids.nodes[].databaseId] | .root = (.root.nodes[0] // {}) \
+| .root.diffHunk = ((.root.diffHunk // \"\") | .[-1000:])";
+/// Fixed GraphQL document for `resolve_review_thread`; only its variables
+/// carry the thread node ID.
+const RESOLVE_THREAD_MUTATION: &str = "mutation($threadId: ID!) { \
+resolveReviewThread(input: {threadId: $threadId}) { thread { id isResolved \
+pullRequest { number } } } }";
+/// Review threads one listing may return before it fails closed.
+pub const MAX_LISTED_REVIEW_THREADS: usize = 1000;
+/// Comments one thread may carry in a listing (GitHub page bound).
+const MAX_THREAD_COMMENTS: usize = 100;
+/// Replies one reconciliation listing may return before it fails closed.
+pub const MAX_LISTED_REPLIES: usize = 200;
+/// Largest diff-hunk context kept per thread (1000 characters at most).
+const MAX_THREAD_HUNK_BYTES: usize = 4 * 1000;
 /// Fixed `--jq` filter that keeps only pending reviews from every page.
 const PENDING_REVIEW_FILTER: &str = r#".[] | select(.state == "PENDING")"#;
 /// Fixed `--jq` filter that streams every item of every page.
@@ -195,6 +224,22 @@ pub enum RepositoryRequest {
     /// to `COMMENT` in the request document; there is no field to name
     /// another event.
     SubmitPendingReview { review_id: u64, body: String },
+    /// `add_reply_to_pull_request_comment`: one reply in the review thread
+    /// whose top-level comment is `comment_id`, through GitHub's reply
+    /// endpoint. The executor resolves the agent's comment ID to that root
+    /// on the target PR and appends the operation's hidden marker.
+    ReplyToReviewComment { comment_id: u64, body: String },
+    /// `resolve_review_thread`: resolve one review thread by node ID. The
+    /// executor first proves the thread belongs to the target PR.
+    ResolveReviewThread { thread_node_id: String },
+    /// Daemon-only: every review thread of the target PR with its comment
+    /// IDs, root anchor, and resolved/outdated state.
+    #[serde(skip_deserializing)]
+    ListReviewThreads {},
+    /// Daemon-only reconciliation: the replies to one top-level review
+    /// comment, with complete bodies, so a lost reply is found by marker.
+    #[serde(skip_deserializing)]
+    ListCommentReplies { comment_id: u64 },
     /// Daemon-only housekeeping: the publisher's current pending review(s)
     /// on the target PR. Never decodable from agent JSON.
     #[serde(skip_deserializing)]
@@ -300,7 +345,10 @@ impl RepositoryRequest {
                 is_node_id(review_node_id) && path_ok(path) && anchor_ok && body_ok(body)
             }
             Self::SubmitPendingReview { review_id, body } => *review_id >= 1 && body_ok(body),
-            Self::ListPendingReviews {} => true,
+            Self::ReplyToReviewComment { comment_id, body } => *comment_id >= 1 && body_ok(body),
+            Self::ResolveReviewThread { thread_node_id } => is_node_id(thread_node_id),
+            Self::ListPendingReviews {} | Self::ListReviewThreads {} => true,
+            Self::ListCommentReplies { comment_id } => *comment_id >= 1,
             Self::GetReview { review_id }
             | Self::DeletePendingReview { review_id }
             | Self::ListReviewComments { review_id } => *review_id >= 1,
@@ -320,8 +368,12 @@ impl RepositoryRequest {
             | Self::CreatePendingReview { .. }
             | Self::AddPendingReviewComment { .. }
             | Self::SubmitPendingReview { .. }
+            | Self::ReplyToReviewComment { .. }
+            | Self::ResolveReviewThread { .. }
             | Self::DeletePendingReview { .. } => OperationEffect::Write,
             Self::ReadPrMetadata {}
+            | Self::ListReviewThreads {}
+            | Self::ListCommentReplies { .. }
             | Self::GetPullRequest {}
             | Self::GetDiff { .. }
             | Self::GetFiles { .. }
@@ -397,6 +449,49 @@ pub enum RepositoryResponse {
     PendingReviewComment(CreatedReviewComment),
     /// The inline comments of one exact review.
     ReviewComments(Vec<ReviewCommentRecord>),
+    /// Every review thread of the target PR.
+    ReviewThreads(Vec<ReviewThreadRecord>),
+    /// The reply GitHub created in a review thread.
+    ReviewReply(ReviewReplyRecord),
+    /// The replies to one top-level review comment.
+    ReviewReplies(Vec<ReviewReplyRecord>),
+    /// The thread GitHub reports resolved on the target PR.
+    ThreadResolved {
+        thread_node_id: String,
+    },
+}
+
+/// One validated review thread of the target PR. `comment_ids` lists the
+/// thread's comments in order, starting with the top-level comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewThreadRecord {
+    pub node_id: String,
+    pub resolved: bool,
+    pub outdated: bool,
+    pub path: String,
+    pub line: Option<u64>,
+    pub original_line: Option<u64>,
+    pub start_line: Option<u64>,
+    pub side: Option<String>,
+    pub subject_type: Option<String>,
+    pub root_comment_id: u64,
+    pub comment_ids: Vec<u64>,
+    /// The commit the thread's anchor currently applies to, when GitHub has one.
+    pub commit_id: Option<String>,
+    /// The commit the top-level comment was made on.
+    pub original_commit_id: Option<String>,
+    /// The tail of the top-level comment's diff hunk: the lines nearest the anchor.
+    pub diff_hunk: String,
+}
+
+/// One validated reply in a review thread on the target PR. `body` is
+/// complete so a lost reply is found by its hidden marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewReplyRecord {
+    pub id: u64,
+    pub node_id: String,
+    pub in_reply_to_id: u64,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -651,11 +746,41 @@ impl GhRepositoryService {
         self
     }
 
+    /// `get_review_comments` also lists the PR's review threads first, so
+    /// each comment carries its thread node ID and resolved/outdated state
+    /// within the same bounded page.
     async fn run(
         &self,
         target: &RepositoryTarget,
         pr: PullRequestNumber,
         request: &RepositoryRequest,
+    ) -> Result<RepositoryResponse, RepositoryError> {
+        let threads = match request {
+            RepositoryRequest::GetReviewComments { .. } => {
+                match self
+                    .run_with(target, pr, &RepositoryRequest::ListReviewThreads {}, &[])
+                    .await?
+                {
+                    RepositoryResponse::ReviewThreads(threads) => threads,
+                    _ => {
+                        return Err(RepositoryError::new(
+                            RepositoryErrorKind::InvalidResponse,
+                            "review thread listing returned another response",
+                        ))
+                    }
+                }
+            }
+            _ => Vec::new(),
+        };
+        self.run_with(target, pr, request, &threads).await
+    }
+
+    async fn run_with(
+        &self,
+        target: &RepositoryTarget,
+        pr: PullRequestNumber,
+        request: &RepositoryRequest,
+        threads: &[ReviewThreadRecord],
     ) -> Result<RepositoryResponse, RepositoryError> {
         let args = gh_args(target, pr, request);
         let input = gh_input(request);
@@ -708,7 +833,7 @@ impl GhRepositoryService {
             }
             return Err(RepositoryError::new(classify_gh_failure(&stderr), &stderr));
         }
-        parse_response(pr, request, &output.stdout).map_err(|reason| {
+        parse_response_with_threads(pr, request, &output.stdout, threads).map_err(|reason| {
             RepositoryError::new(RepositoryErrorKind::InvalidResponse, &redact(&reason))
         })
     }
@@ -826,6 +951,51 @@ fn gh_args(
             "--jq".to_string(),
             EACH_ITEM_FILTER.to_string(),
         ],
+        // The true reply endpoint keeps the reply inside the thread.
+        RepositoryRequest::ReplyToReviewComment { comment_id, .. } => post(format!(
+            "repos/{repo}/pulls/{n}/comments/{comment_id}/replies"
+        )),
+        RepositoryRequest::ResolveReviewThread { .. } => vec![
+            "api".to_string(),
+            "graphql".to_string(),
+            "--input".to_string(),
+            "-".to_string(),
+        ],
+        RepositoryRequest::ListReviewThreads {} => {
+            // `-F` expands gh's `{owner}`/`{repo}` placeholders from the
+            // working directory; a configured slug is passed as raw strings.
+            let (owner, name) = match target.gh_repo().and_then(|slug| slug.split_once('/')) {
+                Some((owner, name)) => (format!("owner={owner}"), format!("name={name}")),
+                None => ("owner={owner}".to_string(), "name={repo}".to_string()),
+            };
+            let field = if target.gh_repo().is_some() {
+                "-f"
+            } else {
+                "-F"
+            };
+            vec![
+                "api".to_string(),
+                "graphql".to_string(),
+                "--paginate".to_string(),
+                "-f".to_string(),
+                format!("query={REVIEW_THREADS_QUERY}"),
+                field.to_string(),
+                owner,
+                field.to_string(),
+                name,
+                "-F".to_string(),
+                format!("number={n}"),
+                "--jq".to_string(),
+                REVIEW_THREADS_FILTER.to_string(),
+            ]
+        }
+        RepositoryRequest::ListCommentReplies { comment_id } => vec![
+            "api".to_string(),
+            "--paginate".to_string(),
+            format!("repos/{repo}/pulls/{n}/comments?per_page=100"),
+            "--jq".to_string(),
+            format!(".[] | select(.in_reply_to_id == {comment_id})"),
+        ],
     }
 }
 
@@ -833,7 +1003,12 @@ fn gh_args(
 /// only here, as JSON strings, byte for byte.
 fn gh_input(request: &RepositoryRequest) -> Option<Vec<u8>> {
     let document = match request {
-        RepositoryRequest::AddIssueComment { body } => json!({ "body": body }),
+        RepositoryRequest::AddIssueComment { body }
+        | RepositoryRequest::ReplyToReviewComment { body, .. } => json!({ "body": body }),
+        RepositoryRequest::ResolveReviewThread { thread_node_id } => json!({
+            "query": RESOLVE_THREAD_MUTATION,
+            "variables": { "threadId": thread_node_id },
+        }),
         // No `event`: GitHub creates the review as PENDING.
         RepositoryRequest::CreatePendingReview { commit_id, body } => {
             json!({ "commit_id": commit_id, "body": body })
@@ -960,10 +1135,22 @@ fn parse_pr_metadata(pr: PullRequestNumber, stdout: &[u8]) -> Result<PrMetadata,
     })
 }
 
+#[cfg(test)]
 fn parse_response(
     pr: PullRequestNumber,
     request: &RepositoryRequest,
     stdout: &[u8],
+) -> Result<RepositoryResponse, String> {
+    parse_response_with_threads(pr, request, stdout, &[])
+}
+
+/// Parse one `gh` answer. `threads` is the PR's review-thread listing that
+/// `get_review_comments` joins onto each comment (empty otherwise).
+fn parse_response_with_threads(
+    pr: PullRequestNumber,
+    request: &RepositoryRequest,
+    stdout: &[u8],
+    threads: &[ReviewThreadRecord],
 ) -> Result<RepositoryResponse, String> {
     let list = |method: &str, page: u32, per_page: u32, items: Result<Vec<Item>, String>| {
         items.map(|items| {
@@ -991,8 +1178,11 @@ fn parse_response(
             "get_review_comments",
             *page,
             *per_page,
-            parse_list::<GhReviewComment>(stdout)
-                .map(|v| v.into_iter().map(review_comment_item).collect()),
+            parse_list::<GhReviewComment>(stdout).map(|v| {
+                v.into_iter()
+                    .map(|comment| review_comment_item(comment, threads))
+                    .collect()
+            }),
         ),
         RepositoryRequest::GetReviews { page, per_page } => list(
             "get_reviews",
@@ -1073,7 +1263,191 @@ fn parse_response(
             }
             Ok(RepositoryResponse::ReviewComments(comments))
         }
+        RepositoryRequest::ReplyToReviewComment { comment_id, .. } => {
+            let value: Value = serde_json::from_slice(stdout)
+                .map_err(|error| format!("gh api reply JSON: {error}"))?;
+            review_reply_record(pr, *comment_id, value).map(RepositoryResponse::ReviewReply)
+        }
+        RepositoryRequest::ListCommentReplies { comment_id } => {
+            let mut replies = Vec::new();
+            for value in serde_json::Deserializer::from_slice(stdout).into_iter::<Value>() {
+                let value = value.map_err(|error| format!("gh api reply JSON: {error}"))?;
+                replies.push(review_reply_record(pr, *comment_id, value)?);
+                if replies.len() > MAX_LISTED_REPLIES {
+                    return Err("gh api listed too many replies".to_string());
+                }
+            }
+            Ok(RepositoryResponse::ReviewReplies(replies))
+        }
+        RepositoryRequest::ListReviewThreads {} => {
+            let mut threads = Vec::new();
+            for value in serde_json::Deserializer::from_slice(stdout).into_iter::<Value>() {
+                let value = value.map_err(|error| format!("gh api graphql JSON: {error}"))?;
+                threads.push(review_thread_record(value)?);
+                if threads.len() > MAX_LISTED_REVIEW_THREADS {
+                    return Err("gh api listed too many review threads".to_string());
+                }
+            }
+            Ok(RepositoryResponse::ReviewThreads(threads))
+        }
+        RepositoryRequest::ResolveReviewThread { thread_node_id } => {
+            parse_resolved_thread(pr, thread_node_id, stdout)
+        }
     }
+}
+
+/// Validate one REST reply: it must be in reply to exactly `comment_id` on
+/// the target PR and carry a complete bounded body.
+fn review_reply_record(
+    pr: PullRequestNumber,
+    comment_id: u64,
+    value: Value,
+) -> Result<ReviewReplyRecord, String> {
+    #[derive(Deserialize)]
+    struct GhReply {
+        id: u64,
+        node_id: String,
+        in_reply_to_id: Option<u64>,
+        body: Option<String>,
+        pull_request_url: String,
+    }
+    let reply: GhReply =
+        serde_json::from_value(value).map_err(|error| format!("gh api reply JSON: {error}"))?;
+    if !reply
+        .pull_request_url
+        .ends_with(&format!("/pulls/{}", pr.get()))
+        || reply.in_reply_to_id != Some(comment_id)
+    {
+        return Err("gh api returned a reply outside the requested thread".to_string());
+    }
+    let body = reply.body.unwrap_or_default();
+    if reply.id == 0 || !is_node_id(&reply.node_id) || body.len() > MAX_RESPONSE_BODY_BYTES {
+        return Err("gh api returned an invalid reply".to_string());
+    }
+    Ok(ReviewReplyRecord {
+        id: reply.id,
+        node_id: reply.node_id,
+        in_reply_to_id: comment_id,
+        body,
+    })
+}
+
+/// Validate one projected review thread from [`REVIEW_THREADS_FILTER`].
+fn review_thread_record(value: Value) -> Result<ReviewThreadRecord, String> {
+    #[derive(Deserialize)]
+    struct Oid {
+        oid: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Root {
+        database_id: Option<u64>,
+        diff_hunk: Option<String>,
+        commit: Option<Oid>,
+        original_commit: Option<Oid>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Thread {
+        id: String,
+        is_resolved: bool,
+        is_outdated: bool,
+        path: String,
+        line: Option<u64>,
+        original_line: Option<u64>,
+        start_line: Option<u64>,
+        diff_side: Option<String>,
+        subject_type: Option<String>,
+        ids: Vec<Option<u64>>,
+        root: Root,
+    }
+    let thread: Thread = serde_json::from_value(value)
+        .map_err(|error| format!("gh api review thread JSON: {error}"))?;
+    let comment_ids: Vec<u64> = thread.ids.into_iter().flatten().collect();
+    let root_comment_id = thread.root.database_id.unwrap_or(0);
+    let commit = |oid: Option<Oid>| -> Result<Option<String>, String> {
+        match oid {
+            Some(Oid { oid }) if !is_object_id(&oid) => {
+                Err("gh api returned an invalid thread commit".to_string())
+            }
+            oid => Ok(oid.map(|oid| oid.oid)),
+        }
+    };
+    let enumerated = |value: &Option<String>, allowed: &[&str]| {
+        value
+            .as_deref()
+            .is_none_or(|value| allowed.contains(&value))
+    };
+    let diff_hunk = thread.root.diff_hunk.unwrap_or_default();
+    if !is_node_id(&thread.id)
+        || thread.path.is_empty()
+        || thread.path.len() > MAX_PATH_BYTES
+        || root_comment_id == 0
+        || comment_ids.first() != Some(&root_comment_id)
+        || comment_ids.len() > MAX_THREAD_COMMENTS
+        || diff_hunk.len() > MAX_THREAD_HUNK_BYTES
+        || !enumerated(&thread.diff_side, &["LEFT", "RIGHT"])
+        || !enumerated(&thread.subject_type, &["LINE", "FILE"])
+    {
+        return Err("gh api returned an invalid review thread".to_string());
+    }
+    Ok(ReviewThreadRecord {
+        node_id: thread.id,
+        resolved: thread.is_resolved,
+        outdated: thread.is_outdated,
+        path: thread.path,
+        line: thread.line,
+        original_line: thread.original_line,
+        start_line: thread.start_line,
+        side: thread.diff_side,
+        subject_type: thread.subject_type,
+        root_comment_id,
+        comment_ids,
+        commit_id: commit(thread.root.commit)?,
+        original_commit_id: commit(thread.root.original_commit)?,
+        diff_hunk,
+    })
+}
+
+fn parse_resolved_thread(
+    pr: PullRequestNumber,
+    thread_node_id: &str,
+    stdout: &[u8],
+) -> Result<RepositoryResponse, String> {
+    #[derive(Deserialize)]
+    struct Response {
+        data: Data,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Data {
+        resolve_review_thread: Payload,
+    }
+    #[derive(Deserialize)]
+    struct Payload {
+        thread: Thread,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Thread {
+        id: String,
+        is_resolved: bool,
+        pull_request: Number,
+    }
+    #[derive(Deserialize)]
+    struct Number {
+        number: u64,
+    }
+    let response: Response =
+        serde_json::from_slice(stdout).map_err(|error| format!("gh api graphql JSON: {error}"))?;
+    let thread = response.data.resolve_review_thread.thread;
+    if thread.id != thread_node_id || thread.pull_request.number != pr.get() || !thread.is_resolved
+    {
+        return Err("gh api graphql did not resolve the requested thread".to_string());
+    }
+    Ok(RepositoryResponse::ThreadResolved {
+        thread_node_id: thread.id,
+    })
 }
 
 /// Validate one REST review comment: it must belong to the exact review on
@@ -1422,10 +1796,24 @@ fn file_item(file: GhFile) -> Item {
     (value, clipped)
 }
 
-fn review_comment_item(comment: GhReviewComment) -> Item {
+/// One REST review comment joined to its review thread, when the listing
+/// holds it: the thread node ID (for `resolve_review_thread`) and GitHub's
+/// own resolved/outdated state. Without a thread, `outdated` falls back to
+/// the missing current-diff line.
+fn review_comment_item(comment: GhReviewComment, threads: &[ReviewThreadRecord]) -> Item {
+    let thread = threads
+        .iter()
+        .find(|thread| thread.comment_ids.contains(&comment.id));
+    let outdated = match thread {
+        Some(thread) => thread.outdated,
+        // GitHub drops the current-diff anchor of an outdated comment.
+        None => comment.line.is_none() && comment.subject_type.as_deref() != Some("file"),
+    };
     let mut clipped = false;
     let short = MAX_SHORT_FIELD_BYTES;
     let value = json!({
+        "thread_id": thread.map(|thread| thread.node_id.as_str()),
+        "resolved": thread.map(|thread| thread.resolved),
         "id": comment.id,
         "node_id": clip(comment.node_id.as_deref(), short, &mut clipped),
         "review_id": comment.pull_request_review_id,
@@ -1439,8 +1827,7 @@ fn review_comment_item(comment: GhReviewComment) -> Item {
         "original_line": comment.original_line,
         "original_start_line": comment.original_start_line,
         "subject_type": clip(comment.subject_type.as_deref(), short, &mut clipped),
-        // GitHub drops the current-diff anchor of an outdated comment.
-        "outdated": comment.line.is_none() && comment.subject_type.as_deref() != Some("file"),
+        "outdated": outdated,
         "in_reply_to_id": comment.in_reply_to_id,
         "author": login(&comment.user, &mut clipped),
         "body": clip(comment.body.as_deref(), MAX_BODY_FIELD_BYTES, &mut clipped),
@@ -3214,5 +3601,247 @@ mod tests {
                 .unwrap(),
             RepositoryResponse::PendingReviews(Vec::new())
         );
+    }
+
+    /// One projected thread as `REVIEW_THREADS_FILTER` streams it.
+    fn thread_line(id: &str, ids: &[u64], resolved: bool, outdated: bool) -> String {
+        json!({
+            "id": id, "isResolved": resolved, "isOutdated": outdated, "path": "src/lib.rs",
+            "line": if outdated { Value::Null } else { json!(3) }, "originalLine": 3,
+            "startLine": null, "diffSide": "RIGHT", "subjectType": "LINE", "ids": ids,
+            "root": {"databaseId": ids[0], "diffHunk": "@@ -1,3 +1,3 @@\n a\n-b\n+c",
+                     "commit": if outdated { Value::Null } else { json!({"oid": SHA}) },
+                     "originalCommit": {"oid": SHA}},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn review_thread_requests_are_closed_and_text_never_reaches_argv() {
+        let decode = |text: &str| RepositoryRequest::decode_agent_json(text.as_bytes());
+        assert_eq!(
+            decode(r#"{"kind":"reply_to_review_comment","comment_id":5,"body":"done"}"#).unwrap(),
+            RepositoryRequest::ReplyToReviewComment {
+                comment_id: 5,
+                body: "done".into()
+            }
+        );
+        assert_eq!(
+            decode(r#"{"kind":"resolve_review_thread","thread_node_id":"PRRT_k1"}"#).unwrap(),
+            RepositoryRequest::ResolveReviewThread {
+                thread_node_id: "PRRT_k1".into()
+            }
+        );
+        for rejected in [
+            r#"{"kind":"reply_to_review_comment","comment_id":0,"body":"x"}"#,
+            r#"{"kind":"reply_to_review_comment","comment_id":5,"body":"  "}"#,
+            r#"{"kind":"reply_to_review_comment","comment_id":5,"body":"x","pr":9}"#,
+            r#"{"kind":"resolve_review_thread","thread_node_id":"a b"}"#,
+            r#"{"kind":"resolve_review_thread","thread_node_id":""}"#,
+            // Daemon-only reads never decode from agent JSON.
+            r#"{"kind":"list_review_threads"}"#,
+            r#"{"kind":"list_comment_replies","comment_id":5}"#,
+        ] {
+            assert!(decode(rejected).is_err(), "{rejected}");
+        }
+        let reply = RepositoryRequest::ReplyToReviewComment {
+            comment_id: 5,
+            body: "Fixed `x` in $(id)".into(),
+        };
+        let resolve = RepositoryRequest::ResolveReviewThread {
+            thread_node_id: "PRRT_k1".into(),
+        };
+        assert_eq!(reply.effect(), OperationEffect::Write);
+        assert_eq!(resolve.effect(), OperationEffect::Write);
+        assert_eq!(
+            RepositoryRequest::ListReviewThreads {}.effect(),
+            OperationEffect::Read
+        );
+        assert_eq!(
+            RepositoryRequest::ListCommentReplies { comment_id: 5 }.effect(),
+            OperationEffect::Read
+        );
+
+        let slug = RepositoryTarget::new(PathBuf::from("/tmp"), Some("acme/widgets")).unwrap();
+        let local = RepositoryTarget::new(PathBuf::from("/tmp"), None).unwrap();
+        assert_eq!(
+            gh_args(&slug, pr(9), &reply),
+            [
+                "api",
+                "--method",
+                "POST",
+                "repos/acme/widgets/pulls/9/comments/5/replies",
+                "--input",
+                "-"
+            ]
+        );
+        let sent: Value = serde_json::from_slice(&gh_input(&reply).unwrap()).unwrap();
+        assert_eq!(sent, json!({"body": "Fixed `x` in $(id)"}));
+        assert_eq!(
+            gh_args(&slug, pr(9), &resolve),
+            ["api", "graphql", "--input", "-"]
+        );
+        let sent: Value = serde_json::from_slice(&gh_input(&resolve).unwrap()).unwrap();
+        assert_eq!(sent["variables"], json!({"threadId": "PRRT_k1"}));
+        assert_eq!(sent["query"], RESOLVE_THREAD_MUTATION);
+        let threads = gh_args(&slug, pr(9), &RepositoryRequest::ListReviewThreads {});
+        assert_eq!(threads[..3], ["api", "graphql", "--paginate"]);
+        for pair in [
+            ["-f", "owner=acme"],
+            ["-f", "name=widgets"],
+            ["-F", "number=9"],
+            ["--jq", REVIEW_THREADS_FILTER],
+        ] {
+            assert!(
+                threads.windows(2).any(|w| w == pair),
+                "{pair:?} in {threads:?}"
+            );
+        }
+        let threads = gh_args(&local, pr(9), &RepositoryRequest::ListReviewThreads {});
+        assert!(threads.windows(2).any(|w| w == ["-F", "owner={owner}"]));
+        assert!(threads.windows(2).any(|w| w == ["-F", "name={repo}"]));
+        assert_eq!(
+            gh_args(
+                &slug,
+                pr(9),
+                &RepositoryRequest::ListCommentReplies { comment_id: 5 }
+            ),
+            [
+                "api",
+                "--paginate",
+                "repos/acme/widgets/pulls/9/comments?per_page=100",
+                "--jq",
+                ".[] | select(.in_reply_to_id == 5)"
+            ]
+        );
+        for request in [&reply, &resolve] {
+            assert!(!gh_args(&slug, pr(9), request).join(" ").contains("Fixed"));
+        }
+    }
+
+    #[test]
+    fn review_thread_responses_are_bound_to_the_target_pr() {
+        let listing = format!(
+            "{}\n{}\n",
+            thread_line("PRRT_a", &[11, 12], false, false),
+            thread_line("PRRT_b", &[21], true, true)
+        );
+        let RepositoryResponse::ReviewThreads(threads) = parse_response(
+            pr(9),
+            &RepositoryRequest::ListReviewThreads {},
+            listing.as_bytes(),
+        )
+        .unwrap() else {
+            panic!("not a thread listing")
+        };
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].node_id, "PRRT_a");
+        assert_eq!(threads[0].comment_ids, vec![11, 12]);
+        assert_eq!(threads[0].root_comment_id, 11);
+        assert_eq!(threads[0].commit_id.as_deref(), Some(SHA));
+        assert!(threads[0].diff_hunk.ends_with("+c"));
+        assert!(threads[1].resolved && threads[1].outdated);
+        assert_eq!(threads[1].line, None);
+        assert_eq!(threads[1].commit_id, None);
+        // A root that is not the first comment, or a bad commit, fails closed.
+        let mut bad: Value =
+            serde_json::from_str(&thread_line("PRRT_c", &[31], false, false)).unwrap();
+        bad["root"]["databaseId"] = json!(32);
+        let bad_commit = thread_line("PRRT_d", &[41], false, false).replace(SHA, "not-a-sha");
+        for invalid in [bad.to_string(), bad_commit] {
+            assert!(parse_response(
+                pr(9),
+                &RepositoryRequest::ListReviewThreads {},
+                invalid.as_bytes()
+            )
+            .is_err());
+        }
+
+        let reply = RepositoryRequest::ReplyToReviewComment {
+            comment_id: 11,
+            body: "x".into(),
+        };
+        let created = |url: &str, in_reply_to: u64| {
+            json!({"id": 13, "node_id": "PRRC_13", "in_reply_to_id": in_reply_to,
+                   "body": "x <!-- m -->", "pull_request_url": url})
+            .to_string()
+        };
+        let own = "https://api.github.com/repos/acme/widgets/pulls/9";
+        assert_eq!(
+            parse_response(pr(9), &reply, created(own, 11).as_bytes()).unwrap(),
+            RepositoryResponse::ReviewReply(ReviewReplyRecord {
+                id: 13,
+                node_id: "PRRC_13".into(),
+                in_reply_to_id: 11,
+                body: "x <!-- m -->".into(),
+            })
+        );
+        let other = "https://api.github.com/repos/acme/widgets/pulls/10";
+        assert!(parse_response(pr(9), &reply, created(other, 11).as_bytes()).is_err());
+        assert!(parse_response(pr(9), &reply, created(own, 12).as_bytes()).is_err());
+
+        let resolve = RepositoryRequest::ResolveReviewThread {
+            thread_node_id: "PRRT_a".into(),
+        };
+        let resolved = |id: &str, number: u64, done: bool| {
+            json!({"data": {"resolveReviewThread": {"thread": {
+                "id": id, "isResolved": done, "pullRequest": {"number": number}}}}})
+            .to_string()
+        };
+        assert_eq!(
+            parse_response(pr(9), &resolve, resolved("PRRT_a", 9, true).as_bytes()).unwrap(),
+            RepositoryResponse::ThreadResolved {
+                thread_node_id: "PRRT_a".into()
+            }
+        );
+        for invalid in [
+            resolved("PRRT_a", 10, true),
+            resolved("PRRT_b", 9, true),
+            resolved("PRRT_a", 9, false),
+        ] {
+            assert!(parse_response(pr(9), &resolve, invalid.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn review_comments_carry_their_thread_id_and_github_state() {
+        let threads = [ReviewThreadRecord {
+            node_id: "PRRT_a".into(),
+            resolved: true,
+            outdated: true,
+            path: "src/lib.rs".into(),
+            line: Some(3),
+            original_line: Some(3),
+            start_line: None,
+            side: Some("RIGHT".into()),
+            subject_type: Some("LINE".into()),
+            root_comment_id: 11,
+            comment_ids: vec![11, 12],
+            commit_id: None,
+            original_commit_id: None,
+            diff_hunk: String::new(),
+        }];
+        let comments = json!([
+            {"id": 12, "path": "src/lib.rs", "line": 3, "body": "reply"},
+            {"id": 99, "path": "src/lib.rs", "line": null, "body": "unthreaded"},
+        ])
+        .to_string();
+        let request = RepositoryRequest::GetReviewComments {
+            page: 1,
+            per_page: 30,
+        };
+        let RepositoryResponse::PullRequestRead(page) =
+            parse_response_with_threads(pr(9), &request, comments.as_bytes(), &threads).unwrap()
+        else {
+            panic!("not a read")
+        };
+        let items = page["items"].as_array().unwrap();
+        assert_eq!(items[0]["thread_id"], "PRRT_a");
+        assert_eq!(items[0]["resolved"], true);
+        // GitHub's own outdated state wins over the current-diff line.
+        assert_eq!(items[0]["outdated"], true);
+        assert_eq!(items[1]["thread_id"], Value::Null);
+        assert_eq!(items[1]["resolved"], Value::Null);
+        assert_eq!(items[1]["outdated"], true);
     }
 }
