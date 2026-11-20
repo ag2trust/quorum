@@ -77,6 +77,8 @@ addPullRequestReviewThread(input: $input) { thread { id pullRequest { number } \
 comments(first: 1) { nodes { id databaseId body pullRequestReview { id databaseId } } } } } }";
 /// Fixed `--jq` filter that keeps only pending reviews from every page.
 const PENDING_REVIEW_FILTER: &str = r#".[] | select(.state == "PENDING")"#;
+/// Fixed `--jq` filter that streams every item of every page.
+const EACH_ITEM_FILTER: &str = ".[]";
 
 /// The daemon-configured repository an operation targets. Built only by
 /// daemon code from repository config; never decoded from agent input.
@@ -206,6 +208,11 @@ pub enum RepositoryRequest {
     #[serde(skip_deserializing)]
     #[cfg_attr(not(test), allow(dead_code))]
     DeletePendingReview { review_id: u64 },
+    /// Daemon-only reconciliation: the inline comments of one exact review
+    /// ID, with complete bodies so a lost inline response is found by its
+    /// hidden operation marker.
+    #[serde(skip_deserializing)]
+    ListReviewComments { review_id: u64 },
 }
 
 /// Diff side of an inline comment anchor.
@@ -294,9 +301,9 @@ impl RepositoryRequest {
             }
             Self::SubmitPendingReview { review_id, body } => *review_id >= 1 && body_ok(body),
             Self::ListPendingReviews {} => true,
-            Self::GetReview { review_id } | Self::DeletePendingReview { review_id } => {
-                *review_id >= 1
-            }
+            Self::GetReview { review_id }
+            | Self::DeletePendingReview { review_id }
+            | Self::ListReviewComments { review_id } => *review_id >= 1,
         };
         if valid {
             Ok(())
@@ -322,7 +329,8 @@ impl RepositoryRequest {
             | Self::GetReviews { .. }
             | Self::GetComments { .. }
             | Self::ListPendingReviews {}
-            | Self::GetReview { .. } => OperationEffect::Read,
+            | Self::GetReview { .. }
+            | Self::ListReviewComments { .. } => OperationEffect::Read,
         }
     }
 }
@@ -387,6 +395,8 @@ pub enum RepositoryResponse {
     },
     /// The inline thread added to a pending review.
     PendingReviewComment(CreatedReviewComment),
+    /// The inline comments of one exact review.
+    ReviewComments(Vec<ReviewCommentRecord>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -452,6 +462,14 @@ pub struct CreatedReviewComment {
     pub node_id: String,
     pub thread_node_id: String,
     pub review_node_id: String,
+    pub body: String,
+}
+
+/// One validated inline comment of an exact review. `body` is complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewCommentRecord {
+    pub id: u64,
+    pub node_id: String,
     pub body: String,
 }
 
@@ -801,6 +819,13 @@ fn gh_args(
             "DELETE".to_string(),
             format!("repos/{repo}/pulls/{n}/reviews/{review_id}"),
         ],
+        RepositoryRequest::ListReviewComments { review_id } => vec![
+            "api".to_string(),
+            "--paginate".to_string(),
+            format!("repos/{repo}/pulls/{n}/reviews/{review_id}/comments?per_page=100"),
+            "--jq".to_string(),
+            EACH_ITEM_FILTER.to_string(),
+        ],
     }
 }
 
@@ -1036,7 +1061,54 @@ fn parse_response(
             parse_review_thread(pr, review_node_id, stdout)
                 .map(RepositoryResponse::PendingReviewComment)
         }
+        RepositoryRequest::ListReviewComments { review_id } => {
+            let mut comments = Vec::new();
+            for value in serde_json::Deserializer::from_slice(stdout).into_iter::<Value>() {
+                let value =
+                    value.map_err(|error| format!("gh api review comment JSON: {error}"))?;
+                comments.push(review_comment_record(pr, *review_id, value)?);
+                if comments.len() > MAX_PENDING_REVIEW_COMMENTS {
+                    return Err("gh api listed too many review comments".to_string());
+                }
+            }
+            Ok(RepositoryResponse::ReviewComments(comments))
+        }
     }
+}
+
+/// Validate one REST review comment: it must belong to the exact review on
+/// the target PR and carry a complete bounded body.
+fn review_comment_record(
+    pr: PullRequestNumber,
+    review_id: u64,
+    value: Value,
+) -> Result<ReviewCommentRecord, String> {
+    #[derive(Deserialize)]
+    struct GhListedReviewComment {
+        id: u64,
+        node_id: String,
+        body: Option<String>,
+        pull_request_review_id: Option<u64>,
+        pull_request_url: String,
+    }
+    let comment: GhListedReviewComment = serde_json::from_value(value)
+        .map_err(|error| format!("gh api review comment JSON: {error}"))?;
+    if !comment
+        .pull_request_url
+        .ends_with(&format!("/pulls/{}", pr.get()))
+        || comment.pull_request_review_id != Some(review_id)
+    {
+        return Err("gh api returned a comment of another review".to_string());
+    }
+    let body = comment.body.unwrap_or_default();
+    if comment.id == 0 || !is_node_id(&comment.node_id) || body.len() > MAX_RESPONSE_BODY_BYTES {
+        return Err("gh api returned an invalid review comment".to_string());
+    }
+    Ok(ReviewCommentRecord {
+        id: comment.id,
+        node_id: comment.node_id,
+        body,
+    })
 }
 
 fn parse_review(pr: PullRequestNumber, stdout: &[u8]) -> Result<ReviewRecord, String> {
@@ -1641,6 +1713,20 @@ impl FakeReviewStore {
                     RepositoryResponse::Review(self.reviews.remove(index).record),
                 ),
                 Some(_) => Err(Self::rejected("HTTP 422: review is not pending")),
+            },
+            RepositoryRequest::ListReviewComments { review_id } => match find(self, *review_id) {
+                None => Err(Self::rejected("HTTP 404: review not found")),
+                Some(index) => Ok(RepositoryResponse::ReviewComments(
+                    self.reviews[index]
+                        .comments
+                        .iter()
+                        .map(|comment| ReviewCommentRecord {
+                            id: comment.id,
+                            node_id: comment.node_id.clone(),
+                            body: comment.body.clone(),
+                        })
+                        .collect(),
+                )),
             },
             other => panic!("FakeReviewStore cannot apply {other:?}"),
         }
@@ -2672,7 +2758,7 @@ mod tests {
             review_id: 41,
             body: body.into(),
         };
-        let cases: [(RepositoryRequest, &[&str]); 6] = [
+        let cases: [(RepositoryRequest, &[&str]); 7] = [
             (
                 create.clone(),
                 &[
@@ -2717,6 +2803,16 @@ mod tests {
                     "--method",
                     "DELETE",
                     "repos/acme/widgets/pulls/7/reviews/41",
+                ],
+            ),
+            (
+                RepositoryRequest::ListReviewComments { review_id: 41 },
+                &[
+                    "api",
+                    "--paginate",
+                    "repos/acme/widgets/pulls/7/reviews/41/comments?per_page=100",
+                    "--jq",
+                    EACH_ITEM_FILTER,
                 ],
             ),
         ];
@@ -2879,6 +2975,51 @@ mod tests {
         assert!(parse_response(pr(7), &inline("PRR_41"), thread(8, "PRR_41").as_bytes()).is_err());
         assert!(parse_response(pr(7), &inline("PRR_41"), thread(7, "PRR_99").as_bytes()).is_err());
         assert!(parse_response(pr(7), &inline("PRR_41"), br#"{"data":null}"#).is_err());
+    }
+
+    #[test]
+    fn review_comment_listing_returns_full_bodies_of_the_exact_review_only() {
+        let list = RepositoryRequest::ListReviewComments { review_id: 41 };
+        assert_eq!(list.effect(), OperationEffect::Read);
+        assert!(RepositoryRequest::decode_agent_json(
+            br#"{"kind":"list_review_comments","review_id":41}"#
+        )
+        .is_err());
+        let comment = |id: u64, review: u64, pr_number: u64, body: &str| {
+            json!({
+                "id": id, "node_id": format!("PRRC_{id}"), "body": body,
+                "pull_request_review_id": review,
+                "pull_request_url": format!("https://api.github.com/repos/acme/widgets/pulls/{pr_number}"),
+            })
+            .to_string()
+        };
+        let long = format!("{}<!-- quorum-op:1 -->", "x".repeat(MAX_BODY_FIELD_BYTES));
+        let stream = format!("{}\n{}", comment(5, 41, 7, "a"), comment(6, 41, 7, &long));
+        let parsed = parse_response(pr(7), &list, stream.as_bytes()).unwrap();
+        let RepositoryResponse::ReviewComments(comments) = parsed else {
+            panic!("{parsed:?}")
+        };
+        assert_eq!(comments.len(), 2);
+        assert_eq!(
+            (comments[1].id, comments[1].body.as_str()),
+            (6, long.as_str())
+        );
+        assert!(parse_response(pr(7), &list, b"").is_ok());
+        for bad in [
+            comment(5, 40, 7, "a"),
+            comment(5, 41, 8, "a"),
+            comment(0, 41, 7, "a"),
+        ] {
+            assert!(
+                parse_response(pr(7), &list, bad.as_bytes()).is_err(),
+                "{bad}"
+            );
+        }
+        let many: String = (1..=MAX_PENDING_REVIEW_COMMENTS as u64 + 1)
+            .map(|id| comment(id, 41, 7, "a"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(parse_response(pr(7), &list, many.as_bytes()).is_err());
     }
 
     #[tokio::test]
