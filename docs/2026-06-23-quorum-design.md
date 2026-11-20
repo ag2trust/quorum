@@ -95,23 +95,32 @@ DB path: `~/.quorum/repos/<owner>__<name>/quorum.db`. Repo identity is resolved 
 `QUORUM_REPO` env var (set by the daemon for workers) > cwd git detection (parse the
 `origin` remote URL) > loud error (exit 2). No daemon required for CLI commands. No
 general network server. Agents invoke lifecycle-safe `quorum <subcommand>` operations as
-ordinary shell commands. Managed PR collaboration additionally uses a credentialless
-`quorum agent-mcp` stdio process injected by the daemon and scoped to the managed provider
-process; persistent providers retain that MCP process across their stdin-fed turns. It writes
-bounded, run-authorized GitHub operation requests through a narrow local daemon endpoint, and the
-daemon alone writes SQLite and performs the remote operation. The MCP process never receives the
-Quorum database, GitHub credentials, or lifecycle authority. An operator may instead run the
-same adapter with `--listen` as a loopback-only Streamable HTTP server authorized per request by
-the run capability (see the GitHub collaboration MCP technical spec). `quorum serve` also embeds
-that HTTP adapter on its own listener: `agent_mcp_listen` (default `127.0.0.1:0`) is bound at
-startup, and every managed run, planners included, receives `QUORUM_AGENT_MCP_URL`
-(`http://<bound addr>/mcp`) beside `QUORUM_RUN_ID`, which is its bearer. A non-loopback bind
-requires `agent_mcp_allowed_hosts`; an address equal to the declared `orchestrator_mcp_listen`
-is refused with exit 2. If the listener cannot bind, serve logs it, writes an `errors` row,
-alerts the owner, and exits without launching any managed run; nothing falls back to stdio. The
-listener stops through a flag after the tick loop's drain. A separate, operator-started `quorum orchestrator-mcp`
-listener exposes the coordinator commands to an outside agent behind an operator token (see
-"Orchestrator MCP" below).
+ordinary shell commands. Managed PR collaboration additionally uses the credentialless
+`quorum agent-mcp` adapter, scoped to the managed provider process. Per the 2026-11-16 owner
+decision, `quorum serve` embeds this adapter as a Streamable HTTP server on its own loopback
+listener — `agent_mcp_listen` (default `127.0.0.1:0`) is bound at startup — superseding the
+earlier split of stdio injection for in-container agents and a separately started HTTP listener
+for agents outside the container. Every managed run, planners included, receives
+`QUORUM_AGENT_MCP_URL` (`http://<bound addr>/mcp`) beside `QUORUM_RUN_ID`, which is its bearer;
+this is the generic runner contract for the default Claude-compatible binary and any `agent_bin`
+substituted for it. It writes bounded, run-authorized GitHub operation requests through a narrow
+local daemon endpoint, and the daemon alone writes SQLite and performs the remote operation. The
+adapter never receives the Quorum database, GitHub credentials, or lifecycle authority. A
+non-loopback bind requires `agent_mcp_allowed_hosts`; an address equal to the declared
+`orchestrator_mcp_listen` is refused with exit 2 (the same socket address for both listeners is a
+configuration error). If the listener cannot bind, serve logs it, writes an `errors` row, alerts
+the owner, and exits without launching any managed run — there is no stdio fallback, and the
+bearer never appears in argv. The listener stops through a flag after the tick loop's drain.
+
+`quorum agent-mcp` without `--listen` still runs the same adapter over stdio. `quorum serve` does
+not spawn it for the generic runner contract above; it remains available for an operator's
+manual, attended use, and Codex and Grok's own provider-native MCP configuration formats still
+declare it as their stdio child, unchanged by this decision (see the GitHub collaboration MCP
+technical spec). An operator may also run the adapter directly with `--listen` as a loopback-only
+Streamable HTTP server authorized per request by the run capability; `quorum serve`'s embedded
+listener reuses that same HTTP implementation. A separate, operator-started
+`quorum orchestrator-mcp` listener exposes the coordinator commands to an outside agent behind an
+operator token (see "Orchestrator MCP" below).
 
 For contained runs, the same local endpoint carries the existing run-scoped `submit` and `react`
 signals and the closed established public-command family, so those commands need neither a
@@ -147,17 +156,24 @@ leave loopback is the operator-started orchestrator MCP described below; it adds
 for existing coordinator commands, not a new operation or authority.
 
 Managed GitHub collaboration is the narrow exception because direct Repository Service
-credentials and shell-composed Markdown are the wrong boundary for an untrusted coding run. The
-daemon injects one tools-only stdio MCP whose inventory is derived from the exact live run role.
-The adapter lifetime follows the managed provider process: turn-oriented providers receive a
-fresh adapter, while a persistent Claude child retains one adapter and authenticated local-endpoint
-session across its stdin-fed turns. That persistent adapter keeps only bounded, opaque session
-state for the current attempt/lifecycle/inventory descriptor and invalidates it through the
-daemon-authorized phase handoff; the adapter is neither durable authority nor a second source of
-coordination state. It forwards closed typed requests to a narrow local daemon endpoint, SQLite
-holds every durable operation request and binding, and `quorum serve` executes remote GitHub work
-outside transactions. Restricted internal model roles receive no MCP. The separate orchestrator
-MCP below has its own listener and authentication and is not implied by this agent interface.
+credentials and shell-composed Markdown are the wrong boundary for an untrusted coding run. Per
+the 2026-11-16 owner decision, `quorum serve` serves one tools-only Streamable HTTP MCP on its own
+loopback listener (`agent_mcp_listen`) for the exact live run role; this generic runner contract —
+`QUORUM_AGENT_MCP_URL` plus the `QUORUM_RUN_ID` bearer, for the default Claude-compatible runner
+and any `agent_bin` substituted for it — supersedes the earlier split of stdio injection for
+in-container agents and a separately started `--listen` HTTP server for agents outside the
+container. The transport is stateless: every `tools/list` and tool call is authorized and resolved
+against the daemon endpoint from the bearer alone, so a live phase change (e.g., worker to rework)
+needs no push notification or control-frame handoff, and the adapter itself keeps no session
+state and is neither durable authority nor a second source of coordination state. It forwards
+closed typed requests to a narrow local daemon endpoint, SQLite holds every durable operation
+request and binding, and `quorum serve` executes remote GitHub work outside transactions. If the
+listener cannot bind, managed launches are refused loudly; there is no stdio fallback, and the
+bearer never appears in argv. Codex and Grok's own provider-native MCP configuration formats are
+unaffected by this decision: they still declare `quorum agent-mcp` as their own stdio child (see
+the GitHub collaboration MCP technical spec). Restricted internal model roles receive no MCP. The
+separate orchestrator MCP below has its own listener and authentication and is not implied by
+this agent interface.
 
 ## Orchestrator MCP
 
