@@ -1761,6 +1761,7 @@ async fn spawn_and_run_classifier(
             environment: &request.env_vars,
             mode: LaunchMode::Normal,
             continuation_id: None,
+            managed: None,
         },
         &AdapterConfig {
             executable: request.agent_bin.as_deref(),

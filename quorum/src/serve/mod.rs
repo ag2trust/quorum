@@ -4237,6 +4237,30 @@ fn managed_run_environment(
     environment
 }
 
+/// The managed-launch declaration every capability-bearing worker or reviewer
+/// launch carries, so the runner applies its agent MCP wiring check and
+/// records a refusal in this daemon's `errors` table.
+fn managed_launch(
+    config: &ServeConfig,
+    role: runner::AgentMcpRole,
+) -> Option<runner::ManagedLaunch<'_>> {
+    Some(runner::ManagedLaunch {
+        role,
+        db_path: &config.db_path,
+    })
+}
+
+/// A durable responsibility role as a managed launch role. Like the
+/// surrounding fallback branches, anything but `worker` is a reviewer, which
+/// is also the stricter tool requirement.
+fn managed_role(role: &str) -> runner::AgentMcpRole {
+    if role == "worker" {
+        runner::AgentMcpRole::Worker
+    } else {
+        runner::AgentMcpRole::Reviewer
+    }
+}
+
 #[cfg(test)]
 fn configured_reviewer_selection<'a>(
     provider_explicit: bool,
@@ -20751,6 +20775,7 @@ async fn feed_worker_turn(
                     &slot.session_id,
                     slot.continuation_id_for_launch(),
                 ),
+                managed: managed_launch(config, runner::AgentMcpRole::Worker),
             },
             &runner_adapter_config(config, config.agent_bin.as_deref()),
         )
@@ -25511,6 +25536,7 @@ async fn provision_reviewer_reserved(
                 environment: &reviewer_env,
                 mode: runner::LaunchMode::Normal,
                 continuation_id,
+                managed: managed_launch(config, runner::AgentMcpRole::Reviewer),
             },
             &runner_adapter_config(config, reviewer_agent_bin),
         )
@@ -27756,6 +27782,7 @@ async fn spawn_admitted_worker(
         environment: &worker_env_vars,
         mode: runner::LaunchMode::Normal,
         continuation_id,
+        managed: managed_launch(config, runner::AgentMcpRole::Worker),
     };
     let responsibility_key = worker_responsibility_key(task.id, task.revision);
     let worker_run_id = {
@@ -29414,6 +29441,7 @@ async fn activate_reviewer_fallback(
         // Cross-provider continuations are forbidden. The alternate gets
         // the exact pending turn in a new provider session.
         continuation_id: runner_continuation_id(alternate_kind, &session_id, None),
+        managed: managed_launch(config, runner::AgentMcpRole::Reviewer),
     };
     let proc = match launch_and_commit_fallback(
         config,
@@ -30117,6 +30145,7 @@ async fn activate_worker_fallback_with(
         mode: runner::LaunchMode::Normal,
         // Cross-provider continuation is never valid.
         continuation_id: runner_continuation_id(alternate_kind, &session_id, None),
+        managed: managed_launch(config, runner::AgentMcpRole::Worker),
     };
     let grok_worker_request =
         (alternate_kind == runner::AgentKind::Grok).then(|| runner::WorkerTurnRequest {
@@ -30433,6 +30462,7 @@ async fn resume_pending_fallbacks(
             environment: &environment,
             mode: runner::LaunchMode::Normal,
             continuation_id: runner_continuation_id(kind, &slot.session_id, None),
+            managed: managed_launch(config, managed_role(&intent.role)),
         };
         let pending_turn = PendingTurn {
             provider: intent.pending_turn.provider.clone(),
@@ -32974,6 +33004,7 @@ async fn spawn_remediation_worker(
         environment: &remediation_env,
         mode: runner::LaunchMode::Normal,
         continuation_id: launch_continuation_id,
+        managed: managed_launch(config, runner::AgentMcpRole::Worker),
     };
     let spawn_result = if fresh_grok_handoff {
         // A workerless review-only task begins its first managed Grok turn in
@@ -37322,6 +37353,7 @@ mod tests {
                     environment: &environment,
                     mode: runner::LaunchMode::Normal,
                     continuation_id: None,
+                    managed: None,
                 },
                 None,
                 gated_fallback_journal(&config.db_path, &worktree),
@@ -37433,6 +37465,7 @@ mod tests {
                 environment: &environment,
                 mode: runner::LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             None,
             gated_fallback_journal(&config.db_path, &worktree),
@@ -37493,6 +37526,7 @@ mod tests {
                 environment: &environment,
                 mode: runner::LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             None,
             gated_fallback_journal(&config.db_path, &worktree),
@@ -38074,6 +38108,7 @@ mod tests {
                         environment: &[],
                         mode: runner::LaunchMode::Normal,
                         continuation_id: None,
+                        managed: None,
                     },
                     &runner::AdapterConfig {
                         executable: primary_runner.to_str(),
@@ -41375,6 +41410,7 @@ mod tests {
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             &runner::AdapterConfig {
                 executable: provider.to_str(),
@@ -43536,6 +43572,7 @@ mod tests {
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id,
+                managed: None,
             },
             &runner::AdapterConfig {
                 executable: Some("true"),
@@ -43634,6 +43671,7 @@ mod tests {
                     environment: &[],
                     mode: runner::LaunchMode::Normal,
                     continuation_id: None,
+                    managed: None,
                 },
                 task_id,
                 role_assignment_id: assignment_id,
@@ -43908,6 +43946,7 @@ mod tests {
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id: retry_after_restart.continuation_id.as_deref(),
+                managed: None,
             },
             &runner::AdapterConfig {
                 executable: resumed_program.to_str(),
@@ -44467,6 +44506,7 @@ mod tests {
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id: retry_turn.continuation_id.as_deref(),
+                managed: None,
             },
             &runner::AdapterConfig {
                 executable: resume_program.to_str(),
@@ -45441,6 +45481,7 @@ printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-session-te
                 environment: &initial_environment,
                 mode: runner::LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             task_id: 1,
             role_assignment_id: 1,
@@ -45481,6 +45522,7 @@ printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-session-te
                 environment: &resumed_environment,
                 mode: runner::LaunchMode::Normal,
                 continuation_id: Some("grok-session-initial"),
+                managed: None,
             },
             &runner_adapter_config(&config, program.to_str()),
         )
@@ -45523,6 +45565,7 @@ printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-session-te
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id: Some("grok-session-initial"),
+                managed: None,
             },
             &runner::AdapterConfig {
                 executable: program.to_str(),
@@ -47652,6 +47695,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             &runner::AdapterConfig {
                 executable: runner.to_str(),
@@ -49516,6 +49560,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             &runner::AdapterConfig {
                 executable: fixture.to_str(),
@@ -50727,6 +50772,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             &runner::AdapterConfig {
                 executable: fixture.to_str(),
@@ -64126,6 +64172,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 environment: &[],
                 mode: runner::LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             Some(runner::WorkerTurnRequest {
                 task_id: 1,

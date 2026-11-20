@@ -1594,6 +1594,7 @@ mod tests {
             environment,
             mode,
             continuation_id: None,
+            managed: None,
         }
     }
 

@@ -168,6 +168,17 @@ impl ProtocolOperation {
     }
 }
 
+/// The protocol operations the endpoint authorizes in `phase`, in inventory
+/// order. The `Inventory` answer and per-call authorization both derive from
+/// `allowed_in`; the agent MCP adapter's advertised list and the launch-time
+/// role-tool check are pinned to this by tests.
+pub(crate) fn phase_operations(phase: LiveRunPhase) -> Vec<ProtocolOperation> {
+    ALL_PROTOCOL_OPERATIONS
+        .into_iter()
+        .filter(|operation| operation.allowed_in(phase))
+        .collect()
+}
+
 const ALL_PROTOCOL_OPERATIONS: [ProtocolOperation; 8] = [
     ProtocolOperation::PullRequestRead,
     ProtocolOperation::AddIssueComment,
@@ -1135,10 +1146,7 @@ fn process_request_blocking(
                 }),
                 Err(_) => {
                     let context = resolve_any_role(&tx, &request.capability)?;
-                    let operations = ALL_PROTOCOL_OPERATIONS
-                        .into_iter()
-                        .filter(|operation| operation.allowed_in(context.phase))
-                        .collect();
+                    let operations = phase_operations(context.phase);
                     Response::success(ResponseResult::Inventory {
                         repository: repository.to_string(),
                         task_id: context.task_id,
@@ -4428,12 +4436,7 @@ mod tests {
 
     #[test]
     fn inventories_are_phase_scoped() {
-        let names = |phase| {
-            ALL_PROTOCOL_OPERATIONS
-                .into_iter()
-                .filter(|operation| operation.allowed_in(phase))
-                .collect::<Vec<_>>()
-        };
+        let names = phase_operations;
         assert_eq!(
             names(LiveRunPhase::InitialWorker),
             vec![ProtocolOperation::DeliveryReportWrite]

@@ -238,9 +238,12 @@ the endpoint socket. Its limits are:
   stored, and the daemon endpoint authorizes every call from it exactly as it does over stdio.
 - Stateless: no sessions, no server-initiated stream, and therefore no
   `notifications/tools/list_changed`. A client learns a phase change by listing tools again.
-- In addition to the stdio inventory it advertises signalling tools by run phase: `submit_work`,
-  `react`, and `task_note` to a worker; `submit_review`, `task_note`, and `alert_owner` to a
-  reviewer. They proxy the endpoint's `Submit`, `React`, `AppendNote`, and `AlertOwner` operations.
+- Like the stdio transport it advertises signalling tools by run phase: `submit_work`, `react`, and
+  `task_note` to a worker; `submit_review`, `task_note`, and `alert_owner` to a reviewer. They
+  proxy the endpoint's `Submit`, `React`, `AppendNote`, and `AlertOwner` operations. Both
+  transports compute `tools/list` from one function, so stdio providers (Codex, Grok) are offered
+  the same signals as Claude and never need a shell fallback. On stdio a signalling name outside
+  the last listed phase inventory is an unknown tool, as `submit_plan` is.
   `AlertOwner` writes one critical feed message to the owner as the reviewer capability's agent.
   None is idempotent: each accepted call writes another row. `alert_owner`, like `quorum post`,
   has no rate or count bound: a live reviewer capability can post any number of alerts, each up
@@ -263,6 +266,19 @@ the endpoint socket. Its limits are:
   serve`'s own embedded listener rather than a separately started one (see above); Codex and Grok
   launches still inject the stdio server, unaffected by this transport or the decision that added
   it.
+
+Every capability-bearing managed launch declares its role (`worker`, `reviewer`, or `planner`)
+at the runner boundary, which refuses to spawn unless the run's wiring is complete and its
+advertised tools cover the role's requirements in every phase the role can reach. Complete wiring
+is `QUORUM_REPO`, `QUORUM_AGENT`, `QUORUM_RUN_ID` (the bearer), and `QUORUM_AGENT_ENDPOINT`, plus
+`QUORUM_AGENT_MCP_URL` for Claude. The required tools are `submit_work`, `react`, and `task_note`
+for a worker (initial and rework); `submit_review`, `alert_owner`, `task_note`, and the reviewer
+GitHub tools for a reviewer; and `submit_plan` for a planner. A refusal is a `NonFailover`,
+`InvalidInput` runner failure that the caller's ordinary launch-failure path handles; worker and
+reviewer refusals are also logged and recorded in `errors` with source `agent_mcp_launch`, and a
+planner refusal is recorded as its failed `planner-spawn` decomposition attempt. A
+`Normal` launch carrying a run capability without a declared role is refused the same way, so no
+managed run can skip the check.
 
 The logical MCP server name is `quorum`, yielding client-visible names such as
 `mcp__quorum__pull_request_read`. The daemon injects only this per-run server into ordinary worker
