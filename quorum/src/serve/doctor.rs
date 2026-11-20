@@ -571,6 +571,8 @@ mod tests {
     /// Slow reap path: a descendant that leaves the doctor's process group
     /// but keeps its stdout open means `kill_and_reap` never sees EOF. The
     /// helper must give up at the bound and keep the row as restart evidence.
+    /// The escapee also scrubs its environment (`env -i`), dropping the
+    /// `proctree` marker: the one documented escape the tree kill cannot reach.
     #[tokio::test]
     async fn unconfirmed_reap_keeps_recovery_row_within_bound() {
         let dir = tempfile::tempdir().unwrap();
@@ -580,7 +582,7 @@ mod tests {
         write_executable(
             &bin,
             &format!(
-                "#!/bin/sh\nperl -e 'setpgrp(0,0); open(my $f, \">\", $ARGV[0]) or die; \
+                "#!/bin/sh\nenv -i \"$(command -v perl)\" -e 'setpgrp(0,0); open(my $f, \">\", $ARGV[0]) or die; \
                  print $f $$; close $f; sleep 300' '{}' &\nexec sleep 300\n",
                 escaped_pid.display()
             ),
