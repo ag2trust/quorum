@@ -1481,8 +1481,12 @@ async fn submit_plan(
     process_timeout: Duration,
 ) -> std::result::Result<Response, EndpointFailure> {
     let received_at = quorum_core::clock::now();
-    let prepared = tokio::time::timeout(
-        process_timeout,
+    // The deadline, not timer-vs-task scheduling, decides a timeout: a prepare
+    // that resolves at or after the deadline is a timeout even if it won the
+    // poll race against the timer (which only fires on a later driver tick).
+    let deadline = tokio::time::Instant::now() + process_timeout;
+    let prepared = match tokio::time::timeout_at(
+        deadline,
         prepare_and_validate_plan(
             db_path.clone(),
             plan_validation,
@@ -1491,12 +1495,13 @@ async fn submit_plan(
         ),
     )
     .await
-    .unwrap_or_else(|_| {
-        Err(EndpointFailure::new(
+    {
+        Ok(prepared) if tokio::time::Instant::now() < deadline => prepared,
+        _ => Err(EndpointFailure::new(
             "timeout",
             "request processing timed out",
-        ))
-    });
+        )),
+    };
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(failure) => {
