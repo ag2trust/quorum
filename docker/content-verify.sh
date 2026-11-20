@@ -18,6 +18,11 @@
 #   5. The build context that .dockerignore admits from CONTEXT_DIR (default:
 #      the repository root) holds no such inputs and stays under
 #      CONTEXT_LIMIT_KIB.
+#   6. The shipped agent-facing provider config
+#      (/usr/share/quorum/serve-codex.toml) contains no credential-like
+#      assignment, token-shaped value, or Quorum database path. Every managed
+#      role reads only this file (or an operator-owned equivalent outside the
+#      image); it must never carry GitHub or daemon-home authority.
 #
 # Diagnostics name the offending class and location, never a matched value.
 # Exit codes: 0 verified · 1 forbidden/missing content · 2 usage.
@@ -111,6 +116,21 @@ if ! docker run --rm --platform linux/amd64 --network none --user 0:0 \
     find / \( -path /proc -o -path /sys -o -path /dev \) -prune -o -type f \
       -exec grep -l -I -E -e "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----" {} + 2>/dev/null \
       | sed "s/^/KEY /"
+    provider_config=/usr/share/quorum/serve-codex.toml
+    if [ -f "$provider_config" ]; then
+      if grep -q -i -E \
+        "(^|[^A-Za-z0-9_])[A-Za-z0-9_]*(TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|CREDENTIALS?)[A-Za-z0-9_]*[[:space:]]*=" \
+        "$provider_config" 2>/dev/null \
+        || grep -q -E \
+          "(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|(^|[^A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|xox[abposr]-[A-Za-z0-9-]{10,})" \
+          "$provider_config" 2>/dev/null; then
+        printf "CONFIG-CRED %s\n" "$provider_config"
+      fi
+      if grep -q -i -E "(quorum\.db|\.sqlite3?|/data/quorum|QUORUM_HOME)" \
+        "$provider_config" 2>/dev/null; then
+        printf "CONFIG-DBPATH %s\n" "$provider_config"
+      fi
+    fi
     printf "SCAN-COMPLETE\n"
   ' >"$work/fs" 2>"$work/fs.err"; then
   fail "filesystem scan could not run: $(head -c 400 "$work/fs.err")"
@@ -122,6 +142,8 @@ else
       MISSING) fail "missing required file $path" ;;
       FORBIDDEN) fail "forbidden path in image: $path" ;;
       KEY) fail "private key material in image file: $path" ;;
+      CONFIG-CRED) fail "credential-like value in agent-facing provider config: $path" ;;
+      CONFIG-DBPATH) fail "Quorum database path in agent-facing provider config: $path" ;;
     esac
   done <"$work/fs"
 fi
