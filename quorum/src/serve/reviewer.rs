@@ -202,8 +202,29 @@ mutation could invalidate it, or an explicit contract requires independent verif
 
 /// A terminal signal is the last managed action for a completed turn.
 const TERMINAL_SIGNAL_RULE: &str = "\
-Before a terminal `submit` or `react`, finish every required verification and repository check. \
-After it reports unambiguous success, do no further tool work; return only a short final result.";
+Before a terminal `submit_work` or `react` call, finish every required verification and \
+repository check. After it reports unambiguous success, do no further tool work; return only a \
+short final result.";
+
+/// How rework and remediation workers answer review findings on the PR.
+const REWORK_PR_TRAIL_CONTRACT: &str = "\
+The PR is the source of truth for this review — address findings there:\n\
+- For each blocking finding, either fix it and commit, or, if you disagree, reply to the finding \
+on the PR with concrete evidence (a citation, a test result, a rationale) using the \
+`add_reply_to_pull_request_comment` tool (or `add_issue_comment` for a summary-level finding). \
+Do NOT silently ignore a finding — an unanswered blocker will still block the next review.\n\
+- The final PR history must let a later reader determine, for each finding, whether it was \
+fixed, accepted, overridden with evidence, or unaddressed. That trail lives on the PR, not in \
+this turn.";
+
+/// The agent MCP tools are a worker's only Quorum signalling channel. Shared by
+/// worker, rework, and remediation prompts so they cannot drift apart.
+const WORKER_MCP_TOOLS_CONTRACT: &str = "\
+Worker tools: signal Quorum only through the agent MCP tools `submit_work` (completion), \
+`react` (blocked, failed, needs-info, or note), and `task_note` (exceptional diagnostics). Local \
+`git` work (`git commit`, `git diff`, `git log`) stays fine; pushing and PR publication are \
+daemon-owned. Never substitute a shell or CLI command for these tools; if one is unavailable, \
+stop and report that in your final result.";
 
 /// A reviewer's terminal signal is `submit_review`; reviewers have no `react`.
 const REVIEWER_TERMINAL_SIGNAL_RULE: &str = "\
@@ -738,9 +759,9 @@ const EXCEPTIONAL_NOTE_GUIDANCE: &str =
     "Where provider and system instructions permit, suppress routine narration. Report unexpected \
      failures, material state changes, decisions, or needed intervention. A task note is only for \
      unexpected durable diagnostics absent from the submission, PR, or reaction, and is written \
-     before `submit` or `react`. For `react --state blocked` or `--state needs-info` you MUST \
-     pass the blocker or the full question via `--reason-stdin` (or `--reason-file`); it is the \
-     only durable record the owner sees. Put remediation evidence on the PR.";
+     with the `task_note` tool before `submit_work` or `react`. For a `react` call with state \
+     `blocked` or `needs-info` you MUST pass the blocker or the full question as `reason`; it is \
+     the only durable record the owner sees. Put remediation evidence on the PR.";
 
 /// Render untrusted text as a quoted block: every line is prefixed with `> `
 /// so no line can begin at column 0, and `[`/`]` are neutralized so the text cannot
@@ -834,11 +855,12 @@ pub fn build_worker_prompt(
          {working_style}\n\n\
          {evidence_economy}\n\n\
          {note_guidance}{budget}\n\n\
+         {worker_tools}\n\n\
          When your work is complete:\n\
          1. Commit your work. Do NOT push or open a PR; the daemon publishes and verifies it.\n\
          2. Run the verification prescribed by the target repository's checked-in instructions \
          and applicable CI/delivery contract; do not invent unavailable scripts or checks.\n\
-         3. Signal completion: quorum submit --agent {agent}\n\n\
+         3. Signal completion by calling the `submit_work` tool.\n\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.\n\
          {terminal_signal}",
         agent = agent_name,
@@ -849,6 +871,7 @@ pub fn build_worker_prompt(
         working_style = WORKING_STYLE,
         evidence_economy = EVIDENCE_ECONOMY_RULE,
         note_guidance = EXCEPTIONAL_NOTE_GUIDANCE,
+        worker_tools = WORKER_MCP_TOOLS_CONTRACT,
         budget = budget_line(0.0, max_task_cost_usd),
         terminal_signal = TERMINAL_SIGNAL_RULE,
     )
@@ -875,7 +898,7 @@ pub fn build_worker_turn(
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_rework_prompt(
-    agent_name: &str,
+    _agent_name: &str,
     _task_id: i64,
     pr: i64,
     feedback: &str,
@@ -893,36 +916,32 @@ pub fn build_rework_prompt(
     let risk_guidance = format!("{risk_guidance}{task_context}");
     format!(
         "REVIEW FAILED — the reviewer requested changes. The reviewer's blocking findings \
-         (summary below) also live on PR #{pr} as review comments — read the PR to see the \
-         full context, inline anchors, and any advisory notes.\n\n\
+         (summary below) also live on PR #{pr} as review comments — read the PR with the \
+         `pull_request_read` tool to see the full context, inline anchors, and any advisory \
+         notes.\n\n\
          Reviewer feedback summary:\n{feedback}{risk_guidance}\n\n\
-         The PR is the source of truth for this review — address findings there:\n\
-         - For each blocking finding, either fix it and commit, or, if you disagree, reply \
-         to the finding on the PR with concrete evidence (a citation, a test result, a \
-         rationale). Do NOT silently ignore a finding — an unanswered blocker will still \
-         block the next review.\n\
-         - The final PR history must let a later reader determine, for each finding, whether \
-         it was fixed, accepted, overridden with evidence, or unaddressed. That trail lives \
-         on the PR, not in this turn.\n\n\
+         {pr_trail}\n\n\
          Preserve the existing published PR lineage. If the base branch must be integrated, \
          merge it into the PR branch. Never rebase, reset away, squash-rebuild, or otherwise \
          replace the published PR head; it must remain an ancestor of your final commit.\n\n\
          Fix directly; do NOT fan out subagents for rework.\n\n\
          {evidence_economy}{budget}\n\n\
          {note_guidance}\n\n\
+         {worker_tools}\n\n\
          After fixing:\n\
          1. Commit your work. Do NOT push or open a PR; the daemon publishes and verifies it.\n\
          2. Run the verification prescribed by the target repository's checked-in instructions \
          and applicable CI/delivery contract; do not invent unavailable scripts or checks.\n\
-         3. Re-signal completion with your PR number: quorum submit --agent {agent} --pr {pr}\n\n\
+         3. Re-signal completion for PR #{pr} by calling the `submit_work` tool.\n\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.\n\
          {terminal_signal}",
         feedback = feedback,
         risk_guidance = risk_guidance,
-        agent = agent_name,
         pr = pr,
+        pr_trail = REWORK_PR_TRAIL_CONTRACT,
         evidence_economy = EVIDENCE_ECONOMY_RULE,
         note_guidance = EXCEPTIONAL_NOTE_GUIDANCE,
+        worker_tools = WORKER_MCP_TOOLS_CONTRACT,
         budget = budget_line(spent_usd, max_task_cost_usd),
         terminal_signal = TERMINAL_SIGNAL_RULE,
     )
@@ -967,26 +986,21 @@ pub fn build_remediation_turn(
          ## Blocking findings from the reviewer\n{feedback}\n\n\
          {continuation_context}\
          ## Instructions\n\
-         You are fixing an EXISTING PR — do NOT open a new one and do NOT run `gh pr create`.\n\n\
+         You are fixing an EXISTING PR — the daemon publishes; do not open a PR.\n\n\
          ## Publishing your fix\n\
          Your worktree is on the daemon-owned local branch `{local_branch}`. The daemon \
          publishes the exact committed SHA to the authoritative PR head and verifies it before \
          re-review.\n\n\
-         The PR is the source of truth for this review — address findings there:\n\
-         - For each blocking finding, either fix it and commit, or, if you disagree, reply \
-         to the finding on the PR with concrete evidence (a citation, a test result, a \
-         rationale). Do NOT silently ignore a finding — an unanswered blocker will still \
-         block the next review.\n\
-         - The final PR history must let a later reader determine, for each finding, whether \
-         it was fixed, accepted, overridden with evidence, or unaddressed.\n\n\
+         {pr_trail}\n\n\
          Fix directly; do NOT fan out subagents for rework.\n\n\
          {evidence_economy}{budget}\n\n\
          {note_guidance}\n\n\
+         {worker_tools}\n\n\
          After fixing:\n\
          1. Commit your work. Do NOT push or name a remote/refspec.\n\
          2. Run the verification prescribed by the target repository's checked-in instructions \
          and applicable CI/delivery contract; do not invent unavailable scripts or checks.\n\
-         3. Signal completion with the existing PR: quorum submit --agent {agent} --pr {pr}\n\n\
+         3. Signal completion for the existing PR #{pr} by calling the `submit_work` tool.\n\n\
          Do NOT mark the task done yourself — the daemon handles task lifecycle.\n\
          {terminal_signal}",
         agent = agent_name,
@@ -999,8 +1013,10 @@ pub fn build_remediation_turn(
         },
         feedback = feedback,
         continuation_context = continuation_context.unwrap_or_default(),
+        pr_trail = REWORK_PR_TRAIL_CONTRACT,
         evidence_economy = EVIDENCE_ECONOMY_RULE,
         note_guidance = EXCEPTIONAL_NOTE_GUIDANCE,
+        worker_tools = WORKER_MCP_TOOLS_CONTRACT,
         budget = budget_line(0.0, max_task_cost_usd),
         terminal_signal = TERMINAL_SIGNAL_RULE,
     )
@@ -1100,7 +1116,8 @@ mod tests {
 
     #[test]
     fn note_guidance_requires_react_reason_for_blocked_and_needs_info() {
-        assert!(EXCEPTIONAL_NOTE_GUIDANCE.contains("--reason-stdin"));
+        assert!(EXCEPTIONAL_NOTE_GUIDANCE.contains("as `reason`"));
+        assert!(EXCEPTIONAL_NOTE_GUIDANCE.contains("`task_note`"));
         assert!(EXCEPTIONAL_NOTE_GUIDANCE.contains("MUST"));
         assert!(!EXCEPTIONAL_NOTE_GUIDANCE.contains("reasons in `react`"));
     }
@@ -1133,7 +1150,7 @@ mod tests {
             .find("Run the verification prescribed")
             .expect("worker prompt must require verification");
         let submit = completion
-            .find("quorum submit")
+            .find("calling the `submit_work` tool")
             .expect("worker prompt must require completion signaling");
         assert!(
             commit < verification && verification < submit,
@@ -1822,8 +1839,8 @@ mod tests {
             "no budget line when no ceiling is configured"
         );
         assert!(
-            turn.contains("quorum submit --agent W-1 --pr 99"),
-            "rework template must instruct agent to re-signal done with PR number"
+            turn.contains("Re-signal completion for PR #99 by calling the `submit_work` tool"),
+            "rework template must instruct agent to re-signal done via submit_work"
         );
         assert!(
             turn.contains("Do NOT mark the task done yourself"),
@@ -1874,7 +1891,7 @@ mod tests {
             "remediation turn must reserve publication for the daemon: {turn}"
         );
         assert!(
-            turn.contains("gh pr create"),
+            turn.contains("the daemon publishes; do not open a PR"),
             "remediation turn must forbid opening a new PR explicitly"
         );
     }
@@ -2131,7 +2148,7 @@ mod tests {
             "worker template must reserve push and PR creation for the daemon"
         );
         assert!(
-            turn.contains("quorum submit --agent W-1"),
+            turn.contains("Signal completion by calling the `submit_work` tool"),
             "worker template must instruct agent to signal completion"
         );
         assert!(
@@ -2159,17 +2176,17 @@ mod tests {
             (
                 "worker",
                 build_worker_turn("W-1", 42, "title", "body", None),
-                "quorum submit --agent W-1",
+                "Signal completion by calling the `submit_work` tool",
             ),
             (
                 "rework",
                 build_rework_turn("W-1", 42, 99, "fix it", 0.0, None),
-                "quorum submit --agent W-1 --pr 99",
+                "Re-signal completion for PR #99 by calling the `submit_work` tool",
             ),
             (
                 "remediation",
                 build_remediation_turn("W-1", 42, 99, "fix it", "body", None, None),
-                "quorum submit --agent W-1 --pr 99",
+                "Signal completion for the existing PR #99 by calling the `submit_work` tool",
             ),
         ];
 
@@ -2201,7 +2218,7 @@ mod tests {
                 "{name} must retain every evidence-economy exception"
             );
             assert_eq!(
-                turn.matches("Before a terminal `submit` or `react`")
+                turn.matches("Before a terminal `submit_work` or `react` call")
                     .count(),
                 1,
                 "{name} must state the pre-signal check and post-success stop rule once"
@@ -2210,7 +2227,7 @@ mod tests {
                 .find(submit)
                 .expect("worker must carry its exact submit command");
             let terminal = turn
-                .find("Before a terminal `submit` or `react`")
+                .find("Before a terminal `submit_work` or `react` call")
                 .expect("worker must carry terminal-signal guidance");
             assert!(
                 signal < terminal,
@@ -2374,96 +2391,135 @@ mod tests {
         }
     }
 
-    /// Extracts every `quorum <subcommand> --<flag>` from all turn-template
-    /// strings and validates each subcommand and flag against the clap Command
-    /// tree. Catches drift between what templates tell agents to run and what
-    /// the binary actually accepts.
-    #[test]
-    fn turn_template_cli_invocations_match_clap_surface() {
-        use clap::CommandFactory;
+    /// A managed prompt embeds a backticked `gh ` or `quorum ` shell command.
+    fn backticked_shell_commands(prompt: &str) -> Vec<&'static str> {
+        ["`gh ", "`quorum "]
+            .into_iter()
+            .filter(|needle| prompt.contains(needle))
+            .collect()
+    }
 
-        let spec = ReviewerSpec {
-            pr: 1,
+    /// Every managed prompt kind (worker, rework, R1, R2, re-review, planner,
+    /// remediation) signals through agent MCP tools only: none may embed a
+    /// backticked `gh` or `quorum` shell command.
+    #[test]
+    fn every_managed_prompt_is_free_of_gh_and_quorum_shell_commands() {
+        let r1 = ReviewerSpec {
+            pr: 7,
             worker_agent: "W".into(),
             reviewer_name: "R".into(),
         };
-        let r2_spec = R2ReviewSpec {
-            pr: 1,
+        let r2 = R2ReviewSpec {
+            pr: 7,
             worker_agent: "W".into(),
             r1_reviewer: "R1".into(),
             r2_name: "R2".into(),
         };
-        let templates: &[(&str, String)] = &[
-            ("worker", build_worker_turn("A", 1, "t", "b", None)),
-            ("reviewer", build_review_prompt(&spec, "medium")),
-            ("rework", build_rework_turn("A", 1, 1, "fix it", 0.0, None)),
-            ("rereview", build_rereview_turn("R", 1, "W", "medium")),
-            ("r2_review", build_r2_review_prompt(&r2_spec, "medium")),
+        let planner_source = super::super::planner::PlanningSource {
+            task_id: 7,
+            revision: 1,
+            title: "plan",
+            body: Some("body"),
+            dependencies: &[],
+        };
+        let risks = vec![RiskFlag {
+            flag: risk::RiskFlagName::ManyConsumers,
+            evidence: "several consumers".into(),
+        }];
+        let context = worker_task_context_section(1, Some("prior failure"), &["note".into()]);
+        let prompts: Vec<(&str, String)> = vec![
             (
-                "codex_reviewer",
-                build_review_prompt_for_kind(AgentKind::Codex, &spec, "medium"),
+                "worker",
+                build_worker_prompt("W", 7, "t", "b", Some(5.0), &risks, &context),
             ),
             (
-                "codex_r2_review",
-                build_r2_review_prompt_for_kind(AgentKind::Codex, &r2_spec, "medium"),
+                "rework",
+                build_rework_prompt("W", 7, 9, "fix", 1.0, Some(5.0), &risks, &context),
+            ),
+            ("Claude R1", build_review_prompt(&r1, "high")),
+            (
+                "Codex R1",
+                build_review_prompt_for_kind(AgentKind::Codex, &r1, "high"),
+            ),
+            ("Claude R2", build_r2_review_prompt(&r2, "high")),
+            (
+                "Codex R2",
+                build_r2_review_prompt_for_kind(AgentKind::Codex, &r2, "high"),
+            ),
+            ("re-review", build_rereview_turn("R", 7, "W", "high")),
+            (
+                "planner",
+                super::super::planner::build_prompt(&planner_source, &risks, &["x".into()]),
+            ),
+            (
+                "remediation",
+                build_remediation_turn("W", 7, 9, "fix", "body", Some("ctx"), Some(5.0)),
             ),
         ];
-
-        let clap_cmd = crate::cli::Cli::command();
-
-        // Extract the text to scan: JSON turn templates embed the content
-        // inside {"message":{"content":"..."}}, with literal newlines escaped
-        // as \n. Parse JSON and pull the content string so we get real lines.
-        fn extract_scannable_text(raw: &str) -> String {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-                if let Some(s) = v["message"]["content"].as_str() {
-                    return s.to_string();
-                }
-            }
-            raw.to_string()
-        }
-
-        let mut invocations_checked = 0usize;
-        for (template_name, text) in templates {
-            let scannable = extract_scannable_text(text);
-            for line in scannable.lines() {
-                let Some(pos) = line.find("quorum ") else {
-                    continue;
-                };
-                let rest = &line[pos + "quorum ".len()..];
-                let tokens: Vec<&str> = rest.split_whitespace().collect();
-                if tokens.is_empty() {
-                    continue;
-                }
-
-                let subcommand = tokens[0];
-                let sub = clap_cmd.find_subcommand(subcommand);
+        for (kind, prompt) in &prompts {
+            let found = backticked_shell_commands(prompt);
+            assert!(
+                found.is_empty(),
+                "{kind} prompt embeds shell command text {found:?}: {prompt}"
+            );
+            // The scan must catch an injected command in this exact prompt.
+            for injected in ["`gh pr create`", "`quorum submit --agent W`"] {
                 assert!(
-                    sub.is_some(),
-                    "template '{template_name}' references unknown subcommand \
-                     'quorum {subcommand}'"
+                    !backticked_shell_commands(&format!("{prompt}\n{injected}")).is_empty(),
+                    "{kind}: scan must detect injected {injected}"
                 );
-                let sub = sub.unwrap();
-
-                for token in &tokens[1..] {
-                    if let Some(flag) = token.strip_prefix("--") {
-                        let has_flag = sub.get_arguments().any(|a| a.get_long() == Some(flag));
-                        assert!(
-                            has_flag,
-                            "template '{template_name}' references unknown flag \
-                             '--{flag}' on 'quorum {subcommand}'"
-                        );
-                    }
-                }
-                invocations_checked += 1;
             }
         }
+        for (kind, prompt) in &prompts[..2] {
+            assert!(prompt.contains("`submit_work`"), "{kind}: {prompt}");
+        }
+        assert!(prompts[8].1.contains("`submit_work`"), "remediation");
+        assert!(prompts[7].1.contains("`submit_plan`"), "planner");
+    }
 
-        assert!(
-            invocations_checked > 0,
-            "no CLI invocations found in any turn template — if templates \
-             no longer embed quorum commands, update or remove this test"
-        );
+    #[test]
+    fn worker_prompts_name_mcp_tools_and_keep_local_git() {
+        for (kind, turn) in [
+            ("worker", build_worker_turn("W-1", 42, "t", "b", None)),
+            (
+                "rework",
+                build_rework_turn("W-1", 42, 99, "fix it", 0.0, None),
+            ),
+            (
+                "remediation",
+                build_remediation_turn("W-1", 42, 99, "fix it", "body", None, None),
+            ),
+        ] {
+            for tool in ["`submit_work`", "`react`", "`task_note`"] {
+                assert!(turn.contains(tool), "{kind} must name {tool}: {turn}");
+            }
+            assert!(
+                turn.contains("`git commit`")
+                    && turn.contains("`git diff`")
+                    && turn.contains("`git log`"),
+                "{kind} must keep local git instructions"
+            );
+            assert!(
+                turn.contains("pushing and PR publication are daemon-owned"),
+                "{kind} must keep publication daemon-owned"
+            );
+            assert!(
+                turn.contains("Never substitute a shell or CLI command for these tools"),
+                "{kind} must forbid a shell fallback"
+            );
+            for forbidden in ["quorum submit", "gh pr", "--reason-stdin", "--agent"] {
+                assert!(!turn.contains(forbidden), "{kind} embeds {forbidden:?}");
+            }
+        }
+        for turn in [
+            build_rework_turn("W-1", 42, 99, "fix it", 0.0, None),
+            build_remediation_turn("W-1", 42, 99, "fix it", "body", None, None),
+        ] {
+            assert!(
+                turn.contains("`add_reply_to_pull_request_comment`"),
+                "{turn}"
+            );
+        }
     }
 
     #[test]
