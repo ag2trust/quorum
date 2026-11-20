@@ -234,7 +234,10 @@ impl LaunchDiff {
             return Err(AnchorError::StaleSha);
         }
         match anchor.subject_type.as_deref() {
-            None | Some("line") => {}
+            // The published add_comment_to_pending_review schema uses "LINE";
+            // lowercase "line" is accepted for compatibility. "FILE" and any
+            // other value are rejected, never downgraded.
+            None | Some("LINE") | Some("line") => {}
             Some(_) => return Err(AnchorError::UnsupportedSubjectType),
         }
         let hunks = self
@@ -638,10 +641,20 @@ diff --git \"a/sp ace\\303\\251.txt\" \"b/sp ace\\303\\251.txt\"
     #[test]
     fn accepts_explicit_line_subject_type_and_quoted_path() {
         let a = InlineAnchor {
-            subject_type: Some("line".into()),
+            subject_type: Some("LINE".into()),
             ..anchor("sp aceé.txt", 1, "RIGHT")
         };
         assert_eq!(check(&a).unwrap().path, "sp aceé.txt");
+        let lower = InlineAnchor {
+            subject_type: Some("line".into()),
+            ..anchor("src/lib.rs", 2, "RIGHT")
+        };
+        assert!(check(&lower).is_ok());
+        let multi = InlineAnchor {
+            subject_type: Some("LINE".into()),
+            ..range("src/lib.rs", 2, Some("RIGHT"), 5, "RIGHT")
+        };
+        assert!(check(&multi).is_ok());
     }
 
     #[test]
@@ -761,11 +774,13 @@ diff --git \"a/sp ace\\303\\251.txt\" \"b/sp ace\\303\\251.txt\"
 
     #[test]
     fn rejects_unsupported_subject_type_and_missing_line() {
-        let file = InlineAnchor {
-            subject_type: Some("file".into()),
-            ..anchor("src/lib.rs", 2, "RIGHT")
-        };
-        assert_eq!(check(&file), Err(AnchorError::UnsupportedSubjectType));
+        for st in ["FILE", "file", "Line", "hunk"] {
+            let a = InlineAnchor {
+                subject_type: Some(st.into()),
+                ..anchor("src/lib.rs", 2, "RIGHT")
+            };
+            assert_eq!(check(&a), Err(AnchorError::UnsupportedSubjectType), "{st}");
+        }
         let mut no_line = anchor("src/lib.rs", 2, "RIGHT");
         no_line.line = None;
         assert_eq!(check(&no_line), Err(AnchorError::MissingLine));
@@ -778,7 +793,7 @@ diff --git \"a/sp ace\\303\\251.txt\" \"b/sp ace\\303\\251.txt\"
     #[test]
     fn deserializes_camel_case_and_rejects_unknown_fields() {
         let a: InlineAnchor = serde_json::from_str(
-            r#"{"path":"src/lib.rs","line":3,"side":"RIGHT","startLine":2,"startSide":"RIGHT","subjectType":"line"}"#,
+            r#"{"path":"src/lib.rs","line":3,"side":"RIGHT","startLine":2,"startSide":"RIGHT","subjectType":"LINE"}"#,
         )
         .unwrap();
         assert!(check(&a).is_ok());
