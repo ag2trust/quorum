@@ -4,6 +4,8 @@
 //! 1. Kill all stale process groups (from journal PIDs)
 //! 2. Reconstruct validated dormant review/merge-wait/rework Codex workers in place
 //!    and retire rows transferred to fresh-retry/graph-block authority
+//!    then reconcile pending-review publication slots before any reviewer is
+//!    provisioned or any orphan draft cleanup is claimed
 //! 3. Delete stale/retired journal entries and GC only non-recovered worktrees
 //! 4. Scan non-terminal tasks and reset them to states the normal tick
 //!    loop can handle:
@@ -822,6 +824,33 @@ fn remove_journaled_decomposition_views(entries: &[JournalEntry]) {
     }
 }
 
+/// Startup half of the pending-review barrier (task #451). A `probing` or
+/// `cleanup_running` slot left by the previous daemon becomes
+/// reconciliation-required (claim fenced; marker, review ID, cycle count, and
+/// deadline retained), and every `owned` slot whose attempt's run died with
+/// that daemon becomes `cleanup_required`. Nothing is deleted or released
+/// here: the cleanup driver re-reads remote state first. Only after this
+/// commits may the barrier or the driver claim a slot.
+pub(crate) async fn reconcile_review_publication_slots(config: &ServeConfig) -> Result<()> {
+    let Some(publication) = config.review_publication.as_ref() else {
+        return Ok(());
+    };
+    let path = config.db_path.clone();
+    let changed = tokio::task::spawn_blocking(move || -> Result<usize> {
+        let mut conn = quorum_core::db::open(&path)?;
+        quorum_core::review_publication_slots::reconcile_on_start(&mut conn, super::now_unix())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("publication slot reconcile join: {error}")))??;
+    if changed > 0 {
+        log(&format!(
+            "recovery: {changed} pending-review publication slot(s) need remote reconciliation"
+        ));
+    }
+    publication.mark_startup_reconciled();
+    Ok(())
+}
+
 pub(crate) async fn recover(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -992,6 +1021,11 @@ pub(crate) async fn recover(
             ));
         }
     }
+
+    // ── Phase 1c: Reconcile pending-review publication slots ───────────
+    // After the previous daemon's capabilities are revoked and before any
+    // reviewer can be provisioned or any cleanup claimed.
+    reconcile_review_publication_slots(config).await?;
 
     // ── Phase 2: Delete stale journal entries, retaining dormant rows ───
     {
@@ -1448,6 +1482,7 @@ mod tests {
             pr_target_program: None,
             max_active_graphs: 2,
             agent_mcp_url: Some("http://127.0.0.1:9/mcp".into()),
+            review_publication: None,
         }
     }
 

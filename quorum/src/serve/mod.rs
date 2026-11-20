@@ -31,6 +31,7 @@ pub mod recovery;
 pub mod render;
 pub mod repository_service;
 pub mod rereview_builder;
+pub mod review_cleanup;
 pub mod review_cycle_context;
 pub mod review_ledger;
 pub mod reviewer;
@@ -1149,6 +1150,13 @@ enum ReviewerProvisionOutcome {
     /// provider/profile-unavailable classification. No reviewer name,
     /// worktree, run, or process was created; retry once a cooldown expires.
     ProfilesCoolingDown,
+    /// The PR's pending-review publication slot is held by cleanup, backoff,
+    /// or a live owner. Nothing was allocated or charged; retry later.
+    PublicationSlotWait,
+    /// The PR's pending-review publication slot is blocked (foreign or
+    /// ambiguous draft, or bounded recovery exhausted). No reviewer may be
+    /// provisioned; the caller parks the task through the durable path.
+    PublicationSlotBlocked(String),
 }
 
 /// The R1 terminal telemetry for an attempted mandatory-R2 handoff. These
@@ -1184,7 +1192,9 @@ fn r2_provision_disposition(
             ReviewerProvisionOutcome::Unavailable
             | ReviewerProvisionOutcome::HeadMoved { .. }
             | ReviewerProvisionOutcome::Deferred
-            | ReviewerProvisionOutcome::ProfilesCoolingDown,
+            | ReviewerProvisionOutcome::ProfilesCoolingDown
+            | ReviewerProvisionOutcome::PublicationSlotWait
+            | ReviewerProvisionOutcome::PublicationSlotBlocked(_),
         ) => R2ProvisionDisposition::Unavailable,
         Ok(ReviewerProvisionOutcome::Failed(_)) => R2ProvisionDisposition::Error,
         Err(_) => R2ProvisionDisposition::Error,
@@ -4989,6 +4999,11 @@ pub struct ServeConfig {
     /// sets it only after the listener is bound; `tick_loop`, which makes
     /// every managed launch, refuses to start while it is `None`.
     pub agent_mcp_url: Option<String>,
+    /// Daemon-owned pending-review publication barrier and cleanup driver.
+    /// `run_serve` sets it with the agent MCP listener; `None` (tests, or an
+    /// invalid configured repository) provisions reviewers without slot
+    /// ownership, so they can never publish a pending review.
+    pub review_publication: Option<Arc<review_cleanup::ReviewPublication>>,
 }
 
 impl ServeConfig {
@@ -5075,6 +5090,7 @@ pub fn run_serve(
                 listener.local_addr()
             ));
             config.agent_mcp_url = Some(url);
+            config.review_publication = review_cleanup::ReviewPublication::from_config(&config);
             serve_with_agent_mcp(&rt, &config, listener, daemon_pid, &daemon_instance)
         }
     };
@@ -5186,6 +5202,15 @@ fn serve_with_agent_mcp(
         // daemon_lock acquired above makes it the only executor on this DB.
         let outbox_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let outbox = start_github_outbox(config, outbox_shutdown.clone());
+        // The pending-review cleanup driver. It claims nothing until crash
+        // recovery has reconciled publication slots.
+        let cleanup_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup = config.review_publication.clone().map(|publication| {
+            tokio::spawn(publication.run_cleanup(
+                cleanup_shutdown.clone(),
+                review_cleanup::CLEANUP_POLL_INTERVAL,
+            ))
+        });
         let result = tick_loop(
             config,
             daemon_pid,
@@ -5202,6 +5227,21 @@ fn serve_with_agent_mcp(
         // Flag only: the executor stops claiming and drains in-flight work
         // within its bounded grace; leftovers reconcile on the next start.
         outbox_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Flag only: the driver stops claiming and stops its current claim
+        // before the next remote call. Past the grace it is aborted, which
+        // kills and reaps an in-flight `gh` child; the slot stays claimed
+        // for startup reconciliation and lifecycle is untouched.
+        cleanup_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(mut cleanup) = cleanup {
+            if tokio::time::timeout(review_cleanup::CLEANUP_SHUTDOWN_GRACE, &mut cleanup)
+                .await
+                .is_err()
+            {
+                log("review cleanup: shutdown grace elapsed; aborting the in-flight cycle");
+                cleanup.abort();
+                let _ = cleanup.await;
+            }
+        }
         if let Some(outbox) = outbox {
             match outbox.await {
                 Ok(Ok(())) => {}
@@ -19168,7 +19208,9 @@ async fn tick(
                         ReviewerProvisionOutcome::Unavailable
                         | ReviewerProvisionOutcome::Failed(_)
                         | ReviewerProvisionOutcome::Deferred
-                        | ReviewerProvisionOutcome::ProfilesCoolingDown => {}
+                        | ReviewerProvisionOutcome::ProfilesCoolingDown
+                        | ReviewerProvisionOutcome::PublicationSlotWait
+                        | ReviewerProvisionOutcome::PublicationSlotBlocked(_) => {}
                     }
                 }
                 Err(e) => {
@@ -19631,7 +19673,9 @@ async fn tick(
                         ReviewerProvisionOutcome::Unavailable
                         | ReviewerProvisionOutcome::Failed(_)
                         | ReviewerProvisionOutcome::Deferred
-                        | ReviewerProvisionOutcome::ProfilesCoolingDown => {}
+                        | ReviewerProvisionOutcome::ProfilesCoolingDown
+                        | ReviewerProvisionOutcome::PublicationSlotWait
+                        | ReviewerProvisionOutcome::PublicationSlotBlocked(_) => {}
                     }
                 }
                 Err(e) => {
@@ -24504,6 +24548,7 @@ async fn provision_reviewer(
         return Ok(ReviewerProvisionOutcome::Unavailable);
     }
     let task_id = worker.task_id;
+    let mut publication_probe = None;
     let result = provision_reviewer_reserved(
         config,
         wt_mgr,
@@ -24519,8 +24564,16 @@ async fn provision_reviewer(
         head_sha,
         recover_interrupted,
         &reservation,
+        &mut publication_probe,
     )
     .await;
+    // A provision that cleared the pending-review barrier but never bound
+    // its reviewer gives the never-owned probe slot back for a fresh probe.
+    if let (Some(claim), Some(publication)) =
+        (publication_probe.take(), config.review_publication.as_ref())
+    {
+        publication.abandon(claim).await;
+    }
     let path = config.db_path.clone();
     let release = tokio::task::spawn_blocking(move || -> Result<bool> {
         let mut conn = quorum_core::db::open(&path)?;
@@ -24532,6 +24585,21 @@ async fn provision_reviewer(
         return Err(QuorumError::Io(format!(
             "reviewer reservation release lost token authority for task #{task_id}"
         )));
+    }
+    // A blocked publication slot never provisions a reviewer: the task waits
+    // on the existing durable parking path. Cleanup itself never parks,
+    // transitions, or charges anything.
+    if let Ok(ReviewerProvisionOutcome::PublicationSlotBlocked(reason)) = &result {
+        park_task_result(
+            &config.db_path,
+            task_id,
+            &format!(
+                "{} reviewer for PR #{pr} not provisioned: {reason}",
+                role.as_str().to_uppercase()
+            ),
+            "in-review",
+        )
+        .await?;
     }
     result
 }
@@ -24552,6 +24620,7 @@ async fn provision_reviewer_reserved(
     head_sha: &str,
     recover_interrupted: bool,
     reservation: &str,
+    publication_probe: &mut Option<quorum_core::review_publication_slots::ProbeClaim>,
 ) -> Result<ReviewerProvisionOutcome> {
     // The check result is meaningful only for the exact PR head that was
     // gated. Re-resolve through the configured executor immediately before
@@ -24738,6 +24807,29 @@ async fn provision_reviewer_reserved(
             return Ok(ReviewerProvisionOutcome::ProfilesCoolingDown);
         }
     };
+    // Pending-review publication barrier (first review, re-review, R1, R2,
+    // and restart recovery alike): no reviewer resource exists until the
+    // PR's publication slot is probed and the publisher has no pending draft.
+    if let Some(publication) = config.review_publication.as_ref() {
+        match publication
+            .probe_before_provision(worker.task_id, pr)
+            .await?
+        {
+            review_cleanup::Barrier::Clear(claim) => *publication_probe = Some(claim),
+            // Logged by the barrier once per distinct reason.
+            review_cleanup::Barrier::Wait(_) => {
+                return Ok(ReviewerProvisionOutcome::PublicationSlotWait);
+            }
+            review_cleanup::Barrier::Blocked(reason) => {
+                log(&format!(
+                    "{}: task #{} PR #{pr} reviewer not provisioned: {reason}",
+                    role.as_str().to_uppercase(),
+                    worker.task_id
+                ));
+                return Ok(ReviewerProvisionOutcome::PublicationSlotBlocked(reason));
+            }
+        }
+    }
     let reviewer_name = if let Some(recovery) = &recovery {
         // Restart recovery deliberately reuses the interrupted reviewer's
         // durable identity. Normal provisioning below excludes every prior
@@ -25372,6 +25464,21 @@ async fn provision_reviewer_reserved(
         }
     }
 
+    // The reviewer run is live: issue its collaboration attempt and make it
+    // the owner of the probed publication slot in one transaction, before
+    // the process can make its first collaboration call.
+    if let (Some(claim), Some(publication)) =
+        (publication_probe.take(), config.review_publication.as_ref())
+    {
+        if let Err(error) = publication.bind(claim, &cap_run_id).await {
+            log(&format!(
+                "{}: task #{} PR #{pr} publication slot bind failed: {error}; \
+                 the reviewer cannot publish a pending review",
+                role.as_str().to_uppercase(),
+                worker.task_id
+            ));
+        }
+    }
     let reviewer_env = managed_run_environment(config, &reviewer_name, Some(cap_run_id.as_str()));
     let reviewer_agent_bin = agent_bin_for_kind(config, reviewer_kind);
     let continuation_id = runner_continuation_id(
@@ -33988,6 +34095,7 @@ mod tests {
             pr_target_program: None,
             max_active_graphs: 2,
             agent_mcp_url: Some("http://127.0.0.1:9/mcp".into()),
+            review_publication: None,
         }
     }
 
@@ -37074,6 +37182,7 @@ mod tests {
             pr_target_program: None,
             max_active_graphs: 2,
             agent_mcp_url: Some("http://127.0.0.1:9/mcp".into()),
+            review_publication: None,
         }
     }
 
@@ -47988,6 +48097,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             pr_target_program: None,
             max_active_graphs: 2,
             agent_mcp_url: Some("http://127.0.0.1:9/mcp".into()),
+            review_publication: None,
         }
     }
 

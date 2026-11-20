@@ -1031,14 +1031,28 @@ pub fn ensure_run_attempt(
         ));
     }
     let tx = begin_immediate(conn)?;
+    let result = ensure_run_attempt_in_tx(&tx, run_id, role, new_attempt_id, retention_secs, now)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+/// The body of [`ensure_run_attempt`] inside the caller's `BEGIN IMMEDIATE`.
+/// The caller commits (or rolls back) whatever this returns.
+fn ensure_run_attempt_in_tx(
+    tx: &Transaction<'_>,
+    run_id: &RunCapabilityId,
+    role: CollaborationRole,
+    new_attempt_id: &CollaborationAttemptId,
+    retention_secs: i64,
+    now: i64,
+) -> Result<RunAttemptResolution> {
     let authority = match capabilities::resolve_live_collaboration_context_for_admission(
-        &tx,
+        tx,
         run_id.as_str(),
         role.as_str(),
     )? {
         LiveCollaborationContextResolution::Live(context) => *context,
         LiveCollaborationContextResolution::Rejected => {
-            tx.commit()?;
             return Ok(RunAttemptResolution::Rejected(
                 CollaborationAdmissionError::CapabilityRejected,
             ));
@@ -1046,7 +1060,6 @@ pub fn ensure_run_attempt(
     };
     let run = &authority.run;
     let Some(pr_number) = run.pr.filter(|pr| *pr > 0) else {
-        tx.commit()?;
         return Ok(RunAttemptResolution::Rejected(
             CollaborationAdmissionError::InvalidField {
                 field: CollaborationAdmissionField::PrNumber,
@@ -1057,7 +1070,6 @@ pub fn ensure_run_attempt(
         CollaborationRole::Reviewer => match run.review_revision.clone() {
             Some(sha) => Some(ReviewerHeadSha::new(sha)?),
             None => {
-                tx.commit()?;
                 return Ok(RunAttemptResolution::Rejected(
                     CollaborationAdmissionError::InvalidField {
                         field: CollaborationAdmissionField::ReviewerHeadSha,
@@ -1078,7 +1090,7 @@ pub fn ensure_run_attempt(
         .optional()?
         .map(|attempt_id| {
             let id = CollaborationAttemptId::new(attempt_id.clone())?;
-            Ok::<_, QuorumError>(get_attempt(&tx, &id)?.map(|stored| (attempt_id, stored)))
+            Ok::<_, QuorumError>(get_attempt(tx, &id)?.map(|stored| (attempt_id, stored)))
         })
         .transpose()?
         .flatten();
@@ -1091,7 +1103,7 @@ pub fn ensure_run_attempt(
             && stored.head_sha.as_deref()
                 == reviewer_head_sha.as_ref().map(ReviewerHeadSha::as_str)
             && stored.lifecycle_generation == authority.lifecycle_generation;
-        let result = if current {
+        return Ok(if current {
             RunAttemptResolution::Bound(CollaborationAttemptStatus {
                 attempt_id: CollaborationAttemptId::new(attempt_id)?,
                 state: stored.state,
@@ -1100,14 +1112,12 @@ pub fn ensure_run_attempt(
             })
         } else {
             RunAttemptResolution::Rejected(CollaborationAdmissionError::AttemptBindingMismatch)
-        };
-        tx.commit()?;
-        return Ok(result);
+        });
     }
 
     // Terminalize every dead run's binding before capacity is counted, so a
     // replacement run is never blocked by an attempt nobody can use again.
-    revoke_dead_run_attempts(&tx, now, UNBOUNDED_GROUP_SWEEP)?;
+    revoke_dead_run_attempts(tx, now, UNBOUNDED_GROUP_SWEEP)?;
 
     let request = CreateCollaborationAttemptRequest::new(
         new_attempt_id.clone(),
@@ -1121,7 +1131,7 @@ pub fn ensure_run_attempt(
         now,
         now.saturating_add(retention_secs),
     )?;
-    let result = match insert_attempt_in_tx(&tx, &request, &authority, now)? {
+    Ok(match insert_attempt_in_tx(tx, &request, &authority, now)? {
         CollaborationAttemptAdmissionResult::Created(status)
         | CollaborationAttemptAdmissionResult::Existing(status) => {
             RunAttemptResolution::Bound(status)
@@ -1129,9 +1139,69 @@ pub fn ensure_run_attempt(
         CollaborationAttemptAdmissionResult::Rejected(rejection) => {
             RunAttemptResolution::Rejected(rejection)
         }
+    })
+}
+
+/// Closed outcome of [`bind_reviewer_run_to_probed_slot`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReviewerSlotBinding {
+    /// The reviewer attempt exists and owns the publication slot.
+    Owned(CollaborationAttemptStatus),
+    /// No attempt could be resolved for the run; nothing was written.
+    AttemptRejected(CollaborationAdmissionError),
+    /// The probe could not grant ownership (claim lost or attempt
+    /// ineligible); nothing was written and the probe claim is unchanged.
+    SlotRejected(crate::review_publication_slots::ProbeOutcome),
+}
+
+/// The spec's empty-probe disposition for a provisioned reviewer: resolve
+/// (issuing when absent) the live reviewer run's collaboration attempt and
+/// change the probed slot to `owned` by it in one `BEGIN IMMEDIATE`. The
+/// caller has already committed `claim` and observed an empty pending-review
+/// listing outside any transaction. Either both rows change or neither does:
+/// any non-`Owned` result rolls the transaction back.
+pub fn bind_reviewer_run_to_probed_slot(
+    conn: &mut Connection,
+    run_id: &RunCapabilityId,
+    new_attempt_id: &CollaborationAttemptId,
+    retention_secs: i64,
+    claim: &crate::review_publication_slots::ProbeClaim,
+    now: i64,
+) -> Result<ReviewerSlotBinding> {
+    use crate::review_publication_slots::{self as slots, ProbeOutcome, ProbeResult};
+    if now < 0 || retention_secs <= 0 {
+        return Err(QuorumError::Usage(
+            "collaboration attempt resolution bounds are invalid".into(),
+        ));
+    }
+    let tx = begin_immediate(conn)?;
+    let status = match ensure_run_attempt_in_tx(
+        &tx,
+        run_id,
+        CollaborationRole::Reviewer,
+        new_attempt_id,
+        retention_secs,
+        now,
+    )? {
+        RunAttemptResolution::Bound(status) => status,
+        RunAttemptResolution::Rejected(rejection) => {
+            return Ok(ReviewerSlotBinding::AttemptRejected(rejection));
+        }
     };
+    let outcome = slots::resolve_probe_in_tx(
+        &tx,
+        claim,
+        ProbeResult::Empty {
+            new_attempt_id: status.attempt_id.as_str(),
+        },
+        now,
+    )?;
+    if !matches!(outcome, ProbeOutcome::Owned(_)) {
+        return Ok(ReviewerSlotBinding::SlotRejected(outcome));
+    }
     tx.commit()?;
-    Ok(result)
+    Ok(ReviewerSlotBinding::Owned(status))
 }
 
 /// Adopt an interrupted attempt only for a freshly issued live capability that

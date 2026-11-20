@@ -1897,6 +1897,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 max_active_graphs: r_max_active_graphs,
                 // Set by `run_serve` once the agent MCP listener is bound.
                 agent_mcp_url: None,
+                review_publication: None,
             };
             Ok(serve::run_serve(config, agent_mcp)?)
         }
