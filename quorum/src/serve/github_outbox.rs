@@ -116,8 +116,8 @@ impl OutboxExecutor {
         .await?;
         if report != github_operations::ReconcileReport::default() {
             log(&format!(
-                "github outbox: startup reconciliation requeued={} ambiguous={} failed={}",
-                report.requeued, report.ambiguous, report.failed
+                "github outbox: startup reconciliation requeued={} ambiguous={} failed={} slots={}",
+                report.requeued, report.ambiguous, report.failed, report.slots
             ));
         }
 

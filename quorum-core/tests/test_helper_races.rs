@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use support::protocol::{
     AcquireDaemonLockInput, AllocateRoleInput, Barrier, ClaimCleanupInput,
-    ClaimGithubOperationInput, ClaimProviderRetryReworkInput, DiscardRunnerRetryInput, Operation,
-    PendingTurnInput, RetryProviderBlockedInput, EXIT_NEGATIVE, EXIT_SUCCESS,
+    ClaimGithubOperationInput, ClaimProviderRetryReworkInput, ClaimReviewCleanupInput,
+    DiscardRunnerRetryInput, Operation, PendingTurnInput, ProbeReviewSlotInput,
+    RetryProviderBlockedInput, EXIT_NEGATIVE, EXIT_SUCCESS,
 };
 
 const BARRIER_TIMEOUT_MS: u64 = 30_000;
@@ -369,6 +370,8 @@ fn stress_repeats_real_process_helper_races() {
     real_process_allocations_are_atomic(3, 8);
     real_process_cleanup_claim_has_exactly_one_winner(8);
     real_process_github_operation_claim_has_exactly_one_winner(20, 8);
+    real_process_review_create_claim_races_cleanup(40, 8);
+    real_process_review_slot_probe_is_unique(20, 8);
 }
 
 fn seed_github_operation(conn: &mut rusqlite::Connection) {
@@ -484,6 +487,295 @@ fn real_process_github_operation_claim_has_exactly_one_winner(iterations: usize,
 #[test]
 fn real_process_github_operation_claim_smoke_has_exactly_one_winner() {
     real_process_github_operation_claim_has_exactly_one_winner(2, 4);
+}
+
+/// One reviewer attempt owning the `(scope-1, PR 7)` slot with its queued
+/// pending-review create (review sequence 0).
+fn seed_owned_review_create(conn: &mut rusqlite::Connection) {
+    conn.execute_batch(
+        "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+         VALUES (1,'src','in-review','owner',1,1);
+         INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+         VALUES ('run-1',1,'Reviewer','reviewer',1);
+         INSERT INTO github_collaboration_attempts(
+             attempt_id,task_id,agent,role,pr_number,head_sha,lifecycle_generation,
+             active_run_id,review_owner_marker,state,created_at,updated_at,expires_at
+         ) VALUES ('att-1',1,'Reviewer','reviewer',7,'sha-1',3,'run-1','marker-1','active',
+                   1,1,999);
+         INSERT INTO github_review_publication_slots(
+             publisher_scope,pr_number,task_id,attempt_id,state,review_owner_marker,
+             created_at,updated_at
+         ) VALUES ('scope-1',7,1,'att-1','owned','marker-1',1,1);",
+    )
+    .unwrap();
+    let request = quorum_core::github_operations::NewGithubOperation {
+        operation_id: "op-create",
+        client_request_id: "req-create",
+        attempt_id: "att-1",
+        created_by_run_id: "run-1",
+        task_id: 1,
+        agent: "Reviewer",
+        role: "reviewer",
+        pr_number: 7,
+        head_sha: Some("sha-1"),
+        reviewer_launch_sha: Some("sha-1"),
+        lifecycle_generation: Some(3),
+        kind: "pull_request_review_write",
+        request_json: r#"{"method":"create"}"#,
+        deadline_at: 500,
+        review_sequence: Some(0),
+        group_key: None,
+        github_marker: None,
+        created_at: 1,
+        expires_at: 999,
+    };
+    assert!(quorum_core::github_operations::enqueue(conn, &request).unwrap());
+}
+
+/// Cross-process pending-review create claim vs cleanup canary. Half the
+/// racers run the outbox claim (claim + start + settle), half move the owned
+/// slot to `cleanup_required` and try to claim cleanup. Whichever transaction
+/// wins, the create is sent at most once, only after `ambiguous` was persisted
+/// on both coupled rows, and a cleanup claim that won first cancels it unsent.
+fn real_process_review_create_claim_races_cleanup(iterations: usize, racers: usize) {
+    const NOW: i64 = 100;
+    let mut create_first = 0;
+    let mut cleanup_first = 0;
+    for iteration in 0..iterations {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(format!("quorum-{iteration}.db"));
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        seed_owned_review_create(&mut conn);
+        drop(conn);
+
+        let go_path = dir.path().join("go");
+        let ready_paths = (0..racers)
+            .map(|index| dir.path().join(format!("ready-{index}")))
+            .collect::<Vec<_>>();
+        let helpers = ready_paths
+            .iter()
+            .enumerate()
+            .map(|(index, ready_path)| {
+                let barrier = barrier(ready_path.clone(), &go_path);
+                // Alternate sides, and alternate which side spawns first.
+                if (index + iteration) % 2 == 0 {
+                    support::spawn(
+                        Operation::ClaimGithubOp,
+                        &ClaimGithubOperationInput {
+                            db_path: db_path.clone(),
+                            now: NOW,
+                            barrier,
+                        },
+                    )
+                } else {
+                    support::spawn(
+                        Operation::ClaimReviewCleanup,
+                        &ClaimReviewCleanupInput {
+                            db_path: db_path.clone(),
+                            attempt_id: "att-1".into(),
+                            now: NOW,
+                            barrier,
+                        },
+                    )
+                }
+                .map(|helper| ((index + iteration) % 2 == 0, helper))
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        release_when_ready(&ready_paths, &go_path);
+        let outputs = helpers
+            .into_iter()
+            .map(|(is_create, helper)| (is_create, helper.wait(PARENT_TIMEOUT).unwrap()))
+            .collect::<Vec<_>>();
+        assert!(
+            outputs.iter().all(|(_, output)| output.stderr.is_empty()
+                && matches!(output.status.code(), Some(EXIT_SUCCESS | EXIT_NEGATIVE))),
+            "iteration {iteration}: {outputs:?}"
+        );
+        let create_wins = outputs
+            .iter()
+            .filter(|(is_create, output)| *is_create && output.status.code() == Some(EXIT_SUCCESS))
+            .collect::<Vec<_>>();
+        let cleanup_wins = outputs
+            .iter()
+            .filter(|(is_create, output)| !*is_create && output.status.code() == Some(EXIT_SUCCESS))
+            .count();
+        let transitions = outputs
+            .iter()
+            .filter(|(is_create, output)| !*is_create && output.json()["transitioned"] == true)
+            .count();
+        assert!(create_wins.len() <= 1, "iteration {iteration}: {outputs:?}");
+        assert!(cleanup_wins <= 1, "iteration {iteration}: {outputs:?}");
+        assert_eq!(transitions, 1, "iteration {iteration}: {outputs:?}");
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let create = quorum_core::github_operations::get_by_operation_id(&conn, "op-create")
+            .unwrap()
+            .unwrap();
+        let (slot_state, slot_send): (String, String) = conn
+            .query_row(
+                "SELECT state, create_send_state FROM github_review_publication_slots
+                 WHERE publisher_scope='scope-1' AND pr_number=7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(create.attempts <= 1, "iteration {iteration}");
+        assert!(!create.active, "iteration {iteration}");
+        // The coupled state machine agrees after every interleaving.
+        assert_eq!(create.send_state, slot_send, "iteration {iteration}");
+        match create_wins.first() {
+            Some((_, winner)) => {
+                create_first += 1;
+                let winner = winner.json();
+                assert_eq!(create.attempts, 1);
+                if winner["started"] == true {
+                    // Sent: ambiguity was persisted before I/O and confirmed.
+                    assert_eq!(winner["settled"], true);
+                    assert_eq!(
+                        (create.state.as_str(), create.send_state.as_str()),
+                        ("succeeded", "confirmed")
+                    );
+                    assert!(create.execution_started_at.is_some());
+                } else {
+                    // Cleanup won between claim and start: never sent.
+                    assert_eq!(
+                        (create.state.as_str(), create.send_state.as_str()),
+                        ("cancelled", "definitely_unsent")
+                    );
+                    assert!(create.execution_started_at.is_none());
+                }
+                assert_ne!(slot_state, "owned", "iteration {iteration}");
+            }
+            None => {
+                cleanup_first += 1;
+                // Cleanup won the transaction race: the create was refused and
+                // cancelled while provably unsent.
+                assert_eq!(create.attempts, 0, "iteration {iteration}");
+                assert_eq!(
+                    (create.state.as_str(), create.send_state.as_str()),
+                    ("cancelled", "not_started"),
+                    "iteration {iteration}"
+                );
+                assert!(create.execution_started_at.is_none());
+                assert_eq!(cleanup_wins, 1, "iteration {iteration}: {outputs:?}");
+                assert_eq!(slot_state, "cleanup_running");
+            }
+        }
+        assert_eq!(count(&conn, "errors"), 0);
+    }
+    eprintln!(
+        "review create/cleanup race: create_first={create_first} cleanup_first={cleanup_first}"
+    );
+}
+
+#[test]
+fn real_process_review_create_claim_smoke_races_cleanup() {
+    real_process_review_create_claim_races_cleanup(6, 4);
+}
+
+/// Cross-process pending-review slot uniqueness canary. Same-scope racers
+/// contend on `PRIMARY KEY(publisher_scope, pr_number)`: exactly one probe
+/// claims and owns. Distinct-scope racers each claim their own slot but
+/// contend on one attempt: `UNIQUE(attempt_id)` lets exactly one own it.
+fn real_process_review_slot_probe_is_unique(iterations: usize, racers: usize) {
+    const NOW: i64 = 100;
+    for iteration in 0..iterations {
+        for same_scope in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join(format!("quorum-{iteration}.db"));
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at)
+                 VALUES (1,'src','in-review','owner',1,1);
+                 INSERT INTO run_capabilities(run_id,task_id,agent,role,created_at)
+                 VALUES ('run-1',1,'Reviewer','reviewer',1);
+                 INSERT INTO github_collaboration_attempts(
+                     attempt_id,task_id,agent,role,pr_number,head_sha,lifecycle_generation,
+                     active_run_id,state,created_at,updated_at,expires_at
+                 ) VALUES ('att-1',1,'Reviewer','reviewer',7,'sha-1',3,'run-1','active',
+                           1,1,999);",
+            )
+            .unwrap();
+            drop(conn);
+            let go_path = dir.path().join("go");
+            let ready_paths = (0..racers)
+                .map(|index| dir.path().join(format!("ready-{index}")))
+                .collect::<Vec<_>>();
+            let helpers = ready_paths
+                .iter()
+                .enumerate()
+                .map(|(index, ready_path)| {
+                    support::spawn(
+                        Operation::ProbeReviewSlot,
+                        &ProbeReviewSlotInput {
+                            db_path: db_path.clone(),
+                            publisher_scope: if same_scope {
+                                "scope".into()
+                            } else {
+                                format!("scope-{index}")
+                            },
+                            attempt_id: "att-1".into(),
+                            now: NOW,
+                            barrier: barrier(ready_path.clone(), &go_path),
+                        },
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            release_when_ready(&ready_paths, &go_path);
+            let outputs = helpers
+                .into_iter()
+                .map(|helper| helper.wait(PARENT_TIMEOUT).unwrap())
+                .collect::<Vec<_>>();
+            let context = format!("iteration {iteration} same_scope={same_scope}: {outputs:?}");
+            assert!(
+                outputs.iter().all(|output| output.stderr.is_empty()),
+                "{context}"
+            );
+            let owners = outputs
+                .iter()
+                .filter(|output| output.status.code() == Some(EXIT_SUCCESS))
+                .count();
+            let claimed = outputs
+                .iter()
+                .filter(|output| output.json()["claimed"] == true)
+                .count();
+            assert_eq!(owners, 1, "{context}");
+            assert_eq!(
+                outputs
+                    .iter()
+                    .filter(|output| output.status.code() == Some(EXIT_NEGATIVE))
+                    .count(),
+                racers - 1,
+                "{context}"
+            );
+            assert_eq!(claimed, if same_scope { 1 } else { racers }, "{context}");
+
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let owned: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM github_review_publication_slots
+                     WHERE state='owned' AND attempt_id='att-1'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(owned, 1, "{context}");
+            assert_eq!(
+                count(&conn, "github_review_publication_slots"),
+                if same_scope { 1 } else { racers as i64 },
+                "{context}"
+            );
+            assert_eq!(count(&conn, "errors"), 0);
+        }
+    }
+}
+
+#[test]
+fn real_process_review_slot_probe_smoke_is_unique() {
+    real_process_review_slot_probe_is_unique(2, 4);
 }
 
 /// Cross-process daemon-lock canary. Each round has `racers` distinct OS
