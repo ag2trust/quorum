@@ -5,6 +5,7 @@
 //! ACP server internals, infer the runner from an executable name, or emulate
 //! Claude/Codex flags.
 
+use super::proctree;
 use super::runner::{
     capture_diagnostics, gated_command, tool_summary, ActivityKind, AdapterConfig, AgentEvent,
     AgentKind, AgentMcpServer, CapturedOutput, DiagnosticBuffer, FailureDisposition,
@@ -1119,6 +1120,9 @@ pub struct GrokProc {
     // A successful wait releases the pid namespace entry. Do not signal that
     // numeric process group again after it could have been recycled.
     process_group_reaped: bool,
+    // Per-spawn tree marker: reaches descendants that left the process group
+    // (`setsid`/`setpgid`). Signalled with SIGKILL alongside the group.
+    tree: proctree::TreeHandle,
     #[cfg(test)]
     killpg_calls: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     reader: BoundedStdout,
@@ -1258,6 +1262,8 @@ impl GrokProc {
                 Ok(())
             });
         }
+        // After every env_remove/strip above, which would drop the marker.
+        let mut tree = proctree::apply(&mut command);
 
         let mut child = command.spawn()?;
         // `Child::id()` becomes `None` after `try_wait()` observes leader
@@ -1267,6 +1273,7 @@ impl GrokProc {
             .id()
             .ok_or_else(|| std::io::Error::other("spawned Grok process has no process-group ID"))?
             as libc::pid_t;
+        tree.bind_leader(process_group_id as u32);
         let reader = BoundedStdout::new(child.stdout.take().expect("stdout was piped"));
         let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Grok);
         let failures = diagnostics.failures();
@@ -1278,6 +1285,7 @@ impl GrokProc {
             child,
             process_group_id,
             process_group_reaped: false,
+            tree,
             #[cfg(test)]
             killpg_calls: None,
             reader,
@@ -1335,12 +1343,15 @@ impl GrokProc {
                 Ok(())
             });
         }
+        // After every env_remove/strip above, which would drop the marker.
+        let mut tree = proctree::apply(&mut command);
 
         let mut child = command.spawn()?;
         let process_group_id = child
             .id()
             .ok_or_else(|| std::io::Error::other("spawned Grok process has no process-group ID"))?
             as libc::pid_t;
+        tree.bind_leader(process_group_id as u32);
         let reader = BoundedStdout::new(child.stdout.take().expect("stdout was piped"));
         let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Grok);
         let failures = diagnostics.failures();
@@ -1354,6 +1365,7 @@ impl GrokProc {
                 child,
                 process_group_id,
                 process_group_reaped: false,
+                tree,
                 #[cfg(test)]
                 killpg_calls: None,
                 reader,
@@ -1643,9 +1655,10 @@ impl GrokProc {
         if let Some(calls) = &self.killpg_calls {
             calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        unsafe {
-            libc::killpg(self.process_group_id, libc::SIGKILL);
-        }
+        // Immediate, synchronous SIGKILL to the spawn-time group (unless its
+        // leader was reaped and the numeric pgid could be recycled) and to
+        // every marked descendant. Never sleeps, so Drop may call it.
+        proctree::kill_tree_now(&self.tree, !self.process_group_reaped);
     }
 
     #[cfg(test)]
@@ -1671,6 +1684,13 @@ impl GrokProc {
         if self.child.wait().await.is_ok() {
             self.process_group_reaped = true;
         }
+        // Bounded post-SIGKILL wait for marked descendants (a timeout is
+        // logged by proctree) so they cannot hold the pipes drained below.
+        let _ = proctree::reap_tree(
+            &self.tree,
+            tokio::time::Instant::now() + proctree::TREE_REAP_TIMEOUT,
+        )
+        .await;
 
         let mut terminal = VecDeque::new();
         let mut dropped = 0usize;
@@ -2667,8 +2687,10 @@ mod tests {
                 Ok(())
             });
         }
+        let mut tree = proctree::apply(&mut command);
         let mut child = command.spawn().unwrap();
         let process_group_id = child.id().unwrap() as libc::pid_t;
+        tree.bind_leader(process_group_id as u32);
         let reader = BoundedStdout::new(child.stdout.take().unwrap());
         let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Grok);
         let failures = diagnostics.failures();
@@ -2680,6 +2702,7 @@ mod tests {
             child,
             process_group_id,
             process_group_reaped: false,
+            tree,
             killpg_calls: None,
             reader,
             diagnostics,
@@ -2890,6 +2913,107 @@ mod tests {
             1,
             "Drop must not signal a process group after kill_and_reap reaped its leader"
         );
+    }
+
+    /// A GrokProc stub whose leader starts a grandchild in a new session (leaving
+    /// the leader's process group while inheriting stdout), records its pid in
+    /// `pidfile`, then sleeps. Returns the proc and the grandchild pid.
+    async fn setsid_tree_proc(pidfile: &std::path::Path) -> (GrokProc, i32) {
+        let path = pidfile.display().to_string();
+        assert!(!path.contains('\''), "pidfile path must be shell-quotable");
+        let mut proc = shell_proc(&format!(
+            r#"inner='echo $$ > "$1.tmp" && mv "$1.tmp" "$1"; exec sleep 300'
+if command -v setsid >/dev/null 2>&1; then
+  setsid sh -c "$inner" sh '{path}' &
+else
+  perl -MPOSIX -e 'POSIX::setsid() or die; exec @ARGV' sh -c "$inner" sh '{path}' &
+fi
+exec sleep 300"#
+        ))
+        .await;
+        let start = std::time::Instant::now();
+        let grandchild = loop {
+            if let Some(pid) = std::fs::read_to_string(pidfile)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "grandchild pidfile never appeared"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            unsafe { libc::getsid(grandchild) },
+            grandchild,
+            "grandchild must lead its own session"
+        );
+        assert_ne!(unsafe { libc::getpgid(grandchild) }, proc.process_group_id);
+        assert!(proc.try_wait().unwrap().is_none());
+        (proc, grandchild)
+    }
+
+    fn pid_alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    async fn wait_esrch(pid: i32) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if unsafe { libc::kill(pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("pid {pid} survived the Grok tree kill"));
+    }
+
+    #[tokio::test]
+    async fn kill_and_reap_kills_setsid_grandchild_and_spares_other_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let (proc_a, grandchild_a) = setsid_tree_proc(&dir.path().join("a")).await;
+        let (mut proc_b, grandchild_b) = setsid_tree_proc(&dir.path().join("b")).await;
+        let leader_b = proc_b.pid().unwrap();
+
+        // The grandchild holds the stdout pipe, so the drain only finishes once
+        // the tree kill reached it.
+        tokio::time::timeout(std::time::Duration::from_secs(15), proc_a.kill_and_reap())
+            .await
+            .expect("kill_and_reap hung on a setsid grandchild holding stdout");
+        wait_esrch(grandchild_a).await;
+
+        assert!(pid_alive(grandchild_b), "another Grok tree was signalled");
+        assert!(pid_alive(leader_b), "another Grok leader was signalled");
+        assert!(proc_b.try_wait().unwrap().is_none());
+        assert!(pid_alive(unsafe { libc::getpid() }));
+
+        tokio::time::timeout(std::time::Duration::from_secs(15), proc_b.kill_and_reap())
+            .await
+            .expect("second tree teardown hung");
+        wait_esrch(grandchild_b).await;
+    }
+
+    #[tokio::test]
+    async fn drop_kills_setsid_grandchild() {
+        let dir = tempfile::tempdir().unwrap();
+        let (proc, grandchild) = setsid_tree_proc(&dir.path().join("g")).await;
+        let (other, other_grandchild) = setsid_tree_proc(&dir.path().join("o")).await;
+
+        drop(proc);
+
+        wait_esrch(grandchild).await;
+        assert!(
+            pid_alive(other_grandchild),
+            "Drop signalled another Grok tree"
+        );
+        drop(other);
+        wait_esrch(other_grandchild).await;
     }
 
     fn grok_available() -> bool {
