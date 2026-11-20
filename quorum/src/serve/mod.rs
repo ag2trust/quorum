@@ -5150,11 +5150,22 @@ fn serve_with_agent_mcp(
         // endpoint and the decomposition coordinator share this instance
         // instead of each holding their own.
         let writable_path_resolver = planner::WritablePathResolver::default();
+        // The pending-review tools and the reviewer verdict guard read the
+        // launch-SHA diff from the daemon's clone and the fresh PR head
+        // through the same daemon-owned Repository Service the outbox uses.
+        let review_evidence = Arc::new(agent_endpoint::RepositoryReviewEvidence::new(
+            &config.repo_dir,
+            &config.repo,
+            Arc::new(repository_service::GhRepositoryService::new(
+                config.merge_executor.publication_credentials(),
+            )),
+        ));
         let endpoint = agent_endpoint::AgentEndpoint::start(
             &config.db_path,
             &config.repo,
             &config.repo_dir,
             writable_path_resolver.clone(),
+            review_evidence,
         )
         .await?;
         let agent_mcp_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -71649,6 +71660,11 @@ exec /bin/cat '{stdout}'
             &config.repo,
             &config.repo_dir,
             coordinator.writable_path_resolver.clone(),
+            Arc::new(agent_endpoint::RepositoryReviewEvidence::new(
+                &config.repo_dir,
+                &config.repo,
+                Arc::new(repository_service::FakeRepositoryService::scripted([])),
+            )),
         )
         .await
         .unwrap();

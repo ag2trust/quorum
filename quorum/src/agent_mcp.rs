@@ -193,12 +193,25 @@ impl ProtocolOperation {
                 false,
             ),
             Self::PullRequestReviewWrite => (
-                "Create or submit the current reviewer's pending COMMENT review for the bound pull request.",
+                "Create or submit this reviewer run's one pending COMMENT review on the bound \
+                 pull request. method=create opens it for commitID, which must be exactly this \
+                 run's launch SHA; repeating create resumes the same review. method=submit_pending \
+                 publishes it with event=COMMENT and the complete Markdown review summary as \
+                 body; repeating it returns the same submit. Nothing else exists: APPROVE, \
+                 REQUEST_CHANGES, dismissal, deletion, and review IDs are rejected with typed \
+                 codes (review_event_unsupported, review_method_unsupported, \
+                 review_id_unsupported, review_commit_mismatch). The formal verdict is \
+                 submitted separately, only after this review is published.",
                 pending_review_schema(),
                 false,
             ),
             Self::AddCommentToPendingReview => (
-                "Add one validated inline Markdown finding to the current pending review.",
+                "Add one inline Markdown finding to this run's pending review (create it first). \
+                 The anchor (path, line, side, and optional startLine/startSide for a multi-line \
+                 range on the same side and hunk) must lie in the pull request diff at this \
+                 run's launch SHA; an invalid anchor is rejected with a typed anchor_* code \
+                 and is never turned into a general comment. Findings publish in the order \
+                 they are admitted; at most 50 per review, none after submit_pending.",
                 github_schema(
                     json!({
                         "owner": bounded_string(1, 100),
@@ -209,11 +222,20 @@ impl ProtocolOperation {
                         "side": {"type":"string","enum":["LEFT","RIGHT"]},
                         "startLine": positive_integer(),
                         "startSide": {"type":"string","enum":["LEFT","RIGHT"]},
-                        "subjectType": {"type":"string","enum":["LINE","FILE"]},
+                        "subjectType": {"type":"string","enum":["LINE"]},
                         "body": bounded_string(1, 32768),
                         "clientRequestId": bounded_string(1, 128)
                     }),
-                    &["owner", "repo", "pullNumber", "path", "subjectType", "body"],
+                    &[
+                        "owner",
+                        "repo",
+                        "pullNumber",
+                        "path",
+                        "line",
+                        "side",
+                        "subjectType",
+                        "body",
+                    ],
                 ),
                 false,
             ),
@@ -411,6 +433,10 @@ fn submit_review_tool() -> Tool {
             "Submit this reviewer run's verdict. `approved` requires `blocking: 0` and takes no \
              feedback. `changes` requires `blocking` >= 1 and non-empty `feedback`. \
              `graph-blocker` takes only `feedback_json` (the graph-blocker feedback object). \
+             Once this run has created a pending review, the verdict is refused \
+             (`review_not_published`, `review_head_moved`) until that COMMENT review is fully \
+             published for the still-current launch SHA; if a review operation failed, pass \
+             `publication_failure: \"operation_failed\"` instead. A refusal records nothing. \
              The daemon re-validates and alone acts on the verdict. Success is \
              {{\"ok\":true,\"mailbox_id\":N}}. {SIGNAL_RETRY}"
         ),
@@ -418,7 +444,8 @@ fn submit_review_tool() -> Tool {
             "verdict": {"type":"string","enum":["approved","changes","graph-blocker"]},
             "blocking": {"type":"integer","minimum":0},
             "feedback": bounded_string(1, 32768),
-            "feedback_json": {"type":"object"}
+            "feedback_json": {"type":"object"},
+            "publication_failure": {"type":"string","enum":["operation_failed"]}
         }),
         &["verdict"],
     )
@@ -484,6 +511,8 @@ struct SubmitReviewArguments {
     feedback: Option<String>,
     #[serde(default)]
     feedback_json: Option<Map<String, Value>>,
+    #[serde(default)]
+    publication_failure: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -532,6 +561,13 @@ fn validate_review(
     let verdict = arguments.verdict.as_str();
     if !matches!(verdict, "approved" | "changes" | "graph-blocker") {
         return Err("verdict must be 'approved', 'changes', or 'graph-blocker'".into());
+    }
+    if arguments
+        .publication_failure
+        .as_deref()
+        .is_some_and(|reason| reason != "operation_failed")
+    {
+        return Err("publication_failure must be 'operation_failed'".into());
     }
     if verdict == "graph-blocker" {
         if arguments.blocking.is_some() || arguments.feedback.is_some() {
@@ -600,10 +636,9 @@ fn pending_review_schema() -> Arc<Map<String, Value>> {
             "owner": bounded_string(1, 100),
             "repo": bounded_string(1, 100),
             "pullNumber": positive_integer(),
-            "commitID": bounded_string(40, 40),
+            "commitID": {"type":"string","pattern":"^[0-9a-f]{40}([0-9a-f]{24})?$"},
             "event": {"type":"string","enum":["COMMENT"]},
-            "body": bounded_string(1, 32768),
-            "clientRequestId": bounded_string(1, 128)
+            "body": bounded_string(1, 32768)
         }),
         &["method", "owner", "repo", "pullNumber"],
     );
@@ -964,7 +999,9 @@ impl QuorumServer {
         }
     }
 
-    /// Admit one `pull_request_read` / `add_issue_comment` call, then wait up
+    /// Admit one `pull_request_read`, `add_issue_comment`,
+    /// `pull_request_review_write`, or `add_comment_to_pending_review` call,
+    /// then wait up
     /// to [`OPERATION_WAIT`] for the daemon executor by polling the same
     /// operation through `github_operation_read`. The endpoint owns every
     /// authority, target, and bound decision; its rejection is relayed with
@@ -1128,6 +1165,7 @@ impl QuorumServer {
                             feedback: None,
                             feedback_json: None,
                             blocking: None,
+                            publication_failure: None,
                         },
                     )
                 })
@@ -1152,6 +1190,7 @@ impl QuorumServer {
                             feedback: arguments.feedback.as_deref(),
                             feedback_json: feedback_json.as_deref(),
                             blocking: arguments.blocking,
+                            publication_failure: arguments.publication_failure.as_deref(),
                         },
                     )
                 })
@@ -1413,7 +1452,10 @@ impl ServerHandler for QuorumServer {
             .ok_or_else(|| McpError::new(ErrorCode::METHOD_NOT_FOUND, "unknown tool", None))?;
         if matches!(
             operation,
-            ProtocolOperation::PullRequestRead | ProtocolOperation::AddIssueComment
+            ProtocolOperation::PullRequestRead
+                | ProtocolOperation::AddIssueComment
+                | ProtocolOperation::PullRequestReviewWrite
+                | ProtocolOperation::AddCommentToPendingReview
         ) {
             return Ok(self
                 .github_operation(&capability, operation, request.arguments)
