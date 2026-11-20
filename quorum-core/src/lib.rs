@@ -50,6 +50,7 @@ pub mod review_followup_reads;
 pub mod review_followup_writes;
 pub mod review_followups;
 pub mod review_interpret_jobs;
+pub mod review_publication_slots;
 pub mod risk;
 pub mod role_assignments;
 pub mod routing_attempts;

@@ -1298,6 +1298,9 @@ fn transition_active_attempt_in_tx(
         )
         .optional()?;
     if let Some(transitioned) = transitioned {
+        // A terminal attempt can no longer publish: its owned pending-review
+        // slot needs cleanup in this same lifecycle transaction.
+        crate::review_publication_slots::sync_in_tx(tx, now)?;
         return Ok(CollaborationAttemptTransitionResult::Transitioned(
             transitioned,
         ));
@@ -1807,6 +1810,9 @@ pub(crate) fn revoke_dead_run_attempts(tx: &Connection, now: i64, limit: i64) ->
             params![attempt_id, now],
         )?;
         cancel_unsent_operations(tx, attempt_id, now)?;
+    }
+    if !attempt_ids.is_empty() {
+        crate::review_publication_slots::sync_in_tx(tx, now)?;
     }
     Ok(attempt_ids.len())
 }
@@ -4661,6 +4667,15 @@ mod tests {
             issue_attempt(&mut conn, &attempt, 20).unwrap(),
             CollaborationAttemptAdmissionResult::Created(_)
         ));
+        // The create is claimable only while this attempt owns the slot.
+        conn.execute(
+            "INSERT INTO github_review_publication_slots(
+                 publisher_scope,pr_number,task_id,attempt_id,state,review_owner_marker,
+                 created_at,updated_at)
+             VALUES ('scope',?1,3,?2,'owned','marker',20,20)",
+            params![WORKER_PR, REVIEW_ATTEMPT],
+        )
+        .unwrap();
         (dir, conn, attempt)
     }
 

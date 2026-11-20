@@ -43,6 +43,7 @@ use crate::collaboration_admission::{
 };
 use crate::db::{begin_immediate, map_sql_err};
 use crate::error::{QuorumError, Result};
+use crate::review_publication_slots;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
@@ -377,6 +378,9 @@ pub struct ReconcileReport {
     pub ambiguous: usize,
     /// Never-sent rows that were out of attempts or past deadline.
     pub failed: usize,
+    /// Pending-review publication slots made reconciliation-required or
+    /// moved to cleanup/blocked by startup reconciliation.
+    pub slots: usize,
 }
 
 fn validate_error_kind(kind: &str) -> Result<()> {
@@ -441,6 +445,7 @@ pub fn claim_next(conn: &mut Connection, now: i64) -> Result<Option<ClaimedOpera
         now,
         crate::collaboration_admission::UNBOUNDED_GROUP_SWEEP,
     )?;
+    review_publication_slots::sync_in_tx(&tx, now)?;
     // A review-sequence row whose lower sequence terminally failed, was
     // cancelled, or completed after revocation can never be sent: fail it
     // (and so, transitively, every later sequence) while still provably unsent.
@@ -483,6 +488,14 @@ pub fn claim_next(conn: &mut Connection, now: i64) -> Result<Option<ClaimedOpera
                      AND p.review_sequence>=0 AND p.review_sequence<o.review_sequence
                      AND p.state='succeeded' AND p.completed_after_revocation=0
                ))
+               AND (o.review_sequence IS NOT 0 OR (
+                   o.send_state IN ('not_started','definitely_unsent')
+                   AND EXISTS (
+                       SELECT 1 FROM github_review_publication_slots s
+                       WHERE s.attempt_id=o.attempt_id AND s.state='owned'
+                         AND s.create_send_state=o.send_state
+                   )
+               ))
              ORDER BY COALESCE(o.next_attempt_at, o.created_at), o.id
              LIMIT 1",
             params![now, MAX_OPERATION_CLAIMS],
@@ -497,8 +510,11 @@ pub fn claim_next(conn: &mut Connection, now: i64) -> Result<Option<ClaimedOpera
     let sql = format!(
         "UPDATE github_agent_operations
          SET state='running', active=1, claimed_at=?2, execution_started_at=NULL,
-             attempts=attempts+1, next_attempt_at=NULL, updated_at=?2
+             attempts=attempts+1, next_attempt_at=NULL, updated_at=?2,
+             send_state=CASE WHEN review_sequence=0 THEN 'ambiguous' ELSE send_state END
          WHERE id=?1 AND state='queued' AND active=0
+           AND (review_sequence IS NOT 0
+                OR send_state IN ('not_started','definitely_unsent'))
          RETURNING {SELECT_COLUMNS}"
     );
     let claimed = match tx
@@ -514,6 +530,24 @@ pub fn claim_next(conn: &mut Connection, now: i64) -> Result<Option<ClaimedOpera
         // sweeps above are idempotent and will re-run on the next claim.
         return Ok(None);
     };
+    if operation.review_sequence == Some(0) {
+        // Pending-review create: the slot's create send state enters
+        // `ambiguous` in this same claim transaction, and only while the slot
+        // is still owned by this attempt. A cleanup transition that committed
+        // first makes this zero rows and the claim rolls back unsent.
+        let coupled = tx
+            .execute(
+                "UPDATE github_review_publication_slots
+                 SET create_send_state='ambiguous', updated_at=?2
+                 WHERE attempt_id=?1 AND state='owned'
+                   AND create_send_state IN ('not_started','definitely_unsent')",
+                params![operation.attempt_id, now],
+            )
+            .map_err(map_sql_err)?;
+        if coupled != 1 {
+            return Ok(None);
+        }
+    }
     tx.commit().map_err(map_sql_err)?;
     Ok(Some(ClaimedOperation {
         claim: OperationClaim {
@@ -558,6 +592,44 @@ pub fn mark_execution_started(
         params![claim.id, claim.attempt, ERR_ATTEMPT_REVOKED, now],
     )
     .map_err(map_sql_err)?;
+    // A claimed pending-review create already carries `ambiguous` from its
+    // claim. This live claimant has not handed anything to GitHub yet
+    // (`execution_started_at IS NULL` under the claim fence), which is the
+    // closed pre-send proof: if authority or slot ownership was lost after
+    // the claim, cancel it as `definitely_unsent` on both the row and slot.
+    let create_cancelled = tx
+        .query_row(
+            "UPDATE github_agent_operations
+             SET state='cancelled', active=0, next_attempt_at=NULL,
+                 send_state='definitely_unsent', error_kind=?3,
+                 error_summary='collaboration attempt or review slot lost before the send started',
+                 updated_at=?4
+             WHERE id=?1 AND attempts=?2 AND active=1 AND state='running'
+               AND execution_started_at IS NULL
+               AND review_sequence=0 AND send_state='ambiguous'
+               AND NOT (
+                   EXISTS (
+                       SELECT 1 FROM github_collaboration_attempts a
+                       JOIN run_capabilities c ON c.run_id=a.active_run_id
+                       WHERE a.attempt_id=github_agent_operations.attempt_id
+                         AND a.state='active' AND c.revoked_at IS NULL
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM github_review_publication_slots s
+                       WHERE s.attempt_id=github_agent_operations.attempt_id
+                         AND s.state='owned'
+                   )
+               )
+             RETURNING attempt_id",
+            params![claim.id, claim.attempt, ERR_ATTEMPT_REVOKED, now],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(map_sql_err)?;
+    if let Some(attempt_id) = create_cancelled {
+        review_publication_slots::couple_create_in_tx(&tx, &attempt_id, now)?;
+        review_publication_slots::sync_in_tx(&tx, now)?;
+    }
     let changed = tx
         .execute(
             "UPDATE github_agent_operations
@@ -566,7 +638,8 @@ pub fn mark_execution_started(
                  updated_at=?3
              WHERE id=?1 AND attempts=?2 AND active=1 AND state='running'
                AND execution_started_at IS NULL
-               AND send_state IN ('not_started','definitely_unsent')",
+               AND (send_state IN ('not_started','definitely_unsent')
+                    OR (review_sequence=0 AND send_state='ambiguous'))",
             params![claim.id, claim.attempt, now, READ_KIND],
         )
         .map_err(map_sql_err)?;
@@ -631,11 +704,15 @@ pub fn settle(
          SET state=?3, send_state={send_sql}, active=0, next_attempt_at=NULL,
              response_json=?4, remote_object_id=?5, error_kind=?6, error_summary=?7,
              updated_at=?8
-         WHERE id=?1 AND attempts=?2 AND active=1 AND state='running'"
+         WHERE id=?1 AND attempts=?2 AND active=1 AND state='running'
+         RETURNING attempt_id, review_sequence, state, completed_after_revocation,
+                   kind='pull_request_review_write'
+                   AND CASE WHEN json_valid(request_json)
+                            THEN json_extract(request_json,'$.method') END='submit_pending'"
     );
     let tx = begin_immediate(conn)?;
-    let changed = tx
-        .execute(
+    let settled: Option<SettledRow> = tx
+        .query_row(
             &sql,
             params![
                 claim.id,
@@ -647,10 +724,50 @@ pub fn settle(
                 error_summary,
                 now
             ],
+            |row| {
+                Ok(SettledRow {
+                    attempt_id: row.get(0)?,
+                    review_sequence: row.get(1)?,
+                    succeeded: row.get::<_, String>(2)? == "succeeded",
+                    completed_after_revocation: row.get::<_, i64>(3)? != 0,
+                    is_submit: row.get::<_, Option<bool>>(4)?.unwrap_or(false),
+                })
+            },
         )
+        .optional()
         .map_err(map_sql_err)?;
+    if let Some(row) = &settled {
+        after_review_result_in_tx(&tx, row, now)?;
+    }
     tx.commit().map_err(map_sql_err)?;
-    Ok(changed > 0)
+    Ok(settled.is_some())
+}
+
+/// The fields of a just-settled/released row the slot hooks need.
+struct SettledRow {
+    attempt_id: String,
+    review_sequence: Option<i64>,
+    succeeded: bool,
+    completed_after_revocation: bool,
+    is_submit: bool,
+}
+
+/// Slot hooks run in the same transaction as a review-sequence result: mirror
+/// a create's send state into its slot, release the owned slot after a
+/// successful `submit_pending`, then move any slot whose attempt can no
+/// longer publish to `cleanup_required`.
+fn after_review_result_in_tx(tx: &Connection, row: &SettledRow, now: i64) -> Result<()> {
+    let Some(sequence) = row.review_sequence else {
+        return Ok(());
+    };
+    if sequence == 0 {
+        review_publication_slots::couple_create_in_tx(tx, &row.attempt_id, now)?;
+    }
+    if row.is_submit && row.succeeded && !row.completed_after_revocation {
+        review_publication_slots::release_after_submit_in_tx(tx, &row.attempt_id)?;
+    }
+    review_publication_slots::sync_in_tx(tx, now)?;
+    Ok(())
 }
 
 /// Release the current claim back to `queued`, due at `retry_at`.
@@ -740,6 +857,23 @@ pub fn release_for_retry(
         )
     }
     .map_err(map_sql_err)?;
+    if changed > 0 {
+        let (attempt_id, review_sequence): (String, Option<i64>) = tx
+            .query_row(
+                "SELECT attempt_id, review_sequence FROM github_agent_operations WHERE id=?1",
+                [claim.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(map_sql_err)?;
+        let row = SettledRow {
+            attempt_id,
+            review_sequence,
+            succeeded: false,
+            completed_after_revocation: false,
+            is_submit: false,
+        };
+        after_review_result_in_tx(&tx, &row, now)?;
+    }
     tx.commit().map_err(map_sql_err)?;
     Ok(match (changed > 0, exhausted) {
         (false, _) => RetryOutcome::Lost,
@@ -794,11 +928,16 @@ pub fn reconcile_on_start(conn: &mut Connection, now: i64) -> Result<ReconcileRe
             params![now, ERR_INTERRUPTED],
         )
         .map_err(map_sql_err)?;
+    // Pending-review slots: `probing` / `cleanup_running` become
+    // reconciliation-required, and any slot whose attempt can no longer
+    // publish (now including interrupted review rows) needs cleanup.
+    let slots = review_publication_slots::reconcile_in_tx(&tx, now)?;
     tx.commit().map_err(map_sql_err)?;
     Ok(ReconcileReport {
         requeued,
         ambiguous,
         failed,
+        slots,
     })
 }
 
@@ -1234,7 +1373,8 @@ mod tests {
             ReconcileReport {
                 requeued: 2,
                 ambiguous: 1,
-                failed: 0
+                failed: 0,
+                slots: 0
             }
         );
         let row = get(&conn, "op-sent");
@@ -1400,6 +1540,17 @@ mod tests {
         req.group_key = None;
         req.created_at = created_at;
         assert!(enqueue(conn, &req).unwrap());
+        if seq == 0 {
+            // A create is claimable only while its attempt owns the slot.
+            conn.execute(
+                "INSERT INTO github_review_publication_slots(
+                     publisher_scope,pr_number,task_id,attempt_id,state,review_owner_marker,
+                     created_at,updated_at)
+                 VALUES ('scope',7,1,'att-1','owned','marker',1,1)",
+                [],
+            )
+            .unwrap();
+        }
     }
 
     /// create(0), inline(1), inline(2), submit(3) — enqueued newest-first so

@@ -3,10 +3,10 @@ mod protocol;
 use protocol::{
     AcquireDaemonLockInput, AdmitGraphInput, AllocateRoleInput, ApplyGraphEventInput, Barrier,
     CancelSourceGraphInput, ClaimCleanupInput, ClaimGithubOperationInput,
-    ClaimProviderRetryReworkInput, ClaimTaskInput, DiscardRunnerRetryInput, GraphAdmission,
-    GraphEvent, MaterializeAssessmentInput, Operation, RetryProviderBlockedInput, EXIT_INTERNAL,
-    EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE, MAX_BARRIER_WAIT_MS, MAX_INPUT_BYTES, MAX_PATH_BYTES,
-    MAX_TEXT_BYTES,
+    ClaimProviderRetryReworkInput, ClaimReviewCleanupInput, ClaimTaskInput,
+    DiscardRunnerRetryInput, GraphAdmission, GraphEvent, MaterializeAssessmentInput, Operation,
+    ProbeReviewSlotInput, RetryProviderBlockedInput, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS,
+    EXIT_USAGE, MAX_BARRIER_WAIT_MS, MAX_INPUT_BYTES, MAX_PATH_BYTES, MAX_TEXT_BYTES,
 };
 use quorum_core::decomposition::SourceCancellation;
 use quorum_core::error::QuorumError;
@@ -80,6 +80,8 @@ fn run() -> Result<i32, HelperError> {
         Operation::RetryProviderBlocked => retry_provider_blocked(parse(&input)?)?,
         Operation::DiscardRunnerRetry => discard_runner_retry(parse(&input)?)?,
         Operation::ClaimGithubOp => claim_github_operation(parse(&input)?)?,
+        Operation::ClaimReviewCleanup => claim_review_cleanup(parse(&input)?)?,
+        Operation::ProbeReviewSlot => probe_review_slot(parse(&input)?)?,
     };
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -401,6 +403,59 @@ fn claim_github_operation(
         "started": started,
         "settled": settled,
     })))
+}
+
+/// Race side of the pending-review create claim: require cleanup for the
+/// attempt's owned slot, then claim cleanup. Positive only on a cleanup claim.
+fn claim_review_cleanup(input: ClaimReviewCleanupInput) -> Result<OperationResult, HelperError> {
+    use quorum_core::review_publication_slots;
+    validate_path("database", &input.db_path)?;
+    validate_text("attempt id", &input.attempt_id)?;
+    wait_at_barrier(&input.barrier)?;
+    let mut conn = quorum_core::db::open(&input.db_path)?;
+    let transitioned =
+        review_publication_slots::require_cleanup(&mut conn, &input.attempt_id, input.now)?;
+    let claim = review_publication_slots::claim_cleanup(&mut conn, input.now)?;
+    let claimed = claim.is_some();
+    Ok(OperationResult::race(
+        json!({
+            "transitioned": transitioned,
+            "claimed": claimed,
+            "create_send_state": claim.map(|claim| claim.create_send_state.as_str()),
+        }),
+        claimed,
+    ))
+}
+
+/// Race the unique slot insert and, on a probe claim, ownership by one
+/// attempt. Positive only when this process made the attempt the owner.
+fn probe_review_slot(input: ProbeReviewSlotInput) -> Result<OperationResult, HelperError> {
+    use quorum_core::review_publication_slots::{self, ProbeOutcome, ProbeResult, ProbeStart};
+    validate_path("database", &input.db_path)?;
+    validate_text("publisher scope", &input.publisher_scope)?;
+    validate_text("attempt id", &input.attempt_id)?;
+    let scope = review_publication_slots::PublisherScope::new(input.publisher_scope)?;
+    wait_at_barrier(&input.barrier)?;
+    let mut conn = quorum_core::db::open(&input.db_path)?;
+    let ProbeStart::Claimed(claim) =
+        review_publication_slots::begin_probe(&mut conn, &scope, 7, 1, input.now)?
+    else {
+        return Ok(OperationResult::race(
+            json!({"claimed": false, "owned": false}),
+            false,
+        ));
+    };
+    let empty = ProbeResult::Empty {
+        new_attempt_id: &input.attempt_id,
+    };
+    let owned = matches!(
+        review_publication_slots::resolve_probe(&mut conn, &claim, empty, input.now)?,
+        ProbeOutcome::Owned(_)
+    );
+    Ok(OperationResult::race(
+        json!({"claimed": true, "owned": owned}),
+        owned,
+    ))
 }
 
 fn materialize_assessment(

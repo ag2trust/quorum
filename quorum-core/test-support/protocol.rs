@@ -31,10 +31,12 @@ pub enum Operation {
     RetryProviderBlocked,
     DiscardRunnerRetry,
     ClaimGithubOp,
+    ClaimReviewCleanup,
+    ProbeReviewSlot,
 }
 
 impl Operation {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::AllocateRole,
         Self::ClaimTask,
         Self::ClaimProviderRetryRework,
@@ -47,6 +49,8 @@ impl Operation {
         Self::RetryProviderBlocked,
         Self::DiscardRunnerRetry,
         Self::ClaimGithubOp,
+        Self::ClaimReviewCleanup,
+        Self::ProbeReviewSlot,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -63,6 +67,8 @@ impl Operation {
             Self::RetryProviderBlocked => "retry-provider-blocked",
             Self::DiscardRunnerRetry => "discard-runner-retry",
             Self::ClaimGithubOp => "claim-github-operation",
+            Self::ClaimReviewCleanup => "claim-review-cleanup",
+            Self::ProbeReviewSlot => "probe-review-slot",
         }
     }
 }
@@ -243,6 +249,29 @@ pub struct AdmitGraphInput {
 #[serde(deny_unknown_fields)]
 pub struct ClaimGithubOperationInput {
     pub db_path: PathBuf,
+    pub now: i64,
+    pub barrier: Barrier,
+}
+
+/// Move an attempt's owned pending-review slot to `cleanup_required`, then
+/// try to claim pending-review cleanup.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimReviewCleanupInput {
+    pub db_path: PathBuf,
+    pub attempt_id: String,
+    pub now: i64,
+    pub barrier: Barrier,
+}
+
+/// Insert/claim the `(scope, PR 7)` probe slot for task 1 and, on a claim,
+/// resolve an empty remote read by making `attempt_id` the owner.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeReviewSlotInput {
+    pub db_path: PathBuf,
+    pub publisher_scope: String,
+    pub attempt_id: String,
     pub now: i64,
     pub barrier: Barrier,
 }
