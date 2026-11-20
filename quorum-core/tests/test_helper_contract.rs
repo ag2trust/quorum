@@ -5,9 +5,10 @@ use std::time::Duration;
 use support::protocol::{
     AcquireDaemonLockInput, AllocateRoleInput, ApplyGraphEventInput, Barrier,
     CancelSourceGraphInput, ClaimCleanupInput, ClaimGithubOperationInput,
-    ClaimProviderRetryReworkInput, ClaimTaskInput, DiscardRunnerRetryInput, GraphEvent,
-    MaterializeAssessmentInput, Operation, PendingTurnInput, RetryProviderBlockedInput,
-    EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS, EXIT_USAGE, MAX_INPUT_BYTES,
+    ClaimProviderRetryReworkInput, ClaimReviewCleanupInput, ClaimTaskInput,
+    DiscardRunnerRetryInput, GraphEvent, MaterializeAssessmentInput, Operation, PendingTurnInput,
+    ProbeReviewSlotInput, RetryProviderBlockedInput, EXIT_INTERNAL, EXIT_NEGATIVE, EXIT_SUCCESS,
+    EXIT_USAGE, MAX_INPUT_BYTES,
 };
 
 fn file_db() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -218,9 +219,36 @@ fn every_scaffolded_operation_runs_in_the_dedicated_executable() {
             support::run(
                 Operation::ClaimGithubOp,
                 &ClaimGithubOperationInput {
-                    db_path,
+                    db_path: db_path.clone(),
                     now: 10,
                     barrier: open_barrier(dir.path(), "github-operation"),
+                },
+            )
+            .unwrap(),
+            EXIT_NEGATIVE,
+        ),
+        (
+            support::run(
+                Operation::ClaimReviewCleanup,
+                &ClaimReviewCleanupInput {
+                    db_path: db_path.clone(),
+                    attempt_id: "att-none".into(),
+                    now: 10,
+                    barrier: open_barrier(dir.path(), "review-cleanup"),
+                },
+            )
+            .unwrap(),
+            EXIT_NEGATIVE,
+        ),
+        (
+            support::run(
+                Operation::ProbeReviewSlot,
+                &ProbeReviewSlotInput {
+                    db_path,
+                    publisher_scope: "scope".into(),
+                    attempt_id: "att-none".into(),
+                    now: 10,
+                    barrier: open_barrier(dir.path(), "review-probe"),
                 },
             )
             .unwrap(),

@@ -760,13 +760,13 @@ fn http_listener_derives_authority_per_request_and_signals_the_daemon() {
         .0,
         "request_too_large"
     );
-    // The same runs over stdio keep exactly their pre-existing inventories:
-    // no signalling tool is advertised or routed there.
+    // The same runs over stdio list the same inventories, signalling tools
+    // included, so a stdio provider never needs a shell fallback.
     assert_stdio_inventory(
         &endpoint,
         "worker-cap",
         "Worker",
-        &["delivery_report_write"],
+        &["delivery_report_write", "submit_work", "react", "task_note"],
     );
     assert_stdio_inventory(
         &endpoint,
@@ -780,6 +780,9 @@ fn http_listener_derives_authority_per_request_and_signals_the_daemon() {
             "add_reply_to_pull_request_comment",
             "resolve_review_thread",
             "github_operation_read",
+            "submit_review",
+            "task_note",
+            "alert_owner",
         ],
     );
     // The stub operations still answer exactly as they do over stdio.
@@ -1312,7 +1315,7 @@ const SIGNAL_TOOLS: [&str; 5] = [
 
 /// Drive one stdio shell for `capability`: it must advertise
 /// `tools/list_changed`, list exactly `expected`, and treat every signalling
-/// tool name as unknown.
+/// tool name outside that list as unknown.
 fn assert_stdio_inventory(endpoint: &Path, capability: &str, agent: &str, expected: &[&str]) {
     let mut child = Command::new(quorum_bin())
         .arg("agent-mcp")
@@ -1358,7 +1361,11 @@ fn assert_stdio_inventory(endpoint: &Path, capability: &str, agent: &str, expect
     );
     let listed = request(2, "tools/list", json!({}));
     assert_eq!(tool_names(&listed), expected, "{capability}");
-    for (id, name) in SIGNAL_TOOLS.into_iter().enumerate() {
+    for (id, name) in SIGNAL_TOOLS
+        .into_iter()
+        .filter(|name| !expected.contains(name))
+        .enumerate()
+    {
         let response = request(
             10 + id as i64,
             "tools/call",
@@ -1371,12 +1378,12 @@ fn assert_stdio_inventory(endpoint: &Path, capability: &str, agent: &str, expect
     assert!(child.wait().unwrap().success());
 }
 
-/// The signalling tools exist only over HTTP. A stdio planner shell
-/// advertises exactly its pre-existing inventory and treats the new names as
+/// A planner holds no signalling tool on either transport. A stdio planner
+/// shell advertises exactly `submit_plan` and treats the signalling names as
 /// unknown. The worker and reviewer stdio inventories are asserted against
 /// the real daemon in the listener test above.
 #[test]
-fn stdio_inventory_and_routing_are_unchanged() {
+fn stdio_planner_inventory_excludes_signalling_tools() {
     let endpoint = FakeEndpoint::start();
     assert_stdio_inventory(&endpoint.path, "planner-cap", "Planner", &["submit_plan"]);
 }
@@ -1711,6 +1718,442 @@ fn pull_request_read_and_comment_run_through_the_daemon_executor() {
         })
         .unwrap();
     assert_eq!(operations, 2);
+
+    shell.stop();
+    daemon.stop();
+}
+
+/// A `gh` stand-in for review-thread work on PR 77: the credential lookup,
+/// the GraphQL thread listing (already projected, as `--jq` would emit it),
+/// the REST reply (echoing its stdin body the way GitHub does), and the
+/// GraphQL resolve. Request documents are recorded per step.
+fn install_fake_thread_gh(dir: &Path) {
+    let thread = r#"{"id":"PRRT_kwDOthread1","isResolved":false,"isOutdated":true,"path":"src/lib.rs","line":null,"originalLine":2,"startLine":null,"diffSide":"RIGHT","subjectType":"LINE","ids":[5001,5002],"root":{"databaseId":5001,"diffHunk":"@@ -1 +1,2 @@\n one\n+two","commit":null,"originalCommit":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}"#;
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = auth ] && [ "$2" = token ]; then echo fake-gh-token; exit 0; fi
+[ "$GH_TOKEN" = fake-gh-token ] || {{ echo "missing token" >&2; exit 7; }}
+echo "$@" >> '{dir}/gh-args.log'
+if [ "$1" = api ] && [ "$2" = graphql ] && [ "$3" = --paginate ]; then
+  printf '%s\n' '{thread}'
+  exit 0
+fi
+if [ "$1" = api ] && [ "$2" = --method ] && [ "$4" = repos/test/repo/pulls/77/comments/5001/replies ]; then
+  cat > '{dir}/reply-stdin.json'
+  printf '%s' '{{"id":5003,"node_id":"PRRC_kwDOreply","in_reply_to_id":5001,"pull_request_url":"https://api.github.com/repos/test/repo/pulls/77",'
+  tail -c +2 '{dir}/reply-stdin.json'
+  exit 0
+fi
+if [ "$1" = api ] && [ "$2" = graphql ] && [ "$3" = --input ]; then
+  cat > '{dir}/resolve-stdin.json'
+  printf '%s' '{{"data":{{"resolveReviewThread":{{"thread":{{"id":"PRRT_kwDOthread1","isResolved":true,"pullRequest":{{"number":77}}}}}}}}}}'
+  exit 0
+fi
+echo "fake gh: unsupported $*" >&2
+exit 1
+"#,
+        dir = dir.display()
+    );
+    let path = dir.join("gh");
+    std::fs::write(&path, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn thread_reply_and_resolve_run_through_the_daemon_executor() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    let worktrees = root.path().join("worktrees");
+    let bin = root.path().join("bin");
+    for dir in [&home, &repo, &worktrees, &bin] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    init_git_repo(&repo);
+    install_fake_thread_gh(&bin);
+    let names = root.path().join("names.txt");
+    std::fs::write(&names, "AgentOne\nAgentTwo\n").unwrap();
+    let config = root.path().join("serve.toml");
+    write_config(&config);
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let daemon =
+        Daemon::start_with_env(&home, &repo, &worktrees, &names, &config, &[("PATH", path)]);
+    daemon.wait_for("serving (cap=1)");
+    let db = home.join("repos/test__repo/quorum.db");
+    let endpoint = endpoint_path(&db);
+    install_fixtures(&db);
+    // The worker's task now has the reviewer's PR: a rework worker.
+    quorum_core::db::open(&db)
+        .unwrap()
+        .execute(r#"UPDATE tasks SET refs='{"pr":77}' WHERE id=200"#, [])
+        .unwrap();
+    let shell = HttpShell::start(&endpoint, &[("GH_TOKEN", "must-not-be-used")]);
+    let addr = shell.addr;
+
+    // Workers cannot resolve threads; nothing is queued.
+    let (is_error, refused) = call(
+        addr,
+        "worker-cap",
+        "resolve_review_thread",
+        json!({"threadID":"PRRT_kwDOthread1"}),
+    );
+    assert!(is_error);
+    assert_eq!(refused["code"], "forbidden_operation", "{refused:#}");
+
+    // The worker replies to a reply (5002); it lands on the thread root.
+    let body = "Fixed in `abc` — see \"two\".\n\n- done";
+    let (is_error, reply) = call(
+        addr,
+        "worker-cap",
+        "add_reply_to_pull_request_comment",
+        json!({"owner":"test","repo":"repo","pullNumber":77,"commentId":5002,"body":body}),
+    );
+    assert!(!is_error, "{reply:#}");
+    assert_eq!(reply["state"], "succeeded", "{reply:#}");
+    assert_eq!(reply["remote_object_id"], "5003");
+    let thread = &reply["result"]["thread"];
+    assert_eq!(thread["id"], "PRRT_kwDOthread1");
+    assert_eq!(thread["outdated"], true);
+    assert_eq!(thread["resolved"], false);
+    assert_eq!(thread["path"], "src/lib.rs");
+    assert_eq!(thread["original_revision"], "a".repeat(40));
+    assert_eq!(thread["context"], "@@ -1 +1,2 @@\n one\n+two");
+    let marker: String = quorum_core::db::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT github_marker FROM github_agent_operations
+             WHERE kind='add_reply_to_pull_request_comment'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stdin_json(&bin, "reply-stdin.json"),
+        json!({"body": format!("{body}\n\n{marker}")})
+    );
+
+    // The reviewer resolves that thread of its bound PR.
+    let (is_error, resolved) = call(
+        addr,
+        "reviewer-cap",
+        "resolve_review_thread",
+        json!({"threadID":"PRRT_kwDOthread1"}),
+    );
+    assert!(!is_error, "{resolved:#}");
+    assert_eq!(resolved["state"], "succeeded", "{resolved:#}");
+    assert_eq!(resolved["result"]["thread"]["resolved"], true);
+    assert_eq!(
+        stdin_json(&bin, "resolve-stdin.json")["variables"],
+        json!({"threadId":"PRRT_kwDOthread1"})
+    );
+
+    // Authored text never reaches argv; each write was sent exactly once.
+    let args = std::fs::read_to_string(bin.join("gh-args.log")).unwrap();
+    assert!(!args.contains("Fixed"), "{args}");
+    assert_eq!(args.lines().filter(|l| l.contains("/replies")).count(), 1);
+    assert_eq!(
+        args.lines()
+            .filter(|l| l.starts_with("api graphql --input"))
+            .count(),
+        1
+    );
+    shell.stop();
+    daemon.stop();
+}
+
+/// A `gh` stand-in that holds one publisher's pending review on PR 77 at
+/// `sha`: it answers the credential lookup, a files page (which creates the
+/// run's collaboration attempt), the review create, the inline GraphQL
+/// thread, the COMMENT submit, and the verdict's PR head fetch. Request
+/// documents are recorded per step; the create and submit echo their bodies
+/// back the way GitHub does.
+fn install_fake_review_gh(dir: &Path, sha: &str) {
+    let review = format!(
+        r#""id":9001,"node_id":"PRR_kwDOfake9001","pull_request_url":"https://api.github.com/repos/test/repo/pulls/77","commit_id":"{sha}""#
+    );
+    let script = format!(
+        r#"#!/bin/sh
+if [ "$1" = auth ] && [ "$2" = token ]; then echo fake-gh-token; exit 0; fi
+[ "$GH_TOKEN" = fake-gh-token ] || {{ echo "missing token" >&2; exit 7; }}
+echo "$@" >> '{dir}/gh-args.log'
+if [ "$1" = api ] && [ "$2" = 'repos/test/repo/pulls/77/files?per_page=10&page=1' ]; then
+  printf '%s' '[]'
+  exit 0
+fi
+if [ "$1" = api ] && [ "$2" = --method ] && [ "$4" = repos/test/repo/pulls/77/reviews ]; then
+  cat > '{dir}/create-stdin.json'
+  printf '%s' '{{{review},"state":"PENDING",'
+  tail -c +2 '{dir}/create-stdin.json' | sed -e 's/"commit_id":"[0-9a-f]*"//' -e 's/^,//' -e 's/,}}$/}}/'
+  exit 0
+fi
+if [ "$1" = api ] && [ "$2" = graphql ]; then
+  cat > '{dir}/inline-stdin.json'
+  printf '%s' '{{"data":{{"addPullRequestReviewThread":{{"thread":{{"id":"PRRT_kwDOfake1","pullRequest":{{"number":77}},"comments":{{"nodes":[{{"id":"PRRC_kwDOfake1","databaseId":5001,"body":"x","pullRequestReview":{{"id":"PRR_kwDOfake9001"}}}}]}}}}}}}}}}'
+  exit 0
+fi
+if [ "$1" = api ] && [ "$2" = --method ] && [ "$4" = repos/test/repo/pulls/77/reviews/9001/events ]; then
+  cat > '{dir}/submit-stdin.json'
+  printf '%s' '{{{review},"state":"COMMENTED",'
+  tail -c +2 '{dir}/submit-stdin.json'
+  exit 0
+fi
+if [ "$1" = pr ] && [ "$2" = view ] && [ "$3" = 77 ]; then
+  printf '%s' '{{"number":77,"state":"OPEN","headRefName":"feature","headRefOid":"{sha}","baseRefName":"main","isCrossRepository":false}}'
+  exit 0
+fi
+echo "fake gh: unsupported $*" >&2
+exit 1
+"#,
+        dir = dir.display()
+    );
+    let path = dir.join("gh");
+    std::fs::write(&path, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Commit `src/lib.rs` on a `feature` branch (left checked out on `main`)
+/// and return the commit SHA: the reviewer's immutable launch SHA.
+fn commit_feature(repo: &Path) -> String {
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    git(&["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "one\ntwo\nthree\n").unwrap();
+    git(&["add", "src/lib.rs"]);
+    git(&["commit", "-q", "-m", "feature"]);
+    let sha = git(&["rev-parse", "HEAD"]);
+    git(&["checkout", "-q", "main"]);
+    sha
+}
+
+fn stdin_json(dir: &Path, name: &str) -> Value {
+    serde_json::from_slice(&std::fs::read(dir.join(name)).unwrap()).unwrap()
+}
+
+#[test]
+fn pending_review_publishes_one_comment_review_through_the_daemon_executor() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    let worktrees = root.path().join("worktrees");
+    let bin = root.path().join("bin");
+    for dir in [&home, &repo, &worktrees, &bin] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    init_git_repo(&repo);
+    let sha = commit_feature(&repo);
+    install_fake_review_gh(&bin, &sha);
+    let names = root.path().join("names.txt");
+    std::fs::write(&names, "AgentOne\nAgentTwo\n").unwrap();
+    let config = root.path().join("serve.toml");
+    write_config(&config);
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let daemon =
+        Daemon::start_with_env(&home, &repo, &worktrees, &names, &config, &[("PATH", path)]);
+    daemon.wait_for("serving (cap=1)");
+    let db = home.join("repos/test__repo/quorum.db");
+    let endpoint = endpoint_path(&db);
+    install_fixtures(&db);
+    {
+        // The reviewer was launched at the feature commit against `main`.
+        let conn = quorum_core::db::open(&db).unwrap();
+        conn.execute(
+            "UPDATE agent_runs SET review_head_sha=?1 WHERE review_cap_run_id='reviewer-cap'",
+            [&sha],
+        )
+        .unwrap();
+        conn.execute("UPDATE tasks SET target_branch='main' WHERE id=201", [])
+            .unwrap();
+    }
+    let shell = HttpShell::start(&endpoint, &[("GH_TOKEN", "must-not-be-used")]);
+    let addr = shell.addr;
+
+    // A first GitHub call binds the run's collaboration attempt.
+    let (is_error, read) = call(
+        addr,
+        "reviewer-cap",
+        "pull_request_read",
+        json!({"method":"get_files","owner":"test","repo":"repo","pullNumber":77,
+               "page":1,"perPage":10}),
+    );
+    assert!(!is_error && read["state"] == "succeeded", "{read:#}");
+    let attempt_id = read["attempt_id"].as_str().unwrap().to_string();
+
+    // Stand-in for the provisioning barrier (not this delivery): the real
+    // probe primitives give the attempt the slot after an empty listing.
+    {
+        use quorum_core::review_publication_slots as slots;
+        let mut conn = quorum_core::db::open(&db).unwrap();
+        let now = quorum_core::clock::now();
+        let scope = slots::PublisherScope::new("test-publisher").unwrap();
+        let slots::ProbeStart::Claimed(claim) =
+            slots::begin_probe(&mut conn, &scope, 77, 201, now).unwrap()
+        else {
+            panic!("probe not claimed");
+        };
+        let owned = slots::resolve_probe(
+            &mut conn,
+            &claim,
+            slots::ProbeResult::Empty {
+                new_attempt_id: &attempt_id,
+            },
+            now,
+        )
+        .unwrap();
+        assert!(matches!(owned, slots::ProbeOutcome::Owned(_)), "{owned:?}");
+    }
+    let owner_marker = quorum_core::review_publication_slots::owner_marker_for_attempt(
+        &quorum_core::db::open(&db).unwrap(),
+        &attempt_id,
+    )
+    .unwrap()
+    .unwrap()
+    .as_str()
+    .to_string();
+
+    let target = json!({"owner":"test","repo":"repo","pullNumber":77});
+    let with = |extra: Value| {
+        let mut arguments = target.clone();
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        arguments
+    };
+    let (is_error, create) = call(
+        addr,
+        "reviewer-cap",
+        "pull_request_review_write",
+        with(json!({"method":"create","commitID":sha})),
+    );
+    assert!(!is_error, "{create:#}");
+    assert_eq!(create["state"], "succeeded", "{create:#}");
+    assert_eq!(create["send_state"], "confirmed");
+    assert_eq!(create["remote_object_id"], "9001");
+    assert_eq!(
+        stdin_json(&bin, "create-stdin.json"),
+        json!({"commit_id": sha, "body": owner_marker})
+    );
+
+    // The verdict waits for the published COMMENT review.
+    let (is_error, early) = call(
+        addr,
+        "reviewer-cap",
+        "submit_review",
+        json!({"verdict":"approved","blocking":0}),
+    );
+    assert!(is_error, "verdict admitted before publication: {early:#}");
+
+    let (is_error, inline) = call(
+        addr,
+        "reviewer-cap",
+        "add_comment_to_pending_review",
+        with(
+            json!({"path":"src/lib.rs","line":2,"side":"RIGHT","subjectType":"LINE",
+                    "body":"Finding: `two` is wrong."}),
+        ),
+    );
+    assert!(!is_error, "{inline:#}");
+    assert_eq!(inline["state"], "succeeded", "{inline:#}");
+    assert_eq!(inline["remote_object_id"], "5001");
+    let inline_marker: String = quorum_core::db::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT github_marker FROM github_agent_operations
+             WHERE kind='add_comment_to_pending_review'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let thread = stdin_json(&bin, "inline-stdin.json");
+    let input = &thread["variables"]["input"];
+    assert_eq!(input["pullRequestReviewId"], "PRR_kwDOfake9001");
+    assert_eq!(
+        (
+            &input["path"],
+            &input["line"],
+            &input["side"],
+            &input["subjectType"]
+        ),
+        (
+            &json!("src/lib.rs"),
+            &json!(2),
+            &json!("RIGHT"),
+            &json!("LINE")
+        )
+    );
+    assert_eq!(
+        input["body"],
+        format!("Finding: `two` is wrong.\n\n{inline_marker}")
+    );
+
+    let summary = "## Summary\n\nOne finding.";
+    let (is_error, submit) = call(
+        addr,
+        "reviewer-cap",
+        "pull_request_review_write",
+        with(json!({"method":"submit_pending","event":"COMMENT","body":summary})),
+    );
+    assert!(!is_error, "{submit:#}");
+    assert_eq!(submit["state"], "succeeded", "{submit:#}");
+    assert_eq!(submit["result"]["state"], "COMMENTED");
+    assert_eq!(submit["result"]["commit_id"], sha.as_str());
+    assert_eq!(
+        stdin_json(&bin, "submit-stdin.json"),
+        json!({"event":"COMMENT","body": format!("{summary}\n\n{owner_marker}")})
+    );
+
+    // Each mutation was sent exactly once, in sequence order; the slot was
+    // released by the submit.
+    let args = std::fs::read_to_string(bin.join("gh-args.log")).unwrap();
+    let mutations = args
+        .lines()
+        .filter(|line| line.contains("--method POST") || line.contains("graphql"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mutations,
+        [
+            "api --method POST repos/test/repo/pulls/77/reviews --input -",
+            "api graphql --input -",
+            "api --method POST repos/test/repo/pulls/77/reviews/9001/events --input -",
+        ]
+    );
+    let slots: i64 = quorum_core::db::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM github_review_publication_slots",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(slots, 0);
+
+    // The fully published review admits the verdict.
+    accepted(
+        addr,
+        "reviewer-cap",
+        "submit_review",
+        json!({"verdict":"approved","blocking":0}),
+        "mailbox_id",
+    );
 
     shell.stop();
     daemon.stop();

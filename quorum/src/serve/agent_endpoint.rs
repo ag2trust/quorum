@@ -131,10 +131,8 @@ enum Operation {
         attempt_id: Option<String>,
         #[serde(default)]
         operation_id: Option<String>,
-        /// The tool's own arguments object for `pull_request_read`,
-        /// `add_issue_comment`, `pull_request_review_write`, and
-        /// `add_comment_to_pending_review`, decoded here against each closed
-        /// schema.
+        /// The tool's own arguments object for each GitHub collaboration
+        /// tool, decoded here against that tool's closed schema.
         #[serde(default)]
         arguments: Option<serde_json::Value>,
     },
@@ -168,6 +166,17 @@ impl ProtocolOperation {
             LiveRunPhase::Reviewer => !matches!(self, Self::DeliveryReportWrite),
         }
     }
+}
+
+/// The protocol operations the endpoint authorizes in `phase`, in inventory
+/// order. The `Inventory` answer and per-call authorization both derive from
+/// `allowed_in`; the agent MCP adapter's advertised list and the launch-time
+/// role-tool check are pinned to this by tests.
+pub(crate) fn phase_operations(phase: LiveRunPhase) -> Vec<ProtocolOperation> {
+    ALL_PROTOCOL_OPERATIONS
+        .into_iter()
+        .filter(|operation| operation.allowed_in(phase))
+        .collect()
 }
 
 const ALL_PROTOCOL_OPERATIONS: [ProtocolOperation; 8] = [
@@ -843,7 +852,10 @@ async fn process_request_with_timeout(
     let request = match request.operation {
         Operation::Protocol {
             operation:
-                operation @ (ProtocolOperation::PullRequestRead | ProtocolOperation::AddIssueComment),
+                operation @ (ProtocolOperation::PullRequestRead
+                | ProtocolOperation::AddIssueComment
+                | ProtocolOperation::AddReplyToPullRequestComment
+                | ProtocolOperation::ResolveReviewThread),
             arguments,
             ..
         } => {
@@ -1134,10 +1146,7 @@ fn process_request_blocking(
                 }),
                 Err(_) => {
                     let context = resolve_any_role(&tx, &request.capability)?;
-                    let operations = ALL_PROTOCOL_OPERATIONS
-                        .into_iter()
-                        .filter(|operation| operation.allowed_in(context.phase))
-                        .collect();
+                    let operations = phase_operations(context.phase);
                     Response::success(ResponseResult::Inventory {
                         repository: repository.to_string(),
                         task_id: context.task_id,
@@ -1164,8 +1173,8 @@ fn process_request_blocking(
                 ));
             }
             // The admitted GitHub tools were routed before this transaction
-            // opened; what remains here is the operation read and the tools
-            // whose delivery slices have not landed.
+            // opened; what remains here is the operation read and any tool
+            // whose delivery slice has not landed.
             if operation != ProtocolOperation::GithubOperationRead {
                 return Err(EndpointFailure::new(
                     "operation_unavailable",
@@ -1232,7 +1241,7 @@ fn github_operation_read(
 }
 
 /// The fixed shared retention of one collaboration attempt and its rows.
-const ATTEMPT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+pub(crate) const ATTEMPT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 /// Wall-clock bound on one operation, from admission.
 const OPERATION_DEADLINE_SECS: i64 = 60 * 60;
 /// GitHub's own default page size, used when `perPage` is absent.
@@ -1263,6 +1272,34 @@ struct AddIssueCommentArguments {
     repo: String,
     issue_number: i64,
     body: String,
+    #[serde(default, rename = "clientRequestId")]
+    client_request_id: Option<String>,
+}
+
+/// Closed `add_reply_to_pull_request_comment` arguments; the target fields
+/// are assertions. `commentId` is resolved to a thread on the bound PR by
+/// the executor before anything is published.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddReplyArguments {
+    owner: String,
+    repo: String,
+    #[serde(rename = "pullNumber")]
+    pull_number: i64,
+    #[serde(rename = "commentId")]
+    comment_id: u64,
+    body: String,
+    #[serde(default, rename = "clientRequestId")]
+    client_request_id: Option<String>,
+}
+
+/// Closed `resolve_review_thread` arguments. The thread must belong to the
+/// bound PR; the executor proves that before the mutation.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolveReviewThreadArguments {
+    #[serde(rename = "threadID")]
+    thread_id: String,
     #[serde(default, rename = "clientRequestId")]
     client_request_id: Option<String>,
 }
@@ -1663,6 +1700,47 @@ fn prepare_github_request(
             (
                 GithubOperationKind::AddIssueComment,
                 json!({"kind": "add_issue_comment", "body": body}),
+                client_request_id,
+            )
+        }
+        ProtocolOperation::AddReplyToPullRequestComment => {
+            let arguments: AddReplyArguments =
+                decode_arguments("add_reply_to_pull_request_comment", arguments)?;
+            check_target(
+                repository,
+                &arguments.owner,
+                &arguments.repo,
+                arguments.pull_number,
+                pr,
+            )?;
+            if arguments.comment_id == 0 {
+                return Err(EndpointFailure::new(
+                    "invalid_operation",
+                    "commentId must be a positive review comment ID",
+                ));
+            }
+            validate_authored_body(&arguments.body)?;
+            let client_request_id = parse_client_request_id(arguments.client_request_id)?;
+            (
+                GithubOperationKind::AddReplyToPullRequestComment,
+                json!({
+                    "kind": "reply_to_review_comment",
+                    "comment_id": arguments.comment_id,
+                    "body": arguments.body,
+                }),
+                client_request_id,
+            )
+        }
+        ProtocolOperation::ResolveReviewThread => {
+            let arguments: ResolveReviewThreadArguments =
+                decode_arguments("resolve_review_thread", arguments)?;
+            let client_request_id = parse_client_request_id(arguments.client_request_id)?;
+            (
+                GithubOperationKind::ResolveReviewThread,
+                json!({
+                    "kind": "resolve_review_thread",
+                    "thread_node_id": arguments.thread_id,
+                }),
                 client_request_id,
             )
         }
@@ -2273,6 +2351,9 @@ fn github_error_code(
             | "interrupted",
         ) => "github_unavailable",
         Some("permanent_failure") => "github_rejected",
+        // The daemon's pre-send lookup of the bound PR's review threads.
+        Some("review_comment_not_found") => "review_comment_not_found",
+        Some("review_thread_not_found") => "review_thread_not_found",
         Some("response_too_large" | "invalid_response" | "result_too_large" | "invalid_result") => {
             "github_invalid_response"
         }
@@ -4355,12 +4436,7 @@ mod tests {
 
     #[test]
     fn inventories_are_phase_scoped() {
-        let names = |phase| {
-            ALL_PROTOCOL_OPERATIONS
-                .into_iter()
-                .filter(|operation| operation.allowed_in(phase))
-                .collect::<Vec<_>>()
-        };
+        let names = phase_operations;
         assert_eq!(
             names(LiveRunPhase::InitialWorker),
             vec![ProtocolOperation::DeliveryReportWrite]
@@ -4452,7 +4528,8 @@ mod tests {
     use crate::serve::github_outbox::{compose_comment_body, OutboxExecutor};
     use crate::serve::repository_service::{
         CreatedComment, FakeOutcome, FakeRepositoryService, PullRequestNumber, RepositoryFuture,
-        RepositoryResponse, RepositoryService, RepositoryTarget,
+        RepositoryResponse, RepositoryService, RepositoryTarget, ReviewReplyRecord,
+        ReviewThreadRecord,
     };
 
     /// Answers every request by kind and records each daemon-supplied call.
@@ -4864,6 +4941,203 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(answer(at_bound).state, GithubOperationState::Queued);
+    }
+
+    fn review_thread(id: &str, ids: &[u64], outdated: bool) -> ReviewThreadRecord {
+        ReviewThreadRecord {
+            node_id: id.into(),
+            resolved: false,
+            outdated,
+            path: "src/lib.rs".into(),
+            line: (!outdated).then_some(2),
+            original_line: Some(2),
+            start_line: None,
+            side: Some("RIGHT".into()),
+            subject_type: Some("LINE".into()),
+            root_comment_id: ids[0],
+            comment_ids: ids.to_vec(),
+            commit_id: None,
+            original_commit_id: Some("a".repeat(40)),
+            diff_hunk: "@@ -1 +1,2 @@\n one\n+two".into(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn thread_replies_and_resolution_are_role_gated_and_bound_to_the_pr() {
+        let fixture = live_run_fixture();
+        // The worker's task now has a durable PR: it is a rework worker.
+        fixture.execute(r#"UPDATE tasks SET refs='{"pr":77}' WHERE id=100"#);
+        let reply = |arguments: serde_json::Value| {
+            github(ProtocolOperation::AddReplyToPullRequestComment, arguments)
+        };
+        let reply_to = |comment: u64| {
+            reply(json!({"owner":"test","repo":"repo","pullNumber":77,
+                         "commentId":comment,"body":"Fixed in `abc`."}))
+        };
+        let resolve = |thread: &str| {
+            github(
+                ProtocolOperation::ResolveReviewThread,
+                json!({"threadID": thread}),
+            )
+        };
+        for (capability, operation, code) in [
+            // Workers cannot resolve findings against themselves.
+            ("live-worker", resolve("PRRT_a"), "forbidden_operation"),
+            (
+                "live-worker",
+                reply(json!({"owner":"test","repo":"repo","pullNumber":78,
+                             "commentId":11,"body":"x"})),
+                "forbidden_operation",
+            ),
+            (
+                "live-worker",
+                reply(json!({"owner":"test","repo":"repo","pullNumber":77,
+                             "commentId":0,"body":"x"})),
+                "invalid_operation",
+            ),
+            (
+                "live-worker",
+                reply(json!({"owner":"test","repo":"repo","pullNumber":77,
+                             "commentId":11,"body":"a\0b"})),
+                "invalid_operation",
+            ),
+            (
+                "live-worker",
+                reply(
+                    json!({"owner":"test","repo":"repo","pullNumber":77,"commentId":11,
+                             "body":"x".repeat(MAX_COMMENT_BODY_BYTES + 1)}),
+                ),
+                "invalid_operation",
+            ),
+            (
+                "live-worker",
+                reply(json!({"owner":"test","repo":"repo","pullNumber":77,
+                             "commentId":11,"body":"x","thread":"PRRT_a"})),
+                "invalid_operation",
+            ),
+            (
+                "live-reviewer",
+                resolve("not a node id"),
+                "invalid_operation",
+            ),
+            (
+                "live-reviewer",
+                github(
+                    ProtocolOperation::ResolveReviewThread,
+                    json!({"threadID":"PRRT_a","pullNumber":77}),
+                ),
+                "invalid_operation",
+            ),
+            ("revoked-reviewer", resolve("PRRT_a"), "unauthorized"),
+        ] {
+            let error = fixture.call(capability, operation).await.unwrap_err();
+            assert_eq!(error.code, code, "{capability}: {}", error.message);
+        }
+        assert_eq!(count(&fixture, "github_agent_operations"), 0);
+
+        // A reply to a comment outside the bound PR's threads publishes nothing.
+        let foreign = answer(fixture.call("live-worker", reply_to(999)).await.unwrap());
+        assert_eq!(foreign.state, GithubOperationState::Queued);
+        let service = Arc::new(FakeRepositoryService::scripted([FakeOutcome::Succeed(
+            RepositoryResponse::ReviewThreads(vec![review_thread("PRRT_a", &[11, 12], true)]),
+        )]));
+        run_executor(&fixture, service.clone()).await;
+        assert_eq!(service.calls().len(), 1, "only the thread lookup ran");
+        let foreign = answer(
+            fixture
+                .call(
+                    "live-worker",
+                    read_operation_request(&foreign.attempt_id, &foreign.operation_id),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(foreign.state, GithubOperationState::Failed);
+        assert_eq!(foreign.send_state, GithubSendState::NotStarted);
+        assert_eq!(foreign.error_code, Some("review_comment_not_found"));
+
+        // A reply in an outdated thread lands in that thread and says so.
+        let posted = answer(fixture.call("live-worker", reply_to(12)).await.unwrap());
+        // The executor accepts the reply only when it carries the exact marker.
+        let marker: String = quorum_core::db::open(&fixture.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT github_marker FROM github_agent_operations WHERE operation_id=?1",
+                [&posted.operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let service = Arc::new(FakeRepositoryService::scripted([
+            FakeOutcome::Succeed(RepositoryResponse::ReviewThreads(vec![review_thread(
+                "PRRT_a",
+                &[11, 12],
+                true,
+            )])),
+            FakeOutcome::Succeed(RepositoryResponse::ReviewReply(ReviewReplyRecord {
+                id: 13,
+                node_id: "PRRC_13".into(),
+                in_reply_to_id: 11,
+                body: compose_comment_body("Fixed in `abc`.", &marker),
+            })),
+        ]));
+        run_executor(&fixture, service.clone()).await;
+        let calls = service.calls();
+        assert_eq!(
+            calls[1].request,
+            RepositoryRequest::ReplyToReviewComment {
+                comment_id: 11,
+                body: compose_comment_body("Fixed in `abc`.", &marker),
+            }
+        );
+        let posted = answer(
+            fixture
+                .call(
+                    "live-worker",
+                    read_operation_request(&posted.attempt_id, &posted.operation_id),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(posted.state, GithubOperationState::Succeeded);
+        assert_eq!(posted.remote_object_id.as_deref(), Some("13"));
+        let result = posted.result.unwrap();
+        assert_eq!(result["thread"]["id"], "PRRT_a");
+        assert_eq!(result["thread"]["outdated"], true);
+        assert_eq!(result["thread"]["resolved"], false);
+        assert_eq!(result["thread"]["path"], "src/lib.rs");
+        assert_eq!(result["thread"]["context"], "@@ -1 +1,2 @@\n one\n+two");
+
+        // The reviewer resolves a thread of its own bound PR.
+        let resolved = answer(
+            fixture
+                .call("live-reviewer", resolve("PRRT_a"))
+                .await
+                .unwrap(),
+        );
+        let service = Arc::new(FakeRepositoryService::scripted([
+            FakeOutcome::Succeed(RepositoryResponse::ReviewThreads(vec![review_thread(
+                "PRRT_a",
+                &[11, 12],
+                true,
+            )])),
+            FakeOutcome::Succeed(RepositoryResponse::ThreadResolved {
+                thread_node_id: "PRRT_a".into(),
+            }),
+        ]));
+        run_executor(&fixture, service.clone()).await;
+        let resolved = answer(
+            fixture
+                .call(
+                    "live-reviewer",
+                    read_operation_request(&resolved.attempt_id, &resolved.operation_id),
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(resolved.state, GithubOperationState::Succeeded);
+        assert_eq!(resolved.result.unwrap()["thread"]["resolved"], true);
+        assert!(service.calls().iter().all(|call| call.pr.get() == 77));
+        assert_eq!(count(&fixture, "errors"), 0);
     }
 
     #[test]

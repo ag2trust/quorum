@@ -687,13 +687,60 @@ const GATE_WRAPPER: &str = concat!(
     "exec \"$@\""
 );
 
-/// Remove operator secrets that no managed process may inherit, whatever its
-/// role or MCP wiring. The orchestrator MCP token is not a Quorum input at
-/// all, but an operator who exported it must not thereby hand a managed
-/// agent coordinator authority. Call this after applying a spec's
-/// environment so nothing re-adds it.
-pub(crate) fn strip_operator_secrets(command: &mut Command) {
-    command.env_remove(crate::orchestrator_mcp::TOKEN_ENV);
+/// Environment names no managed agent process may inherit, whatever its
+/// provider, role, or MCP wiring. Agents signal Quorum only through the run's
+/// agent MCP and never publish to GitHub themselves (pushes, formal reviews
+/// and merges are daemon-owned), so GitHub credentials and Quorum home/DB
+/// location are pure ambient authority here. The orchestrator MCP token is
+/// not a Quorum input at all, but an operator who exported it must not
+/// thereby hand a managed agent coordinator authority. `QUORUM_HOME` is the
+/// only Quorum DB location input (`paths::home_dir`); the per-repo DB path is
+/// derived beneath it.
+pub(crate) const MANAGED_RUN_REMOVED_ENV: &[&str] = &[
+    crate::orchestrator_mcp::TOKEN_ENV,
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "QUORUM_HOME",
+];
+
+/// The one managed-run environment policy shared by every provider spawn
+/// path. It owns a freshly created, empty, run-private `GH_CONFIG_DIR`, so an
+/// ambient `gh` login or config is unusable from the agent's shell. The
+/// directory is removed when this value drops; provider process wrappers
+/// hold it for the child's lifetime.
+#[derive(Debug)]
+pub(crate) struct ManagedRunEnv {
+    gh_config: tempfile::TempDir,
+}
+
+impl ManagedRunEnv {
+    pub(crate) fn create() -> std::io::Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        // Owner-only at creation: no other local user may read or seed it.
+        let gh_config = tempfile::Builder::new()
+            .prefix("quorum-run-gh-config-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        Ok(Self { gh_config })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gh_config_dir(&self) -> &Path {
+        self.gh_config.path()
+    }
+
+    /// Apply the policy. Call this after the spec's environment and every
+    /// provider-specific environment edit so nothing re-adds a removed value
+    /// or overrides the private `GH_CONFIG_DIR`. The run bearer and endpoint
+    /// variables the agent MCP needs are left untouched.
+    pub(crate) fn apply(&self, command: &mut Command) {
+        for name in MANAGED_RUN_REMOVED_ENV {
+            command.env_remove(name);
+        }
+        command.env("GH_CONFIG_DIR", self.gh_config.path());
+    }
 }
 
 /// Start a process-group leader that waits on a close-on-exec pipe before it
@@ -759,6 +806,143 @@ pub struct LaunchRequest<'a> {
     /// Codex uses it to resume the exact provider-issued thread; Grok uses it
     /// with the official CLI's exact-session `--resume` command.
     pub continuation_id: Option<&'a str>,
+    /// Present on every daemon-managed worker or reviewer launch. A `Normal`
+    /// launch carrying a run capability without it is refused, so no managed
+    /// run can bypass the agent MCP wiring check.
+    pub managed: Option<ManagedLaunch<'a>>,
+}
+
+/// The managed role a capability-bearing launch is for, and where its launch
+/// failure is durably recorded.
+#[derive(Debug, Clone, Copy)]
+pub struct ManagedLaunch<'a> {
+    pub role: AgentMcpRole,
+    pub db_path: &'a Path,
+}
+
+pub use crate::agent_mcp::AgentMcpRole;
+
+/// Environment name of the managed run capability, which is also the agent
+/// MCP bearer.
+const RUN_CAPABILITY_ENV: &str = "QUORUM_RUN_ID";
+
+/// The effective (last, as `Command::env` applies them) non-empty value of
+/// `name` in a launch environment.
+fn launch_env<'a>(environment: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    environment
+        .iter()
+        .rev()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+        .filter(|value| !value.is_empty())
+}
+
+fn agent_mcp_launch_failure(detail: String) -> RunnerFailure {
+    RunnerFailure::classified(
+        FailureDisposition::NonFailover,
+        format!("agent MCP launch check failed: {detail}; refusing to spawn without its MCP tools"),
+        std::io::ErrorKind::InvalidInput,
+    )
+}
+
+/// Verify that a `role` launch on `kind` carries complete agent MCP wiring
+/// and that the tools `advertised` for every phase the role can reach include
+/// each tool the role relies on. Pure: it spawns nothing and touches no
+/// database, so the caller decides how the failure is recorded.
+///
+/// The endpoint locator, bearer, repository, and agent identity are needed by
+/// every transport (the stdio child reads all four; the HTTP listener resolves
+/// the bearer through the same endpoint). Claude attaches over HTTP and also
+/// needs the daemon listener URL.
+pub(crate) fn check_agent_mcp_wiring(
+    kind: AgentKind,
+    role: AgentMcpRole,
+    environment: &[(String, String)],
+    advertised: impl Fn(crate::agent_mcp::RunPhase) -> Vec<String>,
+) -> Result<(), RunnerFailure> {
+    let mut required_env: Vec<&str> = AGENT_MCP_ENV_VARS.to_vec();
+    if kind == AgentKind::Claude {
+        required_env.push(AGENT_MCP_URL_ENV);
+    }
+    let missing_env: Vec<&str> = required_env
+        .into_iter()
+        .filter(|name| launch_env(environment, name).is_none())
+        .collect();
+    if !missing_env.is_empty() {
+        return Err(agent_mcp_launch_failure(format!(
+            "{kind} {role} run is missing agent MCP wiring {}",
+            missing_env.join(", ")
+        )));
+    }
+    for &phase in role.phases() {
+        let offered = advertised(phase);
+        let missing_tools: Vec<&str> = role
+            .required_tools()
+            .iter()
+            .copied()
+            .filter(|tool| !offered.iter().any(|offered| offered == tool))
+            .collect();
+        if !missing_tools.is_empty() {
+            return Err(agent_mcp_launch_failure(format!(
+                "{kind} {role} run lacks role-required agent MCP tools in phase {phase}: {}",
+                missing_tools.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The launch gate every `RunnerProc` entry point applies before any provider
+/// process exists. A failure is logged and recorded in `errors` here, once,
+/// so every caller's existing launch-failure path inherits the evidence.
+fn require_managed_agent_mcp(
+    kind: AgentKind,
+    request: &LaunchRequest<'_>,
+) -> Result<(), RunnerFailure> {
+    let Some(managed) = request.managed else {
+        if request.mode == LaunchMode::Normal
+            && launch_env(request.environment, RUN_CAPABILITY_ENV).is_some()
+        {
+            return Err(agent_mcp_launch_failure(format!(
+                "{kind} launch carries {RUN_CAPABILITY_ENV} but declares no managed role"
+            )));
+        }
+        return Ok(());
+    };
+    let result = if request.mode == LaunchMode::Normal {
+        check_agent_mcp_wiring(
+            kind,
+            managed.role,
+            request.environment,
+            crate::agent_mcp::advertised_tool_names,
+        )
+    } else {
+        Err(agent_mcp_launch_failure(format!(
+            "managed {} launch requested restricted mode",
+            managed.role
+        )))
+    };
+    if let Err(failure) = &result {
+        record_agent_mcp_launch_failure(managed.db_path, failure);
+    }
+    result
+}
+
+/// Best-effort operator evidence for a refused managed launch: the daemon log
+/// and one `errors` row. A failure to record never masks the refusal.
+fn record_agent_mcp_launch_failure(db_path: &Path, failure: &RunnerFailure) {
+    super::log(&format!("agent MCP: {failure}"));
+    match quorum_core::db::open(db_path) {
+        Ok(conn) => quorum_core::errlog::log_error(
+            &conn,
+            super::now_unix(),
+            "agent_mcp_launch",
+            failure.detail(),
+        ),
+        Err(error) => super::log(&format!(
+            "agent MCP: could not record launch failure in errors: {error}"
+        )),
+    }
 }
 
 /// Credentialless stdio server registered only for a complete daemon-managed
@@ -951,6 +1135,7 @@ impl RunnerProc {
             RunnerFailure::new(FailureDisposition::Unclassified, error)
                 .with_io_kind(std::io::ErrorKind::InvalidInput)
         })?;
+        require_managed_agent_mcp(kind, request)?;
         let result = match kind {
             AgentKind::Claude => AgentProc::launch(request, config).await.map(Self::Claude),
             AgentKind::Codex => CodexProc::launch(request, config).map(Self::Codex),
@@ -976,6 +1161,7 @@ impl RunnerProc {
             RunnerFailure::new(FailureDisposition::Unclassified, error)
                 .with_io_kind(std::io::ErrorKind::InvalidInput)
         })?;
+        require_managed_agent_mcp(kind, request)?;
         let result = match kind {
             AgentKind::Claude => AgentProc::launch_gated(request, config)
                 .await
@@ -1015,6 +1201,7 @@ impl RunnerProc {
             RunnerFailure::new(FailureDisposition::Unclassified, error)
                 .with_io_kind(std::io::ErrorKind::InvalidInput)
         })?;
+        require_managed_agent_mcp(kind, request)?;
         let result = match kind {
             AgentKind::Claude => AgentProc::launch_restricted_until(request, config, deadline)
                 .await
@@ -1668,9 +1855,142 @@ fn truncate_label(s: &str, max: usize) -> String {
     }
 }
 
+/// Provider env-capture tests print `gh_config=$GH_CONFIG_DIR`. Assert that a
+/// launch saw a run-private directory rather than the ambient value, and that
+/// the directory was removed once its process was reaped and dropped.
+#[cfg(test)]
+pub(crate) fn assert_run_private_gh_config(captured: &str, ambient: &str) {
+    let dir = captured
+        .lines()
+        .find_map(|line| line.strip_prefix("gh_config="))
+        .unwrap_or_else(|| panic!("no gh_config line: {captured}"));
+    assert!(!dir.is_empty(), "GH_CONFIG_DIR unset: {captured}");
+    assert_ne!(dir, ambient, "ambient GH_CONFIG_DIR leaked: {captured}");
+    let name = Path::new(dir)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    assert!(
+        name.starts_with("quorum-run-gh-config-"),
+        "GH_CONFIG_DIR is not run-private: {captured}"
+    );
+    assert!(
+        !Path::new(dir).exists(),
+        "run-private GH_CONFIG_DIR outlived its process: {dir}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec environment that tries to hand a managed run ambient GitHub,
+    /// Quorum-home and operator authority alongside its real run envelope.
+    fn hostile_spec_environment() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("QUORUM_REPO", "owner/repo"),
+            ("QUORUM_AGENT", "Keel-test"),
+            ("QUORUM_RUN_ID", "run-capability"),
+            ("QUORUM_AGENT_ENDPOINT", "/tmp/quorum-agent.sock"),
+            ("QUORUM_AGENT_MCP_URL", "http://127.0.0.1:1/mcp"),
+            ("GH_TOKEN", "ghp_ambient"),
+            ("GITHUB_TOKEN", "ghp_ambient"),
+            ("GH_ENTERPRISE_TOKEN", "ghp_ambient"),
+            ("GITHUB_ENTERPRISE_TOKEN", "ghp_ambient"),
+            ("QUORUM_HOME", "/ambient/quorum-home"),
+            ("GH_CONFIG_DIR", "/ambient/gh-config"),
+            (crate::orchestrator_mcp::TOKEN_ENV, "operator-token"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn managed_run_env_strips_authority_and_pins_private_empty_gh_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let run_env = ManagedRunEnv::create().unwrap();
+        let gh_config = run_env.gh_config_dir().to_path_buf();
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(
+            "env; printf 'gh_config_entries=%s\\n' \"$(ls -A \"$GH_CONFIG_DIR\" | wc -l | tr -d ' ')\"",
+        );
+        for (key, value) in hostile_spec_environment() {
+            command.env(key, value);
+        }
+        run_env.apply(&mut command);
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let env: std::collections::HashMap<&str, &str> = stdout
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+
+        for removed in MANAGED_RUN_REMOVED_ENV {
+            assert!(!env.contains_key(removed), "{removed} reached the run");
+        }
+        assert_eq!(
+            env.get("GH_CONFIG_DIR").copied(),
+            gh_config.to_str(),
+            "{stdout}"
+        );
+        assert_eq!(env.get("gh_config_entries").copied(), Some("0"), "{stdout}");
+        // The run envelope the HTTP/stdio agent MCP needs survives.
+        assert_eq!(env.get("QUORUM_RUN_ID").copied(), Some("run-capability"));
+        assert_eq!(
+            env.get("QUORUM_AGENT_ENDPOINT").copied(),
+            Some("/tmp/quorum-agent.sock")
+        );
+        assert_eq!(
+            env.get("QUORUM_AGENT_MCP_URL").copied(),
+            Some("http://127.0.0.1:1/mcp")
+        );
+        assert_eq!(env.get("QUORUM_REPO").copied(), Some("owner/repo"));
+        assert_eq!(env.get("QUORUM_AGENT").copied(), Some("Keel-test"));
+
+        let mode = std::fs::metadata(&gh_config).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "GH_CONFIG_DIR is not owner-private");
+        // Each run gets its own directory, removed with the run.
+        let other = ManagedRunEnv::create().unwrap();
+        assert_ne!(other.gh_config_dir(), gh_config.as_path());
+        drop(run_env);
+        assert!(!gh_config.exists(), "GH_CONFIG_DIR outlived its run");
+    }
+
+    #[tokio::test]
+    async fn managed_run_env_leaves_gh_not_logged_in() {
+        let gh_available = std::process::Command::new("gh")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !gh_available {
+            eprintln!("skipping: `gh` is not on PATH");
+            return;
+        }
+        let run_env = ManagedRunEnv::create().unwrap();
+        let mut command = Command::new("gh");
+        command.args(["auth", "status"]);
+        for (key, value) in hostile_spec_environment() {
+            command.env(key, value);
+        }
+        run_env.apply(&mut command);
+        let output = command
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "gh reported a login: {text}");
+        assert!(
+            text.contains("not logged in"),
+            "gh did not report not logged in: {text}"
+        );
+    }
 
     fn managed_environment() -> Vec<(String, String)> {
         vec![
@@ -1693,6 +2013,7 @@ mod tests {
             environment,
             mode,
             continuation_id: Some("provider-issued-thread"),
+            managed: None,
         }
     }
 
@@ -1745,6 +2066,248 @@ mod tests {
         );
         for forbidden in [".sqlite", "GH_TOKEN", "GITHUB_TOKEN", "ghp_"] {
             assert!(!command_surface.contains(forbidden), "{command_surface}");
+        }
+    }
+
+    /// A provider stand-in that proves whether it ever executed.
+    #[cfg(unix)]
+    fn marker_runner(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let marker = dir.join("provider-ran");
+        let runner = dir.join("provider");
+        std::fs::write(
+            &runner,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (runner, marker)
+    }
+
+    fn agent_mcp_launch_errors(db_path: &std::path::Path) -> Vec<String> {
+        let conn = quorum_core::db::open(db_path).unwrap();
+        let mut statement = conn
+            .prepare("SELECT detail FROM errors WHERE source = 'agent_mcp_launch' ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap()
+    }
+
+    fn assert_agent_mcp_refusal(failure: &RunnerFailure, names: &[&str]) {
+        assert_eq!(failure.disposition(), FailureDisposition::NonFailover);
+        assert_eq!(failure.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            failure
+                .detail()
+                .starts_with("agent MCP launch check failed: "),
+            "{failure}"
+        );
+        for name in names {
+            assert!(failure.detail().contains(name), "{name}: {failure}");
+        }
+    }
+
+    /// Missing endpoint, bearer, or (Claude) listener URL: every launch entry
+    /// point refuses before any provider process exists, with a classified
+    /// failure and one `errors` row per refusal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_launch_without_agent_mcp_wiring_fails_before_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let (provider, marker) = marker_runner(dir.path());
+        let db_path = dir.path().join("quorum.db");
+        let config = AdapterConfig {
+            executable: provider.to_str(),
+            claude_bare: true,
+            claude_allowed_tools: "Bash,Read",
+            codex_sandbox: "danger-full-access",
+            grok: Default::default(),
+        };
+        let mut complete_claude = managed_environment();
+        complete_claude.push((AGENT_MCP_URL_ENV.into(), "http://127.0.0.1:4100/mcp".into()));
+        let without = |environment: &[(String, String)], name: &str| -> Vec<(String, String)> {
+            environment
+                .iter()
+                .filter(|(key, _)| key != name)
+                .cloned()
+                .collect()
+        };
+        let cases = [
+            (
+                "gpt-5.6-terra",
+                AgentMcpRole::Worker,
+                without(&managed_environment(), "QUORUM_AGENT_ENDPOINT"),
+                "QUORUM_AGENT_ENDPOINT",
+            ),
+            (
+                "claude-sonnet-5",
+                AgentMcpRole::Reviewer,
+                without(&complete_claude, "QUORUM_AGENT_ENDPOINT"),
+                "QUORUM_AGENT_ENDPOINT",
+            ),
+            (
+                "claude-sonnet-5",
+                AgentMcpRole::Worker,
+                without(&complete_claude, AGENT_MCP_URL_ENV),
+                AGENT_MCP_URL_ENV,
+            ),
+            (
+                "gpt-5.6-terra",
+                AgentMcpRole::Reviewer,
+                without(&managed_environment(), "QUORUM_RUN_ID"),
+                "QUORUM_RUN_ID",
+            ),
+        ];
+        for (index, (model, role, environment, missing)) in cases.iter().enumerate() {
+            let request = LaunchRequest {
+                model,
+                effort: "high",
+                worktree: dir.path(),
+                prompt: "exact pending turn",
+                environment,
+                mode: LaunchMode::Normal,
+                continuation_id: None,
+                managed: Some(ManagedLaunch {
+                    role: *role,
+                    db_path: &db_path,
+                }),
+            };
+            let failure = match RunnerProc::launch(&request, &config).await {
+                Ok(_) => panic!("{model} {role} launched without {missing}"),
+                Err(failure) => failure,
+            };
+            assert_agent_mcp_refusal(&failure, &[missing, role.as_str()]);
+            let failure = match RunnerProc::launch_gated(&request, &config).await {
+                Ok(_) => panic!("gated {model} {role} launched without {missing}"),
+                Err(failure) => failure,
+            };
+            assert_agent_mcp_refusal(&failure, &[missing]);
+            let recorded = agent_mcp_launch_errors(&db_path);
+            assert_eq!(recorded.len(), 2 * (index + 1), "{recorded:?}");
+            assert!(recorded.last().unwrap().contains(missing), "{recorded:?}");
+        }
+        assert!(
+            !marker.exists(),
+            "no provider may run without its MCP tools"
+        );
+    }
+
+    /// A capability-bearing launch that declares no managed role cannot skip
+    /// the check, and a managed role cannot be launched restricted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capability_launch_without_declared_role_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (provider, marker) = marker_runner(dir.path());
+        let db_path = dir.path().join("quorum.db");
+        let config = AdapterConfig {
+            executable: provider.to_str(),
+            claude_bare: true,
+            claude_allowed_tools: "",
+            codex_sandbox: "read-only",
+            grok: Default::default(),
+        };
+        let environment = managed_environment();
+        let undeclared = mcp_request(LaunchMode::Normal, &environment);
+        let failure = match RunnerProc::launch(&undeclared, &config).await {
+            Ok(_) => panic!("capability launch without a declared role spawned"),
+            Err(failure) => failure,
+        };
+        assert_agent_mcp_refusal(&failure, &["QUORUM_RUN_ID", "declares no managed role"]);
+
+        let mut restricted = mcp_request(LaunchMode::Restricted, &environment);
+        restricted.managed = Some(ManagedLaunch {
+            role: AgentMcpRole::Worker,
+            db_path: &db_path,
+        });
+        let failure = match RunnerProc::launch(&restricted, &config).await {
+            Ok(_) => panic!("managed worker launched restricted"),
+            Err(failure) => failure,
+        };
+        assert_agent_mcp_refusal(&failure, &["restricted mode"]);
+        assert_eq!(agent_mcp_launch_errors(&db_path).len(), 1);
+        assert!(
+            !marker.exists(),
+            "no provider may run without its MCP tools"
+        );
+    }
+
+    /// Every role's required tools are advertised in every phase it reaches,
+    /// on every provider: complete wiring passes the check.
+    #[test]
+    fn complete_wiring_offers_every_role_required_tool() {
+        let mut environment = managed_environment();
+        environment.push((AGENT_MCP_URL_ENV.into(), "http://127.0.0.1:4100/mcp".into()));
+        for kind in [AgentKind::Claude, AgentKind::Codex, AgentKind::Grok] {
+            for role in [
+                AgentMcpRole::Worker,
+                AgentMcpRole::Reviewer,
+                AgentMcpRole::Planner,
+            ] {
+                check_agent_mcp_wiring(
+                    kind,
+                    role,
+                    &environment,
+                    crate::agent_mcp::advertised_tool_names,
+                )
+                .unwrap_or_else(|failure| panic!("{kind} {role}: {failure}"));
+            }
+        }
+    }
+
+    /// A role-required tool missing from any phase the role can reach is a
+    /// classified refusal naming the tool and phase.
+    #[test]
+    fn missing_role_required_tool_is_a_classified_refusal() {
+        use crate::agent_mcp::RunPhase;
+        let environment = managed_environment();
+        let without = |phase: RunPhase, dropped: RunPhase, tool: &'static str| {
+            let mut offered = crate::agent_mcp::advertised_tool_names(phase);
+            if phase == dropped {
+                offered.retain(|name| name != tool);
+            }
+            offered
+        };
+        for (role, dropped, tool, phase_name) in [
+            (
+                AgentMcpRole::Worker,
+                RunPhase::ReworkWorker,
+                "submit_work",
+                "rework-worker",
+            ),
+            (
+                AgentMcpRole::Worker,
+                RunPhase::InitialWorker,
+                "react",
+                "initial-worker",
+            ),
+            (
+                AgentMcpRole::Reviewer,
+                RunPhase::Reviewer,
+                "alert_owner",
+                "reviewer",
+            ),
+            (
+                AgentMcpRole::Reviewer,
+                RunPhase::Reviewer,
+                "pull_request_review_write",
+                "reviewer",
+            ),
+            (
+                AgentMcpRole::Planner,
+                RunPhase::Planner,
+                "submit_plan",
+                "planner",
+            ),
+        ] {
+            let failure = check_agent_mcp_wiring(AgentKind::Codex, role, &environment, |phase| {
+                without(phase, dropped, tool)
+            })
+            .expect_err("a missing role-required tool must refuse the launch");
+            assert_agent_mcp_refusal(&failure, &[tool, phase_name, role.as_str()]);
         }
     }
 
@@ -1936,6 +2499,7 @@ mod tests {
             environment: &environment,
             mode: LaunchMode::Normal,
             continuation_id: None,
+            managed: None,
         };
 
         let (proc, gate) =
@@ -2033,6 +2597,7 @@ mod tests {
                 environment: &environment,
                 mode: LaunchMode::Normal,
                 continuation_id,
+                managed: None,
             };
             let (mut proc, gate) =
                 RunnerProc::launch_gated(&request, &gate_config(runner.to_str().unwrap()))
@@ -2093,6 +2658,7 @@ mod tests {
                 environment: &environment,
                 mode: LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             };
             let (proc, gate) =
                 RunnerProc::launch_gated(&request, &gate_config(runner.to_str().unwrap()))
@@ -2149,6 +2715,7 @@ mod tests {
                 environment: &environment,
                 mode: LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             };
 
             let (proc_a, gate_a) = RunnerProc::launch_gated(&make_request(), &cfg)
@@ -2229,6 +2796,7 @@ mod tests {
                 environment: &claude_environment,
                 mode: LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             &AdapterConfig {
                 executable: claude_bin.to_str(),
@@ -2281,6 +2849,7 @@ mod tests {
                 environment: &codex_environment,
                 mode: LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             &AdapterConfig {
                 executable: codex_bin.to_str(),
@@ -2321,6 +2890,7 @@ mod tests {
                     environment: &grok_environment,
                     mode: LaunchMode::Normal,
                     continuation_id: None,
+                    managed: None,
                 },
                 &AdapterConfig {
                     executable: grok_bin.to_str(),
@@ -2352,6 +2922,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn managed_launches_inject_exact_provider_mcp_boundaries_and_pending_turns() {
+        // Complete wiring launches unchanged and records no refusal.
+        let error_dir = tempfile::tempdir().unwrap();
+        let error_db = error_dir.path().join("quorum.db");
         let claude_dir = tempfile::tempdir().unwrap();
         let claude_bin = recording_runner(claude_dir.path());
         let mut claude_environment = managed_environment();
@@ -2367,6 +2940,10 @@ mod tests {
                 environment: &claude_environment,
                 mode: LaunchMode::Normal,
                 continuation_id: Some(claude_session),
+                managed: Some(ManagedLaunch {
+                    role: AgentMcpRole::Worker,
+                    db_path: &error_db,
+                }),
             },
             &AdapterConfig {
                 executable: claude_bin.to_str(),
@@ -2430,6 +3007,10 @@ mod tests {
                 environment: &codex_environment,
                 mode: LaunchMode::Normal,
                 continuation_id: Some("provider-issued-thread-42"),
+                managed: Some(ManagedLaunch {
+                    role: AgentMcpRole::Worker,
+                    db_path: &error_db,
+                }),
             },
             &AdapterConfig {
                 executable: codex_bin.to_str(),
@@ -2488,6 +3069,10 @@ mod tests {
                 environment: &grok_environment,
                 mode: LaunchMode::Normal,
                 continuation_id: Some("provider-issued-grok-session-42"),
+                managed: Some(ManagedLaunch {
+                    role: AgentMcpRole::Worker,
+                    db_path: &error_db,
+                }),
             },
             &AdapterConfig {
                 executable: grok_bin.to_str(),
@@ -2578,6 +3163,10 @@ mod tests {
                 assert!(!surface.contains(forbidden), "{surface}");
             }
         }
+        assert!(
+            !error_db.exists(),
+            "a complete managed launch must not record an agent MCP refusal"
+        );
     }
 
     #[cfg(unix)]
@@ -2607,6 +3196,7 @@ mod tests {
                     environment: &environment,
                     mode: LaunchMode::Restricted,
                     continuation_id: None,
+                    managed: None,
                 },
                 &AdapterConfig {
                     executable: executable.to_str(),
@@ -2672,6 +3262,7 @@ mod tests {
                 environment: &[],
                 mode: LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             &AdapterConfig {
                 executable: Some("/definitely/not/a/runner"),
@@ -2703,6 +3294,7 @@ mod tests {
                 environment: &[],
                 mode: LaunchMode::Normal,
                 continuation_id: None,
+                managed: None,
             },
             &AdapterConfig {
                 executable: Some("/definitely/not/a/runner"),
@@ -2776,6 +3368,7 @@ mod tests {
                 environment: &[],
                 mode: LaunchMode::Normal,
                 continuation_id: Some("provider-thread-7"),
+                managed: None,
             },
             &AdapterConfig {
                 executable: executable.to_str(),
@@ -2802,6 +3395,7 @@ mod tests {
                 environment: &[],
                 mode: LaunchMode::Restricted,
                 continuation_id: Some("provider-thread-7"),
+                managed: None,
             },
             &AdapterConfig {
                 executable: executable.to_str(),

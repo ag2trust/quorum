@@ -12,8 +12,9 @@
 //! Two transports share this shell. Over stdio it serves the one run whose
 //! capability was injected into its environment. With `--listen` it serves
 //! loopback Streamable HTTP statelessly: every request names its own run with
-//! an `Authorization: Bearer <run id>` header, nothing about a run is kept
-//! between requests, and the signalling tools below are advertised.
+//! an `Authorization: Bearer <run id>` header and nothing about a run is kept
+//! between requests. Both transports advertise the same phase inventory,
+//! signalling tools included, so no provider needs a shell fallback.
 
 use crate::agent_client::{SignalOutcome, SubmitPlanOutcome};
 use axum::http::{header, request::Parts, HeaderMap, StatusCode};
@@ -240,7 +241,18 @@ impl ProtocolOperation {
                 false,
             ),
             Self::AddReplyToPullRequestComment => (
-                "Reply in an existing review-comment thread on the bound pull request.",
+                "Reply inside an existing review-comment thread on the pull request bound to \
+                 this managed run; owner, repo, and pullNumber must name exactly that pull \
+                 request. commentId is the numeric ID of any review comment in the thread (from \
+                 pull_request_read get_review_comments); the daemon resolves it to its thread on \
+                 the bound pull request before publishing and replies through GitHub's \
+                 review-comment reply endpoint, so the reply stays in that thread. A comment on \
+                 another pull request, a general issue comment, or an unknown ID fails with \
+                 review_comment_not_found and nothing is posted. The body is posted byte for byte \
+                 (at most 32768 bytes, every code fence closed) followed by a hidden daemon \
+                 marker. The result carries the reply id and its thread: id, path, line, \
+                 revision, nearby diff context, resolved, and outdated. An identical retry \
+                 returns the original reply; github_outcome_unknown means it may already exist.",
                 github_schema(
                     json!({
                         "owner": bounded_string(1, 100),
@@ -255,7 +267,12 @@ impl ProtocolOperation {
                 false,
             ),
             Self::ResolveReviewThread => (
-                "Resolve a review thread on the bound pull request as the current reviewer.",
+                "Resolve one review thread on the pull request bound to this reviewer run. \
+                 threadID is the thread node ID that pull_request_read get_review_comments \
+                 reports as thread_id (or that a reply or inline finding returned). The daemon \
+                 checks the thread belongs to the bound pull request before resolving it; any \
+                 other thread fails with review_thread_not_found. Resolving an already-resolved \
+                 thread succeeds without change. Unresolve is not available.",
                 github_schema(
                     json!({
                         "threadID": bounded_string(1, 256),
@@ -384,7 +401,7 @@ const SIGNAL_RETRY: &str = "Not idempotent: every accepted call records another 
      once. A rejection ({\"code\",\"message\"}) recorded nothing and may be corrected and \
      repeated. After `transport` the outcome is unknown and a repeat may record a duplicate.";
 
-/// The signalling tools advertised over HTTP for a run phase. Like
+/// The signalling tools advertised on both transports for a run phase. Like
 /// `submit_plan` they are not `ProtocolOperation`s; the daemon endpoint
 /// re-derives authority from the capability on every call.
 fn signal_tools(phase: RunPhase) -> Vec<Tool> {
@@ -780,6 +797,8 @@ impl OperationView {
                 "github_outcome_unknown" => "the write may already have reached GitHub and is never re-sent; check the pull request before posting again with a new clientRequestId",
                 "github_invalid_response" => "GitHub returned a response the daemon could not accept",
                 "github_operation_cancelled" => "the operation was cancelled before it was sent",
+                "review_comment_not_found" => "the comment is not a review comment on the bound pull request; nothing was posted",
+                "review_thread_not_found" => "the review thread is not on the bound pull request; nothing was changed",
                 _ => "the GitHub operation failed",
             };
             let retrying = matches!(self.state.as_str(), "queued" | "running");
@@ -833,11 +852,107 @@ struct EndpointError {
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-enum RunPhase {
+pub(crate) enum RunPhase {
     InitialWorker,
     ReworkWorker,
     Reviewer,
     Planner,
+}
+
+/// The managed role a daemon launch is for. A run's phase can move within
+/// its role (a worker becomes a rework worker once its pull request exists),
+/// so the launch contract is stated per role and checked against every phase
+/// the role can reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentMcpRole {
+    Worker,
+    Reviewer,
+    Planner,
+}
+
+impl AgentMcpRole {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::Reviewer => "reviewer",
+            Self::Planner => "planner",
+        }
+    }
+
+    pub(crate) const fn phases(self) -> &'static [RunPhase] {
+        match self {
+            Self::Worker => &[RunPhase::InitialWorker, RunPhase::ReworkWorker],
+            Self::Reviewer => &[RunPhase::Reviewer],
+            Self::Planner => &[RunPhase::Planner],
+        }
+    }
+
+    /// The agent MCP tools this role's prompt and lifecycle contract rely on.
+    /// A launch whose wiring cannot provide every one of them must fail
+    /// rather than leave the agent to a shell fallback.
+    pub(crate) const fn required_tools(self) -> &'static [&'static str] {
+        const WORKER: &[&str] = &[SUBMIT_WORK, REACT, TASK_NOTE];
+        const REVIEWER: &[&str] = &[
+            SUBMIT_REVIEW,
+            ALERT_OWNER,
+            TASK_NOTE,
+            ProtocolOperation::PullRequestRead.name(),
+            ProtocolOperation::AddIssueComment.name(),
+            ProtocolOperation::PullRequestReviewWrite.name(),
+            ProtocolOperation::AddCommentToPendingReview.name(),
+            ProtocolOperation::AddReplyToPullRequestComment.name(),
+            ProtocolOperation::ResolveReviewThread.name(),
+            ProtocolOperation::GithubOperationRead.name(),
+        ];
+        const PLANNER: &[&str] = &[SUBMIT_PLAN];
+        match self {
+            Self::Worker => WORKER,
+            Self::Reviewer => REVIEWER,
+            Self::Planner => PLANNER,
+        }
+    }
+}
+
+impl std::fmt::Display for AgentMcpRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Display for RunPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InitialWorker => "initial-worker",
+            Self::ReworkWorker => "rework-worker",
+            Self::Reviewer => "reviewer",
+            Self::Planner => "planner",
+        })
+    }
+}
+
+/// The complete `tools/list` answer for a run in `phase` holding the
+/// endpoint-derived `operations`. Both transports advertise the same set, so
+/// no provider is left to a shell fallback for a signal its role needs.
+fn phase_tools(phase: RunPhase, operations: Vec<ProtocolOperation>) -> Vec<Tool> {
+    let mut tools: Vec<Tool> = operations
+        .into_iter()
+        .map(ProtocolOperation::tool)
+        .collect();
+    if phase == RunPhase::Planner {
+        tools.push(submit_plan_tool());
+    }
+    tools.extend(signal_tools(phase));
+    tools
+}
+
+/// The tool names `tools/list` advertises to a run in `phase`. This is the
+/// same computation `list_tools` answers with, so a launch-time check against
+/// it cannot drift from what the agent will actually be offered.
+pub(crate) fn advertised_tool_names(phase: RunPhase) -> Vec<String> {
+    phase_tools(phase, expected_inventory(phase))
+        .into_iter()
+        .map(|tool| tool.name.into_owned())
+        .collect()
 }
 
 #[derive(Debug)]
@@ -999,10 +1114,8 @@ impl QuorumServer {
         }
     }
 
-    /// Admit one `pull_request_read`, `add_issue_comment`,
-    /// `pull_request_review_write`, or `add_comment_to_pending_review` call,
-    /// then wait up
-    /// to [`OPERATION_WAIT`] for the daemon executor by polling the same
+    /// Admit one GitHub collaboration tool call, then wait up to
+    /// [`OPERATION_WAIT`] for the daemon executor by polling the same
     /// operation through `github_operation_read`. The endpoint owns every
     /// authority, target, and bound decision; its rejection is relayed with
     /// its own code and message.
@@ -1318,6 +1431,21 @@ impl QuorumServer {
         )
     }
 
+    /// stdio only: whether `name` is a signalling tool of the inventory this
+    /// client last received. As with `submit_plan`, a name outside that
+    /// inventory is unknown, and a run that has not listed tools yet is left
+    /// to the endpoint, which authorizes every signal from the capability.
+    fn signal_tool_advertised(&self, name: &str) -> bool {
+        let advertised = *self
+            .advertised_phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match advertised {
+            Some(phase) => signal_tools(phase).iter().any(|tool| tool.name == name),
+            None => [SUBMIT_WORK, SUBMIT_REVIEW, REACT, TASK_NOTE, ALERT_OWNER].contains(&name),
+        }
+    }
+
     fn phase_changed_since_advertisement(&self, phase: RunPhase) -> bool {
         self.advertised_phase
             .lock()
@@ -1407,17 +1535,7 @@ impl ServerHandler for QuorumServer {
         if !self.is_http() {
             self.record_advertised_phase(phase);
         }
-        let mut tools: Vec<Tool> = inventory
-            .operations
-            .into_iter()
-            .map(ProtocolOperation::tool)
-            .collect();
-        if phase == RunPhase::Planner {
-            tools.push(submit_plan_tool());
-        }
-        if self.is_http() {
-            tools.extend(signal_tools(phase));
-        }
+        let tools = phase_tools(phase, inventory.operations);
         // MCP 2026-07-28 requires `ttlMs` and `cacheScope` on list results;
         // rmcp leaves both unset, and Claude Code then rejects the whole
         // inventory (the planner loses `submit_plan`). The inventory is
@@ -1447,6 +1565,13 @@ impl ServerHandler for QuorumServer {
             }
         } else if request.name == SUBMIT_PLAN && self.planner_tool_advertised() {
             return Ok(self.submit_plan(capability, request.arguments).await.into());
+        } else if self.signal_tool_advertised(&request.name) {
+            if let Some(result) = self
+                .call_signal(&request.name, capability.clone(), request.arguments.clone())
+                .await
+            {
+                return Ok(result.into());
+            }
         }
         let operation = ProtocolOperation::from_name(&request.name)
             .ok_or_else(|| McpError::new(ErrorCode::METHOD_NOT_FOUND, "unknown tool", None))?;
@@ -1456,6 +1581,8 @@ impl ServerHandler for QuorumServer {
                 | ProtocolOperation::AddIssueComment
                 | ProtocolOperation::PullRequestReviewWrite
                 | ProtocolOperation::AddCommentToPendingReview
+                | ProtocolOperation::AddReplyToPullRequestComment
+                | ProtocolOperation::ResolveReviewThread
         ) {
             return Ok(self
                 .github_operation(&capability, operation, request.arguments)
@@ -2120,6 +2247,51 @@ fn required_env(name: &str, max_bytes: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The adapter's per-phase inventory, which the launch-time role-tool
+    /// check reads through `advertised_tool_names`, is exactly the endpoint's
+    /// own per-phase authorization. The planner holds no protocol operation.
+    #[test]
+    fn advertised_inventory_matches_endpoint_phase_authorization() {
+        use quorum_core::capabilities::LiveRunPhase;
+        for (live, phase) in [
+            (LiveRunPhase::InitialWorker, RunPhase::InitialWorker),
+            (LiveRunPhase::ReworkWorker, RunPhase::ReworkWorker),
+            (LiveRunPhase::Reviewer, RunPhase::Reviewer),
+        ] {
+            let endpoint =
+                serde_json::to_value(crate::serve::agent_endpoint::phase_operations(live)).unwrap();
+            let adapter = serde_json::to_value(expected_inventory(phase)).unwrap();
+            assert_eq!(endpoint, adapter, "{phase}");
+        }
+        assert!(expected_inventory(RunPhase::Planner).is_empty());
+    }
+
+    /// Both transports advertise the same set, so the launch contract holds
+    /// for stdio providers (Codex, Grok) exactly as for HTTP (Claude).
+    #[test]
+    fn advertised_tools_cover_each_role_on_every_phase() {
+        assert_eq!(
+            advertised_tool_names(RunPhase::InitialWorker),
+            ["delivery_report_write", "submit_work", "react", "task_note"]
+        );
+        assert_eq!(advertised_tool_names(RunPhase::Planner), ["submit_plan"]);
+        for role in [
+            AgentMcpRole::Worker,
+            AgentMcpRole::Reviewer,
+            AgentMcpRole::Planner,
+        ] {
+            for &phase in role.phases() {
+                let offered = advertised_tool_names(phase);
+                for tool in role.required_tools() {
+                    assert!(
+                        offered.iter().any(|name| name == tool),
+                        "{role} {phase} {tool}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn delayed_watcher_snapshot_detects_change_after_tools_list() {

@@ -238,9 +238,12 @@ the endpoint socket. Its limits are:
   stored, and the daemon endpoint authorizes every call from it exactly as it does over stdio.
 - Stateless: no sessions, no server-initiated stream, and therefore no
   `notifications/tools/list_changed`. A client learns a phase change by listing tools again.
-- In addition to the stdio inventory it advertises signalling tools by run phase: `submit_work`,
-  `react`, and `task_note` to a worker; `submit_review`, `task_note`, and `alert_owner` to a
-  reviewer. They proxy the endpoint's `Submit`, `React`, `AppendNote`, and `AlertOwner` operations.
+- Like the stdio transport it advertises signalling tools by run phase: `submit_work`, `react`, and
+  `task_note` to a worker; `submit_review`, `task_note`, and `alert_owner` to a reviewer. They
+  proxy the endpoint's `Submit`, `React`, `AppendNote`, and `AlertOwner` operations. Both
+  transports compute `tools/list` from one function, so stdio providers (Codex, Grok) are offered
+  the same signals as Claude and never need a shell fallback. On stdio a signalling name outside
+  the last listed phase inventory is an unknown tool, as `submit_plan` is.
   `AlertOwner` writes one critical feed message to the owner as the reviewer capability's agent.
   None is idempotent: each accepted call writes another row. `alert_owner`, like `quorum post`,
   has no rate or count bound: a live reviewer capability can post any number of alerts, each up
@@ -263,6 +266,19 @@ the endpoint socket. Its limits are:
   serve`'s own embedded listener rather than a separately started one (see above); Codex and Grok
   launches still inject the stdio server, unaffected by this transport or the decision that added
   it.
+
+Every capability-bearing managed launch declares its role (`worker`, `reviewer`, or `planner`)
+at the runner boundary, which refuses to spawn unless the run's wiring is complete and its
+advertised tools cover the role's requirements in every phase the role can reach. Complete wiring
+is `QUORUM_REPO`, `QUORUM_AGENT`, `QUORUM_RUN_ID` (the bearer), and `QUORUM_AGENT_ENDPOINT`, plus
+`QUORUM_AGENT_MCP_URL` for Claude. The required tools are `submit_work`, `react`, and `task_note`
+for a worker (initial and rework); `submit_review`, `alert_owner`, `task_note`, and the reviewer
+GitHub tools for a reviewer; and `submit_plan` for a planner. A refusal is a `NonFailover`,
+`InvalidInput` runner failure that the caller's ordinary launch-failure path handles; worker and
+reviewer refusals are also logged and recorded in `errors` with source `agent_mcp_launch`, and a
+planner refusal is recorded as its failed `planner-spawn` decomposition attempt. A
+`Normal` launch carrying a run capability without a declared role is refused the same way, so no
+managed run can skip the check.
 
 The logical MCP server name is `quorum`, yielding client-visible names such as
 `mcp__quorum__pull_request_read`. The daemon injects only this per-run server into ordinary worker
@@ -352,7 +368,7 @@ A mismatched `owner`/`repo`/PR number is `forbidden_operation`. Reads page with 
 clipped per field, items that do not fit are counted in `items_omitted`, `get_diff` returns
 newline-aligned pages of at most 40 KiB of escaped diff text, and `truncated` marks any clipping.
 Review comments report `outdated` from the missing current-diff line; thread node ID and resolved
-state need GraphQL and arrive with the thread slice. A comment body is at most 32 KiB, non-blank,
+state need GraphQL and arrive with the thread slice (see `resolve_review_thread`). A comment body is at most 32 KiB, non-blank,
 NUL-free, and must close every code fence; it is posted from a JSON stdin document followed by a
 blank line and the hidden marker. Without `clientRequestId`, a comment's client request ID is a
 digest of its canonical request, so an identical retry returns the original operation; each read
@@ -407,6 +423,23 @@ comment ID is rejected.
 Only the current reviewer may resolve a thread returned by `pull_request_read`. The thread must
 belong to the bound PR. Workers cannot resolve findings against themselves. Unresolve is deferred
 until a concrete workflow needs it.
+
+Implemented bounds (delivery slice 5). Both tools are admitted into the outbox like
+`add_issue_comment`; role/phase gating is the endpoint's (a worker's resolve is
+`forbidden_operation`). Before any mutation, the executor lists the bound PR's review threads
+with one paged GraphQL read (at most 1,000 threads, 100 comment IDs per thread, and a
+1,000-character diff-hunk tail per thread; a larger listing fails closed). A `commentId` in none
+of those threads, including a comment on another PR or a general issue comment, fails unsent as
+`review_comment_not_found`; a `threadID` not on the bound PR fails unsent as
+`review_thread_not_found`. A lookup outage is retried as provably unsent. The reply goes to the
+thread's top-level comment through `POST pulls/{n}/comments/{id}/replies` with the operation
+marker appended; its result carries the reply ID and the thread's node ID, path, line, revision,
+original revision, diff-hunk context, resolved state, and outdated state. A possibly-sent reply is
+reconciled only by its exact marker among the root's replies; a possibly-sent resolve only by
+GitHub's resolved state, which is idempotent, so an already-resolved thread succeeds without a
+mutation. Otherwise the write stays ambiguous and is never re-sent. `get_review_comments` now
+joins each comment to its thread, adding `thread_id` and `resolved` and taking `outdated` from
+GitHub's thread state.
 
 ### `delivery_report_write`
 
