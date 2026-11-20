@@ -315,6 +315,7 @@ const ERR_ATTEMPT_REVOKED: &str = "attempt_revoked";
 const ERR_ATTEMPTS: &str = "attempts_exhausted";
 const ERR_INTERRUPTED: &str = "interrupted";
 const ERR_INTERRUPTED_AMBIGUOUS: &str = "interrupted_ambiguous";
+const ERR_REVIEW_PREDECESSOR: &str = "review_predecessor_failed";
 
 /// Fencing token for one claim. `attempt` is the row's `attempts` value
 /// immediately after this claim incremented it.
@@ -400,6 +401,14 @@ fn validate_error_kind(kind: &str) -> Result<()> {
 /// `queued -> running`, `active 0 -> 1`, stamping `claimed_at` and
 /// incrementing `attempts` via a guarded `UPDATE ... RETURNING`.
 ///
+/// Pending-review ordering: a row with a `review_sequence` is a candidate only
+/// when every lower sequence of its attempt has `succeeded` without
+/// `completed_after_revocation`; a queued, backing-off, or running predecessor
+/// blocks it even when it is otherwise due first. A failed, cancelled, or
+/// completed-after-revocation predecessor terminally fails its still-unsent
+/// dependents (`review_predecessor_failed`) in the same transaction, so they
+/// are never sent.
+///
 /// `Ok(None)` is the clean negative: nothing due, a lost race (zero guarded
 /// rows), or `SQLITE_CONSTRAINT_UNIQUE` on `github_agent_operations_one_active`.
 /// A post-timeout `SQLITE_BUSY` surfaces as [`QuorumError::Busy`].
@@ -432,6 +441,30 @@ pub fn claim_next(conn: &mut Connection, now: i64) -> Result<Option<ClaimedOpera
         now,
         crate::collaboration_admission::UNBOUNDED_GROUP_SWEEP,
     )?;
+    // A review-sequence row whose lower sequence terminally failed, was
+    // cancelled, or completed after revocation can never be sent: fail it
+    // (and so, transitively, every later sequence) while still provably unsent.
+    tx.execute(
+        "UPDATE github_agent_operations
+         SET state='failed', next_attempt_at=NULL, error_kind=?2,
+             error_summary='an earlier review-sequence operation did not succeed; never sent',
+             updated_at=?1
+         WHERE state='queued' AND active=0 AND review_sequence IS NOT NULL
+           AND execution_started_at IS NULL
+           AND send_state IN ('not_started','definitely_unsent')
+           AND EXISTS (
+               SELECT 1 FROM github_agent_operations p
+               WHERE p.attempt_id=github_agent_operations.attempt_id
+                 AND p.review_sequence<github_agent_operations.review_sequence
+                 AND (p.state IN ('failed','cancelled') OR p.completed_after_revocation=1)
+           )",
+        params![now, ERR_REVIEW_PREDECESSOR],
+    )
+    .map_err(map_sql_err)?;
+    // A review-sequence row is claimable only when every lower sequence is
+    // present and `succeeded` without post-revocation completion. Sequences
+    // are UNIQUE per attempt, so a count equal to the row's own sequence is
+    // that proof; a queued, backing-off, or running predecessor blocks it.
     let candidate: Option<i64> = tx
         .query_row(
             "SELECT o.id FROM github_agent_operations o
@@ -444,6 +477,12 @@ pub fn claim_next(conn: &mut Connection, now: i64) -> Result<Option<ClaimedOpera
                    SELECT 1 FROM run_capabilities c
                    WHERE c.run_id=a.active_run_id AND c.revoked_at IS NULL
                )
+               AND (o.review_sequence IS NULL OR o.review_sequence = (
+                   SELECT COUNT(*) FROM github_agent_operations p
+                   WHERE p.attempt_id=o.attempt_id
+                     AND p.review_sequence>=0 AND p.review_sequence<o.review_sequence
+                     AND p.state='succeeded' AND p.completed_after_revocation=0
+               ))
              ORDER BY COALESCE(o.next_attempt_at, o.created_at), o.id
              LIMIT 1",
             params![now, MAX_OPERATION_CLAIMS],
@@ -1341,6 +1380,274 @@ mod tests {
         let again = claim(&mut conn, 120);
         assert!(mark_execution_started(&mut conn, &again.claim, 121).unwrap());
         assert_eq!(get(&conn, "op-w").send_state, "ambiguous");
+    }
+
+    // ---- task #446: pending-review sequence gating ----
+
+    const REVIEW_WRITE: &str = "pull_request_review_write";
+    const INLINE: &str = "add_comment_to_pending_review";
+
+    /// Enqueue one review-sequence row at `created_at`. The storage primitive
+    /// takes the sequence directly, so these tests isolate claim gating from
+    /// admission (covered in `collaboration_admission`).
+    fn enqueue_review(conn: &mut Connection, op: &str, kind: &str, seq: i64, created_at: i64) {
+        let mut req = sample_request();
+        req.operation_id = op;
+        req.client_request_id = op;
+        req.kind = kind;
+        req.request_json = r#"{"body":"x"}"#;
+        req.review_sequence = Some(seq);
+        req.group_key = None;
+        req.created_at = created_at;
+        assert!(enqueue(conn, &req).unwrap());
+    }
+
+    /// create(0), inline(1), inline(2), submit(3) — enqueued newest-first so
+    /// the plain due order would pick the submit before its predecessors.
+    fn enqueue_review_sequence(conn: &mut Connection) {
+        enqueue_review(conn, "op-submit", REVIEW_WRITE, 3, 100);
+        enqueue_review(conn, "op-inline-2", INLINE, 2, 101);
+        enqueue_review(conn, "op-inline-1", INLINE, 1, 102);
+        enqueue_review(conn, "op-create", REVIEW_WRITE, 0, 103);
+    }
+
+    fn succeed(conn: &mut Connection, won: &ClaimedOperation, now: i64) {
+        assert!(mark_execution_started(conn, &won.claim, now).unwrap());
+        let ok = Settlement::Succeeded {
+            response_json: None,
+            remote_object_id: None,
+        };
+        assert!(settle(conn, &won.claim, ok, now).unwrap());
+    }
+
+    #[test]
+    fn review_rows_claim_only_after_every_lower_sequence_succeeds() {
+        let (mut conn, _dir) = test_conn();
+        enqueue_review_sequence(&mut conn);
+        // An unsequenced row is never gated by the review sequence.
+        enqueue_op(&mut conn, "op-read", READ_KIND);
+
+        let read = claim(&mut conn, 110);
+        assert_eq!(read.operation.operation_id, "op-read");
+        // The submit and inline rows are older but gated: create goes first.
+        let create = claim(&mut conn, 110);
+        assert_eq!(create.operation.operation_id, "op-create");
+        // Create running: nothing else is claimable.
+        assert!(claim_next(&mut conn, 110).unwrap().is_none());
+        succeed(&mut conn, &create, 111);
+
+        let inline1 = claim(&mut conn, 112);
+        assert_eq!(inline1.operation.operation_id, "op-inline-1");
+        // A backing-off predecessor blocks every later sequence.
+        let s = summary("gh api 502");
+        assert_eq!(
+            release_for_retry(&mut conn, &inline1.claim, 200, "transient", &s, true, 113).unwrap(),
+            RetryOutcome::Requeued {
+                next_attempt_at: 200
+            }
+        );
+        assert!(claim_next(&mut conn, 150).unwrap().is_none());
+        for op in ["op-inline-2", "op-submit"] {
+            let row = get(&conn, op);
+            assert_eq!((row.state.as_str(), row.attempts), ("queued", 0), "{op}");
+        }
+        let inline1 = claim(&mut conn, 200);
+        assert_eq!(inline1.operation.operation_id, "op-inline-1");
+        succeed(&mut conn, &inline1, 201);
+        let inline2 = claim(&mut conn, 202);
+        assert_eq!(inline2.operation.operation_id, "op-inline-2");
+        assert!(claim_next(&mut conn, 202).unwrap().is_none());
+        succeed(&mut conn, &inline2, 203);
+        let submit = claim(&mut conn, 204);
+        assert_eq!(submit.operation.operation_id, "op-submit");
+        succeed(&mut conn, &submit, 205);
+        assert!(claim_next(&mut conn, 206).unwrap().is_none());
+        assert_eq!(errors_rows(&conn), 0);
+    }
+
+    #[test]
+    fn failed_review_predecessor_fails_dependents_without_sending() {
+        let (mut conn, _dir) = test_conn();
+        enqueue_review_sequence(&mut conn);
+        let create = claim(&mut conn, 110);
+        succeed(&mut conn, &create, 111);
+        let inline1 = claim(&mut conn, 112);
+        let s = summary("rejected anchor");
+        assert!(settle(
+            &mut conn,
+            &inline1.claim,
+            Settlement::FailedUnsent {
+                error_kind: "github_rejected",
+                error_summary: &s
+            },
+            113
+        )
+        .unwrap());
+
+        assert!(claim_next(&mut conn, 114).unwrap().is_none());
+        for op in ["op-inline-2", "op-submit"] {
+            let row = get(&conn, op);
+            assert_eq!(
+                (row.state.as_str(), row.send_state.as_str(), row.attempts),
+                ("failed", "not_started", 0),
+                "{op}"
+            );
+            assert_eq!(row.error_kind.as_deref(), Some(ERR_REVIEW_PREDECESSOR));
+            assert!(row.claimed_at.is_none() && row.execution_started_at.is_none());
+        }
+        assert_eq!(get(&conn, "op-create").state, "succeeded");
+        assert_eq!(errors_rows(&conn), 0);
+    }
+
+    #[test]
+    fn cancelled_or_post_revocation_predecessor_fails_dependents() {
+        for poison in [
+            "state='cancelled'",
+            "state='succeeded', send_state='confirmed', completed_after_revocation=1",
+        ] {
+            let (mut conn, _dir) = test_conn();
+            enqueue_review_sequence(&mut conn);
+            conn.execute(
+                &format!(
+                    "UPDATE github_agent_operations SET {poison} WHERE operation_id='op-create'"
+                ),
+                [],
+            )
+            .unwrap();
+            assert!(claim_next(&mut conn, 110).unwrap().is_none(), "{poison}");
+            for op in ["op-inline-1", "op-inline-2", "op-submit"] {
+                let row = get(&conn, op);
+                assert_eq!(
+                    (row.state.as_str(), row.send_state.as_str(), row.attempts),
+                    ("failed", "not_started", 0),
+                    "{poison}: {op}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_review_predecessor_blocks_later_sequences() {
+        let (mut conn, _dir) = test_conn();
+        // Sequence 1 never enqueued: sequence 2 must not be claimable even
+        // after sequence 0 succeeds.
+        enqueue_review(&mut conn, "op-create", REVIEW_WRITE, 0, 100);
+        enqueue_review(&mut conn, "op-inline-2", INLINE, 2, 101);
+        let create = claim(&mut conn, 110);
+        succeed(&mut conn, &create, 111);
+        assert!(claim_next(&mut conn, 112).unwrap().is_none());
+        assert_eq!(get(&conn, "op-inline-2").state, "queued");
+    }
+
+    #[test]
+    fn real_process_review_claim_race_never_runs_a_sequence_early() {
+        const CHILD_DB: &str = "QUORUM_REVIEW_CLAIM_RACE_DB";
+        const INLINE_COUNT: i64 = 6;
+        const ROUNDS: usize = 6;
+        const CHILDREN: usize = 4;
+
+        if let Ok(path) = std::env::var(CHILD_DB) {
+            let mut conn = db::open(std::path::Path::new(&path)).unwrap();
+            // Rows with a higher sequence that were claimed (running or
+            // settled) while `seq` is still held by this child are a gate
+            // violation; lower rows must all be succeeded already.
+            let violations = |conn: &Connection, seq: i64| -> (i64, i64) {
+                conn.query_row(
+                    "SELECT
+                         COALESCE(SUM(review_sequence>?1 AND state<>'queued'),0),
+                         COALESCE(SUM(review_sequence<?1 AND state<>'succeeded'),0)
+                     FROM github_agent_operations WHERE review_sequence IS NOT NULL",
+                    [seq],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+            };
+            for _ in 0..20_000 {
+                match claim_next(&mut conn, 110).unwrap() {
+                    Some(won) => {
+                        if let Some(seq) = won.operation.review_sequence {
+                            assert_eq!(violations(&conn, seq), (0, 0), "claimed {seq} early");
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            assert_eq!(violations(&conn, seq), (0, 0), "overtook {seq}");
+                        }
+                        succeed(&mut conn, &won, 111);
+                        println!("child-claimed:{}", won.operation.operation_id);
+                    }
+                    None => {
+                        let open: i64 = conn
+                            .query_row(
+                                "SELECT COUNT(*) FROM github_agent_operations
+                                 WHERE state IN ('queued','running')",
+                                [],
+                                |r| r.get(0),
+                            )
+                            .unwrap();
+                        if open == 0 {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+            panic!("child did not drain the review sequence");
+        }
+
+        for round in 0..ROUNDS {
+            let (mut conn, dir) = test_conn();
+            // Enqueued newest-first so plain due order would invert them.
+            enqueue_review(&mut conn, "op-submit", REVIEW_WRITE, INLINE_COUNT + 1, 100);
+            for seq in (1..=INLINE_COUNT).rev() {
+                let op = format!("op-inline-{seq}");
+                enqueue_review(&mut conn, &op, INLINE, seq, 101);
+            }
+            enqueue_review(&mut conn, "op-create", REVIEW_WRITE, 0, 102);
+            enqueue_op(&mut conn, "op-read", READ_KIND);
+            drop(conn);
+
+            let test_name =
+                "github_operations::tests::real_process_review_claim_race_never_runs_a_sequence_early";
+            let children: Vec<_> = (0..CHILDREN)
+                .map(|_| {
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact", test_name, "--nocapture"])
+                        .env(CHILD_DB, dir.path().join("q.db"))
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .unwrap()
+                })
+                .collect();
+            let mut claimed = Vec::new();
+            for child in children {
+                let out = child.wait_with_output().unwrap();
+                assert!(
+                    out.status.success(),
+                    "round {round} child failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    if let Some(op) = line.strip_prefix("child-claimed:") {
+                        claimed.push(op.to_string());
+                    }
+                }
+            }
+            claimed.sort();
+            let total = usize::try_from(INLINE_COUNT).unwrap() + 3;
+            assert_eq!(claimed.len(), total, "round {round}: {claimed:?}");
+            claimed.dedup();
+            assert_eq!(claimed.len(), total, "round {round}: double claim");
+
+            let conn = db::open(&dir.path().join("q.db")).unwrap();
+            for row in list_all(&conn).unwrap() {
+                assert_eq!(
+                    (row.state.as_str(), row.attempts),
+                    ("succeeded", 1),
+                    "round {round}: {}",
+                    row.operation_id
+                );
+            }
+            assert_eq!(errors_rows(&conn), 0, "round {round}");
+        }
     }
 
     #[test]

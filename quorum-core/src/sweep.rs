@@ -864,6 +864,10 @@ pub fn sweep_on_write(conn: &Connection, now: i64, limit: usize) -> Result<()> {
     // effect. Runs before task reclamation so a freed task is GC-able now.
     // A dead run's still-`active` attempt is terminalized first, so its group
     // becomes reclaimable here instead of pinning capacity and task GC.
+    // Because only `completed`/`revoked` parents are eligible, a reviewer's
+    // review-sequence predecessors and their idempotency identities stay
+    // durable until verdict admission completes the attempt or revocation
+    // makes that admission impossible.
     crate::collaboration_admission::revoke_dead_run_attempts(
         conn,
         now,
