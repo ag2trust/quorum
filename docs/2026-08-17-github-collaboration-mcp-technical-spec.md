@@ -311,7 +311,7 @@ inventory fresh from the bearer on every request, so a phase change is simply re
 time the client lists or calls tools, with no push notification. On the stdio transport (Codex,
 Grok, and `quorum agent-mcp` run manually without `--listen`), the server instead pushes
 `notifications/tools/list_changed` once it observes the phase change, via the `notify_phase_changes`
-background task (`quorum/src/agent_mcp.rs:1313-1330`, exercised by `quorum/tests/agent_mcp.rs:557`).
+background task (`quorum/src/agent_mcp.rs:1511-1528`, exercised by `quorum/tests/agent_mcp.rs:557`).
 That push is a liveness aid for a long-lived stdio client, not an authorization gate — the
 endpoint re-checks every call against the live phase regardless of whether the client has
 relisted.
