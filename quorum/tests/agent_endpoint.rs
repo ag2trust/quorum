@@ -480,6 +480,45 @@ fn daemon_endpoint_is_bounded_authoritative_and_torn_down() {
         "rejected calls wrote notes"
     );
 
+    // The pending-review tools reach admission over the real socket: the
+    // worker is forbidden, and a reviewer's non-COMMENT submit or foreign
+    // commit is a typed refusal, never `operation_unavailable`.
+    let review_write = |capability: &str, arguments: Value| {
+        let mut arguments = arguments;
+        arguments["owner"] = json!("test");
+        arguments["repo"] = json!("repo");
+        arguments["pullNumber"] = json!(77);
+        exchange(
+            &endpoint,
+            &request(
+                capability,
+                json!({"type":"protocol","operation":"pull_request_review_write",
+                       "arguments":arguments}),
+            ),
+        )
+    };
+    for (capability, arguments, code) in [
+        (
+            "worker-cap",
+            json!({"method":"create","commitID":"a".repeat(40)}),
+            "forbidden_operation",
+        ),
+        (
+            "reviewer-cap",
+            json!({"method":"submit_pending","event":"REQUEST_CHANGES","body":"no"}),
+            "review_event_unsupported",
+        ),
+        (
+            "reviewer-cap",
+            json!({"method":"create","commitID":"b".repeat(40)}),
+            "review_commit_mismatch",
+        ),
+    ] {
+        let refused = review_write(capability, arguments);
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["error"]["code"], code, "{refused}");
+    }
+
     // The planner tool's wire shape must reach the endpoint's SubmitPlan
     // operation over the real socket: an unknown capability is rejected by the
     // planner authority resolver, not discarded as a malformed request. A

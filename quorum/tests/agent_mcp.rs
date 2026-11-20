@@ -513,7 +513,12 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
         "tools/call",
         json!({"name":"pull_request_review_write","arguments":{}}),
     );
-    assert_tool_error(&forbidden, "tool is forbidden for the current run phase");
+    // Admitted GitHub tools relay the endpoint's own typed refusal.
+    assert_eq!(forbidden["result"]["isError"], true, "{forbidden:#}");
+    assert_eq!(
+        serde_json::from_str::<Value>(tool_text(&forbidden)).unwrap()["code"],
+        "forbidden_operation"
+    );
     let initial_read = worker.request(
         10,
         "tools/call",
@@ -684,6 +689,54 @@ fn stdio_shell_is_tools_only_live_scoped_and_performs_no_github_work() {
             }
         ])
     );
+    // The pending-review tools are admitted by the endpoint now; a call it
+    // refuses comes back as that typed code, never `operation_unavailable`.
+    let target = json!({"owner":"test","repo":"repo","pullNumber":77});
+    for (id, name, arguments, code) in [
+        (
+            30,
+            "pull_request_review_write",
+            json!({"method":"submit_pending","event":"APPROVE","body":"lgtm"}),
+            "review_event_unsupported",
+        ),
+        (
+            31,
+            "pull_request_review_write",
+            json!({"method":"create","commitID":"b".repeat(40)}),
+            "review_commit_mismatch",
+        ),
+        (
+            32,
+            "pull_request_review_write",
+            json!({"method":"delete_pending"}),
+            "review_method_unsupported",
+        ),
+        (
+            33,
+            "add_comment_to_pending_review",
+            json!({"path":"src/lib.rs","line":1,"side":"RIGHT","subjectType":"FILE",
+                   "body":"finding"}),
+            "invalid_operation",
+        ),
+    ] {
+        let mut arguments = arguments;
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(target.as_object().unwrap().clone());
+        if name == "add_comment_to_pending_review" {
+            // An unknown field is refused before any diff is read.
+            arguments["unknown"] = json!(true);
+        }
+        let refused =
+            reviewer.request(id, "tools/call", json!({"name":name,"arguments":arguments}));
+        assert_eq!(refused["result"]["isError"], true, "{refused:#}");
+        assert_eq!(
+            serde_json::from_str::<Value>(tool_text(&refused)).unwrap()["code"],
+            code,
+            "{refused:#}"
+        );
+    }
     let wrong_role = reviewer.request(
         3,
         "tools/call",

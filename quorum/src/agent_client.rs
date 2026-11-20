@@ -50,6 +50,8 @@ enum Operation<'a> {
         feedback_json: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         blocking: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        publication_failure: Option<&'a str>,
     },
     React {
         state: &'a str,
@@ -95,6 +97,9 @@ pub struct Submit<'a> {
     pub feedback: Option<&'a str>,
     pub feedback_json: Option<&'a str>,
     pub blocking: Option<u32>,
+    /// Reviewer only: the typed reason (`operation_failed`) a verdict is
+    /// submitted although the run's pending COMMENT review did not publish.
+    pub publication_failure: Option<&'a str>,
 }
 
 pub struct AppendNote<'a> {
@@ -113,6 +118,7 @@ pub fn submit(request: Submit<'_>) -> Result<i64> {
             feedback: request.feedback,
             feedback_json: request.feedback_json,
             blocking: request.blocking,
+            publication_failure: request.publication_failure,
         },
     )?)
 }
@@ -202,6 +208,7 @@ pub fn submit_at(endpoint: &Path, request: Submit<'_>) -> Result<SignalOutcome> 
             feedback: request.feedback,
             feedback_json: request.feedback_json,
             blocking: request.blocking,
+            publication_failure: request.publication_failure,
         },
         mailbox_id,
     )
@@ -267,7 +274,7 @@ fn signal_at(
 fn exchange(capability: &str, operation: Operation<'_>) -> Result<ResponseResult> {
     match exchange_at(&endpoint()?, capability, operation)? {
         Ok(result) => Ok(result),
-        Err(error) => endpoint_rejection(error.code),
+        Err(error) => endpoint_rejection(error.code, &error.message),
     }
 }
 
@@ -361,11 +368,21 @@ fn message_seq(result: ResponseResult) -> Result<i64> {
     }
 }
 
-fn endpoint_rejection<T>(code: String) -> Result<T> {
+/// Map an endpoint refusal to the CLI exit-code contract. Authority, input,
+/// and pending-review/verdict-guard refusals recorded nothing and are the
+/// caller's to correct (exit 2), and a verdict-guard refusal carries the
+/// endpoint's guidance. Anything else, including a daemon-side or GitHub
+/// fault such as `review_head_unavailable`, is an internal failure (exit 3).
+fn endpoint_rejection<T>(code: String, message: &str) -> Result<T> {
     match code.as_str() {
         "unauthorized" | "invalid_operation" | "forbidden_operation" | "operation_unavailable" => {
             Err(QuorumError::Usage(format!(
                 "agent endpoint rejected managed completion: {code}"
+            )))
+        }
+        review if crate::serve::agent_endpoint::REVIEW_REFUSAL_CODES.contains(&review) => {
+            Err(QuorumError::Usage(format!(
+                "agent endpoint rejected managed completion: {code}: {message}"
             )))
         }
         _ => Err(QuorumError::Io(format!(
@@ -438,6 +455,52 @@ mod tests {
         (db_path, repo_dir)
     }
 
+    #[test]
+    fn endpoint_refusals_follow_the_exit_code_contract() {
+        let exit = |code: &str| {
+            endpoint_rejection::<()>(code.into(), "guidance")
+                .unwrap_err()
+                .exit_code()
+        };
+        for code in crate::serve::agent_endpoint::REVIEW_REFUSAL_CODES {
+            assert_eq!(exit(code), 2, "{code}");
+            let message = endpoint_rejection::<()>(code.into(), "publish first")
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(code) && message.contains("publish first"));
+        }
+        for code in ["unauthorized", "invalid_operation", "forbidden_operation"] {
+            assert_eq!(exit(code), 2, "{code}");
+        }
+        for code in [
+            "review_head_unavailable",
+            "review_diff_unavailable",
+            "internal",
+        ] {
+            assert_eq!(exit(code), 3, "{code}");
+        }
+    }
+
+    #[test]
+    fn reviewer_publication_failure_is_sent_only_when_present() {
+        let encode = |publication_failure| {
+            serde_json::to_value(Operation::Submit {
+                summary: None,
+                verdict: Some("approved"),
+                feedback: None,
+                feedback_json: None,
+                blocking: Some(0),
+                publication_failure,
+            })
+            .unwrap()
+        };
+        assert!(encode(None).get("publication_failure").is_none());
+        assert_eq!(
+            encode(Some("operation_failed"))["publication_failure"],
+            "operation_failed"
+        );
+    }
+
     fn plan_task(key: &str, path: &str, prerequisites: Vec<&str>) -> serde_json::Value {
         json!({
             "key": key,
@@ -467,6 +530,13 @@ mod tests {
             "test/repo",
             &repo_dir,
             crate::serve::planner::WritablePathResolver::default(),
+            std::sync::Arc::new(crate::serve::agent_endpoint::RepositoryReviewEvidence::new(
+                &repo_dir,
+                "test/repo",
+                std::sync::Arc::new(
+                    crate::serve::repository_service::FakeRepositoryService::scripted([]),
+                ),
+            )),
         )
         .await
         .unwrap();
