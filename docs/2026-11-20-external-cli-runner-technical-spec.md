@@ -83,7 +83,7 @@ Two adjacent gaps make this worse:
 | **Outcome** | What a terminal status means to Quorum: `success`, `blocked`, `failure`, or `cancelled`. |
 | **Access level** | `read-write`, `read-only`, or `restricted`, derived from the launch (see "Access levels"). |
 | **Slot** | The role position a session belongs to: `worker`, `reviewer-r1`, or `reviewer-r2`. These are the positions that already keep a continuation (`quorum-core/src/runner_state.rs:10-12`). |
-| **Session file** | `<state dir>/sessions/<task id>/<slot>/session`. Written by runs; untrusted; never read by the daemon. |
+| **Session file** | `<session_base>/<task id>/<slot>/session`. Written by runs; untrusted; never read by the daemon. |
 | **Session record** | Quorum's durable record of a slot's session, in task refs (see "Session record"). |
 | **Resume** | A run started with an existing session file and a short continuation prompt. |
 | **Fresh start** | A run started after the daemon has removed the session file, with the full role prompt. |
@@ -494,23 +494,40 @@ Sessions are enabled when `args_session` is declared. They apply only to slot ru
 ### Layout
 
 ```
-<state dir>/sessions/<task id>/<slot>/session
+<session_base>/<task id>/<slot>/session
 ```
 
-The state directory is the per-repository directory that holds `quorum.db`
-(`quorum/src/paths.rs:86-89`). This amends the clone-mode spec's "session directory"
+`session_base` is a new serve configuration key, beside `worktree_base`:
+
+```toml
+# Root of per-task session directories. Absolute. Default: <state dir>/sessions, where the state
+# directory is the per-repository directory that holds quorum.db. Restart-only.
+# session_base = "/srv/quorum/tasks/sessions"
+```
+
+An operator can put sessions on a different filesystem from the database, so that runs filling
+their session files cannot fill the volume Quorum's own state lives on. Startup refuses
+(exit 2) a `session_base` that is not absolute, that equals or is inside `worktree_base`, or
+that contains `worktree_base` or the state directory. Startup creates it with mode `0700` if it
+is missing, and refuses it if it is a symlink or not a directory. `session_base` is
+registered as restart-only in the reload dispositions. Changing it between restarts abandons
+existing sessions: their records stay, the files are not found (condition 3 below), and each
+slot's next run is a fresh start. Startup removal (see "Daemon rules") runs only under the
+current `session_base`.
+
+This amends the clone-mode spec's "session directory"
 (`docs/2026-11-12-sandboxed-workspace-technical-spec.md:87, 668`): it remains per task and outside
 every workspace, and it is partitioned per slot. The launcher seam receives the slot directory,
 not the task directory. The path does not depend on the workspace mode.
 
 Partitioning matters only where runs are confined. A confined run gets one slot directory, so a
 reviewer cannot read or alter the worker's conversation. Under the local launcher every run has
-the daemon's user and can reach the whole state directory. There, partitioning prevents
+the daemon's user and can reach the whole state directory and `session_base`. There, partitioning prevents
 accidents, not attacks.
 
 ### Daemon rules
 
-- The daemon creates `sessions/`, `<task id>/`, and `<slot>/` with mode `0700`. Each component
+- The daemon creates `<task id>/` and `<slot>/` under `session_base` with mode `0700`. Each component
   must be a real directory, checked with `lstat` and opened with `O_NOFOLLOW | O_DIRECTORY`.
   A symlink or a non-directory anywhere fails the launch with `NonFailover`.
 - The daemon never opens, reads, parses, copies, or hashes the session file. The only operations
@@ -521,7 +538,7 @@ accidents, not attacks.
 - A fresh start removes the file first. If it is a directory, the daemon removes it with the
   symlink-safe recursive removal of the clone-mode spec ("9. Cleanup"). If removal fails, the
   launch fails with `NonFailover`.
-- The task's whole `sessions/<task id>/` tree is removed, with the same symlink-safe removal, when
+- The task's whole `<session_base>/<task id>/` tree is removed, with the same symlink-safe removal, when
   the task becomes `done` or `cancelled`, or is closed with `task-close`. Startup removes trees
   whose task is terminal or does not exist. Parked and failed tasks keep theirs.
 - Quorum does not bound session file size. The operator, or the confinement around the run,
@@ -663,6 +680,7 @@ unreachable. Two pieces reach every daemon:
   - every validation rule has a refusal test;
   - a declaration copied from the example loads;
   - a reload that changes `[external_runner]` is rejected, and the old declaration stays.
+  - each `session_base` refusal; the default path; a changed `session_base` gives fresh starts.
 - **Runner identity:**
   - an external profile whose model is `gpt-5` launches the external adapter;
   - a built-in profile with a mismatched model is still refused at launch;
@@ -714,8 +732,8 @@ unreachable. Two pieces reach every daemon:
 Each slice can be reviewed on its own and leaves the default path unchanged.
 
 1. **Runner identity and configuration.** `LaunchRequest.runner` and every derivation site,
-   `RunnerKind::External`, `[external_runner]` parsing and validation, and the reload
-   disposition. Nothing launches yet. This is the largest slice.
+   `RunnerKind::External`, `[external_runner]` and `session_base` parsing and validation, and
+   their reload dispositions. Nothing launches yet. This is the largest slice.
 2. **Session store.** The directory layout, the no-follow helpers, and terminal-task and startup
    removal. No run uses it yet.
 3. **Adapter and stream mapping.** `AgentKind::External`, `RunnerProc::External`, argv,
