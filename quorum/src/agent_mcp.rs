@@ -240,7 +240,18 @@ impl ProtocolOperation {
                 false,
             ),
             Self::AddReplyToPullRequestComment => (
-                "Reply in an existing review-comment thread on the bound pull request.",
+                "Reply inside an existing review-comment thread on the pull request bound to \
+                 this managed run; owner, repo, and pullNumber must name exactly that pull \
+                 request. commentId is the numeric ID of any review comment in the thread (from \
+                 pull_request_read get_review_comments); the daemon resolves it to its thread on \
+                 the bound pull request before publishing and replies through GitHub's \
+                 review-comment reply endpoint, so the reply stays in that thread. A comment on \
+                 another pull request, a general issue comment, or an unknown ID fails with \
+                 review_comment_not_found and nothing is posted. The body is posted byte for byte \
+                 (at most 32768 bytes, every code fence closed) followed by a hidden daemon \
+                 marker. The result carries the reply id and its thread: id, path, line, \
+                 revision, nearby diff context, resolved, and outdated. An identical retry \
+                 returns the original reply; github_outcome_unknown means it may already exist.",
                 github_schema(
                     json!({
                         "owner": bounded_string(1, 100),
@@ -255,7 +266,12 @@ impl ProtocolOperation {
                 false,
             ),
             Self::ResolveReviewThread => (
-                "Resolve a review thread on the bound pull request as the current reviewer.",
+                "Resolve one review thread on the pull request bound to this reviewer run. \
+                 threadID is the thread node ID that pull_request_read get_review_comments \
+                 reports as thread_id (or that a reply or inline finding returned). The daemon \
+                 checks the thread belongs to the bound pull request before resolving it; any \
+                 other thread fails with review_thread_not_found. Resolving an already-resolved \
+                 thread succeeds without change. Unresolve is not available.",
                 github_schema(
                     json!({
                         "threadID": bounded_string(1, 256),
@@ -780,6 +796,8 @@ impl OperationView {
                 "github_outcome_unknown" => "the write may already have reached GitHub and is never re-sent; check the pull request before posting again with a new clientRequestId",
                 "github_invalid_response" => "GitHub returned a response the daemon could not accept",
                 "github_operation_cancelled" => "the operation was cancelled before it was sent",
+                "review_comment_not_found" => "the comment is not a review comment on the bound pull request; nothing was posted",
+                "review_thread_not_found" => "the review thread is not on the bound pull request; nothing was changed",
                 _ => "the GitHub operation failed",
             };
             let retrying = matches!(self.state.as_str(), "queued" | "running");
@@ -999,10 +1017,8 @@ impl QuorumServer {
         }
     }
 
-    /// Admit one `pull_request_read`, `add_issue_comment`,
-    /// `pull_request_review_write`, or `add_comment_to_pending_review` call,
-    /// then wait up
-    /// to [`OPERATION_WAIT`] for the daemon executor by polling the same
+    /// Admit one GitHub collaboration tool call, then wait up to
+    /// [`OPERATION_WAIT`] for the daemon executor by polling the same
     /// operation through `github_operation_read`. The endpoint owns every
     /// authority, target, and bound decision; its rejection is relayed with
     /// its own code and message.
@@ -1456,6 +1472,8 @@ impl ServerHandler for QuorumServer {
                 | ProtocolOperation::AddIssueComment
                 | ProtocolOperation::PullRequestReviewWrite
                 | ProtocolOperation::AddCommentToPendingReview
+                | ProtocolOperation::AddReplyToPullRequestComment
+                | ProtocolOperation::ResolveReviewThread
         ) {
             return Ok(self
                 .github_operation(&capability, operation, request.arguments)
