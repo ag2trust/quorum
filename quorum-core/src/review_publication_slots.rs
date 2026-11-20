@@ -286,6 +286,17 @@ pub fn get(
     load_status(conn, scope.as_str(), pr_number)
 }
 
+/// Non-transactional read of the slot an attempt owns or is cleaning up.
+pub fn for_attempt(conn: &Connection, attempt_id: &str) -> Result<Option<SlotStatus>> {
+    let sql =
+        format!("SELECT {STATUS_COLUMNS} FROM github_review_publication_slots WHERE attempt_id=?1");
+    conn.query_row(&sql, [attempt_id], status_from_row)
+        .optional()
+        .map_err(map_sql_err)?
+        .map(SlotStatusRaw::into_status)
+        .transpose()
+}
+
 /// Daemon-only read of the owner marker an attempt's create/submit body
 /// carries. Never route the result to an agent-facing surface.
 pub fn owner_marker_for_attempt(
