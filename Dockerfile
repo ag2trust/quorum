@@ -68,6 +68,9 @@ LABEL org.opencontainers.image.source="https://github.com/ag2trust/quorum" \
       org.opencontainers.image.licenses="MIT AND Apache-2.0" \
       org.opencontainers.image.description="Self-hostable Quorum runtime"
 
+# QUORUM_HOME is daemon-home authority for `quorum init`/`serve`/`web` only;
+# every managed provider spawn strips it (and any GitHub credential) before
+# exec, so it never reaches agent runtime input. See docker/entrypoint.sh.
 ENV HOME=/home/quorum \
     QUORUM_HOME=/data/quorum \
     PATH=/opt/codex/bin:/usr/local/bin:/usr/bin:/bin

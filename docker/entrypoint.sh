@@ -22,6 +22,12 @@ case "$QUORUM_REPO" in
 esac
 export QUORUM_REPO
 
+# QUORUM_HOME/QUORUM_REPO below are exported for this supervisor's own
+# children (`quorum init`, `quorum serve`, `quorum web`) only. They are
+# daemon-home and identity authority, not agent runtime input: the managed-run
+# environment policy in quorum/src/serve/runner.rs strips QUORUM_HOME (and any
+# GitHub credential this process inherits) from every spawned provider
+# process, regardless of what this shell exports.
 QUORUM_HOME=${QUORUM_HOME:-/data/quorum}
 REPO_DIR=${QUORUM_REPO_DIR:-/data/repos/project}
 WORKTREE_BASE=${QUORUM_WORKTREE_BASE:-/data/worktrees}

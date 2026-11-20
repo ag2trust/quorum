@@ -1,5 +1,11 @@
 # Fresh public-image routing. The image bundles Codex, so every managed role
 # must select that runner unless the operator supplies an existing config.
+# This is agent-facing provider config read by every managed role: it must
+# never carry a GitHub credential or a Quorum database path. `ModelProfile`
+# (quorum/src/serve_config.rs) rejects unknown fields, so no such value can be
+# added here without failing config parsing; docker/content-verify.sh also
+# scans the shipped copy of this file for credential-like and DB-path
+# content.
 [model_profiles.codex]
 runner = "codex"
 model = "gpt-5.6-terra"
