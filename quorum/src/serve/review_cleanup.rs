@@ -389,6 +389,28 @@ impl ReviewPublication {
         }
     }
 
+    /// R1→R2 handoff: end the retiring R1 run's publication authority before
+    /// R2's barrier probes. The run capability is revoked, its attempt is
+    /// terminalized, and its `owned` slot becomes `cleanup_required` in one
+    /// transaction, so the R2 barrier's inline cleanup can claim it at once
+    /// (never attaching R2 to R1's draft). Failures are logged: the barrier
+    /// then waits and R2 is retried from Phase 5, as before. No verdict,
+    /// lifecycle, or budget effect.
+    pub async fn retire_for_handoff(&self, r1_run_id: &str) {
+        let run_id = r1_run_id.to_string();
+        let result = self
+            .db(move |conn| {
+                review_publication_slots::retire_owner_for_handoff(conn, &run_id, now_unix())
+            })
+            .await;
+        if let Err(error) = result {
+            log(&format!(
+                "review publication: could not end R1 run {r1_run_id}'s publication \
+                 authority before the R2 handoff: {error}"
+            ));
+        }
+    }
+
     /// Give back a cleared probe claim whose provision never reached a
     /// successful [`Self::bind`]. The slot was never owned, so the core
     /// deletes it and the next provision repeats the fresh probe. Failures
@@ -1056,10 +1078,22 @@ mod tests {
             h.slot().unwrap().attempt_id.as_deref(),
             Some(r1_attempt.as_str())
         );
-        // R1 is torn down after its verdict (capability revoked, no
-        // restart): the R2 barrier cleans R1's draft-free slot inline, then
-        // probes fresh, and R2 owns the slot under a new marker.
-        h.retire_reviewer("run-r1");
+        // The R2 gate ends live R1's publication authority before it
+        // provisions R2 (no restart, R1's run still open): the R2 barrier
+        // cleans R1's draft-free slot inline, then probes fresh, and R2 owns
+        // the slot under a new marker.
+        publication.retire_for_handoff("run-r1").await;
+        let slot = h.slot().unwrap();
+        assert_eq!(slot.state, SlotState::CleanupRequired, "{slot:?}");
+        let revoked: Option<i64> = h
+            .conn()
+            .query_row(
+                "SELECT revoked_at FROM run_capabilities WHERE run_id='run-r1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(revoked.is_some(), "R1's capability is fenced");
         let service = Arc::new(FakeRepositoryService::scripted([
             FakeOutcome::Apply, // cleanup: list (empty, create never sent)
             FakeOutcome::Apply, // fresh probe: list
@@ -1080,6 +1114,219 @@ mod tests {
         assert_ne!(h.marker(&r2_attempt), h.marker(&r1_attempt));
         // Then the full restart path for the R2 reviewer.
         orphan_cleaned_before_next_reviewer("run-r2", "Reviewer-R2").await;
+    }
+
+    #[tokio::test]
+    async fn r1_handoff_cancels_unsent_r1_create_and_r2_never_attaches_to_it() {
+        let h = Harness::new();
+        let r1_attempt = provision_first(&h, "run-r1", "Reviewer-R1").await;
+        // R1 enqueued its create but it was never sent.
+        let now = now_unix();
+        let request = quorum_core::github_operations::NewGithubOperation {
+            operation_id: "op-r1-create",
+            client_request_id: "create",
+            attempt_id: &r1_attempt,
+            created_by_run_id: "run-r1",
+            task_id: TASK,
+            agent: "Reviewer-R1",
+            role: "reviewer",
+            pr_number: PR,
+            head_sha: Some(SHA),
+            reviewer_launch_sha: Some(SHA),
+            lifecycle_generation: Some(0),
+            kind: "pull_request_review_write",
+            request_json: r#"{"method":"create"}"#,
+            deadline_at: now + 1_800,
+            review_sequence: Some(0),
+            group_key: None,
+            github_marker: None,
+            created_at: now,
+            expires_at: now + 3_600,
+        };
+        assert!(quorum_core::github_operations::enqueue(&mut h.conn(), &request).unwrap());
+        let before = h.lifecycle_snapshot();
+        let service = Arc::new(FakeRepositoryService::scripted([
+            FakeOutcome::Apply, // cleanup: list (empty; create never sent)
+            FakeOutcome::Apply, // fresh probe: list
+        ]));
+        let publication = h.publication(service.clone());
+        publication.retire_for_handoff("run-r1").await;
+        let op_state: String = h
+            .conn()
+            .query_row(
+                "SELECT state FROM github_agent_operations WHERE operation_id='op-r1-create'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(op_state, "cancelled", "R1's unsent create can never send");
+        let Barrier::Clear(claim) = publication.probe_before_provision(TASK, PR).await.unwrap()
+        else {
+            panic!("the R2 barrier clears after R1's slot is cleaned");
+        };
+        assert_eq!(mutations(&service), vec!["list", "list"]);
+        h.live_reviewer("run-r2", "Reviewer-R2", SHA);
+        assert!(publication.bind(claim, "run-r2").await.unwrap());
+        assert_ne!(h.attempt_for_run("run-r2"), r1_attempt);
+        assert_eq!(h.lifecycle_snapshot(), before);
+        // Idempotent, and a run without a slot is a clean negative.
+        let retired =
+            review_publication_slots::retire_owner_for_handoff(&mut h.conn(), "run-r1", now_unix())
+                .unwrap();
+        assert!(!retired);
+    }
+
+    /// Drive a probe-phase GitHub outage until the shared bound blocks the
+    /// slot.
+    async fn exhaust_probe_outage(h: &Harness) {
+        let service = Arc::new(FakeRepositoryService::scripted(
+            (0..review_publication_slots::MAX_SLOT_CYCLES).map(|_| FakeOutcome::timeout()),
+        ));
+        let publication = h.publication(service.clone());
+        for cycle in 1..=review_publication_slots::MAX_SLOT_CYCLES {
+            h.conn()
+                .execute(
+                    "UPDATE github_review_publication_slots SET next_cleanup_at=0
+                     WHERE state='probing'",
+                    [],
+                )
+                .unwrap();
+            let barrier = publication.probe_before_provision(TASK, PR).await.unwrap();
+            if cycle < review_publication_slots::MAX_SLOT_CYCLES {
+                assert!(matches!(barrier, Barrier::Wait(_)), "cycle {cycle}");
+            } else {
+                assert!(matches!(barrier, Barrier::Blocked(_)), "cycle {cycle}");
+            }
+        }
+        let slot = h.slot().unwrap();
+        assert_eq!(slot.state, SlotState::Blocked);
+        assert_eq!(
+            slot.error_kind.as_deref(),
+            Some(SlotBlockReason::RetryExhausted.as_str())
+        );
+        assert_eq!(
+            service.calls().len(),
+            review_publication_slots::MAX_SLOT_CYCLES as usize
+        );
+    }
+
+    fn park_for_slot(h: &Harness, task_id: i64) {
+        assert!(quorum_core::tasks::park(
+            &mut h.conn(),
+            task_id,
+            "R1 reviewer not provisioned: publication slot blocked",
+            "in-review",
+            now_unix(),
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    #[tokio::test]
+    async fn owner_retry_of_parked_task_resets_a_blocked_slot_once() {
+        let h = Harness::new();
+        exhaust_probe_outage(&h).await;
+        park_for_slot(&h, TASK);
+        // A daemon auto-retry never resets the slot: still blocked.
+        assert!(
+            quorum_core::tasks::retry_parked(&mut h.conn(), TASK, "daemon", false, now_unix())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(h.slot().unwrap().state, SlotState::Blocked);
+        let service = Arc::new(FakeRepositoryService::scripted([]));
+        let publication = h.publication(service.clone());
+        assert!(matches!(
+            publication.probe_before_provision(TASK, PR).await.unwrap(),
+            Barrier::Blocked(_)
+        ));
+        assert!(service.calls().is_empty());
+
+        // The owner's retry after repair: one fresh generation on the same
+        // slot, no new slot, marker, attempt, or review.
+        park_for_slot(&h, TASK);
+        assert!(
+            quorum_core::tasks::retry_parked(&mut h.conn(), TASK, "owner", true, now_unix())
+                .unwrap()
+                .is_some()
+        );
+        let slot = h.slot().unwrap();
+        assert_eq!(slot.state, SlotState::Probing);
+        assert_eq!(slot.task_id, TASK);
+        assert_eq!(slot.cleanup_attempts, 0);
+        assert!(slot.error_kind.is_none());
+        assert!(slot.attempt_id.is_none());
+        let service = Arc::new(FakeRepositoryService::scripted([FakeOutcome::Apply]));
+        let publication = h.publication(service.clone());
+        let Barrier::Clear(claim) = publication.probe_before_provision(TASK, PR).await.unwrap()
+        else {
+            panic!("an empty listing clears the reset slot");
+        };
+        assert_eq!(claim.cycle, 1, "a fresh bounded generation");
+        assert_eq!(mutations(&service), vec!["list"]);
+        let slots: i64 = h
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM github_review_publication_slots",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(slots, 1);
+        let reviews: usize = service.reviews().reviews.len();
+        assert_eq!(reviews, 0, "the retry never creates a review");
+    }
+
+    #[tokio::test]
+    async fn owner_retry_reset_rebinds_the_waiting_task_and_a_foreign_draft_reblocks() {
+        let h = Harness::new();
+        exhaust_probe_outage(&h).await;
+        // A later task on the same PR is the one parked on the slot.
+        const LATER: i64 = 32;
+        h.conn()
+            .execute(
+                "INSERT INTO tasks(id,title,status,created_by,created_at,updated_at,refs)
+                 VALUES (?1,'review again','in-review','owner',1,1,?2)",
+                rusqlite::params![LATER, serde_json::json!({ "pr": PR }).to_string()],
+            )
+            .unwrap();
+        park_for_slot(&h, LATER);
+        assert!(
+            quorum_core::tasks::retry_parked(&mut h.conn(), LATER, "owner", true, now_unix())
+                .unwrap()
+                .is_some()
+        );
+        let slot = h.slot().unwrap();
+        assert_eq!(slot.state, SlotState::Probing);
+        assert_eq!(slot.task_id, LATER, "waiting-task pointer rebound");
+        // The earlier task no longer owns the slot's next probe.
+        let publication = h.publication(Arc::new(FakeRepositoryService::scripted([])));
+        assert!(matches!(
+            publication.probe_before_provision(TASK, PR).await.unwrap(),
+            Barrier::Wait(_)
+        ));
+        // A human left a draft meanwhile: the reset slot re-blocks, no delete.
+        let mut store = FakeReviewStore::default();
+        let foreign = store.seed_pending(pr(), SHA, "a human's unfinished review");
+        let service =
+            Arc::new(FakeRepositoryService::scripted([FakeOutcome::Apply]).with_reviews(store));
+        let publication = h.publication(service.clone());
+        assert!(matches!(
+            publication.probe_before_provision(LATER, PR).await.unwrap(),
+            Barrier::Blocked(_)
+        ));
+        let slot = h.slot().unwrap();
+        assert_eq!(slot.state, SlotState::Blocked);
+        assert_eq!(
+            slot.error_kind.as_deref(),
+            Some(SlotBlockReason::ForeignDraft.as_str())
+        );
+        assert_eq!(mutations(&service), vec!["list"]);
+        assert!(service
+            .reviews()
+            .reviews
+            .iter()
+            .any(|r| r.record.id == foreign));
     }
 
     #[tokio::test]

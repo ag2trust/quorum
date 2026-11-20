@@ -14737,6 +14737,16 @@ async fn tick(
                                         (false, "r2-graph-held")
                                     }
                                     PreReviewChecksGate::Ready => {
+                                        // R1 is torn down on every path below.
+                                        // End its publication authority first so
+                                        // the R2 barrier can clean its slot
+                                        // instead of waiting on a live owner.
+                                        if let (Some(publication), Some(run_id)) = (
+                                            config.review_publication.as_ref(),
+                                            reviewers[ri].cap_run_id.clone(),
+                                        ) {
+                                            publication.retire_for_handoff(&run_id).await;
+                                        }
                                         let reviewer_count_before = reviewers.len();
                                         let r2_provision = provision_reviewer(
                                             config,

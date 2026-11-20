@@ -972,6 +972,93 @@ pub fn require_cleanup(conn: &mut Connection, attempt_id: &str, now: i64) -> Res
     Ok(changed > 0)
 }
 
+/// R1→R2 handoff: end a live reviewer run's publication authority before the
+/// next reviewer's barrier probes, so its `owned` slot can be cleaned instead
+/// of making the handoff wait on an owner that is about to be torn down.
+///
+/// One `BEGIN IMMEDIATE`: revoke the run capability (fencing every later
+/// endpoint call of that run), terminalize its live collaboration attempt
+/// (cancelling its provably unsent rows), and move that attempt's `owned` slot
+/// to `cleanup_required` with a fresh bounded generation. A started or
+/// possibly-sent row keeps its disposition and pins the slot until settled.
+/// Returns `true` when the run's slot now requires cleanup; `false` (clean
+/// negative) when the run owned no slot. Never touches a task or verdict.
+pub fn retire_owner_for_handoff(conn: &mut Connection, run_id: &str, now: i64) -> Result<bool> {
+    validate_now(now)?;
+    let tx = begin_immediate(conn)?;
+    let attempts: Vec<String> = {
+        let mut statement = tx
+            .prepare(
+                "SELECT attempt_id FROM github_collaboration_attempts
+                 WHERE active_run_id=?1 AND state IN ('active','awaiting_resume')",
+            )
+            .map_err(map_sql_err)?;
+        let rows = statement
+            .query_map([run_id], |row| row.get::<_, String>(0))
+            .map_err(map_sql_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(map_sql_err)?;
+        rows
+    };
+    crate::capabilities::revoke_tx(&tx, run_id, now)?;
+    crate::collaboration_admission::revoke_dead_run_attempts(
+        &tx,
+        now,
+        crate::collaboration_admission::UNBOUNDED_GROUP_SWEEP,
+    )?;
+    sync_in_tx(&tx, now)?;
+    let mut requires_cleanup = false;
+    for attempt_id in &attempts {
+        let state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM github_review_publication_slots WHERE attempt_id=?1",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_sql_err)?;
+        requires_cleanup |= state.as_deref() == Some(SlotState::CleanupRequired.as_str());
+    }
+    tx.commit().map_err(map_sql_err)?;
+    Ok(requires_cleanup)
+}
+
+/// Operator-authorized retry of a parked task (technical spec, "An
+/// operator-authorized retry of a later parked task may reset the same
+/// slot's cleanup generation and rebind only its waiting-task pointer").
+///
+/// Within the caller's write transaction, a `blocked` slot on the task's PR
+/// starts one fresh bounded recovery generation and points at this task: a
+/// slot that never had an owner returns to a due `probing` (the next
+/// provision repeats the fresh probe), and one with an owner attempt returns
+/// to a due `cleanup_required` keeping its exact marker, review ID, launch
+/// attempt, and create send state. No slot, marker, attempt, review, or
+/// verdict is created; every core guard (marker, send-state, exhaustion)
+/// re-applies, so a foreign draft re-blocks and the next generation is again
+/// bounded. Returns the number of slots reset.
+pub(crate) fn reset_blocked_for_retry_in_tx(
+    tx: &Connection,
+    task_id: i64,
+    now: i64,
+) -> Result<usize> {
+    validate_now(now)?;
+    let changed = tx
+        .execute(
+            "UPDATE github_review_publication_slots
+             SET task_id=?1,
+                 state=CASE WHEN attempt_id IS NULL THEN 'probing' ELSE 'cleanup_required' END,
+                 cleanup_attempts=0, next_cleanup_at=?2, cleanup_deadline_at=?3,
+                 error_kind=NULL, error_summary=NULL, updated_at=?2
+             WHERE state='blocked' AND pr_number=(
+                 SELECT CAST(json_extract(t.refs, '$.pr') AS INTEGER) FROM tasks t
+                 WHERE t.id=?1 AND json_valid(t.refs)
+                   AND json_type(t.refs, '$.pr') IN ('integer','text'))",
+            params![task_id, now, now.saturating_add(SLOT_RECOVERY_WINDOW_SECS)],
+        )
+        .map_err(map_sql_err)?;
+    Ok(changed)
+}
+
 /// Give back a probe claim whose empty observation was never turned into
 /// ownership (the provision failed before its reviewer run could bind).
 /// The slot was never `owned` and no attempt holds its marker, so no create

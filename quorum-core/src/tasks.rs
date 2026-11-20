@@ -7009,6 +7009,11 @@ pub fn retry_parked(
              WHERE task_id=?1 AND last_provider_error IS NOT NULL",
             params![id],
         )?;
+        // The owner's retry is the authorized exit from a blocked
+        // pending-review publication slot on this task's PR: one fresh
+        // bounded generation, rebound to this task. Daemon auto-retries never
+        // reset it, so there is no automatic unbounded retry path.
+        crate::review_publication_slots::reset_blocked_for_retry_in_tx(&tx, id, now)?;
     }
     if reset_publication {
         tx.execute("DELETE FROM task_branches WHERE task_id=?1", params![id])?;
