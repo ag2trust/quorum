@@ -6,6 +6,7 @@
 //! `thread.started` JSONL event.
 
 use super::codex_stream::{self, Event};
+use super::proctree;
 use super::runner::{
     capture_diagnostics, gated_command, tool_summary, ActivityKind, AdapterConfig, AgentEvent,
     AgentKind, AgentMcpServer, CapturedOutput, DiagnosticBuffer, FailureDisposition,
@@ -191,6 +192,9 @@ pub struct CodexProc {
     // A successful wait releases the pid namespace entry. Do not signal that
     // numeric process group again after it could have been recycled.
     process_group_reaped: bool,
+    // Per-spawn tree marker: reaches descendants that left the process group
+    // (`setsid`/`setpgid`). Kills always go through `proctree::kill_tree_now`.
+    tree: proctree::TreeHandle,
     #[cfg(test)]
     killpg_calls: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     reader: BufReader<tokio::process::ChildStdout>,
@@ -430,11 +434,13 @@ impl CodexProc {
                 Ok(())
             });
         }
+        let mut tree = proctree::apply(&mut cmd);
         let mut child = cmd.spawn()?;
         let process_group_id = child
             .id()
             .ok_or_else(|| std::io::Error::other("spawned Codex process has no process-group ID"))?
             as libc::pid_t;
+        tree.bind_leader(process_group_id as u32);
         let reader = BufReader::new(child.stdout.take().expect("stdout was piped"));
         let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Codex);
         let failures = diagnostics.failures();
@@ -446,6 +452,7 @@ impl CodexProc {
             child,
             process_group_id,
             process_group_reaped: false,
+            tree,
             #[cfg(test)]
             killpg_calls: None,
             reader,
@@ -479,11 +486,13 @@ impl CodexProc {
                 Ok(())
             });
         }
+        let mut tree = proctree::apply(&mut cmd);
         let mut child = cmd.spawn()?;
         let process_group_id = child
             .id()
             .ok_or_else(|| std::io::Error::other("spawned Codex process has no process-group ID"))?
             as libc::pid_t;
+        tree.bind_leader(process_group_id as u32);
         let reader = BufReader::new(child.stdout.take().expect("stdout was piped"));
         let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Codex);
         let failures = diagnostics.failures();
@@ -495,6 +504,7 @@ impl CodexProc {
             child,
             process_group_id,
             process_group_reaped: false,
+            tree,
             #[cfg(test)]
             killpg_calls: None,
             reader,
@@ -539,11 +549,13 @@ impl CodexProc {
             });
         }
 
+        let mut tree = proctree::apply(&mut cmd);
         let mut child = cmd.spawn()?;
         let process_group_id = child
             .id()
             .ok_or_else(|| std::io::Error::other("spawned Codex process has no process-group ID"))?
             as libc::pid_t;
+        tree.bind_leader(process_group_id as u32);
         let stdout = child.stdout.take().expect("stdout was piped");
         let reader = BufReader::new(stdout);
         let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
@@ -557,6 +569,7 @@ impl CodexProc {
             child,
             process_group_id,
             process_group_reaped: false,
+            tree,
             #[cfg(test)]
             killpg_calls: None,
             reader,
@@ -598,11 +611,13 @@ impl CodexProc {
             });
         }
 
+        let mut tree = proctree::apply(&mut cmd);
         let mut child = cmd.spawn()?;
         let process_group_id = child
             .id()
             .ok_or_else(|| std::io::Error::other("spawned Codex process has no process-group ID"))?
             as libc::pid_t;
+        tree.bind_leader(process_group_id as u32);
         let stdout = child.stdout.take().expect("stdout was piped");
         let reader = BufReader::new(stdout);
         let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
@@ -616,6 +631,7 @@ impl CodexProc {
             child,
             process_group_id,
             process_group_reaped: false,
+            tree,
             #[cfg(test)]
             killpg_calls: None,
             reader,
@@ -650,11 +666,13 @@ impl CodexProc {
                 Ok(())
             });
         }
+        let mut tree = proctree::apply(&mut cmd);
         let mut child = cmd.spawn()?;
         let process_group_id = child
             .id()
             .ok_or_else(|| std::io::Error::other("spawned Codex process has no process-group ID"))?
             as libc::pid_t;
+        tree.bind_leader(process_group_id as u32);
         let stdout = child.stdout.take().expect("stdout was piped");
         let reader = BufReader::new(stdout);
         let stderr = BufReader::new(child.stderr.take().expect("stderr was piped"));
@@ -669,6 +687,7 @@ impl CodexProc {
                 child,
                 process_group_id,
                 process_group_reaped: false,
+                tree,
                 #[cfg(test)]
                 killpg_calls: None,
                 reader,
@@ -771,14 +790,15 @@ impl CodexProc {
         self.process_group_id
     }
 
+    /// Immediate, non-blocking whole-tree `SIGKILL`: the spawn-time process
+    /// group plus every marked descendant. Callers only reach this while
+    /// `process_group_reaped` is false, so the numeric pgid is still ours.
     fn kill_process_group(&self) {
         #[cfg(test)]
         if let Some(calls) = &self.killpg_calls {
             calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        unsafe {
-            libc::killpg(self.process_group_id, libc::SIGKILL);
-        }
+        proctree::kill_tree_now(&self.tree, !self.process_group_reaped);
     }
 
     #[cfg(test)]
@@ -804,6 +824,14 @@ impl CodexProc {
         if self.child.wait().await.is_ok() {
             self.process_group_reaped = true;
         }
+        // Escaped descendants may still hold stdout/stderr. The wait is
+        // bounded by TREE_REAP_TIMEOUT and `reap_tree` logs a timeout; the
+        // drains below then proceed either way.
+        let _ = proctree::reap_tree(
+            &self.tree,
+            tokio::time::Instant::now() + proctree::TREE_REAP_TIMEOUT,
+        )
+        .await;
         let mut terminal = Vec::new();
         while let Ok(Some(line)) = self.read_raw_line(None).await {
             terminal.push(CapturedOutput::Stdout(line));
@@ -1004,8 +1032,10 @@ mod tests {
                 Ok(())
             });
         }
+        let mut tree = proctree::apply(&mut command);
         let mut child = command.spawn().unwrap();
         let process_group_id = child.id().unwrap() as libc::pid_t;
+        tree.bind_leader(process_group_id as u32);
         let reader = BufReader::new(child.stdout.take().unwrap());
         let stderr = BufReader::new(child.stderr.take().unwrap());
         let diagnostics = DiagnosticBuffer::for_kind(AgentKind::Codex);
@@ -1017,6 +1047,7 @@ mod tests {
             child,
             process_group_id,
             process_group_reaped: false,
+            tree,
             killpg_calls: None,
             reader,
             line_buffer: Vec::new(),
@@ -1073,6 +1104,92 @@ mod tests {
             1,
             "Drop must not signal a process group after kill_and_reap reaped its leader"
         );
+    }
+
+    /// Leader prints the pid of a grandchild that started its own session (so
+    /// it left the leader's process group and still holds stdout), then sleeps.
+    const SETSID_GRANDCHILD: &str = r#"
+inner='echo $$; exec sleep 300'
+if command -v setsid >/dev/null 2>&1; then
+  setsid sh -c "$inner" &
+else
+  perl -MPOSIX -e 'POSIX::setsid() or die; exec @ARGV' sh -c "$inner" &
+fi
+exec sleep 300
+"#;
+
+    async fn setsid_tree() -> (CodexProc, i32) {
+        let mut proc = shell_proc(SETSID_GRANDCHILD).await;
+        let line = tokio::time::timeout(std::time::Duration::from_secs(10), proc.next_raw_line())
+            .await
+            .expect("grandchild pid line")
+            .expect("grandchild pid line");
+        let grandchild: i32 = line.trim().parse().expect("grandchild pid");
+        assert_eq!(unsafe { libc::getsid(grandchild) }, grandchild);
+        assert_ne!(unsafe { libc::getpgid(grandchild) }, proc.process_group_id);
+        (proc, grandchild)
+    }
+
+    fn pid_alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    async fn assert_pid_gone(pid: i32) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if unsafe { libc::kill(pid, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("pid {pid} survived the tree kill"));
+    }
+
+    #[tokio::test]
+    async fn kill_and_reap_kills_setsid_grandchild_and_spares_other_tree() {
+        let (proc_a, grandchild_a) = setsid_tree().await;
+        let (mut proc_b, grandchild_b) = setsid_tree().await;
+        let leader_b = proc_b.pid().expect("leader b pid");
+
+        // The escaped grandchild holds stdout open; without the tree kill
+        // the drain inside kill_and_reap would never finish.
+        tokio::time::timeout(std::time::Duration::from_secs(10), proc_a.kill_and_reap())
+            .await
+            .expect("kill_and_reap did not finish");
+        assert_pid_gone(grandchild_a).await;
+
+        assert!(
+            pid_alive(grandchild_b),
+            "other tree's grandchild was killed"
+        );
+        assert!(pid_alive(leader_b), "other tree's leader was killed");
+        assert!(proc_b.try_wait().unwrap().is_none());
+        assert!(pid_alive(unsafe { libc::getpid() }));
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), proc_b.kill_and_reap())
+            .await
+            .expect("kill_and_reap did not finish");
+        assert_pid_gone(grandchild_b).await;
+    }
+
+    #[tokio::test]
+    async fn drop_kills_setsid_grandchild() {
+        let (proc, grandchild) = setsid_tree().await;
+        let (proc_b, grandchild_b) = setsid_tree().await;
+
+        drop(proc);
+
+        assert_pid_gone(grandchild).await;
+        assert!(
+            pid_alive(grandchild_b),
+            "other tree's grandchild was killed"
+        );
+        drop(proc_b);
+        assert_pid_gone(grandchild_b).await;
     }
 
     fn test_spec() -> CodexSpec {

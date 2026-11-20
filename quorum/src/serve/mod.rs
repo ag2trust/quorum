@@ -27968,11 +27968,15 @@ async fn poison_task(
     strikes: u32,
     provision_cause: Option<&str>,
 ) {
-    let mut reason = format!("worker {agent} died {strikes} time(s) without producing output");
-    if let Some(cause) = provision_cause {
-        reason.push_str(": ");
-        reason.push_str(&classified_provisioning_cause(cause));
-    }
+    // A provisioning failure happens before any agent starts; say so rather
+    // than reporting it as an agent that died without output.
+    let reason = match provision_cause {
+        Some(cause) => format!(
+            "worker {agent} provisioning failed {strikes} time(s) before agent start: {}",
+            classified_provisioning_cause(cause)
+        ),
+        None => format!("worker {agent} died {strikes} time(s) without producing output"),
+    };
     park_task(db_path, task_id, &reason, "open").await;
 }
 
@@ -72565,6 +72569,11 @@ exec /bin/cat '{stdout}'
             .unwrap();
         assert!(reason.contains("structural:"), "{reason}");
         assert!(reason.contains("couldn't find remote ref"), "{reason}");
+        assert!(
+            reason.contains("provisioning failed 3 time(s) before agent start"),
+            "{reason}"
+        );
+        assert!(!reason.contains("without producing output"), "{reason}");
         let stats = quorum_core::stats::stats(&conn, now_unix(), 60).unwrap();
         assert!(stats.last_errors.iter().any(|error| {
             error.source == "provisioning"
@@ -73449,6 +73458,69 @@ exec /bin/cat '{stdout}'
             )
             .unwrap();
         assert_eq!(alerts, 0, "a successful preservation raises no alert");
+        drop(conn);
+        second.kill_and_reap().await;
+    }
+
+    /// A teardown whose `git worktree remove` failed midway leaves an
+    /// unregistered directory at the task's path. The next provisioning
+    /// removes it (instead of failing `git worktree add` until the task is
+    /// parked) and still resumes the preserved work from its recover ref.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_unregistered_directory_at_worker_path_is_removed_and_work_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = recover_fixture_repo(dir.path());
+        let db_path = dir.path().join("quorum.db");
+        let task_id = recover_fixture_task(&db_path);
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo.clone());
+        config.worktree_base = dir.path().join("worktrees");
+        config.agent_bin = Some(
+            fake_stdin_holding_agent(dir.path(), "hold-worker")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+
+        let first = recover_spawn(&config, &wt_mgr, &mut names).await;
+        let wt = first.worktree_path.clone();
+        std::fs::write(wt.join("state.txt"), "precious\n").unwrap();
+        reap_idle_zombie_worker(&config, &wt_mgr, &mut names, first, 999, 10).await;
+        let refs = recover_refs_for(&repo, task_id);
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        assert!(!wt.exists());
+
+        // The half-deleted remains: no `.git`, not registered.
+        std::fs::create_dir_all(wt.join("target/debug")).unwrap();
+        std::fs::write(wt.join("target/debug/leftover"), "x").unwrap();
+        assert!(!sync_fixture_git(&repo, &["worktree", "list"]).contains(wt.to_str().unwrap()));
+
+        let second = recover_spawn(&config, &wt_mgr, &mut names).await;
+
+        assert_eq!(second.worktree_path, wt, "the deterministic path is reused");
+        assert!(!wt.join("target").exists(), "stale contents are gone");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("state.txt")).unwrap(),
+            "precious\n",
+            "work resumes from the recover ref"
+        );
+        assert_eq!(
+            recover_refs_for(&repo, task_id),
+            refs,
+            "recover ref untouched"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert!(
+            !task
+                .refs
+                .as_deref()
+                .unwrap_or("")
+                .contains("daemon_parked_reason"),
+            "{:?}",
+            task.refs
+        );
         drop(conn);
         second.kill_and_reap().await;
     }
