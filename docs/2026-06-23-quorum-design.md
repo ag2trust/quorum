@@ -2772,7 +2772,14 @@ Fail-safe: if the snapshot fails, nothing is removed or deleted, and an `errors`
 (`source=worktree_recover`) plus at most one live owner alert per (task, subject) are
 written. A kept registered checkout is retried by the next provisioning of the same task
 (which owns the task after its atomic claim and so preserves and releases a leftover
-registered checkout at its worktree path first) or by startup GC.
+registered checkout at its worktree path first) or by startup GC. An *unregistered*
+directory at that path, left when a teardown's `git worktree remove` failed midway, holds no git
+state to snapshot. Startup GC leaves it. The next provisioning of the task removes it and logs the removal, then provisions
+and resumes from the recover ref as usual. Removal is refused, which fails provisioning loudly,
+unless the path is a real directory directly under `worktree_base`, is not a registered worktree,
+is named by no journal row, and holds no `.git` directory or `.git` file whose gitdir still
+exists. A provisioning failure parks after the strike threshold with reason
+`provisioning failed N time(s) before agent start: <classified cause>`, not as an agent death.
 
 Resume: when the daemon provisions the next worker for the task, the newest trusted recover
 ref seeds it if it descends from the provisioning start: the kept task branch tip

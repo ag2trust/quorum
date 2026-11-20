@@ -523,13 +523,16 @@ fn wait_for_worker_cleanup(home: &std::path::Path, agent: &str) {
     panic!("managed worker {agent} was not cleaned up")
 }
 
+/// Occupy each candidate worker path with a directory holding a `.git`
+/// directory. Provisioning removes plain stale unregistered directories, but
+/// refuses to delete foreign git state, so this still forces a failure.
 fn obstruct_unused_worktree_paths(wt_base: &std::path::Path) {
     for i in 0..20 {
         let path = wt_base.join(format!("Agent{i}-t1"));
         if path.exists() {
             continue;
         }
-        std::fs::create_dir(&path).unwrap();
+        std::fs::create_dir_all(path.join(".git")).unwrap();
         std::fs::write(path.join("blocker"), b"force git worktree add failure").unwrap();
     }
 }

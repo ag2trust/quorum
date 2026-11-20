@@ -284,8 +284,14 @@ pub(crate) async fn release_worker_worktree(
 /// The snapshot is attributed to the task (and so trusted for resume) only
 /// when the checkout's registered branch AND path equal the task's daemon
 /// allocation record; a worker-forged checkout at this path is preserved
-/// unattributed and never resumed. An unregistered directory is left to
-/// provisioning exactly as before.
+/// unattributed and never resumed.
+///
+/// An unregistered directory (a teardown whose `git worktree remove` failed
+/// midway) would make every `git worktree add` at this path fail, so it is
+/// removed under the guards of [`WorktreeManager::remove_stale_unregistered_dir`]:
+/// only directly under the worktree root, never a registered worktree, never
+/// a path any journaled agent names. Recover refs are untouched, so resume
+/// from `refs/quorum-recover/*` is unchanged. A refusal fails provisioning.
 pub(crate) async fn release_leftover_worker_checkout(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -305,7 +311,7 @@ pub(crate) async fn release_leftover_worker_checkout(
         Ok(_) => {}
     }
     let Some(registered) = wt_mgr.registered_branch(&config.repo_dir, worktree).await? else {
-        return Ok(());
+        return remove_stale_worker_directory(config, wt_mgr, worktree, task_id).await;
     };
     let path = config.db_path.clone();
     let allocation = tokio::task::spawn_blocking(move || -> Result<Option<(String, String)>> {
@@ -349,6 +355,41 @@ pub(crate) async fn release_leftover_worker_checkout(
     release_worker_worktree(config, wt_mgr, worktree, branch, delete_branch, &identity)
         .await
         .map_err(|error| format!("leftover worker checkout {}: {error}", worktree.display()))
+}
+
+async fn remove_stale_worker_directory(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    worktree: &Path,
+    task_id: i64,
+) -> std::result::Result<(), String> {
+    let path = config.db_path.clone();
+    let active = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+        let conn = quorum_core::db::open(&path)?;
+        Ok(quorum_core::journal::list_in_flight(&conn)?
+            .into_iter()
+            .filter_map(|entry| entry.worktree)
+            .collect())
+    })
+    .await
+    .map_err(|e| format!("stale directory journal lookup join failure: {e}"))?
+    .map_err(|e| format!("stale directory journal lookup failed: {e}"))?;
+    match wt_mgr
+        .remove_stale_unregistered_dir(&config.repo_dir, &config.worktree_base, worktree, &active)
+        .await
+    {
+        Ok(true) => {
+            log(&format!(
+                "task #{task_id}: removed stale unregistered directory {} before provisioning",
+                worktree.display()
+            ));
+            Ok(())
+        }
+        Ok(false) => Ok(()),
+        Err(error) => Err(format!(
+            "stale unregistered directory at worker worktree path: {error}"
+        )),
+    }
 }
 
 /// Loud, bounded record of a work-preservation problem: an `errors` row and
