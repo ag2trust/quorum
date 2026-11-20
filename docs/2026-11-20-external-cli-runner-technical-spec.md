@@ -1,7 +1,7 @@
 # External CLI Runner — Technical Specification
 
 **Date:** 2026-11-20
-**Status:** Proposed
+**Status:** Accepted (owner, 2026-11-20)
 **Implementation base:** `origin/develop` at `579b3bb`
 **Related:** `docs/2026-11-12-sandboxed-workspace-technical-spec.md` (session directory, launcher
 seam). This spec amends its session directory: see "Sessions".
@@ -63,14 +63,14 @@ Two adjacent gaps make this worse:
 
 - Changing the Claude, Codex, or Grok adapters, or porting them to declarations.
 - A plugin API, dynamic libraries, scripting, or any code supplied by configuration.
-- More than one external declaration per daemon (see "Open questions").
+- More than one external declaration per daemon (see "Decisions").
 - Running the Doctor through the external runner. Doctor stays hard-wired to Claude
   (`quorum/src/serve/doctor.rs:256`) and is off by default.
 - Workspace isolation, read-only role materials, and how a confined run reaches the agent MCP.
   Those belong to clone mode (`docs/2026-11-12-sandboxed-workspace-technical-spec.md`).
 - Mid-run token accounting for CLIs that report usage only at the end of a run.
 - Reading, validating, migrating, or bounding the content of a session file.
-- Questions from read-only roles (see "Open questions").
+- Questions from read-only roles (see "Decisions").
 
 ## Terms
 
@@ -740,19 +740,20 @@ Dependencies:
 - Slice 6 needs 2, 3, 4, and 5.
 - Slice 7 comes last.
 
-## Open questions
+## Decisions (2026-11-20)
 
-1. **Several external declarations.** Should a daemon support named declarations
-   (`[external_runners.<name>]`, `runner = "external:<name>"`)? One per daemon matches the single
-   `agent_bin`. Recommendation: not now. The format can add names later without breaking the
-   single form.
-2. **Questions from read-only roles.** Should a reviewer's blocked outcome park the review for
-   an answer instead of failing it? Recommendation: not now. Review parks recover differently,
-   and no current role needs it.
-3. **Unanswered retry prompt.** When `task-retry` resumes a needs-info park, is the fixed
-   "no answer" text acceptable? The alternative is a fresh start, which loses the context the
-   question was asked in.
-4. **Answer through `message_agent`.** Should a `message_agent` to the worker that asked count as
-   an answer while its task is parked needs-info? Recommendation: no. An answer is a lifecycle
-   operation with its own validation and audit row, and a message to a former agent identity is
-   ambiguous after reassignment.
+The owner settled these on 2026-11-20. They were open questions in the first draft.
+
+1. **One declaration per daemon.** A single `[external_runner]` matches the single `agent_bin`.
+   Named declarations (`[external_runners.<name>]`, `runner = "external:<name>"`) are future work.
+   The format can add them without breaking the single form.
+2. **Read-only roles cannot ask.** A blocked outcome from a `read-only` or `restricted` run is a
+   `NonFailover` failure, and the question is not stored (see "Blocked outcome"). Review parks
+   recover differently from worker parks, and no current role needs to ask.
+3. **Unanswered retry resumes.** When `task-retry` restores a needs-info park and the run can
+   resume, it resumes with the fixed "No answer was provided" prompt (see "Resume or fresh
+   start"). This keeps the context the question was asked in. A fresh start would lose it.
+4. **`task-answer` is the only answer path.** `message_agent` keeps its current behavior, and
+   never answers a park. An answer is a lifecycle operation with its own validation and audit
+   row, addressed by task id. A message to a former agent identity is ambiguous after
+   reassignment.
