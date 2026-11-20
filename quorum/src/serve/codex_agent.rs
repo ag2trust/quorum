@@ -198,6 +198,9 @@ pub struct CodexProc {
     diagnostics: DiagnosticBuffer,
     failures: FailureTracker,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
+    /// Keeps the run-private `GH_CONFIG_DIR` alive for the child's lifetime;
+    /// `None` only for test-constructed processes.
+    _run_env: Option<crate::serve::runner::ManagedRunEnv>,
 }
 
 impl CodexProc {
@@ -408,16 +411,15 @@ impl CodexProc {
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
         }
-        crate::serve::runner::strip_operator_secrets(&mut cmd);
         // A planner without an MCP server holds no endpoint authority, so every
         // coordination name is removed. A planner with one must keep its run
         // envelope: Codex copies exactly `AGENT_MCP_ENV_VARS` out of this
         // process environment into the stdio MCP child.
-        if agent_mcp.is_some() {
-            strip_planner_mcp_ambient_authority(&mut cmd);
-        } else {
+        if agent_mcp.is_none() {
             strip_planner_coordination_env(&mut cmd);
         }
+        let run_env = crate::serve::runner::ManagedRunEnv::create()?;
+        run_env.apply(&mut cmd);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -453,6 +455,7 @@ impl CodexProc {
             diagnostics,
             failures,
             stderr_task: Some(stderr_task),
+            _run_env: Some(run_env),
         })
     }
 
@@ -466,7 +469,8 @@ impl CodexProc {
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
         }
-        crate::serve::runner::strip_operator_secrets(&mut cmd);
+        let run_env = crate::serve::runner::ManagedRunEnv::create()?;
+        run_env.apply(&mut cmd);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -502,6 +506,7 @@ impl CodexProc {
             diagnostics,
             failures,
             stderr_task: Some(stderr_task),
+            _run_env: Some(run_env),
         })
     }
 
@@ -524,7 +529,8 @@ impl CodexProc {
         for (k, v) in env_vars {
             cmd.env(k, v);
         }
-        crate::serve::runner::strip_operator_secrets(&mut cmd);
+        let run_env = crate::serve::runner::ManagedRunEnv::create()?;
+        run_env.apply(&mut cmd);
         cmd.current_dir(worktree);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -564,6 +570,7 @@ impl CodexProc {
             diagnostics,
             failures,
             stderr_task: Some(stderr_task),
+            _run_env: Some(run_env),
         })
     }
 
@@ -583,7 +590,8 @@ impl CodexProc {
         for (k, v) in &spec.env_vars {
             cmd.env(k, v);
         }
-        crate::serve::runner::strip_operator_secrets(&mut cmd);
+        let run_env = crate::serve::runner::ManagedRunEnv::create()?;
+        run_env.apply(&mut cmd);
         cmd.current_dir(&spec.worktree);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -623,6 +631,7 @@ impl CodexProc {
             diagnostics,
             failures,
             stderr_task: Some(stderr_task),
+            _run_env: Some(run_env),
         })
     }
 
@@ -637,7 +646,8 @@ impl CodexProc {
         for (key, value) in env_vars {
             cmd.env(key, value);
         }
-        crate::serve::runner::strip_operator_secrets(&mut cmd);
+        let run_env = crate::serve::runner::ManagedRunEnv::create()?;
+        run_env.apply(&mut cmd);
         cmd.current_dir(worktree)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -676,6 +686,7 @@ impl CodexProc {
                 diagnostics,
                 failures,
                 stderr_task: Some(stderr_task),
+                _run_env: Some(run_env),
             },
             gate,
         ))
@@ -951,31 +962,11 @@ fn normalize_event(event: Event) -> Vec<AgentEvent> {
     }
 }
 
+/// A tool-less planner holds no run envelope at all. GitHub, Quorum-home and
+/// operator authority is removed for every managed spawn by
+/// `runner::ManagedRunEnv`; this removes the remaining coordination names.
 fn strip_planner_coordination_env(cmd: &mut Command) {
-    for name in [
-        "QUORUM_AGENT",
-        "QUORUM_HOME",
-        "QUORUM_REPO",
-        "QUORUM_RUN_ID",
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "QUORUM_ORCHESTRATOR_TOKEN",
-    ] {
-        cmd.env_remove(name);
-    }
-}
-
-/// Ambient authority removed from an MCP-carrying planner. The managed run
-/// envelope survives because the stdio MCP child needs it; the database home
-/// and every GitHub credential do not reach the provider or its child.
-fn strip_planner_mcp_ambient_authority(cmd: &mut Command) {
-    for name in [
-        "QUORUM_HOME",
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "GH_CONFIG_DIR",
-        "QUORUM_ORCHESTRATOR_TOKEN",
-    ] {
+    for name in ["QUORUM_AGENT", "QUORUM_REPO", "QUORUM_RUN_ID"] {
         cmd.env_remove(name);
     }
 }
@@ -1023,6 +1014,7 @@ mod tests {
             diagnostics,
             failures,
             stderr_task: Some(stderr_task),
+            _run_env: None,
         }
     }
 
@@ -1423,6 +1415,96 @@ printf '{"repo":"%s","agent":"%s","run":"%s","endpoint":"%s","home":"%s","gh":"%
             ..test_spec()
         };
         assert_eq!(spec.env_vars[0], ("FOO".into(), "bar".into()));
+    }
+
+    /// Every Codex spawn path (worker, resume, restricted classifier, planner
+    /// with and without MCP) applies the shared managed-run environment
+    /// policy after the spec environment.
+    #[tokio::test]
+    async fn every_codex_spawn_path_drops_github_and_quorum_home_authority() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_codex = tmp.path().join("fake-codex");
+        std::fs::write(
+            &fake_codex,
+            "#!/bin/sh\nprintf 'gh=%s\\ngithub=%s\\nquorum_home=%s\\nrun=%s\\ngh_config=%s\\nend\\n' \
+             \"$GH_TOKEN\" \"$GITHUB_TOKEN\" \"$QUORUM_HOME\" \"$QUORUM_RUN_ID\" \"$GH_CONFIG_DIR\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_codex, permissions).unwrap();
+
+        let env_vars: Vec<(String, String)> = vec![
+            ("QUORUM_RUN_ID".into(), "run-capability".into()),
+            ("QUORUM_HOME".into(), "home-authority".into()),
+            ("GH_TOKEN".into(), "gh-authority".into()),
+            ("GITHUB_TOKEN".into(), "github-authority".into()),
+            ("GH_CONFIG_DIR".into(), "/ambient/gh-config".into()),
+        ];
+        let spec = CodexSpec {
+            worktree: tmp.path().to_path_buf(),
+            env_vars: env_vars.clone(),
+            ..test_spec()
+        };
+        let bin = fake_codex.to_str();
+        let procs = vec![
+            ("worker", CodexProc::spawn(&spec, bin).unwrap()),
+            (
+                "resume",
+                CodexProc::spawn_resume(
+                    "thread-1",
+                    "o4-mini",
+                    "high",
+                    "read-only",
+                    tmp.path(),
+                    "pending turn",
+                    &env_vars,
+                    Some(crate::serve::runner::AGENT_MCP_SERVER),
+                    bin,
+                )
+                .unwrap(),
+            ),
+            (
+                "restricted",
+                CodexProc::spawn_restricted(&spec, bin).unwrap(),
+            ),
+            (
+                "planner+mcp",
+                CodexProc::spawn_planner(&spec, bin, Some(crate::serve::runner::AGENT_MCP_SERVER))
+                    .unwrap(),
+            ),
+            (
+                "planner",
+                CodexProc::spawn_planner(&spec, bin, None).unwrap(),
+            ),
+        ];
+        for (path, mut proc) in procs {
+            let mut captured = String::new();
+            while let Some(line) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), proc.next_raw_line())
+                    .await
+                    .expect("fake Codex did not emit its environment")
+            {
+                captured.push_str(&line);
+                captured.push('\n');
+                if line == "end" {
+                    break;
+                }
+            }
+            let _ = proc.kill_and_reap().await;
+            for absent in ["gh=\n", "github=\n", "quorum_home=\n"] {
+                assert!(captured.contains(absent), "{path}: {captured}");
+            }
+            if path != "planner" {
+                assert!(
+                    captured.contains("run=run-capability\n"),
+                    "{path}: {captured}"
+                );
+            }
+            crate::serve::runner::assert_run_private_gh_config(&captured, "/ambient/gh-config");
+        }
     }
 
     #[tokio::test]

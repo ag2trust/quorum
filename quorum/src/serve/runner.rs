@@ -687,13 +687,60 @@ const GATE_WRAPPER: &str = concat!(
     "exec \"$@\""
 );
 
-/// Remove operator secrets that no managed process may inherit, whatever its
-/// role or MCP wiring. The orchestrator MCP token is not a Quorum input at
-/// all, but an operator who exported it must not thereby hand a managed
-/// agent coordinator authority. Call this after applying a spec's
-/// environment so nothing re-adds it.
-pub(crate) fn strip_operator_secrets(command: &mut Command) {
-    command.env_remove(crate::orchestrator_mcp::TOKEN_ENV);
+/// Environment names no managed agent process may inherit, whatever its
+/// provider, role, or MCP wiring. Agents signal Quorum only through the run's
+/// agent MCP and never publish to GitHub themselves (pushes, formal reviews
+/// and merges are daemon-owned), so GitHub credentials and Quorum home/DB
+/// location are pure ambient authority here. The orchestrator MCP token is
+/// not a Quorum input at all, but an operator who exported it must not
+/// thereby hand a managed agent coordinator authority. `QUORUM_HOME` is the
+/// only Quorum DB location input (`paths::home_dir`); the per-repo DB path is
+/// derived beneath it.
+pub(crate) const MANAGED_RUN_REMOVED_ENV: &[&str] = &[
+    crate::orchestrator_mcp::TOKEN_ENV,
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "QUORUM_HOME",
+];
+
+/// The one managed-run environment policy shared by every provider spawn
+/// path. It owns a freshly created, empty, run-private `GH_CONFIG_DIR`, so an
+/// ambient `gh` login or config is unusable from the agent's shell. The
+/// directory is removed when this value drops; provider process wrappers
+/// hold it for the child's lifetime.
+#[derive(Debug)]
+pub(crate) struct ManagedRunEnv {
+    gh_config: tempfile::TempDir,
+}
+
+impl ManagedRunEnv {
+    pub(crate) fn create() -> std::io::Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        // Owner-only at creation: no other local user may read or seed it.
+        let gh_config = tempfile::Builder::new()
+            .prefix("quorum-run-gh-config-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        Ok(Self { gh_config })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gh_config_dir(&self) -> &Path {
+        self.gh_config.path()
+    }
+
+    /// Apply the policy. Call this after the spec's environment and every
+    /// provider-specific environment edit so nothing re-adds a removed value
+    /// or overrides the private `GH_CONFIG_DIR`. The run bearer and endpoint
+    /// variables the agent MCP needs are left untouched.
+    pub(crate) fn apply(&self, command: &mut Command) {
+        for name in MANAGED_RUN_REMOVED_ENV {
+            command.env_remove(name);
+        }
+        command.env("GH_CONFIG_DIR", self.gh_config.path());
+    }
 }
 
 /// Start a process-group leader that waits on a close-on-exec pipe before it
@@ -1808,9 +1855,142 @@ fn truncate_label(s: &str, max: usize) -> String {
     }
 }
 
+/// Provider env-capture tests print `gh_config=$GH_CONFIG_DIR`. Assert that a
+/// launch saw a run-private directory rather than the ambient value, and that
+/// the directory was removed once its process was reaped and dropped.
+#[cfg(test)]
+pub(crate) fn assert_run_private_gh_config(captured: &str, ambient: &str) {
+    let dir = captured
+        .lines()
+        .find_map(|line| line.strip_prefix("gh_config="))
+        .unwrap_or_else(|| panic!("no gh_config line: {captured}"));
+    assert!(!dir.is_empty(), "GH_CONFIG_DIR unset: {captured}");
+    assert_ne!(dir, ambient, "ambient GH_CONFIG_DIR leaked: {captured}");
+    let name = Path::new(dir)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    assert!(
+        name.starts_with("quorum-run-gh-config-"),
+        "GH_CONFIG_DIR is not run-private: {captured}"
+    );
+    assert!(
+        !Path::new(dir).exists(),
+        "run-private GH_CONFIG_DIR outlived its process: {dir}"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec environment that tries to hand a managed run ambient GitHub,
+    /// Quorum-home and operator authority alongside its real run envelope.
+    fn hostile_spec_environment() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("QUORUM_REPO", "owner/repo"),
+            ("QUORUM_AGENT", "Keel-test"),
+            ("QUORUM_RUN_ID", "run-capability"),
+            ("QUORUM_AGENT_ENDPOINT", "/tmp/quorum-agent.sock"),
+            ("QUORUM_AGENT_MCP_URL", "http://127.0.0.1:1/mcp"),
+            ("GH_TOKEN", "ghp_ambient"),
+            ("GITHUB_TOKEN", "ghp_ambient"),
+            ("GH_ENTERPRISE_TOKEN", "ghp_ambient"),
+            ("GITHUB_ENTERPRISE_TOKEN", "ghp_ambient"),
+            ("QUORUM_HOME", "/ambient/quorum-home"),
+            ("GH_CONFIG_DIR", "/ambient/gh-config"),
+            (crate::orchestrator_mcp::TOKEN_ENV, "operator-token"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn managed_run_env_strips_authority_and_pins_private_empty_gh_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let run_env = ManagedRunEnv::create().unwrap();
+        let gh_config = run_env.gh_config_dir().to_path_buf();
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(
+            "env; printf 'gh_config_entries=%s\\n' \"$(ls -A \"$GH_CONFIG_DIR\" | wc -l | tr -d ' ')\"",
+        );
+        for (key, value) in hostile_spec_environment() {
+            command.env(key, value);
+        }
+        run_env.apply(&mut command);
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let env: std::collections::HashMap<&str, &str> = stdout
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+
+        for removed in MANAGED_RUN_REMOVED_ENV {
+            assert!(!env.contains_key(removed), "{removed} reached the run");
+        }
+        assert_eq!(
+            env.get("GH_CONFIG_DIR").copied(),
+            gh_config.to_str(),
+            "{stdout}"
+        );
+        assert_eq!(env.get("gh_config_entries").copied(), Some("0"), "{stdout}");
+        // The run envelope the HTTP/stdio agent MCP needs survives.
+        assert_eq!(env.get("QUORUM_RUN_ID").copied(), Some("run-capability"));
+        assert_eq!(
+            env.get("QUORUM_AGENT_ENDPOINT").copied(),
+            Some("/tmp/quorum-agent.sock")
+        );
+        assert_eq!(
+            env.get("QUORUM_AGENT_MCP_URL").copied(),
+            Some("http://127.0.0.1:1/mcp")
+        );
+        assert_eq!(env.get("QUORUM_REPO").copied(), Some("owner/repo"));
+        assert_eq!(env.get("QUORUM_AGENT").copied(), Some("Keel-test"));
+
+        let mode = std::fs::metadata(&gh_config).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "GH_CONFIG_DIR is not owner-private");
+        // Each run gets its own directory, removed with the run.
+        let other = ManagedRunEnv::create().unwrap();
+        assert_ne!(other.gh_config_dir(), gh_config.as_path());
+        drop(run_env);
+        assert!(!gh_config.exists(), "GH_CONFIG_DIR outlived its run");
+    }
+
+    #[tokio::test]
+    async fn managed_run_env_leaves_gh_not_logged_in() {
+        let gh_available = std::process::Command::new("gh")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !gh_available {
+            eprintln!("skipping: `gh` is not on PATH");
+            return;
+        }
+        let run_env = ManagedRunEnv::create().unwrap();
+        let mut command = Command::new("gh");
+        command.args(["auth", "status"]);
+        for (key, value) in hostile_spec_environment() {
+            command.env(key, value);
+        }
+        run_env.apply(&mut command);
+        let output = command
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "gh reported a login: {text}");
+        assert!(
+            text.contains("not logged in"),
+            "gh did not report not logged in: {text}"
+        );
+    }
 
     fn managed_environment() -> Vec<(String, String)> {
         vec![
