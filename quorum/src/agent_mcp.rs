@@ -3,8 +3,11 @@
 //! This process has no database or GitHub execution path. Every inventory and
 //! known tool call is authorized by the daemon endpoint using only the injected
 //! run capability. Tool arguments deliberately stop at this shell until the
-//! durable operation slices implement their closed endpoint schemas; only
-//! `github_operation_read` forwards its closed `attemptId`/`operationId` pair.
+//! durable operation slices implement their closed endpoint schemas.
+//! `github_operation_read` forwards its closed `attemptId`/`operationId` pair;
+//! `pull_request_read` and `add_issue_comment` forward their arguments object
+//! for the endpoint to decode against its closed schema, then wait a bounded
+//! time for the daemon executor's result.
 //!
 //! Two transports share this shell. Over stdio it serves the one run whose
 //! capability was injected into its environment. With `--listen` it serves
@@ -45,6 +48,11 @@ const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// `github_operation_read` answer fits a single response frame.
 const MAX_RESPONSE_FRAME_BYTES: usize = 96 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a `pull_request_read` / `add_issue_comment` call waits for the
+/// daemon executor before answering with the pending operation. Kept below
+/// `HTTP_REQUEST_TIMEOUT` so the HTTP transport always gets an answer.
+const OPERATION_WAIT: Duration = Duration::from_secs(8);
+const OPERATION_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// The MCP adapter is a credentialless child of a persistent provider, so it
 /// learns daemon phase transitions by asking the endpoint for its derived
 /// inventory. This keeps the adapter out of the database while promptly
@@ -143,14 +151,20 @@ impl ProtocolOperation {
     fn tool(self) -> Tool {
         let (description, schema, read_only) = match self {
             Self::PullRequestRead => (
-                "Read the pull request bound to this managed run using an approved read method.",
+                "Read the pull request bound to this managed run. owner, repo, and pullNumber \
+                 must name exactly that pull request. Methods: get (details), get_diff (the \
+                 diff in bounded pages), get_files, get_review_comments, get_reviews, and \
+                 get_comments (general comments), each paged by page/perPage. Results are \
+                 size-bounded: truncated=true marks clipped text or omitted items, and \
+                 has_next_page asks for the next page. The daemon performs the read; a call \
+                 still running after a short wait returns its operationId for \
+                 github_operation_read.",
                 github_schema(
                     json!({
                         "method": {"type":"string","enum":["get","get_diff","get_files","get_review_comments","get_reviews","get_comments"]},
                         "owner": bounded_string(1, 100),
                         "repo": bounded_string(1, 100),
                         "pullNumber": positive_integer(),
-                        "after": bounded_string(1, 512),
                         "page": {"type":"integer","minimum":1,"maximum":100},
                         "perPage": {"type":"integer","minimum":1,"maximum":100}
                     }),
@@ -159,7 +173,13 @@ impl ProtocolOperation {
                 true,
             ),
             Self::AddIssueComment => (
-                "Add a general Markdown comment to the pull request bound to this managed run.",
+                "Add a general GitHub-flavored Markdown comment to the pull request bound to \
+                 this managed run; issue_number must be that pull request. The body is posted \
+                 byte for byte (at most 32768 bytes, every code fence closed) followed by a \
+                 hidden daemon marker. An identical retry returns the original comment; pass a \
+                 distinct clientRequestId only to post identical text again. If the result is \
+                 github_outcome_unknown the comment may already exist: check get_comments \
+                 before posting again.",
                 github_schema(
                     json!({
                         "owner": bounded_string(1, 100),
@@ -173,12 +193,25 @@ impl ProtocolOperation {
                 false,
             ),
             Self::PullRequestReviewWrite => (
-                "Create or submit the current reviewer's pending COMMENT review for the bound pull request.",
+                "Create or submit this reviewer run's one pending COMMENT review on the bound \
+                 pull request. method=create opens it for commitID, which must be exactly this \
+                 run's launch SHA; repeating create resumes the same review. method=submit_pending \
+                 publishes it with event=COMMENT and the complete Markdown review summary as \
+                 body; repeating it returns the same submit. Nothing else exists: APPROVE, \
+                 REQUEST_CHANGES, dismissal, deletion, and review IDs are rejected with typed \
+                 codes (review_event_unsupported, review_method_unsupported, \
+                 review_id_unsupported, review_commit_mismatch). The formal verdict is \
+                 submitted separately, only after this review is published.",
                 pending_review_schema(),
                 false,
             ),
             Self::AddCommentToPendingReview => (
-                "Add one validated inline Markdown finding to the current pending review.",
+                "Add one inline Markdown finding to this run's pending review (create it first). \
+                 The anchor (path, line, side, and optional startLine/startSide for a multi-line \
+                 range on the same side and hunk) must lie in the pull request diff at this \
+                 run's launch SHA; an invalid anchor is rejected with a typed anchor_* code \
+                 and is never turned into a general comment. Findings publish in the order \
+                 they are admitted; at most 50 per review, none after submit_pending.",
                 github_schema(
                     json!({
                         "owner": bounded_string(1, 100),
@@ -189,11 +222,20 @@ impl ProtocolOperation {
                         "side": {"type":"string","enum":["LEFT","RIGHT"]},
                         "startLine": positive_integer(),
                         "startSide": {"type":"string","enum":["LEFT","RIGHT"]},
-                        "subjectType": {"type":"string","enum":["LINE","FILE"]},
+                        "subjectType": {"type":"string","enum":["LINE"]},
                         "body": bounded_string(1, 32768),
                         "clientRequestId": bounded_string(1, 128)
                     }),
-                    &["owner", "repo", "pullNumber", "path", "subjectType", "body"],
+                    &[
+                        "owner",
+                        "repo",
+                        "pullNumber",
+                        "path",
+                        "line",
+                        "side",
+                        "subjectType",
+                        "body",
+                    ],
                 ),
                 false,
             ),
@@ -391,6 +433,10 @@ fn submit_review_tool() -> Tool {
             "Submit this reviewer run's verdict. `approved` requires `blocking: 0` and takes no \
              feedback. `changes` requires `blocking` >= 1 and non-empty `feedback`. \
              `graph-blocker` takes only `feedback_json` (the graph-blocker feedback object). \
+             Once this run has created a pending review, the verdict is refused \
+             (`review_not_published`, `review_head_moved`) until that COMMENT review is fully \
+             published for the still-current launch SHA; if a review operation failed, pass \
+             `publication_failure: \"operation_failed\"` instead. A refusal records nothing. \
              The daemon re-validates and alone acts on the verdict. Success is \
              {{\"ok\":true,\"mailbox_id\":N}}. {SIGNAL_RETRY}"
         ),
@@ -398,7 +444,8 @@ fn submit_review_tool() -> Tool {
             "verdict": {"type":"string","enum":["approved","changes","graph-blocker"]},
             "blocking": {"type":"integer","minimum":0},
             "feedback": bounded_string(1, 32768),
-            "feedback_json": {"type":"object"}
+            "feedback_json": {"type":"object"},
+            "publication_failure": {"type":"string","enum":["operation_failed"]}
         }),
         &["verdict"],
     )
@@ -464,6 +511,8 @@ struct SubmitReviewArguments {
     feedback: Option<String>,
     #[serde(default)]
     feedback_json: Option<Map<String, Value>>,
+    #[serde(default)]
+    publication_failure: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -512,6 +561,13 @@ fn validate_review(
     let verdict = arguments.verdict.as_str();
     if !matches!(verdict, "approved" | "changes" | "graph-blocker") {
         return Err("verdict must be 'approved', 'changes', or 'graph-blocker'".into());
+    }
+    if arguments
+        .publication_failure
+        .as_deref()
+        .is_some_and(|reason| reason != "operation_failed")
+    {
+        return Err("publication_failure must be 'operation_failed'".into());
     }
     if verdict == "graph-blocker" {
         if arguments.blocking.is_some() || arguments.feedback.is_some() {
@@ -580,10 +636,9 @@ fn pending_review_schema() -> Arc<Map<String, Value>> {
             "owner": bounded_string(1, 100),
             "repo": bounded_string(1, 100),
             "pullNumber": positive_integer(),
-            "commitID": bounded_string(40, 40),
+            "commitID": {"type":"string","pattern":"^[0-9a-f]{40}([0-9a-f]{24})?$"},
             "event": {"type":"string","enum":["COMMENT"]},
-            "body": bounded_string(1, 32768),
-            "clientRequestId": bounded_string(1, 128)
+            "body": bounded_string(1, 32768)
         }),
         &["method", "owner", "repo", "pullNumber"],
     );
@@ -621,6 +676,8 @@ enum EndpointOperation {
         attempt_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         operation_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        arguments: Option<Value>,
     },
 }
 
@@ -659,13 +716,112 @@ enum EndpointResult {
         operations: Vec<ProtocolOperation>,
     },
     GithubOperation {
+        attempt_id: String,
         operation_id: String,
         state: String,
         send_state: String,
         remote_object_id: Option<String>,
         result: Option<Value>,
         error_summary: Option<String>,
+        error_code: Option<String>,
     },
+}
+
+/// One operation status as the endpoint reported it.
+#[derive(Debug)]
+struct OperationView {
+    attempt_id: String,
+    operation_id: String,
+    state: String,
+    send_state: String,
+    remote_object_id: Option<String>,
+    result: Option<Value>,
+    error_summary: Option<String>,
+    error_code: Option<String>,
+}
+
+impl OperationView {
+    fn from_result(result: EndpointResult) -> Option<Self> {
+        match result {
+            EndpointResult::GithubOperation {
+                attempt_id,
+                operation_id,
+                state,
+                send_state,
+                remote_object_id,
+                result,
+                error_summary,
+                error_code,
+            } => Some(Self {
+                attempt_id,
+                operation_id,
+                state,
+                send_state,
+                remote_object_id,
+                result,
+                error_summary,
+                error_code,
+            }),
+            EndpointResult::Inventory { .. } => None,
+        }
+    }
+
+    /// Still in the executor's hands with no GitHub failure reported yet.
+    fn pending(&self) -> bool {
+        matches!(self.state.as_str(), "queued" | "running") && self.error_code.is_none()
+    }
+
+    fn render(self) -> CallToolResult {
+        if let Some(code) = self.error_code {
+            let message = match code.as_str() {
+                "github_rate_limited" => "GitHub rate limit reached; the daemon retries reads within its bounds",
+                "github_unavailable" => "GitHub is unavailable or did not answer in time",
+                "github_rejected" => "GitHub rejected the request",
+                "github_outcome_unknown" => "the write may already have reached GitHub and is never re-sent; check the pull request before posting again with a new clientRequestId",
+                "github_invalid_response" => "GitHub returned a response the daemon could not accept",
+                "github_operation_cancelled" => "the operation was cancelled before it was sent",
+                _ => "the GitHub operation failed",
+            };
+            let retrying = matches!(self.state.as_str(), "queued" | "running");
+            return json_result(
+                json!({
+                    "code": code,
+                    "message": message,
+                    "attempt_id": self.attempt_id,
+                    "operation_id": self.operation_id,
+                    "state": self.state,
+                    "send_state": self.send_state,
+                    "retrying": retrying,
+                    "error_summary": self.error_summary,
+                }),
+                true,
+            );
+        }
+        if self.pending() {
+            return json_result(
+                json!({
+                    "pending": true,
+                    "message": "the daemon is still executing this operation; read its result with github_operation_read",
+                    "attempt_id": self.attempt_id,
+                    "operation_id": self.operation_id,
+                    "state": self.state,
+                    "send_state": self.send_state,
+                }),
+                false,
+            );
+        }
+        json_result(
+            json!({
+                "attempt_id": self.attempt_id,
+                "operation_id": self.operation_id,
+                "state": self.state,
+                "send_state": self.send_state,
+                "remote_object_id": self.remote_object_id,
+                "result": self.result,
+            }),
+            false,
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -692,7 +848,8 @@ struct Inventory {
 
 #[derive(Debug)]
 enum EndpointFailure {
-    Rejected(String),
+    /// The endpoint's closed code and its bounded message.
+    Rejected(String, String),
     Unavailable,
 }
 
@@ -836,10 +993,83 @@ impl QuorumServer {
                     && !error.message.is_empty()
                     && error.message.len() <= 256 =>
             {
-                Err(EndpointFailure::Rejected(error.code))
+                Err(EndpointFailure::Rejected(error.code, error.message))
             }
             _ => Err(EndpointFailure::Unavailable),
         }
+    }
+
+    /// Admit one `pull_request_read`, `add_issue_comment`,
+    /// `pull_request_review_write`, or `add_comment_to_pending_review` call,
+    /// then wait up
+    /// to [`OPERATION_WAIT`] for the daemon executor by polling the same
+    /// operation through `github_operation_read`. The endpoint owns every
+    /// authority, target, and bound decision; its rejection is relayed with
+    /// its own code and message.
+    async fn github_operation(
+        &self,
+        capability: &str,
+        operation: ProtocolOperation,
+        arguments: Option<Map<String, Value>>,
+    ) -> std::result::Result<CallToolResult, McpError> {
+        let arguments = Value::Object(arguments.unwrap_or_default());
+        // Leave room for the request envelope inside one endpoint frame.
+        if arguments.to_string().len() > MAX_FRAME_BYTES - 1024 {
+            return Ok(json_result(
+                json!({
+                    "code": "request_too_large",
+                    "message": "the request does not fit one endpoint request; shorten the body"
+                }),
+                true,
+            ));
+        }
+        let admitted = self
+            .exchange(
+                capability,
+                EndpointOperation::Protocol {
+                    operation,
+                    attempt_id: None,
+                    operation_id: None,
+                    arguments: Some(arguments),
+                },
+            )
+            .await;
+        let mut view = match admitted.map(OperationView::from_result) {
+            Ok(Some(view)) => view,
+            Ok(None) => {
+                return Err(McpError::internal_error(
+                    "agent endpoint returned invalid tool response",
+                    None,
+                ))
+            }
+            Err(EndpointFailure::Rejected(code, message)) => {
+                return Ok(json_result(json!({"code": code, "message": message}), true))
+            }
+            Err(EndpointFailure::Unavailable) => {
+                return Err(McpError::internal_error("agent endpoint unavailable", None))
+            }
+        };
+        let deadline = tokio::time::Instant::now() + OPERATION_WAIT;
+        while view.pending() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(OPERATION_POLL_INTERVAL).await;
+            let read = self
+                .exchange(
+                    capability,
+                    EndpointOperation::Protocol {
+                        operation: ProtocolOperation::GithubOperationRead,
+                        attempt_id: Some(view.attempt_id.clone()),
+                        operation_id: Some(view.operation_id.clone()),
+                        arguments: None,
+                    },
+                )
+                .await;
+            match read.map(OperationView::from_result) {
+                Ok(Some(next)) => view = next,
+                // The operation is durable; the agent can read it later.
+                _ => break,
+            }
+        }
+        Ok(view.render())
     }
 
     /// Proxy one plan submission to the daemon endpoint.
@@ -935,6 +1165,7 @@ impl QuorumServer {
                             feedback: None,
                             feedback_json: None,
                             blocking: None,
+                            publication_failure: None,
                         },
                     )
                 })
@@ -959,6 +1190,7 @@ impl QuorumServer {
                             feedback: arguments.feedback.as_deref(),
                             feedback_json: feedback_json.as_deref(),
                             blocking: arguments.blocking,
+                            publication_failure: arguments.publication_failure.as_deref(),
                         },
                     )
                 })
@@ -1122,10 +1354,10 @@ fn expected_inventory(phase: RunPhase) -> Vec<ProtocolOperation> {
 
 fn inventory_error(error: EndpointFailure) -> McpError {
     match error {
-        EndpointFailure::Rejected(code) if code == "unauthorized" => {
+        EndpointFailure::Rejected(code, _) if code == "unauthorized" => {
             McpError::invalid_request("run authority rejected", None)
         }
-        EndpointFailure::Rejected(_) => McpError::invalid_request("tool inventory rejected", None),
+        EndpointFailure::Rejected(..) => McpError::invalid_request("tool inventory rejected", None),
         EndpointFailure::Unavailable => {
             McpError::internal_error("agent endpoint unavailable", None)
         }
@@ -1218,6 +1450,18 @@ impl ServerHandler for QuorumServer {
         }
         let operation = ProtocolOperation::from_name(&request.name)
             .ok_or_else(|| McpError::new(ErrorCode::METHOD_NOT_FOUND, "unknown tool", None))?;
+        if matches!(
+            operation,
+            ProtocolOperation::PullRequestRead
+                | ProtocolOperation::AddIssueComment
+                | ProtocolOperation::PullRequestReviewWrite
+                | ProtocolOperation::AddCommentToPendingReview
+        ) {
+            return Ok(self
+                .github_operation(&capability, operation, request.arguments)
+                .await?
+                .into());
+        }
         let (attempt_id, operation_id) = if operation == ProtocolOperation::GithubOperationRead {
             let arguments: GithubOperationReadArguments =
                 match signal_arguments(operation.name(), request.arguments) {
@@ -1235,34 +1479,30 @@ impl ServerHandler for QuorumServer {
                     operation,
                     attempt_id,
                     operation_id,
+                    arguments: None,
                 },
             )
             .await
         {
-            Ok(EndpointResult::GithubOperation {
-                operation_id,
-                state,
-                send_state,
-                remote_object_id,
-                result,
-                error_summary,
-            }) if operation == ProtocolOperation::GithubOperationRead => Ok(json_result(
-                json!({
-                    "operation_id": operation_id,
-                    "state": state,
-                    "send_state": send_state,
-                    "remote_object_id": remote_object_id,
-                    "result": result,
-                    "error_summary": error_summary,
-                }),
-                false,
-            )
-            .into()),
+            // A later read renders exactly as the admitting call would have:
+            // a settled failure (timeout, rate limit, ambiguous write) is a
+            // typed `isError` result carrying its `error_code`, never success.
+            Ok(result @ EndpointResult::GithubOperation { .. })
+                if operation == ProtocolOperation::GithubOperationRead =>
+            {
+                match OperationView::from_result(result) {
+                    Some(view) => Ok(view.render().into()),
+                    None => Err(McpError::internal_error(
+                        "agent endpoint returned invalid tool response",
+                        None,
+                    )),
+                }
+            }
             Ok(_) => Err(McpError::internal_error(
                 "agent endpoint returned invalid tool response",
                 None,
             )),
-            Err(EndpointFailure::Rejected(code)) => Ok(tool_error(&code).into()),
+            Err(EndpointFailure::Rejected(code, _)) => Ok(tool_error(&code).into()),
             Err(EndpointFailure::Unavailable) => {
                 Err(McpError::internal_error("agent endpoint unavailable", None))
             }

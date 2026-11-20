@@ -15,10 +15,6 @@
 //! whether the request was provably not sent, definitively rejected, or
 //! possibly sent.
 
-// The executor that consumes this boundary lands in a follow-up slice; the
-// contract tests below exercise the runtime API directly.
-#![allow(dead_code)]
-
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -27,8 +23,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde_json::{json, Value};
 
-use super::{publication_github_token, run_bounded_gh_command, BoundedGhError};
+use super::{publication_github_token, run_bounded_gh_command_with_input, BoundedGhError};
 use crate::github_credentials::GithubCredentialSource;
 
 /// Per-call deadline for one Repository Service `gh` child (spec: reuse the
@@ -44,6 +41,42 @@ const MAX_ERROR_DETAIL_BYTES: usize = 512;
 const MAX_REF_BYTES: usize = 255;
 /// Largest `OWNER/REPO` slug accepted from daemon config.
 const MAX_REPO_SLUG_BYTES: usize = 200;
+/// Largest authored general-comment body, before the daemon marker.
+pub const MAX_COMMENT_BODY_BYTES: usize = 32 * 1024;
+/// Largest page number and page size a pull request read may request.
+pub const MAX_READ_PAGE: u32 = 100;
+pub const MAX_READ_PER_PAGE: u32 = 100;
+/// Serialized-JSON budget for one bounded read result. It sits below the
+/// outbox's retained-result cap so a result at the budget is always stored.
+pub const READ_RESULT_BUDGET_BYTES: usize = 48 * 1024;
+/// Serialized-JSON budget for one `get_diff` page of diff text.
+pub const DIFF_PAGE_BUDGET_BYTES: usize = 40 * 1024;
+/// Serialized-JSON bounds for individual text fields in read results.
+const MAX_BODY_FIELD_BYTES: usize = 8 * 1024;
+const MAX_PATCH_FIELD_BYTES: usize = 16 * 1024;
+const MAX_HUNK_FIELD_BYTES: usize = 4 * 1024;
+const MAX_SHORT_FIELD_BYTES: usize = 1024;
+/// Largest GraphQL node ID accepted in a request or response.
+const MAX_NODE_ID_BYTES: usize = 256;
+/// Largest repository path an inline comment may anchor to.
+const MAX_PATH_BYTES: usize = 4096;
+/// Largest review/comment body accepted back from GitHub. It covers an
+/// authored body at its bound plus the daemon marker and attribution, and
+/// is never clipped, so marker reconciliation sees the whole body.
+pub const MAX_RESPONSE_BODY_BYTES: usize = 64 * 1024;
+/// Inline comments one pending review may carry.
+#[cfg_attr(not(test), allow(dead_code))]
+pub const MAX_PENDING_REVIEW_COMMENTS: usize = 50;
+/// Pending reviews one listing may return before it fails closed. GitHub
+/// keeps at most one per publisher per PR; more is an anomaly.
+pub const MAX_LISTED_PENDING_REVIEWS: usize = 10;
+/// Fixed GraphQL document for `add_comment_to_pending_review`. Only its
+/// variables carry request fields.
+const ADD_REVIEW_THREAD_MUTATION: &str = "mutation($input: AddPullRequestReviewThreadInput!) { \
+addPullRequestReviewThread(input: $input) { thread { id pullRequest { number } \
+comments(first: 1) { nodes { id databaseId body pullRequestReview { id databaseId } } } } } }";
+/// Fixed `--jq` filter that keeps only pending reviews from every page.
+const PENDING_REVIEW_FILTER: &str = r#".[] | select(.state == "PENDING")"#;
 
 /// The daemon-configured repository an operation targets. Built only by
 /// daemon code from repository config; never decoded from agent input.
@@ -123,6 +156,82 @@ pub enum OperationEffect {
 pub enum RepositoryRequest {
     /// Read the target pull request's identity, state, and head/base refs.
     ReadPrMetadata {},
+    /// `pull_request_read method=get`: bounded pull request details.
+    GetPullRequest {},
+    /// `pull_request_read method=get_diff`: one bounded page of the diff.
+    GetDiff { page: u32 },
+    /// `pull_request_read method=get_files`.
+    GetFiles { page: u32, per_page: u32 },
+    /// `pull_request_read method=get_review_comments`.
+    GetReviewComments { page: u32, per_page: u32 },
+    /// `pull_request_read method=get_reviews`.
+    GetReviews { page: u32, per_page: u32 },
+    /// `pull_request_read method=get_comments` (general PR comments).
+    GetComments { page: u32, per_page: u32 },
+    /// `add_issue_comment`: one general Markdown comment on the target PR.
+    /// The executor appends the operation's hidden marker before the call.
+    AddIssueComment { body: String },
+    /// `pull_request_review_write method=create`: open the publisher's
+    /// pending review on `commit_id` (the immutable launch SHA). No event is
+    /// sent, so GitHub leaves the review `PENDING`.
+    CreatePendingReview { commit_id: String, body: String },
+    /// `add_comment_to_pending_review`: one inline thread on the pending
+    /// review identified by its GraphQL node ID.
+    AddPendingReviewComment {
+        review_node_id: String,
+        path: String,
+        line: u32,
+        side: DiffSide,
+        #[serde(default)]
+        start_line: Option<u32>,
+        #[serde(default)]
+        start_side: Option<DiffSide>,
+        subject_type: ReviewSubjectType,
+        body: String,
+    },
+    /// `pull_request_review_write method=submit_pending`. The event is fixed
+    /// to `COMMENT` in the request document; there is no field to name
+    /// another event.
+    SubmitPendingReview { review_id: u64, body: String },
+    /// Daemon-only housekeeping: the publisher's current pending review(s)
+    /// on the target PR. Never decodable from agent JSON.
+    #[serde(skip_deserializing)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    ListPendingReviews {},
+    /// Daemon-only housekeeping: look up one exact review ID.
+    #[serde(skip_deserializing)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    GetReview { review_id: u64 },
+    /// Daemon-only housekeeping: delete one exact pending review ID.
+    #[serde(skip_deserializing)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    DeletePendingReview { review_id: u64 },
+}
+
+/// Diff side of an inline comment anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum DiffSide {
+    #[serde(rename = "LEFT")]
+    Left,
+    #[serde(rename = "RIGHT")]
+    Right,
+}
+
+impl DiffSide {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "LEFT",
+            Self::Right => "RIGHT",
+        }
+    }
+}
+
+/// Whether an inline comment targets diff lines or the whole file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewSubjectType {
+    Line,
+    File,
 }
 
 impl RepositoryRequest {
@@ -140,14 +249,109 @@ impl RepositoryRequest {
         if text.contains('\0') {
             return Err(RequestDecodeError("request contains NUL".to_string()));
         }
-        serde_json::from_str(text).map_err(|error| RequestDecodeError(bounded(&error.to_string())))
+        let request: Self = serde_json::from_str(text)
+            .map_err(|error| RequestDecodeError(bounded(&error.to_string())))?;
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn validate(&self) -> Result<(), RequestDecodeError> {
+        let page_ok = |page: u32| (1..=MAX_READ_PAGE).contains(&page);
+        let per_page_ok = |per_page: u32| (1..=MAX_READ_PER_PAGE).contains(&per_page);
+        let valid = match self {
+            Self::ReadPrMetadata {} | Self::GetPullRequest {} => true,
+            Self::GetDiff { page } => page_ok(*page),
+            Self::GetFiles { page, per_page }
+            | Self::GetReviewComments { page, per_page }
+            | Self::GetReviews { page, per_page }
+            | Self::GetComments { page, per_page } => page_ok(*page) && per_page_ok(*per_page),
+            Self::AddIssueComment { body } => body_ok(body),
+            Self::CreatePendingReview { commit_id, body } => {
+                is_object_id(commit_id) && body_ok(body)
+            }
+            Self::AddPendingReviewComment {
+                review_node_id,
+                path,
+                line,
+                side: _,
+                start_line,
+                start_side,
+                subject_type,
+                body,
+            } => {
+                let anchor_ok = match subject_type {
+                    ReviewSubjectType::Line => {
+                        *line >= 1
+                            && start_line
+                                .map_or(start_side.is_none(), |start| (1..=*line).contains(&start))
+                    }
+                    // A file-level comment has no line range.
+                    ReviewSubjectType::File => {
+                        *line >= 1 && start_line.is_none() && start_side.is_none()
+                    }
+                };
+                is_node_id(review_node_id) && path_ok(path) && anchor_ok && body_ok(body)
+            }
+            Self::SubmitPendingReview { review_id, body } => *review_id >= 1 && body_ok(body),
+            Self::ListPendingReviews {} => true,
+            Self::GetReview { review_id } | Self::DeletePendingReview { review_id } => {
+                *review_id >= 1
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(RequestDecodeError(
+                "request field is outside its bounds".to_string(),
+            ))
+        }
     }
 
     pub fn effect(&self) -> OperationEffect {
         match self {
-            Self::ReadPrMetadata {} => OperationEffect::Read,
+            Self::AddIssueComment { .. }
+            | Self::CreatePendingReview { .. }
+            | Self::AddPendingReviewComment { .. }
+            | Self::SubmitPendingReview { .. }
+            | Self::DeletePendingReview { .. } => OperationEffect::Write,
+            Self::ReadPrMetadata {}
+            | Self::GetPullRequest {}
+            | Self::GetDiff { .. }
+            | Self::GetFiles { .. }
+            | Self::GetReviewComments { .. }
+            | Self::GetReviews { .. }
+            | Self::GetComments { .. }
+            | Self::ListPendingReviews {}
+            | Self::GetReview { .. } => OperationEffect::Read,
         }
     }
+}
+
+/// A non-blank authored body within the per-body byte bound.
+fn body_ok(body: &str) -> bool {
+    !body.trim().is_empty() && body.len() <= MAX_COMMENT_BODY_BYTES
+}
+
+/// A full lowercase hex Git object ID (SHA-1 or SHA-256).
+fn is_object_id(sha: &str) -> bool {
+    matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A bounded GitHub GraphQL node ID.
+fn is_node_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_NODE_ID_BYTES
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'='))
+}
+
+/// A bounded, relative repository path with no control characters.
+fn path_ok(path: &str) -> bool {
+    !path.trim().is_empty()
+        && path.len() <= MAX_PATH_BYTES
+        && !path.starts_with('/')
+        && !path.chars().any(char::is_control)
 }
 
 /// An agent request that does not fit the closed vocabulary.
@@ -166,6 +370,89 @@ impl std::error::Error for RequestDecodeError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepositoryResponse {
     PrMetadata(PrMetadata),
+    /// One bounded `pull_request_read` result, built by the daemon from the
+    /// typed GitHub response. Its serialized form fits
+    /// [`READ_RESULT_BUDGET_BYTES`] and carries a `truncated` indicator.
+    PullRequestRead(Value),
+    /// The general comment GitHub created.
+    IssueComment(CreatedComment),
+    /// The review created, submitted, looked up, or deleted.
+    Review(ReviewRecord),
+    /// The publisher's current pending reviews on the target PR.
+    PendingReviews(Vec<ReviewRecord>),
+    /// An exact-ID lookup or delete answered 404: the review does not exist
+    /// (for a delete, it is already gone).
+    ReviewAbsent {
+        review_id: u64,
+    },
+    /// The inline thread added to a pending review.
+    PendingReviewComment(CreatedReviewComment),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedComment {
+    pub id: u64,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewState {
+    Pending,
+    Commented,
+    Approved,
+    ChangesRequested,
+    Dismissed,
+}
+
+impl ReviewState {
+    fn parse(state: &str) -> Option<Self> {
+        Some(match state {
+            "PENDING" => Self::Pending,
+            "COMMENTED" => Self::Commented,
+            "APPROVED" => Self::Approved,
+            "CHANGES_REQUESTED" => Self::ChangesRequested,
+            "DISMISSED" => Self::Dismissed,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Commented => "COMMENTED",
+            Self::Approved => "APPROVED",
+            Self::ChangesRequested => "CHANGES_REQUESTED",
+            Self::Dismissed => "DISMISSED",
+        }
+    }
+}
+
+/// A validated review on the target PR. `body` is complete (never clipped)
+/// so the daemon can reconcile by its hidden marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRecord {
+    pub id: u64,
+    pub node_id: String,
+    pub state: ReviewState,
+    pub commit_id: Option<String>,
+    pub body: String,
+}
+
+impl ReviewRecord {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn has_marker(&self, marker: &str) -> bool {
+        !marker.is_empty() && self.body.contains(marker)
+    }
+}
+
+/// A validated inline thread GitHub added to a pending review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedReviewComment {
+    pub id: u64,
+    pub node_id: String,
+    pub thread_node_id: String,
+    pub review_node_id: String,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,8 +506,10 @@ pub enum RepositoryErrorKind {
     TimedOut,
     /// A response pipe exceeded the byte cap and the child was killed.
     ResponseTooLarge,
-    /// A transport/5xx/rate-limit style failure after spawn.
+    /// A transport/5xx style failure after spawn: GitHub is unavailable.
     TransientFailure,
+    /// GitHub answered with a primary or secondary rate limit.
+    RateLimited,
     /// GitHub definitively rejected the request (e.g. 4xx, not found).
     PermanentFailure,
     /// `gh` reported success but the response failed validation.
@@ -241,6 +530,7 @@ impl RepositoryError {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn detail(&self) -> &str {
         &self.detail
     }
@@ -251,9 +541,12 @@ impl RepositoryError {
                 Delivery::NotSent
             }
             RepositoryErrorKind::PermanentFailure => Delivery::Rejected,
+            // A rate-limit answer is classified from stderr text, which is
+            // not a closed proof of no effect: writes stay fenced.
             RepositoryErrorKind::TimedOut
             | RepositoryErrorKind::ResponseTooLarge
             | RepositoryErrorKind::TransientFailure
+            | RepositoryErrorKind::RateLimited
             | RepositoryErrorKind::InvalidResponse => Delivery::PossiblySent,
         }
     }
@@ -266,9 +559,9 @@ impl RepositoryError {
             (Delivery::NotSent | Delivery::Rejected, _) => OutcomeClass::NonRetryable,
             (Delivery::PossiblySent, OperationEffect::Write) => OutcomeClass::PossiblySent,
             (Delivery::PossiblySent, OperationEffect::Read) => match self.kind {
-                RepositoryErrorKind::TimedOut | RepositoryErrorKind::TransientFailure => {
-                    OutcomeClass::Retryable
-                }
+                RepositoryErrorKind::TimedOut
+                | RepositoryErrorKind::TransientFailure
+                | RepositoryErrorKind::RateLimited => OutcomeClass::Retryable,
                 _ => OutcomeClass::NonRetryable,
             },
         }
@@ -317,6 +610,7 @@ impl GhRepositoryService {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_bounds(mut self, timeout: Duration, response_byte_limit: usize) -> Self {
         self.timeout = timeout;
         self.response_byte_limit = response_byte_limit;
@@ -346,6 +640,7 @@ impl GhRepositoryService {
         request: &RepositoryRequest,
     ) -> Result<RepositoryResponse, RepositoryError> {
         let args = gh_args(target, pr, request);
+        let input = gh_input(request);
         // One fresh token per operation; a source failure returns before any
         // child is spawned. The token lives only in this frame and the child env.
         let token = publication_github_token(&self.credentials, "repository service")
@@ -361,31 +656,43 @@ impl GhRepositoryService {
         token.apply_to_tokio_command(&mut command);
         let secret = token.expose_secret();
         let redact = |text: &str| text.replace(secret, "<redacted>");
-        let output = run_bounded_gh_command(command, self.timeout, self.response_byte_limit)
-            .await
-            .map_err(|error| {
-                let kind = match &error {
-                    BoundedGhError::Spawn(_) => RepositoryErrorKind::SpawnFailed,
-                    BoundedGhError::PipeOverflow { .. } => RepositoryErrorKind::ResponseTooLarge,
-                    BoundedGhError::TimedOut { .. } | BoundedGhError::CollectionTimedOut => {
-                        RepositoryErrorKind::TimedOut
-                    }
-                    BoundedGhError::Io(_) => RepositoryErrorKind::TransientFailure,
-                };
-                let detail = error.describe("gh", self.timeout, self.response_byte_limit);
-                RepositoryError::new(kind, &redact(&detail))
-            })?;
+        let output = run_bounded_gh_command_with_input(
+            command,
+            input,
+            self.timeout,
+            self.response_byte_limit,
+        )
+        .await
+        .map_err(|error| {
+            let kind = match &error {
+                BoundedGhError::Spawn(_) => RepositoryErrorKind::SpawnFailed,
+                BoundedGhError::PipeOverflow { .. } => RepositoryErrorKind::ResponseTooLarge,
+                BoundedGhError::TimedOut { .. } | BoundedGhError::CollectionTimedOut => {
+                    RepositoryErrorKind::TimedOut
+                }
+                BoundedGhError::Io(_) => RepositoryErrorKind::TransientFailure,
+            };
+            let detail = error.describe("gh", self.timeout, self.response_byte_limit);
+            RepositoryError::new(kind, &redact(&detail))
+        })?;
         if !output.status.success() {
             let stderr = redact(&String::from_utf8_lossy(&output.stderr));
+            // Only the daemon's exact-ID housekeeping reads a 404 as an
+            // answer: the review is absent (or a delete already landed).
+            if let RepositoryRequest::GetReview { review_id }
+            | RepositoryRequest::DeletePendingReview { review_id } = request
+            {
+                if stderr.to_ascii_lowercase().contains("http 404") {
+                    return Ok(RepositoryResponse::ReviewAbsent {
+                        review_id: *review_id,
+                    });
+                }
+            }
             return Err(RepositoryError::new(classify_gh_failure(&stderr), &stderr));
         }
-        match request {
-            RepositoryRequest::ReadPrMetadata {} => parse_pr_metadata(pr, &output.stdout)
-                .map(RepositoryResponse::PrMetadata)
-                .map_err(|reason| {
-                    RepositoryError::new(RepositoryErrorKind::InvalidResponse, &redact(&reason))
-                }),
-        }
+        parse_response(pr, request, &output.stdout).map_err(|reason| {
+            RepositoryError::new(RepositoryErrorKind::InvalidResponse, &redact(&reason))
+        })
     }
 }
 
@@ -401,37 +708,161 @@ impl RepositoryService for GhRepositoryService {
 }
 
 /// The only argv this service can build: a fixed command per closed variant,
-/// with the daemon-supplied PR and optional repository slug.
+/// with the daemon-supplied PR and optional repository slug. Integers are the
+/// only request fields that reach argv; authored text never does.
 fn gh_args(
     target: &RepositoryTarget,
     pr: PullRequestNumber,
     request: &RepositoryRequest,
 ) -> Vec<String> {
-    let mut args = match request {
-        RepositoryRequest::ReadPrMetadata {} => vec![
-            "pr".to_string(),
-            "view".to_string(),
-            pr.get().to_string(),
-            "--json".to_string(),
-            "number,state,headRefName,headRefOid,baseRefName,isCrossRepository".to_string(),
-        ],
+    let n = pr.get();
+    // `gh api` resolves the `{owner}/{repo}` placeholders from the working
+    // directory's repository when daemon config names no slug.
+    let repo = target.gh_repo().unwrap_or("{owner}/{repo}");
+    let api = |path: String| vec!["api".to_string(), format!("repos/{repo}/{path}")];
+    let post = |endpoint: String| {
+        vec![
+            "api".to_string(),
+            "--method".to_string(),
+            "POST".to_string(),
+            endpoint,
+            "--input".to_string(),
+            "-".to_string(),
+        ]
     };
-    if let Some(slug) = target.gh_repo() {
-        args.push("--repo".to_string());
-        args.push(slug.to_string());
+    let paged = |path: &str, page: &u32, per_page: &u32| {
+        api(format!("{path}?per_page={per_page}&page={page}"))
+    };
+    match request {
+        RepositoryRequest::ReadPrMetadata {} => {
+            let mut args = vec![
+                "pr".to_string(),
+                "view".to_string(),
+                n.to_string(),
+                "--json".to_string(),
+                "number,state,headRefName,headRefOid,baseRefName,isCrossRepository".to_string(),
+            ];
+            if let Some(slug) = target.gh_repo() {
+                args.push("--repo".to_string());
+                args.push(slug.to_string());
+            }
+            args
+        }
+        RepositoryRequest::GetPullRequest {} => api(format!("pulls/{n}")),
+        RepositoryRequest::GetDiff { .. } => {
+            let mut args = vec![
+                "api".to_string(),
+                "-H".to_string(),
+                "Accept: application/vnd.github.diff".to_string(),
+            ];
+            args.push(format!("repos/{repo}/pulls/{n}"));
+            args
+        }
+        RepositoryRequest::GetFiles { page, per_page } => {
+            paged(&format!("pulls/{n}/files"), page, per_page)
+        }
+        RepositoryRequest::GetReviewComments { page, per_page } => {
+            paged(&format!("pulls/{n}/comments"), page, per_page)
+        }
+        RepositoryRequest::GetReviews { page, per_page } => {
+            paged(&format!("pulls/{n}/reviews"), page, per_page)
+        }
+        RepositoryRequest::GetComments { page, per_page } => {
+            paged(&format!("issues/{n}/comments"), page, per_page)
+        }
+        RepositoryRequest::AddIssueComment { .. } => {
+            post(format!("repos/{repo}/issues/{n}/comments"))
+        }
+        RepositoryRequest::CreatePendingReview { .. } => {
+            post(format!("repos/{repo}/pulls/{n}/reviews"))
+        }
+        RepositoryRequest::SubmitPendingReview { review_id, .. } => {
+            post(format!("repos/{repo}/pulls/{n}/reviews/{review_id}/events"))
+        }
+        // The GraphQL mutation names the pending review by node ID; the
+        // response is checked against the target PR.
+        RepositoryRequest::AddPendingReviewComment { .. } => vec![
+            "api".to_string(),
+            "graphql".to_string(),
+            "--input".to_string(),
+            "-".to_string(),
+        ],
+        RepositoryRequest::ListPendingReviews {} => vec![
+            "api".to_string(),
+            "--paginate".to_string(),
+            format!("repos/{repo}/pulls/{n}/reviews?per_page=100"),
+            "--jq".to_string(),
+            PENDING_REVIEW_FILTER.to_string(),
+        ],
+        RepositoryRequest::GetReview { review_id } => api(format!("pulls/{n}/reviews/{review_id}")),
+        RepositoryRequest::DeletePendingReview { review_id } => vec![
+            "api".to_string(),
+            "--method".to_string(),
+            "DELETE".to_string(),
+            format!("repos/{repo}/pulls/{n}/reviews/{review_id}"),
+        ],
     }
-    args
+}
+
+/// The request document streamed to `gh` on stdin. Authored text travels
+/// only here, as JSON strings, byte for byte.
+fn gh_input(request: &RepositoryRequest) -> Option<Vec<u8>> {
+    let document = match request {
+        RepositoryRequest::AddIssueComment { body } => json!({ "body": body }),
+        // No `event`: GitHub creates the review as PENDING.
+        RepositoryRequest::CreatePendingReview { commit_id, body } => {
+            json!({ "commit_id": commit_id, "body": body })
+        }
+        // The only event this service can send.
+        RepositoryRequest::SubmitPendingReview { body, .. } => {
+            json!({ "body": body, "event": "COMMENT" })
+        }
+        RepositoryRequest::AddPendingReviewComment {
+            review_node_id,
+            path,
+            line,
+            side,
+            start_line,
+            start_side,
+            subject_type,
+            body,
+        } => {
+            let mut input = json!({
+                "pullRequestReviewId": review_node_id,
+                "path": path,
+                "body": body,
+            });
+            match subject_type {
+                ReviewSubjectType::Line => {
+                    input["subjectType"] = json!("LINE");
+                    input["line"] = json!(line);
+                    input["side"] = json!(side.as_str());
+                    if let Some(start_line) = start_line {
+                        input["startLine"] = json!(start_line);
+                        input["startSide"] = json!(start_side.unwrap_or(*side).as_str());
+                    }
+                }
+                ReviewSubjectType::File => input["subjectType"] = json!("FILE"),
+            }
+            json!({
+                "query": ADD_REVIEW_THREAD_MUTATION,
+                "variables": { "input": input },
+            })
+        }
+        _ => return None,
+    };
+    Some(document.to_string().into_bytes())
 }
 
 /// Nonzero `gh` exits whose stderr names a transport, 5xx, or rate-limit
 /// condition are transient; anything else is a definitive rejection.
 fn classify_gh_failure(stderr: &str) -> RepositoryErrorKind {
+    const RATE_LIMIT_MARKERS: &[&str] = &["rate limit", "http 429"];
     const TRANSIENT_MARKERS: &[&str] = &[
         "http 500",
         "http 502",
         "http 503",
         "http 504",
-        "rate limit",
         "timeout",
         "timed out",
         "connection",
@@ -441,6 +872,12 @@ fn classify_gh_failure(stderr: &str) -> RepositoryErrorKind {
         "something went wrong",
     ];
     let lower = stderr.to_ascii_lowercase();
+    if RATE_LIMIT_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return RepositoryErrorKind::RateLimited;
+    }
     if TRANSIENT_MARKERS
         .iter()
         .any(|marker| lower.contains(marker))
@@ -498,6 +935,548 @@ fn parse_pr_metadata(pr: PullRequestNumber, stdout: &[u8]) -> Result<PrMetadata,
     })
 }
 
+fn parse_response(
+    pr: PullRequestNumber,
+    request: &RepositoryRequest,
+    stdout: &[u8],
+) -> Result<RepositoryResponse, String> {
+    let list = |method: &str, page: u32, per_page: u32, items: Result<Vec<Item>, String>| {
+        items.map(|items| {
+            RepositoryResponse::PullRequestRead(fit_page(method, page, per_page, items))
+        })
+    };
+    match request {
+        RepositoryRequest::ReadPrMetadata {} => {
+            parse_pr_metadata(pr, stdout).map(RepositoryResponse::PrMetadata)
+        }
+        RepositoryRequest::GetPullRequest {} => {
+            parse_pull_request(pr, stdout).map(RepositoryResponse::PullRequestRead)
+        }
+        RepositoryRequest::GetDiff { page } => Ok(RepositoryResponse::PullRequestRead(diff_page(
+            &String::from_utf8_lossy(stdout),
+            *page,
+        ))),
+        RepositoryRequest::GetFiles { page, per_page } => list(
+            "get_files",
+            *page,
+            *per_page,
+            parse_list::<GhFile>(stdout).map(|v| v.into_iter().map(file_item).collect()),
+        ),
+        RepositoryRequest::GetReviewComments { page, per_page } => list(
+            "get_review_comments",
+            *page,
+            *per_page,
+            parse_list::<GhReviewComment>(stdout)
+                .map(|v| v.into_iter().map(review_comment_item).collect()),
+        ),
+        RepositoryRequest::GetReviews { page, per_page } => list(
+            "get_reviews",
+            *page,
+            *per_page,
+            parse_list::<GhReview>(stdout).map(|v| v.into_iter().map(review_item).collect()),
+        ),
+        RepositoryRequest::GetComments { page, per_page } => list(
+            "get_comments",
+            *page,
+            *per_page,
+            parse_list::<GhIssueComment>(stdout)
+                .map(|v| v.into_iter().map(issue_comment_item).collect()),
+        ),
+        RepositoryRequest::AddIssueComment { .. } => {
+            let created: GhIssueComment = serde_json::from_slice(stdout)
+                .map_err(|error| format!("gh api comment JSON: {error}"))?;
+            if created.id == 0 || created.html_url.len() > MAX_SHORT_FIELD_BYTES {
+                return Err("gh api returned an invalid comment".to_string());
+            }
+            Ok(RepositoryResponse::IssueComment(CreatedComment {
+                id: created.id,
+                html_url: created.html_url,
+            }))
+        }
+        RepositoryRequest::CreatePendingReview { commit_id, .. } => {
+            let review = parse_review(pr, stdout)?;
+            if review.state != ReviewState::Pending
+                || review.commit_id.as_deref() != Some(commit_id.as_str())
+            {
+                return Err("gh api did not create a pending review on the commit".to_string());
+            }
+            Ok(RepositoryResponse::Review(review))
+        }
+        RepositoryRequest::SubmitPendingReview { review_id, .. } => {
+            let review = parse_review(pr, stdout)?;
+            if review.id != *review_id || review.state != ReviewState::Commented {
+                return Err("gh api did not submit the review as a comment".to_string());
+            }
+            Ok(RepositoryResponse::Review(review))
+        }
+        RepositoryRequest::GetReview { review_id }
+        | RepositoryRequest::DeletePendingReview { review_id } => {
+            let review = parse_review(pr, stdout)?;
+            if review.id != *review_id {
+                return Err("gh api returned a different review".to_string());
+            }
+            Ok(RepositoryResponse::Review(review))
+        }
+        RepositoryRequest::ListPendingReviews {} => {
+            let mut reviews = Vec::new();
+            for value in serde_json::Deserializer::from_slice(stdout).into_iter::<Value>() {
+                let value = value.map_err(|error| format!("gh api review JSON: {error}"))?;
+                let review = review_record(pr, value)?;
+                if review.state != ReviewState::Pending {
+                    return Err("gh api listed a non-pending review".to_string());
+                }
+                reviews.push(review);
+                if reviews.len() > MAX_LISTED_PENDING_REVIEWS {
+                    return Err("gh api listed too many pending reviews".to_string());
+                }
+            }
+            Ok(RepositoryResponse::PendingReviews(reviews))
+        }
+        RepositoryRequest::AddPendingReviewComment { review_node_id, .. } => {
+            parse_review_thread(pr, review_node_id, stdout)
+                .map(RepositoryResponse::PendingReviewComment)
+        }
+    }
+}
+
+fn parse_review(pr: PullRequestNumber, stdout: &[u8]) -> Result<ReviewRecord, String> {
+    let value: Value =
+        serde_json::from_slice(stdout).map_err(|error| format!("gh api review JSON: {error}"))?;
+    review_record(pr, value)
+}
+
+/// Validate one REST review object: it must belong to the target PR, have a
+/// known state, and carry a complete bounded body.
+fn review_record(pr: PullRequestNumber, value: Value) -> Result<ReviewRecord, String> {
+    #[derive(Deserialize)]
+    struct GhPendingReview {
+        id: u64,
+        node_id: String,
+        state: String,
+        body: Option<String>,
+        commit_id: Option<String>,
+        pull_request_url: String,
+    }
+    let review: GhPendingReview =
+        serde_json::from_value(value).map_err(|error| format!("gh api review JSON: {error}"))?;
+    if !review
+        .pull_request_url
+        .ends_with(&format!("/pulls/{}", pr.get()))
+    {
+        return Err("gh api returned a review for another PR".to_string());
+    }
+    let state = ReviewState::parse(&review.state)
+        .ok_or_else(|| "gh api returned an unknown review state".to_string())?;
+    let body = review.body.unwrap_or_default();
+    if review.id == 0
+        || !is_node_id(&review.node_id)
+        || body.len() > MAX_RESPONSE_BODY_BYTES
+        || review
+            .commit_id
+            .as_deref()
+            .is_some_and(|sha| !is_object_id(sha))
+    {
+        return Err("gh api returned an invalid review".to_string());
+    }
+    Ok(ReviewRecord {
+        id: review.id,
+        node_id: review.node_id,
+        state,
+        commit_id: review.commit_id,
+        body,
+    })
+}
+
+fn parse_review_thread(
+    pr: PullRequestNumber,
+    review_node_id: &str,
+    stdout: &[u8],
+) -> Result<CreatedReviewComment, String> {
+    #[derive(Deserialize)]
+    struct Response {
+        data: Data,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Data {
+        add_pull_request_review_thread: Payload,
+    }
+    #[derive(Deserialize)]
+    struct Payload {
+        thread: Thread,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Thread {
+        id: String,
+        pull_request: Number,
+        comments: Nodes,
+    }
+    #[derive(Deserialize)]
+    struct Number {
+        number: u64,
+    }
+    #[derive(Deserialize)]
+    struct Nodes {
+        nodes: Vec<Comment>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Comment {
+        id: String,
+        database_id: u64,
+        body: String,
+        pull_request_review: Review,
+    }
+    #[derive(Deserialize)]
+    struct Review {
+        id: String,
+    }
+    let response: Response =
+        serde_json::from_slice(stdout).map_err(|error| format!("gh api graphql JSON: {error}"))?;
+    let thread = response.data.add_pull_request_review_thread.thread;
+    if thread.pull_request.number != pr.get() {
+        return Err("gh api graphql added a thread on another PR".to_string());
+    }
+    let [comment] = <[Comment; 1]>::try_from(thread.comments.nodes)
+        .map_err(|_| "gh api graphql returned no single thread comment".to_string())?;
+    if comment.pull_request_review.id != review_node_id
+        || comment.database_id == 0
+        || !is_node_id(&comment.id)
+        || !is_node_id(&thread.id)
+        || comment.body.len() > MAX_RESPONSE_BODY_BYTES
+    {
+        return Err("gh api graphql returned an invalid review thread".to_string());
+    }
+    Ok(CreatedReviewComment {
+        id: comment.database_id,
+        node_id: comment.id,
+        thread_node_id: thread.id,
+        review_node_id: comment.pull_request_review.id,
+        body: comment.body,
+    })
+}
+
+/// One rendered list item and whether any of its text fields was clipped.
+type Item = (Value, bool);
+
+#[derive(Deserialize)]
+struct GhUser {
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct GhRef {
+    #[serde(rename = "ref")]
+    name: String,
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct GhPull {
+    number: u64,
+    title: String,
+    body: Option<String>,
+    state: String,
+    draft: Option<bool>,
+    merged: Option<bool>,
+    user: Option<GhUser>,
+    head: GhRef,
+    base: GhRef,
+    html_url: String,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    additions: Option<u64>,
+    deletions: Option<u64>,
+    changed_files: Option<u64>,
+    commits: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct GhFile {
+    filename: String,
+    status: String,
+    additions: u64,
+    deletions: u64,
+    changes: u64,
+    patch: Option<String>,
+    previous_filename: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GhReviewComment {
+    id: u64,
+    node_id: Option<String>,
+    pull_request_review_id: Option<u64>,
+    path: String,
+    commit_id: Option<String>,
+    original_commit_id: Option<String>,
+    side: Option<String>,
+    start_side: Option<String>,
+    line: Option<u64>,
+    start_line: Option<u64>,
+    original_line: Option<u64>,
+    original_start_line: Option<u64>,
+    subject_type: Option<String>,
+    diff_hunk: Option<String>,
+    body: Option<String>,
+    user: Option<GhUser>,
+    in_reply_to_id: Option<u64>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    html_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GhReview {
+    id: u64,
+    user: Option<GhUser>,
+    state: String,
+    body: Option<String>,
+    commit_id: Option<String>,
+    submitted_at: Option<String>,
+    html_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GhIssueComment {
+    id: u64,
+    user: Option<GhUser>,
+    body: Option<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    html_url: String,
+}
+
+fn parse_list<T: for<'de> Deserialize<'de>>(stdout: &[u8]) -> Result<Vec<T>, String> {
+    serde_json::from_slice(stdout).map_err(|error| format!("gh api list JSON: {error}"))
+}
+
+/// JSON-escaped length of one character inside a string literal.
+fn escaped_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// The longest prefix of `text` whose JSON-escaped form fits `budget` bytes,
+/// cut on a character boundary.
+fn escaped_prefix(text: &str, budget: usize) -> &str {
+    let mut used = 0;
+    for (index, c) in text.char_indices() {
+        used += escaped_len(c);
+        if used > budget {
+            return &text[..index];
+        }
+    }
+    text
+}
+
+/// Clip one text field to its serialized bound, recording any clipping.
+fn clip(text: Option<&str>, budget: usize, clipped: &mut bool) -> Value {
+    match text {
+        None => Value::Null,
+        Some(text) => {
+            let kept = escaped_prefix(text, budget);
+            if kept.len() < text.len() {
+                *clipped = true;
+            }
+            Value::String(kept.to_string())
+        }
+    }
+}
+
+fn login(user: &Option<GhUser>, clipped: &mut bool) -> Value {
+    clip(
+        user.as_ref().map(|user| user.login.as_str()),
+        MAX_SHORT_FIELD_BYTES,
+        clipped,
+    )
+}
+
+fn parse_pull_request(pr: PullRequestNumber, stdout: &[u8]) -> Result<Value, String> {
+    let pull: GhPull =
+        serde_json::from_slice(stdout).map_err(|error| format!("gh api pull JSON: {error}"))?;
+    if pull.number != pr.get() {
+        return Err(format!(
+            "gh api returned PR #{} for requested PR #{}",
+            pull.number,
+            pr.get()
+        ));
+    }
+    let mut clipped = false;
+    let short = MAX_SHORT_FIELD_BYTES;
+    let pull_request = json!({
+        "number": pull.number,
+        "title": clip(Some(&pull.title), short, &mut clipped),
+        "body": clip(pull.body.as_deref(), MAX_BODY_FIELD_BYTES, &mut clipped),
+        "state": clip(Some(&pull.state), short, &mut clipped),
+        "draft": pull.draft,
+        "merged": pull.merged,
+        "author": login(&pull.user, &mut clipped),
+        "head_ref": clip(Some(&pull.head.name), short, &mut clipped),
+        "head_sha": clip(Some(&pull.head.sha), short, &mut clipped),
+        "base_ref": clip(Some(&pull.base.name), short, &mut clipped),
+        "base_sha": clip(Some(&pull.base.sha), short, &mut clipped),
+        "html_url": clip(Some(&pull.html_url), short, &mut clipped),
+        "created_at": clip(pull.created_at.as_deref(), short, &mut clipped),
+        "updated_at": clip(pull.updated_at.as_deref(), short, &mut clipped),
+        "additions": pull.additions,
+        "deletions": pull.deletions,
+        "changed_files": pull.changed_files,
+        "commits": pull.commits,
+    });
+    Ok(json!({
+        "method": "get",
+        "pull_request": pull_request,
+        "truncated": clipped,
+    }))
+}
+
+fn file_item(file: GhFile) -> Item {
+    let mut clipped = false;
+    let short = MAX_SHORT_FIELD_BYTES * 4;
+    let value = json!({
+        "filename": clip(Some(&file.filename), short, &mut clipped),
+        "previous_filename": clip(file.previous_filename.as_deref(), short, &mut clipped),
+        "status": clip(Some(&file.status), MAX_SHORT_FIELD_BYTES, &mut clipped),
+        "additions": file.additions,
+        "deletions": file.deletions,
+        "changes": file.changes,
+        "patch": clip(file.patch.as_deref(), MAX_PATCH_FIELD_BYTES, &mut clipped),
+    });
+    (value, clipped)
+}
+
+fn review_comment_item(comment: GhReviewComment) -> Item {
+    let mut clipped = false;
+    let short = MAX_SHORT_FIELD_BYTES;
+    let value = json!({
+        "id": comment.id,
+        "node_id": clip(comment.node_id.as_deref(), short, &mut clipped),
+        "review_id": comment.pull_request_review_id,
+        "path": clip(Some(&comment.path), short * 4, &mut clipped),
+        "commit_id": clip(comment.commit_id.as_deref(), short, &mut clipped),
+        "original_commit_id": clip(comment.original_commit_id.as_deref(), short, &mut clipped),
+        "side": clip(comment.side.as_deref(), short, &mut clipped),
+        "start_side": clip(comment.start_side.as_deref(), short, &mut clipped),
+        "line": comment.line,
+        "start_line": comment.start_line,
+        "original_line": comment.original_line,
+        "original_start_line": comment.original_start_line,
+        "subject_type": clip(comment.subject_type.as_deref(), short, &mut clipped),
+        // GitHub drops the current-diff anchor of an outdated comment.
+        "outdated": comment.line.is_none() && comment.subject_type.as_deref() != Some("file"),
+        "in_reply_to_id": comment.in_reply_to_id,
+        "author": login(&comment.user, &mut clipped),
+        "body": clip(comment.body.as_deref(), MAX_BODY_FIELD_BYTES, &mut clipped),
+        "diff_hunk": clip(comment.diff_hunk.as_deref(), MAX_HUNK_FIELD_BYTES, &mut clipped),
+        "created_at": clip(comment.created_at.as_deref(), short, &mut clipped),
+        "updated_at": clip(comment.updated_at.as_deref(), short, &mut clipped),
+        "html_url": clip(comment.html_url.as_deref(), short, &mut clipped),
+    });
+    (value, clipped)
+}
+
+fn review_item(review: GhReview) -> Item {
+    let mut clipped = false;
+    let short = MAX_SHORT_FIELD_BYTES;
+    let value = json!({
+        "id": review.id,
+        "author": login(&review.user, &mut clipped),
+        "state": clip(Some(&review.state), short, &mut clipped),
+        "body": clip(review.body.as_deref(), MAX_BODY_FIELD_BYTES, &mut clipped),
+        "commit_id": clip(review.commit_id.as_deref(), short, &mut clipped),
+        "submitted_at": clip(review.submitted_at.as_deref(), short, &mut clipped),
+        "html_url": clip(review.html_url.as_deref(), short, &mut clipped),
+    });
+    (value, clipped)
+}
+
+fn issue_comment_item(comment: GhIssueComment) -> Item {
+    let mut clipped = false;
+    let short = MAX_SHORT_FIELD_BYTES;
+    let value = json!({
+        "id": comment.id,
+        "author": login(&comment.user, &mut clipped),
+        "body": clip(comment.body.as_deref(), MAX_BODY_FIELD_BYTES, &mut clipped),
+        "created_at": clip(comment.created_at.as_deref(), short, &mut clipped),
+        "updated_at": clip(comment.updated_at.as_deref(), short, &mut clipped),
+        "html_url": clip(Some(&comment.html_url), short, &mut clipped),
+    });
+    (value, clipped)
+}
+
+/// Fit one GitHub page into [`READ_RESULT_BUDGET_BYTES`]. Items are kept in
+/// order while they fit; `items_omitted` counts the rest so the caller can
+/// re-read with a smaller `perPage`. `has_next_page` reports that GitHub
+/// returned a full page.
+fn fit_page(method: &str, page: u32, per_page: u32, items: Vec<Item>) -> Value {
+    let returned = items.len();
+    let envelope = |kept: Vec<Value>, omitted: usize, truncated: bool| {
+        json!({
+            "method": method,
+            "page": page,
+            "per_page": per_page,
+            "items": kept,
+            "items_omitted": omitted,
+            "has_next_page": returned >= per_page as usize,
+            "truncated": truncated,
+        })
+    };
+    // Worst-case envelope with every counter at its widest.
+    let mut used = envelope(Vec::new(), usize::MAX, true).to_string().len();
+    let mut kept = Vec::new();
+    let mut clipped = false;
+    for (item, item_clipped) in items {
+        let size = item.to_string().len() + 1;
+        if used + size > READ_RESULT_BUDGET_BYTES {
+            break;
+        }
+        used += size;
+        clipped |= item_clipped;
+        kept.push(item);
+    }
+    let omitted = returned - kept.len();
+    envelope(kept, omitted, clipped || omitted > 0)
+}
+
+/// Split `diff` into consecutive pages whose escaped text fits
+/// [`DIFF_PAGE_BUDGET_BYTES`], preferring to end each page after a newline,
+/// and return page `page` (1-based).
+fn diff_page(diff: &str, page: u32) -> Value {
+    let mut start = 0;
+    let mut current = 1;
+    let mut pages = 0;
+    let mut selected = "";
+    while start < diff.len() {
+        let rest = &diff[start..];
+        let mut chunk = escaped_prefix(rest, DIFF_PAGE_BUDGET_BYTES);
+        if chunk.len() < rest.len() {
+            if let Some(newline) = chunk.rfind('\n') {
+                chunk = &chunk[..=newline];
+            }
+        }
+        pages += 1;
+        if current == page {
+            selected = chunk;
+        }
+        current += 1;
+        start += chunk.len();
+    }
+    json!({
+        "method": "get_diff",
+        "page": page,
+        "total_pages": pages,
+        "total_bytes": diff.len(),
+        "diff": selected,
+        "has_next_page": page < pages,
+        "truncated": pages > 1,
+    })
+}
+
 fn bounded(text: &str) -> String {
     let text = text.trim();
     if text.len() <= MAX_ERROR_DETAIL_BYTES {
@@ -516,13 +1495,163 @@ fn bounded(text: &str) -> String {
 pub struct FakeRepositoryService {
     script: std::sync::Mutex<std::collections::VecDeque<FakeOutcome>>,
     calls: std::sync::Mutex<Vec<FakeCall>>,
+    reviews: std::sync::Mutex<FakeReviewStore>,
 }
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub enum FakeOutcome {
     Succeed(RepositoryResponse),
+    /// Fails with no remote effect (for an ambiguous kind, the effect is
+    /// unknown to the caller but did not happen).
     Fail(RepositoryErrorKind),
+    /// Apply a pending-review request to the fake's review store and
+    /// return GitHub's answer.
+    Apply,
+    /// Apply the request to the store, then lose the response: the effect
+    /// happened but the caller sees this possibly-sent failure kind.
+    ApplyThenLose(RepositoryErrorKind),
+}
+
+/// One review held by the fake, as GitHub would hold it for the publisher.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeReview {
+    pub pr: PullRequestNumber,
+    pub record: ReviewRecord,
+    pub comments: Vec<CreatedReviewComment>,
+}
+
+/// The fake's remote review state. It outlives a fake instance via
+/// [`FakeRepositoryService::reviews`] / [`FakeRepositoryService::with_reviews`],
+/// so a test can carry an orphan pending review across a daemon restart.
+#[cfg(test)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FakeReviewStore {
+    pub reviews: Vec<FakeReview>,
+    next_id: u64,
+}
+
+#[cfg(test)]
+impl FakeReviewStore {
+    fn next_id(&mut self) -> u64 {
+        self.next_id += 1;
+        1000 + self.next_id
+    }
+
+    /// Seed a pending review as if a prior daemon created it and crashed.
+    pub fn seed_pending(&mut self, pr: PullRequestNumber, commit_id: &str, body: &str) -> u64 {
+        let id = self.next_id();
+        self.reviews.push(FakeReview {
+            pr,
+            record: ReviewRecord {
+                id,
+                node_id: format!("PRR_fake{id}"),
+                state: ReviewState::Pending,
+                commit_id: Some(commit_id.to_string()),
+                body: body.to_string(),
+            },
+            comments: Vec::new(),
+        });
+        id
+    }
+
+    fn rejected(detail: &str) -> RepositoryError {
+        RepositoryError::new(RepositoryErrorKind::PermanentFailure, detail)
+    }
+
+    /// GitHub's behaviour for the pending-review requests: one pending
+    /// review per publisher per PR; inline comments and submit only on a
+    /// pending review; delete only of a pending review.
+    fn apply(
+        &mut self,
+        pr: PullRequestNumber,
+        request: &RepositoryRequest,
+    ) -> Result<RepositoryResponse, RepositoryError> {
+        let find = |store: &mut Self, id: u64| {
+            store
+                .reviews
+                .iter()
+                .position(|review| review.pr == pr && review.record.id == id)
+        };
+        match request {
+            RepositoryRequest::CreatePendingReview { commit_id, body } => {
+                if self.pending(pr).next().is_some() {
+                    return Err(Self::rejected(
+                        "HTTP 422: user can only have one pending review per pull request",
+                    ));
+                }
+                let id = self.seed_pending(pr, commit_id, body);
+                let index = find(self, id).unwrap();
+                Ok(RepositoryResponse::Review(
+                    self.reviews[index].record.clone(),
+                ))
+            }
+            RepositoryRequest::AddPendingReviewComment {
+                review_node_id,
+                body,
+                ..
+            } => {
+                let id = self.next_id();
+                let review = self
+                    .reviews
+                    .iter_mut()
+                    .find(|review| {
+                        review.pr == pr
+                            && review.record.node_id == *review_node_id
+                            && review.record.state == ReviewState::Pending
+                    })
+                    .ok_or_else(|| Self::rejected("review is not pending"))?;
+                if review.comments.len() >= MAX_PENDING_REVIEW_COMMENTS {
+                    return Err(Self::rejected("too many inline comments"));
+                }
+                let comment = CreatedReviewComment {
+                    id,
+                    node_id: format!("PRRC_fake{id}"),
+                    thread_node_id: format!("PRRT_fake{id}"),
+                    review_node_id: review_node_id.clone(),
+                    body: body.clone(),
+                };
+                review.comments.push(comment.clone());
+                Ok(RepositoryResponse::PendingReviewComment(comment))
+            }
+            RepositoryRequest::SubmitPendingReview { review_id, body } => {
+                let index = find(self, *review_id)
+                    .filter(|&i| self.reviews[i].record.state == ReviewState::Pending)
+                    .ok_or_else(|| Self::rejected("review is not pending"))?;
+                let record = &mut self.reviews[index].record;
+                record.state = ReviewState::Commented;
+                record.body = body.clone();
+                Ok(RepositoryResponse::Review(record.clone()))
+            }
+            RepositoryRequest::ListPendingReviews {} => Ok(RepositoryResponse::PendingReviews(
+                self.pending(pr).cloned().collect(),
+            )),
+            RepositoryRequest::GetReview { review_id } => Ok(match find(self, *review_id) {
+                Some(index) => RepositoryResponse::Review(self.reviews[index].record.clone()),
+                None => RepositoryResponse::ReviewAbsent {
+                    review_id: *review_id,
+                },
+            }),
+            RepositoryRequest::DeletePendingReview { review_id } => match find(self, *review_id) {
+                None => Ok(RepositoryResponse::ReviewAbsent {
+                    review_id: *review_id,
+                }),
+                Some(index) if self.reviews[index].record.state == ReviewState::Pending => Ok(
+                    RepositoryResponse::Review(self.reviews.remove(index).record),
+                ),
+                Some(_) => Err(Self::rejected("HTTP 422: review is not pending")),
+            },
+            other => panic!("FakeReviewStore cannot apply {other:?}"),
+        }
+    }
+
+    fn pending(&self, pr: PullRequestNumber) -> impl Iterator<Item = &ReviewRecord> {
+        self.reviews
+            .iter()
+            .filter(move |review| review.pr == pr && review.record.state == ReviewState::Pending)
+            .map(|review| &review.record)
+    }
 }
 
 #[cfg(test)]
@@ -543,6 +1672,10 @@ impl FakeOutcome {
     pub fn credential_unavailable() -> Self {
         Self::Fail(RepositoryErrorKind::CredentialUnavailable)
     }
+    /// The write landed on GitHub but its response was lost to a timeout.
+    pub fn lost_response() -> Self {
+        Self::ApplyThenLose(RepositoryErrorKind::TimedOut)
+    }
 }
 
 #[cfg(test)]
@@ -559,11 +1692,23 @@ impl FakeRepositoryService {
         Self {
             script: std::sync::Mutex::new(outcomes.into_iter().collect()),
             calls: Default::default(),
+            reviews: Default::default(),
         }
+    }
+
+    /// Start from existing remote review state (e.g. after a restart).
+    pub fn with_reviews(self, reviews: FakeReviewStore) -> Self {
+        *self.reviews.lock().unwrap() = reviews;
+        self
     }
 
     pub fn calls(&self) -> Vec<FakeCall> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// Snapshot of the remote review state.
+    pub fn reviews(&self) -> FakeReviewStore {
+        self.reviews.lock().unwrap().clone()
     }
 }
 
@@ -586,12 +1731,16 @@ impl RepositoryService for FakeRepositoryService {
             .unwrap()
             .pop_front()
             .expect("FakeRepositoryService: call with no scripted outcome");
-        Box::pin(async move {
-            match outcome {
-                FakeOutcome::Succeed(response) => Ok(response),
-                FakeOutcome::Fail(kind) => Err(RepositoryError::new(kind, "fake outcome")),
+        let result = match outcome {
+            FakeOutcome::Succeed(response) => Ok(response),
+            FakeOutcome::Fail(kind) => Err(RepositoryError::new(kind, "fake outcome")),
+            FakeOutcome::Apply => self.reviews.lock().unwrap().apply(pr, request),
+            FakeOutcome::ApplyThenLose(kind) => {
+                let _ = self.reviews.lock().unwrap().apply(pr, request);
+                Err(RepositoryError::new(kind, "fake lost response"))
             }
-        })
+        };
+        Box::pin(async move { result })
     }
 }
 
@@ -744,6 +1893,7 @@ mod tests {
                 NonRetryable,
                 PossiblySent,
             ),
+            (RateLimited, Delivery::PossiblySent, Retryable, PossiblySent),
         ];
         for (kind, delivery, read, write) in cases {
             let error = RepositoryError::new(kind, "x");
@@ -977,8 +2127,13 @@ mod tests {
                 "HTTP 502: Bad Gateway",
                 RepositoryErrorKind::TransientFailure,
             ),
+            ("API rate limit exceeded", RepositoryErrorKind::RateLimited),
             (
-                "API rate limit exceeded",
+                "You have exceeded a secondary rate limit (HTTP 403)",
+                RepositoryErrorKind::RateLimited,
+            ),
+            (
+                "HTTP 503: Service Unavailable",
                 RepositoryErrorKind::TransientFailure,
             ),
             (
@@ -1031,5 +2186,892 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.kind, RepositoryErrorKind::InvalidResponse, "{stdout}");
         }
+    }
+
+    #[test]
+    fn decode_accepts_bounded_read_methods_and_comments() {
+        for (json, expected) in [
+            (
+                r#"{"kind":"get_pull_request"}"#,
+                RepositoryRequest::GetPullRequest {},
+            ),
+            (
+                r#"{"kind":"get_diff","page":3}"#,
+                RepositoryRequest::GetDiff { page: 3 },
+            ),
+            (
+                r#"{"kind":"get_files","page":1,"per_page":100}"#,
+                RepositoryRequest::GetFiles {
+                    page: 1,
+                    per_page: 100,
+                },
+            ),
+            (
+                r#"{"kind":"get_review_comments","page":100,"per_page":1}"#,
+                RepositoryRequest::GetReviewComments {
+                    page: 100,
+                    per_page: 1,
+                },
+            ),
+            (
+                r#"{"kind":"get_reviews","page":2,"per_page":30}"#,
+                RepositoryRequest::GetReviews {
+                    page: 2,
+                    per_page: 30,
+                },
+            ),
+            (
+                r#"{"kind":"get_comments","page":2,"per_page":30}"#,
+                RepositoryRequest::GetComments {
+                    page: 2,
+                    per_page: 30,
+                },
+            ),
+            (
+                r#"{"kind":"add_issue_comment","body":"hi"}"#,
+                RepositoryRequest::AddIssueComment { body: "hi".into() },
+            ),
+        ] {
+            assert_eq!(
+                RepositoryRequest::decode_agent_json(json.as_bytes()).unwrap(),
+                expected
+            );
+        }
+        let oversize = serde_json::json!({
+            "kind": "add_issue_comment",
+            "body": "x".repeat(MAX_COMMENT_BODY_BYTES + 1)
+        })
+        .to_string();
+        for rejected in [
+            r#"{"kind":"get_diff","page":0}"#,
+            r#"{"kind":"get_files","page":1,"per_page":101}"#,
+            r#"{"kind":"get_files","page":101,"per_page":1}"#,
+            r#"{"kind":"get_files","page":1}"#,
+            r#"{"kind":"get_reviews","page":1,"per_page":1,"pr":9}"#,
+            r#"{"kind":"add_issue_comment","body":"  "}"#,
+            r#"{"kind":"add_issue_comment","body":"x","issue_number":3}"#,
+            r#"{"kind":"get_check_runs"}"#,
+            oversize.as_str(),
+        ] {
+            assert!(
+                RepositoryRequest::decode_agent_json(rejected.as_bytes()).is_err(),
+                "accepted {rejected}"
+            );
+        }
+        assert_eq!(
+            RepositoryRequest::AddIssueComment { body: "x".into() }.effect(),
+            OperationEffect::Write
+        );
+        assert_eq!(
+            RepositoryRequest::GetDiff { page: 1 }.effect(),
+            OperationEffect::Read
+        );
+    }
+
+    #[test]
+    fn argv_names_only_fixed_paths_and_integers() {
+        let dir = PathBuf::from("/tmp");
+        let target = RepositoryTarget::new(dir.clone(), Some("acme/widgets")).unwrap();
+        let cases = [
+            (
+                RepositoryRequest::GetPullRequest {},
+                vec!["api", "repos/acme/widgets/pulls/9"],
+            ),
+            (
+                RepositoryRequest::GetDiff { page: 2 },
+                vec![
+                    "api",
+                    "-H",
+                    "Accept: application/vnd.github.diff",
+                    "repos/acme/widgets/pulls/9",
+                ],
+            ),
+            (
+                RepositoryRequest::GetFiles {
+                    page: 2,
+                    per_page: 5,
+                },
+                vec!["api", "repos/acme/widgets/pulls/9/files?per_page=5&page=2"],
+            ),
+            (
+                RepositoryRequest::GetReviewComments {
+                    page: 1,
+                    per_page: 30,
+                },
+                vec![
+                    "api",
+                    "repos/acme/widgets/pulls/9/comments?per_page=30&page=1",
+                ],
+            ),
+            (
+                RepositoryRequest::GetReviews {
+                    page: 1,
+                    per_page: 30,
+                },
+                vec![
+                    "api",
+                    "repos/acme/widgets/pulls/9/reviews?per_page=30&page=1",
+                ],
+            ),
+            (
+                RepositoryRequest::GetComments {
+                    page: 1,
+                    per_page: 30,
+                },
+                vec![
+                    "api",
+                    "repos/acme/widgets/issues/9/comments?per_page=30&page=1",
+                ],
+            ),
+            (
+                RepositoryRequest::AddIssueComment {
+                    body: "--repo evil/x `rm`".into(),
+                },
+                vec![
+                    "api",
+                    "--method",
+                    "POST",
+                    "repos/acme/widgets/issues/9/comments",
+                    "--input",
+                    "-",
+                ],
+            ),
+        ];
+        for (request, expected) in cases {
+            assert_eq!(gh_args(&target, pr(9), &request), expected, "{request:?}");
+        }
+        let unpinned = RepositoryTarget::new(dir, None).unwrap();
+        assert_eq!(
+            gh_args(&unpinned, pr(9), &RepositoryRequest::GetPullRequest {}),
+            ["api", "repos/{owner}/{repo}/pulls/9"]
+        );
+        assert!(gh_input(&RepositoryRequest::GetPullRequest {}).is_none());
+    }
+
+    #[tokio::test]
+    async fn comment_body_reaches_gh_on_stdin_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let stdin_log = dir.path().join("stdin");
+        let args_log = dir.path().join("args");
+        let body = format!(
+            "cat > '{}'\necho \"$@\" > '{}'\nprintf '%s' '{{\"id\":321,\"html_url\":\"https://x/1\"}}'",
+            stdin_log.display(),
+            args_log.display()
+        );
+        let source = Arc::new(FakeCredentialSource::token(SECRET));
+        let service = service(
+            &source,
+            script(dir.path(), &body),
+            Duration::from_secs(10),
+            DEFAULT_RESPONSE_BYTE_LIMIT,
+        );
+        let markdown =
+            "## `x` \"q\" 'single' $HOME $(id)\n\n```sh\necho \"hi\"\n```\n\\n\t\u{e9}\n";
+        let response = service
+            .execute(
+                &target(dir.path()),
+                pr(7),
+                &RepositoryRequest::AddIssueComment {
+                    body: markdown.into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response,
+            RepositoryResponse::IssueComment(CreatedComment {
+                id: 321,
+                html_url: "https://x/1".into()
+            })
+        );
+        let sent: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&stdin_log).unwrap()).unwrap();
+        assert_eq!(sent, serde_json::json!({ "body": markdown }));
+        let args = std::fs::read_to_string(&args_log).unwrap();
+        assert_eq!(
+            args.trim_end(),
+            "api --method POST repos/acme/widgets/issues/7/comments --input -"
+        );
+        assert!(!args.contains("HOME"));
+    }
+
+    #[test]
+    fn pull_request_get_is_bounded_and_matches_the_target() {
+        let pull = |number: u64, body: &str| {
+            serde_json::json!({
+                "number": number, "title": "T", "body": body, "state": "open",
+                "draft": false, "merged": false, "user": {"login": "alice"},
+                "head": {"ref": "feature", "sha": SHA}, "base": {"ref": "main", "sha": SHA},
+                "html_url": "https://x/pull/7", "additions": 1, "deletions": 2,
+                "changed_files": 3, "commits": 1, "unrelated": {"nested": true}
+            })
+            .to_string()
+        };
+        let request = RepositoryRequest::GetPullRequest {};
+        let RepositoryResponse::PullRequestRead(value) =
+            parse_response(pr(7), &request, pull(7, "short").as_bytes()).unwrap()
+        else {
+            panic!("expected a read result")
+        };
+        assert_eq!(value["method"], "get");
+        assert_eq!(value["pull_request"]["author"], "alice");
+        assert_eq!(value["pull_request"]["head_sha"], SHA);
+        assert_eq!(value["truncated"], false);
+        assert!(value["pull_request"].get("unrelated").is_none());
+
+        let long = "\u{1}".repeat(MAX_BODY_FIELD_BYTES);
+        let RepositoryResponse::PullRequestRead(value) =
+            parse_response(pr(7), &request, pull(7, &long).as_bytes()).unwrap()
+        else {
+            panic!("expected a read result")
+        };
+        assert_eq!(value["truncated"], true);
+        assert!(value.to_string().len() <= READ_RESULT_BUDGET_BYTES);
+        assert!(parse_response(pr(7), &request, pull(8, "x").as_bytes()).is_err());
+    }
+
+    #[test]
+    fn list_pages_fit_the_budget_and_report_omissions() {
+        let comments: Vec<serde_json::Value> = (0..60)
+            .map(|id| {
+                serde_json::json!({
+                    "id": id + 1, "user": {"login": "bob"}, "body": "b".repeat(4_000),
+                    "created_at": "2026-01-01T00:00:00Z", "html_url": "https://x"
+                })
+            })
+            .collect();
+        let stdout = serde_json::to_vec(&comments).unwrap();
+        let request = RepositoryRequest::GetComments {
+            page: 1,
+            per_page: 60,
+        };
+        let RepositoryResponse::PullRequestRead(value) =
+            parse_response(pr(7), &request, &stdout).unwrap()
+        else {
+            panic!("expected a read result")
+        };
+        assert!(value.to_string().len() <= READ_RESULT_BUDGET_BYTES);
+        let kept = value["items"].as_array().unwrap().len();
+        assert!(kept > 0 && kept < 60, "{kept}");
+        assert_eq!(value["items_omitted"], 60 - kept);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["has_next_page"], true);
+        assert_eq!(value["items"][0]["id"], 1);
+
+        let review_comment = serde_json::json!([{
+            "id": 5, "node_id": "PRRC_x", "path": "src/a.rs", "line": null,
+            "original_line": 4, "side": "RIGHT", "body": "b", "diff_hunk": "@@",
+            "user": null, "subject_type": "line"
+        }]);
+        let RepositoryResponse::PullRequestRead(value) = parse_response(
+            pr(7),
+            &RepositoryRequest::GetReviewComments {
+                page: 1,
+                per_page: 30,
+            },
+            review_comment.to_string().as_bytes(),
+        )
+        .unwrap() else {
+            panic!("expected a read result")
+        };
+        assert_eq!(value["items"][0]["outdated"], true);
+        assert_eq!(value["items"][0]["author"], serde_json::Value::Null);
+        assert_eq!(value["has_next_page"], false);
+        assert_eq!(value["truncated"], false);
+        assert!(parse_response(
+            pr(7),
+            &RepositoryRequest::GetReviews {
+                page: 1,
+                per_page: 30
+            },
+            b"{\"not\":\"a list\"}"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn diff_pages_cover_the_whole_diff_within_the_budget() {
+        let line = "+    let value = \"quoted\\tvalue\";\n";
+        let diff = line.repeat(4_000);
+        let first = diff_page(&diff, 1);
+        let pages = first["total_pages"].as_u64().unwrap();
+        assert!(pages > 1);
+        let mut joined = String::new();
+        for page in 1..=pages {
+            let value = diff_page(&diff, page as u32);
+            assert!(value.to_string().len() <= READ_RESULT_BUDGET_BYTES);
+            let text = value["diff"].as_str().unwrap();
+            assert!(text.ends_with('\n'), "pages end on a line boundary");
+            joined.push_str(text);
+            assert_eq!(value["has_next_page"], page < pages);
+        }
+        assert_eq!(joined, diff);
+        assert_eq!(diff_page(&diff, pages as u32 + 1)["diff"], "");
+        let small = diff_page("+x\n", 1);
+        assert_eq!(
+            (small["total_pages"].as_u64(), small["truncated"].as_bool()),
+            (Some(1), Some(false))
+        );
+    }
+
+    fn review_json(id: u64, n: u64, state: &str, body: &str) -> String {
+        json!({
+            "id": id,
+            "node_id": format!("PRR_{id}"),
+            "state": state,
+            "body": body,
+            "commit_id": SHA,
+            "pull_request_url": format!("https://api.github.com/repos/acme/widgets/pulls/{n}"),
+        })
+        .to_string()
+    }
+
+    fn inline(review_node_id: &str) -> RepositoryRequest {
+        RepositoryRequest::AddPendingReviewComment {
+            review_node_id: review_node_id.into(),
+            path: "src/lib.rs".into(),
+            line: 12,
+            side: DiffSide::Right,
+            start_line: Some(10),
+            start_side: None,
+            subject_type: ReviewSubjectType::Line,
+            body: "Finding `x`".into(),
+        }
+    }
+
+    #[test]
+    fn decode_accepts_pending_review_writes_with_comment_only_submit() {
+        let decode = |text: &str| RepositoryRequest::decode_agent_json(text.as_bytes());
+        assert_eq!(
+            decode(&format!(
+                r#"{{"kind":"create_pending_review","commit_id":"{SHA}","body":"m"}}"#
+            ))
+            .unwrap(),
+            RepositoryRequest::CreatePendingReview {
+                commit_id: SHA.into(),
+                body: "m".into()
+            }
+        );
+        assert_eq!(
+            decode(r#"{"kind":"submit_pending_review","review_id":9,"body":"Summary"}"#).unwrap(),
+            RepositoryRequest::SubmitPendingReview {
+                review_id: 9,
+                body: "Summary".into()
+            }
+        );
+        assert_eq!(
+            decode(
+                r#"{"kind":"add_pending_review_comment","review_node_id":"PRR_x","path":"src/lib.rs","line":12,"side":"RIGHT","start_line":10,"subject_type":"line","body":"Finding `x`"}"#
+            )
+            .unwrap(),
+            inline("PRR_x")
+        );
+        let big = "x".repeat(MAX_COMMENT_BODY_BYTES + 1);
+        let comment = |fields: &str| {
+            format!(
+                r#"{{"kind":"add_pending_review_comment","review_node_id":"PRR_x","path":"a.rs","subject_type":"line","body":"b",{fields}}}"#
+            )
+        };
+        for rejected in [
+            // No event other than the fixed COMMENT can be expressed.
+            r#"{"kind":"submit_pending_review","review_id":9,"body":"s","event":"APPROVE"}"#.to_string(),
+            r#"{"kind":"submit_pending_review","review_id":9,"body":"s","event":"REQUEST_CHANGES"}"#.to_string(),
+            r#"{"kind":"submit_pending_review","review_id":9,"body":"s","event":"COMMENT"}"#.to_string(),
+            r#"{"kind":"approve_pull_request","review_id":9}"#.to_string(),
+            r#"{"kind":"dismiss_review","review_id":9}"#.to_string(),
+            r#"{"kind":"submit_pending_review","review_id":0,"body":"s"}"#.to_string(),
+            r#"{"kind":"submit_pending_review","review_id":9,"body":"  "}"#.to_string(),
+            format!(r#"{{"kind":"submit_pending_review","review_id":9,"body":"{big}"}}"#),
+            // Daemon-only housekeeping never decodes from agent JSON.
+            r#"{"kind":"list_pending_reviews"}"#.to_string(),
+            r#"{"kind":"get_review","review_id":9}"#.to_string(),
+            r#"{"kind":"delete_pending_review","review_id":9}"#.to_string(),
+            // Create bounds.
+            r#"{"kind":"create_pending_review","commit_id":"main","body":"m"}"#.to_string(),
+            format!(r#"{{"kind":"create_pending_review","commit_id":"{}","body":"m"}}"#, SHA.to_uppercase()),
+            format!(r#"{{"kind":"create_pending_review","commit_id":"{SHA}","body":""}}"#),
+            format!(r#"{{"kind":"create_pending_review","commit_id":"{SHA}","body":"m","event":"APPROVE"}}"#),
+            format!(r#"{{"kind":"create_pending_review","commit_id":"{SHA}","body":"m","pr":3}}"#),
+            // Inline anchor bounds.
+            comment(r#""line":0,"side":"RIGHT""#),
+            comment(r#""line":3,"side":"BOTH""#),
+            comment(r#""line":3,"side":"right""#),
+            comment(r#""line":3,"side":"RIGHT","start_line":4"#),
+            comment(r#""line":3,"side":"RIGHT","start_line":0"#),
+            comment(r#""line":3,"side":"RIGHT","start_side":"LEFT""#),
+            comment(r#""line":3,"side":"RIGHT","extra":1"#),
+            comment(r#""line":-1,"side":"RIGHT""#),
+            r#"{"kind":"add_pending_review_comment","review_node_id":"PRR_x","path":"a.rs","subject_type":"file","line":3,"side":"RIGHT","start_line":1,"body":"b"}"#.to_string(),
+            r#"{"kind":"add_pending_review_comment","review_node_id":"PRR_x","path":"a.rs","subject_type":"hunk","line":3,"side":"RIGHT","body":"b"}"#.to_string(),
+            r#"{"kind":"add_pending_review_comment","review_node_id":"a b","path":"a.rs","subject_type":"line","line":3,"side":"RIGHT","body":"b"}"#.to_string(),
+            r#"{"kind":"add_pending_review_comment","review_node_id":"PRR_x","path":"/etc/passwd","subject_type":"line","line":3,"side":"RIGHT","body":"b"}"#.to_string(),
+            r#"{"kind":"add_pending_review_comment","review_node_id":"PRR_x","path":"a\nb","subject_type":"line","line":3,"side":"RIGHT","body":"b"}"#.to_string(),
+            r#"{"kind":"add_pending_review_comment","review_node_id":"PRR_x","path":"a.rs","subject_type":"line","line":3,"side":"RIGHT","body":""}"#.to_string(),
+        ] {
+            assert!(decode(&rejected).is_err(), "accepted {rejected}");
+        }
+        assert!(RepositoryRequest::decode_agent_json(
+            b"{\"kind\":\"submit_pending_review\",\"review_id\":9,\"body\":\"a\0\"}"
+        )
+        .is_err());
+        assert!(RepositoryRequest::decode_agent_json(
+            b"{\"kind\":\"submit_pending_review\",\"review_id\":9,\"body\":\"\xff\"}"
+        )
+        .is_err());
+        // A same-line range start and a file-level comment are in bounds.
+        assert!(decode(&comment(
+            r#""line":3,"side":"LEFT","start_line":3,"start_side":"LEFT""#
+        ))
+        .is_ok());
+        assert!(decode(r#"{"kind":"add_pending_review_comment","review_node_id":"PRR_x","path":"a.rs","subject_type":"file","line":1,"side":"RIGHT","body":"b"}"#).is_ok());
+    }
+
+    #[test]
+    fn pending_review_effects_fence_possibly_sent_writes() {
+        let writes = [
+            RepositoryRequest::CreatePendingReview {
+                commit_id: SHA.into(),
+                body: "m".into(),
+            },
+            inline("PRR_x"),
+            RepositoryRequest::SubmitPendingReview {
+                review_id: 9,
+                body: "s".into(),
+            },
+            RepositoryRequest::DeletePendingReview { review_id: 9 },
+        ];
+        let lost = RepositoryError::new(RepositoryErrorKind::TimedOut, "lost");
+        for request in &writes {
+            assert_eq!(request.effect(), OperationEffect::Write, "{request:?}");
+            assert_eq!(lost.outcome(request.effect()), OutcomeClass::PossiblySent);
+        }
+        for request in [
+            RepositoryRequest::ListPendingReviews {},
+            RepositoryRequest::GetReview { review_id: 9 },
+        ] {
+            assert_eq!(request.effect(), OperationEffect::Read, "{request:?}");
+            assert_eq!(request.validate(), Ok(()));
+        }
+        assert!(RepositoryRequest::GetReview { review_id: 0 }
+            .validate()
+            .is_err());
+        assert!(RepositoryRequest::DeletePendingReview { review_id: 0 }
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn pending_review_argv_is_fixed_and_bodies_travel_on_stdin() {
+        let target = RepositoryTarget::new(PathBuf::from("/tmp"), Some("acme/widgets")).unwrap();
+        let body = "Body $(id) --method DELETE";
+        let create = RepositoryRequest::CreatePendingReview {
+            commit_id: SHA.into(),
+            body: body.into(),
+        };
+        let submit = RepositoryRequest::SubmitPendingReview {
+            review_id: 41,
+            body: body.into(),
+        };
+        let cases: [(RepositoryRequest, &[&str]); 6] = [
+            (
+                create.clone(),
+                &[
+                    "api",
+                    "--method",
+                    "POST",
+                    "repos/acme/widgets/pulls/7/reviews",
+                    "--input",
+                    "-",
+                ],
+            ),
+            (
+                submit.clone(),
+                &[
+                    "api",
+                    "--method",
+                    "POST",
+                    "repos/acme/widgets/pulls/7/reviews/41/events",
+                    "--input",
+                    "-",
+                ],
+            ),
+            (inline("PRR_x"), &["api", "graphql", "--input", "-"]),
+            (
+                RepositoryRequest::ListPendingReviews {},
+                &[
+                    "api",
+                    "--paginate",
+                    "repos/acme/widgets/pulls/7/reviews?per_page=100",
+                    "--jq",
+                    PENDING_REVIEW_FILTER,
+                ],
+            ),
+            (
+                RepositoryRequest::GetReview { review_id: 41 },
+                &["api", "repos/acme/widgets/pulls/7/reviews/41"],
+            ),
+            (
+                RepositoryRequest::DeletePendingReview { review_id: 41 },
+                &[
+                    "api",
+                    "--method",
+                    "DELETE",
+                    "repos/acme/widgets/pulls/7/reviews/41",
+                ],
+            ),
+        ];
+        for (request, expected) in &cases {
+            let args = gh_args(&target, pr(7), request);
+            assert_eq!(args, *expected, "{request:?}");
+            assert!(!args.iter().any(|arg| arg.contains("$(id)")));
+        }
+        let input = |request: &RepositoryRequest| -> Value {
+            serde_json::from_slice(&gh_input(request).unwrap()).unwrap()
+        };
+        // Create sends no event, so the review stays PENDING.
+        assert_eq!(input(&create), json!({ "commit_id": SHA, "body": body }));
+        // Submit can only ever send COMMENT.
+        assert_eq!(input(&submit), json!({ "body": body, "event": "COMMENT" }));
+        let graphql = input(&inline("PRR_x"));
+        assert_eq!(graphql["query"], ADD_REVIEW_THREAD_MUTATION);
+        assert_eq!(
+            graphql["variables"]["input"],
+            json!({
+                "pullRequestReviewId": "PRR_x",
+                "path": "src/lib.rs",
+                "body": "Finding `x`",
+                "subjectType": "LINE",
+                "line": 12,
+                "side": "RIGHT",
+                "startLine": 10,
+                "startSide": "RIGHT",
+            })
+        );
+        let file = RepositoryRequest::AddPendingReviewComment {
+            review_node_id: "PRR_x".into(),
+            path: "a.rs".into(),
+            line: 1,
+            side: DiffSide::Left,
+            start_line: None,
+            start_side: None,
+            subject_type: ReviewSubjectType::File,
+            body: "b".into(),
+        };
+        assert_eq!(
+            input(&file)["variables"]["input"],
+            json!({ "pullRequestReviewId": "PRR_x", "path": "a.rs", "body": "b", "subjectType": "FILE" })
+        );
+        for request in [
+            RepositoryRequest::ListPendingReviews {},
+            RepositoryRequest::GetReview { review_id: 41 },
+            RepositoryRequest::DeletePendingReview { review_id: 41 },
+        ] {
+            assert!(gh_input(&request).is_none());
+        }
+    }
+
+    #[test]
+    fn pending_review_responses_return_ids_and_full_bodies() {
+        let create = RepositoryRequest::CreatePendingReview {
+            commit_id: SHA.into(),
+            body: "<!-- m -->".into(),
+        };
+        let parsed = parse_response(
+            pr(7),
+            &create,
+            review_json(41, 7, "PENDING", "<!-- m -->").as_bytes(),
+        )
+        .unwrap();
+        let RepositoryResponse::Review(review) = parsed else {
+            panic!("{parsed:?}")
+        };
+        assert_eq!(
+            (review.id, review.node_id.as_str(), review.state),
+            (41, "PRR_41", ReviewState::Pending)
+        );
+        assert!(review.has_marker("<!-- m -->") && !review.has_marker(""));
+        for bad in [
+            review_json(41, 8, "PENDING", "m"),
+            review_json(41, 7, "COMMENTED", "m"),
+            review_json(41, 7, "WEIRD", "m"),
+            review_json(0, 7, "PENDING", "m"),
+            review_json(41, 7, "PENDING", &"x".repeat(MAX_RESPONSE_BODY_BYTES + 1)),
+            "{}".to_string(),
+        ] {
+            assert!(
+                parse_response(pr(7), &create, bad.as_bytes()).is_err(),
+                "{bad}"
+            );
+        }
+        let submit = RepositoryRequest::SubmitPendingReview {
+            review_id: 41,
+            body: "s".into(),
+        };
+        assert!(parse_response(
+            pr(7),
+            &submit,
+            review_json(41, 7, "COMMENTED", "s").as_bytes()
+        )
+        .is_ok());
+        assert!(parse_response(
+            pr(7),
+            &submit,
+            review_json(41, 7, "APPROVED", "s").as_bytes()
+        )
+        .is_err());
+        assert!(parse_response(
+            pr(7),
+            &submit,
+            review_json(42, 7, "COMMENTED", "s").as_bytes()
+        )
+        .is_err());
+        assert!(parse_response(
+            pr(7),
+            &RepositoryRequest::DeletePendingReview { review_id: 41 },
+            review_json(42, 7, "PENDING", "s").as_bytes()
+        )
+        .is_err());
+
+        let list = RepositoryRequest::ListPendingReviews {};
+        let stream = format!(
+            "{}\n{}\n",
+            review_json(41, 7, "PENDING", "a"),
+            review_json(42, 7, "PENDING", "b")
+        );
+        let RepositoryResponse::PendingReviews(reviews) =
+            parse_response(pr(7), &list, stream.as_bytes()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(reviews.iter().map(|r| r.id).collect::<Vec<_>>(), [41, 42]);
+        assert_eq!(
+            parse_response(pr(7), &list, b"").unwrap(),
+            RepositoryResponse::PendingReviews(Vec::new())
+        );
+        assert!(parse_response(
+            pr(7),
+            &list,
+            review_json(41, 7, "COMMENTED", "a").as_bytes()
+        )
+        .is_err());
+        let many: String = (1..=MAX_LISTED_PENDING_REVIEWS as u64 + 1)
+            .map(|id| review_json(id, 7, "PENDING", "a"))
+            .collect();
+        assert!(parse_response(pr(7), &list, many.as_bytes()).is_err());
+
+        let thread = |n: u64, review: &str| {
+            json!({"data": {"addPullRequestReviewThread": {"thread": {
+                "id": "PRRT_1", "pullRequest": {"number": n},
+                "comments": {"nodes": [{"id": "PRRC_1", "databaseId": 77, "body": "Finding <!-- m -->",
+                    "pullRequestReview": {"id": review, "databaseId": 41}}]}}}}})
+            .to_string()
+        };
+        assert_eq!(
+            parse_response(pr(7), &inline("PRR_41"), thread(7, "PRR_41").as_bytes()).unwrap(),
+            RepositoryResponse::PendingReviewComment(CreatedReviewComment {
+                id: 77,
+                node_id: "PRRC_1".into(),
+                thread_node_id: "PRRT_1".into(),
+                review_node_id: "PRR_41".into(),
+                body: "Finding <!-- m -->".into(),
+            })
+        );
+        assert!(parse_response(pr(7), &inline("PRR_41"), thread(8, "PRR_41").as_bytes()).is_err());
+        assert!(parse_response(pr(7), &inline("PRR_41"), thread(7, "PRR_99").as_bytes()).is_err());
+        assert!(parse_response(pr(7), &inline("PRR_41"), br#"{"data":null}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_review_404_is_absence_only_for_housekeeping() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "echo 'gh: Not Found (HTTP 404)' >&2\nexit 1";
+        let source = Arc::new(FakeCredentialSource::token(SECRET));
+        let service = service(
+            &source,
+            script(dir.path(), body),
+            Duration::from_secs(10),
+            DEFAULT_RESPONSE_BYTE_LIMIT,
+        );
+        let target = target(dir.path());
+        for request in [
+            RepositoryRequest::GetReview { review_id: 41 },
+            RepositoryRequest::DeletePendingReview { review_id: 41 },
+        ] {
+            assert_eq!(
+                service.execute(&target, pr(7), &request).await.unwrap(),
+                RepositoryResponse::ReviewAbsent { review_id: 41 }
+            );
+        }
+        let error = service
+            .execute(
+                &target,
+                pr(7),
+                &RepositoryRequest::SubmitPendingReview {
+                    review_id: 41,
+                    body: "s".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, RepositoryErrorKind::PermanentFailure);
+    }
+
+    #[tokio::test]
+    async fn fake_service_simulates_pending_review_lifecycle_and_ambiguity() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = target(dir.path());
+        let create = RepositoryRequest::CreatePendingReview {
+            commit_id: SHA.into(),
+            body: "<!-- owner -->".into(),
+        };
+        let list = RepositoryRequest::ListPendingReviews {};
+        // A create whose response is lost still lands; a second create is
+        // refused because GitHub allows one pending review per publisher.
+        let fake = FakeRepositoryService::scripted([
+            FakeOutcome::lost_response(),
+            FakeOutcome::Apply,
+            FakeOutcome::Apply,
+        ]);
+        let error = fake.execute(&target, pr(7), &create).await.unwrap_err();
+        assert_eq!(error.outcome(create.effect()), OutcomeClass::PossiblySent);
+        assert_eq!(
+            fake.execute(&target, pr(7), &create)
+                .await
+                .unwrap_err()
+                .kind,
+            RepositoryErrorKind::PermanentFailure
+        );
+        let RepositoryResponse::PendingReviews(found) =
+            fake.execute(&target, pr(7), &list).await.unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(found.len(), 1);
+        assert!(found[0].has_marker("<!-- owner -->"));
+
+        // The orphan draft survives a daemon restart (a fresh fake over the
+        // same remote state); the new daemon reconciles and deletes it.
+        let remote = fake.reviews();
+        let orphan = found[0].clone();
+        let restarted = FakeRepositoryService::scripted([
+            FakeOutcome::Apply,
+            FakeOutcome::Apply,
+            FakeOutcome::ambiguous(),
+            FakeOutcome::Apply,
+            FakeOutcome::Apply,
+            FakeOutcome::Apply,
+        ])
+        .with_reviews(remote);
+        assert_eq!(
+            restarted.execute(&target, pr(7), &list).await.unwrap(),
+            RepositoryResponse::PendingReviews(vec![orphan.clone()])
+        );
+        assert_eq!(
+            restarted
+                .execute(
+                    &target,
+                    pr(7),
+                    &RepositoryRequest::GetReview {
+                        review_id: orphan.id
+                    }
+                )
+                .await
+                .unwrap(),
+            RepositoryResponse::Review(orphan.clone())
+        );
+        let delete = RepositoryRequest::DeletePendingReview {
+            review_id: orphan.id,
+        };
+        // An ambiguous delete has no effect in the fake but is fenced.
+        let error = restarted
+            .execute(&target, pr(7), &delete)
+            .await
+            .unwrap_err();
+        assert_eq!(error.outcome(delete.effect()), OutcomeClass::PossiblySent);
+        assert_eq!(restarted.reviews().reviews.len(), 1);
+        assert_eq!(
+            restarted.execute(&target, pr(7), &delete).await.unwrap(),
+            RepositoryResponse::Review(orphan.clone())
+        );
+        assert_eq!(
+            restarted.execute(&target, pr(7), &delete).await.unwrap(),
+            RepositoryResponse::ReviewAbsent {
+                review_id: orphan.id
+            }
+        );
+        assert_eq!(
+            restarted.execute(&target, pr(7), &list).await.unwrap(),
+            RepositoryResponse::PendingReviews(Vec::new())
+        );
+
+        // Full create → inline → submit on a clean slot; a submitted review
+        // takes no more inline comments and cannot be deleted.
+        let fake =
+            FakeRepositoryService::scripted(std::iter::repeat_with(|| FakeOutcome::Apply).take(6));
+        let RepositoryResponse::Review(review) =
+            fake.execute(&target, pr(7), &create).await.unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(review.state, ReviewState::Pending);
+        let RepositoryResponse::PendingReviewComment(comment) = fake
+            .execute(&target, pr(7), &inline(&review.node_id))
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(comment.review_node_id, review.node_id);
+        let submit = RepositoryRequest::SubmitPendingReview {
+            review_id: review.id,
+            body: "Summary <!-- owner -->".into(),
+        };
+        let RepositoryResponse::Review(submitted) =
+            fake.execute(&target, pr(7), &submit).await.unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(submitted.state, ReviewState::Commented);
+        assert!(submitted.has_marker("<!-- owner -->"));
+        assert!(fake
+            .execute(&target, pr(7), &inline(&review.node_id))
+            .await
+            .is_err());
+        assert!(fake
+            .execute(
+                &target,
+                pr(7),
+                &RepositoryRequest::DeletePendingReview {
+                    review_id: review.id
+                }
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            fake.execute(&target, pr(7), &list).await.unwrap(),
+            RepositoryResponse::PendingReviews(Vec::new())
+        );
+        assert_eq!(fake.reviews().reviews[0].comments, vec![comment]);
+    }
+
+    #[test]
+    fn fake_store_bounds_inline_comments_per_review() {
+        let mut store = FakeReviewStore::default();
+        let id = store.seed_pending(pr(7), SHA, "m");
+        let node = format!("PRR_fake{id}");
+        for _ in 0..MAX_PENDING_REVIEW_COMMENTS {
+            store.apply(pr(7), &inline(&node)).unwrap();
+        }
+        assert_eq!(
+            store.apply(pr(7), &inline(&node)).unwrap_err().kind,
+            RepositoryErrorKind::PermanentFailure
+        );
+        // Another PR does not see this pending review.
+        assert_eq!(
+            store
+                .apply(pr(8), &RepositoryRequest::ListPendingReviews {})
+                .unwrap(),
+            RepositoryResponse::PendingReviews(Vec::new())
+        );
     }
 }

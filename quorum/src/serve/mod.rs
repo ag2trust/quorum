@@ -1898,8 +1898,32 @@ impl BoundedGhError {
     }
 }
 
+/// Aborts a helper task when the bounded command returns on any path.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 async fn run_bounded_gh_command(
+    command: tokio::process::Command,
+    timeout: Duration,
+    pipe_limit: usize,
+) -> std::result::Result<std::process::Output, BoundedGhError> {
+    run_bounded_gh_command_with_input(command, None, timeout, pipe_limit).await
+}
+
+/// [`run_bounded_gh_command`] with an optional request document streamed to
+/// the child's stdin, so authored text reaches `gh` as a body stream and never
+/// as a command argument. The writer is bounded by the same deadline: a child
+/// that exits or is killed closes the pipe and ends the write.
+async fn run_bounded_gh_command_with_input(
     mut command: tokio::process::Command,
+    input: Option<Vec<u8>>,
     timeout: Duration,
     pipe_limit: usize,
 ) -> std::result::Result<std::process::Output, BoundedGhError> {
@@ -1909,9 +1933,23 @@ async fn run_bounded_gh_command(
         .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    }
     let mut child = command
         .spawn()
         .map_err(|error| BoundedGhError::Spawn(error.to_string()))?;
+    let stdin_writer = match (input, child.stdin.take()) {
+        (Some(input), Some(mut stdin)) => Some(tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            // A write error means the child closed its stdin early; its exit
+            // status and stderr carry the real outcome.
+            let _ = stdin.write_all(&input).await;
+            let _ = stdin.shutdown().await;
+        })),
+        _ => None,
+    };
+    let _stdin_writer = AbortOnDrop(stdin_writer);
     let stdout = child
         .stdout
         .take()
@@ -5112,11 +5150,22 @@ fn serve_with_agent_mcp(
         // endpoint and the decomposition coordinator share this instance
         // instead of each holding their own.
         let writable_path_resolver = planner::WritablePathResolver::default();
+        // The pending-review tools and the reviewer verdict guard read the
+        // launch-SHA diff from the daemon's clone and the fresh PR head
+        // through the same daemon-owned Repository Service the outbox uses.
+        let review_evidence = Arc::new(agent_endpoint::RepositoryReviewEvidence::new(
+            &config.repo_dir,
+            &config.repo,
+            Arc::new(repository_service::GhRepositoryService::new(
+                config.merge_executor.publication_credentials(),
+            )),
+        ));
         let endpoint = agent_endpoint::AgentEndpoint::start(
             &config.db_path,
             &config.repo,
             &config.repo_dir,
             writable_path_resolver.clone(),
+            review_evidence,
         )
         .await?;
         let agent_mcp_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -71611,6 +71660,11 @@ exec /bin/cat '{stdout}'
             &config.repo,
             &config.repo_dir,
             coordinator.writable_path_resolver.clone(),
+            Arc::new(agent_endpoint::RepositoryReviewEvidence::new(
+                &config.repo_dir,
+                &config.repo,
+                Arc::new(repository_service::FakeRepositoryService::scripted([])),
+            )),
         )
         .await
         .unwrap();

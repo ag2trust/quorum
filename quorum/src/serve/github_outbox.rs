@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use quorum_core::collaboration_admission::{
-    GithubOperationKind, GithubOperationResponseJson, OperationErrorSummary,
+    GithubOperationKind, GithubOperationResponseJson, OperationErrorSummary, RemoteObjectId,
     MAX_OPERATION_ERROR_BYTES, MAX_OPERATION_JSON_BYTES,
 };
 use quorum_core::error::{QuorumError, Result};
@@ -47,9 +47,9 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use super::repository_service::{
-    Delivery, OperationEffect, OutcomeClass, PrMetadata, PrState, PullRequestNumber,
-    RepositoryError, RepositoryRequest, RepositoryResponse, RepositoryService, RepositoryTarget,
-    DEFAULT_CALL_TIMEOUT, MAX_AGENT_REQUEST_BYTES,
+    CreatedComment, Delivery, OperationEffect, OutcomeClass, PrMetadata, PrState,
+    PullRequestNumber, RepositoryError, RepositoryRequest, RepositoryResponse, RepositoryService,
+    RepositoryTarget, DEFAULT_CALL_TIMEOUT, MAX_AGENT_REQUEST_BYTES,
 };
 use super::{log, now_unix};
 
@@ -100,7 +100,7 @@ impl OutboxExecutor {
     }
 
     #[cfg(test)]
-    fn with_timing(mut self, poll_interval: Duration, shutdown_grace: Duration) -> Self {
+    pub(crate) fn with_timing(mut self, poll_interval: Duration, shutdown_grace: Duration) -> Self {
         self.poll_interval = poll_interval;
         self.shutdown_grace = shutdown_grace;
         self
@@ -248,7 +248,8 @@ async fn claim_due(db_path: &Path) -> Result<Option<ClaimedOperation>> {
 /// What the executor records for one execution result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Disposition {
-    Succeeded(GithubOperationResponseJson),
+    /// Confirmed, with the created GitHub object's id when there is one.
+    Succeeded(GithubOperationResponseJson, Option<RemoteObjectId>),
     /// Release for another attempt. `proven_unsent` is the closed transport
     /// proof that nothing was handed to GitHub.
     Retry {
@@ -288,11 +289,31 @@ fn decode_stored(
                 summary: error.to_string(),
             }
         })?;
-    let matches_kind = match request {
-        RepositoryRequest::ReadPrMetadata {} => {
-            kind == GithubOperationKind::PullRequestRead.as_str()
+    let expected = match request {
+        RepositoryRequest::ReadPrMetadata {}
+        | RepositoryRequest::GetPullRequest {}
+        | RepositoryRequest::GetDiff { .. }
+        | RepositoryRequest::GetFiles { .. }
+        | RepositoryRequest::GetReviewComments { .. }
+        | RepositoryRequest::GetReviews { .. }
+        | RepositoryRequest::GetComments { .. } => GithubOperationKind::PullRequestRead,
+        RepositoryRequest::AddIssueComment { .. } => GithubOperationKind::AddIssueComment,
+        // Pending-review publication needs the slot/sequence executor, which
+        // has not landed: refuse before any send. Housekeeping variants are
+        // daemon-only and never decode from a stored agent request.
+        RepositoryRequest::CreatePendingReview { .. }
+        | RepositoryRequest::AddPendingReviewComment { .. }
+        | RepositoryRequest::SubmitPendingReview { .. }
+        | RepositoryRequest::ListPendingReviews {}
+        | RepositoryRequest::GetReview { .. }
+        | RepositoryRequest::DeletePendingReview { .. } => {
+            return Err(Disposition::FailedUnsent {
+                error_kind: "unsupported_request",
+                summary: "pending-review operations are not executable yet".to_string(),
+            })
         }
     };
+    let matches_kind = kind == expected.as_str();
     if !matches_kind {
         return Err(Disposition::FailedUnsent {
             error_kind: "request_kind_mismatch",
@@ -300,6 +321,26 @@ fn decode_stored(
         });
     }
     Ok(request)
+}
+
+/// Every write carries the operation's hidden marker. A comment without one
+/// fails before any send rather than posting an unattributable body.
+fn attach_marker(
+    request: RepositoryRequest,
+    marker: Option<&str>,
+) -> std::result::Result<RepositoryRequest, Disposition> {
+    match request {
+        RepositoryRequest::AddIssueComment { body } => match marker {
+            Some(marker) if !marker.is_empty() => Ok(RepositoryRequest::AddIssueComment {
+                body: compose_comment_body(&body, marker),
+            }),
+            _ => Err(Disposition::FailedUnsent {
+                error_kind: "missing_marker",
+                summary: "write operation has no daemon marker".to_string(),
+            }),
+        },
+        request => Ok(request),
+    }
 }
 
 /// Fail-safe effect: an operation is a read only when both the row kind and
@@ -322,6 +363,7 @@ fn error_kind_token(error: &RepositoryError) -> &'static str {
         K::TimedOut => "timed_out",
         K::ResponseTooLarge => "response_too_large",
         K::TransientFailure => "transient_failure",
+        K::RateLimited => "rate_limited",
         K::PermanentFailure => "permanent_failure",
         K::InvalidResponse => "invalid_response",
     }
@@ -343,8 +385,22 @@ fn disposition(
                     summary: format!("result exceeds {MAX_RESULT_BYTES} bytes"),
                 };
             }
+            let remote_object_id = match &response {
+                RepositoryResponse::IssueComment(comment) => {
+                    match RemoteObjectId::new(comment.id.to_string()) {
+                        Ok(id) => Some(id),
+                        Err(error) => {
+                            return Disposition::Ambiguous {
+                                error_kind: "invalid_result",
+                                summary: error.to_string(),
+                            }
+                        }
+                    }
+                }
+                _ => None,
+            };
             return match GithubOperationResponseJson::new(&text) {
-                Ok(json) => Disposition::Succeeded(json),
+                Ok(json) => Disposition::Succeeded(json, remote_object_id),
                 Err(error) => Disposition::Ambiguous {
                     error_kind: "invalid_result",
                     summary: error.to_string(),
@@ -403,7 +459,55 @@ fn response_json(response: &RepositoryResponse) -> serde_json::Value {
             "base_ref": base_ref,
             "is_cross_repository": is_cross_repository,
         }),
+        RepositoryResponse::PullRequestRead(value) => value.clone(),
+        RepositoryResponse::IssueComment(CreatedComment { id, html_url }) => serde_json::json!({
+            "kind": "issue_comment",
+            "id": id,
+            "html_url": html_url,
+        }),
+        // Never produced by an executable request yet (decode_stored refuses
+        // pending-review kinds); rendered without the body, which carries the
+        // hidden marker.
+        RepositoryResponse::Review(review) => review_json(review),
+        RepositoryResponse::PendingReviews(reviews) => serde_json::json!({
+            "kind": "pending_reviews",
+            "reviews": reviews.iter().map(review_json).collect::<Vec<_>>(),
+        }),
+        RepositoryResponse::ReviewAbsent { review_id } => serde_json::json!({
+            "kind": "review_absent",
+            "id": review_id,
+        }),
+        RepositoryResponse::PendingReviewComment(comment) => serde_json::json!({
+            "kind": "pending_review_comment",
+            "id": comment.id,
+            "node_id": comment.node_id,
+            "thread_node_id": comment.thread_node_id,
+        }),
     }
+}
+
+fn review_json(review: &super::repository_service::ReviewRecord) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "review",
+        "id": review.id,
+        "node_id": review.node_id,
+        "state": review.state.as_str(),
+        "commit_id": review.commit_id,
+    })
+}
+
+/// The body actually posted for a general comment: the authored Markdown,
+/// byte for byte, then a blank line and the operation's hidden marker. The
+/// blank line ends any open paragraph, list, quote, or table, and the
+/// endpoint refuses a body with an unclosed code fence, so the marker never
+/// enters an authored construct.
+pub fn compose_comment_body(authored: &str, marker: &str) -> String {
+    let separator = if authored.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    format!("{authored}{separator}{marker}")
 }
 
 /// Bounded, NUL-free, non-empty summary text.
@@ -439,6 +543,9 @@ async fn execute_claimed(ctx: &ExecContext, claimed: ClaimedOperation) -> Result
         })
         .and_then(|pr| {
             decode_stored(&operation.kind, &operation.request_json).map(|request| (pr, request))
+        })
+        .and_then(|(pr, request)| {
+            attach_marker(request, operation.github_marker.as_deref()).map(|request| (pr, request))
         });
     let (pr, request) = match prepared {
         Ok(prepared) => prepared,
@@ -479,13 +586,13 @@ async fn record(db_path: &Path, claim: OperationClaim, disposition: Disposition)
     with_conn(db_path, move |conn| {
         let now = now_unix();
         match disposition {
-            Disposition::Succeeded(json) => {
+            Disposition::Succeeded(json, remote_object_id) => {
                 github_operations::settle(
                     conn,
                     &claim,
                     Settlement::Succeeded {
                         response_json: Some(&json),
-                        remote_object_id: None,
+                        remote_object_id: remote_object_id.as_ref(),
                     },
                     now,
                 )?;
