@@ -1162,7 +1162,10 @@ exec sleep 300
             .expect("kill_and_reap did not finish");
         assert_pid_gone(grandchild_a).await;
 
-        assert!(pid_alive(grandchild_b), "other tree's grandchild was killed");
+        assert!(
+            pid_alive(grandchild_b),
+            "other tree's grandchild was killed"
+        );
         assert!(pid_alive(leader_b), "other tree's leader was killed");
         assert!(proc_b.try_wait().unwrap().is_none());
         assert!(pid_alive(unsafe { libc::getpid() }));
@@ -1181,7 +1184,10 @@ exec sleep 300
         drop(proc);
 
         assert_pid_gone(grandchild).await;
-        assert!(pid_alive(grandchild_b), "other tree's grandchild was killed");
+        assert!(
+            pid_alive(grandchild_b),
+            "other tree's grandchild was killed"
+        );
         drop(proc_b);
         assert_pid_gone(grandchild_b).await;
     }
