@@ -64,7 +64,7 @@ pub const MAX_PUBLISHER_SCOPE_BYTES: usize = 128;
 const MAX_REVIEW_ID_BYTES: usize = 128;
 const MAX_COMMIT_SHA_BYTES: usize = 128;
 
-const ERR_CLEANUP_CANCELLED: &str = "review_cleanup";
+pub(crate) const ERR_CLEANUP_CANCELLED: &str = "review_cleanup";
 
 /// Opaque daemon-derived Repository Service namespace. Never agent input.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -996,8 +996,9 @@ pub struct CleanupClaim {
 /// One `BEGIN IMMEDIATE`: run [`sync_in_tx`], block every slot whose
 /// generation is exhausted or that lacks a marker/launch SHA, then pick a due
 /// slot whose attempt has no running or reconciliation-only operation, cancel
-/// that attempt's still-queued create rows (retaining their send disposition),
-/// and increment the cycle. `Ok(None)` is the clean negative.
+/// every still-queued, provably unsent review-sequence row of that attempt
+/// (create, inline comments, `submit_pending`; retaining their send
+/// disposition), and increment the cycle. `Ok(None)` is the clean negative.
 pub fn claim_cleanup(conn: &mut Connection, now: i64) -> Result<Option<CleanupClaim>> {
     validate_now(now)?;
     let tx = begin_immediate(conn)?;
@@ -1050,9 +1051,9 @@ pub fn claim_cleanup(conn: &mut Connection, now: i64) -> Result<Option<CleanupCl
     tx.execute(
         "UPDATE github_agent_operations
          SET state='cancelled', next_attempt_at=NULL, error_kind=?3,
-             error_summary='pending-review cleanup claimed before the create was sent',
+             error_summary='pending-review cleanup claimed before the operation was sent',
              updated_at=?2
-         WHERE attempt_id=?1 AND review_sequence=0 AND state='queued' AND active=0
+         WHERE attempt_id=?1 AND review_sequence IS NOT NULL AND state='queued' AND active=0
            AND execution_started_at IS NULL
            AND send_state IN ('not_started','definitely_unsent')",
         params![attempt_id, now, ERR_CLEANUP_CANCELLED],
@@ -1712,6 +1713,94 @@ mod tests {
             complete_cleanup(&mut conn, &claim, empty_listing(), NOW).unwrap(),
             CleanupOutcome::Released
         );
+    }
+
+    /// Own the slot with att-a, succeed its create, and queue an inline
+    /// comment (1) and `submit_pending` (2) behind it.
+    fn confirmed_create_with_queued_followers(conn: &mut Connection) {
+        own(conn, "att-a");
+        enqueue_create(conn, "att-a");
+        enqueue_review(conn, "att-a", "op-inline", 1, r#"{"body":"x"}"#);
+        enqueue_review(
+            conn,
+            "att-a",
+            "op-submit",
+            2,
+            r#"{"method":"submit_pending","event":"COMMENT","body":"done"}"#,
+        );
+        let won = github_operations::claim_next(conn, NOW).unwrap().unwrap();
+        assert_eq!(won.operation.operation_id, "op-create");
+        assert!(github_operations::mark_execution_started(conn, &won.claim, NOW).unwrap());
+        let id = RemoteObjectId::new("PRR_1").unwrap();
+        let ok = Settlement::Succeeded {
+            response_json: None,
+            remote_object_id: Some(&id),
+        };
+        assert!(github_operations::settle(conn, &won.claim, ok, NOW).unwrap());
+        assert_eq!(slot(conn).unwrap().state, SlotState::Owned);
+    }
+
+    #[test]
+    fn cleanup_fences_queued_inline_and_submit_rows_of_an_active_attempt() {
+        let (_dir, mut conn) = setup();
+        confirmed_create_with_queued_followers(&mut conn);
+        // The attempt stays active; only the slot leaves `owned`.
+        assert!(require_cleanup(&mut conn, "att-a", NOW).unwrap());
+        // No later review-sequence row is claimable once the slot is not owned.
+        assert!(github_operations::claim_next(&mut conn, NOW)
+            .unwrap()
+            .is_none());
+        let claim = cleanup(&mut conn, NOW);
+        assert_eq!(slot(&conn).unwrap().state, SlotState::CleanupRunning);
+        assert_eq!(claim.create_send_state, GithubSendState::Confirmed);
+        for id in ["op-inline", "op-submit"] {
+            let row = op(&conn, id);
+            assert_eq!(
+                (
+                    row.state.as_str(),
+                    row.send_state.as_str(),
+                    row.attempts,
+                    row.execution_started_at
+                ),
+                ("cancelled", "not_started", 0, None),
+                "{id}"
+            );
+        }
+        assert!(github_operations::claim_next(&mut conn, NOW)
+            .unwrap()
+            .is_none());
+        assert_eq!(errors(&conn), 0);
+    }
+
+    #[test]
+    fn slot_lost_between_claim_and_start_cancels_inline_unsent() {
+        let (_dir, mut conn) = setup();
+        confirmed_create_with_queued_followers(&mut conn);
+        let won = github_operations::claim_next(&mut conn, NOW)
+            .unwrap()
+            .unwrap();
+        assert_eq!(won.operation.operation_id, "op-inline");
+        assert!(require_cleanup(&mut conn, "att-a", NOW).unwrap());
+        // Cleanup waits while the inline row is claimed.
+        assert!(claim_cleanup(&mut conn, NOW).unwrap().is_none());
+        // The claimant never starts the send: the row is cancelled unsent.
+        assert!(!github_operations::mark_execution_started(&mut conn, &won.claim, NOW).unwrap());
+        let inline = op(&conn, "op-inline");
+        assert_eq!(
+            (
+                inline.state.as_str(),
+                inline.send_state.as_str(),
+                inline.execution_started_at
+            ),
+            ("cancelled", "not_started", None)
+        );
+        // Cleanup now runs and fences the still-queued submit.
+        cleanup(&mut conn, NOW);
+        assert_eq!(op(&conn, "op-submit").state, "cancelled");
+        assert_eq!(op(&conn, "op-submit").send_state, "not_started");
+        assert!(github_operations::claim_next(&mut conn, NOW)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

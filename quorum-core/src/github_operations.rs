@@ -411,7 +411,8 @@ fn validate_error_kind(kind: &str) -> Result<()> {
 /// blocks it even when it is otherwise due first. A failed, cancelled, or
 /// completed-after-revocation predecessor terminally fails its still-unsent
 /// dependents (`review_predecessor_failed`) in the same transaction, so they
-/// are never sent.
+/// are never sent. Every review-sequence row (create, inline, submit) is also
+/// claimable only while its attempt's pending-review slot is `owned`.
 ///
 /// `Ok(None)` is the clean negative: nothing due, a lost race (zero guarded
 /// rows), or `SQLITE_CONSTRAINT_UNIQUE` on `github_agent_operations_one_active`.
@@ -487,6 +488,10 @@ pub fn claim_next(conn: &mut Connection, now: i64) -> Result<Option<ClaimedOpera
                    WHERE p.attempt_id=o.attempt_id
                      AND p.review_sequence>=0 AND p.review_sequence<o.review_sequence
                      AND p.state='succeeded' AND p.completed_after_revocation=0
+               ))
+               AND (o.review_sequence IS NULL OR EXISTS (
+                   SELECT 1 FROM github_review_publication_slots s
+                   WHERE s.attempt_id=o.attempt_id AND s.state='owned'
                ))
                AND (o.review_sequence IS NOT 0 OR (
                    o.send_state IN ('not_started','definitely_unsent')
@@ -590,6 +595,31 @@ pub fn mark_execution_started(
                  AND a.state='active' AND c.revoked_at IS NULL
            )",
         params![claim.id, claim.attempt, ERR_ATTEMPT_REVOKED, now],
+    )
+    .map_err(map_sql_err)?;
+    // A claimed later review-sequence row (inline comment, submit_pending)
+    // is sendable only while its attempt still owns the pending-review slot.
+    // If cleanup was required after the claim, cancel it provably unsent.
+    tx.execute(
+        "UPDATE github_agent_operations
+         SET state='cancelled', active=0, next_attempt_at=NULL, error_kind=?3,
+             error_summary='review slot lost before the send started',
+             updated_at=?4
+         WHERE id=?1 AND attempts=?2 AND active=1 AND state='running'
+           AND execution_started_at IS NULL
+           AND review_sequence>0
+           AND send_state IN ('not_started','definitely_unsent')
+           AND NOT EXISTS (
+               SELECT 1 FROM github_review_publication_slots s
+               WHERE s.attempt_id=github_agent_operations.attempt_id
+                 AND s.state='owned'
+           )",
+        params![
+            claim.id,
+            claim.attempt,
+            review_publication_slots::ERR_CLEANUP_CANCELLED,
+            now
+        ],
     )
     .map_err(map_sql_err)?;
     // A claimed pending-review create already carries `ambiguous` from its
