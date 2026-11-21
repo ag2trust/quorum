@@ -199,3 +199,62 @@ pub fn task_retry(db: &Path, task_id: i64, by: &str, now: i64) -> Result<(String
         },
     )
 }
+
+/// `task-answer`: answer a needs-info park and resume the task. Runs the same
+/// pre-checks as [`task_retry`] (cancelled dependency, reviewer cap), with the
+/// same JSON shapes and exit 1, before validating and writing the answer via
+/// [`quorum_core::tasks::answer_parked`]. Returns the JSON the command emits
+/// and its exit code (0 answered, 1 refused).
+pub fn task_answer(
+    db: &Path,
+    task_id: i64,
+    by: &str,
+    answer: &str,
+    now: i64,
+) -> Result<(String, i32)> {
+    let mut conn = quorum_core::db::open(db)?;
+    let cancelled = quorum_core::tasks::cancelled_dep_ids(&conn, task_id)?;
+    if !cancelled.is_empty() {
+        return Ok(emitted(
+            &serde_json::json!({
+                "ok": false,
+                "reason": "dependency cancelled — unsatisfiable; \
+                           edit depends_on or close the dependent",
+                "cancelled_deps": cancelled,
+            }),
+            1,
+        ));
+    }
+    if let Some(reason) = quorum_core::tasks::reviewer_cap_retry_refusal(&conn, task_id)? {
+        return Ok(emitted(
+            &serde_json::json!({
+                "ok": false,
+                "outcome": "task-retry-rejected",
+                "reason": reason,
+            }),
+            1,
+        ));
+    }
+    Ok(
+        match quorum_core::tasks::answer_parked(&mut conn, task_id, by, answer, now)? {
+            quorum_core::tasks::AnswerOutcome::Answered { note_id, .. } => emitted(
+                &serde_json::json!({
+                    "ok": true,
+                    "task_id": task_id,
+                    "answer_note_id": note_id,
+                }),
+                0,
+            ),
+            quorum_core::tasks::AnswerOutcome::NotFound
+            | quorum_core::tasks::AnswerOutcome::NotWaiting
+            | quorum_core::tasks::AnswerOutcome::RetryRefused => emitted(
+                &serde_json::json!({
+                    "ok": false,
+                    "outcome": "task-answer-rejected",
+                    "reason": "task is not waiting for an answer",
+                }),
+                1,
+            ),
+        },
+    )
+}
