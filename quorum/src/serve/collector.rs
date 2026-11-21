@@ -1013,9 +1013,9 @@ impl CollectionRequest {
         agent_bin: Option<String>,
         bare_agent: bool,
     ) -> Self {
-        let default_provider = AgentKind::for_model(CLASSIFIER_MODEL)
-            .map(|kind| kind.to_string())
-            .unwrap_or_default();
+        // The built-in default collector profile is Claude's classifier
+        // model; routed collections replace it with the profile's runner.
+        let default_provider = AgentKind::Claude.to_string();
         Self {
             pr_number,
             task_id,
@@ -1752,8 +1752,19 @@ async fn spawn_and_run_classifier(
     request: &CollectionRequest,
     prompt: &str,
 ) -> ClassifierTurnOutcome {
+    let runner = match AgentKind::for_profile_runner(&request.collector_runner) {
+        Ok(runner) => runner,
+        Err(error) => {
+            return ClassifierTurnOutcome {
+                response: Err(QuorumError::Usage(format!("spawn classifier: {error}"))),
+                usage: None,
+                failure: None,
+            };
+        }
+    };
     let launched = RunnerProc::launch(
         &LaunchRequest {
+            runner,
             model: &request.collector_model,
             effort: &request.collector_effort,
             worktree: &request.repo_dir,
@@ -2638,8 +2649,8 @@ mod tests {
             true,
         )
         .with_collector(
-            "unknown",
-            "unknown",
+            "claude",
+            "claude",
             "unknown-provider-model",
             "medium",
             "danger-full-access",
@@ -2654,6 +2665,57 @@ mod tests {
         let run = review_findings::get_run(&conn, 44).unwrap().unwrap();
         assert_eq!(run.status, RunStatus::Failed);
         assert_eq!(run.collector_model, "unknown-provider-model");
+    }
+
+    #[tokio::test]
+    async fn unknown_collector_runner_fails_loudly_without_model_fallback() {
+        let dir = setup_git_dir();
+        let db_path = dir.path().join("q.db");
+        let _ = db::open(&db_path).unwrap();
+        let request = CollectionRequest::new(
+            45,
+            None,
+            None,
+            db_path.clone(),
+            dir.path().to_path_buf(),
+            Some("/bin/false".into()),
+            true,
+        )
+        .with_collector(
+            "unknown",
+            "unknown",
+            CLASSIFIER_MODEL,
+            "medium",
+            "danger-full-access",
+        );
+
+        let error = run_collection_with_inputs(&request, synthetic_inputs(45), 1000)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("unknown profile runner"),
+            "{error}"
+        );
+
+        let conn = db::open(&db_path).unwrap();
+        let run = review_findings::get_run(&conn, 45).unwrap().unwrap();
+        assert_eq!(run.status, RunStatus::Failed);
+    }
+
+    #[test]
+    fn default_collector_runner_matches_its_built_in_model() {
+        let request = CollectionRequest::new(
+            1,
+            None,
+            None,
+            PathBuf::from("/tmp/q.db"),
+            PathBuf::from("/tmp"),
+            None,
+            true,
+        );
+        let expected = AgentKind::for_model(CLASSIFIER_MODEL).unwrap().to_string();
+        assert_eq!(request.collector_provider, expected);
+        assert_eq!(request.collector_runner, expected);
     }
 
     #[tokio::test]

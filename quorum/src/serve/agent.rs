@@ -1580,6 +1580,7 @@ mod tests {
         mode: LaunchMode,
     ) -> LaunchRequest<'a> {
         LaunchRequest {
+            runner: AgentKind::Claude,
             model: "claude-opus-4-6",
             effort: "high",
             worktree,
