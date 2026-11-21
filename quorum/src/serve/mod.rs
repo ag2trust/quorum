@@ -39860,6 +39860,436 @@ mod tests {
         (workers, spawned)
     }
 
+    const PENDING_RESUME_QUESTION_NOTE: &str = "needs-info: which base branch should I target?";
+
+    /// Park `task_id` as a worker `needs-info` reaction resuming `resume`.
+    fn park_needs_info_for_resume(conn: &rusqlite::Connection, task_id: i64, resume: &str) {
+        conn.execute(
+            "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, 1, 'Wkr', ?2)",
+            rusqlite::params![task_id, PENDING_RESUME_QUESTION_NOTE],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='failed', assignee=NULL,
+                 refs=json_set(refs, '$.daemon_parked', json('true'),
+                     '$.daemon_parked_reason', ?2, '$.daemon_resume_status', ?3)
+             WHERE id=?1",
+            rusqlite::params![task_id, tasks::NEEDS_INFO_PARK_REASON, resume],
+        )
+        .unwrap();
+    }
+
+    fn task_refs_json(db_path: &Path, task_id: i64) -> serde_json::Value {
+        let conn = quorum_core::db::open(db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        serde_json::from_str(task.refs.as_deref().unwrap_or("{}")).unwrap()
+    }
+
+    /// What one worker launch bound: prompt, routing, and continuation.
+    #[derive(Debug, PartialEq, Eq)]
+    struct PendingResumeLaunch {
+        prompt: String,
+        turn_kind: String,
+        model: String,
+        effort: String,
+        kind: runner::AgentKind,
+        continuation_id: Option<String>,
+        agent_name: String,
+    }
+
+    /// Restore a `needs-info` park (`task-answer` when `answer` is set,
+    /// otherwise `task-retry`), optionally strip `pending_resume` before
+    /// dispatch, then spawn the next worker through the production
+    /// `spawn_worker` admission and return what it launched. The fake CLI
+    /// records nothing and holds its stdin; prompts are compared verbatim.
+    #[cfg(unix)]
+    async fn pending_resume_worker_launch(
+        runner_kind: &str,
+        resume: &str,
+        answer: Option<&str>,
+        strip_pending_resume: bool,
+    ) -> PendingResumeLaunch {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = launch_test_repo(dir.path());
+        let db_path = dir.path().join("pending-resume.db");
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo);
+        config.worktree_base = dir.path().join("worktrees");
+        config.agent_bin = Some(
+            fake_stdin_holding_agent(dir.path(), "fake-cli")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let model = match runner_kind {
+            "claude" => "claude-sonnet-5",
+            "codex" => "gpt-5.6-sol",
+            "grok" => "grok-4.5",
+            other => panic!("unknown runner {other}"),
+        };
+        config.model_profiles = std::collections::BTreeMap::from([(
+            "test".to_string(),
+            crate::serve_config::ModelProfile {
+                runner: runner_kind.into(),
+                model: model.into(),
+                effort: "high".into(),
+            },
+        )]);
+
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "pending resume worker",
+                Some("resume after the owner's answer"),
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            park_needs_info_for_resume(&conn, task_id, resume);
+            match answer {
+                Some(answer) => assert!(matches!(
+                    tasks::answer_parked(&mut conn, task_id, "owner", answer, 2).unwrap(),
+                    tasks::AnswerOutcome::Answered { .. }
+                )),
+                None => assert!(tasks::retry_parked(&mut conn, task_id, "owner", true, 2)
+                    .unwrap()
+                    .is_some()),
+            }
+            task_id
+        };
+        let refs = task_refs_json(&db_path, task_id);
+        let expected_kind = if answer.is_some() {
+            "answer"
+        } else {
+            "unanswered"
+        };
+        assert_eq!(
+            refs[tasks::PENDING_RESUME_REF]["kind"],
+            expected_kind,
+            "{refs}"
+        );
+        if resume == "rework" {
+            assert!(daemon_rework_retry_requested(Some(&refs.to_string())));
+        }
+        if strip_pending_resume {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET refs=json_remove(refs, '$.pending_resume') WHERE id=?1",
+                [task_id],
+            )
+            .unwrap();
+        }
+
+        let names_path = dir.path().join("names.txt");
+        std::fs::write(&names_path, "Wkr2\n").unwrap();
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::load(&names_path, 1).unwrap();
+        let mut workers = Vec::new();
+        let mut poison = PoisonTracker::new();
+        let mut skips = ClaimSkipLogLimiter::new();
+        let mut roster = LifetimeRoster::new();
+        assert!(
+            spawn_worker(
+                &config,
+                &wt_mgr,
+                &mut names,
+                &mut workers,
+                &mut poison,
+                &mut skips,
+                &mut roster,
+            )
+            .await
+            .unwrap(),
+            "{runner_kind} {resume} admission must launch a worker"
+        );
+        assert_eq!(workers.len(), 1);
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let held = if resume == "rework" {
+            "rework"
+        } else {
+            "working"
+        };
+        assert_eq!(task.status, held);
+        assert_eq!(task.assignee.as_deref(), Some("Wkr2"));
+        drop(conn);
+        let refs = task_refs_json(&db_path, task_id);
+        assert!(
+            refs.get(tasks::PENDING_RESUME_REF).is_none(),
+            "the admission consumes pending_resume: {refs}"
+        );
+
+        let slot = workers.pop().unwrap();
+        let launch = PendingResumeLaunch {
+            prompt: slot.pending_prompt.clone(),
+            turn_kind: slot.pending_turn_kind.clone(),
+            model: slot.model.clone(),
+            effort: slot.effort.clone(),
+            kind: slot.process_kind(),
+            continuation_id: slot.continuation_id.clone(),
+            agent_name: slot.agent_name.clone(),
+        };
+        let _ = slot.kill_and_reap().await;
+        launch
+    }
+
+    #[cfg(unix)]
+    async fn assert_pending_resume_prompt_parity(runner_kind: &str, resume: &str) {
+        let answer = "target main; keep the API stable";
+        let with = pending_resume_worker_launch(runner_kind, resume, Some(answer), false).await;
+        let without = pending_resume_worker_launch(runner_kind, resume, Some(answer), true).await;
+        assert_eq!(
+            with, without,
+            "{runner_kind} {resume}: pending_resume must not change prompt, routing, or continuation"
+        );
+        assert!(
+            with.prompt.contains(PENDING_RESUME_QUESTION_NOTE),
+            "{runner_kind}: the question reaches the worker through task notes: {}",
+            with.prompt
+        );
+        assert!(
+            with.prompt.contains(&format!("answer:\n{answer}"))
+                || with.prompt.contains(&format!("answer: {answer}")),
+            "{runner_kind}: the answer note reaches the worker through task notes: {}",
+            with.prompt
+        );
+        assert_eq!(
+            with.continuation_id, None,
+            "a fresh worker starts a new session"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_resume_open_admission_claude_prompt_is_unchanged_and_ref_consumed() {
+        assert_pending_resume_prompt_parity("claude", "open").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_resume_open_admission_codex_prompt_is_unchanged_and_ref_consumed() {
+        assert_pending_resume_prompt_parity("codex", "open").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_resume_open_admission_grok_prompt_is_unchanged_and_ref_consumed() {
+        assert_pending_resume_prompt_parity("grok", "open").await;
+    }
+
+    /// A rework park restored with an answer still dispatches through the
+    /// `daemon_rework_retry_requested` admission, which consumes the ref.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_resume_rework_retry_admission_consumes_ref_with_unchanged_prompt() {
+        for runner_kind in ["claude", "codex", "grok"] {
+            assert_pending_resume_prompt_parity(runner_kind, "rework").await;
+        }
+    }
+
+    /// `task-retry` of a needs-info park (no answer) is consumed the same way.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_resume_unanswered_retry_is_consumed_by_open_and_rework_admission() {
+        for resume in ["open", "rework"] {
+            let with = pending_resume_worker_launch("claude", resume, None, false).await;
+            let without = pending_resume_worker_launch("claude", resume, None, true).await;
+            assert_eq!(with, without, "{resume}");
+        }
+    }
+
+    /// A lost admission leaves `pending_resume` for the winner; only the
+    /// winning admission of each serve-side path consumes it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_resume_survives_lost_admission_and_is_consumed_by_the_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pending-resume-race.db");
+        let cx = r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#;
+        let seed = |resume: &str| -> i64 {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let id = tasks::create(
+                &mut conn,
+                "owner",
+                "t",
+                None,
+                0,
+                None,
+                Some(cx),
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+            park_needs_info_for_resume(&conn, id, resume);
+            tasks::answer_parked(&mut conn, id, "owner", "go", 2).unwrap();
+            assert_eq!(
+                task_refs_json(&db_path, id)[tasks::PENDING_RESUME_REF]["kind"],
+                "answer"
+            );
+            id
+        };
+        let has_pending = |id: i64| {
+            task_refs_json(&db_path, id)
+                .get(tasks::PENDING_RESUME_REF)
+                .is_some()
+        };
+        let ttl = tasks::DEFAULT_LEASE_TTL_SECS;
+
+        // Open admission (spawn_admitted_worker → claim_with_graph_limit).
+        let open = seed("open");
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO claims(target, holder, ts, expires_at, active)
+                 VALUES (?1, 'Other', 3, ?2, 1)",
+                rusqlite::params![tasks::lease_target(open), now_unix() + 3600],
+            )
+            .unwrap();
+            let lost = tasks::claim_with_graph_limit(
+                &mut conn,
+                "Loser",
+                Some(open),
+                &[],
+                ttl,
+                now_unix(),
+                1,
+            );
+            assert!(!matches!(lost, Ok(Some(_))), "{lost:?}");
+            assert!(has_pending(open), "a lost open admission keeps the ref");
+            conn.execute(
+                "UPDATE claims SET active=0 WHERE target=?1",
+                [tasks::lease_target(open)],
+            )
+            .unwrap();
+        }
+
+        // Rework retry admission (spawn_admitted_worker → claim_provider_retry_rework).
+        let rework = seed("rework");
+        {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute("UPDATE tasks SET assignee='Other' WHERE id=?1", [rework])
+                .unwrap();
+            assert!(tasks::claim_provider_retry_rework(
+                &mut conn,
+                "Loser",
+                rework,
+                ttl,
+                now_unix()
+            )
+            .unwrap()
+            .is_none());
+            assert!(has_pending(rework), "a lost rework admission keeps the ref");
+            conn.execute("UPDATE tasks SET assignee=NULL WHERE id=?1", [rework])
+                .unwrap();
+        }
+
+        // Remediation / replacement admission (spawn_remediation_worker →
+        // claim_remediation_for_worker → claim_remediation_rework_with_feedback).
+        let remediation = seed("rework");
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO claims(target, holder, ts, expires_at, active)
+                 VALUES (?1, 'Other', 3, ?2, 1)",
+                rusqlite::params![tasks::lease_target(remediation), now_unix() + 3600],
+            )
+            .unwrap();
+        }
+        assert!(claim_remediation_for_worker(
+            db_path.clone(),
+            "Loser".into(),
+            remediation,
+            "fix".into()
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert!(
+            has_pending(remediation),
+            "a lost remediation admission keeps the ref"
+        );
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE claims SET active=0 WHERE target=?1",
+                [tasks::lease_target(remediation)],
+            )
+            .unwrap();
+        }
+        let won = claim_remediation_for_worker(
+            db_path.clone(),
+            "Winner".into(),
+            remediation,
+            "fix".into(),
+        )
+        .await
+        .unwrap()
+        .expect("the remediation winner is admitted");
+        assert!(won.refs.as_deref().unwrap().contains("pending_resume"));
+        assert!(
+            !has_pending(remediation),
+            "the remediation winner consumes the ref"
+        );
+
+        // Concurrent open and rework admissions: exactly one winner each, and
+        // the ref is gone afterwards.
+        // Fresh parks per round; repeated to expose flakes.
+        for rework_claim in (0..10).flat_map(|_| [false, true]) {
+            let id = seed(if rework_claim { "rework" } else { "open" });
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+            let handles: Vec<_> = (0..4)
+                .map(|i| {
+                    let db_path = db_path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        let mut conn = quorum_core::db::open(&db_path).unwrap();
+                        let agent = format!("Racer{i}");
+                        barrier.wait();
+                        if rework_claim {
+                            tasks::claim_provider_retry_rework(
+                                &mut conn,
+                                &agent,
+                                id,
+                                ttl,
+                                now_unix(),
+                            )
+                        } else {
+                            tasks::claim_with_graph_limit(
+                                &mut conn,
+                                &agent,
+                                Some(id),
+                                &[],
+                                ttl,
+                                now_unix(),
+                                1,
+                            )
+                        }
+                        .unwrap()
+                    })
+                })
+                .collect();
+            let winners: Vec<_> = handles
+                .into_iter()
+                .filter_map(|h| h.join().unwrap())
+                .collect();
+            assert_eq!(winners.len(), 1, "task #{id}: exactly one admission wins");
+            assert!(winners[0]
+                .refs
+                .as_deref()
+                .unwrap()
+                .contains("pending_resume"));
+            assert!(!has_pending(id), "task #{id}: the winner consumed the ref");
+        }
+    }
+
     /// Task #367 shape: a requested Codex retry carrying a provider thread
     /// while only Claude profiles are configured. Dispatch drops the exact
     /// turn and its continuation atomically and launches a fresh Claude worker
