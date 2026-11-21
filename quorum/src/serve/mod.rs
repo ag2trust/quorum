@@ -39,6 +39,7 @@ pub mod reviewer;
 pub mod role_failover;
 pub mod runner;
 pub mod session_log;
+pub mod session_store;
 pub mod stream;
 mod worker_recover;
 pub mod worktree;
@@ -3021,6 +3022,41 @@ fn configure_daemon_log(log_dir: Option<&Path>) {
     *configured = logger;
 }
 
+/// The external runner's session root. Until `session_base` is configurable
+/// this is the documented default, `<state dir>/sessions`.
+fn session_base(config: &ServeConfig) -> PathBuf {
+    session_store::default_session_base(&config.db_path)
+}
+
+/// Remove session trees whose task is `done`, `cancelled` (including
+/// `task-close`), or unknown, under the current `session_base` only. A missing
+/// `session_base` is a no-op, so daemons that never created one are unchanged.
+async fn sweep_session_trees(config: &ServeConfig, limit: usize) {
+    let db = config.db_path.clone();
+    let base = session_base(config);
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = quorum_core::db::open(&db)?;
+        session_store::sweep_finished(&conn, &base, limit)
+    })
+    .await;
+    match result {
+        Ok(Ok(outcome)) => {
+            for id in &outcome.removed {
+                log(&format!(
+                    "session store: removed tree of finished task #{id}"
+                ));
+            }
+            for (id, e) in &outcome.failed {
+                log(&format!(
+                    "session store: tree removal for task #{id} failed: {e}"
+                ));
+            }
+        }
+        Ok(Err(e)) => log(&format!("session store: sweep failed: {e}")),
+        Err(e) => log(&format!("session store: sweep join failed: {e}")),
+    }
+}
+
 fn log(msg: &str) {
     let _ = writeln!(std::io::stderr(), "{SERVE_LOG_PREFIX}{msg}");
 
@@ -5048,6 +5084,13 @@ pub const EXIT_SELF_UPDATE: i32 = 75;
 
 const DAEMON_LOCK_STALE_SECS: i64 = 30;
 const DRIFT_CHECK_INTERVAL_SECS: u64 = 15 * 60;
+/// Cadence of the session-tree sweep that removes `<session_base>/<task id>/`
+/// trees of `done`/`cancelled`/unknown tasks. Terminal statuses are written by
+/// short-lived CLI commands (`cancel`, `task-close`) that do not know
+/// `session_base`, so the daemon converges on them by observation.
+const SESSION_SWEEP_INTERVAL_SECS: u64 = 60;
+/// Trees removed per periodic sweep pass; the startup pass is unbounded.
+const SESSION_SWEEP_LIMIT: usize = 32;
 const PUBLICATION_REF_RECONCILE_INTERVAL_SECS: u64 = 60;
 const WORKTREE_PRUNE_INTERVAL_SECS: u64 = 60 * 60;
 const PUBLICATION_REF_RECONCILE_BATCH_SIZE: i64 = 64;
@@ -13417,6 +13460,11 @@ async fn tick_loop_owning_doctor(
     // intents have settled or exhausted.
     cleanup::startup(config, &wt_mgr).await?;
 
+    // Session trees of tasks that finished or vanished while no daemon ran
+    // ("Sessions" > "Daemon rules"). Housekeeping: a failure is logged.
+    sweep_session_trees(config, usize::MAX).await;
+    let mut last_session_sweep = std::time::Instant::now();
+
     // Branch synchronizations are daemon-owned non-task work. Reconcile one
     // before lifecycle recovery so a crash can resume its pinned/prepared
     // evidence without waiting for the first normal daemon tick.
@@ -13940,6 +13988,11 @@ async fn tick_loop_owning_doctor(
             },
         )
         .await?;
+
+        if last_session_sweep.elapsed().as_secs() >= SESSION_SWEEP_INTERVAL_SECS {
+            last_session_sweep = std::time::Instant::now();
+            sweep_session_trees(config, SESSION_SWEEP_LIMIT).await;
+        }
 
         // ── Drift check: unbacked/twin PR detection (~15 min cadence) ──
         let should_drift_check = match last_drift_check {
@@ -34081,6 +34134,46 @@ mod tests {
             ReviewerSlotAdmission::Admitted
         );
         assert!(queue.waiting_task_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_tree_sweep_hook_removes_only_finished_and_unknown_task_trees() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("quorum.db");
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let mut task_with = |status: &str| {
+            let id = tasks::create(
+                &mut conn, "boss", status, None, 50, None, None, None, None, 1,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE tasks SET status=?2 WHERE id=?1",
+                rusqlite::params![id, status],
+            )
+            .unwrap();
+            id
+        };
+        let parked = task_with("failed");
+        let live = task_with("working");
+        let done = task_with("done");
+        let cancelled = task_with("cancelled");
+        drop(conn);
+        let config = pre_review_checks_config(db_path.clone(), root.path().to_path_buf());
+        let base = session_base(&config);
+        assert_eq!(base, root.path().join("sessions"));
+
+        // No session_base: the sweep is a no-op and creates nothing.
+        sweep_session_trees(&config, usize::MAX).await;
+        assert!(!base.exists());
+
+        for id in [parked, live, done, cancelled, 4_242] {
+            session_store::open_slot(&base, id, session_store::Slot::Worker).unwrap();
+        }
+        sweep_session_trees(&config, SESSION_SWEEP_LIMIT).await;
+        assert_eq!(
+            session_store::list_task_trees(&base).unwrap(),
+            vec![parked, live]
+        );
     }
 
     fn pre_review_checks_config(db_path: PathBuf, repo_dir: PathBuf) -> ServeConfig {
