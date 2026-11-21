@@ -4,7 +4,9 @@
 //! Contract: `docs/2026-11-20-external-cli-runner-technical-spec.md`,
 //! "Configuration" > "Validation", and "Terms" (Fingerprint). Rules that need
 //! the rest of the serve config (profiles, roles, cost limits, and whether
-//! `executable` or `agent_bin` supplies the program) are not checked here.
+//! `executable` or `agent_bin` supplies the program) are not checked by
+//! `ExternalSpec::from_file`; `serve_config::validate_model_routing` applies
+//! them through `check_external_profile` and `check_routed_role`.
 
 // Slice 1 only parses and validates. The adapter and the session record
 // consume the validated spec and its fingerprint in later slices.
@@ -508,6 +510,109 @@ impl ExternalSpec {
             fingerprint: fingerprint(&file, agent_bin)?,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-config rules (spec "Validation", "Access levels", "agent_bin")
+// ---------------------------------------------------------------------------
+
+/// The access level a role launches with (spec "Access levels").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessLevel {
+    ReadWrite,
+    ReadOnly,
+    Restricted,
+}
+
+/// What a routed role demands of the declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleLaunch {
+    pub access: AccessLevel,
+    /// The role is wired to the agent MCP, so `args_mcp` is required.
+    pub agent_mcp: bool,
+    /// The role consumes the run's terminal text (classifier, arbiter).
+    pub final_text: bool,
+}
+
+/// Rules every `runner = "external"` profile must meet, routed or not: a
+/// program (`executable` or `agent_bin`) and, when `efforts` is declared, an
+/// effort from that list. `decl` is the raw `[external_runner]` table.
+pub fn check_external_profile(
+    decl: Option<&ExternalRunnerFile>,
+    agent_bin: Option<&str>,
+    profile: &str,
+    effort: &str,
+) -> Result<()> {
+    let executable = decl.and_then(|d| d.executable.as_deref());
+    if executable.is_none() && agent_bin.is_none() {
+        return Err(refuse(
+            "external_runner.executable",
+            format!(
+                "executable or agent_bin is required because model profile \"{profile}\" uses runner \"external\""
+            ),
+        ));
+    }
+    if let Some(efforts) = decl.and_then(|d| d.efforts.as_ref()) {
+        if !efforts.iter().any(|allowed| allowed == effort) {
+            return Err(refuse(
+                &format!("model_profiles.{profile}.effort"),
+                format!("\"{effort}\" is not one of external_runner.efforts"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rules a profile routed to a role places on the declaration: the access
+/// level's `args_*` list, `args_mcp` for agent-MCP roles, and
+/// `terminal.final_text` for roles that read the terminal text.
+pub fn check_routed_role(
+    decl: &ExternalRunnerFile,
+    role: &str,
+    profile: &str,
+    launch: RoleLaunch,
+) -> Result<()> {
+    let because = |what: &str| {
+        format!("is required because routing.{role} routes external profile \"{profile}\" ({what})")
+    };
+    let (key, list, level) = match launch.access {
+        AccessLevel::ReadWrite => (
+            "external_runner.args_read_write",
+            &decl.args_read_write,
+            "read-write",
+        ),
+        AccessLevel::ReadOnly => (
+            "external_runner.args_read_only",
+            &decl.args_read_only,
+            "read-only",
+        ),
+        AccessLevel::Restricted => (
+            "external_runner.args_restricted",
+            &decl.args_restricted,
+            "restricted",
+        ),
+    };
+    if list.is_none() {
+        return Err(refuse(key, because(&format!("access level {level}"))));
+    }
+    if launch.agent_mcp && decl.args_mcp.is_none() {
+        return Err(refuse(
+            "external_runner.args_mcp",
+            because("wired to the agent MCP"),
+        ));
+    }
+    let has_final_text = decl
+        .stream
+        .as_ref()
+        .and_then(|s| s.terminal.as_ref())
+        .is_some_and(|t| t.final_text.is_some());
+    if launch.final_text && !has_final_text {
+        return Err(refuse(
+            "external_runner.stream.terminal.final_text",
+            because("the role reads the terminal text"),
+        ));
+    }
+    Ok(())
 }
 
 fn valid_effort(effort: &str) -> bool {
