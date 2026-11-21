@@ -7231,7 +7231,7 @@ fn finish_terminal_status_write_tx(conn: &Connection, task_id: i64) -> Result<()
 #[derive(Debug)]
 pub enum AnswerOutcome {
     /// The answer note was written and the task restored.
-    Answered { note_id: i64, task: Task },
+    Answered { note_id: i64, task: Box<Task> },
     /// No task with this id exists.
     NotFound,
     /// The task is not daemon-parked with `daemon_parked_reason=needs-info`.
@@ -7315,7 +7315,10 @@ pub fn answer_parked(
     )?;
     task.ready = compute_ready(&tx, &task.depends_on)?;
     tx.commit()?;
-    Ok(AnswerOutcome::Answered { note_id, task })
+    Ok(AnswerOutcome::Answered {
+        note_id,
+        task: Box::new(task),
+    })
 }
 
 /// Atomically consume at most one durable merge replay intent.
