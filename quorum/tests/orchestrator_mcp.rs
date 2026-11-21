@@ -285,13 +285,14 @@ fn cli(home: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
-const TOOLS: [&str; 7] = [
+const TOOLS: [&str; 8] = [
     "task_create",
     "task_list",
     "task_get",
     "task_log",
     "task_cancel",
     "task_retry",
+    "task_answer",
     "message_agent",
 ];
 
@@ -527,6 +528,212 @@ fn tools_run_the_coordinator_operations_against_a_real_database() {
         .unwrap()
         .iter()
         .any(|event| event["kind"] == "task_cancelled"));
+
+    // No negative above is an error to the operator.
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM errors"), 0);
+    listener.stop();
+}
+
+/// Directly park task `task_id` as a daemon `needs-info` park with the given
+/// resume status, mirroring the real worker `react --state needs-info` path
+/// closely enough for `task_answer` tests (`cli_tasks.rs::sql_park_needs_info`).
+fn sql_park_needs_info(db: &Path, task_id: i64, resume_status: &str) {
+    quorum_core::db::open(db)
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_reason', 'needs-info',
+                 'daemon_resume_status', ?2
+             ) WHERE id=?1",
+            params![task_id, resume_status],
+        )
+        .unwrap();
+}
+
+/// Task #479: the orchestrator `task_answer` tool maps `coordinator::task_answer`
+/// results the way `task_retry` maps its own, with one addition: a missing
+/// task is `not_found` rather than `rejected`, since the command's own JSON
+/// does not distinguish the two.
+#[test]
+fn task_answer_maps_results_the_way_task_retry_does() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path();
+    let listener = Listener::orchestrator(home);
+    let addr = listener.addr;
+    let db = db_path(home);
+
+    // Success: a needs-info park is answered, the note is written as this
+    // server's identity, and the task is restored.
+    let parked = ok(addr, "task_create", json!({"title": "needs info"}))["id"]
+        .as_i64()
+        .unwrap();
+    sql_park_needs_info(&db, parked, "open");
+    let answered = ok(
+        addr,
+        "task_answer",
+        json!({"task_id": parked, "answer": "use schema v2"}),
+    );
+    assert_eq!(answered["ok"], true);
+    assert_eq!(answered["task_id"], parked);
+    assert!(answered["answer_note_id"].is_i64());
+    assert_eq!(status_of(&db, parked), "open");
+    let (agent, body): (String, String) = quorum_core::db::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT agent, body FROM task_notes WHERE task_id=?1",
+            [parked],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(agent, "Coordinator");
+    assert_eq!(body, "answer:\nuse schema v2");
+
+    // Not waiting for an answer: a clean negative, code `rejected`, every
+    // field the command emits kept beside it, no note.
+    let open_task = ok(addr, "task_create", json!({"title": "open"}))["id"]
+        .as_i64()
+        .unwrap();
+    let (is_error, rejected) = call_as(
+        addr,
+        TOKEN,
+        "task_answer",
+        json!({"task_id": open_task, "answer": "x"}),
+    );
+    assert!(is_error, "{rejected}");
+    assert_eq!(rejected["code"], "rejected");
+    assert_eq!(rejected["outcome"], "task-answer-rejected");
+    assert!(
+        rejected["reason"]
+            .as_str()
+            .unwrap()
+            .contains("not waiting for an answer"),
+        "{rejected}"
+    );
+    assert_eq!(rejected["message"], rejected["reason"]);
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM task_notes WHERE task_id={open_task}")
+        ),
+        0
+    );
+
+    // Cancelled dependency: the same pre-check `task_retry` runs, before any
+    // write.
+    let dep = ok(addr, "task_create", json!({"title": "dep"}))["id"]
+        .as_i64()
+        .unwrap();
+    let dependent = ok(addr, "task_create", json!({"title": "dependent"}))["id"]
+        .as_i64()
+        .unwrap();
+    {
+        let conn = quorum_core::db::open(&db).unwrap();
+        conn.execute("UPDATE tasks SET status='cancelled' WHERE id=?1", [dep])
+            .unwrap();
+        conn.execute(
+            "UPDATE tasks SET depends_on=?2 WHERE id=?1",
+            params![dependent, format!("[{dep}]")],
+        )
+        .unwrap();
+    }
+    sql_park_needs_info(&db, dependent, "open");
+    let (is_error, rejected) = call_as(
+        addr,
+        TOKEN,
+        "task_answer",
+        json!({"task_id": dependent, "answer": "x"}),
+    );
+    assert!(is_error, "{rejected}");
+    assert_eq!(rejected["code"], "rejected");
+    assert_eq!(rejected["cancelled_deps"], json!([dep]));
+    assert!(
+        rejected["reason"].as_str().unwrap().contains("cancelled"),
+        "{rejected}"
+    );
+    assert_eq!(status_of(&db, dependent), "failed");
+
+    // Reviewer cap exhausted: again a pre-check shared with `task_retry`.
+    let capped = ok(addr, "task_create", json!({"title": "capped"}))["id"]
+        .as_i64()
+        .unwrap();
+    sql_park_needs_info(&db, capped, "in-review");
+    {
+        let conn = quorum_core::db::open(&db).unwrap();
+        for n in 0..quorum_core::provision_attempts::MAX_TOTAL_REVIEWER_RUNS {
+            quorum_core::agent_runs::insert(
+                &conn,
+                capped,
+                &format!("rev-{n}"),
+                "reviewer",
+                "model",
+                "high",
+                "claude",
+                100 + n,
+            )
+            .unwrap();
+        }
+    }
+    let (is_error, rejected) = call_as(
+        addr,
+        TOKEN,
+        "task_answer",
+        json!({"task_id": capped, "answer": "x"}),
+    );
+    assert!(is_error, "{rejected}");
+    assert_eq!(rejected["code"], "rejected");
+    assert_eq!(rejected["outcome"], "task-retry-rejected");
+    assert!(
+        rejected["reason"]
+            .as_str()
+            .unwrap()
+            .contains("reviewer run cap exhausted"),
+        "{rejected}"
+    );
+
+    // An unknown task is `not_found`, not `rejected`, and carries only the
+    // `{code,message}` shape `task_get` uses for the same case.
+    let (code, _) = refused(
+        addr,
+        "task_answer",
+        json!({"task_id": 999_999, "answer": "x"}),
+    );
+    assert_eq!(code, "not_found");
+
+    // A frozen decomposition graph is the usage error `task_retry` would hit
+    // too: `invalid_arguments`, with the whole transaction rolled back.
+    let frozen = ok(addr, "task_create", json!({"title": "frozen"}))["id"]
+        .as_i64()
+        .unwrap();
+    sql_park_needs_info(&db, frozen, "open");
+    {
+        let conn = quorum_core::db::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+             VALUES (?1,'planning',0,1,1,1000,1000)",
+            [frozen],
+        )
+        .unwrap();
+    }
+    let (code, message) = refused(
+        addr,
+        "task_answer",
+        json!({"task_id": frozen, "answer": "x"}),
+    );
+    assert_eq!(code, "invalid_arguments");
+    assert!(
+        message.contains("decomposition freeze is active"),
+        "{message}"
+    );
+    assert_eq!(status_of(&db, frozen), "failed");
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM task_notes WHERE task_id={frozen}")
+        ),
+        0
+    );
 
     // No negative above is an error to the operator.
     assert_eq!(count(&db, "SELECT COUNT(*) FROM errors"), 0);
@@ -896,6 +1103,23 @@ fn free_text_is_bounded_and_text_safe() {
         ("task_get", json!({"task_id": 0})),
         ("task_get", json!({})),
         ("task_retry", json!({"task_id": 1, "by": "Someone"})),
+        ("task_answer", json!({"task_id": 1, "answer": ""})),
+        ("task_answer", json!({"task_id": 1, "answer": "   \n"})),
+        ("task_answer", json!({"task_id": 1, "answer": "x\u{0}"})),
+        (
+            "task_answer",
+            json!({
+                "task_id": 1,
+                "answer": "x".repeat(quorum_core::tasks::ANSWER_MAX_BYTES + 1)
+            }),
+        ),
+        ("task_answer", json!({"task_id": -1, "answer": "x"})),
+        ("task_answer", json!({"task_id": 1})),
+        ("task_answer", json!({"answer": "x"})),
+        (
+            "task_answer",
+            json!({"task_id": 1, "answer": "x", "by": "Someone"}),
+        ),
     ] {
         let (code, message) = refused(addr, tool, arguments.clone());
         assert_eq!(code, "invalid_arguments", "{tool} {arguments}: {message}");

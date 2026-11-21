@@ -2,8 +2,8 @@
 //!
 //! `quorum orchestrator-mcp --listen <SOCKETADDR>` serves Streamable HTTP MCP
 //! at `/mcp` and exposes the coordinator subset of the CLI for one repository:
-//! create, list, inspect, cancel, and retry tasks, and message a managed
-//! agent. Every tool runs the operation its CLI command runs, as one
+//! create, list, inspect, cancel, retry, and answer tasks, and message a
+//! managed agent. Every tool runs the operation its CLI command runs, as one
 //! short-lived SQLite connection per call, acting as the single coordinator
 //! identity the operator bound at startup. Nothing here transitions
 //! lifecycle, talks to GitHub, or controls the daemon process.
@@ -84,6 +84,7 @@ const TASK_GET: &str = "task_get";
 const TASK_LOG: &str = "task_log";
 const TASK_CANCEL: &str = "task_cancel";
 const TASK_RETRY: &str = "task_retry";
+const TASK_ANSWER: &str = "task_answer";
 const MESSAGE_AGENT: &str = "message_agent";
 
 #[derive(Debug, Clone)]
@@ -227,6 +228,23 @@ fn tools() -> Vec<Tool> {
             false,
         ),
         tool(
+            TASK_ANSWER,
+            "Answer a needs-info park and resume the task (`quorum task-answer`), from this \
+             server's coordinator identity. It keeps the task's PR, branch, dependencies, and \
+             rework context. It runs the same cancelled-dependency and reviewer-cap pre-checks \
+             as `task_retry`, and also refuses a task that is not daemon-parked waiting for an \
+             answer; either refusal carries code `rejected` and the command's own `outcome` and \
+             `reason`. An unknown task is refused with code `not_found`. Success is \
+             {\"ok\":true,\"task_id\":N,\"answer_note_id\":N}.",
+            json!({
+                "task_id": positive_integer(),
+                "answer": bounded_string(1, quorum_core::tasks::ANSWER_MAX_BYTES)
+            }),
+            &["task_id", "answer"],
+            false,
+            false,
+        ),
+        tool(
             MESSAGE_AGENT,
             "Queue a message for one daemon-managed agent (`quorum message`). The daemon delivers \
              it as a turn when that agent is idle, from this server's coordinator identity. A \
@@ -312,6 +330,13 @@ struct TaskCancelArguments {
 #[serde(deny_unknown_fields)]
 struct TaskRetryArguments {
     task_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskAnswerArguments {
+    task_id: i64,
+    answer: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -795,6 +820,50 @@ impl Orchestrator {
             .await)
     }
 
+    async fn task_answer(&self, arguments: TaskAnswerArguments) -> Checked<CallToolResult> {
+        positive("task_id", arguments.task_id)?;
+        text(
+            "answer",
+            &arguments.answer,
+            quorum_core::tasks::ANSWER_MAX_BYTES,
+        )?;
+        let identity = Arc::clone(&self.identity);
+        Ok(self
+            .blocking(TASK_ANSWER, move |db| {
+                // A task-answer refusal does not say whether the task is
+                // missing, so this is the only place that can tell `rejected`
+                // from `not_found`.
+                if quorum_core::tasks::get(&quorum_core::db::open(db)?, arguments.task_id)?
+                    .is_none()
+                {
+                    return Ok(refusal("not_found", "no such task"));
+                }
+                let (emitted, exit) = crate::coordinator::task_answer(
+                    db,
+                    arguments.task_id,
+                    &identity,
+                    &arguments.answer,
+                    quorum_core::clock::now(),
+                )?;
+                let mut value: Value = serde_json::from_str(&emitted)
+                    .map_err(|error| QuorumError::Io(error.to_string()))?;
+                if exit == 0 {
+                    return Ok(json_result(value, false));
+                }
+                // A refusal keeps every field the command emits (`outcome`,
+                // `reason`, `cancelled_deps`) beside this server's `code` and
+                // `message`.
+                let message = value["reason"]
+                    .as_str()
+                    .unwrap_or("the task is not waiting for an answer")
+                    .to_string();
+                value["code"] = Value::from("rejected");
+                value["message"] = Value::from(message);
+                Ok(json_result(value, true))
+            })
+            .await)
+    }
+
     async fn message_agent(&self, arguments: MessageAgentArguments) -> Checked<CallToolResult> {
         line("to", &arguments.to, MAX_IDENTITY_BYTES)?;
         text("body", &arguments.body, MAX_MESSAGE_BYTES)?;
@@ -829,6 +898,7 @@ impl Orchestrator {
             TASK_LOG => route!(task_log),
             TASK_CANCEL => route!(task_cancel),
             TASK_RETRY => route!(task_retry),
+            TASK_ANSWER => route!(task_answer),
             MESSAGE_AGENT => route!(message_agent),
             _ => return None,
         })
@@ -852,9 +922,10 @@ impl ServerHandler for Orchestrator {
             ))
             .with_instructions(
                 "Coordinator tools for one repository's Quorum task queue: create, list, \
-                 inspect, cancel, and retry tasks, and message a managed agent. Create only \
-                 execution-ready tasks. The daemon alone claims work, transitions lifecycle, \
-                 reviews, and merges; nothing here does, and nothing here controls the daemon.",
+                 inspect, cancel, retry, and answer tasks, and message a managed agent. Create \
+                 only execution-ready tasks. The daemon alone claims work, transitions \
+                 lifecycle, reviews, and merges; nothing here does, and nothing here controls \
+                 the daemon.",
             )
     }
 
