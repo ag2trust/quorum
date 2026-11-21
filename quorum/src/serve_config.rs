@@ -271,11 +271,16 @@ declare_serve_file_config! {
     /// Serve never runs it; the address only lets startup refuse an agent MCP
     /// listener on the same socket address.
     orchestrator_mcp_listen: Option<std::net::SocketAddr>,
+    /// The one external CLI declaration. Restart-only.
+    external_runner: Option<crate::external_runner_spec::ExternalRunnerFile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigKeyDisposition {
     Runtime,
+    /// Consumed at startup only. A reload that changes it is refused and the
+    /// running configuration stays in force.
+    RestartOnly,
     Deprecated,
 }
 
@@ -360,6 +365,7 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("agent_mcp_listen", ConfigKeyDisposition::Runtime),
     ("agent_mcp_allowed_hosts", ConfigKeyDisposition::Runtime),
     ("orchestrator_mcp_listen", ConfigKeyDisposition::Runtime),
+    ("external_runner", ConfigKeyDisposition::RestartOnly),
     #[cfg(test)]
     ("test_only_unconsumed", ConfigKeyDisposition::Deprecated),
 ];
@@ -727,6 +733,7 @@ pub fn load(path: &Path, explicit: bool) -> Result<ServeFileConfig> {
             validate_model_routing(&cfg)?;
             validate_sync_pairs(&cfg.sync_pairs)?;
             resolve_resource_monitor_config(&cfg)?;
+            resolve_external_runner(&cfg)?;
             warn_for_deprecated_keys(&s)?;
             Ok(cfg)
         }
@@ -744,6 +751,56 @@ pub fn load(path: &Path, explicit: bool) -> Result<ServeFileConfig> {
             "cannot read serve config {}: {e}",
             path.display()
         ))),
+    }
+}
+
+/// The validated `[external_runner]` declaration and its fingerprint, or
+/// `None` when the table is absent. Every table-local rule is a usage error.
+pub fn resolve_external_runner(
+    cfg: &ServeFileConfig,
+) -> Result<Option<crate::external_runner_spec::ExternalSpec>> {
+    cfg.external_runner
+        .as_ref()
+        .map(|file| {
+            crate::external_runner_spec::ExternalSpec::from_file(file, cfg.agent_bin.as_deref())
+        })
+        .transpose()
+}
+
+/// Replace `running` with the config at `path` only when the candidate passes
+/// every startup rule and leaves every restart-only key unchanged. On any
+/// refusal `running` is untouched. The daemon has no live reload trigger yet;
+/// this is the one gate any reload path must use.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn reload(running: &mut ServeFileConfig, path: &Path) -> Result<()> {
+    let candidate = load(path, true)?;
+    for (key, disposition) in SERVE_FILE_CONFIG_KEY_REGISTRY {
+        if *disposition == ConfigKeyDisposition::RestartOnly
+            && restart_only_key_changed(key, running, &candidate)
+        {
+            return Err(QuorumError::Usage(format!(
+                "serve config key \"{key}\" is restart-only; the running configuration stays in force until restart"
+            )));
+        }
+    }
+    *running = candidate;
+    Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn restart_only_key_changed(
+    key: &str,
+    running: &ServeFileConfig,
+    candidate: &ServeFileConfig,
+) -> bool {
+    match key {
+        "external_runner" => {
+            let filled =
+                |cfg: &ServeFileConfig| cfg.external_runner.as_ref().map(|f| f.with_defaults());
+            filled(running) != filled(candidate)
+        }
+        // A restart-only key without a comparison is treated as changed.
+        _ => true,
     }
 }
 
@@ -859,9 +916,90 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
     for (complexity, pool) in &routing.reviewer {
         validate_grok_role_gate(&format!("reviewer.{complexity}"), pool, profiles)?;
     }
+    validate_external_routing(config, profiles, routing)?;
     resolve_token_limit_basis(config.token_limit_basis.as_deref())?;
     validate_token_ceilings(config.max_turn_tokens, config.max_task_tokens)?;
     validate_routed_cost_limits(config, config.max_turn_cost_usd, config.max_task_cost_usd)?;
+    Ok(())
+}
+
+/// Cross-config rules for `runner = "external"` profiles (spec
+/// `docs/2026-11-20-external-cli-runner-technical-spec.md`, "Validation",
+/// "Access levels", "agent_bin"). A config without external profiles passes
+/// untouched.
+fn validate_external_routing(
+    config: &ServeFileConfig,
+    profiles: &BTreeMap<String, ModelProfile>,
+    routing: &RoutingPolicy,
+) -> Result<()> {
+    use crate::external_runner_spec::{
+        check_external_profile, check_routed_role, AccessLevel, RoleLaunch,
+    };
+    let is_external = |id: &str| profiles.get(id).is_some_and(|p| p.runner == "external");
+    for (name, profile) in profiles.iter().filter(|(name, _)| is_external(name)) {
+        check_external_profile(
+            config.external_runner.as_ref(),
+            config.agent_bin.as_deref(),
+            name,
+            &profile.effort,
+        )?;
+    }
+    // Spec "Access levels": managed worker runs are read-write with the agent
+    // MCP; reviewer and planner runs are read-only with it; classifier,
+    // collector, and arbiter runs are restricted without it.
+    const WORKER: RoleLaunch = RoleLaunch {
+        access: AccessLevel::ReadWrite,
+        agent_mcp: true,
+        final_text: false,
+    };
+    const READ_ONLY_MCP: RoleLaunch = RoleLaunch {
+        access: AccessLevel::ReadOnly,
+        agent_mcp: true,
+        final_text: false,
+    };
+    const RESTRICTED: RoleLaunch = RoleLaunch {
+        access: AccessLevel::Restricted,
+        agent_mcp: false,
+        final_text: false,
+    };
+    const RESTRICTED_FINAL_TEXT: RoleLaunch = RoleLaunch {
+        final_text: true,
+        ..RESTRICTED
+    };
+    let mut pools: Vec<(String, &PercentagePool, RoleLaunch)> = vec![
+        (
+            "classifier".into(),
+            &routing.classifier,
+            RESTRICTED_FINAL_TEXT,
+        ),
+        ("planner".into(), &routing.planner, READ_ONLY_MCP),
+        (
+            "arbiter".into(),
+            routing.arbiter_pool(),
+            RESTRICTED_FINAL_TEXT,
+        ),
+        ("collector".into(), &routing.collector, RESTRICTED),
+    ];
+    pools.extend(
+        routing
+            .worker
+            .iter()
+            .map(|(level, pool)| (format!("worker.{level}"), pool, WORKER)),
+    );
+    pools.extend(
+        routing
+            .reviewer
+            .iter()
+            .map(|(level, pool)| (format!("reviewer.{level}"), pool, READ_ONLY_MCP)),
+    );
+    for (role, pool, launch) in pools {
+        for profile_id in pool.keys().filter(|id| is_external(id)) {
+            // check_external_profile already refused a missing declaration.
+            if let Some(decl) = config.external_runner.as_ref() {
+                check_routed_role(decl, &role, profile_id, launch)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -934,6 +1072,20 @@ pub fn validate_routed_cost_limits(
             "USD cost limits are unsupported when routing can select a Codex or Grok profile"
                 .into(),
         ));
+    }
+    // Spec "Validation": the external runner reports no cost.
+    let key = if max_turn_cost_usd.is_some() {
+        "max_turn_cost_usd"
+    } else {
+        "max_task_cost_usd"
+    };
+    if let Some(profile_id) = referenced_profile_ids(routing)
+        .find(|profile_id| profiles[*profile_id].runner == "external")
+        .filter(|_| max_turn_cost_usd.is_some() || max_task_cost_usd.is_some())
+    {
+        return Err(QuorumError::Usage(format!(
+            "serve config {key}: USD cost limits are unsupported when routing can select external profile \"{profile_id}\"; the external runner reports no cost"
+        )));
     }
     Ok(())
 }
@@ -2713,6 +2865,8 @@ worktree_base = "/tmp/wt"
         profile.runner = "external".into();
         profile.model = "gpt-5".into();
         profile.effort = "deep_think-2".into();
+        // Any [a-z0-9_-]{1,32} effort is accepted when `efforts` is absent.
+        cfg.external_runner = Some(external_decl(&["efforts"]));
         validate_model_routing(&cfg).unwrap();
         let runner = RunnerKind::from_str_opt(Some("external")).unwrap();
         assert_eq!(runner, RunnerKind::External);
@@ -2769,6 +2923,7 @@ worktree_base = "/tmp/wt"
             .unwrap();
         profile.runner = "external".into();
         profile.effort = "a".repeat(32);
+        cfg.external_runner = Some(external_decl(&["efforts"]));
         validate_model_routing(&cfg).unwrap();
     }
 
@@ -3454,5 +3609,336 @@ worktree_base = "/tmp/wt"
             b.contains("effective idle limit:      900 (default; max_idle_secs overrides"),
             "effective idle limit should be 900 by default: {b}"
         );
+    }
+
+    fn write_serve_config(dir: &Path, extra: &str) -> std::path::PathBuf {
+        let path = dir.join("serve.toml");
+        std::fs::write(&path, format!("{extra}\n{VALID_ROUTING}")).unwrap();
+        path
+    }
+
+    fn external_fingerprint(cfg: &ServeFileConfig) -> Option<String> {
+        resolve_external_runner(cfg)
+            .unwrap()
+            .map(|spec| spec.fingerprint)
+    }
+
+    #[test]
+    fn external_runner_declaration_loads_into_a_validated_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let declaration = crate::external_runner_spec::tests::VALID;
+        let cfg = load(&write_serve_config(dir.path(), declaration), true).unwrap();
+        let spec = resolve_external_runner(&cfg).unwrap().expect("declared");
+        assert_eq!(spec.stream.terminal_exit_secs, 30);
+
+        // The config's agent_bin participates in the fingerprint. (The
+        // fixture routing spans runners, so agent_bin is set directly.)
+        let mut cfg_bin = load(&write_serve_config(dir.path(), declaration), true).unwrap();
+        cfg_bin.agent_bin = Some("/opt/wrapper".into());
+        assert_ne!(external_fingerprint(&cfg_bin), Some(spec.fingerprint));
+
+        // Absent: no spec, exactly as before.
+        let cfg = load(&write_serve_config(dir.path(), ""), true).unwrap();
+        assert!(cfg.external_runner.is_none());
+        assert!(resolve_external_runner(&cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn invalid_external_runner_is_refused_at_load_naming_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let declaration = crate::external_runner_spec::tests::VALID.replacen(
+            "\"/usr/local/bin/fake-cli\"",
+            "\"fake-cli\"",
+            1,
+        );
+        let err = load(&write_serve_config(dir.path(), &declaration), true).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string().contains("external_runner.executable"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reload_refuses_any_external_runner_change_and_keeps_the_running_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let declaration = crate::external_runner_spec::tests::VALID;
+        let path = write_serve_config(dir.path(), &format!("cap = 3\n{declaration}"));
+        let mut running = load(&path, true).unwrap();
+        let before = external_fingerprint(&running);
+
+        let assert_refused = |running: &mut ServeFileConfig, extra: &str, needle: &str| {
+            let path = write_serve_config(dir.path(), extra);
+            let err = reload(running, &path).unwrap_err();
+            assert_eq!(err.exit_code(), 2);
+            assert!(err.to_string().contains(needle), "{err}");
+            assert_eq!(running.cap, Some(3), "running config replaced");
+            assert_eq!(external_fingerprint(running), before);
+        };
+        // A changed declaration, alongside a runtime change.
+        let changed = declaration.replacen("max_line_bytes = 1048576", "max_line_bytes = 2048", 1);
+        assert_refused(
+            &mut running,
+            &format!("cap = 4\n{changed}"),
+            "\"external_runner\" is restart-only",
+        );
+        // Removing the table is a change.
+        assert_refused(
+            &mut running,
+            "cap = 4\n",
+            "\"external_runner\" is restart-only",
+        );
+        // A declaration that fails a rule is refused with the startup message.
+        let invalid = declaration.replacen("\"/usr/local/bin/fake-cli\"", "\"fake-cli\"", 1);
+        let startup = load(&write_serve_config(dir.path(), &invalid), true).unwrap_err();
+        assert_refused(&mut running, &invalid, &startup.to_string());
+
+        // Unchanged declaration (explicit default included): runtime keys apply.
+        let same = declaration.replacen(
+            "max_line_bytes = 1048576",
+            "max_line_bytes = 1048576\nterminal_exit_secs = 30",
+            1,
+        );
+        let path = write_serve_config(dir.path(), &format!("cap = 5\n{same}"));
+        reload(&mut running, &path).unwrap();
+        assert_eq!(running.cap, Some(5));
+        assert_eq!(external_fingerprint(&running), before);
+    }
+
+    #[test]
+    fn reload_without_external_runner_applies_runtime_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut running = load(&write_serve_config(dir.path(), "cap = 3\n"), true).unwrap();
+        reload(&mut running, &write_serve_config(dir.path(), "cap = 6\n")).unwrap();
+        assert_eq!(running.cap, Some(6));
+        assert!(running.external_runner.is_none());
+        // Adding the table is a restart-only change.
+        let err = reload(
+            &mut running,
+            &write_serve_config(dir.path(), crate::external_runner_spec::tests::VALID),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("restart-only"), "{err}");
+        assert!(running.external_runner.is_none());
+    }
+
+    /// The external declaration fixture without the lines starting with any
+    /// of `drop` (each prefix must match, so a stale fixture cannot pass).
+    fn external_decl_source(drop: &[&str]) -> String {
+        let src = crate::external_runner_spec::tests::VALID;
+        for prefix in drop {
+            assert!(
+                src.lines().any(|line| line.starts_with(prefix)),
+                "fixture lacks {prefix:?}"
+            );
+        }
+        src.lines()
+            .filter(|line| !drop.iter().any(|prefix| line.starts_with(prefix)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn external_decl(drop: &[&str]) -> crate::external_runner_spec::ExternalRunnerFile {
+        let cfg: ServeFileConfig = toml::from_str(&external_decl_source(drop)).unwrap();
+        cfg.external_runner.unwrap()
+    }
+
+    /// VALID_ROUTING with `primary` (classifier, collector, arbiter-free,
+    /// worker, reviewer) on the external runner beside the Claude planner.
+    fn external_routing() -> String {
+        let from = "runner = \"codex\"\nmodel = \"gpt-5.6-sol\"";
+        assert!(VALID_ROUTING.contains(from));
+        VALID_ROUTING.replacen(from, "runner = \"external\"\nmodel = \"fake-model-1\"", 1)
+    }
+
+    fn external_config(top: &str, routing: &str, drop: &[&str]) -> ServeFileConfig {
+        toml::from_str(&format!("{top}\n{routing}\n{}", external_decl_source(drop))).unwrap()
+    }
+
+    fn assert_refused_naming(cfg: &ServeFileConfig, key: &str) {
+        let err = validate_model_routing(cfg).expect_err("config should be refused");
+        assert_eq!(err.exit_code(), 2, "{err}");
+        assert!(
+            err.to_string().contains(key),
+            "error should name {key}: {err}"
+        );
+    }
+
+    #[test]
+    fn mixed_external_and_builtin_config_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        std::fs::write(
+            &path,
+            format!("{}\n{}", external_routing(), external_decl_source(&[])),
+        )
+        .unwrap();
+        let cfg = load(&path, true).unwrap();
+        assert_eq!(cfg.model_profiles.unwrap()["primary"].runner, "external");
+        assert!(cfg.external_runner.is_some());
+    }
+
+    #[test]
+    fn external_profile_requires_executable_or_agent_bin() {
+        // No declaration at all.
+        let mut cfg: ServeFileConfig = toml::from_str(&external_routing()).unwrap();
+        assert_refused_naming(&cfg, "external_runner.executable");
+        // A declaration without executable, and no agent_bin.
+        cfg.external_runner = Some(external_decl(&["executable"]));
+        assert_refused_naming(&cfg, "external_runner.executable");
+
+        // agent_bin replaces executable. The single-runner rule still holds,
+        // so every profile is external here.
+        let all_external = external_routing().replacen(
+            "runner = \"claude\"\nmodel = \"claude-opus-4-8\"",
+            "runner = \"external\"\nmodel = \"fake-model-2\"",
+            1,
+        );
+        let mut cfg = external_config("", &all_external, &["executable"]);
+        assert_refused_naming(&cfg, "external_runner.executable");
+        cfg.agent_bin = Some("/opt/fake-wrapper".into());
+        validate_model_routing(&cfg).unwrap();
+
+        // Mixed runners with agent_bin stay refused by the unchanged rule.
+        let mut cfg = external_config("", &external_routing(), &[]);
+        cfg.agent_bin = Some("/opt/fake-wrapper".into());
+        assert_refused_naming(&cfg, "agent_bin");
+    }
+
+    #[test]
+    fn external_effort_must_be_a_declared_effort() {
+        let routing = external_routing().replacen(
+            "model = \"fake-model-1\"",
+            "model = \"fake-model-1\"\neffort = \"xhigh\"",
+            1,
+        );
+        let cfg = external_config("", &routing, &[]);
+        assert_refused_naming(&cfg, "model_profiles.primary.effort");
+        // Without `efforts`, any [a-z0-9_-]{1,32} value is accepted.
+        let cfg = external_config("", &routing, &["efforts"]);
+        validate_model_routing(&cfg).unwrap();
+    }
+
+    #[test]
+    fn external_profile_routed_to_a_role_requires_its_access_args() {
+        // primary serves workers (read-write), reviewers (read-only), and the
+        // classifier and collector (restricted).
+        for key in ["args_read_write", "args_read_only", "args_restricted"] {
+            let cfg = external_config("", &external_routing(), &[key]);
+            assert_refused_naming(&cfg, &format!("external_runner.{key}"));
+        }
+        // An access level no routed role uses needs no list: route only the
+        // restricted roles to the external profile.
+        let mut only_restricted = String::from(
+            "[model_profiles.primary]\nrunner = \"external\"\nmodel = \"fake-model-1\"\n\
+             [model_profiles.planner]\nrunner = \"claude\"\nmodel = \"claude-opus-4-8\"\n\
+             [routing.classifier]\nprimary = 100\n[routing.collector]\nprimary = 100\n\
+             [routing.planner]\nplanner = 100\n",
+        );
+        for role in ["worker", "reviewer"] {
+            for level in 1..=5 {
+                only_restricted.push_str(&format!("[routing.{role}.{level}]\nplanner = 100\n"));
+            }
+        }
+        let cfg = external_config(
+            "",
+            &only_restricted,
+            &["args_read_write", "args_read_only", "args_mcp"],
+        );
+        validate_model_routing(&cfg).unwrap();
+    }
+
+    #[test]
+    fn external_profile_routed_to_an_agent_mcp_role_requires_args_mcp() {
+        let cfg = external_config("", &external_routing(), &["args_mcp"]);
+        assert_refused_naming(&cfg, "external_runner.args_mcp");
+    }
+
+    #[test]
+    fn external_profile_routed_to_classifier_or_arbiter_requires_final_text() {
+        let cfg = external_config("", &external_routing(), &["final_text"]);
+        assert_refused_naming(&cfg, "external_runner.stream.terminal.final_text");
+
+        // Arbiter: classifier on the Claude planner profile, arbiter external.
+        let arbiter = external_routing().replacen(
+            "[routing.classifier]\nprimary = 100",
+            "[routing.classifier]\nplanner = 100\n[routing.arbiter]\nprimary = 100",
+            1,
+        );
+        let cfg = external_config("", &arbiter, &["final_text"]);
+        assert_refused_naming(&cfg, "external_runner.stream.terminal.final_text");
+
+        // Neither classifier nor arbiter external: final_text is optional.
+        let neither = external_routing().replacen(
+            "[routing.classifier]\nprimary = 100",
+            "[routing.classifier]\nplanner = 100",
+            1,
+        );
+        let cfg = external_config("", &neither, &["final_text"]);
+        validate_model_routing(&cfg).unwrap();
+    }
+
+    #[test]
+    fn usd_cost_limit_refused_when_routing_can_select_an_external_profile() {
+        for key in ["max_turn_cost_usd", "max_task_cost_usd"] {
+            let cfg = external_config(&format!("{key} = 1.0"), &external_routing(), &[]);
+            assert_refused_naming(&cfg, key);
+            let err = validate_routed_cost_limits(&cfg, Some(1.0), None).unwrap_err();
+            assert_eq!(err.exit_code(), 2);
+        }
+        // A declared but unrouted external profile does not block USD limits.
+        let unrouted = VALID_ROUTING.replacen(
+            "[routing.classifier]",
+            "[model_profiles.ext]\nrunner = \"external\"\nmodel = \"fake-model-1\"\n\n[routing.classifier]",
+            1,
+        );
+        let cfg: ServeFileConfig = toml::from_str(&unrouted).unwrap();
+        validate_routed_cost_limits(&cfg, Some(1.0), None).unwrap_err(); // codex still routed
+        let unrouted_claude = unrouted.replacen(
+            "runner = \"codex\"\nmodel = \"gpt-5.6-sol\"",
+            "runner = \"claude\"\nmodel = \"claude-sonnet-4-6\"",
+            1,
+        );
+        let cfg: ServeFileConfig = toml::from_str(&unrouted_claude).unwrap();
+        validate_routed_cost_limits(&cfg, Some(1.0), Some(2.0)).unwrap();
+    }
+
+    #[test]
+    fn reload_failing_an_external_cross_rule_keeps_the_running_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.toml");
+        let write = |top: &str, routing: &str| {
+            std::fs::write(
+                &path,
+                format!("{top}\n{routing}\n{}", external_decl_source(&[])),
+            )
+            .unwrap();
+        };
+        write("cap = 3", &external_routing());
+        let mut running = load(&path, true).unwrap();
+        let before = format!("{running:?}");
+
+        write("cap = 7\nmax_turn_cost_usd = 1.0", &external_routing());
+        let err = reload(&mut running, &path).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("max_turn_cost_usd"), "{err}");
+        assert_eq!(format!("{running:?}"), before);
+
+        let bad_effort = external_routing().replacen(
+            "model = \"fake-model-1\"",
+            "model = \"fake-model-1\"\neffort = \"xhigh\"",
+            1,
+        );
+        write("cap = 7", &bad_effort);
+        let err = reload(&mut running, &path).unwrap_err();
+        assert!(
+            err.to_string().contains("model_profiles.primary.effort"),
+            "{err}"
+        );
+        assert_eq!(format!("{running:?}"), before);
+
+        write("cap = 7", &external_routing());
+        reload(&mut running, &path).unwrap();
+        assert_eq!(running.cap, Some(7));
     }
 }

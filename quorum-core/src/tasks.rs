@@ -37,6 +37,18 @@ pub const MAX_RECOVERY_ATTEMPTS: i64 = 3;
 pub const PARKED_REF: &str = "daemon_parked";
 pub const PARKED_REASON_REF: &str = "daemon_parked_reason";
 pub const PARKED_RESUME_STATUS_REF: &str = "daemon_resume_status";
+/// The `daemon_parked_reason` of a park on a worker's `needs-info` reaction.
+pub const NEEDS_INFO_PARK_REASON: &str = "needs-info";
+/// How the next admitted worker of a restored needs-info park resumes:
+/// `{"kind":"unanswered"}` after a plain restore, or
+/// `{"kind":"answer","note_id":<id>}` after `task-answer`. Consumed in the
+/// worker admission transaction ([`consume_pending_resume_tx`]); removed by any
+/// later park and by every terminal status write.
+pub const PENDING_RESUME_REF: &str = "pending_resume";
+/// The prefix that heads every answer note body.
+const ANSWER_NOTE_PREFIX: &str = "answer:\n";
+/// Answer text limit: the whole note must fit the 4 KiB per-note prompt cap.
+pub const ANSWER_MAX_BYTES: usize = 4096 - ANSWER_NOTE_PREFIX.len();
 /// Monotonic, daemon-owned generation incremented by each successful explicit
 /// `task-retry`. A live daemon consumes a newer generation to discard only
 /// the matching task's in-memory zero-output poison budget.
@@ -2157,6 +2169,9 @@ pub fn claim_with_graph_limit(
                 params![target, agent, now, now + ttl],
             )?;
             crate::events::emit(&tx, "task_claimed", &target, &format!("by {agent}"), now)?;
+            // Worker admission consumes a restored park's resume intent; the
+            // returned task is the admission snapshot that still carries it.
+            clear_pending_resume_tx(&tx, t.id)?;
         } else {
             crate::events::emit(
                 &tx,
@@ -2232,6 +2247,9 @@ pub fn claim_provider_retry_rework(
             params![target, agent, now, now + ttl],
         )?;
         crate::events::emit(&tx, "task_claimed", &target, &format!("by {agent}"), now)?;
+        // Worker admission consumes a restored park's resume intent; the
+        // returned task is the admission snapshot that still carries it.
+        clear_pending_resume_tx(&tx, task.id)?;
     }
 
     // Sweep only after the replacement lease exists. Sweeping first would
@@ -2516,6 +2534,9 @@ pub fn claim_remediation_rework_with_feedback(
         row_to_task,
     )?;
     task.ready = compute_ready(&tx, &task.depends_on)?;
+    // Worker admission consumes a restored park's resume intent; the returned
+    // task is the admission snapshot that still carries it.
+    clear_pending_resume_tx(&tx, id)?;
 
     // Sweep only after the replacement lease exists.
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
@@ -4477,8 +4498,11 @@ where
     )?;
     // The merge-gate observation is only meaningful while merging; every
     // lifecycle exit (done, rework, in-review, failed, cancelled) drops it in
-    // this same transaction.
-    if status == Status::Merging && new_status != Status::Merging {
+    // this same transaction. Terminal writes go through the shared terminal
+    // helper, which also clears `pending_resume`.
+    if new_status.is_terminal() {
+        finish_terminal_status_write_tx(&tx, id)?;
+    } else if status == Status::Merging && new_status != Status::Merging {
         clear_merge_checks_tx(&tx, id)?;
     }
 
@@ -4806,7 +4830,7 @@ pub fn update(
             )?;
             cancel_applied = rows > 0;
             if cancel_applied {
-                clear_merge_checks_tx(&tx, id)?;
+                finish_terminal_status_write_tx(&tx, id)?;
             }
             rows
         }
@@ -5717,6 +5741,8 @@ pub(crate) fn set_parked_refs(
     object.remove(PARKED_UNSATISFIABLE_REF);
     // A terminal task cannot retain an automatic replacement-worker intent.
     object.remove(RECOVERED_REMEDIATION_RETRY_REF);
+    // A restored park's resume intent never outlives a later park.
+    object.remove(PENDING_RESUME_REF);
     // Every park leaves `merging` (if it was there); the merge-gate
     // observation belongs only to a live merging task.
     object.remove(MERGE_CHECKS_REF);
@@ -6483,7 +6509,7 @@ fn process_cancelled_dependency_reconciliation(
         tx.execute(
             "UPDATE tasks
              SET refs = json_set(
-                     refs,
+                     json_remove(refs, '$.pending_resume'),
                      '$.daemon_parked_unsatisfiable', json('true'),
                      '$.daemon_parked_reason', ?1
                  ),
@@ -6683,6 +6709,25 @@ pub fn retry_parked(
     let tx = begin_immediate(conn)?;
     crate::agents::touch(&tx, by, now)?;
     crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    let task = retry_parked_tx(&tx, id, by, reset_recovery_budget, now)?;
+    tx.commit()?;
+    Ok(task)
+}
+
+/// [`retry_parked`] inside the caller's write transaction. Every refusal
+/// (`Ok(None)`) and error keeps the order and meaning documented on
+/// [`retry_parked`]; the caller decides whether to commit or roll back.
+///
+/// Restoring a park whose `daemon_parked_reason` is `needs-info` sets
+/// `pending_resume = {"kind":"unanswered"}` in the restoring statement; any
+/// other restore removes a stale `pending_resume`.
+pub fn retry_parked_tx(
+    tx: &Transaction<'_>,
+    id: i64,
+    by: &str,
+    reset_recovery_budget: bool,
+    now: i64,
+) -> Result<Option<Task>> {
     let resume_status: Option<String> = tx
         .query_row(
             "SELECT json_extract(refs, '$.daemon_resume_status')
@@ -6695,15 +6740,13 @@ pub fn retry_parked(
         )
         .optional()?;
     let Some(resume_status) = resume_status else {
-        tx.commit()?;
         return Ok(None);
     };
     // A parked task whose depends_on contains a cancelled id is unsatisfiable:
     // cancelled is terminal, so the sweep will just re-park immediately. Refuse
     // the restore so the operator has a clear disposition prompt via the CLI
     // exit-1 path instead of a false "restored" outcome.
-    if !cancelled_dep_ids(&tx, id)?.is_empty() {
-        tx.commit()?;
+    if !cancelled_dep_ids(tx, id)?.is_empty() {
         return Ok(None);
     }
     // A publication parked because the pinned PR was observed MERGED (#186)
@@ -6721,7 +6764,6 @@ pub fn retry_parked(
         |row| row.get(0),
     )?;
     if pr_merged_parked {
-        tx.commit()?;
         return Ok(None);
     }
     let policy_parked: bool = tx.query_row(
@@ -6800,7 +6842,7 @@ pub fn retry_parked(
             params![id, now, reset_recovery_budget, poison_retry_generation],
         )?;
         crate::events::emit(
-            &tx,
+            tx,
             "task_retry",
             &lease_target(id),
             &format!("policy-parked task reclassification requested by {by}"),
@@ -6811,14 +6853,12 @@ pub fn retry_parked(
             params![id],
             row_to_task,
         )?;
-        task.ready = compute_ready(&tx, &task.depends_on)?;
-        tx.commit()?;
+        task.ready = compute_ready(tx, &task.depends_on)?;
         return Ok(Some(task));
     }
     // Checked under the write lock: the cap is not an owner-renewable budget,
     // so a restore here would only be re-parked by the next provision pass.
-    if reviewer_cap_retry_refusal(&tx, id)?.is_some() {
-        tx.commit()?;
+    if reviewer_cap_retry_refusal(tx, id)?.is_some() {
         return Ok(None);
     }
     if !matches!(
@@ -6921,7 +6961,7 @@ pub fn retry_parked(
              author=CASE WHEN ?6 THEN NULL ELSE author END,
              continue_pr=CASE WHEN ?7 THEN NULL ELSE continue_pr END,
              recovery_attempts=CASE WHEN ?5 THEN 0 ELSE recovery_attempts END,
-             refs=json_set(
+             refs=json_patch(json_remove(json_set(
                  CASE
                      WHEN ?6
                      THEN json_remove(
@@ -6979,7 +7019,13 @@ pub fn retry_parked(
                      )
                  END,
                  '$.poison_retry_generation', ?8
-             ),
+             ), '$.pending_resume'),
+             -- Restoring a needs-info park records that the task's next
+             -- worker admission still owes the question an answer
+             -- (`task-answer` overwrites this in its own transaction). Any
+             -- other restore leaves no pending_resume behind.
+             CASE WHEN json_extract(refs, '$.daemon_parked_reason')=?9
+                  THEN ?10 ELSE '{}' END),
              updated_at=?3
          WHERE id=?1 AND status='failed'
            AND json_valid(refs)
@@ -6994,10 +7040,12 @@ pub fn retry_parked(
             reset_publication,
             retire_closed_continuation,
             poison_retry_generation,
+            NEEDS_INFO_PARK_REASON,
+            serde_json::json!({ PENDING_RESUME_REF: PendingResume::Unanswered.to_json() })
+                .to_string(),
         ],
     )?;
     if updated == 0 {
-        tx.commit()?;
         return Ok(None);
     }
     // Provider-failure strikes say nothing about this PR head, so an owner
@@ -7013,7 +7061,7 @@ pub fn retry_parked(
         // pending-review publication slot on this task's PR: one fresh
         // bounded generation, rebound to this task. Daemon auto-retries never
         // reset it, so there is no automatic unbounded retry path.
-        crate::review_publication_slots::reset_blocked_for_retry_in_tx(&tx, id, now)?;
+        crate::review_publication_slots::reset_blocked_for_retry_in_tx(tx, id, now)?;
     }
     if reset_publication {
         tx.execute("DELETE FROM task_branches WHERE task_id=?1", params![id])?;
@@ -7031,7 +7079,7 @@ pub fn retry_parked(
             params![id, ABANDONED_PUBLICATION_REF, audit.to_string(), now],
         )?;
         crate::events::emit(
-            &tx,
+            tx,
             "task_publication_abandoned",
             &lease_target(id),
             &format!(
@@ -7044,7 +7092,7 @@ pub fn retry_parked(
             now,
         )?;
     }
-    deactivate_lease(&tx, id, now)?;
+    deactivate_lease(tx, id, now)?;
     // Pre-structured generated-child holds from before this recovery path have
     // string summaries. They intentionally do not match: no migration or
     // backfill can safely infer which child those legacy rows name.
@@ -7064,7 +7112,7 @@ pub fn retry_parked(
         params![id, now],
     )?;
     crate::events::emit(
-        &tx,
+        tx,
         "task_retry",
         &lease_target(id),
         &format!("parked task resumed by {by}"),
@@ -7072,7 +7120,7 @@ pub fn retry_parked(
     )?;
     if graph_reactivated == 1 {
         crate::events::emit(
-            &tx,
+            tx,
             "task_graph_unblocked",
             &lease_target(id),
             "generated child retry restored graph authority",
@@ -7084,9 +7132,193 @@ pub fn retry_parked(
         params![id],
         row_to_task,
     )?;
+    task.ready = compute_ready(tx, &task.depends_on)?;
+    Ok(Some(task))
+}
+
+/// The durable `pending_resume` ref of a restored needs-info park.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingResume {
+    /// Restored by `task-retry` without an answer.
+    Unanswered,
+    /// Restored by `task-answer`; `note_id` names the `answer:\n` task note.
+    Answer { note_id: i64 },
+}
+
+impl PendingResume {
+    pub fn to_json(self) -> serde_json::Value {
+        match self {
+            PendingResume::Unanswered => serde_json::json!({ "kind": "unanswered" }),
+            PendingResume::Answer { note_id } => {
+                serde_json::json!({ "kind": "answer", "note_id": note_id })
+            }
+        }
+    }
+
+    fn from_json(value: &serde_json::Value) -> Option<Self> {
+        match value.get("kind")?.as_str()? {
+            "unanswered" => Some(PendingResume::Unanswered),
+            "answer" => Some(PendingResume::Answer {
+                note_id: value.get("note_id")?.as_i64()?,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Remove `pending_resume` from a task's refs inside the caller's write
+/// transaction and return the removed value. Worker admission paths call this
+/// in the transaction that admits the task's next worker process, so the ref
+/// is consumed exactly once. The core worker claims ([`claim_with_graph_limit`]
+/// for `open → working`, [`claim_provider_retry_rework`], and
+/// [`claim_remediation_rework_with_feedback`]) already remove it in their own
+/// transaction and return the pre-removal admission snapshot in `Task::refs`. A malformed persisted value surfaces as an `Io`
+/// error, so the caller's transaction rolls back instead of silently choosing
+/// a prompt; a later park or terminal status write still clears it.
+pub fn consume_pending_resume_tx(
+    tx: &Transaction<'_>,
+    task_id: i64,
+) -> Result<Option<PendingResume>> {
+    // The caller's write transaction holds the lock, so this read and the
+    // removal below observe the same value.
+    let raw: Option<String> = tx
+        .query_row(
+            "SELECT json_extract(refs, '$.pending_resume')
+             FROM tasks
+             WHERE id=?1 AND json_valid(refs)
+               AND json_type(refs, '$.pending_resume') IS NOT NULL",
+            params![task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let pending = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .as_ref()
+        .and_then(PendingResume::from_json)
+        .ok_or_else(|| {
+            QuorumError::Io(format!(
+                "invalid persisted pending_resume for task #{task_id}"
+            ))
+        })?;
+    clear_pending_resume_tx(tx, task_id)?;
+    Ok(Some(pending))
+}
+
+/// Remove `pending_resume` from one task's refs. No-op when absent.
+fn clear_pending_resume_tx(conn: &Connection, task_id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks SET refs=json_remove(refs, '$.pending_resume')
+         WHERE id=?1 AND json_valid(refs)
+           AND json_type(refs, '$.pending_resume') IS NOT NULL",
+        params![task_id],
+    )?;
+    Ok(())
+}
+
+/// Shared tail of every core write of a terminal status (`done`, `failed`,
+/// `cancelled`), run in the same transaction as the status write: the
+/// merge-gate observation and a restored park's `pending_resume` belong only
+/// to a live task. Route any new terminal status write through this helper.
+fn finish_terminal_status_write_tx(conn: &Connection, task_id: i64) -> Result<()> {
+    clear_merge_checks_tx(conn, task_id)?;
+    clear_pending_resume_tx(conn, task_id)
+}
+
+/// Outcome of [`answer_parked`].
+#[derive(Debug)]
+pub enum AnswerOutcome {
+    /// The answer note was written and the task restored.
+    Answered { note_id: i64, task: Box<Task> },
+    /// No task with this id exists.
+    NotFound,
+    /// The task is not daemon-parked with `daemon_parked_reason=needs-info`.
+    NotWaiting,
+    /// [`retry_parked_tx`] refused the restore (cancelled dependency, merged
+    /// PR, or reviewer cap). Nothing was written.
+    RetryRefused,
+}
+
+/// Answer a needs-info park and resume the task, all in one `BEGIN IMMEDIATE`
+/// transaction: insert the `answer:\n<text>` note from `by`, restore the task
+/// as an owner `task-retry` does (`reset_recovery_budget = true`), and set
+/// `pending_resume = {"kind":"answer","note_id":<id>}`. Any refusal or error
+/// (including the decomposition-freeze usage error from [`retry_parked_tx`])
+/// rolls back the note and every ref change.
+pub fn answer_parked(
+    conn: &mut Connection,
+    task_id: i64,
+    by: &str,
+    answer: &str,
+    now: i64,
+) -> Result<AnswerOutcome> {
+    if answer.trim().is_empty() {
+        return Err(QuorumError::BadInput("answer must not be empty".into()));
+    }
+    if answer.contains('\0') {
+        return Err(QuorumError::BadInput("embedded NUL byte in answer".into()));
+    }
+    if answer.len() > ANSWER_MAX_BYTES {
+        return Err(QuorumError::BadInput(format!(
+            "answer exceeds {ANSWER_MAX_BYTES} bytes"
+        )));
+    }
+    let tx = begin_immediate(conn)?;
+    crate::agents::touch(&tx, by, now)?;
+    crate::sweep::sweep_on_write(&tx, now, SWEEP_LIMIT)?;
+    let waiting: Option<bool> = tx
+        .query_row(
+            "SELECT COALESCE(
+                 status='failed'
+                 AND json_valid(refs)
+                 AND json_extract(refs, '$.daemon_parked')=1
+                 AND json_extract(refs, '$.daemon_parked_reason')=?2
+                 AND COALESCE(json_extract(refs, '$.classifier_policy_parked'), 0)<>1,
+                 0
+             )
+             FROM tasks WHERE id=?1",
+            params![task_id, NEEDS_INFO_PARK_REASON],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match waiting {
+        None => return Ok(AnswerOutcome::NotFound),
+        Some(false) => return Ok(AnswerOutcome::NotWaiting),
+        Some(true) => {}
+    }
+    let note_id: i64 = tx.query_row(
+        "INSERT INTO task_notes(task_id, ts, agent, body)
+         VALUES (?1, ?2, ?3, ?4)
+         RETURNING id",
+        params![task_id, now, by, format!("{ANSWER_NOTE_PREFIX}{answer}")],
+        |row| row.get(0),
+    )?;
+    if retry_parked_tx(&tx, task_id, by, true, now)?.is_none() {
+        // Dropping the transaction rolls back the note.
+        return Ok(AnswerOutcome::RetryRefused);
+    }
+    tx.execute(
+        "UPDATE tasks
+         SET refs=json_set(refs, '$.pending_resume', json(?2))
+         WHERE id=?1",
+        params![
+            task_id,
+            PendingResume::Answer { note_id }.to_json().to_string()
+        ],
+    )?;
+    let mut task = tx.query_row(
+        &format!("SELECT {COLS} FROM tasks WHERE id=?1"),
+        params![task_id],
+        row_to_task,
+    )?;
     task.ready = compute_ready(&tx, &task.depends_on)?;
     tx.commit()?;
-    Ok(Some(task))
+    Ok(AnswerOutcome::Answered {
+        note_id,
+        task: Box::new(task),
+    })
 }
 
 /// Atomically consume at most one durable merge replay intent.
@@ -7526,7 +7758,7 @@ fn close_after_merge_inner(
         tx.commit()?;
         return Ok(false);
     }
-    clear_merge_checks_tx(&tx, id)?;
+    finish_terminal_status_write_tx(&tx, id)?;
     deactivate_lease(&tx, id, now)?;
     tx.execute(
         "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, 'daemon', ?3)",
@@ -7610,7 +7842,7 @@ pub fn close_manual(
         tx.commit()?;
         return Ok(None);
     }
-    clear_merge_checks_tx(&tx, id)?;
+    finish_terminal_status_write_tx(&tx, id)?;
     // Mark this dependency done before the opportunistic failed-dependency
     // sweep. A recovered failed task can otherwise cause the same write to
     // park all of its dependents just before this manual resolution unblocks
@@ -19137,6 +19369,354 @@ mod tests {
         )
         .unwrap();
         id
+    }
+
+    fn park_needs_info(c: &mut Connection, resume_status: &str) -> i64 {
+        let id = park_for_retry(c, resume_status);
+        c.execute(
+            "UPDATE tasks SET refs=json_set(refs,'$.daemon_parked_reason',?2) WHERE id=?1",
+            params![id, NEEDS_INFO_PARK_REASON],
+        )
+        .unwrap();
+        id
+    }
+
+    fn answer_task_refs(c: &Connection, id: i64) -> serde_json::Value {
+        let task = get(c, id).unwrap().unwrap();
+        serde_json::from_str(task.refs.as_deref().unwrap_or("{}")).unwrap()
+    }
+
+    fn answer_notes(c: &Connection, id: i64) -> Vec<(i64, String, String)> {
+        let mut stmt = c
+            .prepare(
+                "SELECT id, agent, body FROM task_notes
+                 WHERE task_id=?1 AND body LIKE 'answer:%' ORDER BY id",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows
+    }
+
+    /// A real `needs-info` reaction park restored by `task-retry` records the
+    /// unanswered resume; a later park through `set_parked_refs` drops it.
+    #[test]
+    fn retry_of_needs_info_park_sets_unanswered_and_later_park_clears_it() {
+        let (_d, mut c) = open_tmp();
+        let id = persistent_worker_task(&mut c);
+        worker_reacts(&mut c, id, "needs-info");
+        assert_eq!(
+            park_persistent_worker_reaction(&mut c, id, "worker", 1001).unwrap(),
+            PersistentReactionDisposition::Parked
+        );
+        assert_eq!(
+            answer_task_refs(&c, id)[PARKED_REASON_REF],
+            NEEDS_INFO_PARK_REASON
+        );
+
+        let restored = retry_parked(&mut c, id, "operator", true, 1002)
+            .unwrap()
+            .expect("needs-info park restores");
+        assert_eq!(restored.status, "open");
+        let refs = answer_task_refs(&c, id);
+        assert_eq!(
+            refs[PENDING_RESUME_REF],
+            serde_json::json!({ "kind": "unanswered" })
+        );
+        assert!(refs.get(PARKED_REF).is_none(), "{refs}");
+
+        let reparked = set_parked_refs(Some(&refs.to_string()), "blocked", "open", None).unwrap();
+        let reparked: serde_json::Value = serde_json::from_str(&reparked).unwrap();
+        assert!(reparked.get(PENDING_RESUME_REF).is_none(), "{reparked}");
+        assert_eq!(reparked[PARKED_REASON_REF], "blocked");
+    }
+
+    #[test]
+    fn retry_of_other_park_reason_sets_no_pending_resume_and_drops_stale_one() {
+        let (_d, mut c) = open_tmp();
+        let plain = park_for_retry(&mut c, "open");
+        retry_parked(&mut c, plain, "operator", true, 1001)
+            .unwrap()
+            .expect("restored");
+        assert!(answer_task_refs(&c, plain)
+            .get(PENDING_RESUME_REF)
+            .is_none());
+
+        // A park path that left a stale value behind cannot leak it into the
+        // restored task.
+        let stale = park_for_retry(&mut c, "rework");
+        c.execute(
+            "UPDATE tasks SET refs=json_set(refs,'$.pending_resume',
+                 json('{\"kind\":\"answer\",\"note_id\":7}')) WHERE id=?1",
+            params![stale],
+        )
+        .unwrap();
+        let restored = retry_parked(&mut c, stale, "operator", true, 1001)
+            .unwrap()
+            .expect("restored");
+        assert_eq!(restored.status, "rework");
+        let refs = answer_task_refs(&c, stale);
+        assert!(refs.get(PENDING_RESUME_REF).is_none(), "{refs}");
+        assert_eq!(refs[PARKED_REWORK_RETRY_REF], serde_json::json!(true));
+    }
+
+    #[test]
+    fn answer_parked_writes_note_restores_rework_and_records_answer_resume() {
+        let (_d, mut c) = open_tmp();
+        let id = park_needs_info(&mut c, "rework");
+        c.execute(
+            "UPDATE tasks SET recovery_attempts=2 WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+
+        let outcome = answer_parked(&mut c, id, "operator", "use schema v2", 1001).unwrap();
+        let AnswerOutcome::Answered { note_id, task } = outcome else {
+            panic!("expected Answered, got {outcome:?}");
+        };
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.recovery_attempts, 0);
+        assert_eq!(
+            answer_notes(&c, id),
+            vec![(
+                note_id,
+                "operator".to_string(),
+                "answer:\nuse schema v2".to_string()
+            )]
+        );
+        let refs = answer_task_refs(&c, id);
+        assert_eq!(
+            refs[PENDING_RESUME_REF],
+            serde_json::json!({ "kind": "answer", "note_id": note_id })
+        );
+        assert_eq!(refs[PARKED_REWORK_RETRY_REF], serde_json::json!(true));
+        assert!(refs.get(PARKED_REF).is_none(), "{refs}");
+        assert_eq!(refs[POISON_RETRY_GENERATION_REF], serde_json::json!(1));
+        assert_eq!(task_retry_events(&c, id), 1);
+        // The returned task reflects the committed refs.
+        let returned: serde_json::Value =
+            serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(returned, refs);
+    }
+
+    #[test]
+    fn answer_parked_refuses_tasks_not_waiting_for_an_answer_without_writes() {
+        let (_d, mut c) = open_tmp();
+        let open = create(&mut c, "boss", "t", None, 0, None, None, None, None, 1000).unwrap();
+        let other_reason = park_for_retry(&mut c, "open");
+        for (id, expected) in [
+            (open, AnswerOutcome::NotWaiting),
+            (other_reason, AnswerOutcome::NotWaiting),
+            (9999, AnswerOutcome::NotFound),
+        ] {
+            let before = get(&c, id).unwrap();
+            let outcome = answer_parked(&mut c, id, "operator", "x", 1001).unwrap();
+            assert_eq!(
+                std::mem::discriminant(&outcome),
+                std::mem::discriminant(&expected),
+                "task {id}: {outcome:?}"
+            );
+            assert!(answer_notes(&c, id).is_empty());
+            assert_eq!(
+                get(&c, id).unwrap().map(|t| (t.status, t.refs)),
+                before.map(|t| (t.status, t.refs))
+            );
+        }
+
+        // A cancelled dependency is refused by the restore itself; the note
+        // inserted before it rolls back.
+        let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, None, 1000).unwrap();
+        c.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            params![dep],
+        )
+        .unwrap();
+        let blocked = park_needs_info(&mut c, "open");
+        c.execute(
+            "UPDATE tasks SET depends_on=?2 WHERE id=?1",
+            params![blocked, format!("[{dep}]")],
+        )
+        .unwrap();
+        let refs_before = answer_task_refs(&c, blocked);
+        let outcome = answer_parked(&mut c, blocked, "operator", "x", 1001).unwrap();
+        assert!(
+            matches!(outcome, AnswerOutcome::RetryRefused),
+            "{outcome:?}"
+        );
+        assert!(answer_notes(&c, blocked).is_empty());
+        assert_eq!(answer_task_refs(&c, blocked), refs_before);
+        assert_eq!(get(&c, blocked).unwrap().unwrap().status, "failed");
+
+        let waiting = park_needs_info(&mut c, "open");
+        for bad in ["", "  \n", "a\0b"] {
+            let err = answer_parked(&mut c, waiting, "operator", bad, 1001).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{bad:?}");
+        }
+        let too_big = "x".repeat(ANSWER_MAX_BYTES + 1);
+        assert_eq!(
+            answer_parked(&mut c, waiting, "operator", &too_big, 1001)
+                .unwrap_err()
+                .exit_code(),
+            2
+        );
+        assert!(answer_notes(&c, waiting).is_empty());
+    }
+
+    #[test]
+    fn answer_parked_rolls_back_note_and_refs_under_decomposition_freeze() {
+        let (_d, mut c) = open_tmp();
+        let source = park_needs_info(&mut c, "open");
+        c.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+             VALUES (?1,'planning',0,1,1,1000,1000)",
+            params![source],
+        )
+        .unwrap();
+        let refs_before = answer_task_refs(&c, source);
+        let err = answer_parked(&mut c, source, "operator", "answer", 1001).unwrap_err();
+        assert!(matches!(err, QuorumError::Usage(_)), "{err:?}");
+        assert!(answer_notes(&c, source).is_empty());
+        assert_eq!(answer_task_refs(&c, source), refs_before);
+        assert_eq!(get(&c, source).unwrap().unwrap().status, "failed");
+    }
+
+    /// Restore a needs-info park so the task is `open` with an unanswered
+    /// `pending_resume`.
+    fn open_with_pending_resume(c: &mut Connection) -> i64 {
+        let id = park_needs_info(c, "open");
+        retry_parked(c, id, "operator", true, 1001)
+            .unwrap()
+            .expect("restored");
+        assert!(answer_task_refs(c, id).get(PENDING_RESUME_REF).is_some());
+        id
+    }
+
+    #[test]
+    fn terminal_status_writes_clear_pending_resume() {
+        let (_d, mut c) = open_tmp();
+
+        let cancelled = open_with_pending_resume(&mut c);
+        apply_event(
+            &mut c,
+            "boss",
+            cancelled,
+            &Event::Cancelled { by: "boss".into() },
+            1002,
+        )
+        .unwrap();
+        assert_eq!(get(&c, cancelled).unwrap().unwrap().status, "cancelled");
+        assert!(answer_task_refs(&c, cancelled)
+            .get(PENDING_RESUME_REF)
+            .is_none());
+
+        let closed = open_with_pending_resume(&mut c);
+        close_manual(&mut c, "boss", closed, "landed by hand", None, 1002)
+            .unwrap()
+            .expect("closed");
+        assert_eq!(get(&c, closed).unwrap().unwrap().status, "done");
+        assert!(answer_task_refs(&c, closed)
+            .get(PENDING_RESUME_REF)
+            .is_none());
+
+        let merged = open_with_pending_resume(&mut c);
+        assert!(close_after_merge(&mut c, merged, "merged", 1002).unwrap());
+        assert_eq!(get(&c, merged).unwrap().unwrap().status, "done");
+        assert!(answer_task_refs(&c, merged)
+            .get(PENDING_RESUME_REF)
+            .is_none());
+    }
+
+    #[test]
+    fn cancelled_dependency_convergence_clears_pending_resume() {
+        let (_d, mut c) = open_tmp();
+        let dep = create(&mut c, "boss", "dep", None, 0, None, None, None, None, 1000).unwrap();
+        let id = park_for_retry(&mut c, "open");
+        c.execute(
+            "UPDATE tasks SET depends_on=?2,
+                 refs=json_set(refs,'$.pending_resume',json('{\"kind\":\"unanswered\"}'))
+             WHERE id=?1",
+            params![id, format!("[{dep}]")],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='cancelled' WHERE id=?1",
+            params![dep],
+        )
+        .unwrap();
+        assert_eq!(
+            converge_parked_dependents_of_cancelled(&c, dep, 1002).unwrap(),
+            1
+        );
+        let refs = answer_task_refs(&c, id);
+        assert_eq!(refs[PARKED_UNSATISFIABLE_REF], serde_json::json!(true));
+        assert!(refs.get(PENDING_RESUME_REF).is_none(), "{refs}");
+    }
+
+    #[test]
+    fn worker_admission_claims_consume_pending_resume_and_return_the_snapshot() {
+        let (_d, mut c) = open_tmp();
+        let classified = |c: &mut Connection, id: i64| {
+            c.execute(
+                "UPDATE tasks SET refs=json_set(refs,'$.cx_est',2,'$.cx_size','S',
+                     '$.cx_ready',json('true'),'$.cx_not_ready_reason',json('null'),
+                     '$.cx_by','test:v2')
+                 WHERE id=?1",
+                params![id],
+            )
+            .unwrap();
+        };
+        for resume in ["open", "rework"] {
+            let id = park_needs_info(&mut c, resume);
+            classified(&mut c, id);
+            answer_parked(&mut c, id, "operator", "go", 1001).unwrap();
+            let claimed = if resume == "open" {
+                claim(&mut c, "worker", Some(id), &[], TTL, 1002)
+            } else {
+                claim_provider_retry_rework(&mut c, "worker", id, TTL, 1002)
+            }
+            .unwrap()
+            .unwrap_or_else(|| panic!("{resume} admission claims the task"));
+            let snapshot: serde_json::Value =
+                serde_json::from_str(claimed.refs.as_deref().unwrap()).unwrap();
+            assert_eq!(snapshot[PENDING_RESUME_REF]["kind"], "answer", "{resume}");
+            let refs = answer_task_refs(&c, id);
+            assert!(refs.get(PENDING_RESUME_REF).is_none(), "{resume}: {refs}");
+        }
+    }
+
+    #[test]
+    fn consume_pending_resume_tx_returns_and_removes_the_value_once() {
+        let (_d, mut c) = open_tmp();
+        let id = park_needs_info(&mut c, "open");
+        let AnswerOutcome::Answered { note_id, .. } =
+            answer_parked(&mut c, id, "operator", "go", 1001).unwrap()
+        else {
+            panic!("answered");
+        };
+        let tx = begin_immediate(&mut c).unwrap();
+        assert_eq!(
+            consume_pending_resume_tx(&tx, id).unwrap(),
+            Some(PendingResume::Answer { note_id })
+        );
+        assert_eq!(consume_pending_resume_tx(&tx, id).unwrap(), None);
+        tx.commit().unwrap();
+        assert!(answer_task_refs(&c, id).get(PENDING_RESUME_REF).is_none());
+
+        c.execute(
+            "UPDATE tasks SET refs=json_set(refs,'$.pending_resume',json('{\"kind\":\"bogus\"}'))
+             WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        let tx = begin_immediate(&mut c).unwrap();
+        assert!(matches!(
+            consume_pending_resume_tx(&tx, id),
+            Err(QuorumError::Io(_))
+        ));
     }
 
     fn add_reviewer_runs(c: &Connection, task_id: i64, count: i64) {
