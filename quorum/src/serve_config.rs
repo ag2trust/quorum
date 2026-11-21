@@ -69,6 +69,8 @@ pub enum RunnerKind {
     Claude,
     Codex,
     Grok,
+    /// Operator-declared external CLI runner.
+    External,
 }
 
 impl std::fmt::Display for RunnerKind {
@@ -77,18 +79,30 @@ impl std::fmt::Display for RunnerKind {
             Self::Claude => write!(f, "claude"),
             Self::Codex => write!(f, "codex"),
             Self::Grok => write!(f, "grok"),
+            Self::External => write!(f, "external"),
         }
     }
 }
 
 impl RunnerKind {
+    /// The launch adapter kind for this configured runner.
+    pub fn agent_kind(self) -> crate::serve::runner::AgentKind {
+        match self {
+            Self::Claude => crate::serve::runner::AgentKind::Claude,
+            Self::Codex => crate::serve::runner::AgentKind::Codex,
+            Self::Grok => crate::serve::runner::AgentKind::Grok,
+            Self::External => crate::serve::runner::AgentKind::External,
+        }
+    }
+
     pub fn from_str_opt(s: Option<&str>) -> Result<Self> {
         match s {
             None | Some("claude") => Ok(Self::Claude),
             Some("codex") => Ok(Self::Codex),
             Some("grok") => Ok(Self::Grok),
+            Some("external") => Ok(Self::External),
             Some(other) => Err(QuorumError::Usage(format!(
-                "bad agent value: \"{other}\" (expected \"claude\", \"codex\", or \"grok\")"
+                "bad agent value: \"{other}\" (expected \"claude\", \"codex\", \"grok\", or \"external\")"
             ))),
         }
     }
@@ -542,11 +556,7 @@ pub fn resolve_roles(
             {
                 continue;
             }
-            let expected = match provider {
-                RunnerKind::Claude => crate::serve::runner::AgentKind::Claude,
-                RunnerKind::Codex => crate::serve::runner::AgentKind::Codex,
-                RunnerKind::Grok => crate::serve::runner::AgentKind::Grok,
-            };
+            let expected = provider.agent_kind();
             if actual != expected {
                 return Err(QuorumError::Usage(format!(
                     "{role}_model \"{model}\" does not match provider=\"{provider}\""
@@ -790,13 +800,14 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
         validate_durable_routing_text("model profile name", name)?;
         validate_durable_routing_text("model", &profile.model)?;
         validate_durable_routing_text("effort", &profile.effort)?;
-        let expected = RunnerKind::from_str_opt(Some(&profile.runner))?;
-        let actual = crate::serve::runner::AgentKind::for_model(&profile.model)
-            .map_err(|error| QuorumError::Usage(format!("model profile \"{name}\": {error}")))?;
-        let expected = match expected {
-            RunnerKind::Claude => crate::serve::runner::AgentKind::Claude,
-            RunnerKind::Codex => crate::serve::runner::AgentKind::Codex,
-            RunnerKind::Grok => crate::serve::runner::AgentKind::Grok,
+        let expected = RunnerKind::from_str_opt(Some(&profile.runner))?.agent_kind();
+        // External profiles take their runner from the profile alone; the
+        // model string is passed to the CLI verbatim and never resolved.
+        let actual = if expected == crate::serve::runner::AgentKind::External {
+            expected
+        } else {
+            crate::serve::runner::AgentKind::for_model(&profile.model)
+                .map_err(|error| QuorumError::Usage(format!("model profile \"{name}\": {error}")))?
         };
         if actual != expected {
             return Err(QuorumError::Usage(format!(
@@ -814,7 +825,14 @@ pub fn validate_model_routing(config: &ServeFileConfig) -> Result<()> {
             crate::serve::runner::AgentKind::Grok => {
                 matches!(profile.effort.as_str(), "low" | "medium" | "high")
             }
+            crate::serve::runner::AgentKind::External => external_effort_is_valid(&profile.effort),
         };
+        if !effort_supported && expected == crate::serve::runner::AgentKind::External {
+            return Err(QuorumError::Usage(format!(
+                "model_profiles.{name}.effort \"{}\" must match [a-z0-9_-]{{1,32}} for runner \"external\"",
+                profile.effort
+            )));
+        }
         if !effort_supported {
             return Err(QuorumError::Usage(format!(
                 "model profile \"{name}\" has unsupported effort \"{}\" for runner \"{}\"",
@@ -870,6 +888,14 @@ fn validate_grok_role_gate(
 /// A custom executable belongs to one provider CLI. Validate it after every
 /// config source has been resolved, because `--agent-bin` is merged after the
 /// TOML file itself has been validated.
+/// External-profile effort syntax: `[a-z0-9_-]{1,32}`.
+fn external_effort_is_valid(effort: &str) -> bool {
+    (1..=32).contains(&effort.len())
+        && effort
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
 pub fn validate_agent_bin_for_profiles(
     agent_bin: Option<&str>,
     profiles: &BTreeMap<String, ModelProfile>,
@@ -2673,6 +2699,77 @@ worktree_base = "/tmp/wt"
         profile.effort = "xhigh".into();
         let err = validate_model_routing(&claude).unwrap_err();
         assert!(err.to_string().contains("unsupported effort"), "{err}");
+    }
+
+    #[test]
+    fn routing_external_profile_skips_model_cross_check() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        let profile = cfg
+            .model_profiles
+            .as_mut()
+            .unwrap()
+            .get_mut("primary")
+            .unwrap();
+        profile.runner = "external".into();
+        profile.model = "gpt-5".into();
+        profile.effort = "deep_think-2".into();
+        validate_model_routing(&cfg).unwrap();
+        let runner = RunnerKind::from_str_opt(Some("external")).unwrap();
+        assert_eq!(runner, RunnerKind::External);
+        assert_eq!(
+            runner.agent_kind(),
+            crate::serve::runner::AgentKind::External
+        );
+        assert_ne!(
+            runner.agent_kind(),
+            crate::serve::runner::AgentKind::for_model("gpt-5").unwrap()
+        );
+        assert_eq!(RunnerKind::External.to_string(), "external");
+    }
+
+    #[test]
+    fn routing_builtin_profile_mismatch_still_refused_beside_external() {
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        let profiles = cfg.model_profiles.as_mut().unwrap();
+        let mut external = profiles.get("primary").unwrap().clone();
+        external.runner = "external".into();
+        profiles.insert("ext".into(), external);
+        profiles.get_mut("primary").unwrap().runner = "claude".into();
+        let err = validate_model_routing(&cfg).unwrap_err();
+        assert!(err.to_string().contains("does not match runner"), "{err}");
+    }
+
+    #[test]
+    fn routing_rejects_external_effort_outside_pattern() {
+        for effort in ["", "High", "a b", "x.y", &"a".repeat(33)] {
+            let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+            let profile = cfg
+                .model_profiles
+                .as_mut()
+                .unwrap()
+                .get_mut("primary")
+                .unwrap();
+            profile.runner = "external".into();
+            profile.effort = effort.to_string();
+            let err = validate_model_routing(&cfg).unwrap_err();
+            assert!(matches!(err, QuorumError::Usage(_)), "{err}");
+            if !effort.is_empty() {
+                assert!(
+                    err.to_string().contains("model_profiles.primary.effort"),
+                    "{effort:?}: {err}"
+                );
+            }
+        }
+        let mut cfg: ServeFileConfig = toml::from_str(VALID_ROUTING).unwrap();
+        let profile = cfg
+            .model_profiles
+            .as_mut()
+            .unwrap()
+            .get_mut("primary")
+            .unwrap();
+        profile.runner = "external".into();
+        profile.effort = "a".repeat(32);
+        validate_model_routing(&cfg).unwrap();
     }
 
     #[test]
