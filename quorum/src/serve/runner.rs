@@ -1585,8 +1585,6 @@ pub fn launch_failure(error: &std::io::Error) -> Option<RunnerFailure> {
         .cloned()
 }
 
-/// Launch failure for the external runner until its adapter exists. The
-/// configuration cannot be repaired by failing over, so it is NonFailover.
 /// The runner a launch dispatches on. A built-in runner must agree with
 /// [`AgentKind::for_model`]; an external runner never consults it and is
 /// refused until its adapter exists.
@@ -1611,6 +1609,8 @@ fn routed_runner(request: &LaunchRequest<'_>) -> Result<AgentKind, RunnerFailure
     Ok(request.runner)
 }
 
+/// Launch failure for the external runner until its adapter exists. The
+/// configuration cannot be repaired by failing over, so it is NonFailover.
 fn external_adapter_not_built() -> RunnerFailure {
     RunnerFailure::new(
         FailureDisposition::NonFailover,
