@@ -7199,7 +7199,9 @@ pub fn consume_pending_resume_tx(
         .as_ref()
         .and_then(PendingResume::from_json)
         .ok_or_else(|| {
-            QuorumError::Io(format!("invalid persisted pending_resume for task #{task_id}"))
+            QuorumError::Io(format!(
+                "invalid persisted pending_resume for task #{task_id}"
+            ))
         })?;
     clear_pending_resume_tx(tx, task_id)?;
     Ok(Some(pending))
@@ -19407,7 +19409,10 @@ mod tests {
             park_persistent_worker_reaction(&mut c, id, "worker", 1001).unwrap(),
             PersistentReactionDisposition::Parked
         );
-        assert_eq!(answer_task_refs(&c, id)[PARKED_REASON_REF], NEEDS_INFO_PARK_REASON);
+        assert_eq!(
+            answer_task_refs(&c, id)[PARKED_REASON_REF],
+            NEEDS_INFO_PARK_REASON
+        );
 
         let restored = retry_parked(&mut c, id, "operator", true, 1002)
             .unwrap()
@@ -19433,7 +19438,9 @@ mod tests {
         retry_parked(&mut c, plain, "operator", true, 1001)
             .unwrap()
             .expect("restored");
-        assert!(answer_task_refs(&c, plain).get(PENDING_RESUME_REF).is_none());
+        assert!(answer_task_refs(&c, plain)
+            .get(PENDING_RESUME_REF)
+            .is_none());
 
         // A park path that left a stale value behind cannot leak it into the
         // restored task.
@@ -19532,7 +19539,10 @@ mod tests {
         .unwrap();
         let refs_before = answer_task_refs(&c, blocked);
         let outcome = answer_parked(&mut c, blocked, "operator", "x", 1001).unwrap();
-        assert!(matches!(outcome, AnswerOutcome::RetryRefused), "{outcome:?}");
+        assert!(
+            matches!(outcome, AnswerOutcome::RetryRefused),
+            "{outcome:?}"
+        );
         assert!(answer_notes(&c, blocked).is_empty());
         assert_eq!(answer_task_refs(&c, blocked), refs_before);
         assert_eq!(get(&c, blocked).unwrap().unwrap().status, "failed");
@@ -19596,19 +19606,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(get(&c, cancelled).unwrap().unwrap().status, "cancelled");
-        assert!(answer_task_refs(&c, cancelled).get(PENDING_RESUME_REF).is_none());
+        assert!(answer_task_refs(&c, cancelled)
+            .get(PENDING_RESUME_REF)
+            .is_none());
 
         let closed = open_with_pending_resume(&mut c);
         close_manual(&mut c, "boss", closed, "landed by hand", None, 1002)
             .unwrap()
             .expect("closed");
         assert_eq!(get(&c, closed).unwrap().unwrap().status, "done");
-        assert!(answer_task_refs(&c, closed).get(PENDING_RESUME_REF).is_none());
+        assert!(answer_task_refs(&c, closed)
+            .get(PENDING_RESUME_REF)
+            .is_none());
 
         let merged = open_with_pending_resume(&mut c);
         assert!(close_after_merge(&mut c, merged, "merged", 1002).unwrap());
         assert_eq!(get(&c, merged).unwrap().unwrap().status, "done");
-        assert!(answer_task_refs(&c, merged).get(PENDING_RESUME_REF).is_none());
+        assert!(answer_task_refs(&c, merged)
+            .get(PENDING_RESUME_REF)
+            .is_none());
     }
 
     #[test]
