@@ -271,11 +271,16 @@ declare_serve_file_config! {
     /// Serve never runs it; the address only lets startup refuse an agent MCP
     /// listener on the same socket address.
     orchestrator_mcp_listen: Option<std::net::SocketAddr>,
+    /// The one external CLI declaration. Restart-only.
+    external_runner: Option<crate::external_runner_spec::ExternalRunnerFile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigKeyDisposition {
     Runtime,
+    /// Consumed at startup only. A reload that changes it is refused and the
+    /// running configuration stays in force.
+    RestartOnly,
     Deprecated,
 }
 
@@ -360,6 +365,7 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("agent_mcp_listen", ConfigKeyDisposition::Runtime),
     ("agent_mcp_allowed_hosts", ConfigKeyDisposition::Runtime),
     ("orchestrator_mcp_listen", ConfigKeyDisposition::Runtime),
+    ("external_runner", ConfigKeyDisposition::RestartOnly),
     #[cfg(test)]
     ("test_only_unconsumed", ConfigKeyDisposition::Deprecated),
 ];
@@ -727,6 +733,7 @@ pub fn load(path: &Path, explicit: bool) -> Result<ServeFileConfig> {
             validate_model_routing(&cfg)?;
             validate_sync_pairs(&cfg.sync_pairs)?;
             resolve_resource_monitor_config(&cfg)?;
+            resolve_external_runner(&cfg)?;
             warn_for_deprecated_keys(&s)?;
             Ok(cfg)
         }
@@ -744,6 +751,56 @@ pub fn load(path: &Path, explicit: bool) -> Result<ServeFileConfig> {
             "cannot read serve config {}: {e}",
             path.display()
         ))),
+    }
+}
+
+/// The validated `[external_runner]` declaration and its fingerprint, or
+/// `None` when the table is absent. Every table-local rule is a usage error.
+pub fn resolve_external_runner(
+    cfg: &ServeFileConfig,
+) -> Result<Option<crate::external_runner_spec::ExternalSpec>> {
+    cfg.external_runner
+        .as_ref()
+        .map(|file| {
+            crate::external_runner_spec::ExternalSpec::from_file(file, cfg.agent_bin.as_deref())
+        })
+        .transpose()
+}
+
+/// Replace `running` with the config at `path` only when the candidate passes
+/// every startup rule and leaves every restart-only key unchanged. On any
+/// refusal `running` is untouched. The daemon has no live reload trigger yet;
+/// this is the one gate any reload path must use.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn reload(running: &mut ServeFileConfig, path: &Path) -> Result<()> {
+    let candidate = load(path, true)?;
+    for (key, disposition) in SERVE_FILE_CONFIG_KEY_REGISTRY {
+        if *disposition == ConfigKeyDisposition::RestartOnly
+            && restart_only_key_changed(key, running, &candidate)
+        {
+            return Err(QuorumError::Usage(format!(
+                "serve config key \"{key}\" is restart-only; the running configuration stays in force until restart"
+            )));
+        }
+    }
+    *running = candidate;
+    Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn restart_only_key_changed(
+    key: &str,
+    running: &ServeFileConfig,
+    candidate: &ServeFileConfig,
+) -> bool {
+    match key {
+        "external_runner" => {
+            let filled =
+                |cfg: &ServeFileConfig| cfg.external_runner.as_ref().map(|f| f.with_defaults());
+            filled(running) != filled(candidate)
+        }
+        // A restart-only key without a comparison is treated as changed.
+        _ => true,
     }
 }
 
@@ -3454,5 +3511,116 @@ worktree_base = "/tmp/wt"
             b.contains("effective idle limit:      900 (default; max_idle_secs overrides"),
             "effective idle limit should be 900 by default: {b}"
         );
+    }
+
+    fn write_serve_config(dir: &Path, extra: &str) -> std::path::PathBuf {
+        let path = dir.join("serve.toml");
+        std::fs::write(&path, format!("{extra}\n{VALID_ROUTING}")).unwrap();
+        path
+    }
+
+    fn external_fingerprint(cfg: &ServeFileConfig) -> Option<String> {
+        resolve_external_runner(cfg)
+            .unwrap()
+            .map(|spec| spec.fingerprint)
+    }
+
+    #[test]
+    fn external_runner_declaration_loads_into_a_validated_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let declaration = crate::external_runner_spec::tests::VALID;
+        let cfg = load(&write_serve_config(dir.path(), declaration), true).unwrap();
+        let spec = resolve_external_runner(&cfg).unwrap().expect("declared");
+        assert_eq!(spec.stream.terminal_exit_secs, 30);
+
+        // The config's agent_bin participates in the fingerprint. (The
+        // fixture routing spans runners, so agent_bin is set directly.)
+        let mut cfg_bin = load(&write_serve_config(dir.path(), declaration), true).unwrap();
+        cfg_bin.agent_bin = Some("/opt/wrapper".into());
+        assert_ne!(external_fingerprint(&cfg_bin), Some(spec.fingerprint));
+
+        // Absent: no spec, exactly as before.
+        let cfg = load(&write_serve_config(dir.path(), ""), true).unwrap();
+        assert!(cfg.external_runner.is_none());
+        assert!(resolve_external_runner(&cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn invalid_external_runner_is_refused_at_load_naming_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let declaration = crate::external_runner_spec::tests::VALID.replacen(
+            "\"/usr/local/bin/fake-cli\"",
+            "\"fake-cli\"",
+            1,
+        );
+        let err = load(&write_serve_config(dir.path(), &declaration), true).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string().contains("external_runner.executable"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reload_refuses_any_external_runner_change_and_keeps_the_running_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let declaration = crate::external_runner_spec::tests::VALID;
+        let path = write_serve_config(dir.path(), &format!("cap = 3\n{declaration}"));
+        let mut running = load(&path, true).unwrap();
+        let before = external_fingerprint(&running);
+
+        let assert_refused = |running: &mut ServeFileConfig, extra: &str, needle: &str| {
+            let path = write_serve_config(dir.path(), extra);
+            let err = reload(running, &path).unwrap_err();
+            assert_eq!(err.exit_code(), 2);
+            assert!(err.to_string().contains(needle), "{err}");
+            assert_eq!(running.cap, Some(3), "running config replaced");
+            assert_eq!(external_fingerprint(running), before);
+        };
+        // A changed declaration, alongside a runtime change.
+        let changed = declaration.replacen("max_line_bytes = 1048576", "max_line_bytes = 2048", 1);
+        assert_refused(
+            &mut running,
+            &format!("cap = 4\n{changed}"),
+            "\"external_runner\" is restart-only",
+        );
+        // Removing the table is a change.
+        assert_refused(
+            &mut running,
+            "cap = 4\n",
+            "\"external_runner\" is restart-only",
+        );
+        // A declaration that fails a rule is refused with the startup message.
+        let invalid = declaration.replacen("\"/usr/local/bin/fake-cli\"", "\"fake-cli\"", 1);
+        let startup = load(&write_serve_config(dir.path(), &invalid), true).unwrap_err();
+        assert_refused(&mut running, &invalid, &startup.to_string());
+
+        // Unchanged declaration (explicit default included): runtime keys apply.
+        let same = declaration.replacen(
+            "max_line_bytes = 1048576",
+            "max_line_bytes = 1048576\nterminal_exit_secs = 30",
+            1,
+        );
+        let path = write_serve_config(dir.path(), &format!("cap = 5\n{same}"));
+        reload(&mut running, &path).unwrap();
+        assert_eq!(running.cap, Some(5));
+        assert_eq!(external_fingerprint(&running), before);
+    }
+
+    #[test]
+    fn reload_without_external_runner_applies_runtime_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut running = load(&write_serve_config(dir.path(), "cap = 3\n"), true).unwrap();
+        reload(&mut running, &write_serve_config(dir.path(), "cap = 6\n")).unwrap();
+        assert_eq!(running.cap, Some(6));
+        assert!(running.external_runner.is_none());
+        // Adding the table is a restart-only change.
+        let err = reload(
+            &mut running,
+            &write_serve_config(dir.path(), crate::external_runner_spec::tests::VALID),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("restart-only"), "{err}");
+        assert!(running.external_runner.is_none());
     }
 }

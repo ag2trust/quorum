@@ -11,6 +11,7 @@ mod cli;
 mod cockpit;
 mod config;
 mod coordinator;
+mod external_runner_spec;
 mod github_credentials;
 mod graph_blocker;
 mod input;
