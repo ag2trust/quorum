@@ -80,15 +80,16 @@ fn add_captured_usage(
     }
 }
 
-/// Spawn using the provider resolved from `model`. Provider resolution is
-/// authoritative: an unknown model is rejected and a failed spawn is returned
-/// directly; neither condition falls back to the other runner.
+/// Spawn on the routed profile's `runner`. A built-in runner whose model does
+/// not resolve to it is refused, and a failed spawn is returned directly;
+/// neither condition falls back to another runner.
 #[allow(clippy::too_many_arguments)]
 pub async fn spawn_classifier_configured(
     tasks: &[TaskForClassification],
     dup_context: &[TaskForClassification],
     agent_bin: Option<&str>,
     bare: bool,
+    runner: AgentKind,
     model: &str,
     effort: &str,
     codex_sandbox: &str,
@@ -99,6 +100,7 @@ pub async fn spawn_classifier_configured(
         dup_context,
         agent_bin,
         bare,
+        runner,
         model,
         effort,
         codex_sandbox,
@@ -114,6 +116,7 @@ async fn spawn_classifier_configured_with_timeout(
     dup_context: &[TaskForClassification],
     agent_bin: Option<&str>,
     bare: bool,
+    runner: AgentKind,
     model: &str,
     effort: &str,
     codex_sandbox: &str,
@@ -133,6 +136,7 @@ async fn spawn_classifier_configured_with_timeout(
     // CLAUDE.md ever exists there to inject.
     let proc = RunnerProc::launch_restricted_until(
         &LaunchRequest {
+            runner,
             model,
             effort,
             worktree: dir.path(),
@@ -154,9 +158,7 @@ async fn spawn_classifier_configured_with_timeout(
     .await?;
     Ok(ClassifierSlot {
         proc,
-        provider: AgentKind::for_model(model)
-            .map(|kind| kind.to_string())
-            .unwrap_or_else(|_| "unknown".to_string()),
+        provider: runner.to_string(),
         model: model.to_string(),
         effort: effort.to_string(),
         pending_task_ids,
@@ -490,6 +492,7 @@ mod tests {
             &[],
             runner.to_str(),
             false,
+            AgentKind::for_model(model).unwrap(),
             model,
             "low",
             "read-only",
@@ -706,6 +709,7 @@ mod tests {
             &[],
             runner.to_str(),
             false,
+            AgentKind::for_model("gpt-5.6-terra").unwrap(),
             "gpt-5.6-terra",
             "medium",
             "danger-full-access",
@@ -756,6 +760,7 @@ mod tests {
             &[],
             runner.to_str(),
             false,
+            AgentKind::for_model(CLASSIFIER_MODEL).unwrap(),
             CLASSIFIER_MODEL,
             CLASSIFIER_EFFORT,
             "read-only",
@@ -777,6 +782,57 @@ mod tests {
             -1,
             "classifier was not reaped"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_profile_classifier_never_launches_the_model_derived_runner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("ran");
+        let runner = dir.path().join("runner");
+        std::fs::write(
+            &runner,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", ran.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tasks = vec![TaskForClassification {
+            id: 1,
+            revision: 1,
+            title: "task".into(),
+            body: None,
+            dependencies: vec![],
+            recovery_notes: vec![],
+            body_char_limit: classify::BODY_CHAR_LIMIT,
+        }];
+        let error = match spawn_classifier_configured(
+            &tasks,
+            &[],
+            runner.to_str(),
+            false,
+            AgentKind::External,
+            "gpt-5",
+            "low",
+            "read-only",
+            "",
+        )
+        .await
+        {
+            Ok(slot) => {
+                slot.kill_and_reap().await;
+                panic!("external classifier unexpectedly launched a built-in runner")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("external runner adapter not built"),
+            "{error}"
+        );
+        assert!(!ran.exists(), "a refused classifier launch ran a provider");
     }
 
     #[cfg(unix)]
@@ -822,6 +878,7 @@ mod tests {
             &[],
             runner.to_str(),
             false,
+            AgentKind::for_model("claude-haiku-4-5-20251001").unwrap(),
             "claude-haiku-4-5-20251001",
             "low",
             "read-only",
@@ -901,6 +958,7 @@ mod tests {
             &[],
             runner.to_str(),
             false,
+            AgentKind::for_model(CLASSIFIER_MODEL).unwrap(),
             CLASSIFIER_MODEL,
             CLASSIFIER_EFFORT,
             "read-only",
