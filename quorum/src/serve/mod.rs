@@ -4159,6 +4159,7 @@ fn agent_bin_for_kind(config: &ServeConfig, kind: runner::AgentKind) -> Option<&
             "claude" => Some(runner::AgentKind::Claude),
             "codex" => Some(runner::AgentKind::Codex),
             "grok" => Some(runner::AgentKind::Grok),
+            "external" => Some(runner::AgentKind::External),
             _ => None,
         })
         .collect::<Option<Vec<_>>>()?;
@@ -4184,11 +4185,7 @@ fn agent_bin_for_runner(
     if !provider_explicit {
         return agent_bin;
     }
-    let configured_kind = match runner_kind {
-        crate::serve_config::RunnerKind::Claude => runner::AgentKind::Claude,
-        crate::serve_config::RunnerKind::Codex => runner::AgentKind::Codex,
-        crate::serve_config::RunnerKind::Grok => runner::AgentKind::Grok,
-    };
+    let configured_kind = runner_kind.agent_kind();
     (kind == configured_kind).then_some(agent_bin).flatten()
 }
 
@@ -21447,6 +21444,7 @@ fn runner_continuation_id<'a>(
         runner::AgentKind::Claude => Some(claude_session_id),
         runner::AgentKind::Codex => provider_continuation_id,
         runner::AgentKind::Grok => provider_continuation_id,
+        runner::AgentKind::External => provider_continuation_id,
     }
 }
 
@@ -28832,11 +28830,15 @@ fn routed_provider_executable_in_path(
     worktree: &Path,
     path: Option<&std::ffi::OsStr>,
 ) -> std::result::Result<String, runner::RunnerFailure> {
-    let requested = agent_bin_for_kind(config, kind).unwrap_or(match kind {
-        runner::AgentKind::Claude => "claude",
-        runner::AgentKind::Codex => "codex",
-        runner::AgentKind::Grok => "grok",
-    });
+    let requested = match (agent_bin_for_kind(config, kind), kind) {
+        (Some(agent_bin), _) => agent_bin,
+        (None, runner::AgentKind::Claude) => "claude",
+        (None, runner::AgentKind::Codex) => "codex",
+        (None, runner::AgentKind::Grok) => "grok",
+        (None, runner::AgentKind::External) => {
+            return Err(fallback_launch_failure("external runner adapter not built"));
+        }
+    };
     if requested.is_empty() || requested.contains('\0') {
         return Err(fallback_launch_failure(format!(
             "routed {kind} executable is empty or invalid"
@@ -61281,6 +61283,36 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
     }
 
     #[test]
+    fn agent_bin_for_kind_applies_to_external_only_profiles() {
+        let mut config =
+            pre_review_checks_config(PathBuf::from("/tmp/q.db"), PathBuf::from("/tmp"));
+        config.agent_bin = Some("/opt/fake-cli".into());
+        for profile in config.model_profiles.values_mut() {
+            profile.runner = "external".into();
+            profile.model = "gpt-5".into();
+        }
+        assert_eq!(
+            agent_bin_for_kind(&config, runner::AgentKind::External),
+            Some("/opt/fake-cli")
+        );
+        assert_eq!(agent_bin_for_kind(&config, runner::AgentKind::Codex), None);
+
+        config.model_profiles.insert(
+            "builtin".into(),
+            crate::serve_config::ModelProfile {
+                runner: "codex".into(),
+                model: "gpt-5.5".into(),
+                effort: "medium".into(),
+            },
+        );
+        assert_eq!(
+            agent_bin_for_kind(&config, runner::AgentKind::External),
+            None,
+            "mixed runners never share agent_bin"
+        );
+    }
+
+    #[test]
     fn explicit_review_model_without_provider_selects_its_model_and_effort() {
         assert_eq!(
             configured_reviewer_selection(false, true, "gpt-5.6-terra", "high",),
@@ -68159,7 +68191,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 &move |kind| match kind {
                     runner::AgentKind::Codex => Some(codex.to_string_lossy().into_owned()),
                     runner::AgentKind::Claude => Some(claude.to_string_lossy().into_owned()),
-                    runner::AgentKind::Grok => None,
+                    runner::AgentKind::Grok | runner::AgentKind::External => None,
                 },
             )
             .await

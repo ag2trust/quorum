@@ -201,7 +201,7 @@ impl FailureTracker {
             Some(AgentKind::Claude) => AgentProc::failure_observation(raw),
             Some(AgentKind::Codex) => CodexProc::failure_observation(raw),
             Some(AgentKind::Grok) => GrokProc::failure_observation(raw),
-            None => return,
+            Some(AgentKind::External) | None => return,
         };
         self.record(observation, true);
     }
@@ -212,7 +212,7 @@ impl FailureTracker {
             Some(AgentKind::Claude) => AgentProc::stderr_failure_observation(text),
             Some(AgentKind::Codex) => CodexProc::stderr_failure_observation(text),
             Some(AgentKind::Grok) => GrokProc::stderr_failure_observation(text),
-            None => return,
+            Some(AgentKind::External) | None => return,
         };
         self.record(observation, false);
     }
@@ -547,6 +547,10 @@ pub enum AgentKind {
     Claude,
     Codex,
     Grok,
+    /// Operator-declared external CLI runner. Selected only from a routed
+    /// profile's `runner = "external"`; [`AgentKind::for_model`] never
+    /// returns it.
+    External,
 }
 
 /// Unbound gate half returned by [`gated_command`]. Adapters bind it to the
@@ -1083,6 +1087,9 @@ impl RunnerProc {
             RunnerFailure::new(FailureDisposition::Unclassified, error)
                 .with_io_kind(std::io::ErrorKind::InvalidInput)
         })?;
+        if kind == AgentKind::External {
+            return Err(external_adapter_not_built());
+        }
         if kind != AgentKind::Grok
             || request.task_id <= 0
             || request.role_assignment_id <= 0
@@ -1135,11 +1142,20 @@ impl RunnerProc {
             RunnerFailure::new(FailureDisposition::Unclassified, error)
                 .with_io_kind(std::io::ErrorKind::InvalidInput)
         })?;
+        Self::launch_as(kind, request, config).await
+    }
+
+    async fn launch_as(
+        kind: AgentKind,
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+    ) -> Result<Self, RunnerFailure> {
         require_managed_agent_mcp(kind, request)?;
         let result = match kind {
             AgentKind::Claude => AgentProc::launch(request, config).await.map(Self::Claude),
             AgentKind::Codex => CodexProc::launch(request, config).map(Self::Codex),
             AgentKind::Grok => GrokProc::launch(request, config).map(Self::Grok),
+            AgentKind::External => return Err(external_adapter_not_built()),
         };
         result.map_err(|error| classify_launch_error(kind, error))
     }
@@ -1161,6 +1177,15 @@ impl RunnerProc {
             RunnerFailure::new(FailureDisposition::Unclassified, error)
                 .with_io_kind(std::io::ErrorKind::InvalidInput)
         })?;
+        Self::launch_gated_as(kind, request, config).await
+    }
+
+    #[allow(dead_code)] // dormant fallback boundary; no lifecycle caller yet
+    async fn launch_gated_as(
+        kind: AgentKind,
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+    ) -> Result<(Self, LaunchGate), RunnerFailure> {
         require_managed_agent_mcp(kind, request)?;
         let result = match kind {
             AgentKind::Claude => AgentProc::launch_gated(request, config)
@@ -1171,6 +1196,7 @@ impl RunnerProc {
             AgentKind::Grok => {
                 GrokProc::launch_gated(request, config).map(|(proc, gate)| (Self::Grok(proc), gate))
             }
+            AgentKind::External => return Err(external_adapter_not_built()),
         };
         result.map_err(|error| classify_launch_error(kind, error))
     }
@@ -1201,6 +1227,15 @@ impl RunnerProc {
             RunnerFailure::new(FailureDisposition::Unclassified, error)
                 .with_io_kind(std::io::ErrorKind::InvalidInput)
         })?;
+        Self::launch_restricted_until_as(kind, request, config, deadline).await
+    }
+
+    async fn launch_restricted_until_as(
+        kind: AgentKind,
+        request: &LaunchRequest<'_>,
+        config: &AdapterConfig<'_>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, RunnerFailure> {
         require_managed_agent_mcp(kind, request)?;
         let result = match kind {
             AgentKind::Claude => AgentProc::launch_restricted_until(request, config, deadline)
@@ -1208,6 +1243,7 @@ impl RunnerProc {
                 .map(Self::Claude),
             AgentKind::Codex => CodexProc::launch(request, config).map(Self::Codex),
             AgentKind::Grok => GrokProc::launch(request, config).map(Self::Grok),
+            AgentKind::External => return Err(external_adapter_not_built()),
         };
         result.map_err(|error| classify_launch_error(kind, error))
     }
@@ -1559,6 +1595,16 @@ pub fn launch_failure(error: &std::io::Error) -> Option<RunnerFailure> {
         .cloned()
 }
 
+/// Launch failure for the external runner until its adapter exists. The
+/// configuration cannot be repaired by failing over, so it is NonFailover.
+fn external_adapter_not_built() -> RunnerFailure {
+    RunnerFailure::new(
+        FailureDisposition::NonFailover,
+        "external runner adapter not built",
+    )
+    .with_io_kind(std::io::ErrorKind::Unsupported)
+}
+
 fn classify_launch_error(kind: AgentKind, error: std::io::Error) -> RunnerFailure {
     // A Claude child can exit while the first stdin write races it. Its
     // adapter has already waited for the exit and classified its bounded
@@ -1594,6 +1640,7 @@ impl AgentKind {
             Self::Claude => TurnMode::PersistentChild,
             Self::Codex => TurnMode::RespawnPerTurn,
             Self::Grok => TurnMode::RespawnPerTurn,
+            Self::External => TurnMode::RespawnPerTurn,
         }
     }
 
@@ -1637,6 +1684,7 @@ impl std::fmt::Display for AgentKind {
             Self::Claude => f.write_str("claude"),
             Self::Codex => f.write_str("codex"),
             Self::Grok => f.write_str("grok"),
+            Self::External => f.write_str("external"),
         }
     }
 }
@@ -1809,6 +1857,9 @@ pub fn normalize_line(kind: AgentKind, raw: &str) -> Vec<AgentEvent> {
         AgentKind::Claude => normalize_claude_line(raw),
         AgentKind::Codex => normalize_codex_line(raw),
         AgentKind::Grok => normalize_grok_line(raw),
+        // The external stream mapping is declared by the operator and is
+        // built with the external adapter; no built-in parser applies.
+        AgentKind::External => Vec::new(),
     }
 }
 
@@ -3246,6 +3297,7 @@ mod tests {
                         ""
                     );
                 }
+                AgentKind::External => unreachable!("for_model never resolves External"),
             }
         }
     }
@@ -3280,6 +3332,63 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("unknown model"));
         assert_eq!(error.disposition(), FailureDisposition::Unclassified);
+    }
+
+    #[tokio::test]
+    async fn external_kind_launch_is_non_failover_until_adapter_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = LaunchRequest {
+            model: "gpt-5",
+            effort: "custom_effort",
+            worktree: dir.path(),
+            prompt: "prompt",
+            environment: &[],
+            mode: LaunchMode::Normal,
+            continuation_id: None,
+            managed: None,
+        };
+        let config = AdapterConfig {
+            executable: Some("/definitely/not/a/runner"),
+            claude_bare: false,
+            claude_allowed_tools: "",
+            codex_sandbox: "read-only",
+            grok: Default::default(),
+        };
+        let assert_stub = |error: RunnerFailure| {
+            assert_eq!(error.disposition(), FailureDisposition::NonFailover);
+            assert_eq!(error.detail(), "external runner adapter not built");
+        };
+        match RunnerProc::launch_as(AgentKind::External, &request, &config).await {
+            Ok(_) => panic!("external runner unexpectedly launched"),
+            Err(error) => assert_stub(error),
+        }
+        match RunnerProc::launch_gated_as(AgentKind::External, &request, &config).await {
+            Ok(_) => panic!("external runner unexpectedly launched gated"),
+            Err(error) => assert_stub(error),
+        }
+        let restricted = LaunchRequest {
+            mode: LaunchMode::Restricted,
+            ..request
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        match RunnerProc::launch_restricted_until_as(
+            AgentKind::External,
+            &restricted,
+            &config,
+            deadline,
+        )
+        .await
+        {
+            Ok(_) => panic!("external runner unexpectedly launched restricted"),
+            Err(error) => assert_stub(error),
+        }
+        // The model string never selects the external runner.
+        assert_eq!(AgentKind::for_model("gpt-5").unwrap(), AgentKind::Codex);
+        assert_eq!(AgentKind::External.to_string(), "external");
+        assert_eq!(
+            AgentKind::External.turn_mode(),
+            super::TurnMode::RespawnPerTurn
+        );
     }
 
     #[tokio::test]

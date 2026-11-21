@@ -375,6 +375,12 @@ pub async fn spawn_arbiter(
                 std::io::ErrorKind::PermissionDenied,
                 "Grok plan-review arbiter refused: managed Grok lifecycle roles are not enabled",
             )),
+            AgentKind::External => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "external runner adapter not built",
+                ))
+            }
             AgentKind::Claude => {
                 let spec = AgentSpec {
                     kind: AgentKind::Claude,
@@ -489,6 +495,7 @@ pub async fn poll_arbiter(slot: &mut ArbiterSlot) -> Option<ArbiterPoll> {
             AgentKind::Claude => super::runner::normalize_claude_line(&raw),
             AgentKind::Codex => super::runner::normalize_codex_line(&raw),
             AgentKind::Grok => super::runner::normalize_grok_line(&raw),
+            AgentKind::External => Vec::new(),
         };
         if let Some(session_log) = slot.session_log.as_mut() {
             session_log.log_raw_and_normalized(&raw, &events);
