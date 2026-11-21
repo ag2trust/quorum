@@ -4940,6 +4940,9 @@ pub struct ServeConfig {
     pub routing: crate::serve_config::RoutingPolicy,
     pub repo_dir: PathBuf,
     pub worktree_base: PathBuf,
+    /// Root of per-task session directories (spec "Sessions" > "Layout").
+    /// Resolved and validated by `serve_config::resolve_session_base`.
+    pub session_base: PathBuf,
     pub names_file: Option<PathBuf>,
     pub agent_bin: Option<String>,
     pub merge_executor: Arc<dyn merge::MergeExecutor>,
@@ -5058,8 +5061,11 @@ pub fn run_serve(
 ) -> Result<i32> {
     configure_daemon_log(config.log_dir.as_deref());
     log(&format!(
-        "starting (cap={}, repo={}, max_active_graphs={})",
-        config.cap, config.repo, config.max_active_graphs
+        "starting (cap={}, repo={}, max_active_graphs={}, session_base={})",
+        config.cap,
+        config.repo,
+        config.max_active_graphs,
+        config.session_base.display()
     ));
 
     let daemon_pid = std::process::id() as i64;
@@ -34107,6 +34113,7 @@ mod tests {
                     .collect(),
             },
             worktree_base: repo_dir.clone(),
+            session_base: repo_dir.with_file_name("sessions"),
             repo_dir,
             names_file: None,
             agent_bin: None,
@@ -37195,6 +37202,7 @@ mod tests {
             },
             repo_dir: root.to_path_buf(),
             worktree_base: root.to_path_buf(),
+            session_base: root.with_file_name("sessions"),
             names_file: None,
             agent_bin: Some(runner_program.to_string_lossy().into_owned()),
             merge_executor,
@@ -48117,6 +48125,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                     .map(|level| (level.to_string(), pool.clone()))
                     .collect(),
             },
+            session_base: repo_dir.with_file_name("sessions"),
             repo_dir: repo_dir.clone(),
             worktree_base: repo_dir,
             names_file: None,

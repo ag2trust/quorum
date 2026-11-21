@@ -169,6 +169,9 @@ declare_serve_file_config! {
     cap: Option<usize>,
     repo_dir: Option<String>,
     worktree_base: Option<String>,
+    /// Root of per-task session directories. Absolute. Default:
+    /// `<state dir>/sessions`. Restart-only: see spec "Sessions" > "Layout".
+    session_base: Option<String>,
     names_file: Option<String>,
     agent_bin: Option<String>,
     #[cfg(test)]
@@ -262,6 +265,9 @@ declare_serve_file_config! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigKeyDisposition {
     Runtime,
+    /// Consumed at startup only. A reload that changes it is refused and the
+    /// running configuration stays in force.
+    RestartOnly,
     Deprecated,
 }
 
@@ -278,6 +284,7 @@ const SERVE_FILE_CONFIG_KEY_REGISTRY: &[(&str, ConfigKeyDisposition)] = &[
     ("cap", ConfigKeyDisposition::Runtime),
     ("repo_dir", ConfigKeyDisposition::Runtime),
     ("worktree_base", ConfigKeyDisposition::Runtime),
+    ("session_base", ConfigKeyDisposition::RestartOnly),
     ("names_file", ConfigKeyDisposition::Runtime),
     ("agent_bin", ConfigKeyDisposition::Runtime),
     #[cfg(test)]
@@ -734,6 +741,136 @@ pub fn load(path: &Path, explicit: bool) -> Result<ServeFileConfig> {
             "cannot read serve config {}: {e}",
             path.display()
         ))),
+    }
+}
+
+/// Default subdirectory name for `session_base` when resolved from the state
+/// directory (the per-repository directory holding `quorum.db`).
+const SESSION_BASE_DIR_NAME: &str = "sessions";
+
+/// Resolve and validate `session_base`: the root of per-task session
+/// directories (spec "Sessions" > "Layout"). Default: `<state_dir>/sessions`,
+/// which sits inside the state directory on purpose, so that a bare config
+/// keeps working unchanged. Refused (exit 2): not absolute; equal to or
+/// inside `worktree_base`; or containing `worktree_base` or `state_dir`.
+/// Creates the directory with mode 0700 when missing; refuses a symlink or a
+/// non-directory left at that path. `session_base` is restart-only — see
+/// `SERVE_FILE_CONFIG_KEY_REGISTRY`.
+pub fn resolve_session_base(
+    configured: Option<&str>,
+    state_dir: &Path,
+    worktree_base: &Path,
+) -> Result<std::path::PathBuf> {
+    let session_base = match configured {
+        Some(value) => std::path::PathBuf::from(value),
+        None => state_dir.join(SESSION_BASE_DIR_NAME),
+    };
+    if !session_base.is_absolute() {
+        return Err(QuorumError::Usage(format!(
+            "session_base must be an absolute path, got \"{}\"",
+            session_base.display()
+        )));
+    }
+    if path_contains(&session_base, worktree_base) || path_contains(worktree_base, &session_base) {
+        return Err(QuorumError::Usage(format!(
+            "session_base \"{}\" must not equal, be inside, or contain worktree_base \"{}\"",
+            session_base.display(),
+            worktree_base.display()
+        )));
+    }
+    if path_contains(&session_base, state_dir) {
+        return Err(QuorumError::Usage(format!(
+            "session_base \"{}\" must not contain the state directory \"{}\"",
+            session_base.display(),
+            state_dir.display()
+        )));
+    }
+    create_session_base_dir(&session_base)?;
+    Ok(session_base)
+}
+
+/// True when `ancestor` lexically equals or contains `path`, compared
+/// component-by-component without touching the filesystem.  `session_base`
+/// may not exist yet, so this cannot canonicalize either side.
+fn path_contains(ancestor: &Path, path: &Path) -> bool {
+    let ancestor: Vec<_> = ancestor.components().collect();
+    let path: Vec<_> = path.components().collect();
+    ancestor.len() <= path.len() && ancestor.iter().zip(path.iter()).all(|(a, b)| a == b)
+}
+
+/// Create `session_base` with mode 0700 if missing; refuse a symlink or a
+/// non-directory already at that path.
+fn create_session_base_dir(session_base: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::symlink_metadata(session_base) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(QuorumError::Usage(format!(
+                    "session_base \"{}\" must not be a symlink",
+                    session_base.display()
+                )));
+            }
+            if !metadata.is_dir() {
+                return Err(QuorumError::Usage(format!(
+                    "session_base \"{}\" must be a directory",
+                    session_base.display()
+                )));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(session_base).map_err(|error| {
+                QuorumError::Io(format!(
+                    "failed to create session_base \"{}\": {error}",
+                    session_base.display()
+                ))
+            })?;
+            std::fs::set_permissions(session_base, std::fs::Permissions::from_mode(0o700)).map_err(
+                |error| {
+                    QuorumError::Io(format!(
+                        "failed to set session_base \"{}\" permissions: {error}",
+                        session_base.display()
+                    ))
+                },
+            )
+        }
+        Err(error) => Err(QuorumError::Io(format!(
+            "failed to inspect session_base \"{}\": {error}",
+            session_base.display()
+        ))),
+    }
+}
+
+/// Replace `running` with the config at `path` only when the candidate passes
+/// every startup rule and leaves every restart-only key unchanged. On any
+/// refusal `running` is untouched. The daemon has no live reload trigger yet;
+/// this is the one gate any reload path must use.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn reload(running: &mut ServeFileConfig, path: &Path) -> Result<()> {
+    let candidate = load(path, true)?;
+    for (key, disposition) in SERVE_FILE_CONFIG_KEY_REGISTRY {
+        if *disposition == ConfigKeyDisposition::RestartOnly
+            && restart_only_key_changed(key, running, &candidate)
+        {
+            return Err(QuorumError::Usage(format!(
+                "serve config key \"{key}\" is restart-only; the running configuration stays in force until restart"
+            )));
+        }
+    }
+    *running = candidate;
+    Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn restart_only_key_changed(
+    key: &str,
+    running: &ServeFileConfig,
+    candidate: &ServeFileConfig,
+) -> bool {
+    match key {
+        "session_base" => running.session_base != candidate.session_base,
+        // A restart-only key without a comparison is treated as changed.
+        _ => true,
     }
 }
 
@@ -3357,5 +3494,197 @@ worktree_base = "/tmp/wt"
             b.contains("effective idle limit:      900 (default; max_idle_secs overrides"),
             "effective idle limit should be 900 by default: {b}"
         );
+    }
+
+    // ── session_base ─────────────────────────────────────────────────
+
+    fn session_base_dirs(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let state_dir = dir.join("state");
+        let worktree_base = dir.join("worktrees");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&worktree_base).unwrap();
+        (state_dir, worktree_base)
+    }
+
+    #[test]
+    fn session_base_default_resolves_under_the_state_dir_and_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state_dir, worktree_base) = session_base_dirs(dir.path());
+        let resolved = resolve_session_base(None, &state_dir, &worktree_base).unwrap();
+        assert_eq!(resolved, state_dir.join("sessions"));
+        let metadata = std::fs::symlink_metadata(&resolved).unwrap();
+        assert!(metadata.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        }
+    }
+
+    #[test]
+    fn session_base_missing_directory_is_created_with_default_configured_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state_dir, worktree_base) = session_base_dirs(dir.path());
+        let configured = dir.path().join("elsewhere").join("sessions");
+        assert!(!configured.exists());
+        let resolved = resolve_session_base(
+            Some(configured.to_str().unwrap()),
+            &state_dir,
+            &worktree_base,
+        )
+        .unwrap();
+        assert_eq!(resolved, configured);
+        assert!(std::fs::symlink_metadata(&configured).unwrap().is_dir());
+    }
+
+    #[test]
+    fn session_base_refuses_a_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state_dir, worktree_base) = session_base_dirs(dir.path());
+        let err = resolve_session_base(Some("relative/sessions"), &state_dir, &worktree_base)
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("session_base"), "{err}");
+        assert!(err.to_string().contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn session_base_refuses_equal_to_worktree_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state_dir, worktree_base) = session_base_dirs(dir.path());
+        let err = resolve_session_base(
+            Some(worktree_base.to_str().unwrap()),
+            &state_dir,
+            &worktree_base,
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("session_base"), "{err}");
+        assert!(err.to_string().contains("worktree_base"), "{err}");
+    }
+
+    #[test]
+    fn session_base_refuses_inside_worktree_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state_dir, worktree_base) = session_base_dirs(dir.path());
+        let inside = worktree_base.join("sessions");
+        let err = resolve_session_base(Some(inside.to_str().unwrap()), &state_dir, &worktree_base)
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("worktree_base"), "{err}");
+    }
+
+    #[test]
+    fn session_base_refuses_containing_worktree_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state_dir, worktree_base) = session_base_dirs(dir.path());
+        let containing = worktree_base.parent().unwrap().to_path_buf();
+        let err = resolve_session_base(
+            Some(containing.to_str().unwrap()),
+            &state_dir,
+            &worktree_base,
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("worktree_base"), "{err}");
+    }
+
+    #[test]
+    fn session_base_refuses_containing_the_state_dir() {
+        // state_dir nests one level deeper than worktree_base so that an
+        // ancestor of state_dir is not also an ancestor of worktree_base,
+        // isolating the "contains the state directory" rule from the
+        // worktree_base containment rule.
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("nested").join("state");
+        let worktree_base = dir.path().join("worktrees");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&worktree_base).unwrap();
+        let containing = state_dir.parent().unwrap().to_path_buf();
+        let err = resolve_session_base(
+            Some(containing.to_str().unwrap()),
+            &state_dir,
+            &worktree_base,
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("state directory"), "{err}");
+    }
+
+    #[test]
+    fn session_base_allows_the_default_location_inside_the_state_dir() {
+        // The default (<state_dir>/sessions) is a descendant of state_dir,
+        // not an ancestor, so it must not trip the "contains the state
+        // directory" refusal.
+        let dir = tempfile::tempdir().unwrap();
+        let (state_dir, worktree_base) = session_base_dirs(dir.path());
+        let inside_state_dir = state_dir.join("sessions");
+        resolve_session_base(
+            Some(inside_state_dir.to_str().unwrap()),
+            &state_dir,
+            &worktree_base,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn session_base_refuses_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state_dir, worktree_base) = session_base_dirs(dir.path());
+        let real_target = dir.path().join("real-sessions");
+        std::fs::create_dir_all(&real_target).unwrap();
+        let link = dir.path().join("linked-sessions");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_target, &link).unwrap();
+        let err = resolve_session_base(Some(link.to_str().unwrap()), &state_dir, &worktree_base)
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn session_base_refuses_a_non_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state_dir, worktree_base) = session_base_dirs(dir.path());
+        let file = dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let err = resolve_session_base(Some(file.to_str().unwrap()), &state_dir, &worktree_base)
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("directory"), "{err}");
+    }
+
+    fn write_serve_config(dir: &Path, extra: &str) -> std::path::PathBuf {
+        let path = dir.join("serve.toml");
+        std::fs::write(&path, format!("{extra}\n{VALID_ROUTING}")).unwrap();
+        path
+    }
+
+    #[test]
+    fn reload_refuses_a_session_base_change_and_keeps_the_running_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_serve_config(dir.path(), "cap = 3\nsession_base = \"/srv/a\"\n");
+        let mut running = load(&path, true).unwrap();
+        assert_eq!(running.session_base.as_deref(), Some("/srv/a"));
+
+        let changed_path = write_serve_config(dir.path(), "cap = 4\nsession_base = \"/srv/b\"\n");
+        let err = reload(&mut running, &changed_path).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("session_base"), "{err}");
+        assert!(err.to_string().contains("restart-only"), "{err}");
+        assert_eq!(running.cap, Some(3), "running config must stay in force");
+        assert_eq!(running.session_base.as_deref(), Some("/srv/a"));
+    }
+
+    #[test]
+    fn reload_without_a_session_base_change_applies_runtime_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_serve_config(dir.path(), "cap = 3\nsession_base = \"/srv/a\"\n");
+        let mut running = load(&path, true).unwrap();
+
+        let same_path = write_serve_config(dir.path(), "cap = 5\nsession_base = \"/srv/a\"\n");
+        reload(&mut running, &same_path).unwrap();
+        assert_eq!(running.cap, Some(5));
+        assert_eq!(running.session_base.as_deref(), Some("/srv/a"));
     }
 }

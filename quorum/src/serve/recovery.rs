@@ -1448,6 +1448,7 @@ mod tests {
                 reviewer: std::collections::BTreeMap::new(),
             },
             repo_dir,
+            session_base: worktree_base.with_file_name("sessions"),
             worktree_base,
             names_file: None,
             agent_bin: None,
