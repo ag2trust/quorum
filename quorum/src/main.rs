@@ -2106,6 +2106,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                         &dup_context,
                         agent_bin.as_deref(),
                         !no_bare_agent,
+                        // The built-in default classifier profile runs on Claude.
+                        serve::runner::AgentKind::Claude,
                         serve::classifier::CLASSIFIER_MODEL,
                         serve::classifier::CLASSIFIER_EFFORT,
                         "workspace-write",
