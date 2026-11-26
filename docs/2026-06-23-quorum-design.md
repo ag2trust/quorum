@@ -1620,9 +1620,17 @@ provisioning and merge.
 - `Pending`, `TimedOut`, and pending required jobs keep the task `in-review`. The daemon
   polls in a background blocking task, consumes no reviewer identity or process slot, and
   makes no lifecycle transition.
+- A required job absent from the exact-head rollup is unregistered, not failed: GitHub can
+  report `CLEAN` or an empty rollup seconds after a push, before CI registers its jobs.
+  While no required job has a terminal non-`SUCCESS` conclusion, absence keeps the task
+  `in-review` at the normal poll cadence with no worker feedback, rework round, or
+  remediation attempt. If jobs stay unregistered for `merge_checks_timeout_secs` after the
+  gate first saw that head, the daemon posts one metadata-only owner alert (task, PR, head,
+  missing jobs) and keeps waiting; a new head restarts the window. The merge-time and
+  branch-sync required-jobs gates keep treating absence as `NotReady`.
 - `Failed` or a completed required-job result other than `SUCCESS` fires
   `ChecksFailed` from the daemon and enters the existing rework/remediation path without
-  spawning a reviewer.
+  spawning a reviewer. A terminal failure fails even when other required jobs are absent.
 - The gate is keyed by `(task, PR, head SHA)` and discarded after each provisioning
   attempt. R2 and sticky `ResumeReviewer` turns therefore recheck CI; a prior review
   cannot authorize any later review turn against a moved or newly failing head. A pending
