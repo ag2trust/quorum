@@ -99,6 +99,11 @@ max_task_cost_usd  = 100.0
 
 # ── merge ─────────────────────────────────────────────────────────────
 # merge_token_file         = "/home/user/.quorum/serve/merge-token"
+# Without merge_token_file, the daemon merges in one-identity mode: it shares its
+# publishing identity with the PRs it merges, so it cannot post a formal
+# APPROVE/REQUEST_CHANGES on its own PR and posts a COMMENT verdict instead. If branch
+# protection requires an approving review from someone other than the author, that
+# review still needs a person; the daemon parks the merge until one is given.
 merge_checks_timeout_secs  = 900
 # merge_checks_poll_secs   = 30
 # Required for every configured branch sync. Syncs fail closed once published
