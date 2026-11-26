@@ -74,6 +74,12 @@ printf 'FROM %s\nUSER 0\nRUN mkdir -p /opt/src && touch /opt/src/main.rs\n' "$im
   | negative rust-source 'a Rust source tree' 'forbidden path in image: /opt/src/main.rs'
 printf 'FROM %s\nRUN printf -- "-----BEGIN OPENSSH %%s-----\\n" "PRIVATE KEY" >/home/quorum/notes\n' "$image" \
   | negative ssh-key 'an SSH private key' 'private key material in image file: /home/quorum/notes'
+printf 'FROM %s\nUSER 0\nRUN printf "\\nGH_TOKEN = \\"fixture-not-a-secret\\"\\n" >>/usr/share/quorum/serve-codex.toml\n' "$image" \
+  | negative provider-config-cred 'a credential planted in the provider config' \
+    'credential-like value in agent-facing provider config: /usr/share/quorum/serve-codex.toml'
+printf 'FROM %s\nUSER 0\nRUN printf "\\ndb = \\"/data/quorum/repos/x/quorum.db\\"\\n" >>/usr/share/quorum/serve-codex.toml\n' "$image" \
+  | negative provider-config-dbpath 'a Quorum DB path planted in the provider config' \
+    'Quorum database path in agent-facing provider config: /usr/share/quorum/serve-codex.toml'
 
 # A context with no .dockerignore admits VCS metadata, local DBs and build
 # output; an oversized one breaks the bound. The real .dockerignore filters the

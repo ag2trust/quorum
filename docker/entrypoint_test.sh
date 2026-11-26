@@ -186,6 +186,26 @@ check 'init outside managed checkout' "$QUORUM_HOME/init" "$init_pwd"
 check 'serve and Web started' 'serve web ' "$(awk '$1 == "serve" || $1 == "web" { print $1 }' "$FAKE_CALLS" | sort | tr '\n' ' ')"
 teardown
 
+# GH_TOKEN/GITHUB_TOKEN are legitimate daemon-only authority (the operator
+# injects them for `quorum serve`'s own GitHub access, inherited from this
+# script's own environment). The installed provider config is a byte-for-byte
+# copy of the template, never templated or interpolated, so it must never
+# carry these fixture values, and the recorded init/serve/web argv must never
+# carry them either.
+setup
+GH_TOKEN=entrypoint-fixture-token GITHUB_TOKEN=entrypoint-fixture-token-2 \
+  FAKE_SERVE_SLEEP=1 FAKE_SERVE_CODE=0 FAKE_WEB_SLEEP=30 \
+  sh "$ENTRY" >/dev/null 2>&1
+check 'serve exit 0 with ambient GH tokens' 0 "$?"
+config="$QUORUM_HOME/serve/acme__widget.toml"
+check 'fresh config excludes ambient GH_TOKEN' no \
+  "$(grep -qF entrypoint-fixture-token "$config" && echo yes || echo no)"
+check 'fresh config excludes ambient GITHUB_TOKEN' no \
+  "$(grep -qF entrypoint-fixture-token-2 "$config" && echo yes || echo no)"
+check 'recorded argv excludes ambient GH tokens' no \
+  "$(grep -qF entrypoint-fixture-token "$FAKE_CALLS" && echo yes || echo no)"
+teardown
+
 # Existing configuration is preserved byte-for-byte.
 setup
 mkdir -p "$QUORUM_HOME/serve"
