@@ -976,6 +976,103 @@ fn restart_after_checks_failed_recovers_exact_same_pr_remediation() {
     handle.sigkill();
 }
 
+/// Restart while a pre-review conflict rework is pending (MergeConflict and
+/// its durable intent committed, no worker yet) provisions exactly one
+/// remediation worker carrying the merge-base feedback.
+#[test]
+fn restart_after_pre_review_conflict_provisions_one_remediation_worker() {
+    let home = tempfile::tempdir().unwrap();
+    let repo_dir = tempfile::tempdir().unwrap();
+    let wt_base = tempfile::tempdir().unwrap();
+    init_git_repo(repo_dir.path());
+    let names_file = write_names_file(home.path());
+
+    Command::new(cargo_bin("quorum"))
+        .env("QUORUM_HOME", home.path())
+        .env("QUORUM_REPO", "test/repo")
+        .arg("init")
+        .status()
+        .unwrap();
+    let author = "OrigWorker";
+    let pr = 1;
+    let task_id = seed_in_review_task(home.path(), author, pr);
+    create_pr_branch(repo_dir.path(), author, task_id);
+    let head_sha = String::from_utf8(
+        Command::new("git")
+            .args([
+                "-C",
+                &repo_dir.path().to_string_lossy(),
+                "rev-parse",
+                "HEAD",
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let db_path = home
+        .path()
+        .join("repos")
+        .join("test__repo")
+        .join("quorum.db");
+    let feedback = "PR #1 has conflicts with main (a sibling PR likely merged first).\n\n\
+                    Preserve the published PR head, merge main into the PR branch, resolve \
+                    conflicts, commit, and submit without pushing. Never rebase.";
+    {
+        let mut conn = quorum_core::db::open(&db_path).unwrap();
+        let entered = quorum_core::tasks::apply_pre_review_conflict_with_remediation(
+            &mut conn,
+            task_id,
+            pr,
+            &head_sha,
+            feedback,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+        )
+        .unwrap();
+        assert_eq!(entered.task.status, "rework");
+        assert_eq!(entered.task.rework_round, 1);
+    }
+
+    let mut handle = ServeHandle::start(
+        home.path(),
+        repo_dir.path(),
+        wt_base.path(),
+        &names_file,
+        "true",
+        &[],
+    );
+    assert!(
+        handle.wait_for("remediation worker", 15),
+        "restart did not provision the conflict remediation: {:?}",
+        handle.lines
+    );
+    // Let several more ticks run: the reconciler must not provision again.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    let conn = quorum_core::db::open(&db_path).unwrap();
+    let task = quorum_core::tasks::get(&conn, task_id).unwrap().unwrap();
+    assert_eq!(task.status, "rework");
+    assert_eq!(task.rework_round, 1, "restart must not spend another round");
+    let runs = quorum_core::agent_runs::runs_for_task(&conn, task_id).unwrap();
+    let worker_runs: Vec<_> = runs.iter().filter(|run| run.role == "worker").collect();
+    assert_eq!(
+        worker_runs.len(),
+        1,
+        "exactly one remediation worker after restart: {runs:?}"
+    );
+    let intent = quorum_core::tasks::ci_remediation_intent(task.refs.as_deref())
+        .unwrap()
+        .unwrap();
+    assert_eq!(intent.head_sha, head_sha);
+    assert_eq!(intent.feedback, feedback);
+    handle.sigkill();
+}
+
 /// A durable CI remediation with a cancelled (unsatisfiable) dependency must park
 /// instead of retrying its clean-negative claim on every daemon tick.
 #[test]
