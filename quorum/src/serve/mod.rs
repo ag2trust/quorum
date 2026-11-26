@@ -74284,8 +74284,8 @@ exec /bin/cat '{stdout}'
             .unwrap_err()
             .to_string();
             assert!(error.contains("timed out"), "{error}");
-            let pids = [&archive_pid, &tar_pid]
-                .map(|pid_file| std::fs::read_to_string(pid_file).ok());
+            let pids =
+                [&archive_pid, &tar_pid].map(|pid_file| std::fs::read_to_string(pid_file).ok());
             if pids.iter().any(Option::is_none) {
                 // A wrapper that never started may still have been reaped; check
                 // whichever did start, then retry with the longer deadline.
