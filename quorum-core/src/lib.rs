@@ -11,6 +11,7 @@ pub mod approvals;
 pub mod branch_sync;
 pub mod branches;
 pub mod capabilities;
+pub mod ci_digest;
 pub mod claims;
 pub mod classify;
 pub mod clock;
