@@ -14,6 +14,8 @@ use std::path::Path;
 pub(crate) const WORKTREE_RECOVER_TEXT_MAX: usize = 1024;
 /// Restored untracked paths listed in a resume note.
 const RESTORED_PATHS_MAX: usize = 20;
+/// Bytes of the predecessor's busy-ceiling cause quoted in a resume note.
+const BUSY_CEILING_CAUSE_MAX: usize = 360;
 /// Bound on recover refs retired per housekeeping pass.
 const RECOVER_REF_HOUSEKEEPING_MAX_DELETES: i64 = 64;
 /// Recover refs of done/cancelled tasks are kept this long after the task's
@@ -490,11 +492,14 @@ pub(crate) async fn restore_resumed_snapshot(
 
 /// Task-note body (bounded) describing a resume decision for the next
 /// worker. `None` for outcomes that need no note.
+/// `busy_ceiling_cause` is the predecessor's recorded busy-ceiling failure
+/// cause, quoted when the resumed run was torn down at the busy ceiling.
 pub(crate) fn recover_resume_note(
     agent: &str,
     start: &str,
     outcome: &std::result::Result<RecoverResume, String>,
     restored: Option<&std::result::Result<Vec<String>, String>>,
+    busy_ceiling_cause: Option<&str>,
 ) -> Option<String> {
     let body = match outcome {
         Ok(RecoverResume::None) | Ok(RecoverResume::AlreadyIncorporated(_)) => return None,
@@ -505,6 +510,9 @@ pub(crate) fn recover_resume_note(
                  work (teardown reason: {reason}). Its commits are on the branch.",
                 recover.refname, recover.sha
             );
+            if is_busy_ceiling_teardown(&reason) {
+                body.push_str(&busy_ceiling_resume_guidance(busy_ceiling_cause));
+            }
             match restored {
                 Some(Ok(added)) => {
                     body.push_str(
@@ -562,6 +570,59 @@ pub(crate) fn recover_resume_note(
     Some(truncate_utf8_bytes(&body, WORKTREE_RECOVER_TEXT_MAX).to_string())
 }
 
+/// Teardown reasons are recorded in the ref name, optionally suffixed
+/// (`busy_ceiling-tracked-only`).
+fn is_busy_ceiling_teardown(reason: &str) -> bool {
+    reason.split('-').next() == Some("busy_ceiling")
+}
+
+/// Why the predecessor stopped and how to avoid repeating it: its verification
+/// was cut off at the busy ceiling, not finished, so rerun it once in the
+/// foreground rather than restarting a long background cascade.
+fn busy_ceiling_resume_guidance(cause: Option<&str>) -> String {
+    let detail = cause.map_or_else(
+        || "no command or elapsed time was recorded".to_string(),
+        |cause| truncate_utf8_bytes(cause, BUSY_CEILING_CAUSE_MAX).to_string(),
+    );
+    format!(
+        " The previous run was stopped at the busy ceiling while its background work was \
+         still running ({detail}); that work did not finish. Run that verification once in the \
+         foreground (the repository's full gate directly) instead of repeating separate \
+         build/fmt/clippy/test steps and then the full gate."
+    )
+}
+
+/// The most recent busy-ceiling failure cause recorded for `task_id`.
+async fn latest_busy_ceiling_cause(db_path: &Path, task_id: i64) -> Option<String> {
+    let path = db_path.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        let conn = quorum_core::db::open(&path)?;
+        Ok(conn
+            .query_row(
+                "SELECT substr(body, instr(body, ?2), ?3) FROM task_notes
+                 WHERE task_id=?1 AND agent='daemon' AND instr(body, ?2) > 0
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![
+                    task_id,
+                    super::BUSY_CEILING_CAUSE_MARKER,
+                    BUSY_CEILING_CAUSE_MAX as i64
+                ],
+                |row| row.get(0),
+            )
+            .optional()?)
+    })
+    .await;
+    match result {
+        Ok(Ok(cause)) => cause,
+        other => {
+            log(&format!(
+                "task #{task_id}: busy-ceiling cause lookup failed: {other:?}"
+            ));
+            None
+        }
+    }
+}
+
 /// Record a resume decision as a daemon task note (deduplicated by body so a
 /// repeatedly stale ref does not grow notes); failures also go to `errors`.
 pub(crate) async fn record_recover_resume(
@@ -572,7 +633,21 @@ pub(crate) async fn record_recover_resume(
     outcome: &std::result::Result<RecoverResume, String>,
     restored: Option<&std::result::Result<Vec<String>, String>>,
 ) {
-    let Some(body) = recover_resume_note(agent, start, outcome, restored) else {
+    let busy_ceiling_cause = match outcome {
+        Ok(RecoverResume::Resumed { recover, .. })
+            if is_busy_ceiling_teardown(&recover.provenance().1) =>
+        {
+            latest_busy_ceiling_cause(db_path, task_id).await
+        }
+        _ => None,
+    };
+    let Some(body) = recover_resume_note(
+        agent,
+        start,
+        outcome,
+        restored,
+        busy_ceiling_cause.as_deref(),
+    ) else {
         return;
     };
     log(&format!("task #{task_id}: {body}"));

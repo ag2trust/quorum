@@ -131,6 +131,14 @@ pub const MAX_DEPENDENCY_DECOMPOSITION_DEPTH: usize = 8;
 
 /// Prefix of the durable note recorded on every crash-recovery transition.
 pub const WORKER_FAILURE_NOTE_PREFIX: &str = "worker failure, recovery attempt ";
+/// Prefix of the durable note recorded when a worker reaped at the busy
+/// ceiling is requeued without spending a recovery attempt.
+pub const BUSY_CEILING_NOTE_PREFIX: &str =
+    "worker stopped at busy ceiling, no recovery attempt charged";
+/// Cumulative wall seconds of worker slots reaped at the busy ceiling without
+/// a recovery charge since the last delivery handoff. Bounded by
+/// `max_task_wall_secs`; cleared with the other round-scoped refs.
+pub const BUSY_CEILING_WALL_SECS_REF: &str = "busy_ceiling_wall_secs";
 const WORKER_FAILURE_CAUSE_LIMIT: usize = 1024;
 
 /// Upper bound on a worker's `react` reason (bytes), enforced at the CLI and
@@ -4224,6 +4232,18 @@ where
 /// the transition. Only a review-only/no-rework close consumes it (durable
 /// `refs.review_outcome_findings` and the findings note); every other
 /// transition ignores it.
+/// Whether a crash-recovery transition spends the task's recovery budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryCharge {
+    Charge,
+    /// A busy-ceiling reap within the task wall ceiling: requeue without
+    /// incrementing `recovery_attempts` or applying its exhaustion guard.
+    Waive {
+        wall_used_secs: u64,
+        wall_max_secs: u64,
+    },
+}
+
 fn apply_event_tx_with_findings<F>(
     tx: Transaction<'_>,
     agent: &str,
@@ -4236,7 +4256,17 @@ fn apply_event_tx_with_findings<F>(
 where
     F: FnOnce(&Transaction<'_>) -> Result<()>,
 {
-    apply_event_tx_inner(tx, agent, id, event, now, false, findings, before_commit)
+    apply_event_tx_inner(
+        tx,
+        agent,
+        id,
+        event,
+        now,
+        false,
+        findings,
+        RecoveryCharge::Charge,
+        before_commit,
+    )
 }
 
 fn apply_event_tx_with_deferred_sweep<F>(
@@ -4251,7 +4281,17 @@ fn apply_event_tx_with_deferred_sweep<F>(
 where
     F: FnOnce(&Transaction<'_>) -> Result<()>,
 {
-    apply_event_tx_inner(tx, agent, id, event, now, defer_sweep, None, before_commit)
+    apply_event_tx_inner(
+        tx,
+        agent,
+        id,
+        event,
+        now,
+        defer_sweep,
+        None,
+        RecoveryCharge::Charge,
+        before_commit,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4263,6 +4303,7 @@ fn apply_event_tx_inner<F>(
     now: i64,
     defer_sweep: bool,
     findings: Option<&str>,
+    recovery_charge: RecoveryCharge,
     before_commit: F,
 ) -> Result<TransitionResult>
 where
@@ -4359,6 +4400,7 @@ where
     let is_crash_recovery = matches!(new_status, Status::Open | Status::Rework)
         && matches!(status, Status::Working | Status::Rework)
         && matches!(event, Event::AgentFailed { .. } | Event::LeaseExpired);
+    let charges_recovery = is_crash_recovery && recovery_charge == RecoveryCharge::Charge;
 
     let failure_cause = match event {
         Event::AgentFailed { reason } => reason.as_str(),
@@ -4379,7 +4421,7 @@ where
         let reason = format!("branch sync judgment worker failed without retry: {failure_cause}");
         crate::branch_sync::fail_for_task_tx(&tx, id, &format!("task #{id}: {reason}"), now)?;
         effects.push(Effect::NotifyOwner { reason });
-    } else if is_crash_recovery && task.recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
+    } else if charges_recovery && task.recovery_attempts >= MAX_RECOVERY_ATTEMPTS {
         new_status = Status::Failed;
         // A terminal recovery exhaustion must not retain the rework respawn
         // effect selected before this storage-level budget guard.
@@ -4426,7 +4468,7 @@ where
     );
     let recovery_attempts = if reset_recovery {
         0
-    } else if is_crash_recovery && matches!(new_status, Status::Open | Status::Rework) {
+    } else if charges_recovery && matches!(new_status, Status::Open | Status::Rework) {
         task.recovery_attempts + 1
     } else {
         task.recovery_attempts
@@ -4485,16 +4527,23 @@ where
         // Durable, bounded record of why the worker died so the replacement
         // worker's prompt can carry it (owner alerts are ephemeral).
         let cause = crate::classify::truncate_for_prompt(failure_cause, WORKER_FAILURE_CAUSE_LIMIT);
+        let body = match recovery_charge {
+            RecoveryCharge::Charge => format!(
+                "{WORKER_FAILURE_NOTE_PREFIX}{}\n{cause}",
+                task.recovery_attempts + 1
+            ),
+            RecoveryCharge::Waive {
+                wall_used_secs,
+                wall_max_secs,
+            } => format!(
+                "{BUSY_CEILING_NOTE_PREFIX} ({}/{MAX_RECOVERY_ATTEMPTS} attempts used; \
+                 busy-ceiling wall {wall_used_secs}s of {wall_max_secs}s)\n{cause}",
+                task.recovery_attempts
+            ),
+        };
         tx.execute(
             "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, ?2, 'daemon', ?3)",
-            params![
-                id,
-                now,
-                format!(
-                    "{WORKER_FAILURE_NOTE_PREFIX}{}\n{cause}",
-                    task.recovery_attempts + 1
-                )
-            ],
+            params![id, now, body],
         )?;
     }
 
@@ -4706,6 +4755,9 @@ fn clear_runner_retry_refs(refs: Option<&str>) -> Result<Option<String>> {
             CI_REMEDIATION_FEEDBACK_REF,
             CI_REMEDIATION_CHECKS_REF,
             CI_REMEDIATION_ATTEMPTS_REF,
+            // The busy-ceiling wall budget is per delivery round, like the
+            // recovery budget this handoff also resets.
+            BUSY_CEILING_WALL_SECS_REF,
         ] {
             object.remove(key);
         }
@@ -5375,6 +5427,43 @@ pub fn fail_worker_assignment(
     reason: &str,
     now: i64,
 ) -> Result<WorkerFailureOutcome> {
+    fail_worker_assignment_inner(conn, agent, id, reason, None, now)
+}
+
+/// Busy-ceiling variant of [`fail_worker_assignment`]: the worker was reaped
+/// while its tool/background work was still outstanding, not because it was
+/// dead. In the same immediate transaction, the slot's wall seconds are added
+/// to the durable [`BUSY_CEILING_WALL_SECS_REF`]. While that total stays within
+/// `max_task_wall_secs`, the requeue spends no recovery attempt; past it (or
+/// with no wall ceiling configured) the reap is an ordinary charged failure,
+/// so the recovery budget still fails the task.
+pub fn fail_worker_assignment_at_busy_ceiling(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    reason: &str,
+    slot_wall_secs: u64,
+    max_task_wall_secs: Option<u64>,
+    now: i64,
+) -> Result<WorkerFailureOutcome> {
+    fail_worker_assignment_inner(
+        conn,
+        agent,
+        id,
+        reason,
+        Some((slot_wall_secs, max_task_wall_secs)),
+        now,
+    )
+}
+
+fn fail_worker_assignment_inner(
+    conn: &mut Connection,
+    agent: &str,
+    id: i64,
+    reason: &str,
+    busy_ceiling: Option<(u64, Option<u64>)>,
+    now: i64,
+) -> Result<WorkerFailureOutcome> {
     let tx = begin_immediate(conn)?;
     let read_assignment = |tx: &Transaction<'_>| -> Result<Option<(String, Option<String>)>> {
         Ok(tx
@@ -5396,7 +5485,13 @@ pub fn fail_worker_assignment(
         tx.commit()?;
         return Ok(WorkerFailureOutcome::AlreadyRecoveredBySweep);
     }
-    apply_event_tx_with_deferred_sweep(
+    let recovery_charge = match busy_ceiling {
+        None => RecoveryCharge::Charge,
+        Some((slot_wall_secs, max_task_wall_secs)) => {
+            busy_ceiling_recovery_charge(&tx, id, slot_wall_secs, max_task_wall_secs)?
+        }
+    };
+    apply_event_tx_inner(
         tx,
         agent,
         id,
@@ -5405,6 +5500,8 @@ pub fn fail_worker_assignment(
         },
         now,
         true,
+        None,
+        recovery_charge,
         |tx| {
             // `Merging + AgentFailed` returns to `in-review`, where an
             // unconsumed replay request is unclaimable and also blocks the
@@ -5417,10 +5514,58 @@ pub fn fail_worker_assignment(
                    AND json_extract(refs, '$.daemon_merge_retry')='requested'",
                 params![id],
             )?;
+            if let RecoveryCharge::Waive { wall_used_secs, .. } = recovery_charge {
+                // Only a requeue keeps the wall budget; a terminal row needs none.
+                tx.execute(
+                    "UPDATE tasks SET refs=json_set(COALESCE(refs, '{}'), ?2, ?3)
+                     WHERE id=?1 AND status IN ('open','rework')",
+                    params![
+                        id,
+                        format!("$.{BUSY_CEILING_WALL_SECS_REF}"),
+                        i64::try_from(wall_used_secs).unwrap_or(i64::MAX)
+                    ],
+                )?;
+            }
             Ok(())
         },
     )
     .map(|transition| WorkerFailureOutcome::Applied(Box::new(transition)))
+}
+
+/// Charge decision for a busy-ceiling reap, read in the caller's transaction.
+/// A non-numeric or negative stored total charges, so corrupt state can
+/// never extend the bound.
+fn busy_ceiling_recovery_charge(
+    tx: &Transaction<'_>,
+    id: i64,
+    slot_wall_secs: u64,
+    max_task_wall_secs: Option<u64>,
+) -> Result<RecoveryCharge> {
+    let Some(wall_max_secs) = max_task_wall_secs else {
+        return Ok(RecoveryCharge::Charge);
+    };
+    let stored: Option<rusqlite::types::Value> = tx
+        .query_row(
+            "SELECT CASE WHEN json_valid(refs) THEN json_extract(refs, ?2) END
+             FROM tasks WHERE id=?1",
+            params![id, format!("$.{BUSY_CEILING_WALL_SECS_REF}")],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let prior = match stored {
+        None | Some(rusqlite::types::Value::Null) => 0,
+        Some(rusqlite::types::Value::Integer(secs)) if secs >= 0 => secs as u64,
+        Some(_) => return Ok(RecoveryCharge::Charge),
+    };
+    let wall_used_secs = prior.saturating_add(slot_wall_secs);
+    Ok(if wall_used_secs <= wall_max_secs {
+        RecoveryCharge::Waive {
+            wall_used_secs,
+            wall_max_secs,
+        }
+    } else {
+        RecoveryCharge::Charge
+    })
 }
 
 fn dispose_managed_exit_inner(
@@ -9993,6 +10138,132 @@ mod tests {
         assert!(note.starts_with("worker failure, recovery attempt 1\nworker idle 900s"));
         assert!(!note.contains("TAIL_HIDDEN"));
         assert!(note.chars().count() < 1200);
+    }
+
+    fn busy_ceiling_fixture() -> (tempfile::TempDir, Connection, i64) {
+        let (d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "t",
+            None,
+            0,
+            None,
+            Some(r#"{"branch":"daemon/worker-t1"}"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        (d, c, id)
+    }
+
+    fn busy_reap(c: &mut Connection, id: i64, slot_secs: u64, wall: Option<u64>) -> Task {
+        claim(c, "worker", Some(id), &[], TTL, 1000).unwrap();
+        match fail_worker_assignment_at_busy_ceiling(
+            c,
+            "worker",
+            id,
+            "worker exceeded busy ceiling 3600s",
+            slot_secs,
+            wall,
+            1001,
+        )
+        .unwrap()
+        {
+            WorkerFailureOutcome::Applied(transition) => transition.task,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn latest_daemon_note(c: &Connection, id: i64) -> String {
+        c.query_row(
+            "SELECT body FROM task_notes WHERE task_id=?1 AND agent='daemon' ORDER BY id DESC LIMIT 1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn busy_ceiling_reap_within_task_wall_spends_no_recovery_attempt() {
+        let (_d, mut c, id) = busy_ceiling_fixture();
+        let task = busy_reap(&mut c, id, 3700, Some(10_000));
+        assert_eq!(task.status, "open");
+        assert_eq!(task.recovery_attempts, 0);
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[BUSY_CEILING_WALL_SECS_REF], 3700);
+        assert_eq!(refs["branch"], "daemon/worker-t1", "other refs survive");
+        let note = latest_daemon_note(&c, id);
+        assert!(note.starts_with(BUSY_CEILING_NOTE_PREFIX), "{note}");
+        assert!(note.contains("busy-ceiling wall 3700s of 10000s"), "{note}");
+        assert!(
+            note.contains("worker exceeded busy ceiling 3600s"),
+            "{note}"
+        );
+
+        // Exhausted by earlier dead workers: a waived reap neither fails the
+        // task nor increments past the budget.
+        c.execute(
+            "UPDATE tasks SET recovery_attempts=?2 WHERE id=?1",
+            params![id, MAX_RECOVERY_ATTEMPTS],
+        )
+        .unwrap();
+        let task = busy_reap(&mut c, id, 3700, Some(10_000));
+        assert_eq!(task.status, "open");
+        assert_eq!(task.recovery_attempts, MAX_RECOVERY_ATTEMPTS);
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            refs[BUSY_CEILING_WALL_SECS_REF], 7400,
+            "the wall accumulates"
+        );
+    }
+
+    #[test]
+    fn busy_ceiling_reap_past_task_wall_is_charged_and_exhaustion_fails_the_task() {
+        let (_d, mut c, id) = busy_ceiling_fixture();
+        let first = busy_reap(&mut c, id, 3700, Some(5000));
+        assert_eq!(first.recovery_attempts, 0);
+        // 3700 + 3700 > 5000: the wall bound is exhausted, so every further
+        // busy-ceiling reap spends the recovery budget like any failure.
+        for attempt in 1..=MAX_RECOVERY_ATTEMPTS {
+            let task = busy_reap(&mut c, id, 3700, Some(5000));
+            assert_eq!(task.status, "open");
+            assert_eq!(task.recovery_attempts, attempt);
+            let note = latest_daemon_note(&c, id);
+            assert!(
+                note.starts_with(&format!("{WORKER_FAILURE_NOTE_PREFIX}{attempt}")),
+                "{note}"
+            );
+        }
+        let task = busy_reap(&mut c, id, 3700, Some(5000));
+        assert_eq!(
+            task.status, "failed",
+            "wall exhaustion still fails the task"
+        );
+    }
+
+    #[test]
+    fn busy_ceiling_reap_without_task_wall_or_with_corrupt_total_is_charged() {
+        let (_d, mut c, id) = busy_ceiling_fixture();
+        let task = busy_reap(&mut c, id, 3700, None);
+        assert_eq!(task.recovery_attempts, 1, "no wall ceiling, no waiver");
+
+        c.execute(
+            "UPDATE tasks SET refs=json_set(refs, ?2, 'garbage') WHERE id=?1",
+            params![id, format!("$.{BUSY_CEILING_WALL_SECS_REF}")],
+        )
+        .unwrap();
+        let task = busy_reap(&mut c, id, 1, Some(u64::MAX));
+        assert_eq!(task.recovery_attempts, 2, "a corrupt total can only charge");
+    }
+
+    #[test]
+    fn delivery_handoff_clears_the_busy_ceiling_wall() {
+        let refs = format!(r#"{{"branch":"b","{BUSY_CEILING_WALL_SECS_REF}":3700}}"#);
+        let cleared = clear_runner_retry_refs(Some(&refs)).unwrap().unwrap();
+        assert!(!cleared.contains(BUSY_CEILING_WALL_SECS_REF), "{cleared}");
+        assert!(cleared.contains("\"branch\""));
     }
 
     #[test]
