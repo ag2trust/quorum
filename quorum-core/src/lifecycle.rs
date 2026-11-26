@@ -278,7 +278,7 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::InReview, Event::ChecksFailed { checks }) if t.no_rework => {
             Ok(close_no_rework(&no_rework_checks_outcome(checks)))
         }
-        (Status::Merging, Event::MergeConflict) if t.no_rework => {
+        (Status::InReview | Status::Merging, Event::MergeConflict) if t.no_rework => {
             Ok(close_no_rework("PR has a merge conflict"))
         }
         // Defense in depth: a no-rework task has no worker phase. Observing
@@ -441,7 +441,13 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
                 pr: t.pr.clone().unwrap_or_default(),
             }],
         )),
-        (Status::InReview, Event::VerdictChanges | Event::ChecksFailed { .. }) => {
+        // A pre-review conflict (GitHub reports DIRTY for the recorded head)
+        // routes straight to merge-base rework with the same cap accounting
+        // as a merge-time conflict or a CI failure.
+        (
+            Status::InReview,
+            Event::VerdictChanges | Event::ChecksFailed { .. } | Event::MergeConflict,
+        ) => {
             if t.rework_round >= t.rework_cap {
                 return Ok((
                     Status::Failed,
@@ -490,7 +496,6 @@ pub fn transition(t: &TaskView, e: &Event) -> Result<(Status, Vec<Effect>), Inva
         (Status::InReview, Event::ReworkPushed) => reject("not in rework"),
         (Status::InReview, Event::MergeSucceeded) => reject("not merging"),
         (Status::InReview, Event::MergeFailed { .. }) => reject("not merging"),
-        (Status::InReview, Event::MergeConflict) => reject("not merging"),
         (Status::InReview, Event::PrFoundMerged) => Ok((Status::Done, vec![Effect::ReleaseLease])),
         (Status::InReview, Event::PrFoundClosed) => Ok((
             Status::Failed,
@@ -1214,7 +1219,6 @@ mod tests {
             Event::ReworkPushed,
             Event::MergeSucceeded,
             Event::MergeFailed { reason: "x".into() },
-            Event::MergeConflict,
         ];
         for e in &invalid_events {
             assert_invalid(&t, e);
@@ -2407,6 +2411,48 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Effect::NotifyOwner { .. })));
         assert!(!effects.contains(&Effect::ResumeWorker));
+    }
+
+    // Pre-review conflict: InReview + MergeConflict → Rework (no reviewer hop).
+    #[test]
+    fn in_review_merge_conflict_enters_rework() {
+        let mut t = view(Status::InReview);
+        t.author = Some("W1".into());
+        t.pr = Some("99".into());
+        t.rework_round = REWORK_CAP - 1;
+
+        let (next, effects) = transition(&t, &Event::MergeConflict).unwrap();
+        assert_eq!(next, Status::Rework);
+        assert!(effects.contains(&Effect::IncrementReworkRound));
+        assert!(effects.contains(&Effect::ResumeWorker));
+        assert!(effects.contains(&Effect::ReleaseLease));
+        assert!(!effects.contains(&Effect::SpawnReviewer));
+    }
+
+    #[test]
+    fn in_review_merge_conflict_at_cap_fails() {
+        let mut t = view(Status::InReview);
+        t.author = Some("W1".into());
+        t.pr = Some("99".into());
+        t.rework_round = REWORK_CAP;
+
+        let (next, effects) = transition(&t, &Event::MergeConflict).unwrap();
+        assert_eq!(next, Status::Failed);
+        assert!(effects.iter().any(|e| matches!(
+            e,
+            Effect::NotifyOwner { reason } if reason == &format!("rework cap ({REWORK_CAP}) exceeded")
+        )));
+        assert!(!effects.contains(&Effect::IncrementReworkRound));
+        assert!(!effects.contains(&Effect::ResumeWorker));
+    }
+
+    #[test]
+    fn in_review_no_rework_merge_conflict_closes_done() {
+        assert_no_rework_closed(
+            &no_rework_view(Status::InReview),
+            &Event::MergeConflict,
+            "merge conflict",
+        );
     }
 
     // MergeFailed (non-conflict) still goes to InReview with reviewer

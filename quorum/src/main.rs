@@ -1837,9 +1837,12 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                             ),
                         ),
                         // PR authoring stays on the publishing identity (the
-                        // token gh itself would use), never the merge token:
-                        // a merge-account-authored PR cannot be approved by
-                        // the merge account.
+                        // token gh itself would use), never the merge token.
+                        // When no merge_token_file is configured, this makes
+                        // publication and merge the same identity: GhMergeExecutor
+                        // detects that per PR (viewerDidAuthor) and runs
+                        // one-identity mode, posting a COMMENT verdict instead
+                        // of a formal APPROVE/REQUEST_CHANGES review.
                         publication_credentials: std::sync::Arc::new(
                             github_credentials::LocalDefaultCredentialSource::new(None),
                         ),
