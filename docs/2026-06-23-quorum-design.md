@@ -867,6 +867,22 @@ full idle window to react to the completion. Because activity can only be record
 while the slot is still under the busy ceiling, a persistent worker is reaped at most
 about `max_busy_idle_secs + max_idle_secs` after its last daemon-fed turn. At most 8
 self-continued turns are tolerated per daemon-fed turn.
+
+The two between-turn reap reasons are distinct, and one classification decides both the
+worker and reviewer watchdogs. A slot reaped while the busy ceiling was selected
+(outstanding work or an open self-continued turn) is logged as
+`WATCHDOG: worker X exceeded busy ceiling Ns on task #T (outstanding work: …)`, naming
+the launching command when the provider reported it. Its end reason is `busy_ceiling`,
+and its task note says the same. Only a plain-idle reap is a zombie (`idle_reaped`). A
+worker `busy_ceiling` reap requeues without spending a recovery attempt while the task's
+cumulative busy-ceiling slot time stays within `max_task_wall_secs`. That total is kept
+in `refs.busy_ceiling_wall_secs`, decided in the same immediate transaction as the
+`AgentFailed`, and cleared on the delivery handoff that also resets `recovery_attempts`.
+Past that total, or with no `max_task_wall_secs` configured, the reap is an ordinary
+charged failure, so the recovery budget still fails the task. When the next worker
+resumes a `busy_ceiling` recover ref, its resume note quotes the predecessor's
+outstanding command and elapsed time. It tells the worker to run that verification once
+in the foreground.
 A reviewer that already recorded its verdict and waits for its sticky re-review — task in
 `rework` (worker rework or CI remediation), in `merging` (merge failure resumes the
 reviewer), or `in-review` with the CI-gated `ResumeReviewer` still pending — is not an

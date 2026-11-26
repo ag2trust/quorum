@@ -1478,6 +1478,14 @@ impl RunnerProc {
         matches!(self, Self::Claude(proc) if proc.unfed_turn_open())
     }
 
+    /// Bounded description of the outstanding work, when the provider reports it.
+    pub fn outstanding_work_summary(&self) -> Option<String> {
+        match self {
+            Self::Claude(proc) => proc.outstanding_work_summary(),
+            Self::Codex(_) | Self::Grok(_) => None,
+        }
+    }
+
     pub fn unfed_turns_since_feed(&self) -> u32 {
         match self {
             Self::Claude(proc) => proc.unfed_turns_since_feed(),
