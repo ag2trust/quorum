@@ -1022,6 +1022,58 @@ assert second["cleanup"]["complete"] is True
 assert "execute_outcome" not in third
 PY
 
+# A whole-binary timeout kills libtest before it prints its failures section.
+# The supervisor must still name the tests libtest already reported FAILED.
+cat >"$TMP/timeout-after-failures-test-binary" <<'EOF'
+#!/bin/sh
+printf 'running 3 tests\n'
+printf 'test alpha::passes ... ok\n'
+printf 'test alpha::first_broken ... FAILED\n'
+printf 'test beta::second_broken ... FAILED\n'
+exec sleep 30
+EOF
+chmod +x "$TMP/timeout-after-failures-test-binary"
+TIMEOUT_FAILED_OUT="$TMP/timeout-failed-timing"
+if PREFLIGHT_CARGO_TEST_BINARIES=1 \
+  PREFLIGHT_FIRST_TEST_BINARY="$TMP/timeout-after-failures-test-binary" \
+  PREFLIGHT_SECOND_TEST_BINARY="$TMP/second-test-binary" \
+  PREFLIGHT_TEST_LAUNCH_LOG="$TMP/timeout-failed-launches.log" \
+  PATH="$BIN:$PATH" scripts/preflight/timing.sh \
+    --skip-fmt --skip-clippy --test-jobs 1 --test-timeout-secs 1 \
+    --term-grace-secs 0.1 --out "$TIMEOUT_FAILED_OUT" \
+    >"$TMP/timeout-failed.out" 2>&1; then
+  echo 'expected timed-out test binary to reject timing run' >&2
+  exit 1
+fi
+grep -Fq 'timed out after' "$TMP/timeout-failed.out"
+grep -Fq \
+  'Tests already FAILED before the timeout: alpha::first_broken, beta::second_broken.' \
+  "$TMP/timeout-failed.out"
+# The test binary's own output is still passed through.
+grep -Fqx 'test alpha::passes ... ok' "$TMP/timeout-failed.out"
+grep -Fqx '  failed_tests_seen: 2' "$TIMEOUT_FAILED_OUT/summary.txt"
+grep -Fqx '    alpha::first_broken' "$TIMEOUT_FAILED_OUT/summary.txt"
+grep -Fqx '    beta::second_broken' "$TIMEOUT_FAILED_OUT/summary.txt"
+if grep -Fq 'alpha::passes' "$TIMEOUT_FAILED_OUT/summary.txt"; then
+  echo 'passing test must not be listed as failed' >&2
+  exit 1
+fi
+python3 - "$TIMEOUT_FAILED_OUT/timing.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1]))
+assert data["first_failure"]["outcome"] == "timed_out"
+assert data["first_failure"]["exit_code"] == 124
+expected = ["alpha::first_broken", "beta::second_broken"]
+assert data["first_failure"]["failed_tests"] == expected
+assert data["first_failure"]["failed_tests_total"] == 2
+binary = data["test_binaries"][0]
+assert binary["execute_timed_out"] is True
+assert binary["failed_tests"] == expected
+assert binary["cleanup"]["complete"] is True
+PY
+
 # A test binary may orphan a process group and assert the group vanishes after
 # SIGKILL, as quorum's provider teardown tests do (for example the Grok
 # teardown_kills_stored_process_group_after_leader_is_reaped test). On Linux
