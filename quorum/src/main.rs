@@ -1387,6 +1387,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     // fields are not consulted by merge_commit_status.
                     base_branch: "main".into(),
                     self_update_branch: "main".into(),
+                    gh_program: std::path::PathBuf::from("gh"),
                 };
                 match executor.merge_commit_status(pr, std::path::Path::new(".")) {
                     serve::merge::MergeCommitStatus::Merged {
@@ -1845,6 +1846,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                         gh_repo: resolve_gh_repo(&r_repo_dir.value),
                         base_branch: r_base_branch.value.clone(),
                         self_update_branch: r_self_update_branch.value.clone(),
+                        gh_program: std::path::PathBuf::from("gh"),
                     })
                 };
 

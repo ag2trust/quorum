@@ -1,6 +1,6 @@
 //! MergeExecutor — seam for PR merge so tests can mock the `gh` call.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -686,6 +686,9 @@ pub struct GhMergeExecutor {
     /// Long-lived daemon branches that must never be deleted after a merge.
     pub base_branch: String,
     pub self_update_branch: String,
+    /// `gh` program every child runs. Production is `gh` (PATH lookup);
+    /// tests point it at a fake script.
+    pub gh_program: PathBuf,
 }
 
 impl GhMergeExecutor {
@@ -697,7 +700,7 @@ impl GhMergeExecutor {
         repo_dir: &Path,
     ) -> std::result::Result<Command, GithubCredentialError> {
         let token = self.credentials.token()?;
-        let mut cmd = Command::new("gh");
+        let mut cmd = Command::new(&self.gh_program);
         cmd.args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_OPTIONAL_LOCKS", "0");
@@ -804,7 +807,7 @@ impl GhMergeExecutor {
         repo_dir: &Path,
     ) -> std::result::Result<Command, GithubCredentialError> {
         let token = self.credentials.token()?;
-        let mut cmd = Command::new("gh");
+        let mut cmd = Command::new(&self.gh_program);
         cmd.args(["repo", "view"])
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_OPTIONAL_LOCKS", "0");
@@ -880,6 +883,104 @@ impl GhMergeExecutor {
             .as_str()?
             .to_string();
         Some((stdout, head))
+    }
+
+    /// Build the identity probe: `gh api graphql` with the constant
+    /// [`PR_IDENTITY_QUERY`] and only daemon-derived owner, name, and number
+    /// as variables. `gh api` rejects `-R`, so a configured slug travels as
+    /// raw `-f` strings; without one, `-F` expands gh's `{owner}`/`{repo}`
+    /// placeholders from `repo_dir`. The token is fetched first, so a source
+    /// failure spawns nothing.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn identity_probe_cmd(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+    ) -> std::result::Result<Command, GithubCredentialError> {
+        let token = self.credentials.token()?;
+        let mut cmd = Command::new(&self.gh_program);
+        cmd.args(["api", "graphql", "-f"])
+            .arg(format!("query={PR_IDENTITY_QUERY}"))
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0");
+        match self
+            .gh_repo
+            .as_deref()
+            .and_then(|slug| slug.split_once('/'))
+        {
+            Some((owner, name)) => {
+                cmd.args(["-f", &format!("owner={owner}")])
+                    .args(["-f", &format!("name={name}")]);
+            }
+            None => {
+                cmd.args(["-F", "owner={owner}", "-F", "name={repo}"])
+                    .current_dir(repo_dir);
+            }
+        }
+        cmd.args(["-F", &format!("number={pr}")]);
+        token.apply_to_command(&mut cmd);
+        Ok(cmd)
+    }
+
+    /// Ask GitHub, with the merge credential, whether that credential's
+    /// identity authored the PR. `None` (never one-identity) on credential
+    /// failure, gh failure, or any malformed/partial response; each failure
+    /// is logged.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn probe_pr_identity(&self, pr: i64, repo_dir: &Path) -> Option<PrIdentity> {
+        let mut cmd = match self.identity_probe_cmd(pr, repo_dir) {
+            Ok(cmd) => cmd,
+            Err(error) => {
+                eprintln!("warn: PR #{pr} identity probe not run: {error}");
+                return None;
+            }
+        };
+        let output = match cmd.output() {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("warn: PR #{pr} identity probe failed to run gh: {error}");
+                return None;
+            }
+        };
+        if !output.status.success() {
+            eprintln!(
+                "warn: PR #{pr} identity probe failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            return None;
+        }
+        let parsed = parse_pr_identity(&String::from_utf8_lossy(&output.stdout));
+        if parsed.is_none() {
+            eprintln!("warn: PR #{pr} identity probe returned an unusable response");
+        }
+        parsed
+    }
+
+    /// Fresh `reviewDecision` read (`gh pr view <n> --json reviewDecision`).
+    /// `None` on credential/gh failure or a malformed response; `Some("")`
+    /// when GitHub reports no decision.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn live_review_decision(&self, pr: i64, repo_dir: &Path) -> Option<String> {
+        let pr_str = pr.to_string();
+        let mut cmd = match self.build_gh_cmd(
+            &["pr", "view", &pr_str, "--json", "reviewDecision"],
+            repo_dir,
+        ) {
+            Ok(cmd) => cmd,
+            Err(error) => {
+                eprintln!("warn: PR #{pr} reviewDecision read not run: {error}");
+                return None;
+            }
+        };
+        let output = cmd.output().ok()?;
+        if !output.status.success() {
+            eprintln!(
+                "warn: PR #{pr} reviewDecision read failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            return None;
+        }
+        parse_review_decision(&String::from_utf8_lossy(&output.stdout))
     }
 
     fn verify_pr_merged(&self, pr: i64, repo_dir: &Path) -> bool {
@@ -1198,6 +1299,118 @@ fn head_has_approval(reviews_json: &str, head_sha: &str) -> bool {
                 .and_then(|c| c.get("oid"))
                 .and_then(|o| o.as_str())
                 == Some(head_sha)
+    })
+}
+
+/// Fixed GraphQL document for the merge-credential identity probe. Only its
+/// variables carry the daemon-derived repository and PR number.
+#[cfg_attr(not(test), allow(dead_code))]
+const PR_IDENTITY_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { \
+repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
+viewerDidAuthor reviewDecision } } }";
+
+/// Identity-probe result for one PR, as seen by the merge credential.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrIdentity {
+    /// The merge credential's identity authored the PR (one-identity mode).
+    pub viewer_did_author: bool,
+    /// `reviewDecision`; `None` when GitHub reports `null`.
+    pub review_decision: Option<String>,
+}
+
+/// Parse the identity-probe response. `None` on malformed JSON, a GraphQL
+/// `errors` entry, a missing `pullRequest`, a non-boolean/missing
+/// `viewerDidAuthor`, or a missing/non-string `reviewDecision` key, so no
+/// partial response ever selects one-identity mode.
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_pr_identity(json_str: &str) -> Option<PrIdentity> {
+    let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    match val.get("errors") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Array(errors)) if errors.is_empty() => {}
+        Some(_) => return None,
+    }
+    let pull = val
+        .get("data")?
+        .get("repository")?
+        .get("pullRequest")?
+        .as_object()?;
+    let viewer_did_author = pull.get("viewerDidAuthor")?.as_bool()?;
+    let review_decision = match pull.get("reviewDecision")? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(decision) => Some(decision.clone()),
+        _ => return None,
+    };
+    Some(PrIdentity {
+        viewer_did_author,
+        review_decision,
+    })
+}
+
+/// True only for a well-formed probe that reports `viewerDidAuthor=true`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_one_identity(identity: Option<&PrIdentity>) -> bool {
+    identity.is_some_and(|identity| identity.viewer_did_author)
+}
+
+/// Parse `gh pr view --json reviewDecision`. `null` reads as `""`;
+/// malformed JSON or a missing/non-string field is `None`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_review_decision(json_str: &str) -> Option<String> {
+    match serde_json::from_str::<serde_json::Value>(json_str)
+        .ok()?
+        .get("reviewDecision")?
+    {
+        serde_json::Value::Null => Some(String::new()),
+        serde_json::Value::String(decision) => Some(decision.clone()),
+        _ => None,
+    }
+}
+
+/// Verdict kinds the daemon marks on a review body for duplicate
+/// suppression. The marker never feeds a merge or lifecycle decision.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerdictKind {
+    Approved,
+    Changes,
+}
+
+/// Hidden marker binding a verdict kind to one head SHA, e.g.
+/// `<!-- quorum-verdict:approved head=<sha> -->`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn verdict_marker(kind: VerdictKind, head_sha: &str) -> String {
+    let kind = match kind {
+        VerdictKind::Approved => "approved",
+        VerdictKind::Changes => "changes",
+    };
+    format!("<!-- quorum-verdict:{kind} head={head_sha} -->")
+}
+
+/// True iff a review in `reviews_json` (from `fetch_reviews_and_head`) whose
+/// `commit.oid` is `head_sha` carries the exact marker for `kind` and
+/// `head_sha`. Parse failure or an empty head is false. Dedupe only.
+#[cfg_attr(not(test), allow(dead_code))]
+fn head_has_verdict_marker(reviews_json: &str, head_sha: &str, kind: VerdictKind) -> bool {
+    if head_sha.is_empty() {
+        return false;
+    }
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(reviews_json) else {
+        return false;
+    };
+    let Some(reviews) = val.get("reviews").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    let marker = verdict_marker(kind, head_sha);
+    reviews.iter().any(|r| {
+        r.get("commit")
+            .and_then(|c| c.get("oid"))
+            .and_then(|o| o.as_str())
+            == Some(head_sha)
+            && r.get("body")
+                .and_then(|b| b.as_str())
+                .is_some_and(|body| body.contains(&marker))
     })
 }
 
@@ -2598,6 +2811,7 @@ mod tests {
             gh_repo,
             base_branch: "main".into(),
             self_update_branch: "main".into(),
+            gh_program: PathBuf::from("gh"),
         }
     }
 
@@ -2895,6 +3109,505 @@ mod tests {
             branch.as_deref().is_some_and(|b| !b.is_empty()),
             "gh repo view must resolve a non-empty default branch for a configured slug, got {branch:?}"
         );
+    }
+
+    // ── Identity probe, reviewDecision, verdict markers ─────────────────
+
+    fn probe_json(viewer_did_author: &str, review_decision: &str) -> String {
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequest":{{"viewerDidAuthor":{viewer_did_author},"reviewDecision":{review_decision}}}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn parse_pr_identity_true_selects_one_identity() {
+        let parsed = parse_pr_identity(&probe_json("true", r#""APPROVED""#));
+        assert_eq!(
+            parsed,
+            Some(PrIdentity {
+                viewer_did_author: true,
+                review_decision: Some("APPROVED".into()),
+            })
+        );
+        assert!(is_one_identity(parsed.as_ref()));
+        let null_decision = parse_pr_identity(&probe_json("true", "null")).unwrap();
+        assert_eq!(null_decision.review_decision, None);
+        assert!(is_one_identity(Some(&null_decision)));
+    }
+
+    #[test]
+    fn parse_pr_identity_false_selects_two_identity() {
+        let parsed = parse_pr_identity(&probe_json("false", r#""REVIEW_REQUIRED""#));
+        assert_eq!(
+            parsed.as_ref().map(|p| p.viewer_did_author),
+            Some(false),
+            "{parsed:?}"
+        );
+        assert!(!is_one_identity(parsed.as_ref()));
+    }
+
+    #[test]
+    fn parse_pr_identity_errors_entry_is_not_one_identity() {
+        // A GraphQL error alongside otherwise-valid data must not count.
+        let with_errors = r#"{"data":{"repository":{"pullRequest":{"viewerDidAuthor":true,"reviewDecision":null}}},"errors":[{"message":"boom"}]}"#;
+        assert_eq!(parse_pr_identity(with_errors), None);
+        let errors_object = r#"{"data":{"repository":{"pullRequest":{"viewerDidAuthor":true,"reviewDecision":null}}},"errors":{"message":"boom"}}"#;
+        assert_eq!(parse_pr_identity(errors_object), None);
+        let errors_only = r#"{"data":null,"errors":[{"type":"NOT_FOUND"}]}"#;
+        assert_eq!(parse_pr_identity(errors_only), None);
+        assert!(!is_one_identity(parse_pr_identity(with_errors).as_ref()));
+    }
+
+    #[test]
+    fn parse_pr_identity_malformed_or_missing_field_is_not_one_identity() {
+        for body in [
+            "",
+            "not json",
+            "true",
+            r#"{}"#,
+            r#"{"data":{}}"#,
+            r#"{"data":{"repository":null}}"#,
+            r#"{"data":{"repository":{"pullRequest":null}}}"#,
+            r#"{"data":{"repository":{"pullRequest":{"reviewDecision":"APPROVED"}}}}"#,
+            r#"{"data":{"repository":{"pullRequest":{"viewerDidAuthor":true}}}}"#,
+            r#"{"data":{"repository":{"pullRequest":{"viewerDidAuthor":"true","reviewDecision":null}}}}"#,
+            r#"{"data":{"repository":{"pullRequest":{"viewerDidAuthor":1,"reviewDecision":null}}}}"#,
+            r#"{"data":{"repository":{"pullRequest":{"viewerDidAuthor":true,"reviewDecision":7}}}}"#,
+        ] {
+            let parsed = parse_pr_identity(body);
+            assert_eq!(parsed, None, "{body}");
+            assert!(!is_one_identity(parsed.as_ref()), "{body}");
+        }
+        assert!(!is_one_identity(None));
+    }
+
+    #[test]
+    fn parse_review_decision_reads_string_null_and_rejects_malformed() {
+        assert_eq!(
+            parse_review_decision(r#"{"reviewDecision":"CHANGES_REQUESTED"}"#).as_deref(),
+            Some("CHANGES_REQUESTED")
+        );
+        assert_eq!(
+            parse_review_decision(r#"{"reviewDecision":""}"#).as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            parse_review_decision(r#"{"reviewDecision":null}"#).as_deref(),
+            Some("")
+        );
+        for body in ["", "nope", "{}", r#"{"reviewDecision":3}"#] {
+            assert_eq!(parse_review_decision(body), None, "{body}");
+        }
+    }
+
+    #[test]
+    fn verdict_marker_binds_kind_and_head() {
+        assert_eq!(
+            verdict_marker(VerdictKind::Approved, "abc123"),
+            "<!-- quorum-verdict:approved head=abc123 -->"
+        );
+        assert_eq!(
+            verdict_marker(VerdictKind::Changes, "abc123"),
+            "<!-- quorum-verdict:changes head=abc123 -->"
+        );
+    }
+
+    fn reviews_with(entries: &[(&str, &str, &str)]) -> String {
+        let reviews: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(state, oid, body)| {
+                serde_json::json!({"state": state, "commit": {"oid": oid}, "body": body})
+            })
+            .collect();
+        serde_json::json!({ "reviews": reviews, "headRefOid": "head1" }).to_string()
+    }
+
+    #[test]
+    fn head_has_verdict_marker_matches_only_exact_kind_and_current_head() {
+        let approved = verdict_marker(VerdictKind::Approved, "head1");
+        let changes = verdict_marker(VerdictKind::Changes, "head1");
+        let body = format!("Looks good.\n\n{approved}");
+        let json = reviews_with(&[("COMMENTED", "head1", &body)]);
+        assert!(head_has_verdict_marker(
+            &json,
+            "head1",
+            VerdictKind::Approved
+        ));
+        // The other verdict kind does not dedupe.
+        assert!(!head_has_verdict_marker(
+            &json,
+            "head1",
+            VerdictKind::Changes
+        ));
+        let json = reviews_with(&[("CHANGES_REQUESTED", "head1", &changes)]);
+        assert!(head_has_verdict_marker(
+            &json,
+            "head1",
+            VerdictKind::Changes
+        ));
+        assert!(!head_has_verdict_marker(
+            &json,
+            "head1",
+            VerdictKind::Approved
+        ));
+    }
+
+    #[test]
+    fn head_has_verdict_marker_rejects_other_head_and_missing_marker() {
+        // Marker for an older head on an older-head review.
+        let old = verdict_marker(VerdictKind::Approved, "head0");
+        let json = reviews_with(&[("COMMENTED", "head0", &old)]);
+        assert!(!head_has_verdict_marker(
+            &json,
+            "head1",
+            VerdictKind::Approved
+        ));
+        // Marker naming another head, carried by a current-head review.
+        let json = reviews_with(&[("COMMENTED", "head1", &old)]);
+        assert!(!head_has_verdict_marker(
+            &json,
+            "head1",
+            VerdictKind::Approved
+        ));
+        // A current-head marker carried by a review on another commit.
+        let current = verdict_marker(VerdictKind::Approved, "head1");
+        let json = reviews_with(&[("COMMENTED", "head0", &current)]);
+        assert!(!head_has_verdict_marker(
+            &json,
+            "head1",
+            VerdictKind::Approved
+        ));
+        // A head that is a prefix of the marked head does not match.
+        let long = verdict_marker(VerdictKind::Approved, "head10");
+        let json = reviews_with(&[("COMMENTED", "head1", &long)]);
+        assert!(!head_has_verdict_marker(
+            &json,
+            "head1",
+            VerdictKind::Approved
+        ));
+        // Reviews without the marker, malformed JSON, and an empty head.
+        let json = reviews_with(&[("APPROVED", "head1", "LGTM")]);
+        assert!(!head_has_verdict_marker(
+            &json,
+            "head1",
+            VerdictKind::Approved
+        ));
+        let no_body = r#"{"reviews":[{"state":"APPROVED","commit":{"oid":"head1"}}]}"#;
+        assert!(!head_has_verdict_marker(
+            no_body,
+            "head1",
+            VerdictKind::Approved
+        ));
+        assert!(!head_has_verdict_marker(
+            "nope",
+            "head1",
+            VerdictKind::Approved
+        ));
+        let empty_head = verdict_marker(VerdictKind::Approved, "");
+        let json = reviews_with(&[("COMMENTED", "", &empty_head)]);
+        assert!(!head_has_verdict_marker(&json, "", VerdictKind::Approved));
+    }
+
+    /// Negative case 9: a COMMENTED review is never an approval, even when it
+    /// carries the daemon's approved marker for the current head.
+    #[test]
+    fn head_has_approval_false_for_commented_review_with_marker() {
+        let marker = verdict_marker(VerdictKind::Approved, "head1");
+        let json = reviews_with(&[("COMMENTED", "head1", &marker)]);
+        assert!(head_has_verdict_marker(
+            &json,
+            "head1",
+            VerdictKind::Approved
+        ));
+        assert!(!head_has_approval(&json, "head1"));
+        let json = reviews_with(&[("COMMENTED", "head1", "plain comment")]);
+        assert!(!head_has_approval(&json, "head1"));
+    }
+
+    /// Reusable fake `gh`: records argv and `GH_TOKEN` per call and serves
+    /// scripted stdout/stderr/exit per route (`probe`, `reviews`, `decision`,
+    /// `review`, `merge`, `view`, `other`).
+    #[cfg(unix)]
+    struct FakeGh {
+        dir: tempfile::TempDir,
+        program: PathBuf,
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug, PartialEq, Eq)]
+    struct FakeGhCall {
+        argv: Vec<String>,
+        gh_token: String,
+    }
+
+    #[cfg(unix)]
+    impl FakeGh {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().display().to_string();
+            let script = format!(
+                r#"#!/bin/sh
+d='{root}'
+printf 'CALL\t%s\n' "$GH_TOKEN" >> "$d/calls.log"
+for a in "$@"; do printf 'ARG\t%s\n' "$a" >> "$d/calls.log"; done
+case "$1 $2" in
+  "api graphql") route=probe ;;
+  "pr review") route=review ;;
+  "pr merge") route=merge ;;
+  "pr view")
+    route=view
+    for a in "$@"; do
+      case "$a" in
+        reviews,headRefOid) route=reviews ;;
+        reviewDecision) route=decision ;;
+      esac
+    done ;;
+  *) route=other ;;
+esac
+[ -f "$d/$route.out" ] && cat "$d/$route.out"
+[ -f "$d/$route.err" ] && cat "$d/$route.err" >&2
+code=0
+[ -f "$d/$route.code" ] && code=$(cat "$d/$route.code")
+exit "$code"
+"#
+            );
+            let program = dir.path().join("fake-gh");
+            std::fs::write(&program, script).unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self { dir, program }
+        }
+
+        fn respond(&self, route: &str, stdout: &str, code: i32) {
+            let dir = self.dir.path();
+            std::fs::write(dir.join(format!("{route}.out")), stdout).unwrap();
+            std::fs::write(dir.join(format!("{route}.code")), code.to_string()).unwrap();
+            let _ = std::fs::remove_file(dir.join(format!("{route}.err")));
+        }
+
+        fn fail(&self, route: &str, stderr: &str, code: i32) {
+            self.respond(route, "", code);
+            std::fs::write(self.dir.path().join(format!("{route}.err")), stderr).unwrap();
+        }
+
+        fn calls(&self) -> Vec<FakeGhCall> {
+            let Ok(log) = std::fs::read_to_string(self.dir.path().join("calls.log")) else {
+                return Vec::new();
+            };
+            let mut calls: Vec<FakeGhCall> = Vec::new();
+            for line in log.lines() {
+                if let Some(token) = line.strip_prefix("CALL\t") {
+                    calls.push(FakeGhCall {
+                        argv: Vec::new(),
+                        gh_token: token.to_string(),
+                    });
+                } else if let Some(arg) = line.strip_prefix("ARG\t") {
+                    calls.last_mut().unwrap().argv.push(arg.to_string());
+                }
+            }
+            calls
+        }
+
+        fn exec(
+            &self,
+            credentials: Arc<dyn GithubCredentialSource>,
+            gh_repo: Option<&str>,
+        ) -> GhMergeExecutor {
+            let mut exec = gh_exec(credentials, gh_repo.map(str::to_owned));
+            exec.gh_program = self.program.clone();
+            exec
+        }
+    }
+
+    #[test]
+    fn production_gh_program_default_is_gh() {
+        let (_, exec) = fake_exec("t");
+        let cmd = exec
+            .build_gh_cmd(&["pr", "view", "1"], Path::new("/tmp"))
+            .unwrap();
+        assert_eq!(cmd.get_program(), std::ffi::OsStr::new("gh"));
+        let cmd = exec.identity_probe_cmd(1, Path::new("/tmp")).unwrap();
+        assert_eq!(cmd.get_program(), std::ffi::OsStr::new("gh"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_probe_argv_carries_constant_query_and_variables_only() {
+        const SECRET: &str = "ghs_probe_secret_value";
+        let gh = FakeGh::new();
+        gh.respond("probe", &probe_json("true", r#""APPROVED""#), 0);
+        let source = Arc::new(FakeCredentialSource::token(SECRET));
+        let exec = gh.exec(source.clone(), Some("owner/repo"));
+
+        let identity = exec.probe_pr_identity(42, Path::new("/tmp"));
+        assert!(is_one_identity(identity.as_ref()), "{identity:?}");
+        assert_eq!(
+            identity.unwrap().review_decision.as_deref(),
+            Some("APPROVED")
+        );
+
+        let calls = gh.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(source.calls(), 1);
+        assert_eq!(calls[0].gh_token, SECRET, "token travels via GH_TOKEN");
+        assert_eq!(
+            calls[0].argv,
+            vec![
+                "api".to_string(),
+                "graphql".into(),
+                "-f".into(),
+                format!("query={PR_IDENTITY_QUERY}"),
+                "-f".into(),
+                "owner=owner".into(),
+                "-f".into(),
+                "name=repo".into(),
+                "-F".into(),
+                "number=42".into(),
+            ]
+        );
+        assert!(!calls[0].argv.iter().any(|a| a == "-R"));
+        assert!(
+            !calls[0].argv.iter().any(|a| a.contains(SECRET)),
+            "token must never enter argv"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_probe_without_slug_uses_placeholders_in_repo_dir() {
+        let gh = FakeGh::new();
+        gh.respond("probe", &probe_json("false", "null"), 0);
+        let exec = gh.exec(Arc::new(FakeCredentialSource::token("t")), None);
+        let repo_dir = tempfile::tempdir().unwrap();
+        let cmd = exec.identity_probe_cmd(7, repo_dir.path()).unwrap();
+        assert_eq!(cmd.get_current_dir(), Some(repo_dir.path()));
+
+        let identity = exec.probe_pr_identity(7, repo_dir.path());
+        assert!(!is_one_identity(identity.as_ref()), "{identity:?}");
+        assert_eq!(
+            gh.calls()[0].argv[4..],
+            ["-F", "owner={owner}", "-F", "name={repo}", "-F", "number=7"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_probe_failures_never_select_one_identity() {
+        let gh = FakeGh::new();
+        let exec = gh.exec(Arc::new(FakeCredentialSource::token("t")), Some("o/r"));
+        // gh failure, even with a one-identity body on stdout.
+        gh.respond("probe", &probe_json("true", "null"), 1);
+        assert_eq!(exec.probe_pr_identity(1, Path::new("/tmp")), None);
+        gh.fail("probe", "HTTP 502", 1);
+        assert_eq!(exec.probe_pr_identity(1, Path::new("/tmp")), None);
+        // GraphQL errors entry with exit 0.
+        gh.respond(
+            "probe",
+            r#"{"data":{"repository":{"pullRequest":{"viewerDidAuthor":true,"reviewDecision":null}}},"errors":[{"message":"x"}]}"#,
+            0,
+        );
+        assert_eq!(exec.probe_pr_identity(1, Path::new("/tmp")), None);
+        // Malformed JSON and missing field.
+        gh.respond("probe", "{not json", 0);
+        assert_eq!(exec.probe_pr_identity(1, Path::new("/tmp")), None);
+        gh.respond(
+            "probe",
+            r#"{"data":{"repository":{"pullRequest":{"reviewDecision":null}}}}"#,
+            0,
+        );
+        assert_eq!(exec.probe_pr_identity(1, Path::new("/tmp")), None);
+        assert_eq!(gh.calls().len(), 5);
+        // An unspawnable program is a failure too.
+        let mut missing = gh.exec(Arc::new(FakeCredentialSource::token("t")), Some("o/r"));
+        missing.gh_program = PathBuf::from("/nonexistent/bin/gh");
+        assert_eq!(missing.probe_pr_identity(1, Path::new("/tmp")), None);
+    }
+
+    /// Negative case 11: a missing merge token file spawns no gh child.
+    #[cfg(unix)]
+    #[test]
+    fn identity_probe_missing_credential_spawns_nothing() {
+        let gh = FakeGh::new();
+        gh.respond("probe", &probe_json("true", "null"), 0);
+        let exec = gh.exec(
+            Arc::new(LocalDefaultCredentialSource::new(Some(PathBuf::from(
+                "/nonexistent/path/token",
+            )))),
+            Some("o/r"),
+        );
+        assert!(matches!(
+            exec.identity_probe_cmd(1, Path::new("/tmp")),
+            Err(GithubCredentialError::TokenFileUnreadable { .. })
+        ));
+        assert_eq!(exec.probe_pr_identity(1, Path::new("/tmp")), None);
+        assert_eq!(exec.live_review_decision(1, Path::new("/tmp")), None);
+        assert!(gh.calls().is_empty(), "no gh child may spawn");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_gh_serves_review_decision_reviews_review_and_merge() {
+        const SECRET: &str = "ghs_merge_secret";
+        let gh = FakeGh::new();
+        let exec = gh.exec(Arc::new(FakeCredentialSource::token(SECRET)), Some("o/r"));
+
+        gh.respond("decision", r#"{"reviewDecision":"APPROVED"}"#, 0);
+        assert_eq!(
+            exec.live_review_decision(5, Path::new("/tmp")).as_deref(),
+            Some("APPROVED")
+        );
+        gh.fail("decision", "boom", 1);
+        assert_eq!(exec.live_review_decision(5, Path::new("/tmp")), None);
+
+        let marker = verdict_marker(VerdictKind::Approved, "head1");
+        gh.respond(
+            "reviews",
+            &reviews_with(&[("COMMENTED", "head1", &marker)]),
+            0,
+        );
+        let (reviews, head) = exec.fetch_reviews_and_head(5, Path::new("/tmp")).unwrap();
+        assert_eq!(head, "head1");
+        assert!(head_has_verdict_marker(
+            &reviews,
+            &head,
+            VerdictKind::Approved
+        ));
+        assert!(!head_has_approval(&reviews, &head));
+
+        gh.respond("review", "", 0);
+        assert!(
+            exec.run_gh(&["pr", "review", "5", "--comment"], Path::new("/tmp"))
+                .success
+        );
+        gh.fail("merge", "merge blocked", 1);
+        let merged = exec.run_gh(&["pr", "merge", "5", "--merge"], Path::new("/tmp"));
+        assert!(!merged.success);
+        assert_eq!(merged.message, "merge blocked");
+
+        let calls = gh.calls();
+        assert_eq!(calls.len(), 5);
+        for call in &calls {
+            assert_eq!(call.gh_token, SECRET);
+            assert!(!call.argv.iter().any(|a| a.contains(SECRET)));
+        }
+        assert_eq!(
+            calls[0].argv,
+            ["pr", "view", "5", "--json", "reviewDecision", "-R", "o/r"]
+        );
+        assert_eq!(
+            calls[2].argv,
+            [
+                "pr",
+                "view",
+                "5",
+                "--json",
+                "reviews,headRefOid",
+                "-R",
+                "o/r"
+            ]
+        );
+        assert_eq!(calls[3].argv[..2], ["pr", "review"]);
+        assert_eq!(calls[4].argv[..2], ["pr", "merge"]);
     }
 
     #[test]
