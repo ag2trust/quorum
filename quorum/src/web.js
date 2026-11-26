@@ -192,7 +192,10 @@
   }
 
   const utf8 = new TextDecoder('utf-8', {fatal: true});
-  function hexBytes(hex) { const bytes = new Uint8Array(hex.length / 2); for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16); return bytes; }
+  // Decode by character code: a pending record may be 8 MiB, and per-byte
+  // slice()+parseInt() made that path take seconds. Non-hex digits decode as 0.
+  function hexNibble(code) { if (code >= 48 && code <= 57) return code - 48; if (code >= 97 && code <= 102) return code - 87; if (code >= 65 && code <= 70) return code - 55; return -1; }
+  function hexBytes(hex) { const bytes = new Uint8Array(hex.length >> 1); for (let i = 0; i < bytes.length; i++) { const high = hexNibble(hex.charCodeAt(i * 2)), low = hexNibble(hex.charCodeAt(i * 2 + 1)); bytes[i] = high < 0 || low < 0 ? 0 : (high << 4) | low; } return bytes; }
   function joinBytes(left, right) { const joined = new Uint8Array(left.length + right.length); joined.set(left); joined.set(right, left.length); return joined; }
   // Keep only the suffix that can reach the bounded normalizer. `lines` itself comes
   // from a 2 MiB JSON response and can contain hundreds of thousands of tiny records.

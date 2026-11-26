@@ -2135,9 +2135,12 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerTurnEnd> {
 mod tests {
     use super::*;
 
-    // The no-read provider test fills a pipe with a near-limit prompt. Allow
-    // normal CI scheduling delay while retaining a finite failure boundary.
-    const TEST_STDIN_FEED_TIMEOUT: Duration = Duration::from_secs(15);
+    // The no-read provider test fills a pipe with a near-limit prompt. The
+    // deadline is pure wall time in the passing case, so try a short one first
+    // and fall back to a CI-tolerant one only when the provider had not even
+    // recorded its PID before the shorter deadline fired.
+    const TEST_STDIN_FEED_TIMEOUTS: [Duration; 2] =
+        [Duration::from_secs(2), Duration::from_secs(15)];
     const TEST_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(15);
 
     #[cfg(unix)]
@@ -3226,28 +3229,39 @@ mod tests {
         std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
         let prompt = "x".repeat(MAX_PROMPT_BYTES - 1024);
 
-        let error = match spawn_planner_with_timeout(
-            AgentKind::Claude,
-            CLAUDE_PLANNER_MODEL,
-            PLANNER_EFFORT,
-            dir.path(),
-            &prompt,
-            false,
-            runner.to_str(),
-            None,
-            TEST_STDIN_FEED_TIMEOUT,
-        )
-        .await
-        {
-            Ok(slot) => {
-                slot.kill_and_reap().await;
-                panic!("a no-read provider unexpectedly accepted the bounded prompt")
-            }
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        let pid: i32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
+        for (attempt, timeout) in TEST_STDIN_FEED_TIMEOUTS.into_iter().enumerate() {
+            let _ = std::fs::remove_file(&pid_path);
+            let error = match spawn_planner_with_timeout(
+                AgentKind::Claude,
+                CLAUDE_PLANNER_MODEL,
+                PLANNER_EFFORT,
+                dir.path(),
+                &prompt,
+                false,
+                runner.to_str(),
+                None,
+                timeout,
+            )
+            .await
+            {
+                Ok(slot) => {
+                    slot.kill_and_reap().await;
+                    panic!("a no-read provider unexpectedly accepted the bounded prompt")
+                }
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            let Ok(pid) = std::fs::read_to_string(&pid_path) else {
+                assert!(
+                    attempt + 1 < TEST_STDIN_FEED_TIMEOUTS.len(),
+                    "provider never started within {timeout:?}"
+                );
+                continue;
+            };
+            let pid: i32 = pid.parse().unwrap();
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "planner was not reaped");
+            return;
+        }
     }
 
     #[cfg(unix)]
