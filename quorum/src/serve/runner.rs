@@ -793,11 +793,16 @@ pub enum TurnMode {
 /// Provider-neutral inputs for starting one runner turn.
 ///
 /// Provider adapters translate this request into their private command specs.
-/// The model is resolved through [`AgentKind::for_model`], so callers cannot
-/// pair an arbitrary runner with a model. Cross-provider fallback is installed
+/// `runner` comes from the profile the caller routed, never from the model
+/// string. For a built-in runner the entry points still require
+/// [`AgentKind::for_model`] to agree, so a run cannot spawn one runner and
+/// persist another; an external runner's model is passed through verbatim and
+/// `for_model` is never consulted. Cross-provider fallback is installed
 /// by the lifecycle orchestrator as a fresh request; adapters never migrate a
 /// provider continuation themselves.
 pub struct LaunchRequest<'a> {
+    /// Runner named by the routed profile.
+    pub runner: AgentKind,
     pub model: &'a str,
     pub effort: &'a str,
     pub worktree: &'a Path,
@@ -1083,13 +1088,7 @@ impl RunnerProc {
         request: &RunnerRequest<'_>,
         config: &AdapterConfig<'_>,
     ) -> Result<Self, RunnerFailure> {
-        let kind = AgentKind::for_model(request.launch.model).map_err(|error| {
-            RunnerFailure::new(FailureDisposition::Unclassified, error)
-                .with_io_kind(std::io::ErrorKind::InvalidInput)
-        })?;
-        if kind == AgentKind::External {
-            return Err(external_adapter_not_built());
-        }
+        let kind = routed_runner(&request.launch)?;
         if kind != AgentKind::Grok
             || request.task_id <= 0
             || request.role_assignment_id <= 0
@@ -1133,15 +1132,12 @@ impl RunnerProc {
         }
     }
 
-    /// Resolve and launch the explicit built-in adapter for this model.
+    /// Launch the adapter for the request's routed runner.
     pub async fn launch(
         request: &LaunchRequest<'_>,
         config: &AdapterConfig<'_>,
     ) -> Result<Self, RunnerFailure> {
-        let kind = AgentKind::for_model(request.model).map_err(|error| {
-            RunnerFailure::new(FailureDisposition::Unclassified, error)
-                .with_io_kind(std::io::ErrorKind::InvalidInput)
-        })?;
+        let kind = routed_runner(request)?;
         Self::launch_as(kind, request, config).await
     }
 
@@ -1173,10 +1169,7 @@ impl RunnerProc {
         request: &LaunchRequest<'_>,
         config: &AdapterConfig<'_>,
     ) -> Result<(Self, LaunchGate), RunnerFailure> {
-        let kind = AgentKind::for_model(request.model).map_err(|error| {
-            RunnerFailure::new(FailureDisposition::Unclassified, error)
-                .with_io_kind(std::io::ErrorKind::InvalidInput)
-        })?;
+        let kind = routed_runner(request)?;
         Self::launch_gated_as(kind, request, config).await
     }
 
@@ -1223,10 +1216,7 @@ impl RunnerProc {
             )
             .with_io_kind(std::io::ErrorKind::TimedOut));
         }
-        let kind = AgentKind::for_model(request.model).map_err(|error| {
-            RunnerFailure::new(FailureDisposition::Unclassified, error)
-                .with_io_kind(std::io::ErrorKind::InvalidInput)
-        })?;
+        let kind = routed_runner(request)?;
         Self::launch_restricted_until_as(kind, request, config, deadline).await
     }
 
@@ -1595,6 +1585,30 @@ pub fn launch_failure(error: &std::io::Error) -> Option<RunnerFailure> {
         .cloned()
 }
 
+/// The runner a launch dispatches on. A built-in runner must agree with
+/// [`AgentKind::for_model`]; an external runner never consults it and is
+/// refused until its adapter exists.
+fn routed_runner(request: &LaunchRequest<'_>) -> Result<AgentKind, RunnerFailure> {
+    if request.runner == AgentKind::External {
+        return Err(external_adapter_not_built());
+    }
+    let model_kind = AgentKind::for_model(request.model).map_err(|error| {
+        RunnerFailure::new(FailureDisposition::Unclassified, error)
+            .with_io_kind(std::io::ErrorKind::InvalidInput)
+    })?;
+    if model_kind != request.runner {
+        return Err(RunnerFailure::new(
+            FailureDisposition::NonFailover,
+            format!(
+                "routed runner '{}' does not match model '{}' resolved as '{model_kind}'",
+                request.runner, request.model
+            ),
+        )
+        .with_io_kind(std::io::ErrorKind::InvalidInput));
+    }
+    Ok(request.runner)
+}
+
 /// Launch failure for the external runner until its adapter exists. The
 /// configuration cannot be repaired by failing over, so it is NonFailover.
 fn external_adapter_not_built() -> RunnerFailure {
@@ -1641,6 +1655,19 @@ impl AgentKind {
             Self::Codex => TurnMode::RespawnPerTurn,
             Self::Grok => TurnMode::RespawnPerTurn,
             Self::External => TurnMode::RespawnPerTurn,
+        }
+    }
+
+    /// Resolve the runner a routed profile's `runner` value names.
+    pub fn for_profile_runner(runner: &str) -> Result<Self, String> {
+        match runner {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            "grok" => Ok(Self::Grok),
+            "external" => Ok(Self::External),
+            other => Err(format!(
+                "unknown profile runner '{other}' (expected claude, codex, grok, or external)"
+            )),
         }
     }
 
@@ -2057,6 +2084,7 @@ mod tests {
 
     fn mcp_request<'a>(mode: LaunchMode, environment: &'a [(String, String)]) -> LaunchRequest<'a> {
         LaunchRequest {
+            runner: AgentKind::Codex,
             model: "gpt-5.6-terra",
             effort: "high",
             worktree: std::path::Path::new("/tmp/worktree"),
@@ -2214,6 +2242,7 @@ mod tests {
         ];
         for (index, (model, role, environment, missing)) in cases.iter().enumerate() {
             let request = LaunchRequest {
+                runner: AgentKind::for_model(model).unwrap(),
                 model,
                 effort: "high",
                 worktree: dir.path(),
@@ -2543,6 +2572,7 @@ mod tests {
         let runner = recording_runner(dir.path());
         let environment = vec![("QUORUM_ADAPTER_TEST".into(), "gated-claude-env".into())];
         let request = LaunchRequest {
+            runner: AgentKind::Claude,
             model: "claude-sonnet-5",
             effort: "high",
             worktree: dir.path(),
@@ -2641,6 +2671,7 @@ mod tests {
             let runner = recording_runner(dir.path());
             let environment = vec![("QUORUM_ADAPTER_TEST".into(), "must-not-run".into())];
             let request = LaunchRequest {
+                runner: AgentKind::for_model(model).unwrap(),
                 model,
                 effort: "high",
                 worktree: dir.path(),
@@ -2702,6 +2733,7 @@ mod tests {
             std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
             let environment = Vec::new();
             let request = LaunchRequest {
+                runner: AgentKind::for_model(model).unwrap(),
                 model,
                 effort: "high",
                 worktree: dir.path(),
@@ -2759,6 +2791,7 @@ mod tests {
             let environment = Vec::new();
             let cfg = gate_config(runner.to_str().unwrap());
             let make_request = || LaunchRequest {
+                runner: AgentKind::for_model(model).unwrap(),
                 model,
                 effort: "high",
                 worktree: dir.path(),
@@ -2840,6 +2873,7 @@ mod tests {
         let claude_environment = vec![("QUORUM_ADAPTER_TEST".into(), "claude-env".into())];
         let mut claude = launch_recording_runner(
             &LaunchRequest {
+                runner: AgentKind::Claude,
                 model: "claude-sonnet-5",
                 effort: "high",
                 worktree: claude_dir.path(),
@@ -2893,6 +2927,7 @@ mod tests {
         let codex_environment = vec![("QUORUM_ADAPTER_TEST".into(), "codex-env".into())];
         let mut codex = launch_recording_runner(
             &LaunchRequest {
+                runner: AgentKind::Codex,
                 model: "gpt-5.6-terra",
                 effort: "medium",
                 worktree: codex_dir.path(),
@@ -2934,6 +2969,7 @@ mod tests {
             let grok_environment = vec![("QUORUM_ADAPTER_TEST".into(), "grok-env".into())];
             let mut grok = launch_recording_runner(
                 &LaunchRequest {
+                    runner: AgentKind::for_model(model).unwrap(),
                     model,
                     effort: "high",
                     worktree: grok_dir.path(),
@@ -2984,6 +3020,7 @@ mod tests {
         let claude_session = "00000000-0000-4000-8000-000000000042";
         let mut claude = launch_recording_runner(
             &LaunchRequest {
+                runner: AgentKind::Claude,
                 model: "claude-sonnet-5",
                 effort: "high",
                 worktree: claude_dir.path(),
@@ -3051,6 +3088,7 @@ mod tests {
         codex_environment.push(("QUORUM_ADAPTER_TEST".into(), "managed-codex".into()));
         let mut codex = launch_recording_runner(
             &LaunchRequest {
+                runner: AgentKind::Codex,
                 model: "gpt-5.6-terra",
                 effort: "high",
                 worktree: codex_dir.path(),
@@ -3113,6 +3151,7 @@ mod tests {
         grok_environment.push(("GROK_HOME".into(), original_grok_home.display().to_string()));
         let mut grok = launch_recording_runner(
             &LaunchRequest {
+                runner: AgentKind::Grok,
                 model: "grok-4.5",
                 effort: "high",
                 worktree: grok_dir.path(),
@@ -3240,6 +3279,7 @@ mod tests {
             let environment = vec![("GROK_HOME".into(), grok_home.display().to_string())];
             let mut proc = launch_recording_runner(
                 &LaunchRequest {
+                    runner: expected_kind,
                     model,
                     effort: "low",
                     worktree: dir.path(),
@@ -3307,6 +3347,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let error = match RunnerProc::launch(
             &LaunchRequest {
+                runner: AgentKind::Claude,
                 model: "unknown-runner-model",
                 effort: "low",
                 worktree: dir.path(),
@@ -3334,10 +3375,119 @@ mod tests {
         assert_eq!(error.disposition(), FailureDisposition::Unclassified);
     }
 
+    /// Launch through every public entry point with `runner` and `model`.
+    async fn launch_all_entry_points(
+        runner: AgentKind,
+        model: &str,
+    ) -> Vec<(&'static str, RunnerFailure)> {
+        let dir = tempfile::tempdir().unwrap();
+        let request = |mode| LaunchRequest {
+            runner,
+            model,
+            effort: "custom_effort",
+            worktree: dir.path(),
+            prompt: "prompt",
+            environment: &[],
+            mode,
+            continuation_id: None,
+            managed: None,
+        };
+        let config = AdapterConfig {
+            executable: Some("/definitely/not/a/runner"),
+            claude_bare: false,
+            claude_allowed_tools: "",
+            codex_sandbox: "read-only",
+            grok: Default::default(),
+        };
+        let mut failures = Vec::new();
+        match RunnerProc::launch(&request(LaunchMode::Normal), &config).await {
+            Ok(_) => panic!("{runner} launch with model {model} unexpectedly started"),
+            Err(error) => failures.push(("launch", error)),
+        }
+        match RunnerProc::launch_gated(&request(LaunchMode::Normal), &config).await {
+            Ok(_) => panic!("{runner} gated launch with model {model} unexpectedly started"),
+            Err(error) => failures.push(("launch_gated", error)),
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        match RunnerProc::launch_restricted_until(
+            &request(LaunchMode::Restricted),
+            &config,
+            deadline,
+        )
+        .await
+        {
+            Ok(_) => panic!("{runner} restricted launch with model {model} unexpectedly started"),
+            Err(error) => failures.push(("launch_restricted_until", error)),
+        }
+        let internal = RunnerRequest {
+            launch: request(LaunchMode::Normal),
+            task_id: 1,
+            role_assignment_id: 1,
+            responsibility_key: "worker:task:1:1",
+            agent: "agent",
+            role: "worker",
+            pending_turn: PendingTurn {
+                provider: runner.to_string(),
+                model: model.to_string(),
+                effort: "custom_effort".into(),
+                prompt: "prompt".into(),
+                turn_kind: "initial".into(),
+                continuation_id: None,
+                requested: false,
+            },
+        };
+        match RunnerProc::launch_internal_worker(&internal, &config).await {
+            Ok(_) => panic!("{runner} internal worker with model {model} unexpectedly started"),
+            Err(error) => failures.push(("launch_internal_worker", error)),
+        }
+        failures
+    }
+
+    #[tokio::test]
+    async fn built_in_runner_with_mismatched_model_is_refused_at_every_entry_point() {
+        for (runner, model) in [
+            (AgentKind::Claude, "gpt-5.6-terra"),
+            (AgentKind::Codex, "claude-sonnet-5"),
+            (AgentKind::Grok, "gpt-5"),
+        ] {
+            for (entry, error) in launch_all_entry_points(runner, model).await {
+                assert_eq!(
+                    error.disposition(),
+                    FailureDisposition::NonFailover,
+                    "{entry}: {error}"
+                );
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{entry}");
+                assert!(
+                    error
+                        .detail()
+                        .contains(&format!("routed runner '{runner}' does not match model")),
+                    "{entry}: {error}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn external_kind_launch_is_non_failover_until_adapter_exists() {
+        // A model the built-in mapping resolves to Codex must not launch
+        // Codex when the routed profile names the external runner.
+        let failures = launch_all_entry_points(AgentKind::External, "gpt-5").await;
+        assert_eq!(failures.len(), 4);
+        for (entry, error) in failures {
+            assert_eq!(
+                error.disposition(),
+                FailureDisposition::NonFailover,
+                "{entry}"
+            );
+            assert_eq!(
+                error.detail(),
+                "external runner adapter not built",
+                "{entry}"
+            );
+        }
         let dir = tempfile::tempdir().unwrap();
         let request = LaunchRequest {
+            runner: AgentKind::External,
             model: "gpt-5",
             effort: "custom_effort",
             worktree: dir.path(),
@@ -3382,6 +3532,15 @@ mod tests {
             Ok(_) => panic!("external runner unexpectedly launched restricted"),
             Err(error) => assert_stub(error),
         }
+        assert_eq!(
+            AgentKind::for_profile_runner("external").unwrap(),
+            AgentKind::External
+        );
+        assert_eq!(
+            AgentKind::for_profile_runner("codex").unwrap(),
+            AgentKind::Codex
+        );
+        assert!(AgentKind::for_profile_runner("gpt-5").is_err());
         // The model string never selects the external runner.
         assert_eq!(AgentKind::for_model("gpt-5").unwrap(), AgentKind::Codex);
         assert_eq!(AgentKind::External.to_string(), "external");
@@ -3396,6 +3555,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let error = match RunnerProc::launch(
             &LaunchRequest {
+                runner: AgentKind::Codex,
                 model: "gpt-5.6-terra",
                 effort: "medium",
                 worktree: dir.path(),
@@ -3470,6 +3630,7 @@ mod tests {
         let executable = recording_runner(dir.path());
         let mut proc = launch_recording_runner(
             &LaunchRequest {
+                runner: AgentKind::Codex,
                 model: "gpt-5.6-terra",
                 effort: "high",
                 worktree: dir.path(),
@@ -3497,6 +3658,7 @@ mod tests {
 
         let error = match RunnerProc::launch(
             &LaunchRequest {
+                runner: AgentKind::Codex,
                 model: "gpt-5.6-terra",
                 effort: "high",
                 worktree: dir.path(),

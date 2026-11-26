@@ -4127,6 +4127,12 @@ pub fn resolve_provider(model: &str) -> Result<runner::AgentKind> {
     runner::AgentKind::for_model(model).map_err(QuorumError::Usage)
 }
 
+/// Resolve the runner a routed profile names. The runner always comes from
+/// the profile, never from its model string.
+fn resolve_profile_runner(runner: &str) -> Result<runner::AgentKind> {
+    runner::AgentKind::for_profile_runner(runner).map_err(QuorumError::Usage)
+}
+
 fn resolve_worker_provider(model: &str) -> Result<runner::AgentKind> {
     resolve_provider(model)
 }
@@ -10475,12 +10481,13 @@ async fn tick_decomposition(
             coordinator.classifier_route_probe,
         )?;
         coordinator.classifier_route_probe = coordinator.classifier_route_probe.wrapping_add(1);
-        let classifier_kind = resolve_provider(&route.profile.model)?;
+        let classifier_kind = resolve_profile_runner(&route.profile.runner)?;
         match classifier::spawn_classifier_configured(
             &tasks,
             &[],
             agent_bin_for_kind(config, classifier_kind),
             config.bare_agent,
+            classifier_kind,
             &route.profile.model,
             &route.profile.effort,
             &config.codex_sandbox,
@@ -10761,12 +10768,13 @@ async fn tick_classifier(
                 // reaches every provider in the pool under its own backoff.
                 let route =
                     assign_classifier_route(config, &tasks, None, *classifier_consec_errors)?;
-                let classifier_kind = resolve_provider(&route.profile.model)?;
+                let classifier_kind = resolve_profile_runner(&route.profile.runner)?;
                 match classifier::spawn_classifier_configured(
                     &tasks,
                     &dup_context,
                     provider_bin(classifier_kind).as_deref(),
                     config.bare_agent,
+                    classifier_kind,
                     &route.profile.model,
                     &route.profile.effort,
                     &config.codex_sandbox,
@@ -20821,6 +20829,7 @@ async fn feed_worker_turn(
 
         let launch = runner::RunnerProc::launch(
             &runner::LaunchRequest {
+                runner: slot.process_kind(),
                 model,
                 effort,
                 worktree: &slot.worktree_path,
@@ -24852,6 +24861,7 @@ async fn provision_reviewer_reserved(
     let reviewer_model = assignment.model.clone();
     let reviewer_effort = assignment.effort.clone();
     let reviewer_kind = resolve_provider(&reviewer_model)?;
+    let reviewer_runner = resolve_profile_runner(&assignment.runner)?;
     let reviewer_continuation_id = recovery
         .as_ref()
         .and_then(|recovery| recovery.continuation_id.clone());
@@ -25587,6 +25597,7 @@ async fn provision_reviewer_reserved(
     } else {
         runner::RunnerProc::launch(
             &runner::LaunchRequest {
+                runner: reviewer_runner,
                 model: &reviewer_model,
                 effort: &reviewer_effort,
                 worktree: &wt_path,
@@ -27730,6 +27741,15 @@ async fn spawn_admitted_worker(
             ));
         }
     };
+    let resolved_runner = match resolve_profile_runner(&assignment.runner) {
+        Ok(kind) => kind,
+        Err(error) => {
+            refuse_launch!(format!(
+                "worker launch refused: profile {} runner resolution failed: {error}",
+                assignment.profile_id
+            ));
+        }
+    };
 
     // Codex cannot fabricate USD cost — reject rather than silently spawn
     // with no cost enforcement.
@@ -27833,6 +27853,7 @@ async fn spawn_admitted_worker(
         }
     }
     let launch = runner::LaunchRequest {
+        runner: resolved_runner,
         model: &resolved_model,
         effort: &resolved_effort,
         worktree: &wt_path,
@@ -29498,6 +29519,7 @@ async fn activate_reviewer_fallback(
         .as_ref()
         .map(|log| log.dir().to_string_lossy().into_owned());
     let launch = runner::LaunchRequest {
+        runner: alternate_kind,
         model: &intent.pending_turn.model,
         effort: &intent.pending_turn.effort,
         worktree: Path::new(&intent.worktree),
@@ -30203,6 +30225,7 @@ async fn activate_worker_fallback_with(
         Some(intent.capability_run_id.as_str()),
     );
     let launch = runner::LaunchRequest {
+        runner: alternate_kind,
         model: &intent.pending_turn.model,
         effort: &intent.pending_turn.effort,
         worktree: Path::new(&intent.worktree),
@@ -30521,6 +30544,7 @@ async fn resume_pending_fallbacks(
             Some(intent.capability_run_id.as_str()),
         );
         let launch = runner::LaunchRequest {
+            runner: kind,
             model: &intent.pending_turn.model,
             effort: &intent.pending_turn.effort,
             worktree: &slot.worktree_path,
@@ -32837,9 +32861,11 @@ async fn spawn_remediation_worker(
         remediation_kind,
         has_original_worker,
         worker_assignment,
+        remediation_runner,
     ) = {
         let resolved = match original_worker {
             Some(worker) => {
+                // The original worker's runner is its durable record.
                 let conn = quorum_core::db::open(db_path)?;
                 recover_original_remediation_layout(&conn, task_id, worker).map(|layout| {
                     (
@@ -32848,21 +32874,23 @@ async fn spawn_remediation_worker(
                         layout.kind,
                         true,
                         layout.assignment,
+                        layout.kind,
                     )
                 })
             }
             None => {
                 let assignment =
                     fresh_assignment.expect("workerless remediation has a fresh assignment");
-                let kind = resolve_worker_provider(&assignment.model);
-                kind.map(|kind| {
-                    (
+                resolve_worker_provider(&assignment.model).and_then(|kind| {
+                    let runner = resolve_profile_runner(&assignment.runner)?;
+                    Ok((
                         assignment.model.clone(),
                         assignment.effort.clone(),
                         kind,
                         false,
                         Some(assignment),
-                    )
+                        runner,
+                    ))
                 })
             }
         };
@@ -33063,6 +33091,7 @@ async fn spawn_remediation_worker(
     let fresh_grok_handoff =
         remediation_kind == runner::AgentKind::Grok && launch_continuation_id.is_none();
     let launch = runner::LaunchRequest {
+        runner: remediation_runner,
         model: &remediation_model,
         effort: &remediation_effort,
         worktree: &wt_path,
@@ -37454,6 +37483,7 @@ mod tests {
                 &config,
                 runner::AgentKind::Codex,
                 &runner::LaunchRequest {
+                    runner: runner::AgentKind::Codex,
                     model: "gpt-5.6-terra",
                     effort: "high",
                     worktree: &worktree,
@@ -37566,6 +37596,7 @@ mod tests {
             &config,
             runner::AgentKind::Codex,
             &runner::LaunchRequest {
+                runner: runner::AgentKind::Codex,
                 model: "gpt-5.6-terra",
                 effort: "high",
                 worktree: &worktree,
@@ -37627,6 +37658,7 @@ mod tests {
             &config,
             runner::AgentKind::Codex,
             &runner::LaunchRequest {
+                runner: runner::AgentKind::Codex,
                 model: "gpt-5.6-terra",
                 effort: "high",
                 worktree: &worktree,
@@ -38209,6 +38241,7 @@ mod tests {
             proc: SlotProcess::running(
                 runner::RunnerProc::launch(
                     &runner::LaunchRequest {
+                        runner: resolve_profile_runner(&assignment.runner).unwrap(),
                         model: &assignment.model,
                         effort: &assignment.effort,
                         worktree: &worktree,
@@ -41941,6 +41974,7 @@ mod tests {
         std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
         let proc = runner::RunnerProc::launch(
             &runner::LaunchRequest {
+                runner: resolve_profile_runner(&assignment.runner).unwrap(),
                 model: &assignment.model,
                 effort: &assignment.effort,
                 worktree: &worktree,
@@ -44103,6 +44137,7 @@ mod tests {
     ) -> runner::RunnerProc {
         runner::RunnerProc::launch(
             &runner::LaunchRequest {
+                runner: runner::AgentKind::Codex,
                 model: "gpt-5.6-terra",
                 effort: "medium",
                 worktree,
@@ -44202,6 +44237,7 @@ mod tests {
         let proc = runner::RunnerProc::launch_internal_worker(
             &runner::RunnerRequest {
                 launch: runner::LaunchRequest {
+                    runner: runner::AgentKind::Grok,
                     model: "grok-4.5",
                     effort: "high",
                     worktree: &worktree,
@@ -44477,6 +44513,7 @@ mod tests {
         };
         let resumed_proc = runner::RunnerProc::launch(
             &runner::LaunchRequest {
+                runner: runner::AgentKind::Grok,
                 model: "grok-4.5",
                 effort: "high",
                 worktree: &initial.worktree_path,
@@ -45037,6 +45074,7 @@ mod tests {
         );
         let mut resumed = runner::RunnerProc::launch(
             &runner::LaunchRequest {
+                runner: runner::AgentKind::Grok,
                 model: "grok-4.5",
                 effort: "high",
                 worktree: dir.path(),
@@ -46012,6 +46050,7 @@ printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-session-te
         )];
         let initial_request = runner::RunnerRequest {
             launch: runner::LaunchRequest {
+                runner: runner::AgentKind::Grok,
                 model: "grok-4.5",
                 effort: "high",
                 worktree: &worktree,
@@ -46053,6 +46092,7 @@ printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-session-te
         )];
         let resumed = runner::RunnerProc::launch(
             &runner::LaunchRequest {
+                runner: runner::AgentKind::Grok,
                 model: "grok-4.5",
                 effort: "high",
                 worktree: &worktree,
@@ -46096,6 +46136,7 @@ printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-session-te
         );
         let resumed = runner::RunnerProc::launch(
             &runner::LaunchRequest {
+                runner: runner::AgentKind::Grok,
                 model: "grok-4.5",
                 effort: "high",
                 worktree: &slot.worktree_path,
@@ -48226,6 +48267,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
         let proc = runner::RunnerProc::launch(
             &runner::LaunchRequest {
+                runner: runner::AgentKind::Codex,
                 model: "gpt-5.6-terra",
                 effort: "medium",
                 worktree: &worktree,
@@ -50092,6 +50134,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
         let proc = runner::RunnerProc::launch(
             &runner::LaunchRequest {
+                runner: runner::AgentKind::Codex,
                 model: "gpt-5.6-terra",
                 effort: "high",
                 worktree: repo_dir,
@@ -51304,6 +51347,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
         let proc = runner::RunnerProc::launch(
             &runner::LaunchRequest {
+                runner: runner::AgentKind::Codex,
                 model: "gpt-5.6-terra",
                 effort: "high",
                 worktree: &repo_dir,
@@ -58706,6 +58750,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             gh_repo: Some("o/r".into()),
             base_branch: "main".into(),
             self_update_branch: "main".into(),
+            gh_program: PathBuf::from("gh"),
         };
         let executor: Arc<dyn merge::MergeExecutor> = Arc::new(executor);
 
@@ -64734,6 +64779,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &config,
             runner::AgentKind::Grok,
             &runner::LaunchRequest {
+                runner: runner::AgentKind::Grok,
                 model: "grok-4.5",
                 effort: "high",
                 worktree: &worktree,
@@ -71756,6 +71802,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &[],
             runner.to_str(),
             false,
+            runner::AgentKind::Claude,
             classifier::CLASSIFIER_MODEL,
             classifier::CLASSIFIER_EFFORT,
             "read-only",
@@ -71867,6 +71914,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             &[],
             runner.to_str(),
             false,
+            runner::AgentKind::Claude,
             classifier::CLASSIFIER_MODEL,
             classifier::CLASSIFIER_EFFORT,
             "read-only",

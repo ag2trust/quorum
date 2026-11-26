@@ -1387,6 +1387,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                     // fields are not consulted by merge_commit_status.
                     base_branch: "main".into(),
                     self_update_branch: "main".into(),
+                    gh_program: std::path::PathBuf::from("gh"),
                 };
                 match executor.merge_commit_status(pr, std::path::Path::new(".")) {
                     serve::merge::MergeCommitStatus::Merged {
@@ -1854,6 +1855,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                         gh_repo: resolve_gh_repo(&r_repo_dir.value),
                         base_branch: r_base_branch.value.clone(),
                         self_update_branch: r_self_update_branch.value.clone(),
+                        gh_program: std::path::PathBuf::from("gh"),
                     })
                 };
 
@@ -2116,6 +2118,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                         &dup_context,
                         agent_bin.as_deref(),
                         !no_bare_agent,
+                        // The built-in default classifier profile runs on Claude.
+                        serve::runner::AgentKind::Claude,
                         serve::classifier::CLASSIFIER_MODEL,
                         serve::classifier::CLASSIFIER_EFFORT,
                         "workspace-write",
