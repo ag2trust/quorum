@@ -376,6 +376,13 @@ pub fn build_review_prompt_for_kind_with_context_and_cycle(
             build_codex_review_prompt(spec, effort),
             graph_review_contract(graph_context)
         ),
+        // Provider-neutral repository-instruction methodology; the external
+        // adapter and its role wiring land in later slices.
+        AgentKind::External => format!(
+            "{}{review_cycle_contract}{risk_instruction}{}",
+            build_codex_review_prompt(spec, effort),
+            graph_review_contract(graph_context)
+        ),
         AgentKind::Grok => unreachable!("Grok managed reviewer roles are not enabled"),
     }
 }
@@ -662,6 +669,13 @@ pub fn build_r2_review_prompt_for_kind_with_context_and_cycle(
             graph_review_contract(graph_context)
         ),
         AgentKind::Codex => format!(
+            "{}{review_cycle_contract}{risk_instruction}{}",
+            build_codex_r2_review_prompt(spec, effort),
+            graph_review_contract(graph_context)
+        ),
+        // Provider-neutral repository-instruction methodology; the external
+        // adapter and its role wiring land in later slices.
+        AgentKind::External => format!(
             "{}{review_cycle_contract}{risk_instruction}{}",
             build_codex_r2_review_prompt(spec, effort),
             graph_review_contract(graph_context)

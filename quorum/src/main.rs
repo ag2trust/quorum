@@ -11,6 +11,7 @@ mod cli;
 mod cockpit;
 mod config;
 mod coordinator;
+mod external_runner_spec;
 mod github_credentials;
 mod graph_blocker;
 mod input;
@@ -206,6 +207,7 @@ fn command_source(cmd: &cli::Command) -> &'static str {
         cli::Command::Classify { .. } => "classify",
         cli::Command::TaskClose { .. } => "task-close",
         cli::Command::TaskRetry { .. } => "task-retry",
+        cli::Command::TaskAnswer { .. } => "task-answer",
         cli::Command::DecompositionAdoptRecovery { .. } => "decomposition-adopt-recovery",
         cli::Command::Kill { .. } => "kill",
         cli::Command::ReviewInterpret { .. } => "review-interpret",
@@ -1440,6 +1442,24 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
         }
         cli::Command::TaskRetry { task_id, by } => {
             let (json, exit) = coordinator::task_retry(&paths::db_path()?, task_id, &by, now)?;
+            println!("{json}");
+            Ok(exit)
+        }
+        cli::Command::TaskAnswer {
+            task_id,
+            by,
+            body_stdin,
+            body_file,
+            repo,
+        } => {
+            let answer = read_optional_body(body_stdin, body_file)?.ok_or_else(|| {
+                QuorumError::Usage(
+                    "--body-stdin or --body-file is required for `task-answer`".into(),
+                )
+            })?;
+            let resolved_repo = resolve_repo_override(repo.as_deref())?;
+            let db_path = paths::ensure_repo_dir(&resolved_repo)?;
+            let (json, exit) = coordinator::task_answer(&db_path, task_id, &by, &answer, now)?;
             println!("{json}");
             Ok(exit)
         }

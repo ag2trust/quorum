@@ -1406,6 +1406,460 @@ fn task_retry_refuses_when_a_dependency_is_cancelled() {
         .stdout(predicates::str::contains("\"status\":\"open\""));
 }
 
+/// Directly park task `task_id` in `db` as a daemon `needs-info` park with the
+/// given resume status, mirroring the real worker `react --state needs-info`
+/// path closely enough for `task-answer` CLI tests.
+fn sql_park_needs_info(db: &std::path::Path, task_id: i64, resume_status: &str) {
+    let conn = quorum_core::db::open(db).unwrap();
+    conn.execute(
+        "UPDATE tasks SET status='failed', refs=json_object(
+             'daemon_parked', json('true'),
+             'daemon_parked_reason', 'needs-info',
+             'daemon_resume_status', ?2
+         ) WHERE id=?1",
+        rusqlite::params![task_id, resume_status],
+    )
+    .unwrap();
+}
+
+fn note_count(db: &std::path::Path, task_id: i64) -> i64 {
+    let conn = quorum_core::db::open(db).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM task_notes WHERE task_id=?1",
+        [task_id],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// Task #478: `task-answer` answers a needs-info park, in one transaction
+/// inserting the `answer:\n<text>` note from `--by`, restoring the task like
+/// `task-retry` does, and recording `pending_resume = {"kind":"answer",...}`.
+#[test]
+fn task_answer_answers_needs_info_park_and_prints_contract_json() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "needs info",
+        ])
+        .assert()
+        .success();
+    let db = home.path().join("repos/test__repo/quorum.db");
+    sql_park_needs_info(&db, 1, "open");
+    conn_set_recovery_attempts(&db, 1, 3);
+
+    quorum(home.path())
+        .args([
+            "task-answer",
+            "--task-id",
+            "1",
+            "--by",
+            "operator",
+            "--body-stdin",
+        ])
+        .write_stdin("use schema v2")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"ok\":true"))
+        .stdout(predicates::str::contains("\"task_id\":1"))
+        .stdout(predicates::str::contains("\"answer_note_id\""));
+
+    let conn = quorum_core::db::open(&db).unwrap();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "open");
+    assert_eq!(
+        task.recovery_attempts, 0,
+        "explicit retry resets the budget"
+    );
+    let (agent, body): (String, String) = conn
+        .query_row(
+            "SELECT agent, body FROM task_notes WHERE task_id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(agent, "operator");
+    assert_eq!(body, "answer:\nuse schema v2");
+    let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+    assert_eq!(refs["pending_resume"]["kind"], "answer");
+    assert!(refs.get("daemon_parked").is_none());
+}
+
+fn conn_set_recovery_attempts(db: &std::path::Path, task_id: i64, attempts: i64) {
+    let conn = quorum_core::db::open(db).unwrap();
+    conn.execute(
+        "UPDATE tasks SET recovery_attempts=?2 WHERE id=?1",
+        rusqlite::params![task_id, attempts],
+    )
+    .unwrap();
+}
+
+/// A task that is not daemon-parked at all, or parked for a reason other than
+/// `needs-info`, or missing entirely, all refuse with the same clean negative
+/// and never write a note.
+#[test]
+fn task_answer_refuses_tasks_not_waiting_for_an_answer() {
+    let home = tempfile::tempdir().unwrap();
+    for title in ["open task", "parked other reason"] {
+        quorum(home.path())
+            .args(["task-create", "--created-by", "boss", "--title", title])
+            .assert()
+            .success();
+    }
+    let db = home.path().join("repos/test__repo/quorum.db");
+    {
+        let conn = quorum_core::db::open(&db).unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='failed', refs=json_object(
+                 'daemon_parked', json('true'),
+                 'daemon_parked_reason', 'blocked',
+                 'daemon_resume_status', 'open'
+             ) WHERE id=2",
+            [],
+        )
+        .unwrap();
+    }
+
+    for (task_id, by) in [(1, "operator"), (2, "operator"), (9999, "operator")] {
+        quorum(home.path())
+            .args([
+                "task-answer",
+                "--task-id",
+                &task_id.to_string(),
+                "--by",
+                by,
+                "--body-stdin",
+            ])
+            .write_stdin("x")
+            .assert()
+            .code(1)
+            .stdout(predicates::str::contains("\"ok\":false"))
+            .stdout(predicates::str::contains(
+                "\"outcome\":\"task-answer-rejected\"",
+            ))
+            .stdout(predicates::str::contains(
+                "task is not waiting for an answer",
+            ));
+    }
+    for task_id in [1, 2] {
+        assert_eq!(note_count(&db, task_id), 0, "task {task_id}");
+    }
+}
+
+/// Task #478: `task-answer` runs the same cancelled-dependency pre-check as
+/// `task-retry`, with the same JSON shape and exit 1, before ever writing the
+/// answer note.
+#[test]
+fn task_answer_refuses_cancelled_dependency() {
+    let home = tempfile::tempdir().unwrap();
+    for title in ["cancelled dep", "needs-info dependent"] {
+        quorum(home.path())
+            .args(["task-create", "--created-by", "boss", "--title", title])
+            .assert()
+            .success();
+    }
+    let db = home.path().join("repos/test__repo/quorum.db");
+    {
+        let conn = quorum_core::db::open(&db).unwrap();
+        conn.execute("UPDATE tasks SET status='cancelled' WHERE id=1", [])
+            .unwrap();
+        conn.execute("UPDATE tasks SET depends_on='[1]' WHERE id=2", [])
+            .unwrap();
+    }
+    sql_park_needs_info(&db, 2, "open");
+
+    quorum(home.path())
+        .args([
+            "task-answer",
+            "--task-id",
+            "2",
+            "--by",
+            "operator",
+            "--body-stdin",
+        ])
+        .write_stdin("x")
+        .assert()
+        .code(1)
+        .stdout(predicates::str::contains("\"ok\":false"))
+        .stdout(predicates::str::contains("cancelled — unsatisfiable"))
+        .stdout(predicates::str::contains("\"cancelled_deps\":[1]"));
+
+    let conn = quorum_core::db::open(&db).unwrap();
+    let task = quorum_core::tasks::get(&conn, 2).unwrap().unwrap();
+    assert_eq!(task.status, "failed", "must not silently restore #2");
+    assert_eq!(note_count(&db, 2), 0);
+}
+
+/// Task #478: the lifetime reviewer-run cap refuses a `task-answer` restore
+/// with the same JSON shape `task-retry` uses, before writing the note.
+#[test]
+fn task_answer_refuses_reviewer_cap_exhausted_park() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "capped"])
+        .assert()
+        .success();
+    let db = home.path().join("repos/test__repo/quorum.db");
+    sql_park_needs_info(&db, 1, "in-review");
+    {
+        let conn = quorum_core::db::open(&db).unwrap();
+        for n in 0..quorum_core::provision_attempts::MAX_TOTAL_REVIEWER_RUNS {
+            quorum_core::agent_runs::insert(
+                &conn,
+                1,
+                &format!("rev-{n}"),
+                "reviewer",
+                "model",
+                "high",
+                "claude",
+                100 + n,
+            )
+            .unwrap();
+        }
+    }
+
+    quorum(home.path())
+        .args([
+            "task-answer",
+            "--task-id",
+            "1",
+            "--by",
+            "operator",
+            "--body-stdin",
+        ])
+        .write_stdin("x")
+        .assert()
+        .code(1)
+        .stdout(predicates::str::contains("\"ok\":false"))
+        .stdout(predicates::str::contains(
+            "\"outcome\":\"task-retry-rejected\"",
+        ))
+        .stdout(predicates::str::contains("reviewer run cap exhausted"));
+    assert_eq!(note_count(&db, 1), 0);
+}
+
+/// Task #478: a frozen decomposition graph surfaces as the same usage error
+/// (exit 2) `task-retry` sees, and rolls back the whole transaction — no
+/// note, no state change.
+#[test]
+fn task_answer_rejects_under_decomposition_freeze_with_full_rollback() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "frozen"])
+        .assert()
+        .success();
+    let db = home.path().join("repos/test__repo/quorum.db");
+    sql_park_needs_info(&db, 1, "open");
+    {
+        let conn = quorum_core::db::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO task_decompositions(source_task_id,state,active,freeze_active,
+                 planned_source_revision,created_at,updated_at)
+             VALUES (1,'planning',0,1,1,1000,1000)",
+            [],
+        )
+        .unwrap();
+    }
+    let refs_before = {
+        let conn = quorum_core::db::open(&db).unwrap();
+        quorum_core::tasks::get(&conn, 1).unwrap().unwrap().refs
+    };
+
+    quorum(home.path())
+        .args([
+            "task-answer",
+            "--task-id",
+            "1",
+            "--by",
+            "operator",
+            "--body-stdin",
+        ])
+        .write_stdin("x")
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("decomposition freeze is active"));
+
+    let conn = quorum_core::db::open(&db).unwrap();
+    let task = quorum_core::tasks::get(&conn, 1).unwrap().unwrap();
+    assert_eq!(task.status, "failed");
+    assert_eq!(task.refs, refs_before);
+    assert_eq!(note_count(&db, 1), 0);
+}
+
+/// Task #478: an empty/whitespace-only, NUL-embedded, or oversize answer is a
+/// usage error (exit 2) and never writes a note, regardless of whether the
+/// task is actually waiting for one.
+#[test]
+fn task_answer_rejects_invalid_answers_without_writes() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args(["task-create", "--created-by", "boss", "--title", "x"])
+        .assert()
+        .success();
+    let db = home.path().join("repos/test__repo/quorum.db");
+    sql_park_needs_info(&db, 1, "open");
+
+    for bad in ["", "   \n"] {
+        quorum(home.path())
+            .args([
+                "task-answer",
+                "--task-id",
+                "1",
+                "--by",
+                "operator",
+                "--body-stdin",
+            ])
+            .write_stdin(bad)
+            .assert()
+            .code(2);
+    }
+    quorum(home.path())
+        .args([
+            "task-answer",
+            "--task-id",
+            "1",
+            "--by",
+            "operator",
+            "--body-stdin",
+        ])
+        .write_stdin(b"a\0b".to_vec())
+        .assert()
+        .code(2);
+    let too_big = "x".repeat(quorum_core::tasks::ANSWER_MAX_BYTES + 1);
+    quorum(home.path())
+        .args([
+            "task-answer",
+            "--task-id",
+            "1",
+            "--by",
+            "operator",
+            "--body-stdin",
+        ])
+        .write_stdin(too_big)
+        .assert()
+        .code(2);
+
+    assert_eq!(note_count(&db, 1), 0);
+    let conn = quorum_core::db::open(&db).unwrap();
+    assert_eq!(
+        quorum_core::tasks::get(&conn, 1).unwrap().unwrap().status,
+        "failed"
+    );
+}
+
+/// A leftover `pending_resume` ref from an earlier answer must never make
+/// `task-answer` treat a cancelled, closed, or differently-parked task as
+/// still waiting for one — the refusal looks only at the live park state.
+#[test]
+fn task_answer_refuses_despite_a_stale_pending_resume_ref() {
+    let home = tempfile::tempdir().unwrap();
+    for title in ["cancelled", "done", "parked other reason"] {
+        quorum(home.path())
+            .args(["task-create", "--created-by", "boss", "--title", title])
+            .assert()
+            .success();
+    }
+    let db = home.path().join("repos/test__repo/quorum.db");
+    let stale = r#"json('{"kind":"answer","note_id":999}')"#;
+    {
+        let conn = quorum_core::db::open(&db).unwrap();
+        conn.execute(
+            &format!(
+                "UPDATE tasks SET status='cancelled',
+                     refs=json_object('pending_resume', {stale}) WHERE id=1"
+            ),
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            &format!(
+                "UPDATE tasks SET status='done',
+                     refs=json_object('pending_resume', {stale}) WHERE id=2"
+            ),
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            &format!(
+                "UPDATE tasks SET status='failed',
+                     refs=json_object(
+                         'daemon_parked', json('true'),
+                         'daemon_parked_reason', 'blocked',
+                         'daemon_resume_status', 'open',
+                         'pending_resume', {stale}
+                     ) WHERE id=3"
+            ),
+            [],
+        )
+        .unwrap();
+    }
+
+    for task_id in [1, 2, 3] {
+        quorum(home.path())
+            .args([
+                "task-answer",
+                "--task-id",
+                &task_id.to_string(),
+                "--by",
+                "operator",
+                "--body-stdin",
+            ])
+            .write_stdin("x")
+            .assert()
+            .code(1)
+            .stdout(predicates::str::contains(
+                "\"outcome\":\"task-answer-rejected\"",
+            ));
+        assert_eq!(note_count(&db, task_id), 0, "task {task_id}");
+    }
+}
+
+/// `--repo` routes `task-answer` to that repo's database, like other
+/// coordinator commands, rather than the cwd/env default.
+#[test]
+fn task_answer_resolves_db_via_repo_override() {
+    let home = tempfile::tempdir().unwrap();
+    quorum(home.path())
+        .args([
+            "task-create",
+            "--created-by",
+            "boss",
+            "--title",
+            "x",
+            "--repo",
+            "other/repo",
+        ])
+        .assert()
+        .success();
+    let db = home.path().join("repos/other__repo/quorum.db");
+    assert!(db.exists(), "task-create --repo must create that repo's DB");
+    sql_park_needs_info(&db, 1, "open");
+
+    quorum(home.path())
+        .args([
+            "task-answer",
+            "--task-id",
+            "1",
+            "--by",
+            "operator",
+            "--body-stdin",
+            "--repo",
+            "other/repo",
+        ])
+        .write_stdin("x")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\"ok\":true"));
+
+    // The default-repo DB never saw this task.
+    let default_db = home.path().join("repos/test__repo/quorum.db");
+    assert!(!default_db.exists());
+}
+
 #[test]
 fn release_then_reclaim_hands_off_task() {
     // Hand-off under the lease model: the holder releases (→ open), then another agent claims.

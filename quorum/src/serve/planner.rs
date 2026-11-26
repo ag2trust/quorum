@@ -762,6 +762,7 @@ impl PlannerDiagnostics {
                 AgentKind::Claude => self.observe_claude_event(&value),
                 AgentKind::Codex => self.observe_codex_event(&value),
                 AgentKind::Grok => self.observe_grok_event(&value),
+                AgentKind::External => {}
             }
         }
 
@@ -1546,6 +1547,7 @@ fn sanitized_provider(provider: AgentKind) -> SanitizedProvider {
         AgentKind::Claude => SanitizedProvider::Claude,
         AgentKind::Codex => SanitizedProvider::Codex,
         AgentKind::Grok => SanitizedProvider::Grok,
+        AgentKind::External => SanitizedProvider::Other,
     }
 }
 
@@ -1784,6 +1786,12 @@ async fn spawn_planner_with_timeout(
                 std::io::ErrorKind::PermissionDenied,
                 "Grok decomposition planner refused: managed Grok lifecycle roles are not enabled",
             )),
+            AgentKind::External => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "external runner adapter not built",
+                ))
+            }
             AgentKind::Claude => {
                 let spec = AgentSpec {
                     kind: AgentKind::Claude,
@@ -1848,6 +1856,7 @@ fn provider_failure_summary(slot: &PlannerSlot, reason: &str, byte_count_kind: &
                 AgentKind::Claude => "claude",
                 AgentKind::Codex => "codex",
                 AgentKind::Grok => "grok",
+                AgentKind::External => "external",
             },
             "stdout_bytes_observed": slot.stdout_bytes,
             "stdout_byte_count_kind": byte_count_kind,
@@ -1962,6 +1971,7 @@ pub async fn poll_planner(slot: &mut PlannerSlot) -> Option<PlannerTurnEnd> {
             AgentKind::Claude => super::runner::normalize_claude_line(&raw),
             AgentKind::Codex => super::runner::normalize_codex_line(&raw),
             AgentKind::Grok => super::runner::normalize_grok_line(&raw),
+            AgentKind::External => Vec::new(),
         };
         if slot.session_log.is_some() {
             slot.log_sanitized_line(&raw);
