@@ -58823,6 +58823,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             gh_repo: Some("o/r".into()),
             base_branch: "main".into(),
             self_update_branch: "main".into(),
+            gh_program: PathBuf::from("gh"),
         };
         let executor: Arc<dyn merge::MergeExecutor> = Arc::new(executor);
 
