@@ -334,6 +334,12 @@ pub fn ci_remediation_intent(refs: Option<&str>) -> Result<Option<CiRemediationI
 /// becomes MERGEABLE again.
 pub const MERGE_BLOCKED_BODY: &str = "daemon:merge-blocked";
 
+/// Body marker for a review-only task whose PR GitHub reported as conflicting
+/// (`DIRTY`) at its recorded head before review. Unlike [`MERGE_BLOCKED_BODY`]
+/// there is no approval to re-fire: once the PR is mergeable the daemon clears
+/// the marker and the normal pre-review CI gate and reviewer path resume.
+pub const PRE_REVIEW_MERGE_BLOCKED_BODY: &str = "daemon:merge-blocked:pre-review";
+
 const KNOWN_EFFORTS: &[&str] = &["medium", "high"];
 const KNOWN_COMPLEXITIES: &[&str] = &["1", "2", "3", "4", "5"];
 
@@ -3454,6 +3460,60 @@ pub fn apply_checks_failed_with_remediation(
     feedback: &str,
     now: i64,
 ) -> Result<TransitionResult> {
+    apply_pre_review_remediation(
+        conn,
+        id,
+        pr,
+        head_sha,
+        &Event::ChecksFailed {
+            checks: checks.to_vec(),
+        },
+        checks,
+        feedback,
+        now,
+    )
+}
+
+/// Remediation-intent label persisted for a pre-review merge conflict. It
+/// occupies the durable `ci_remediation_checks` slot so restart recovery
+/// replays the conflict through the same CI remediation provisioning.
+pub const PRE_REVIEW_CONFLICT_REMEDIATION_CHECK: &str = "merge-conflict";
+
+/// Atomically enter rework because GitHub reports the recorded PR head as
+/// conflicting (`DIRTY`) before review, and persist the same durable
+/// remediation intent as a pre-review CI failure. `MergeConflict` applies the
+/// rework-cap and `no_rework` semantics of the merge-time conflict.
+pub fn apply_pre_review_conflict_with_remediation(
+    conn: &mut Connection,
+    id: i64,
+    pr: i64,
+    head_sha: &str,
+    feedback: &str,
+    now: i64,
+) -> Result<TransitionResult> {
+    apply_pre_review_remediation(
+        conn,
+        id,
+        pr,
+        head_sha,
+        &Event::MergeConflict,
+        &[PRE_REVIEW_CONFLICT_REMEDIATION_CHECK.to_string()],
+        feedback,
+        now,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_pre_review_remediation(
+    conn: &mut Connection,
+    id: i64,
+    pr: i64,
+    head_sha: &str,
+    event: &Event,
+    checks: &[String],
+    feedback: &str,
+    now: i64,
+) -> Result<TransitionResult> {
     if pr <= 0 || head_sha.is_empty() || checks.is_empty() || feedback.is_empty() {
         return Err(QuorumError::BadInput(
             "CI remediation requires PR, head SHA, checks, and feedback".into(),
@@ -3462,20 +3522,11 @@ pub fn apply_checks_failed_with_remediation(
     let tx = begin_immediate(conn)?;
     let checks_json = serde_json::to_string(checks)
         .map_err(|error| QuorumError::Io(format!("serialize failing checks: {error}")))?;
-    apply_event_tx_with_findings(
-        tx,
-        "system",
-        id,
-        &Event::ChecksFailed {
-            checks: checks.to_vec(),
-        },
-        now,
-        Some(feedback),
-        |tx| {
-            // The lifecycle update has already selected the destination. Only
-            // rework receives retry intent; a rework-cap failure remains terminal.
-            tx.execute(
-                "UPDATE tasks SET refs=json_set(
+    apply_event_tx_with_findings(tx, "system", id, event, now, Some(feedback), |tx| {
+        // The lifecycle update has already selected the destination. Only
+        // rework receives retry intent; a rework-cap failure remains terminal.
+        tx.execute(
+            "UPDATE tasks SET refs=json_set(
                      COALESCE(refs, '{}'),
                      '$.ci_remediation_requested', json('true'),
                      '$.ci_remediation_pr', ?2,
@@ -3485,15 +3536,14 @@ pub fn apply_checks_failed_with_remediation(
                      '$.ci_remediation_attempts', 0
                  )
                  WHERE id=?1 AND status='rework'",
-                params![id, pr, head_sha, feedback, checks_json],
-            )?;
-            tx.execute(
-                "DELETE FROM approvals WHERE pr_number=?1 AND task_id=?2",
-                params![pr, id],
-            )?;
-            Ok(())
-        },
-    )
+            params![id, pr, head_sha, feedback, checks_json],
+        )?;
+        tx.execute(
+            "DELETE FROM approvals WHERE pr_number=?1 AND task_id=?2",
+            params![pr, id],
+        )?;
+        Ok(())
+    })
 }
 
 /// Persist one failed attempt to provision a CI remediation worker.
@@ -12750,6 +12800,92 @@ mod tests {
             serde_json::json!(["ci-lint", "ci-test"])
         );
         assert!(no_rework_notes(&c, id)[0].contains("Failing checks: ci-lint, ci-test"));
+    }
+
+    #[test]
+    fn no_rework_pre_review_conflict_closes_done_with_merge_conflict_outcome() {
+        let (_d, mut c) = open_tmp();
+        let id = create_no_rework(&mut c, 63);
+        let r = apply_pre_review_conflict_with_remediation(
+            &mut c,
+            id,
+            63,
+            "abc123",
+            "PR #63 has conflicts with main",
+            1002,
+        )
+        .unwrap();
+        assert_no_rework_closed(&mut c, id, &r, "merge_conflict");
+        assert_eq!(ci_remediation_intent(r.task.refs.as_deref()).unwrap(), None);
+    }
+
+    #[test]
+    fn pre_review_conflict_persists_durable_remediation_and_respects_cap() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c, "boss", "conflict", None, 0, None, None, None, None, 1000,
+        )
+        .unwrap();
+        claim(&mut c, "W1", Some(id), &[], TTL, 1000).unwrap();
+        apply_event(
+            &mut c,
+            "W1",
+            id,
+            &Event::SignaledDone { pr: "1007".into() },
+            1100,
+        )
+        .unwrap();
+
+        let r = apply_pre_review_conflict_with_remediation(
+            &mut c,
+            id,
+            1007,
+            "8aadb5bc",
+            "merge develop",
+            1200,
+        )
+        .unwrap();
+        assert_eq!(r.task.status, "rework");
+        assert_eq!(r.task.rework_round, 1);
+        assert_eq!(
+            ci_remediation_intent(r.task.refs.as_deref())
+                .unwrap()
+                .unwrap(),
+            CiRemediationIntent {
+                pr: 1007,
+                head_sha: "8aadb5bc".into(),
+                feedback: "merge develop".into(),
+                checks: vec![PRE_REVIEW_CONFLICT_REMEDIATION_CHECK.to_string()],
+                attempts: 0,
+            }
+        );
+
+        // At the cap the same event fails the task with no retry intent.
+        c.execute(
+            "UPDATE tasks SET status='in-review', rework_round=5, rework_cap=5,
+                 refs=json_remove(refs, '$.ci_remediation_requested')
+             WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        let capped = apply_pre_review_conflict_with_remediation(
+            &mut c,
+            id,
+            1007,
+            "8aadb5bc",
+            "merge develop",
+            1300,
+        )
+        .unwrap();
+        assert_eq!(capped.task.status, "failed");
+        assert_eq!(
+            ci_remediation_intent(capped.task.refs.as_deref()).unwrap(),
+            None
+        );
+        assert!(capped.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::NotifyOwner { reason } if reason.contains("rework cap")
+        )));
     }
 
     #[test]

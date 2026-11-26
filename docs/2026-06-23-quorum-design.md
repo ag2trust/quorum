@@ -1054,9 +1054,12 @@ only through an explicit outside request)
 - `VerdictApprove` → Merging · effects: MergePr
 - `VerdictChanges` → Rework · effects: IncrementReworkRound, ResumeWorker
 - `ChecksFailed` → Rework · effects: IncrementReworkRound, ResumeWorker
+- `MergeConflict` (pre-review: GitHub reports `DIRTY` for the recorded head) → Rework ·
+  effects: IncrementReworkRound, ResumeWorker (at the rework cap → Failed · effects:
+  NotifyOwner, ReleaseLease). Same cap accounting as the merge-time conflict.
 - `VerdictChanges` (review_only=true) → Rework · effects: IncrementReworkRound,
   ResumeWorker (at the rework cap → Failed · effects: NotifyOwner, ReleaseLease)
-- `VerdictChanges` / `ChecksFailed` (no_rework=true) → **Done** · effects: ReleaseLease,
+- `VerdictChanges` / `ChecksFailed` / `MergeConflict` (no_rework=true) → **Done** · effects: ReleaseLease,
   PostFindingsNote, NotifyOwner. Takes precedence over the rework cap; never
   IncrementReworkRound or ResumeWorker. R1 changes therefore end the task before any R2.
 - `VerdictChanges` (rework_round ≥ the task's stamped rework cap) → Failed · effects: NotifyOwner, ReleaseLease
@@ -1684,6 +1687,22 @@ provisioning and merge.
   clear only stale runtime ownership, and retry remediation on the existing PR branch.
   Provisioning exhaustion parks loudly in `failed` with a `rework` resume marker; it never
   degrades to a generic `open` task or a fresh implementation prompt.
+- **Pre-review conflict.** GitHub runs no `pull_request` workflows on a conflicting PR,
+  so its rollup stays empty and every required job reads `absent`. Before the gate starts
+  or evaluates a wait, the shared per-PR mergeability read (same `pre_review_external_poll_due`
+  cadence, one `gh pr view --json mergeStateStatus,state,headRefOid` call) is checked: only
+  `DIRTY` reported for exactly the recorded head (the `pr_targets` publication baseline,
+  else the head the gate tracks) is a conflict. `UNKNOWN`, `BLOCKED`, `BEHIND`, `UNSTABLE`,
+  a failed read (fail-open `Mergeable`), and a `DIRTY` report for any other head keep the
+  normal gate. On a conflict an implementation task fires `MergeConflict` from `in-review`
+  with the merge-time `merge_base_remediation_message` feedback for its effective target
+  branch, persisted as the same durable remediation intent as `ChecksFailed` (check label
+  `merge-conflict`), so restart provisions exactly one remediation worker. A review-only
+  task is not reworked: it is marked `daemon:merge-blocked:pre-review` and resumes the
+  normal gate once the PR is no longer conflicting (no approval exists to re-fire). A
+  `no_rework` task closes `done` with `review_outcome=merge_conflict`. As defense in depth,
+  a gate failure whose required jobs are all `absent` re-reads head-bound mergeability once
+  and routes a `DIRTY` exact head to the conflict path instead of CI feedback.
 - Gate state is optimization-only memory. On shutdown it is dropped without mutating the
   task; restart finds the durable `in-review` task and polls again. Stateful lifecycle work
   is never raced inside `select!`.

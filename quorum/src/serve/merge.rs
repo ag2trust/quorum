@@ -259,6 +259,19 @@ pub trait MergeExecutor: Send + Sync {
         MergeabilityState::Mergeable
     }
 
+    /// [`MergeExecutor::check_mergeability`] plus the `headRefOid` GitHub
+    /// computed that state for, read in the same response. The pre-review gate
+    /// acts on `Conflicting` only when this head equals the recorded head, so a
+    /// lagging DIRTY report for an older head never triggers conflict rework.
+    /// Default: no head, which never authorizes pre-review conflict routing.
+    fn check_mergeability_with_head(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+    ) -> (MergeabilityState, Option<String>) {
+        (self.check_mergeability(pr, repo_dir), None)
+    }
+
     /// Current head commit SHA of the PR's branch (`headRefOid`). Used by #228
     /// restart recovery to SHA-bind a durable approval to the exact diff the
     /// reviewer approved: a moved head auto-invalidates the approval. Returns
@@ -1430,6 +1443,16 @@ fn parse_mergeability(json_str: &str) -> MergeabilityState {
     }
 }
 
+fn parse_head_ref_oid(json_str: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(json_str)
+        .ok()?
+        .get("headRefOid")?
+        .as_str()
+        .map(str::trim)
+        .filter(|sha| !sha.is_empty())
+        .map(str::to_string)
+}
+
 fn parse_merge_commit_sha(json_str: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(json_str)
         .ok()?
@@ -1772,6 +1795,30 @@ impl MergeExecutor for GhMergeExecutor {
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
         parse_mergeability(&stdout)
+    }
+
+    fn check_mergeability_with_head(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+    ) -> (MergeabilityState, Option<String>) {
+        let pr_str = pr.to_string();
+        let cmd = self.build_gh_cmd(
+            &[
+                "pr",
+                "view",
+                &pr_str,
+                "--json",
+                "mergeStateStatus,state,headRefOid",
+            ],
+            repo_dir,
+        );
+        let output = match cmd.map(|mut cmd| cmd.output()) {
+            Ok(Ok(o)) if o.status.success() => o,
+            _ => return (MergeabilityState::Mergeable, None),
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        (parse_mergeability(&stdout), parse_head_ref_oid(&stdout))
     }
 
     fn head_sha(&self, pr: i64, repo_dir: &Path) -> Option<String> {
@@ -2794,6 +2841,21 @@ mod tests {
     #[test]
     fn parse_mergeability_invalid_json() {
         assert_eq!(parse_mergeability("not json"), MergeabilityState::Mergeable,);
+        assert_eq!(
+            parse_mergeability(r#"{"mergeStateStatus":"UNKNOWN"}"#),
+            MergeabilityState::Mergeable,
+            "UNKNOWN just after a push is never a conflict"
+        );
+        assert_eq!(
+            parse_mergeability(r#"{"mergeStateStatus":"UNSTABLE"}"#),
+            MergeabilityState::Mergeable
+        );
+        assert_eq!(parse_head_ref_oid("not json"), None);
+        assert_eq!(parse_head_ref_oid(r#"{"headRefOid":""}"#), None);
+        assert_eq!(
+            parse_head_ref_oid(r#"{"mergeStateStatus":"DIRTY","headRefOid":"8aadb5bc"}"#),
+            Some("8aadb5bc".to_string())
+        );
     }
 
     #[test]

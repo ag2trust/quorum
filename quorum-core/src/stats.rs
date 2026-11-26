@@ -3743,20 +3743,26 @@ fn merge_blockers(conn: &Connection, now: i64) -> Result<Vec<MergeBlockerView>> 
     let mut stmt = conn.prepare(
         "SELECT id, title, refs, status, updated_at, rework_round
          FROM tasks
-         WHERE body = ?1 AND status NOT IN ('done', 'failed', 'cancelled')
+         WHERE body IN (?1, ?2) AND status NOT IN ('done', 'failed', 'cancelled')
          ORDER BY updated_at ASC",
     )?;
     let rows = stmt
-        .query_map(params![crate::tasks::MERGE_BLOCKED_BODY], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, i32>(5)?,
-            ))
-        })?
+        .query_map(
+            params![
+                crate::tasks::MERGE_BLOCKED_BODY,
+                crate::tasks::PRE_REVIEW_MERGE_BLOCKED_BODY
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i32>(5)?,
+                ))
+            },
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (id, title, refs, status, updated_at, rework_round) in rows {
         result.push(MergeBlockerView {

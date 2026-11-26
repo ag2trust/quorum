@@ -11159,22 +11159,104 @@ fn defer_pre_review_after_head_move(
 
 /// Share one per-PR cadence for pre-review GitHub reads across normal, orphan,
 /// and resumed-reviewer reconciliation.
+///
+/// Returns the mergeability state together with the `headRefOid` GitHub
+/// reported in the same response (`None` when unknown). A failed read keeps
+/// the fail-open `Mergeable` default.
 async fn poll_pre_review_mergeability_if_due(
     config: &ServeConfig,
     waits: &HashMap<i64, PreReviewChecksEntry>,
     task_id: i64,
     pr: i64,
-) -> Option<merge::MergeabilityState> {
+) -> Option<(merge::MergeabilityState, Option<String>)> {
     if !pre_review_external_poll_due(config, waits, task_id, pr) {
         return None;
     }
+    Some(read_pre_review_mergeability(config, pr).await)
+}
+
+async fn read_pre_review_mergeability(
+    config: &ServeConfig,
+    pr: i64,
+) -> (merge::MergeabilityState, Option<String>) {
     let executor = Arc::clone(&config.merge_executor);
     let repo = config.repo_dir.clone();
-    Some(
-        tokio::task::spawn_blocking(move || executor.check_mergeability(pr, &repo))
-            .await
-            .unwrap_or(merge::MergeabilityState::Mergeable),
-    )
+    tokio::task::spawn_blocking(move || executor.check_mergeability_with_head(pr, &repo))
+        .await
+        .unwrap_or((merge::MergeabilityState::Mergeable, None))
+}
+
+/// Decide whether a pre-review mergeability observation is an actionable
+/// conflict: GitHub must report `DIRTY` for exactly the recorded head. The
+/// recorded head is the daemon-published `pr_targets` baseline, else the head
+/// the pre-review gate is already tracking. A DIRTY report for any other head
+/// (e.g. GitHub lagging behind a just-pushed merge commit) or with no reported
+/// head keeps today's behavior. Returns the bound head on a conflict.
+async fn pre_review_conflict_head(
+    config: &ServeConfig,
+    waits: &HashMap<i64, PreReviewChecksEntry>,
+    task_id: i64,
+    pr: i64,
+    observation: &(merge::MergeabilityState, Option<String>),
+) -> Result<Option<String>> {
+    let (merge::MergeabilityState::Conflicting, Some(reported)) = observation else {
+        return Ok(None);
+    };
+    let recorded = match load_publication_pr_baseline(&config.db_path, task_id, pr)
+        .await
+        .map_err(QuorumError::Io)?
+    {
+        Some(target) => Some(target.head_sha),
+        None => waits
+            .get(&task_id)
+            .filter(|entry| entry.pr == pr && !entry.head_sha.is_empty())
+            .map(|entry| entry.head_sha.clone()),
+    };
+    match recorded {
+        Some(recorded) if &recorded == reported => Ok(Some(recorded)),
+        Some(recorded) => {
+            log(&format!(
+                "PRE-REVIEW CONFLICT: task #{task_id} PR #{pr} — GitHub reports DIRTY for head \
+                 {reported}, not recorded head {recorded}; not treating as a conflict"
+            ));
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
+fn discard_pre_review_wait(waits: &mut HashMap<i64, PreReviewChecksEntry>, task_id: i64) {
+    if let Some(entry) = waits.remove(&task_id) {
+        if let PreReviewChecksState::Waiting(handle) = entry.state {
+            handle.abort();
+        }
+    }
+}
+
+/// Clear a pre-review merge block once GitHub no longer reports the PR as
+/// conflicting. The guarded update is a no-op for every other body.
+async fn clear_pre_review_merge_block(db_path: &Path, task_id: i64) -> Result<bool> {
+    let db_path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let conn = quorum_core::db::open(&db_path)?;
+        // Read first so the common unblocked case takes no write lock.
+        let blocked: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND body=?2)",
+            rusqlite::params![task_id, tasks::PRE_REVIEW_MERGE_BLOCKED_BODY],
+            |row| row.get(0),
+        )?;
+        if !blocked {
+            return Ok(false);
+        }
+        let changed = conn.execute(
+            "UPDATE tasks SET body='', updated_at=?3
+             WHERE id=?1 AND status='in-review' AND body=?2",
+            rusqlite::params![task_id, tasks::PRE_REVIEW_MERGE_BLOCKED_BODY, now_unix()],
+        )?;
+        Ok(changed == 1)
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("pre-review merge-block clear join: {error}")))?
 }
 
 async fn poll_resume_reviewer_pre_review_checks(
@@ -11413,6 +11495,38 @@ async fn handle_pre_review_checks_failure(
     head_sha: &str,
     failing_checks: &[String],
 ) -> Result<()> {
+    // GitHub runs no `pull_request` workflows on a conflicting PR, so an
+    // all-absent required-jobs result may be a conflict, not a CI failure.
+    // Confirm with one head-bound mergeability read (only on this failure
+    // event) before sending "fix the failing checks" feedback.
+    if !failing_checks.is_empty()
+        && failing_checks
+            .iter()
+            .all(|check| check.ends_with(" (absent)"))
+    {
+        let (state, reported) = read_pre_review_mergeability(config, pr).await;
+        if state == merge::MergeabilityState::Conflicting
+            && reported.as_deref() == Some(head_sha)
+            && !head_sha.is_empty()
+        {
+            log(&format!(
+                "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} — required jobs absent because \
+                 head {head_sha} is DIRTY; routing to merge-base rework"
+            ));
+            return handle_pre_review_conflict(
+                config,
+                wt_mgr,
+                name_pool,
+                workers,
+                profile_cooldown,
+                task_id,
+                pr,
+                head_sha,
+            )
+            .await;
+        }
+    }
+
     let names = failing_checks.join(", ");
     let feedback = format!(
         "CI checks failed before review for PR #{pr}: {names}\n\n\
@@ -11494,6 +11608,36 @@ async fn handle_pre_review_checks_failure(
             }
         }
     };
+    deliver_pre_review_remediation(
+        config,
+        wt_mgr,
+        name_pool,
+        workers,
+        profile_cooldown,
+        task_id,
+        pr,
+        &feedback,
+        transition,
+        "pre-review CI failure",
+    )
+    .await
+}
+
+/// Feed (or durably defer) the rework that a pre-review CI failure or
+/// conflict transition selected, or clean up a terminal close.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_pre_review_remediation(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    profile_cooldown: &mut ProfileCooldown,
+    task_id: i64,
+    pr: i64,
+    feedback: &str,
+    transition: Option<tasks::TransitionResult>,
+    cause: &str,
+) -> Result<()> {
     match transition {
         Some(ref result) if result.task.status == "rework" => {
             if let Some(worker_index) = workers.iter().position(|w| w.task_id == task_id) {
@@ -11502,7 +11646,7 @@ async fn handle_pre_review_checks_failure(
                     workers[worker_index].agent_name.clone(),
                     task_id,
                     pr,
-                    &feedback,
+                    feedback,
                 )
                 .await?
                 {
@@ -11521,7 +11665,7 @@ async fn handle_pre_review_checks_failure(
                         &workers[worker_index].agent_name,
                         task_id,
                         pr,
-                        &feedback,
+                        feedback,
                         workers[worker_index].cost_usd,
                         config.limits.max_task_cost_usd,
                         &load_task_risk_flags_for_prompt(&config.db_path, task_id).await?,
@@ -11531,7 +11675,7 @@ async fn handle_pre_review_checks_failure(
                         feed_worker_turn(&mut workers[worker_index], &prompt, config).await
                     {
                         log(&format!(
-                            "pre-review CI rework feed failed for task #{task_id}: {error}; \
+                            "{cause} rework feed failed for task #{task_id}: {error}; \
                          preserving durable remediation intent"
                         ));
                         if !handle_dormant_worker_feed_failure(
@@ -11575,14 +11719,14 @@ async fn handle_pre_review_checks_failure(
                             return Ok(());
                         }
                         log(&format!(
-                            "worker {} rework #{} (pre-review CI failure)",
+                            "worker {} rework #{} ({cause})",
                             worker.agent_name, worker.rework_count
                         ));
                     }
                 }
             } else {
                 log(&format!(
-                    "no live worker for pre-review CI rework on task #{task_id} — \
+                    "no live worker for {cause} rework on task #{task_id} — \
                      durable remediation will provision from the tick reconciler"
                 ));
             }
@@ -11604,11 +11748,119 @@ async fn handle_pre_review_checks_failure(
         }
         None => {
             log(&format!(
-                "PRE-REVIEW CI GATE: ChecksFailed transition failed for task #{task_id}"
+                "PRE-REVIEW: {cause} transition failed for task #{task_id}"
             ));
         }
     }
     Ok(())
+}
+
+/// Route a pre-review PR that GitHub reports `DIRTY` at the recorded head to
+/// the merge-time conflict remediation, before any CI wait or reviewer. An
+/// implementation task enters rework with merge-base feedback; a review-only
+/// task is parked merge-blocked until the PR is mergeable; a `--review-only`
+/// (`no_rework`) task closes `done` with `review_outcome=merge_conflict`.
+#[allow(clippy::too_many_arguments)]
+async fn handle_pre_review_conflict(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    profile_cooldown: &mut ProfileCooldown,
+    task_id: i64,
+    pr: i64,
+    head_sha: &str,
+) -> Result<()> {
+    let (review_only, no_rework) = {
+        let path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<(bool, bool)> {
+            let conn = quorum_core::db::open(&path)?;
+            Ok(tasks::get(&conn, task_id)?
+                .map_or((false, false), |task| (task.review_only, task.no_rework)))
+        })
+        .await
+        .map_err(|error| {
+            QuorumError::Io(format!(
+                "pre-review conflict task lookup join for task #{task_id}: {error}"
+            ))
+        })??
+    };
+    let base = effective_task_base_branch(&config.db_path, task_id, &config.base_branch).await?;
+    if review_only && !no_rework {
+        // The external author owns the merge; mirror the merge-time path.
+        log(&format!(
+            "PRE-REVIEW CONFLICT: review-only task #{task_id} PR #{pr} head {head_sha} \
+             conflicts with {base} — parking merge-blocked, not reworking"
+        ));
+        set_task_body(
+            &config.db_path,
+            task_id,
+            tasks::PRE_REVIEW_MERGE_BLOCKED_BODY,
+        )
+        .await;
+        return Ok(());
+    }
+    let feedback = merge_base_remediation_message(
+        &format!("PR #{pr} has conflicts with {base} (a sibling PR likely merged first)."),
+        &base,
+    );
+    log(&format!(
+        "PRE-REVIEW CONFLICT: task #{task_id} PR #{pr} head {head_sha} conflicts with {base} — \
+         firing MergeConflict without CI wait or reviewer"
+    ));
+    let transition = {
+        let p = config.db_path.clone();
+        let sha = head_sha.to_string();
+        let remediation_feedback = feedback.clone();
+        match tokio::task::spawn_blocking(move || -> Result<tasks::TransitionResult> {
+            let mut conn = quorum_core::db::open(&p)?;
+            tasks::apply_pre_review_conflict_with_remediation(
+                &mut conn,
+                task_id,
+                pr,
+                &sha,
+                &remediation_feedback,
+                now_unix(),
+            )
+        })
+        .await
+        {
+            Ok(Ok(result)) => {
+                log(&format!(
+                    "lifecycle: task #{task_id} -> {}",
+                    result.task.status
+                ));
+                Some(result)
+            }
+            Ok(Err(error)) => {
+                log(&format!(
+                    "PRE-REVIEW CONFLICT: failed to durably enter remediation \
+                     for task #{task_id}: {error}"
+                ));
+                None
+            }
+            Err(error) => {
+                log(&format!(
+                    "PRE-REVIEW CONFLICT: remediation transition join failed \
+                     for task #{task_id}: {error}"
+                ));
+                None
+            }
+        }
+    };
+    deliver_pre_review_remediation(
+        config,
+        wt_mgr,
+        name_pool,
+        workers,
+        profile_cooldown,
+        task_id,
+        pr,
+        &feedback,
+        transition,
+        "pre-review merge conflict",
+    )
+    .await
 }
 
 async fn sticky_branch_sync_ci_fix_observed_head_matches(
@@ -19074,6 +19326,7 @@ async fn tick(
         let mut repo_mismatch_workers: Vec<(usize, String)> = Vec::new();
         let mut pr_closed_workers: Vec<usize> = Vec::new();
         let mut failed_pre_review_checks: Vec<(i64, i64, String, Vec<String>)> = Vec::new();
+        let mut conflicting_pre_review: Vec<(i64, i64, String)> = Vec::new();
         for (pr, task_id, wi) in &needs_reviewer_from_workers {
             // #75: detect cross-repo PR before burning provision strikes
             let task_refs = lookup_task_refs(&db_path, *task_id).await;
@@ -19088,9 +19341,9 @@ async fn tick(
                 repo_mismatch_workers.push((*wi, task_repo));
                 continue;
             }
-            if let Some(pr_state) =
-                poll_pre_review_mergeability_if_due(config, pre_review_checks, *task_id, *pr).await
-            {
+            let mergeability =
+                poll_pre_review_mergeability_if_due(config, pre_review_checks, *task_id, *pr).await;
+            if let Some((pr_state, _)) = &mergeability {
                 match pr_state {
                     merge::MergeabilityState::AlreadyMerged => {
                         log(&format!(
@@ -19119,6 +19372,21 @@ async fn tick(
             if !reviewer_graph_authority_current(&db_path, *task_id).await? {
                 log_graph_hold(graph_skip_logs, *task_id, *pr);
                 continue;
+            }
+            // A PR GitHub reports DIRTY at the recorded head runs no CI; route
+            // it to merge-base rework before any CI wait or reviewer.
+            if let Some(observation) = &mergeability {
+                if let Some(conflict_head) =
+                    pre_review_conflict_head(config, pre_review_checks, *task_id, *pr, observation)
+                        .await?
+                {
+                    discard_pre_review_wait(pre_review_checks, *task_id);
+                    conflicting_pre_review.push((*task_id, *pr, conflict_head));
+                    continue;
+                }
+                if observation.0 != merge::MergeabilityState::Conflicting {
+                    clear_pre_review_merge_block(&db_path, *task_id).await?;
+                }
             }
             let (ci_gate, head_sha, head_polled) =
                 poll_resume_reviewer_pre_review_checks(config, pre_review_checks, *task_id, *pr)
@@ -19357,6 +19625,19 @@ async fn tick(
             notify_provision_failure(&db_path, w.task_id, &notification_reason, &pr_label).await;
             cleanup_slot(config, wt_mgr, name_pool, w, None, "parked").await;
         }
+        for (task_id, pr, head_sha) in conflicting_pre_review {
+            handle_pre_review_conflict(
+                config,
+                wt_mgr,
+                name_pool,
+                workers,
+                profile_cooldown,
+                task_id,
+                pr,
+                &head_sha,
+            )
+            .await?;
+        }
         for (task_id, pr, head_sha, failing_checks) in failed_pre_review_checks {
             pre_review_checks.remove(&task_id);
             handle_pre_review_checks_failure(
@@ -19437,9 +19718,10 @@ async fn tick(
             if has_worker || has_reviewer {
                 continue;
             }
-            if let Some(pr_state) =
-                poll_pre_review_mergeability_if_due(config, pre_review_checks, *task_id, *pr).await
-            {
+            let pre_review_blocked = body.as_deref() == Some(tasks::PRE_REVIEW_MERGE_BLOCKED_BODY);
+            let mergeability =
+                poll_pre_review_mergeability_if_due(config, pre_review_checks, *task_id, *pr).await;
+            if let Some((pr_state, _)) = &mergeability {
                 match pr_state {
                     merge::MergeabilityState::AlreadyMerged => {
                         log(&format!(
@@ -19460,11 +19742,22 @@ async fn tick(
                         continue;
                     }
                     merge::MergeabilityState::Conflicting
-                        if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY) =>
+                        if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY)
+                            || pre_review_blocked =>
                     {
                         continue;
                     }
                     _ => {}
+                }
+
+                // Pre-review merge block: no approval exists to re-fire, so
+                // clear the marker and resume the normal pre-review path.
+                if pre_review_blocked {
+                    log(&format!(
+                        "pre-review merge-blocked task #{task_id} PR #{pr}: \
+                         PR is no longer conflicting — resuming pre-review"
+                    ));
+                    clear_pre_review_merge_block(&db_path, *task_id).await?;
                 }
 
                 // Merge-blocked retry: approved review-only task waiting for
@@ -19494,7 +19787,7 @@ async fn tick(
                     }
                     continue;
                 }
-            } else if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY) {
+            } else if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY) || pre_review_blocked {
                 continue;
             }
 
@@ -19531,6 +19824,26 @@ async fn tick(
             if !reviewer_graph_authority_current(&db_path, *task_id).await? {
                 log_graph_hold(graph_skip_logs, *task_id, *pr);
                 continue;
+            }
+            if let Some(observation) = &mergeability {
+                if let Some(conflict_head) =
+                    pre_review_conflict_head(config, pre_review_checks, *task_id, *pr, observation)
+                        .await?
+                {
+                    discard_pre_review_wait(pre_review_checks, *task_id);
+                    handle_pre_review_conflict(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        workers,
+                        profile_cooldown,
+                        *task_id,
+                        *pr,
+                        &conflict_head,
+                    )
+                    .await?;
+                    continue;
+                }
             }
             let (ci_gate, head_sha, head_polled) =
                 poll_resume_reviewer_pre_review_checks(config, pre_review_checks, *task_id, *pr)
@@ -33370,6 +33683,13 @@ mod tests {
         fn check_mergeability(&self, pr: i64, repo_dir: &Path) -> merge::MergeabilityState {
             self.inner.check_mergeability(pr, repo_dir)
         }
+        fn check_mergeability_with_head(
+            &self,
+            pr: i64,
+            repo_dir: &Path,
+        ) -> (merge::MergeabilityState, Option<String>) {
+            self.inner.check_mergeability_with_head(pr, repo_dir)
+        }
         fn head_sha(&self, pr: i64, repo_dir: &Path) -> Option<String> {
             self.inner.head_sha(pr, repo_dir)
         }
@@ -35195,7 +35515,7 @@ mod tests {
 
         assert_eq!(
             poll_pre_review_mergeability_if_due(&config, &waits, TASK_ID, PR).await,
-            Some(merge::MergeabilityState::Mergeable)
+            Some((merge::MergeabilityState::Mergeable, None))
         );
         let (gate, head_sha, polled) =
             poll_resume_reviewer_pre_review_checks(&config, &mut waits, TASK_ID, PR)
@@ -35271,7 +35591,7 @@ mod tests {
             Some(std::time::Instant::now() - Duration::from_secs(30));
         assert_eq!(
             poll_pre_review_mergeability_if_due(&config, &waits, TASK_ID, PR).await,
-            Some(merge::MergeabilityState::Mergeable)
+            Some((merge::MergeabilityState::Mergeable, None))
         );
         let (_, _, polled) =
             poll_resume_reviewer_pre_review_checks(&config, &mut waits, TASK_ID, PR)
@@ -36359,6 +36679,488 @@ mod tests {
         .expect("the green same-head gate must leave reviewer provisioning eligible");
         assert_eq!(reviewer.status, "in-review");
         assert_eq!(reviewer.reviewer.as_deref(), Some("reviewer"));
+    }
+
+    /// Mergeability executor that reports a fixed state for a fixed head, read
+    /// in one response like `gh pr view --json mergeStateStatus,state,headRefOid`.
+    struct HeadBoundMergeability {
+        state: merge::MergeabilityState,
+        head: Option<String>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HeadBoundMergeability {
+        fn new(state: merge::MergeabilityState, head: Option<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                state,
+                head: head.map(str::to_string),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl merge::MergeExecutor for HeadBoundMergeability {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: true,
+                message: String::new(),
+                failure_kind: None,
+            }
+        }
+
+        fn check_mergeability_with_head(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+        ) -> (merge::MergeabilityState, Option<String>) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (self.state, self.head.clone())
+        }
+    }
+
+    const CONFLICT_HEAD: &str = "8aadb5bc8aadb5bc8aadb5bc8aadb5bc8aadb5bc";
+
+    /// An implementation task in review on `pr` with a daemon-recorded head.
+    fn seed_in_review_conflict_task(db_path: &Path, pr: i64, recorded_head: Option<&str>) -> i64 {
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        let now = now_unix();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "conflicting child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        tasks::update_refs_daemon(
+            &mut conn,
+            task_id,
+            r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            now,
+        )
+        .unwrap();
+        tasks::claim(&mut conn, "W1", Some(task_id), &[], 3600, now)
+            .unwrap()
+            .unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "W1",
+            task_id,
+            &Event::SignaledDone { pr: pr.to_string() },
+            now,
+        )
+        .unwrap();
+        if let Some(head) = recorded_head {
+            pr_targets::upsert(&mut conn, task_id, pr, "daemon/w1-t1", head, false).unwrap();
+        }
+        task_id
+    }
+
+    fn conflict_test_config(
+        db_path: &Path,
+        dir: &Path,
+        executor: Arc<HeadBoundMergeability>,
+    ) -> ServeConfig {
+        let mut config = pre_review_ci_test_config(db_path.to_path_buf(), dir.to_path_buf());
+        config.merge_executor = executor;
+        config
+    }
+
+    async fn run_pre_review_conflict(config: &ServeConfig, task_id: i64, pr: i64, head: &str) {
+        handle_pre_review_conflict(
+            config,
+            &WorktreeManager::new(),
+            &mut Pool::new_generated(),
+            &mut Vec::new(),
+            &mut ProfileCooldown::new(),
+            task_id,
+            pr,
+            head,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pre_review_dirty_at_recorded_head_enters_merge_base_rework_without_ci_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pre-review-conflict.db");
+        let pr = 1007;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, Some(CONFLICT_HEAD));
+        let executor =
+            HeadBoundMergeability::new(merge::MergeabilityState::Conflicting, Some(CONFLICT_HEAD));
+        let config = conflict_test_config(&db_path, dir.path(), executor.clone());
+        let mut waits: HashMap<i64, PreReviewChecksEntry> = HashMap::new();
+
+        let observation = poll_pre_review_mergeability_if_due(&config, &waits, task_id, pr)
+            .await
+            .expect("first read is due");
+        let head = pre_review_conflict_head(&config, &waits, task_id, pr, &observation)
+            .await
+            .unwrap()
+            .expect("DIRTY at the recorded head is a conflict");
+        assert_eq!(head, CONFLICT_HEAD);
+        discard_pre_review_wait(&mut waits, task_id);
+        let mut workers = Vec::new();
+        handle_pre_review_conflict(
+            &config,
+            &WorktreeManager::new(),
+            &mut Pool::new_generated(),
+            &mut workers,
+            &mut ProfileCooldown::new(),
+            task_id,
+            pr,
+            &head,
+        )
+        .await
+        .unwrap();
+
+        assert!(waits.is_empty(), "no pre-review CI wait may start");
+        assert!(workers.is_empty(), "no worker or reviewer slot is created");
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.rework_round, 1);
+        assert_eq!(task.reviewer, None, "no reviewer is provisioned");
+        let intent = tasks::ci_remediation_intent(task.refs.as_deref())
+            .unwrap()
+            .expect("durable remediation intent");
+        assert_eq!(intent.pr, pr);
+        assert_eq!(intent.head_sha, CONFLICT_HEAD);
+        assert_eq!(
+            intent.checks,
+            vec![tasks::PRE_REVIEW_CONFLICT_REMEDIATION_CHECK.to_string()]
+        );
+        assert_eq!(
+            intent.feedback,
+            merge_base_remediation_message(
+                "PR #1007 has conflicts with main (a sibling PR likely merged first).",
+                "main"
+            )
+        );
+        assert!(intent.feedback.contains("merge main into the PR branch"));
+        assert!(!intent.feedback.contains("Fix the failing checks"));
+        let runs = quorum_core::agent_runs::runs_for_task(&conn, task_id).unwrap();
+        assert!(runs.is_empty(), "no reviewer run: {runs:?}");
+    }
+
+    #[tokio::test]
+    async fn pre_review_conflict_requires_dirty_for_the_recorded_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pre-review-conflict-head.db");
+        let pr = 1008;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, Some(CONFLICT_HEAD));
+        let config = conflict_test_config(
+            &db_path,
+            dir.path(),
+            HeadBoundMergeability::new(merge::MergeabilityState::Mergeable, None),
+        );
+        let waits: HashMap<i64, PreReviewChecksEntry> = HashMap::new();
+        let decide = |state, head: Option<&str>| {
+            let observation = (state, head.map(str::to_string));
+            let config = &config;
+            let waits = &waits;
+            async move {
+                pre_review_conflict_head(config, waits, task_id, pr, &observation)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // GitHub lagging: DIRTY reported for the pre-merge head, not ours.
+        assert_eq!(
+            decide(merge::MergeabilityState::Conflicting, Some("d4419eb-old")).await,
+            None
+        );
+        // DIRTY with no head in the response is never bound.
+        assert_eq!(
+            decide(merge::MergeabilityState::Conflicting, None).await,
+            None
+        );
+        // UNKNOWN/BLOCKED/BEHIND/UNSTABLE and failed reads all parse to
+        // Mergeable (merge.rs parse tests), which is never a conflict.
+        assert_eq!(
+            decide(merge::MergeabilityState::Mergeable, Some(CONFLICT_HEAD)).await,
+            None
+        );
+        // After the worker merges the base, the new head is no longer DIRTY
+        // and the normal pre-review CI gate runs.
+        assert_eq!(
+            decide(merge::MergeabilityState::Mergeable, Some("merged-head")).await,
+            None
+        );
+        assert_eq!(
+            decide(merge::MergeabilityState::Conflicting, Some(CONFLICT_HEAD)).await,
+            Some(CONFLICT_HEAD.to_string())
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review", "decisions alone never transition");
+        assert_eq!(task.rework_round, 0);
+    }
+
+    #[tokio::test]
+    async fn pre_review_conflict_without_baseline_binds_to_the_gated_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pre-review-conflict-gated.db");
+        let pr = 1009;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, None);
+        let config = conflict_test_config(
+            &db_path,
+            dir.path(),
+            HeadBoundMergeability::new(merge::MergeabilityState::Mergeable, None),
+        );
+        let observation = (
+            merge::MergeabilityState::Conflicting,
+            Some(CONFLICT_HEAD.to_string()),
+        );
+        let mut waits: HashMap<i64, PreReviewChecksEntry> = HashMap::new();
+        assert_eq!(
+            pre_review_conflict_head(&config, &waits, task_id, pr, &observation)
+                .await
+                .unwrap(),
+            None,
+            "no recorded or gated head: keep today's behavior"
+        );
+        waits.insert(
+            task_id,
+            PreReviewChecksEntry {
+                pr,
+                head_sha: CONFLICT_HEAD.into(),
+                last_head_poll: Some(std::time::Instant::now()),
+                post_gate_validation_attempted: false,
+                state: PreReviewChecksState::Retry,
+                consecutive_timeouts: 0,
+                timeout_alerted: false,
+                head_lag_since: None,
+            },
+        );
+        assert_eq!(
+            pre_review_conflict_head(&config, &waits, task_id, pr, &observation)
+                .await
+                .unwrap(),
+            Some(CONFLICT_HEAD.to_string())
+        );
+        discard_pre_review_wait(&mut waits, task_id);
+        assert!(waits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_only_pre_review_conflict_parks_merge_blocked_until_mergeable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("review-only-pre-review-conflict.db");
+        let pr = 1010;
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::create(
+                &mut conn,
+                "owner",
+                "review-only conflict",
+                None,
+                0,
+                None,
+                None,
+                None,
+                Some(pr),
+                now_unix(),
+            )
+            .unwrap()
+        };
+        let config = conflict_test_config(
+            &db_path,
+            dir.path(),
+            HeadBoundMergeability::new(merge::MergeabilityState::Conflicting, Some(CONFLICT_HEAD)),
+        );
+        run_pre_review_conflict(&config, task_id, pr, CONFLICT_HEAD).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert!(task.review_only);
+        assert_eq!(task.status, "in-review", "review-only is never reworked");
+        assert_eq!(task.rework_round, 0);
+        assert_eq!(
+            task.body.as_deref(),
+            Some(tasks::PRE_REVIEW_MERGE_BLOCKED_BODY)
+        );
+        assert_eq!(
+            tasks::ci_remediation_intent(task.refs.as_deref()).unwrap(),
+            None
+        );
+        drop(conn);
+
+        // Once GitHub no longer reports a conflict the block clears and the
+        // normal pre-review path resumes; a second clear is a no-op.
+        assert!(clear_pre_review_merge_block(&db_path, task_id)
+            .await
+            .unwrap());
+        assert!(!clear_pre_review_merge_block(&db_path, task_id)
+            .await
+            .unwrap());
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_ne!(
+            task.body.as_deref(),
+            Some(tasks::PRE_REVIEW_MERGE_BLOCKED_BODY)
+        );
+    }
+
+    #[tokio::test]
+    async fn no_rework_pre_review_conflict_closes_done_with_merge_conflict_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("no-rework-pre-review-conflict.db");
+        let pr = 1011;
+        let task_id = create_no_rework_review_task(&db_path, pr);
+        let config = conflict_test_config(
+            &db_path,
+            dir.path(),
+            HeadBoundMergeability::new(merge::MergeabilityState::Conflicting, Some(CONFLICT_HEAD)),
+        );
+        run_pre_review_conflict(&config, task_id, pr, CONFLICT_HEAD).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "done");
+        assert_eq!(task.rework_round, 0);
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[tasks::REVIEW_OUTCOME_REF], "merge_conflict");
+        assert!(refs.get(tasks::CI_REMEDIATION_REQUESTED_REF).is_none());
+    }
+
+    #[tokio::test]
+    async fn pre_review_conflict_at_rework_cap_fails_with_cap_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pre-review-conflict-cap.db");
+        let pr = 1012;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, Some(CONFLICT_HEAD));
+        let cap = {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let cap = tasks::get(&conn, task_id)
+                .unwrap()
+                .unwrap()
+                .effective_rework_cap();
+            conn.execute(
+                "UPDATE tasks SET rework_round=?2 WHERE id=?1",
+                rusqlite::params![task_id, cap],
+            )
+            .unwrap();
+            cap
+        };
+        let config = conflict_test_config(
+            &db_path,
+            dir.path(),
+            HeadBoundMergeability::new(merge::MergeabilityState::Conflicting, Some(CONFLICT_HEAD)),
+        );
+        run_pre_review_conflict(&config, task_id, pr, CONFLICT_HEAD).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        assert_eq!(task.rework_round, i64::from(cap), "cap is not exceeded");
+        assert_eq!(
+            tasks::ci_remediation_intent(task.refs.as_deref()).unwrap(),
+            None
+        );
+        let alert: String = conn
+            .query_row(
+                "SELECT body FROM messages
+                 WHERE recipient='owner' AND kind='alert' AND refs=?1",
+                [format!("task:{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            alert,
+            format!("task #{task_id}: rework cap ({cap}) exceeded"),
+            "same owner notice as the merge-time conflict"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_absent_required_jobs_on_dirty_head_never_send_ci_feedback() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("absent-dirty.db");
+        let pr = 1013;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, Some(CONFLICT_HEAD));
+        let executor =
+            HeadBoundMergeability::new(merge::MergeabilityState::Conflicting, Some(CONFLICT_HEAD));
+        let config = conflict_test_config(&db_path, dir.path(), executor.clone());
+        handle_pre_review_checks_failure(
+            &config,
+            &WorktreeManager::new(),
+            &mut Pool::new_generated(),
+            &mut Vec::new(),
+            &mut LifetimeRoster::new(),
+            &mut ProfileCooldown::new(),
+            task_id,
+            pr,
+            CONFLICT_HEAD,
+            &["container (absent)".into(), "shell-tests (absent)".into()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.rework_round, 1);
+        let intent = tasks::ci_remediation_intent(task.refs.as_deref())
+            .unwrap()
+            .unwrap();
+        assert!(!intent.feedback.contains("Fix the failing checks"));
+        assert!(intent.feedback.contains("PR #1013 has conflicts with main"));
+        assert_eq!(
+            intent.checks,
+            vec![tasks::PRE_REVIEW_CONFLICT_REMEDIATION_CHECK.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn all_absent_required_jobs_on_lagging_dirty_report_keep_ci_feedback() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("absent-lagging-dirty.db");
+        let pr = 1014;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, Some(CONFLICT_HEAD));
+        let config = conflict_test_config(
+            &db_path,
+            dir.path(),
+            HeadBoundMergeability::new(merge::MergeabilityState::Conflicting, Some("older-head")),
+        );
+        handle_pre_review_checks_failure(
+            &config,
+            &WorktreeManager::new(),
+            &mut Pool::new_generated(),
+            &mut Vec::new(),
+            &mut LifetimeRoster::new(),
+            &mut ProfileCooldown::new(),
+            task_id,
+            pr,
+            CONFLICT_HEAD,
+            &["container (absent)".into()],
+        )
+        .await
+        .unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let intent = tasks::ci_remediation_intent(task.refs.as_deref())
+            .unwrap()
+            .unwrap();
+        assert!(intent.feedback.contains("Fix the failing checks"));
+        assert_eq!(intent.checks, vec!["container (absent)".to_string()]);
     }
 
     #[tokio::test]
