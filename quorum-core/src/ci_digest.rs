@@ -5,7 +5,9 @@
 //! unbounded `read_line`), strips the GitHub timestamp prefix and ANSI escape
 //! sequences, and keeps only bounded collections of failure markers:
 //!
-//! * `preflight timing: FIRST FAILURE:` and `timed out after` lines;
+//! * up to [`FIRST_FAILURE_LINES_MAX`] `preflight timing: FIRST FAILURE:`
+//!   lines, kept separately so no volume of other markers can displace them;
+//! * up to [`TIMEOUT_LINES_MAX`] `timed out after` lines;
 //! * up to [`FAILED_NAMES_MAX`] `test <path> ... FAILED` names;
 //! * up to [`PANICS_MAX`] `panicked at` lines, each paired with the following
 //!   non-blank (assertion) line;
@@ -25,8 +27,10 @@ pub const FAILED_NAMES_MAX: usize = 20;
 pub const TAIL_LINES: usize = 30;
 /// Hard cap on the rendered digest, in bytes.
 pub const DIGEST_MAX_BYTES: usize = 4096;
-/// Maximum number of first-failure / timeout lines kept.
-pub const MARKER_LINES_MAX: usize = 8;
+/// Maximum number of `preflight timing: FIRST FAILURE:` lines kept.
+pub const FIRST_FAILURE_LINES_MAX: usize = 4;
+/// Maximum number of `timed out after` lines kept.
+pub const TIMEOUT_LINES_MAX: usize = 8;
 /// Maximum number of panic (+ assertion) pairs kept.
 pub const PANICS_MAX: usize = 5;
 /// Maximum raw bytes buffered for one log line; the remainder is discarded.
@@ -62,6 +66,9 @@ pub enum TailSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CiJobDigest {
     pub first_failure_lines: Vec<String>,
+    pub first_failure_truncated: bool,
+    pub timeout_lines: Vec<String>,
+    pub timeout_lines_truncated: bool,
     pub failed_names: Vec<String>,
     pub failed_names_truncated: bool,
     pub panics: Vec<PanicDigest>,
@@ -74,9 +81,10 @@ pub struct CiJobDigest {
 }
 
 impl CiJobDigest {
-    /// True when any first-failure, FAILED, or panic marker was found.
+    /// True when any first-failure, timeout, FAILED, or panic marker was found.
     pub fn has_markers(&self) -> bool {
         !self.first_failure_lines.is_empty()
+            || !self.timeout_lines.is_empty()
             || !self.failed_names.is_empty()
             || !self.panics.is_empty()
     }
@@ -105,6 +113,9 @@ pub fn render_digest(digest: &CiJobDigest, job_name: &str, run_id: u64, job_id: 
 #[derive(Default)]
 struct Builder {
     first_failure_lines: Vec<String>,
+    first_failure_truncated: bool,
+    timeout_lines: Vec<String>,
+    timeout_lines_truncated: bool,
     failed_names: Vec<String>,
     failed_names_truncated: bool,
     panics: Vec<PanicDigest>,
@@ -127,10 +138,20 @@ impl Builder {
                 self.panics[idx].assertion = Some(t.to_string());
             }
         }
-        if (t.contains(FIRST_FAILURE_MARKER) || t.contains(TIMEOUT_MARKER))
-            && self.first_failure_lines.len() < MARKER_LINES_MAX
-        {
-            self.first_failure_lines.push(t.to_string());
+        if t.contains(FIRST_FAILURE_MARKER) {
+            push_capped(
+                &mut self.first_failure_lines,
+                &mut self.first_failure_truncated,
+                FIRST_FAILURE_LINES_MAX,
+                t,
+            );
+        } else if t.contains(TIMEOUT_MARKER) {
+            push_capped(
+                &mut self.timeout_lines,
+                &mut self.timeout_lines_truncated,
+                TIMEOUT_LINES_MAX,
+                t,
+            );
         }
         if let Some(name) = failed_name(t) {
             if !self.failed_names.iter().any(|n| n == name) {
@@ -169,6 +190,9 @@ impl Builder {
         };
         CiJobDigest {
             first_failure_lines: self.first_failure_lines,
+            first_failure_truncated: self.first_failure_truncated,
+            timeout_lines: self.timeout_lines,
+            timeout_lines_truncated: self.timeout_lines_truncated,
             failed_names: self.failed_names,
             failed_names_truncated: self.failed_names_truncated,
             panics: self.panics,
@@ -177,6 +201,22 @@ impl Builder {
             tail_source,
             error_line: self.error_line,
         }
+    }
+}
+
+fn push_capped(lines: &mut Vec<String>, truncated: &mut bool, max: usize, t: &str) {
+    if lines.len() < max {
+        lines.push(t.to_string());
+    } else {
+        *truncated = true;
+    }
+}
+
+fn section_header(title: &str, shown: usize, truncated: bool) -> String {
+    if truncated {
+        format!("{title} (first {shown} shown; more omitted):")
+    } else {
+        format!("{title} ({shown}):")
     }
 }
 
@@ -227,7 +267,8 @@ fn read_capped_line<R: BufRead>(
 /// and cap the result at [`LINE_MAX_BYTES`].
 fn clean_line(raw: &[u8], read_cut: bool) -> String {
     let lossy = String::from_utf8_lossy(raw);
-    let mut out = strip_ansi(strip_timestamp(&lossy));
+    let line = lossy.strip_prefix('\u{feff}').unwrap_or(&lossy);
+    let mut out = strip_ansi(strip_timestamp(line));
     out.truncate(out.trim_end().len());
     cap_line(out, LINE_MAX_BYTES, read_cut)
 }
@@ -341,18 +382,27 @@ fn render_lines(digest: &CiJobDigest, job_name: &str, run_id: u64, job_id: u64) 
     ];
     if digest.has_markers() {
         if !digest.first_failure_lines.is_empty() {
-            lines.push("first failure / timeout:".to_string());
+            lines.push(section_header(
+                "first failure",
+                digest.first_failure_lines.len(),
+                digest.first_failure_truncated,
+            ));
             lines.extend(digest.first_failure_lines.iter().map(|l| format!("  {l}")));
         }
+        if !digest.timeout_lines.is_empty() {
+            lines.push(section_header(
+                "timeouts",
+                digest.timeout_lines.len(),
+                digest.timeout_lines_truncated,
+            ));
+            lines.extend(digest.timeout_lines.iter().map(|l| format!("  {l}")));
+        }
         if !digest.failed_names.is_empty() {
-            lines.push(if digest.failed_names_truncated {
-                format!(
-                    "failed tests (first {} shown; more omitted):",
-                    digest.failed_names.len()
-                )
-            } else {
-                format!("failed tests ({}):", digest.failed_names.len())
-            });
+            lines.push(section_header(
+                "failed tests",
+                digest.failed_names.len(),
+                digest.failed_names_truncated,
+            ));
             lines.extend(digest.failed_names.iter().map(|n| format!("  {n}")));
         }
         if !digest.panics.is_empty() {
@@ -477,9 +527,10 @@ mod tests {
                 "job: preflight\n",
                 "run id: 1016\n",
                 "job id: 4242\n",
-                "first failure / timeout:\n",
-                "  preflight timing: test binary 'quorum' timed out after 600s\n",
+                "first failure (1):\n",
                 "  preflight timing: FIRST FAILURE: test binary 'quorum' (timed_out, exit 124)\n",
+                "timeouts (1):\n",
+                "  preflight timing: test binary 'quorum' timed out after 600s\n",
                 "failed tests (7):\n",
                 "  serve::merge::one\n",
                 "  serve::merge::two\n",
@@ -490,8 +541,66 @@ mod tests {
                 "  serve::runner::seven\n",
             )
         );
-        assert_eq!(out.len(), 397);
+        assert_eq!(out.len(), 405);
         assert_clean(&out);
+    }
+
+    #[test]
+    fn first_failure_survives_many_earlier_timeout_lines() {
+        // timing.sh streams test output first and prints FIRST FAILURE only
+        // after the binary exits; `wait_until` panics say "timed out after".
+        let mut log = String::new();
+        for i in 0..TIMEOUT_LINES_MAX + 4 {
+            log.push_str(&format!(
+                "2026-11-20T10:00:00.0Z thread 't{i}' panicked at quorum/tests/x.rs:1:1:\n\
+                 2026-11-20T10:00:00.0Z timed out after 30s waiting for w{i}\n"
+            ));
+        }
+        log.push_str(
+            "2026-11-20T10:10:00.0Z preflight timing: FIRST FAILURE: test binary 'quorum' (timed_out, exit 124)\n",
+        );
+        let d = digest(&log);
+        assert_eq!(
+            d.first_failure_lines,
+            vec![
+                "preflight timing: FIRST FAILURE: test binary 'quorum' (timed_out, exit 124)"
+                    .to_string()
+            ]
+        );
+        assert!(!d.first_failure_truncated);
+        assert_eq!(d.timeout_lines.len(), TIMEOUT_LINES_MAX);
+        assert!(d.timeout_lines_truncated);
+        let out = render_digest(&d, "preflight", 5, 6);
+        let mut expected = String::from(
+            "CI job failure digest\njob: preflight\nrun id: 5\njob id: 6\n\
+             first failure (1):\n  \
+             preflight timing: FIRST FAILURE: test binary 'quorum' (timed_out, exit 124)\n\
+             timeouts (first 8 shown; more omitted):\n",
+        );
+        for i in 0..TIMEOUT_LINES_MAX {
+            expected.push_str(&format!("  timed out after 30s waiting for w{i}\n"));
+        }
+        expected.push_str("panics (first 5 shown; more omitted):\n");
+        for i in 0..PANICS_MAX {
+            expected.push_str(&format!(
+                "  thread 't{i}' panicked at quorum/tests/x.rs:1:1:\n    \
+                 timed out after 30s waiting for w{i}\n"
+            ));
+        }
+        assert_eq!(out, expected);
+        assert_eq!(out.len(), 968);
+        assert_clean(&out);
+
+        let mut many = String::new();
+        for i in 0..FIRST_FAILURE_LINES_MAX + 1 {
+            many.push_str(&format!("preflight timing: FIRST FAILURE: step {i}\n"));
+        }
+        let d = digest(&many);
+        assert_eq!(d.first_failure_lines.len(), FIRST_FAILURE_LINES_MAX);
+        assert!(d.first_failure_truncated);
+        assert!(
+            render_digest(&d, "p", 1, 2).contains("first failure (first 4 shown; more omitted):\n")
+        );
     }
 
     #[test]
@@ -748,6 +857,10 @@ mod tests {
             "red link z\tend"
         );
         assert_eq!(clean_line(b"\xff ok", false), "\u{fffd} ok");
+        assert_eq!(
+            clean_line("\u{feff}2026-11-26T06:00:00Z bom".as_bytes(), false),
+            "bom"
+        );
         let multibyte = "é".repeat(LINE_MAX_BYTES);
         let capped = clean_line(multibyte.as_bytes(), false);
         assert!(capped.ends_with(LINE_TRUNCATED_SUFFIX));
