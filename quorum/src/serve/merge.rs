@@ -891,7 +891,6 @@ impl GhMergeExecutor {
     /// raw `-f` strings; without one, `-F` expands gh's `{owner}`/`{repo}`
     /// placeholders from `repo_dir`. The token is fetched first, so a source
     /// failure spawns nothing.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn identity_probe_cmd(
         &self,
         pr: i64,
@@ -926,7 +925,6 @@ impl GhMergeExecutor {
     /// identity authored the PR. `None` (never one-identity) on credential
     /// failure, gh failure, or any malformed/partial response; each failure
     /// is logged.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn probe_pr_identity(&self, pr: i64, repo_dir: &Path) -> Option<PrIdentity> {
         let mut cmd = match self.identity_probe_cmd(pr, repo_dir) {
             Ok(cmd) => cmd,
@@ -981,6 +979,34 @@ impl GhMergeExecutor {
             return None;
         }
         parse_review_decision(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    /// One-identity changes verdict: true once a review on the current head
+    /// carries the changes marker for that head, found or just posted. Never
+    /// posts `--request-changes`. Without a readable head, nothing is posted
+    /// (false) because the marker cannot be bound.
+    fn ensure_changes_comment(&self, pr: i64, repo_dir: &Path, body: &str) -> bool {
+        let Some((reviews, head)) = self.fetch_reviews_and_head(pr, repo_dir) else {
+            eprintln!("warn: PR #{pr} changes comment not posted: reviews/head read failed");
+            return false;
+        };
+        if head.is_empty() {
+            eprintln!("warn: PR #{pr} changes comment not posted: empty head");
+            return false;
+        }
+        if head_has_verdict_marker(&reviews, &head, VerdictKind::Changes) {
+            return true;
+        }
+        let pr_str = pr.to_string();
+        let marked = format!("{body}\n\n{}", verdict_marker(VerdictKind::Changes, &head));
+        let result = self.run_gh(
+            &["pr", "review", &pr_str, "--comment", "--body", &marked],
+            repo_dir,
+        );
+        if !result.success {
+            eprintln!("warn: PR #{pr} changes comment failed: {}", result.message);
+        }
+        result.success
     }
 
     fn verify_pr_merged(&self, pr: i64, repo_dir: &Path) -> bool {
@@ -1304,7 +1330,6 @@ fn head_has_approval(reviews_json: &str, head_sha: &str) -> bool {
 
 /// Fixed GraphQL document for the merge-credential identity probe. Only its
 /// variables carry the daemon-derived repository and PR number.
-#[cfg_attr(not(test), allow(dead_code))]
 const PR_IDENTITY_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { \
 repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
 viewerDidAuthor reviewDecision } } }";
@@ -1323,7 +1348,6 @@ pub(crate) struct PrIdentity {
 /// `errors` entry, a missing `pullRequest`, a non-boolean/missing
 /// `viewerDidAuthor`, or a missing/non-string `reviewDecision` key, so no
 /// partial response ever selects one-identity mode.
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_pr_identity(json_str: &str) -> Option<PrIdentity> {
     let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
     match val.get("errors") {
@@ -1349,7 +1373,6 @@ fn parse_pr_identity(json_str: &str) -> Option<PrIdentity> {
 }
 
 /// True only for a well-formed probe that reports `viewerDidAuthor=true`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn is_one_identity(identity: Option<&PrIdentity>) -> bool {
     identity.is_some_and(|identity| identity.viewer_did_author)
 }
@@ -1379,7 +1402,6 @@ pub(crate) enum VerdictKind {
 
 /// Hidden marker binding a verdict kind to one head SHA, e.g.
 /// `<!-- quorum-verdict:approved head=<sha> -->`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn verdict_marker(kind: VerdictKind, head_sha: &str) -> String {
     let kind = match kind {
         VerdictKind::Approved => "approved",
@@ -1391,7 +1413,6 @@ fn verdict_marker(kind: VerdictKind, head_sha: &str) -> String {
 /// True iff a review in `reviews_json` (from `fetch_reviews_and_head`) whose
 /// `commit.oid` is `head_sha` carries the exact marker for `kind` and
 /// `head_sha`. Parse failure or an empty head is false. Dedupe only.
-#[cfg_attr(not(test), allow(dead_code))]
 fn head_has_verdict_marker(reviews_json: &str, head_sha: &str, kind: VerdictKind) -> bool {
     if head_sha.is_empty() {
         return false;
@@ -1845,6 +1866,12 @@ impl MergeExecutor for GhMergeExecutor {
 
     fn ensure_changes_requested(&self, pr: i64, repo_dir: &Path, body: &str) -> bool {
         let pr_str = pr.to_string();
+        // One identity: GitHub refuses --request-changes on your own PR, so
+        // post a COMMENT carrying the head-bound changes marker instead. A
+        // failed probe falls through to the two-identity path below.
+        if is_one_identity(self.probe_pr_identity(pr, repo_dir).as_ref()) {
+            return self.ensure_changes_comment(pr, repo_dir, body);
+        }
         let post = || {
             self.build_gh_cmd(
                 &["pr", "review", &pr_str, "--request-changes", "--body", body],
@@ -3350,7 +3377,7 @@ mod tests {
                 r#"#!/bin/sh
 d='{root}'
 printf 'CALL\t%s\n' "$GH_TOKEN" >> "$d/calls.log"
-for a in "$@"; do printf 'ARG\t%s\n' "$a" >> "$d/calls.log"; done
+for a in "$@"; do printf 'ARG\t%s\n' "$(printf '%s' "$a" | tr '\n' '\036')" >> "$d/calls.log"; done
 case "$1 $2" in
   "api graphql") route=probe ;;
   "pr review") route=review ;;
@@ -3402,7 +3429,12 @@ exit "$code"
                         gh_token: token.to_string(),
                     });
                 } else if let Some(arg) = line.strip_prefix("ARG\t") {
-                    calls.last_mut().unwrap().argv.push(arg.to_string());
+                    // The script encodes newlines as RS (0x1e) to keep one arg per line.
+                    calls
+                        .last_mut()
+                        .unwrap()
+                        .argv
+                        .push(arg.replace('\u{1e}', "\n"));
                 }
             }
             calls
@@ -3608,6 +3640,247 @@ exit "$code"
         );
         assert_eq!(calls[3].argv[..2], ["pr", "review"]);
         assert_eq!(calls[4].argv[..2], ["pr", "merge"]);
+    }
+
+    // ── ensure_changes_requested: one- vs two-identity ──────────────────
+
+    #[cfg(unix)]
+    const CHANGES_SECRET: &str = "ghs_changes_secret";
+
+    #[cfg(unix)]
+    fn reviews_at(head: &str, entries: &[(&str, &str, &str)]) -> String {
+        let reviews: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(state, oid, body)| {
+                serde_json::json!({"state": state, "commit": {"oid": oid}, "body": body})
+            })
+            .collect();
+        serde_json::json!({ "reviews": reviews, "headRefOid": head }).to_string()
+    }
+
+    #[cfg(unix)]
+    fn changes_gh() -> (FakeGh, GhMergeExecutor) {
+        let gh = FakeGh::new();
+        let exec = gh.exec(
+            Arc::new(FakeCredentialSource::token(CHANGES_SECRET)),
+            Some("o/r"),
+        );
+        gh.respond("review", "", 0);
+        (gh, exec)
+    }
+
+    #[cfg(unix)]
+    fn review_calls(gh: &FakeGh) -> Vec<Vec<String>> {
+        gh.calls()
+            .into_iter()
+            .inspect(|call| {
+                assert_eq!(call.gh_token, CHANGES_SECRET, "token via GH_TOKEN");
+                assert!(
+                    !call.argv.iter().any(|a| a.contains(CHANGES_SECRET)),
+                    "token must never enter argv: {:?}",
+                    call.argv
+                );
+            })
+            .filter(|call| call.argv[..2] == ["pr", "review"])
+            .map(|call| call.argv)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn request_changes_argv(body: &str) -> Vec<String> {
+        [
+            "pr",
+            "review",
+            "9",
+            "--request-changes",
+            "--body",
+            body,
+            "-R",
+            "o/r",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    }
+
+    /// Negative case 1: viewerDidAuthor=false keeps today's argv and dedupe.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_changes_two_identity_posts_request_changes_unchanged() {
+        let (gh, exec) = changes_gh();
+        gh.respond("probe", &probe_json("false", "null"), 0);
+        gh.respond("decision", r#"{"reviewDecision":"REVIEW_REQUIRED"}"#, 0);
+        assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        assert_eq!(review_calls(&gh), vec![request_changes_argv("fix it")]);
+        let routes: Vec<String> = gh.calls().iter().map(|c| c.argv[0].clone()).collect();
+        assert_eq!(routes, ["api", "pr", "pr"], "probe, decision, review");
+
+        // Existing CHANGES_REQUESTED dedupe still short-circuits.
+        let (gh, exec) = changes_gh();
+        gh.respond("probe", &probe_json("false", "null"), 0);
+        gh.respond("decision", r#"{"reviewDecision":"CHANGES_REQUESTED"}"#, 0);
+        assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        assert!(review_calls(&gh).is_empty());
+
+        // A refused --request-changes still fails as today.
+        let (gh, exec) = changes_gh();
+        gh.respond("probe", &probe_json("false", "null"), 0);
+        gh.respond("decision", r#"{"reviewDecision":""}"#, 0);
+        gh.fail("review", "refused", 1);
+        assert!(!exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        assert_eq!(review_calls(&gh), vec![request_changes_argv("fix it")]);
+    }
+
+    /// Negative case 2: a failed probe takes the two-identity path.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_changes_failed_probe_falls_back_to_two_identity() {
+        let probes: [fn(&FakeGh); 2] = [
+            |gh| gh.fail("probe", "HTTP 502", 1),
+            |gh| gh.respond("probe", "{not json", 0),
+        ];
+        for fail_probe in probes {
+            let (gh, exec) = changes_gh();
+            fail_probe(&gh);
+            gh.respond("decision", r#"{"reviewDecision":""}"#, 0);
+            assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+            assert_eq!(review_calls(&gh), vec![request_changes_argv("fix it")]);
+        }
+    }
+
+    /// One identity posts a marker COMMENT bound to the current head and
+    /// never `--request-changes`.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_changes_one_identity_posts_marker_comment() {
+        let (gh, exec) = changes_gh();
+        gh.respond("probe", &probe_json("true", "null"), 0);
+        gh.respond("reviews", &reviews_at("head1", &[]), 0);
+        // Even a CHANGES_REQUESTED decision is not consulted in this mode.
+        gh.respond("decision", r#"{"reviewDecision":"CHANGES_REQUESTED"}"#, 0);
+        assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        let marked = format!(
+            "fix it\n\n{}",
+            verdict_marker(VerdictKind::Changes, "head1")
+        );
+        assert_eq!(
+            review_calls(&gh),
+            vec![[
+                "pr",
+                "review",
+                "9",
+                "--comment",
+                "--body",
+                &marked,
+                "-R",
+                "o/r"
+            ]
+            .map(str::to_owned)
+            .to_vec()]
+        );
+        assert!(!gh
+            .calls()
+            .iter()
+            .any(|c| c.argv.iter().any(|a| a == "--request-changes")));
+
+        // A failed comment post is a failure, still never --request-changes.
+        let (gh, exec) = changes_gh();
+        gh.respond("probe", &probe_json("true", "null"), 0);
+        gh.respond("reviews", &reviews_at("head1", &[]), 0);
+        gh.fail("review", "boom", 1);
+        assert!(!exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        let reviews = review_calls(&gh);
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0][3], "--comment");
+
+        // An unreadable head posts nothing.
+        let (gh, exec) = changes_gh();
+        gh.respond("probe", &probe_json("true", "null"), 0);
+        gh.fail("reviews", "boom", 1);
+        assert!(!exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        assert!(review_calls(&gh).is_empty());
+    }
+
+    /// Negative case 4: a retry on the same head finds the marker, posts no
+    /// second comment, and returns true.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_changes_one_identity_retry_same_head_posts_once() {
+        let (gh, exec) = changes_gh();
+        gh.respond("probe", &probe_json("true", "null"), 0);
+        gh.respond("reviews", &reviews_at("head1", &[]), 0);
+        assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        let posted = review_calls(&gh)[0][5].clone();
+        gh.respond(
+            "reviews",
+            &reviews_at("head1", &[("COMMENTED", "head1", &posted)]),
+            0,
+        );
+        assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "other"));
+        assert_eq!(review_calls(&gh).len(), 1, "exactly one marker comment");
+    }
+
+    /// Negative case 5: after the head moves, the old marker does not dedupe.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_changes_one_identity_head_move_posts_new_marker() {
+        let (gh, exec) = changes_gh();
+        gh.respond("probe", &probe_json("true", "null"), 0);
+        let old = format!("x\n\n{}", verdict_marker(VerdictKind::Changes, "head1"));
+        gh.respond(
+            "reviews",
+            &reviews_at("head2", &[("COMMENTED", "head1", &old)]),
+            0,
+        );
+        assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        let reviews = review_calls(&gh);
+        assert_eq!(reviews.len(), 1);
+        assert!(reviews[0][5].ends_with(&verdict_marker(VerdictKind::Changes, "head2")));
+    }
+
+    /// Negative case 10: a current-head comment quoting another head's
+    /// marker, the approved marker, or no marker does not dedupe.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_changes_one_identity_ignores_quoted_or_missing_marker() {
+        let other_head = format!(
+            "as the daemon said: {}",
+            verdict_marker(VerdictKind::Changes, "head0")
+        );
+        let approved = verdict_marker(VerdictKind::Approved, "head1");
+        for body in [other_head.as_str(), approved.as_str(), "please fix"] {
+            let (gh, exec) = changes_gh();
+            gh.respond("probe", &probe_json("true", "null"), 0);
+            gh.respond(
+                "reviews",
+                &reviews_at("head1", &[("COMMENTED", "head1", body)]),
+                0,
+            );
+            assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+            let reviews = review_calls(&gh);
+            assert_eq!(reviews.len(), 1, "{body}");
+            assert!(reviews[0][5].ends_with(&verdict_marker(VerdictKind::Changes, "head1")));
+        }
+    }
+
+    /// Negative cases 11/12: a missing credential spawns no gh child for the
+    /// probe or any review; the token never enters argv (asserted per call by
+    /// `review_calls` in the other tests).
+    #[cfg(unix)]
+    #[test]
+    fn ensure_changes_missing_credential_spawns_nothing() {
+        let gh = FakeGh::new();
+        gh.respond("probe", &probe_json("true", "null"), 0);
+        gh.respond("reviews", &reviews_at("head1", &[]), 0);
+        gh.respond("review", "", 0);
+        let exec = gh.exec(
+            Arc::new(LocalDefaultCredentialSource::new(Some(PathBuf::from(
+                "/nonexistent/path/token",
+            )))),
+            Some("o/r"),
+        );
+        assert!(!exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        assert!(gh.calls().is_empty(), "no gh child may spawn");
     }
 
     #[test]
