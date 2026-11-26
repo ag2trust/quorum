@@ -737,6 +737,24 @@ pub enum Command {
         #[arg(long)]
         by: String,
     },
+    /// Answer a needs-info park and resume the task. Refuses any task that
+    /// is not daemon-parked waiting for an answer. Answer text via
+    /// --body-stdin or --body-file.
+    TaskAnswer {
+        #[arg(long = "task-id")]
+        task_id: i64,
+        /// Identity recorded as the answer note's author.
+        #[arg(long)]
+        by: String,
+        #[arg(long = "body-stdin")]
+        body_stdin: bool,
+        #[arg(long = "body-file")]
+        body_file: Option<PathBuf>,
+        /// Target repo as owner/name (e.g. ag2trust/quorum). Routes to that repo's DB
+        /// instead of resolving from cwd/env.
+        #[arg(long)]
+        repo: Option<String>,
+    },
     /// Explicitly adopt one completed managed continuation as the exact
     /// delivery of the final failed member of an active decomposition. This
     /// operator-only incident recovery requires durable publication, managed
