@@ -533,14 +533,23 @@ pub fn resolve_roles(
         || file.review_model.is_some()
         || file.classifier_model.is_some()
         || file.collector_model.is_some();
+    // An external provider is its own runner authority: its role models are
+    // opaque strings passed to the CLI verbatim and never resolved through
+    // the built-in model mapping. Built-in providers keep deriving the kind
+    // from the model so their mismatch checks are unchanged.
+    let role_kind = |model: &str| -> std::result::Result<crate::serve::runner::AgentKind, String> {
+        if provider == RunnerKind::External {
+            Ok(crate::serve::runner::AgentKind::External)
+        } else {
+            crate::serve::runner::AgentKind::for_model(model)
+        }
+    };
     for (role, model) in [
         ("review", roles.review_model.as_str()),
         ("classifier", roles.classifier_model.as_str()),
         ("collector", roles.collector_model.as_str()),
     ] {
-        if crate::serve::runner::AgentKind::for_model(model)
-            .is_ok_and(|kind| kind == crate::serve::runner::AgentKind::Grok)
-        {
+        if role_kind(model).is_ok_and(|kind| kind == crate::serve::runner::AgentKind::Grok) {
             return Err(QuorumError::Usage(format!(
                 "{role}_model \"{model}\" selects Grok, but Grok is enabled only for managed workers"
             )));
@@ -555,8 +564,7 @@ pub fn resolve_roles(
             ("classifier", roles.classifier_model.as_str()),
             ("collector", roles.collector_model.as_str()),
         ] {
-            let actual =
-                crate::serve::runner::AgentKind::for_model(model).map_err(QuorumError::Usage)?;
+            let actual = role_kind(model).map_err(QuorumError::Usage)?;
             if (provider == RunnerKind::Grok && role != "worker")
                 || (role == "worker" && actual == crate::serve::runner::AgentKind::Grok)
             {
@@ -570,8 +578,7 @@ pub fn resolve_roles(
             }
         }
 
-        crate::serve::runner::AgentKind::for_model(&roles.review_model)
-            .map_err(QuorumError::Usage)?;
+        role_kind(&roles.review_model).map_err(QuorumError::Usage)?;
     }
     Ok(roles)
 }
@@ -2520,6 +2527,28 @@ log_dir = "/home/user/.quorum/serve/quorum/logs"
                 "medium",
             )
         );
+    }
+
+    #[test]
+    fn external_provider_role_models_are_not_resolved_through_for_model() {
+        // "gpt-5" maps to Codex through the built-in mapping; under an
+        // external provider it is an opaque model and must not be rejected.
+        let cfg: ServeFileConfig = toml::from_str(
+            "provider = \"external\"\nworker_model = \"gpt-5\"\nreview_model = \"gpt-5\"\n\
+             classifier_model = \"gpt-5\"\ncollector_model = \"grok-4.5\"\n",
+        )
+        .unwrap();
+        let roles = resolve_roles(&cfg, None, "sonnet", "high").unwrap();
+        assert_eq!(roles.provider, RunnerKind::External);
+        assert_eq!(roles.worker_model, "gpt-5");
+        assert_eq!(roles.review_model, "gpt-5");
+        assert_eq!(roles.collector_model, "grok-4.5");
+
+        // A built-in provider keeps its model mismatch check.
+        let cfg: ServeFileConfig =
+            toml::from_str("provider = \"claude\"\nworker_model = \"gpt-5\"\n").unwrap();
+        let err = resolve_roles(&cfg, None, "sonnet", "high").unwrap_err();
+        assert!(err.to_string().contains("does not match provider"), "{err}");
     }
 
     #[test]
