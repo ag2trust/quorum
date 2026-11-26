@@ -11277,16 +11277,20 @@ fn hold_pre_review_on_cadence(
     now: std::time::Instant,
 ) {
     let previous = waits.remove(&task_id);
-    let (consecutive_timeouts, timeout_alerted, previous_head) = match previous {
+    let (consecutive_timeouts, timeout_alerted, previous_entry) = match previous {
         Some(entry) => {
             if let PreReviewChecksState::Waiting(handle) = entry.state {
                 handle.abort();
             }
-            let previous_head = (entry.pr == pr).then_some(entry.head_sha);
+            let previous_entry = (entry.pr == pr).then_some((
+                entry.head_sha,
+                entry.head_first_seen,
+                entry.unregistered_alerted,
+            ));
             (
                 entry.consecutive_timeouts,
                 entry.timeout_alerted,
-                previous_head,
+                previous_entry,
             )
         }
         None => (0, false, None),
@@ -11294,9 +11298,22 @@ fn hold_pre_review_on_cadence(
     // An empty head keeps the previously tracked head for this PR, so a hold
     // never adopts an unverified GitHub-reported head as the recorded one.
     let head_sha = if head_sha.is_empty() {
-        previous_head.unwrap_or_default()
+        previous_entry
+            .as_ref()
+            .map(|(head, _, _)| head.clone())
+            .unwrap_or_default()
     } else {
         head_sha.to_string()
+    };
+    // A new head creates a new entry for the unregistered-jobs alert window;
+    // otherwise keep the window (and whether it already fired) from before.
+    let (head_first_seen, unregistered_alerted) = match previous_entry {
+        Some((previous_head, head_first_seen, unregistered_alerted))
+            if previous_head == head_sha =>
+        {
+            (head_first_seen, unregistered_alerted)
+        }
+        _ => (now, false),
     };
     waits.insert(
         task_id,
@@ -11309,6 +11326,8 @@ fn hold_pre_review_on_cadence(
             consecutive_timeouts,
             timeout_alerted,
             head_lag_since: None,
+            head_first_seen,
+            unregistered_alerted,
         },
     );
 }
@@ -37425,6 +37444,8 @@ mod tests {
                 consecutive_timeouts: 0,
                 timeout_alerted: false,
                 head_lag_since: None,
+                head_first_seen: std::time::Instant::now(),
+                unregistered_alerted: false,
             },
         );
         assert_eq!(
