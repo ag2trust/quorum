@@ -3145,7 +3145,7 @@ fn routed_collector_request(
         repo,
         config.db_path.clone(),
         config.repo_dir.clone(),
-        provider_bin(&profile.model),
+        provider_bin(&profile.runner),
         config.bare_agent,
     )
     .with_collector(
@@ -50394,6 +50394,31 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 .to_string()
                 .contains("refusing provider migration"),
             "a runner must never continue through a different provider adapter"
+        );
+    }
+
+    /// The routed collector's primary binary comes from the profile's runner,
+    /// not its model: a model string is not a runner name, and resolving it
+    /// as one silently dropped the configured binary (falling back to PATH).
+    #[cfg(unix)]
+    #[test]
+    fn routed_collector_request_uses_the_profile_runner_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = launch_test_repo(dir.path());
+        let (runner, _) = retry_test_claude_runner(dir.path());
+        let config = claude_only_retry_test_config(dir.path(), &repo, &runner);
+        let task_id = seed_retry_test_task(&config, "in-review", serde_json::json!(null));
+
+        let request = routed_collector_request(&config, 77, task_id, None, 0).unwrap();
+
+        let expected = config.agent_bin.clone();
+        assert!(expected.is_some());
+        assert_eq!(request.agent_bin, expected);
+        assert_eq!(request.collector_runner, "claude");
+        let routing = request.routing.as_ref().unwrap();
+        assert_eq!(
+            routing.agent_bins.get("c-claude").cloned().flatten(),
+            expected
         );
     }
 
