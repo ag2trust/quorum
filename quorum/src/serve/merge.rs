@@ -341,12 +341,15 @@ pub trait MergeExecutor: Send + Sync {
     }
 
     /// The daemon's PR-authoring (publishing) identity: publication,
-    /// PR-target lookup, drift, branch-sync, and cleanup `gh` children. This
-    /// must differ from the merge-authority source when a merge token file is
-    /// configured — daemon PRs authored by the merge account would make the
-    /// daemon's own approve/request-changes reviews self-reviews, which
-    /// GitHub rejects. The default is the merge default (both are the local
-    /// default source with no token file).
+    /// PR-target lookup, drift, branch-sync, and cleanup `gh` children.
+    /// Configuring a merge token file distinct from this source keeps the two
+    /// identities apart, so the merge account's formal APPROVE/REQUEST_CHANGES
+    /// review is never a self-review. The default is the merge default (both
+    /// are the local default source with no token file); GitHub then rejects a
+    /// formal self-review, so `MergeExecutor::merge` and
+    /// `ensure_changes_requested` detect that per PR (`viewerDidAuthor`) and
+    /// fall back to posting a `COMMENT` verdict review instead — one-identity
+    /// mode.
     fn publication_credentials(&self) -> Arc<dyn GithubCredentialSource> {
         self.github_credentials()
     }
@@ -692,7 +695,11 @@ pub struct GhMergeExecutor {
     pub credentials: Arc<dyn GithubCredentialSource>,
     /// PR-authoring source (local default, no merge token file), returned by
     /// [`MergeExecutor::publication_credentials`]. Never the merge token, so
-    /// daemon-authored PRs stay reviewable by the merge account.
+    /// a distinct `credentials` source keeps daemon-authored PRs reviewable
+    /// by the merge account. Equal to `credentials` by default (no merge
+    /// token file configured), which puts every PR in one-identity mode:
+    /// `merge`/`ensure_changes_requested` detect that per PR and post a
+    /// `COMMENT` verdict instead of a formal review.
     pub publication_credentials: Arc<dyn GithubCredentialSource>,
     /// `owner/repo` slug for `-R` flag — avoids cwd git dependency.
     pub gh_repo: Option<String>,
