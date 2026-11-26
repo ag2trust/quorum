@@ -3121,8 +3121,8 @@ fn routed_collector_request(
         },
         probe,
     )?;
-    let provider_bin = |model: &str| {
-        resolve_provider(model)
+    let provider_bin = |runner: &str| {
+        resolve_profile_runner(runner)
             .ok()
             .and_then(|kind| agent_bin_for_kind(config, kind))
             .map(str::to_owned)
@@ -3134,7 +3134,7 @@ fn routed_collector_request(
         .map(|weighted| {
             (
                 weighted.profile.id.clone(),
-                provider_bin(&weighted.profile.model),
+                provider_bin(&weighted.profile.runner),
             )
         })
         .collect();
@@ -3145,7 +3145,7 @@ fn routed_collector_request(
         repo,
         config.db_path.clone(),
         config.repo_dir.clone(),
-        provider_bin(&profile.model),
+        provider_bin(&profile.runner),
         config.bare_agent,
     )
     .with_collector(
@@ -4133,12 +4133,34 @@ fn resolve_profile_runner(runner: &str) -> Result<runner::AgentKind> {
     runner::AgentKind::for_profile_runner(runner).map_err(QuorumError::Usage)
 }
 
+/// Resolve the runner kind of a run whose durable record or routed profile
+/// names `recorded` as its provider/runner. An `"external"` record is its own
+/// authority: the model string is opaque and `for_model` is never consulted.
+/// Built-in records still derive the kind from the model so each caller's
+/// existing record/model mismatch check keeps binding the two together.
+fn resolve_recorded_provider(recorded: &str, model: &str) -> Result<runner::AgentKind> {
+    if recorded == "external" {
+        return Ok(runner::AgentKind::External);
+    }
+    resolve_provider(model)
+}
+
+#[cfg(test)]
 fn resolve_worker_provider(model: &str) -> Result<runner::AgentKind> {
     resolve_provider(model)
 }
 
+#[cfg(test)]
 fn resolve_managed_provider(model: &str, role: &str) -> Result<runner::AgentKind> {
-    let kind = resolve_provider(model)?;
+    resolve_recorded_managed_provider("", model, role)
+}
+
+fn resolve_recorded_managed_provider(
+    recorded: &str,
+    model: &str,
+    role: &str,
+) -> Result<runner::AgentKind> {
+    let kind = resolve_recorded_provider(recorded, model)?;
     if kind == runner::AgentKind::Grok {
         return Err(QuorumError::Usage(format!(
             "model '{model}' selects Grok, but managed Grok {role} roles are not enabled"
@@ -4153,7 +4175,7 @@ fn require_configured_provider(
     actual: runner::AgentKind,
     context: &str,
 ) -> Result<()> {
-    let resolved = resolve_worker_provider(model)?;
+    let resolved = resolve_recorded_provider(&actual.to_string(), model)?;
     if resolved != actual {
         return Err(QuorumError::Io(format!(
             "{context} persisted provider '{actual}' does not match model '{model}' resolved as '{resolved}'"
@@ -4331,8 +4353,10 @@ fn resolve_original_remediation_provider(
     recorded_provider: Option<&str>,
     model: &str,
 ) -> Result<runner::AgentKind> {
-    let model_kind = resolve_worker_provider(model)?;
     let kind = match recorded_provider {
+        // The durable record is the authority for an external run; its model
+        // string is opaque and never resolved.
+        Some("external") => return Ok(runner::AgentKind::External),
         Some("claude") => runner::AgentKind::Claude,
         Some("codex") => runner::AgentKind::Codex,
         Some("grok") => runner::AgentKind::Grok,
@@ -4347,6 +4371,7 @@ fn resolve_original_remediation_provider(
             )));
         }
     };
+    let model_kind = resolve_provider(model)?;
     if kind != model_kind {
         return Err(QuorumError::Io(format!(
             "persisted provider '{kind}' does not match model '{model}' resolved as '{model_kind}'"
@@ -4465,7 +4490,7 @@ fn resolve_reviewer_recovery(
             run.id
         ))
     })?;
-    let kind = resolve_managed_provider(&run.model, "reviewer recovery")?;
+    let kind = resolve_recorded_managed_provider(provider, &run.model, "reviewer recovery")?;
     if provider != kind.to_string() {
         return Err(QuorumError::Io(format!(
             "persisted provider '{provider}' does not match reviewer model '{}' resolved as '{kind}'",
@@ -5863,7 +5888,7 @@ fn worker_publication_pr(
 fn runner_retry_turn(refs: Option<&str>) -> Option<PendingTurn> {
     let refs: serde_json::Value = serde_json::from_str(refs?).ok()?;
     let turn = runner_state::requested_retry_any(&refs)?;
-    let resolved = resolve_worker_provider(&turn.model).ok()?;
+    let resolved = resolve_recorded_provider(&turn.provider, &turn.model).ok()?;
     (turn.provider == resolved.to_string()).then_some(turn)
 }
 
@@ -9296,7 +9321,7 @@ async fn spawn_arbiter_review(
         },
         None,
     )?;
-    let arbiter_kind = resolve_provider(&assignment.model)?;
+    let arbiter_kind = resolve_recorded_provider(&assignment.runner, &assignment.model)?;
     let view = match retain_cached_frozen_planner_view(config, coordinator, snapshot).await {
         Ok(view) => view,
         Err(error) => {
@@ -10308,7 +10333,7 @@ async fn tick_decomposition(
                 return Ok(false);
             }
         };
-        let planner_kind = resolve_provider(&assignment.model)?;
+        let planner_kind = resolve_recorded_provider(&assignment.runner, &assignment.model)?;
         // One attempt, one identity. This id is the run capability, the
         // `QUORUM_RUN_ID` the `submit_plan` tool authenticates with, the graph's
         // `planner_session_id` the endpoint resolver requires, the journalled
@@ -18146,10 +18171,17 @@ async fn tick(
     )
     .await;
     for &(i, idle, limit, awaiting_rereview) in idle_reviewers.iter().rev() {
+        let kind = between_turn_idle_kind(&reviewers[i]);
         let reason = if awaiting_rereview {
             format!(
                 "reviewer idle {idle}s awaiting sticky re-review (busy ceiling {limit}s) — \
                  zombie reaped; a fresh reviewer reviews the reworked head"
+            )
+        } else if kind == IdleReapKind::BusyCeiling {
+            format!(
+                "reviewer exceeded busy ceiling {limit}s ({idle}s after its last daemon-fed turn) \
+                 while its work was still running (outstanding work: {})",
+                outstanding_work_description(&reviewers[i])
             )
         } else {
             format!("reviewer idle {idle}s between turns (limit {limit}s) — zombie reaped")
@@ -18169,7 +18201,11 @@ async fn tick(
             continue;
         }
         let dead = reviewers.remove(i);
-        teardown_reviewer(config, wt_mgr, name_pool, dead, "idle").await;
+        let close_reason = match kind {
+            IdleReapKind::BusyCeiling if !awaiting_rereview => "busy_ceiling",
+            _ => "idle",
+        };
+        teardown_reviewer(config, wt_mgr, name_pool, dead, close_reason).await;
     }
 
     // ── Phase 4: Drain events from active workers ──────────────────────
@@ -18258,7 +18294,7 @@ async fn tick(
     // Phase-aware: workers whose task is already in-review or merging are
     // legitimately idle (awaiting review/merge) — release gracefully without
     // firing AgentFailed (#176).
-    let mut idle_workers: Vec<(usize, u64, u64)> = Vec::new();
+    let mut idle_workers: Vec<(usize, u64, u64, IdleReapKind)> = Vec::new();
     for (i, w) in workers.iter().enumerate() {
         if !slot_is_idle_zombie_candidate(w, idle_timeout, max_busy_idle_secs(&config.limits)) {
             continue;
@@ -18266,10 +18302,10 @@ async fn tick(
         if let Some((idle_secs, idle_limit)) =
             between_turn_idle(w, idle_timeout, max_busy_idle_secs(&config.limits))
         {
-            idle_workers.push((i, idle_secs, idle_limit));
+            idle_workers.push((i, idle_secs, idle_limit, between_turn_idle_kind(w)));
         }
     }
-    for &(i, idle_secs, idle_limit) in idle_workers.iter().rev() {
+    for &(i, idle_secs, idle_limit, kind) in idle_workers.iter().rev() {
         let task_id = workers[i].task_id;
 
         // Look up current task status to distinguish legitimate waits from zombies.
@@ -18304,8 +18340,10 @@ async fn tick(
                 cleanup_slot(config, wt_mgr, name_pool, dead, None, end_reason).await;
             }
             _ => {
-                reap_idle_zombie_worker(config, wt_mgr, name_pool, dead, idle_secs, idle_limit)
-                    .await;
+                reap_idle_zombie_worker(
+                    config, wt_mgr, name_pool, dead, idle_secs, idle_limit, kind,
+                )
+                .await;
             }
         }
     }
@@ -21098,10 +21136,7 @@ const MAX_UNFED_TURNS_PER_FED_TURN: u32 = 8;
 /// `max_task_wall_secs` still bound a provider that keeps itself busy.
 fn between_turn_idle(slot: &SlotState, idle_secs: u64, busy_idle_secs: u64) -> Option<(u64, u64)> {
     let fed_turn_ended = slot.turn_ended_at?;
-    let provider_active = matches!(
-        &slot.proc,
-        SlotProcess::Running(proc) if proc.has_outstanding_work() || proc.unfed_turn_open()
-    );
+    let provider_active = between_turn_idle_kind(slot) == IdleReapKind::BusyCeiling;
     let anchor = if provider_active {
         fed_turn_ended
     } else {
@@ -21113,6 +21148,84 @@ fn between_turn_idle(slot: &SlotState, idle_secs: u64, busy_idle_secs: u64) -> O
         effective_idle_secs(idle_secs, busy_idle_secs, provider_active),
     ))
 }
+
+/// Which between-turn ceiling [`between_turn_idle`] applies, and therefore why
+/// a slot past it is reaped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdleReapKind {
+    /// Plain idle ceiling: nothing outstanding and no self-continued turn
+    /// open. The worker is a zombie and the reap spends a recovery attempt.
+    Zombie,
+    /// Busy ceiling: tool/background work outstanding or a self-continued
+    /// turn open. The worker was alive; the bound on self-continuation from
+    /// the last daemon-fed turn stopped it.
+    BusyCeiling,
+}
+
+impl IdleReapKind {
+    fn end_reason(self) -> &'static str {
+        match self {
+            Self::Zombie => "idle_reaped",
+            Self::BusyCeiling => "busy_ceiling",
+        }
+    }
+}
+
+/// The single classification shared by the worker and reviewer between-turn
+/// watchdogs: the busy ceiling applies exactly while the provider is acting.
+fn between_turn_idle_kind(slot: &SlotState) -> IdleReapKind {
+    if matches!(
+        &slot.proc,
+        SlotProcess::Running(proc) if proc.has_outstanding_work() || proc.unfed_turn_open()
+    ) {
+        IdleReapKind::BusyCeiling
+    } else {
+        IdleReapKind::Zombie
+    }
+}
+
+/// Bounded description of what a busy slot was still doing.
+fn outstanding_work_description(slot: &SlotState) -> String {
+    match &slot.proc {
+        SlotProcess::Running(proc) => proc
+            .outstanding_work_summary()
+            .unwrap_or_else(|| "self-continued provider turn in progress".to_string()),
+        _ => "none reported".to_string(),
+    }
+}
+
+/// Watchdog log line and task-note failure cause for a between-turn reap.
+fn worker_idle_reap_text(
+    kind: IdleReapKind,
+    agent: &str,
+    task_id: i64,
+    idle_secs: u64,
+    limit_secs: u64,
+    outstanding: &str,
+) -> (String, String) {
+    match kind {
+        IdleReapKind::Zombie => (
+            format!(
+                "WATCHDOG: worker {agent} idle {idle_secs}s on task #{task_id} (limit {limit_secs}s) — killing zombie"
+            ),
+            format!("worker idle {idle_secs}s between turns (limit {limit_secs}s) — zombie reaped"),
+        ),
+        IdleReapKind::BusyCeiling => (
+            format!(
+                "WATCHDOG: worker {agent} exceeded busy ceiling {limit_secs}s on task #{task_id} (outstanding work: {outstanding})"
+            ),
+            format!(
+                "{BUSY_CEILING_CAUSE_MARKER}{limit_secs}s ({idle_secs}s after its last daemon-fed turn) \
+                 while its work was still running (outstanding work: {outstanding}); stopped at the \
+                 busy ceiling, not a dead worker"
+            ),
+        ),
+    }
+}
+
+/// Stable start of a busy-ceiling failure cause; the resume note finds the
+/// predecessor's cause by it.
+const BUSY_CEILING_CAUSE_MARKER: &str = "worker exceeded busy ceiling ";
 
 /// Refresh `last_provider_activity_at` after one normalized stdout line: a
 /// self-continued turn ended, or outstanding tool/background work went from
@@ -21868,6 +21981,10 @@ fn runner_continuation_identity(slot: &SlotState) -> std::io::Result<(&str, &str
         ));
     }
     let expected = slot.process_kind();
+    // An external slot's kind is its durable runner; the model is opaque.
+    if expected == runner::AgentKind::External {
+        return Ok((&slot.model, &slot.effort));
+    }
     match runner::AgentKind::for_model(&slot.model) {
         Ok(actual) if actual == expected => Ok((&slot.model, &slot.effort)),
         Ok(actual) => Err(std::io::Error::new(
@@ -22731,10 +22848,13 @@ async fn renew_active_worker_task_leases(db_path: &Path, workers: &[SlotState]) 
 /// operator-configured limit. Extracted so the production decision is
 /// testable: a regression that lets the watchdog kill a dormant awaiting-
 /// review slot must break the same predicate the tick loop consults.
-/// Reap a genuine idle-zombie worker (Phase 4-idle): fail its assignment and
-/// release the slot. The failure is sweep-aware, so a lease that lapsed while
-/// the worker idled is settled by the committed reap rather than a rejected
-/// second `AgentFailed`.
+/// Reap a worker past its between-turn ceiling (Phase 4-idle): fail its
+/// assignment and release the slot. The failure is sweep-aware, so a lease
+/// that lapsed while the worker idled is settled by the committed reap rather
+/// than a rejected second `AgentFailed`. A plain-idle zombie spends a recovery
+/// attempt; a busy-ceiling reap does not while the task's busy-ceiling wall
+/// stays within `max_task_wall_secs` (see
+/// `tasks::fail_worker_assignment_at_busy_ceiling`).
 async fn reap_idle_zombie_worker(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -22742,6 +22862,7 @@ async fn reap_idle_zombie_worker(
     dead: SlotState,
     idle_secs: u64,
     idle_timeout: u64,
+    kind: IdleReapKind,
 ) {
     // A reaction committed after the last mailbox snapshot is still honored.
     if park_worker_on_reaction(&config.db_path, &dead).await
@@ -22754,18 +22875,48 @@ async fn reap_idle_zombie_worker(
         cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
         return;
     }
-    log(&format!(
-        "WATCHDOG: worker {} idle {}s on task #{} (limit {}s) — killing zombie",
-        dead.agent_name, idle_secs, dead.task_id, idle_timeout
-    ));
-    fail_worker_assignment_settled(
-        &config.db_path,
+    let (line, reason) = worker_idle_reap_text(
+        kind,
         &dead.agent_name,
         dead.task_id,
-        &format!("worker idle {idle_secs}s between turns (limit {idle_timeout}s) — zombie reaped"),
-    )
-    .await;
-    cleanup_slot(config, wt_mgr, name_pool, dead, None, "idle_reaped").await;
+        idle_secs,
+        idle_timeout,
+        &outstanding_work_description(&dead),
+    );
+    log(&line);
+    match kind {
+        IdleReapKind::Zombie => {
+            fail_worker_assignment_settled(
+                &config.db_path,
+                &dead.agent_name,
+                dead.task_id,
+                &reason,
+            )
+            .await;
+        }
+        IdleReapKind::BusyCeiling => {
+            let charge = WorkerFailureCharge::BusyCeiling {
+                slot_wall_secs: dead.task_started_at.elapsed().as_secs(),
+                max_task_wall_secs: config.limits.max_task_wall_secs,
+            };
+            if let Some(tasks::WorkerFailureOutcome::Applied(transition)) =
+                fail_worker_assignment_with(
+                    &config.db_path,
+                    &dead.agent_name,
+                    dead.task_id,
+                    &reason,
+                    charge,
+                )
+                .await
+            {
+                log(&format!(
+                    "busy-ceiling reap of {} on task #{}: recovery_attempts now {}",
+                    dead.agent_name, dead.task_id, transition.task.recovery_attempts
+                ));
+            }
+        }
+    }
+    cleanup_slot(config, wt_mgr, name_pool, dead, None, kind.end_reason()).await;
 }
 
 /// Phase 4-react: park every live persistent worker whose turn ended on a
@@ -22962,6 +23113,13 @@ async fn idle_reviewer_reap_candidates(
                  exceeded the busy ceiling ({limit}s) — reaping; the fresh-reviewer path \
                  reviews the reworked head",
                 r.agent_name, r.task_id
+            ));
+        } else if between_turn_idle_kind(r) == IdleReapKind::BusyCeiling {
+            log(&format!(
+                "WATCHDOG: reviewer {} exceeded busy ceiling {limit}s on task #{} (outstanding work: {})",
+                r.agent_name,
+                r.task_id,
+                outstanding_work_description(r)
             ));
         } else {
             log(&format!(
@@ -25243,7 +25401,7 @@ async fn provision_reviewer_reserved(
     )?;
     let reviewer_model = assignment.model.clone();
     let reviewer_effort = assignment.effort.clone();
-    let reviewer_kind = resolve_provider(&reviewer_model)?;
+    let reviewer_kind = resolve_recorded_provider(&assignment.runner, &reviewer_model)?;
     let reviewer_runner = resolve_profile_runner(&assignment.runner)?;
     let reviewer_continuation_id = recovery
         .as_ref()
@@ -28115,7 +28273,7 @@ async fn spawn_admitted_worker(
         prompt_text.push_str(context);
     }
 
-    let resolved_kind = match resolve_worker_provider(&resolved_model) {
+    let resolved_kind = match resolve_recorded_provider(&assignment.runner, &resolved_model) {
         Ok(kind) => kind,
         Err(error) => {
             refuse_launch!(format!(
@@ -29804,39 +29962,42 @@ async fn activate_reviewer_fallback(
         fallback::FallbackInstallOutcome::Installed(intent) => intent,
     };
 
-    let alternate_kind =
-        match resolve_managed_provider(&intent.pending_turn.model, "reviewer fallback") {
-            Ok(kind) if kind.to_string() == intent.pending_turn.provider => kind,
-            Ok(kind) => {
-                let error = format!(
-                    "fallback intent provider '{}' does not match model '{}' resolved as '{kind}'",
-                    intent.pending_turn.provider, intent.pending_turn.model
-                );
-                return settle_failed_reviewer_fallback(
-                    config,
-                    slot,
-                    &intent.capability_run_id,
-                    &session_id,
-                    &intent.worktree,
-                    &intent.pending_turn.provider,
-                    &error,
-                )
-                .await;
-            }
-            Err(error) => {
-                let reason = format!("reviewer fallback route is not executable: {error}");
-                return settle_failed_reviewer_fallback(
-                    config,
-                    slot,
-                    &intent.capability_run_id,
-                    &session_id,
-                    &intent.worktree,
-                    &intent.pending_turn.provider,
-                    &reason,
-                )
-                .await;
-            }
-        };
+    let alternate_kind = match resolve_recorded_managed_provider(
+        &intent.pending_turn.provider,
+        &intent.pending_turn.model,
+        "reviewer fallback",
+    ) {
+        Ok(kind) if kind.to_string() == intent.pending_turn.provider => kind,
+        Ok(kind) => {
+            let error = format!(
+                "fallback intent provider '{}' does not match model '{}' resolved as '{kind}'",
+                intent.pending_turn.provider, intent.pending_turn.model
+            );
+            return settle_failed_reviewer_fallback(
+                config,
+                slot,
+                &intent.capability_run_id,
+                &session_id,
+                &intent.worktree,
+                &intent.pending_turn.provider,
+                &error,
+            )
+            .await;
+        }
+        Err(error) => {
+            let reason = format!("reviewer fallback route is not executable: {error}");
+            return settle_failed_reviewer_fallback(
+                config,
+                slot,
+                &intent.capability_run_id,
+                &session_id,
+                &intent.worktree,
+                &intent.pending_turn.provider,
+                &reason,
+            )
+            .await;
+        }
+    };
     // The selected alternate may itself be cooling down. Retire it as a
     // classified profile-unavailable launch without contacting the provider;
     // each skip adds one durable profile exclusion, so this walk is bounded by
@@ -30514,7 +30675,10 @@ async fn activate_worker_fallback_with(
         continuation_id: None,
         requested: intent.pending_turn.requested,
     };
-    let alternate_kind = match resolve_worker_provider(&intent.pending_turn.model) {
+    let alternate_kind = match resolve_recorded_provider(
+        &intent.pending_turn.provider,
+        &intent.pending_turn.model,
+    ) {
         Ok(kind) if kind.to_string() == intent.pending_turn.provider => kind,
         Ok(kind) => {
             let reason = format!(
@@ -30783,7 +30947,11 @@ async fn resume_pending_fallbacks(
         let intent = recovery.intent;
         let entry = recovery.entry;
         let agent_name = recovery.agent;
-        let kind = resolve_managed_provider(&intent.pending_turn.model, "fallback recovery")?;
+        let kind = resolve_recorded_managed_provider(
+            &intent.pending_turn.provider,
+            &intent.pending_turn.model,
+            "fallback recovery",
+        )?;
         if kind.to_string() != intent.pending_turn.provider {
             return Err(QuorumError::Io(format!(
                 "fallback recovery provider '{}' does not match model '{}'",
@@ -31535,12 +31703,60 @@ async fn fail_worker_assignment(
     task_id: i64,
     reason: &str,
 ) -> Option<tasks::WorkerFailureOutcome> {
+    fail_worker_assignment_with(
+        db_path,
+        agent,
+        task_id,
+        reason,
+        WorkerFailureCharge::Charged,
+    )
+    .await
+}
+
+/// How a worker failure is charged against the task's recovery budget.
+#[derive(Clone, Copy, Debug)]
+enum WorkerFailureCharge {
+    Charged,
+    /// Busy-ceiling reap: waived while within the task's wall ceiling.
+    BusyCeiling {
+        slot_wall_secs: u64,
+        max_task_wall_secs: Option<u64>,
+    },
+}
+
+async fn fail_worker_assignment_with(
+    db_path: &Path,
+    agent: &str,
+    task_id: i64,
+    reason: &str,
+    charge: WorkerFailureCharge,
+) -> Option<tasks::WorkerFailureOutcome> {
     let p = db_path.to_path_buf();
     let actor = agent.to_string();
     let failure_reason = reason.to_string();
     let result = tokio::task::spawn_blocking(move || {
         let mut conn = quorum_core::db::open(&p)?;
-        tasks::fail_worker_assignment(&mut conn, &actor, task_id, &failure_reason, now_unix())
+        match charge {
+            WorkerFailureCharge::Charged => tasks::fail_worker_assignment(
+                &mut conn,
+                &actor,
+                task_id,
+                &failure_reason,
+                now_unix(),
+            ),
+            WorkerFailureCharge::BusyCeiling {
+                slot_wall_secs,
+                max_task_wall_secs,
+            } => tasks::fail_worker_assignment_at_busy_ceiling(
+                &mut conn,
+                &actor,
+                task_id,
+                &failure_reason,
+                slot_wall_secs,
+                max_task_wall_secs,
+                now_unix(),
+            ),
+        }
     })
     .await;
     let event_debug = format!(
@@ -33264,7 +33480,7 @@ async fn spawn_remediation_worker(
             None => {
                 let assignment =
                     fresh_assignment.expect("workerless remediation has a fresh assignment");
-                resolve_worker_provider(&assignment.model).and_then(|kind| {
+                resolve_recorded_provider(&assignment.runner, &assignment.model).and_then(|kind| {
                     let runner = resolve_profile_runner(&assignment.runner)?;
                     Ok((
                         assignment.model.clone(),
@@ -44918,6 +45134,68 @@ mod tests {
         idle.kill_and_reap().await;
     }
 
+    /// Incident #476: the busy ceiling and the plain idle ceiling are distinct
+    /// reap reasons with distinct end reasons and wording.
+    #[tokio::test]
+    async fn idle_reap_classification_distinguishes_busy_ceiling_from_zombie() {
+        let dir = tempfile::tempdir().unwrap();
+        let started =
+            fixture_prefix_through(CLAUDE_BETWEEN_TURNS_FIXTURE, "system", Some("task_started"));
+        let mut lines: Vec<&str> = started.iter().map(String::as_str).collect();
+        lines.push(r#"{"type":"result","result":"started"}"#);
+        let mut busy = claude_replay_slot(dir.path(), &lines, "sleep 5");
+        run_turn_then_observe_between_turns(&mut busy, dir.path()).await;
+        assert_eq!(between_turn_idle_kind(&busy), IdleReapKind::BusyCeiling);
+        assert_eq!(IdleReapKind::BusyCeiling.end_reason(), "busy_ceiling");
+        let outstanding = outstanding_work_description(&busy);
+        assert_eq!(outstanding, "background Bash: sleep 10 && echo bg-done2");
+        let (line, reason) = worker_idle_reap_text(
+            IdleReapKind::BusyCeiling,
+            "Cleat",
+            476,
+            3601,
+            3600,
+            &outstanding,
+        );
+        assert_eq!(
+            line,
+            "WATCHDOG: worker Cleat exceeded busy ceiling 3600s on task #476 \
+             (outstanding work: background Bash: sleep 10 && echo bg-done2)"
+        );
+        assert!(reason.starts_with(BUSY_CEILING_CAUSE_MARKER), "{reason}");
+        assert!(
+            reason.contains("3601s after its last daemon-fed turn"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("Bash: sleep 10 && echo bg-done2"),
+            "{reason}"
+        );
+        assert!(
+            !line.contains("zombie") && !reason.contains("zombie"),
+            "{reason}"
+        );
+        busy.kill_and_reap().await;
+
+        let idle = make_dummy_slot_async().await;
+        assert_eq!(between_turn_idle_kind(&idle), IdleReapKind::Zombie);
+        assert_eq!(IdleReapKind::Zombie.end_reason(), "idle_reaped");
+        let (line, reason) = worker_idle_reap_text(
+            IdleReapKind::Zombie,
+            "Cleat",
+            476,
+            901,
+            900,
+            &outstanding_work_description(&idle),
+        );
+        assert!(line.ends_with("— killing zombie"), "{line}");
+        assert_eq!(
+            reason,
+            "worker idle 901s between turns (limit 900s) — zombie reaped"
+        );
+        idle.kill_and_reap().await;
+    }
+
     /// boostmyagents #841: the fed turn ends with a background task running;
     /// it finishes more than `max_idle_secs` later. The worker must get the
     /// full idle window to react to the completion, not be reaped at once.
@@ -50356,6 +50634,74 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 .contains("refusing provider migration"),
             "a runner must never continue through a different provider adapter"
         );
+    }
+
+    /// The routed collector's primary binary comes from the profile's runner,
+    /// not its model: a model string is not a runner name, and resolving it
+    /// as one silently dropped the configured binary (falling back to PATH).
+    #[cfg(unix)]
+    #[test]
+    fn routed_collector_request_uses_the_profile_runner_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = launch_test_repo(dir.path());
+        let (runner, _) = retry_test_claude_runner(dir.path());
+        let config = claude_only_retry_test_config(dir.path(), &repo, &runner);
+        let task_id = seed_retry_test_task(&config, "in-review", serde_json::json!(null));
+
+        let request = routed_collector_request(&config, 77, task_id, None, 0).unwrap();
+
+        let expected = config.agent_bin.clone();
+        assert!(expected.is_some());
+        assert_eq!(request.agent_bin, expected);
+        assert_eq!(request.collector_runner, "claude");
+        let routing = request.routing.as_ref().unwrap();
+        assert_eq!(
+            routing.agent_bins.get("c-claude").cloned().flatten(),
+            expected
+        );
+    }
+
+    #[test]
+    fn external_runner_kind_comes_from_durable_record_not_model() {
+        // "gpt-5" maps to Codex through for_model; an external record must
+        // resolve External regardless.
+        assert_eq!(
+            resolve_recorded_provider("external", "gpt-5").unwrap(),
+            runner::AgentKind::External
+        );
+        assert_eq!(
+            resolve_recorded_managed_provider("external", "gpt-5", "reviewer recovery").unwrap(),
+            runner::AgentKind::External
+        );
+        assert_eq!(
+            resolve_original_remediation_provider(Some("external"), "gpt-5").unwrap(),
+            runner::AgentKind::External
+        );
+        // Built-in records keep the model-derived kind and its mismatch check.
+        assert_eq!(
+            resolve_recorded_provider("codex", "gpt-5").unwrap(),
+            runner::AgentKind::Codex
+        );
+        assert_eq!(
+            resolve_recorded_provider("claude", "gpt-5").unwrap(),
+            runner::AgentKind::Codex
+        );
+        assert!(resolve_recorded_provider("claude", "unknown-model").is_err());
+        assert!(resolve_original_remediation_provider(Some("claude"), "gpt-5").is_err());
+        assert!(
+            resolve_recorded_managed_provider("grok", "grok-4.5", "reviewer recovery").is_err()
+        );
+
+        let mut slot = make_dummy_slot();
+        slot.proc =
+            SlotProcess::dormant(runner::AgentKind::External, Some("external-session")).unwrap();
+        slot.model = "gpt-5".into();
+        assert_eq!(
+            runner_continuation_identity(&slot).unwrap(),
+            ("gpt-5", "high")
+        );
+        let entry = slot_journal_entry(&slot, "worker", "working");
+        assert_eq!(entry.provider.as_deref(), Some("external"));
     }
 
     #[test]
@@ -64614,7 +64960,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let mut name_pool = Pool::new_generated();
         let slot = drain_test_slot(DRAIN_AUTHOR, 1, worktree, DRAIN_AUTHOR_CAP, None).await;
 
-        reap_idle_zombie_worker(&config, &wt_mgr, &mut name_pool, slot, 900, 600).await;
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            slot,
+            900,
+            600,
+            IdleReapKind::Zombie,
+        )
+        .await;
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         let task = tasks::get(&conn, 1).unwrap().unwrap();
@@ -64649,7 +65004,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let mut name_pool = Pool::new_generated();
         let slot = drain_test_slot(DRAIN_AUTHOR, 1, worktree, DRAIN_AUTHOR_CAP, None).await;
 
-        reap_idle_zombie_worker(&config, &wt_mgr, &mut name_pool, slot, 900, 600).await;
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            slot,
+            900,
+            600,
+            IdleReapKind::Zombie,
+        )
+        .await;
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         let task = tasks::get(&conn, 1).unwrap().unwrap();
@@ -64838,7 +65202,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             append_worker_reaction_row(&db_path, state, "which config should I use?");
             assert!(slot_is_idle_zombie_candidate(&slot, 900, 3600), "{state}");
 
-            reap_idle_zombie_worker(&config, &wt_mgr, &mut name_pool, slot, 901, 900).await;
+            reap_idle_zombie_worker(
+                &config,
+                &wt_mgr,
+                &mut name_pool,
+                slot,
+                901,
+                900,
+                IdleReapKind::Zombie,
+            )
+            .await;
 
             assert_parked_without_recovery(&db_path, run_id, state);
         }
@@ -64874,7 +65247,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             let mut slot = workers.remove(0);
             slot.turn_ended_at =
                 Some(std::time::Instant::now() - std::time::Duration::from_secs(901));
-            reap_idle_zombie_worker(&config, &wt_mgr, &mut name_pool, slot, 901, 900).await;
+            reap_idle_zombie_worker(
+                &config,
+                &wt_mgr,
+                &mut name_pool,
+                slot,
+                901,
+                900,
+                IdleReapKind::Zombie,
+            )
+            .await;
 
             let conn = quorum_core::db::open(&db_path).unwrap();
             let task = tasks::get(&conn, 1).unwrap().unwrap();
@@ -75136,6 +75518,302 @@ exec /bin/cat '{stdout}'
         workers.remove(0)
     }
 
+    #[cfg(unix)]
+    fn task_recovery_state(db_path: &Path, task_id: i64) -> (String, i64) {
+        let conn = quorum_core::db::open(db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        (task.status, task.recovery_attempts)
+    }
+
+    #[cfg(unix)]
+    fn daemon_notes(db_path: &Path, task_id: i64) -> Vec<String> {
+        let conn = quorum_core::db::open(db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT body FROM task_notes WHERE task_id=?1 AND agent='daemon' ORDER BY id")
+            .unwrap();
+        stmt.query_map([task_id], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// Incident #476: a live worker whose background verification outlives
+    /// the busy ceiling is reaped as `busy_ceiling`, spends no recovery
+    /// attempt, and its successor is told why and what to do differently.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn busy_ceiling_reap_spends_no_recovery_attempt_and_explains_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = recover_fixture_repo(dir.path());
+        let db_path = dir.path().join("quorum.db");
+        let task_id = recover_fixture_task(&db_path);
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo.clone());
+        config.worktree_base = dir.path().join("worktrees");
+        config.limits.max_task_wall_secs = Some(14_400);
+        // The worker starts a background Bash command, ends its fed turn,
+        // and keeps the child alive.
+        let started =
+            fixture_prefix_through(CLAUDE_BETWEEN_TURNS_FIXTURE, "system", Some("task_started"));
+        let replay = dir.path().join("busy.jsonl");
+        std::fs::write(
+            &replay,
+            format!(
+                "{}\n{{\"type\":\"result\",\"result\":\"started\"}}\n",
+                started.join("\n")
+            ),
+        )
+        .unwrap();
+        config.agent_bin = Some(
+            write_fake_gh_script(
+                dir.path(),
+                "busy-worker",
+                &format!(
+                    "#!/bin/sh\ncat '{}'\nwhile IFS= read -r _; do :; done\n",
+                    replay.display()
+                ),
+            )
+            .to_string_lossy()
+            .into_owned(),
+        );
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+
+        let mut first = recover_spawn(&config, &wt_mgr, &mut names).await;
+        std::fs::write(first.worktree_path.join("state.txt"), "half-verified\n").unwrap();
+        for _ in 0..200 {
+            drain_events(&mut first, &db_path, "worker", &config.limits)
+                .await
+                .unwrap();
+            if !first.draining {
+                break;
+            }
+        }
+        assert!(!first.draining, "the fed turn ends");
+        assert!(first.has_outstanding_provider_work());
+        first.turn_ended_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(3601));
+        assert!(slot_is_idle_zombie_candidate(&first, 900, 3600));
+        let (idle_secs, limit) = between_turn_idle(&first, 900, 3600).unwrap();
+        assert_eq!(limit, 3600, "the busy ceiling was selected");
+        let kind = between_turn_idle_kind(&first);
+        assert_eq!(kind, IdleReapKind::BusyCeiling);
+
+        reap_idle_zombie_worker(&config, &wt_mgr, &mut names, first, idle_secs, limit, kind).await;
+
+        assert_eq!(
+            task_recovery_state(&db_path, task_id),
+            ("open".to_string(), 0),
+            "a busy-ceiling reap within the task wall spends no recovery attempt"
+        );
+        let refs = recover_refs_for(&repo, task_id);
+        assert_eq!(refs.len(), 1, "work preservation is unchanged: {refs:?}");
+        assert!(refs[0].0.ends_with("/busy_ceiling"), "{}", refs[0].0);
+        let notes = daemon_notes(&db_path, task_id);
+        let reap_note = notes
+            .iter()
+            .find(|n| n.starts_with(tasks::BUSY_CEILING_NOTE_PREFIX))
+            .unwrap_or_else(|| panic!("{notes:?}"));
+        assert!(
+            reap_note.contains("exceeded busy ceiling 3600s"),
+            "{reap_note}"
+        );
+        assert!(!reap_note.contains("zombie"), "{reap_note}");
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let end_reason: String = conn
+                .query_row(
+                    "SELECT end_reason FROM agent_runs WHERE task_id=?1 ORDER BY rowid DESC LIMIT 1",
+                    [task_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(end_reason, "busy_ceiling");
+        }
+
+        config.agent_bin = Some(
+            fake_stdin_holding_agent(dir.path(), "hold-worker")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let second = recover_spawn(&config, &wt_mgr, &mut names).await;
+        assert_eq!(
+            std::fs::read_to_string(second.worktree_path.join("state.txt")).unwrap(),
+            "half-verified\n",
+            "resume-from-ref is unchanged"
+        );
+        let notes = daemon_notes(&db_path, task_id);
+        let resume = notes
+            .iter()
+            .find(|n| n.contains("resumed from"))
+            .unwrap_or_else(|| panic!("{notes:?}"));
+        assert!(
+            resume.contains(
+                "stopped at the busy ceiling while its background work was still running"
+            ),
+            "{resume}"
+        );
+        assert!(
+            resume.contains("Bash: sleep 10 && echo bg-done2"),
+            "{resume}"
+        );
+        assert!(resume.contains(&format!("{idle_secs}s after its last daemon-fed turn")));
+        assert!(resume.contains("once in the foreground"), "{resume}");
+        second.kill_and_reap().await;
+    }
+
+    /// A plain idle zombie still spends a recovery attempt and still fails
+    /// the task once the budget is exhausted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plain_idle_zombie_reap_still_spends_recovery_and_fails_when_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = recover_fixture_repo(dir.path());
+        let db_path = dir.path().join("quorum.db");
+        let task_id = recover_fixture_task(&db_path);
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo);
+        config.worktree_base = dir.path().join("worktrees");
+        config.limits.max_task_wall_secs = Some(14_400);
+        config.agent_bin = Some(
+            fake_stdin_holding_agent(dir.path(), "hold-worker")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+
+        let first = recover_spawn(&config, &wt_mgr, &mut names).await;
+        assert_eq!(between_turn_idle_kind(&first), IdleReapKind::Zombie);
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            first,
+            901,
+            900,
+            IdleReapKind::Zombie,
+        )
+        .await;
+        assert_eq!(
+            task_recovery_state(&db_path, task_id),
+            ("open".to_string(), 1)
+        );
+
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET recovery_attempts=?2 WHERE id=?1",
+                rusqlite::params![task_id, tasks::MAX_RECOVERY_ATTEMPTS],
+            )
+            .unwrap();
+        }
+        let last = recover_spawn(&config, &wt_mgr, &mut names).await;
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            last,
+            901,
+            900,
+            IdleReapKind::Zombie,
+        )
+        .await;
+        assert_eq!(task_recovery_state(&db_path, task_id).0, "failed");
+    }
+
+    /// The task wall ceiling still bounds busy-ceiling reaps: once their
+    /// cumulative slot time passes `max_task_wall_secs`, each reap is charged
+    /// and the exhausted budget fails the task.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wall_ceiling_exhaustion_fails_task_even_when_every_reap_is_busy_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = recover_fixture_repo(dir.path());
+        let db_path = dir.path().join("quorum.db");
+        let task_id = recover_fixture_task(&db_path);
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo);
+        config.worktree_base = dir.path().join("worktrees");
+        config.limits.max_task_wall_secs = Some(5000);
+        config.agent_bin = Some(
+            fake_stdin_holding_agent(dir.path(), "hold-worker")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let reap_busy = |mut slot: SlotState| {
+            slot.task_started_at = std::time::Instant::now() - std::time::Duration::from_secs(3700);
+            slot
+        };
+
+        let first = reap_busy(recover_spawn(&config, &wt_mgr, &mut names).await);
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            first,
+            3601,
+            3600,
+            IdleReapKind::BusyCeiling,
+        )
+        .await;
+        assert_eq!(
+            task_recovery_state(&db_path, task_id),
+            ("open".to_string(), 0),
+            "3700s of 5000s: within the wall"
+        );
+
+        let second = reap_busy(recover_spawn(&config, &wt_mgr, &mut names).await);
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            second,
+            3601,
+            3600,
+            IdleReapKind::BusyCeiling,
+        )
+        .await;
+        assert_eq!(
+            task_recovery_state(&db_path, task_id),
+            ("open".to_string(), 1),
+            "7400s of 5000s: past the wall, the reap is charged"
+        );
+
+        for _ in 1..tasks::MAX_RECOVERY_ATTEMPTS {
+            let next = reap_busy(recover_spawn(&config, &wt_mgr, &mut names).await);
+            reap_idle_zombie_worker(
+                &config,
+                &wt_mgr,
+                &mut names,
+                next,
+                3601,
+                3600,
+                IdleReapKind::BusyCeiling,
+            )
+            .await;
+        }
+        assert_eq!(
+            task_recovery_state(&db_path, task_id),
+            ("open".to_string(), tasks::MAX_RECOVERY_ATTEMPTS)
+        );
+        let last = reap_busy(recover_spawn(&config, &wt_mgr, &mut names).await);
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            last,
+            3601,
+            3600,
+            IdleReapKind::BusyCeiling,
+        )
+        .await;
+        assert_eq!(
+            task_recovery_state(&db_path, task_id).0,
+            "failed",
+            "the wall ceiling remains the bound that fails the task"
+        );
+    }
+
     /// Incident 412/422: an idle-reaped worker's finished but uncommitted
     /// (and committed-but-unpushed) code must survive teardown and seed the
     /// next worker for the same task.
@@ -75166,7 +75844,16 @@ exec /bin/cat '{stdout}'
         std::fs::write(wt.join("state.txt"), "finished\n").unwrap();
         std::fs::write(wt.join("new_module.rs"), "pub fn done() {}\n").unwrap();
 
-        reap_idle_zombie_worker(&config, &wt_mgr, &mut names, first, 999, 10).await;
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            first,
+            999,
+            10,
+            IdleReapKind::Zombie,
+        )
+        .await;
 
         assert!(!wt.exists(), "reap still releases the checkout");
         assert!(
@@ -75274,7 +75961,16 @@ exec /bin/cat '{stdout}'
         let first = recover_spawn(&config, &wt_mgr, &mut names).await;
         let wt = first.worktree_path.clone();
         std::fs::write(wt.join("state.txt"), "precious\n").unwrap();
-        reap_idle_zombie_worker(&config, &wt_mgr, &mut names, first, 999, 10).await;
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            first,
+            999,
+            10,
+            IdleReapKind::Zombie,
+        )
+        .await;
         let refs = recover_refs_for(&repo, task_id);
         assert_eq!(refs.len(), 1, "{refs:?}");
         assert!(!wt.exists());
@@ -75342,7 +76038,16 @@ exec /bin/cat '{stdout}'
         let branch = first.branch.clone();
         std::fs::write(wt.join("state.txt"), "precious\n").unwrap();
 
-        reap_idle_zombie_worker(&config, &failing, &mut names, first, 999, 10).await;
+        reap_idle_zombie_worker(
+            &config,
+            &failing,
+            &mut names,
+            first,
+            999,
+            10,
+            IdleReapKind::Zombie,
+        )
+        .await;
 
         assert!(wt.exists(), "a failed snapshot must not force-remove");
         assert_eq!(
@@ -75682,7 +76387,16 @@ exec /bin/cat '{stdout}'
         // First run records the allocation, then is reaped with no work.
         let first = recover_spawn(&config, &wt_mgr, &mut names).await;
         let wt = first.worktree_path.clone();
-        reap_idle_zombie_worker(&config, &wt_mgr, &mut names, first, 999, 10).await;
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            first,
+            999,
+            10,
+            IdleReapKind::Zombie,
+        )
+        .await;
         assert!(!wt.exists());
         assert!(recover_refs_for(&repo, task_id).is_empty());
 
@@ -75811,9 +76525,14 @@ exec /bin/cat '{stdout}'
             std::fs::read_to_string(wt2.join("state.txt")).unwrap(),
             "base edit\n"
         );
-        let note =
-            worker_recover::recover_resume_note("Forge", "PR head", &resume, restored.as_ref())
-                .unwrap();
+        let note = worker_recover::recover_resume_note(
+            "Forge",
+            "PR head",
+            &resume,
+            restored.as_ref(),
+            None,
+        )
+        .unwrap();
         assert!(note.contains("FAILED"), "{note}");
         assert!(note.contains(&snap.refname), "{note}");
     }
@@ -75840,7 +76559,16 @@ exec /bin/cat '{stdout}'
 
         let first = recover_spawn(&config, &wt_mgr, &mut names).await;
         std::fs::write(first.worktree_path.join("state.txt"), "old attempt\n").unwrap();
-        reap_idle_zombie_worker(&config, &wt_mgr, &mut names, first, 999, 10).await;
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            first,
+            999,
+            10,
+            IdleReapKind::Zombie,
+        )
+        .await;
         assert_eq!(recover_refs_for(&repo, task_id).len(), 1);
         {
             let conn = quorum_core::db::open(&db_path).unwrap();

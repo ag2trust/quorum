@@ -2824,6 +2824,7 @@ const ABNORMAL_RUNNER_ENDINGS: &[&str] = &[
     "crashed",
     "agent_failed",
     "idle_reaped",
+    "busy_ceiling",
     "idle",
     "killed",
     "provider_blocked",

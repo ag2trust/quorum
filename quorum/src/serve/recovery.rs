@@ -201,6 +201,9 @@ fn validate_dormant_recovery(
         "codex" => super::runner::AgentKind::Codex,
         "claude" => super::runner::AgentKind::Claude,
         "grok" => super::runner::AgentKind::Grok,
+        // The journal provider is the durable record of an external run's
+        // runner; its model string is opaque and never resolved.
+        "external" => super::runner::AgentKind::External,
         other => return Err(invalid(format!("unknown provider '{other}'"))),
     };
     if provider.turn_mode() != super::runner::TurnMode::RespawnPerTurn {
@@ -360,7 +363,7 @@ fn validate_dormant_recovery(
     if run.provider.as_deref() != Some(provider_name) {
         return Err(invalid("worker run provider mismatch".into()));
     }
-    let model_provider = super::resolve_worker_provider(&run.model)
+    let model_provider = super::resolve_recorded_provider(provider_name, &run.model)
         .map_err(|error| invalid(format!("worker run model is invalid: {error}")))?;
     if model_provider != provider {
         return Err(invalid("worker run model/provider mismatch".into()));
@@ -511,8 +514,9 @@ fn recovered_limit_tokens(
         let input = match usage_run.provider.as_str() {
             // Claude and Codex report cache writes outside input_tokens.
             "claude" | "codex" => uncached.saturating_add(cached),
-            // Grok's normalized raw input includes cache creation tokens.
-            "grok" => uncached.saturating_add(cached).saturating_add(cache_write),
+            // Grok's normalized raw input includes cache creation tokens, and
+            // the external runner's input is the sum of all three by contract.
+            "grok" | "external" => uncached.saturating_add(cached).saturating_add(cache_write),
             provider => {
                 return Err(dormant_recovery_error(
                     agent,
@@ -2020,6 +2024,75 @@ mod tests {
         );
         assert_eq!(worker.model, "grok-4.5");
         assert_eq!(worker.effort, "high");
+    }
+
+    #[tokio::test]
+    async fn restart_reconstructs_external_worker_from_durable_provider_not_model() {
+        // "gpt-5" resolves to Codex through the built-in model mapping, so a
+        // recovery that consulted it would refuse this external record as a
+        // model/provider mismatch.
+        let fixture = dormant_fixture();
+        {
+            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+            let task = tasks::get(&conn, fixture.task_id).unwrap().unwrap();
+            let mut refs: serde_json::Value =
+                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+            runner_state::set_continuation(
+                &mut refs,
+                ContinuationSlot::Worker,
+                &runner_state::ContinuationIdentity {
+                    provider: "external".into(),
+                    id: "external-session".into(),
+                },
+            );
+            tasks::update_refs_daemon(
+                &mut conn,
+                fixture.task_id,
+                &refs.to_string(),
+                super::super::now_unix(),
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE agent_runs SET model='gpt-5',effort='deep',provider='external' \
+                 WHERE task_id=?1 AND role='worker'",
+                [fixture.task_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE journal SET provider='external',continuation_id='external-session' \
+                 WHERE task_id=?1 AND role='worker'",
+                [fixture.task_id],
+            )
+            .unwrap();
+        }
+
+        let wt_mgr = WorktreeManager::new();
+        let mut names = super::super::names::Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut roster = LifetimeRoster::new();
+        recover(
+            &fixture.config,
+            &wt_mgr,
+            &mut names,
+            &mut workers,
+            &mut roster,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(workers.len(), 1);
+        let worker = &workers[0];
+        assert_eq!(
+            worker.process_kind(),
+            super::super::runner::AgentKind::External
+        );
+        assert_eq!(
+            worker.continuation_id_for_launch(),
+            Some("external-session")
+        );
+        assert_eq!(worker.model, "gpt-5");
+        let entry = super::super::slot_journal_entry(worker, "worker", "working");
+        assert_eq!(entry.provider.as_deref(), Some("external"));
     }
 
     #[tokio::test]
