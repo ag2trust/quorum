@@ -904,7 +904,6 @@ impl GhMergeExecutor {
     /// raw `-f` strings; without one, `-F` expands gh's `{owner}`/`{repo}`
     /// placeholders from `repo_dir`. The token is fetched first, so a source
     /// failure spawns nothing.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn identity_probe_cmd(
         &self,
         pr: i64,
@@ -939,7 +938,6 @@ impl GhMergeExecutor {
     /// identity authored the PR. `None` (never one-identity) on credential
     /// failure, gh failure, or any malformed/partial response; each failure
     /// is logged.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn probe_pr_identity(&self, pr: i64, repo_dir: &Path) -> Option<PrIdentity> {
         let mut cmd = match self.identity_probe_cmd(pr, repo_dir) {
             Ok(cmd) => cmd,
@@ -972,7 +970,6 @@ impl GhMergeExecutor {
     /// Fresh `reviewDecision` read (`gh pr view <n> --json reviewDecision`).
     /// `None` on credential/gh failure or a malformed response; `Some("")`
     /// when GitHub reports no decision.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn live_review_decision(&self, pr: i64, repo_dir: &Path) -> Option<String> {
         let pr_str = pr.to_string();
         let mut cmd = match self.build_gh_cmd(
@@ -994,6 +991,12 @@ impl GhMergeExecutor {
             return None;
         }
         parse_review_decision(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    /// True only when a fresh `reviewDecision` read is `REVIEW_REQUIRED`; a
+    /// failed read or any other decision leaves today's merge path in charge.
+    fn review_required(&self, pr: i64, repo_dir: &Path) -> bool {
+        self.live_review_decision(pr, repo_dir).as_deref() == Some("REVIEW_REQUIRED")
     }
 
     fn verify_pr_merged(&self, pr: i64, repo_dir: &Path) -> bool {
@@ -1277,6 +1280,20 @@ fn merge_branch_metadata(
     })
 }
 
+/// One-identity park reason: branch protection needs a person's approval the
+/// merge identity (the PR author) cannot give.
+fn self_approval_required(pr: i64, head_sha: &str) -> MergeResult {
+    MergeResult {
+        success: false,
+        message: format!(
+            "PR #{pr}: branch protection requires an approving review from someone \
+             other than the pull request author; the merge identity authored this PR \
+             and cannot approve it. A person must approve head {head_sha}; merge not attempted"
+        ),
+        failure_kind: Some(MergeFailureKind::PolicyBlocked),
+    }
+}
+
 fn merge_command_args<'a>(
     pr: &'a str,
     expected_head_sha: &'a str,
@@ -1317,7 +1334,6 @@ fn head_has_approval(reviews_json: &str, head_sha: &str) -> bool {
 
 /// Fixed GraphQL document for the merge-credential identity probe. Only its
 /// variables carry the daemon-derived repository and PR number.
-#[cfg_attr(not(test), allow(dead_code))]
 const PR_IDENTITY_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { \
 repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
 viewerDidAuthor reviewDecision } } }";
@@ -1336,7 +1352,6 @@ pub(crate) struct PrIdentity {
 /// `errors` entry, a missing `pullRequest`, a non-boolean/missing
 /// `viewerDidAuthor`, or a missing/non-string `reviewDecision` key, so no
 /// partial response ever selects one-identity mode.
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_pr_identity(json_str: &str) -> Option<PrIdentity> {
     let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
     match val.get("errors") {
@@ -1362,14 +1377,12 @@ fn parse_pr_identity(json_str: &str) -> Option<PrIdentity> {
 }
 
 /// True only for a well-formed probe that reports `viewerDidAuthor=true`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn is_one_identity(identity: Option<&PrIdentity>) -> bool {
     identity.is_some_and(|identity| identity.viewer_did_author)
 }
 
 /// Parse `gh pr view --json reviewDecision`. `null` reads as `""`;
 /// malformed JSON or a missing/non-string field is `None`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_review_decision(json_str: &str) -> Option<String> {
     match serde_json::from_str::<serde_json::Value>(json_str)
         .ok()?
@@ -1392,7 +1405,6 @@ pub(crate) enum VerdictKind {
 
 /// Hidden marker binding a verdict kind to one head SHA, e.g.
 /// `<!-- quorum-verdict:approved head=<sha> -->`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn verdict_marker(kind: VerdictKind, head_sha: &str) -> String {
     let kind = match kind {
         VerdictKind::Approved => "approved",
@@ -1404,7 +1416,6 @@ fn verdict_marker(kind: VerdictKind, head_sha: &str) -> String {
 /// True iff a review in `reviews_json` (from `fetch_reviews_and_head`) whose
 /// `commit.oid` is `head_sha` carries the exact marker for `kind` and
 /// `head_sha`. Parse failure or an empty head is false. Dedupe only.
-#[cfg_attr(not(test), allow(dead_code))]
 fn head_has_verdict_marker(reviews_json: &str, head_sha: &str, kind: VerdictKind) -> bool {
     if head_sha.is_empty() {
         return false;
@@ -1541,15 +1552,27 @@ impl MergeExecutor for GhMergeExecutor {
             }
         }
 
+        // Probe once, before any review write. Only a well-formed
+        // `viewerDidAuthor=true` selects one-identity mode; every probe failure
+        // keeps the two-identity `--approve` path.
+        let one_identity = is_one_identity(self.probe_pr_identity(pr, repo_dir).as_ref());
+
         // #49: on a PolicyPending retry the daemon calls merge() again — without
         // dedupe every retry posts another `--approve` stub, cluttering the PR
         // review history (4 identical approvals in 7s observed on task #45).
         // Skip the approve step if an APPROVED review already exists on the
-        // current head SHA. Fail-open: query hiccup falls through to the
-        // approve call and behaves as before this guard.
+        // current head SHA (one-identity: a review on the current head carrying
+        // the approved marker). Fail-open: query hiccup falls through to the
+        // review call and behaves as before this guard.
         let already_approved = self
             .fetch_reviews_and_head(pr, repo_dir)
-            .map(|(reviews_json, head)| head_has_approval(&reviews_json, &head))
+            .map(|(reviews_json, head)| {
+                if one_identity {
+                    head_has_verdict_marker(&reviews_json, &head, VerdictKind::Approved)
+                } else {
+                    head_has_approval(&reviews_json, &head)
+                }
+            })
             .unwrap_or(false);
 
         // Recheck after draft/check/review queries and immediately before the
@@ -1562,7 +1585,45 @@ impl MergeExecutor for GhMergeExecutor {
             return rejected;
         }
 
-        if !already_approved {
+        if one_identity {
+            // GitHub refuses a self-approval, so the merge identity posts its
+            // verdict as a COMMENT. The marker only suppresses a duplicate
+            // comment; it never stands in for an approval.
+            if !already_approved {
+                let comment_body = format!(
+                    "Approved verdict — per {} review verdict (task #{}). \
+                     The merge identity authored this PR, so this is a comment, \
+                     not a formal approval (daemon model).\n\n{}",
+                    ctx.reviewer_name,
+                    ctx.review_task_id,
+                    verdict_marker(VerdictKind::Approved, &ctx.expected_head_sha),
+                );
+                let comment = self.run_gh(
+                    &[
+                        "pr",
+                        "review",
+                        &pr_str,
+                        "--comment",
+                        "--body",
+                        &comment_body,
+                    ],
+                    repo_dir,
+                );
+                if !comment.success {
+                    return MergeResult {
+                        success: false,
+                        message: format!(
+                            "verdict comment failed (merge not attempted): {}",
+                            comment.message
+                        ),
+                        failure_kind: Some(MergeFailureKind::PolicyBlocked),
+                    };
+                }
+            }
+            if self.review_required(pr, repo_dir) {
+                return self_approval_required(pr, &ctx.expected_head_sha);
+            }
+        } else if !already_approved {
             let approve_body = format!(
                 "Formal approval — per {} review verdict (task #{}). \
                  Merge performed programmatically on approved verdict (daemon model).",
@@ -1630,6 +1691,9 @@ impl MergeExecutor for GhMergeExecutor {
                 ),
                 failure_kind: None,
             };
+        }
+        if !result.success && one_identity && self.review_required(pr, repo_dir) {
+            return self_approval_required(pr, &ctx.expected_head_sha);
         }
 
         result
@@ -2075,7 +2139,7 @@ impl MergeExecutor for CommandMergeExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github_credentials::FakeCredentialSource;
+    use crate::github_credentials::{FakeCredentialSource, GithubToken};
 
     fn checks_snapshot(head: &str, conclusion: &str) -> String {
         format!(
@@ -3427,7 +3491,12 @@ case "$1 $2" in
     done ;;
   *) route=other ;;
 esac
-[ -f "$d/$route.out" ] && cat "$d/$route.out"
+n=1
+[ -f "$d/$route.n" ] && n=$(( $(cat "$d/$route.n") + 1 ))
+echo "$n" > "$d/$route.n"
+out="$d/$route.out"
+[ -f "$out.$n" ] && out="$out.$n"
+[ -f "$out" ] && cat "$out"
 [ -f "$d/$route.err" ] && cat "$d/$route.err" >&2
 code=0
 [ -f "$d/$route.code" ] && code=$(cat "$d/$route.code")
@@ -3445,6 +3514,11 @@ exit "$code"
             std::fs::write(dir.join(format!("{route}.out")), stdout).unwrap();
             std::fs::write(dir.join(format!("{route}.code")), code.to_string()).unwrap();
             let _ = std::fs::remove_file(dir.join(format!("{route}.err")));
+        }
+
+        /// Override stdout for only the `nth` (1-based) call on `route`.
+        fn respond_nth(&self, route: &str, nth: usize, stdout: &str) {
+            std::fs::write(self.dir.path().join(format!("{route}.out.{nth}")), stdout).unwrap();
         }
 
         fn fail(&self, route: &str, stderr: &str, code: i32) {
@@ -3465,6 +3539,10 @@ exit "$code"
                     });
                 } else if let Some(arg) = line.strip_prefix("ARG\t") {
                     calls.last_mut().unwrap().argv.push(arg.to_string());
+                } else if let Some(arg) = calls.last_mut().and_then(|c| c.argv.last_mut()) {
+                    // Continuation of a multi-line argument.
+                    arg.push('\n');
+                    arg.push_str(line);
                 }
             }
             calls
@@ -3670,6 +3748,449 @@ exit "$code"
         );
         assert_eq!(calls[3].argv[..2], ["pr", "review"]);
         assert_eq!(calls[4].argv[..2], ["pr", "merge"]);
+    }
+
+    // ── merge(): one-identity approved-verdict path ─────────────────────
+
+    const MERGE_SECRET: &str = "ghs_merge_path_secret";
+    const VIEW_AT_HEAD: &str =
+        r#"{"baseRefName":"main","headRefOid":"abc123","headRefName":"feature","state":"OPEN"}"#;
+
+    /// A fake gh serving a mergeable PR #1 at head `abc123` (ctx head) with
+    /// no reviews, the given probe stdout, and the given reviewDecision.
+    #[cfg(unix)]
+    fn merge_fixture(probe: &str, decision: &str) -> FakeGh {
+        let gh = FakeGh::new();
+        gh.respond("view", VIEW_AT_HEAD, 0);
+        gh.respond("other", r#"{"defaultBranchRef":{"name":"main"}}"#, 0);
+        gh.respond("reviews", r#"{"reviews":[],"headRefOid":"abc123"}"#, 0);
+        gh.respond("probe", probe, 0);
+        gh.respond(
+            "decision",
+            &format!(r#"{{"reviewDecision":{decision}}}"#),
+            0,
+        );
+        gh.respond("review", "", 0);
+        gh.respond("merge", "", 0);
+        gh
+    }
+
+    #[cfg(unix)]
+    fn merge_exec(gh: &FakeGh) -> GhMergeExecutor {
+        gh.exec(
+            Arc::new(FakeCredentialSource::token(MERGE_SECRET)),
+            Some("o/r"),
+        )
+    }
+
+    #[cfg(unix)]
+    fn calls_for(calls: &[FakeGhCall], verb: &str) -> Vec<Vec<String>> {
+        calls
+            .iter()
+            .filter(|c| c.argv.len() >= 2 && c.argv[0] == "pr" && c.argv[1] == verb)
+            .map(|c| c.argv.clone())
+            .collect()
+    }
+
+    fn expected_merge_argv() -> Vec<String> {
+        [
+            "pr",
+            "merge",
+            "1",
+            "--merge",
+            "--delete-branch",
+            "--match-head-commit",
+            "abc123",
+            "-R",
+            "o/r",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    fn expected_approve_argv(ctx: &MergeContext) -> Vec<String> {
+        let body = format!(
+            "Formal approval — per {} review verdict (task #{}). \
+             Merge performed programmatically on approved verdict (daemon model).",
+            ctx.reviewer_name, ctx.review_task_id,
+        );
+        [
+            "pr",
+            "review",
+            "1",
+            "--approve",
+            "--body",
+            &body,
+            "-R",
+            "o/r",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    #[cfg(unix)]
+    fn assert_token_only_in_env(calls: &[FakeGhCall]) {
+        assert!(!calls.is_empty());
+        for call in calls {
+            assert_eq!(call.gh_token, MERGE_SECRET, "{:?}", call.argv);
+            assert!(
+                !call.argv.iter().any(|a| a.contains(MERGE_SECRET)),
+                "token must never enter argv: {:?}",
+                call.argv
+            );
+        }
+    }
+
+    /// Negative case 1: viewerDidAuthor=false keeps today's argv exactly.
+    #[cfg(unix)]
+    #[test]
+    fn merge_two_identity_keeps_approve_and_merge_argv() {
+        let ctx = test_ctx();
+        let gh = merge_fixture(
+            &probe_json("false", r#""REVIEW_REQUIRED""#),
+            r#""REVIEW_REQUIRED""#,
+        );
+        let result = merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx);
+        assert!(result.success, "{result:?}");
+
+        let calls = gh.calls();
+        assert_eq!(
+            calls_for(&calls, "review"),
+            vec![expected_approve_argv(&ctx)]
+        );
+        assert_eq!(calls_for(&calls, "merge"), vec![expected_merge_argv()]);
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.argv.iter().any(|a| a == "reviewDecision")),
+            "two-identity mode never reads reviewDecision"
+        );
+        assert_token_only_in_env(&calls);
+
+        // #49 dedupe unchanged: an APPROVED review on the head skips --approve.
+        let gh = merge_fixture(&probe_json("false", "null"), "null");
+        gh.respond(
+            "reviews",
+            &reviews_with_head(&[("APPROVED", "abc123", "ok")], "abc123"),
+            0,
+        );
+        assert!(merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx).success);
+        let calls = gh.calls();
+        assert!(calls_for(&calls, "review").is_empty());
+        assert_eq!(calls_for(&calls, "merge"), vec![expected_merge_argv()]);
+    }
+
+    /// Negative case 2: every failed probe keeps the two-identity path.
+    #[cfg(unix)]
+    #[test]
+    fn merge_failed_probe_keeps_two_identity_path() {
+        let ctx = test_ctx();
+        let one_identity = probe_json("true", r#""REVIEW_REQUIRED""#);
+        let errors_entry = r#"{"data":{"repository":{"pullRequest":{"viewerDidAuthor":true,"reviewDecision":null}}},"errors":[{"message":"x"}]}"#;
+        let missing_field = r#"{"data":{"repository":{"pullRequest":{"reviewDecision":null}}}}"#;
+        for (stdout, code) in [
+            (one_identity.as_str(), 1),
+            (errors_entry, 0),
+            ("{not json", 0),
+            (missing_field, 0),
+        ] {
+            let gh = merge_fixture(stdout, r#""REVIEW_REQUIRED""#);
+            gh.respond("probe", stdout, code);
+            let result = merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx);
+            assert!(result.success, "{stdout}: {result:?}");
+            let calls = gh.calls();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|c| c.argv[..2] == ["api", "graphql"])
+                    .count(),
+                1,
+                "probe runs once per merge() call"
+            );
+            assert_eq!(
+                calls_for(&calls, "review"),
+                vec![expected_approve_argv(&ctx)],
+                "{stdout}"
+            );
+            assert_eq!(
+                calls_for(&calls, "merge"),
+                vec![expected_merge_argv()],
+                "{stdout}"
+            );
+        }
+    }
+
+    fn reviews_with_head(entries: &[(&str, &str, &str)], head: &str) -> String {
+        let mut json: serde_json::Value = serde_json::from_str(&reviews_with(entries)).unwrap();
+        json["headRefOid"] = serde_json::Value::String(head.into());
+        json.to_string()
+    }
+
+    /// Negative cases 3 and 7: one marker COMMENT per head, then the
+    /// unchanged merge argv when reviewDecision is not REVIEW_REQUIRED.
+    #[cfg(unix)]
+    #[test]
+    fn merge_one_identity_posts_one_marker_comment_per_head_and_merges() {
+        let ctx = test_ctx();
+        let gh = merge_fixture(&probe_json("true", "null"), r#""APPROVED""#);
+        let exec = merge_exec(&gh);
+        let result = exec.merge(1, Path::new("/tmp"), &ctx);
+        assert!(result.success, "{result:?}");
+
+        let calls = gh.calls();
+        let reviews = calls_for(&calls, "review");
+        assert_eq!(reviews.len(), 1);
+        let comment = &reviews[0];
+        assert_eq!(comment[..5], ["pr", "review", "1", "--comment", "--body"]);
+        assert_eq!(comment[6..], ["-R", "o/r"]);
+        assert!(!comment.iter().any(|a| a == "--approve"));
+        let body = &comment[5];
+        assert!(
+            body.contains("Rev-1") && body.contains("task #99"),
+            "{body}"
+        );
+        assert!(
+            body.contains(&verdict_marker(VerdictKind::Approved, "abc123")),
+            "{body}"
+        );
+        assert_eq!(calls_for(&calls, "merge"), vec![expected_merge_argv()]);
+        assert_token_only_in_env(&calls);
+
+        // Re-entry on the same head: GitHub now lists the daemon's COMMENT.
+        gh.respond(
+            "reviews",
+            &reviews_with_head(&[("COMMENTED", "abc123", body)], "abc123"),
+            0,
+        );
+        assert!(exec.merge(1, Path::new("/tmp"), &ctx).success);
+        let calls = gh.calls();
+        assert_eq!(
+            calls_for(&calls, "review").len(),
+            1,
+            "no second marker comment"
+        );
+        assert_eq!(calls_for(&calls, "merge").len(), 2);
+
+        // A null decision is "anything else": merge is attempted unchanged.
+        let gh = merge_fixture(&probe_json("true", "null"), "null");
+        assert!(merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx).success);
+        assert_eq!(calls_for(&gh.calls(), "merge"), vec![expected_merge_argv()]);
+    }
+
+    /// Negative case 6: REVIEW_REQUIRED never spawns `gh pr merge`.
+    #[cfg(unix)]
+    #[test]
+    fn merge_one_identity_review_required_parks_without_merging() {
+        let ctx = test_ctx();
+        let gh = merge_fixture(&probe_json("true", "null"), r#""REVIEW_REQUIRED""#);
+        let result = merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx);
+        assert!(!result.success);
+        assert_eq!(result.failure_kind, Some(MergeFailureKind::PolicyBlocked));
+        assert_eq!(result.message, self_approval_required(1, "abc123").message);
+        assert!(
+            result
+                .message
+                .contains("someone other than the pull request author")
+                && result.message.contains("A person must approve head abc123")
+                && result.message.contains("merge not attempted"),
+            "{}",
+            result.message
+        );
+        let calls = gh.calls();
+        assert_eq!(calls_for(&calls, "review").len(), 1);
+        assert!(
+            calls_for(&calls, "merge").is_empty(),
+            "gh pr merge must not spawn"
+        );
+    }
+
+    /// Negative case 5: a moved head ignores the old marker and the existing
+    /// drift rejection fires before any comment or merge.
+    #[cfg(unix)]
+    #[test]
+    fn merge_one_identity_moved_head_rejects_before_comment() {
+        let ctx = test_ctx();
+        let gh = merge_fixture(&probe_json("true", "null"), r#""APPROVED""#);
+        let old = verdict_marker(VerdictKind::Approved, "abc123");
+        gh.respond(
+            "reviews",
+            &reviews_with_head(&[("COMMENTED", "abc123", &old)], "def456"),
+            0,
+        );
+        // View calls: base, head, isDraft pass; the post-dedupe base/head
+        // recheck sees the moved head.
+        let moved = VIEW_AT_HEAD.replace("abc123", "def456");
+        for nth in 4..=8 {
+            gh.respond_nth("view", nth, &moved);
+        }
+        let result = merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx);
+        assert!(!result.success);
+        assert_eq!(result.failure_kind, Some(MergeFailureKind::StaleAuthority));
+        assert!(
+            result.message.contains("head drifted to def456"),
+            "{}",
+            result.message
+        );
+        let calls = gh.calls();
+        assert!(
+            calls_for(&calls, "review").is_empty(),
+            "no comment after head moved"
+        );
+        assert!(calls_for(&calls, "merge").is_empty());
+    }
+
+    /// Negative case 8: a failed merge with a fresh non-REVIEW_REQUIRED
+    /// decision is classified exactly as today; REVIEW_REQUIRED names the
+    /// missing person's approval.
+    #[cfg(unix)]
+    #[test]
+    fn merge_one_identity_failed_merge_classification() {
+        let ctx = test_ctx();
+        let stderr = "Pull request is not mergeable: the base branch policy prohibits the merge";
+        for (fresh, expect_specific) in [
+            (r#""APPROVED""#, false),
+            ("null", false),
+            (r#""REVIEW_REQUIRED""#, true),
+        ] {
+            let gh = merge_fixture(&probe_json("true", "null"), r#""APPROVED""#);
+            gh.fail("merge", stderr, 1);
+            gh.respond_nth("decision", 2, &format!(r#"{{"reviewDecision":{fresh}}}"#));
+            let result = merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx);
+            assert!(!result.success);
+            assert_eq!(calls_for(&gh.calls(), "merge"), vec![expected_merge_argv()]);
+            if expect_specific {
+                assert_eq!(result.message, self_approval_required(1, "abc123").message);
+                assert_eq!(result.failure_kind, Some(MergeFailureKind::PolicyBlocked));
+            } else {
+                assert_eq!(result.message, stderr, "{fresh}");
+                assert_eq!(result.failure_kind, Some(classify_merge_failure(stderr)));
+            }
+        }
+        // A failed fresh read keeps today's classification too.
+        let gh = merge_fixture(&probe_json("true", "null"), r#""APPROVED""#);
+        gh.fail("merge", "merge conflict", 1);
+        gh.respond_nth("decision", 2, "{not json");
+        let result = merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx);
+        assert_eq!(result.message, "merge conflict");
+        assert_eq!(
+            result.failure_kind,
+            Some(classify_merge_failure("merge conflict"))
+        );
+    }
+
+    /// Negative case 10: agent-authored comments quoting another head's
+    /// marker or none do not dedupe; a copied current-head marker at most
+    /// suppresses the comment and never changes the merge decision.
+    #[cfg(unix)]
+    #[test]
+    fn merge_one_identity_forged_markers_never_change_merge_outcome() {
+        let ctx = test_ctx();
+        let other_head = verdict_marker(VerdictKind::Approved, "zzz999");
+        for body in ["LGTM, approved!", other_head.as_str()] {
+            let gh = merge_fixture(&probe_json("true", "null"), r#""APPROVED""#);
+            gh.respond(
+                "reviews",
+                &reviews_with_head(&[("COMMENTED", "abc123", body)], "abc123"),
+                0,
+            );
+            assert!(merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx).success);
+            assert_eq!(calls_for(&gh.calls(), "review").len(), 1, "{body}");
+        }
+
+        let copied = verdict_marker(VerdictKind::Approved, "abc123");
+        for (decision, merges) in [(r#""APPROVED""#, true), (r#""REVIEW_REQUIRED""#, false)] {
+            let gh = merge_fixture(&probe_json("true", "null"), decision);
+            gh.respond(
+                "reviews",
+                &reviews_with_head(&[("COMMENTED", "abc123", &copied)], "abc123"),
+                0,
+            );
+            let result = merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx);
+            let calls = gh.calls();
+            assert!(
+                calls_for(&calls, "review").is_empty(),
+                "duplicate comment suppressed"
+            );
+            assert_eq!(result.success, merges, "{decision}: {result:?}");
+            assert_eq!(calls_for(&calls, "merge").len(), usize::from(merges));
+            if !merges {
+                assert_eq!(result.message, self_approval_required(1, "abc123").message);
+            }
+        }
+    }
+
+    /// Succeeds for the first `ok` token fetches, then fails.
+    struct CountdownSource {
+        ok: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GithubCredentialSource for CountdownSource {
+        fn token(&self) -> std::result::Result<GithubToken, GithubCredentialError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.ok {
+                FakeCredentialSource::token(MERGE_SECRET).token()
+            } else {
+                Err(GithubCredentialError::LookupTimedOut {
+                    timeout: Duration::from_secs(10),
+                })
+            }
+        }
+    }
+
+    /// Negative cases 11/12: a credential failure at the probe or at the
+    /// `--comment` review spawns no gh child for it, and nothing merges.
+    #[cfg(unix)]
+    #[test]
+    fn merge_one_identity_credential_failure_spawns_no_probe_or_comment() {
+        let ctx = test_ctx();
+        // Baseline: every gh child fetches exactly one token first.
+        let gh = merge_fixture(&probe_json("true", "null"), r#""APPROVED""#);
+        assert!(merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx).success);
+        let baseline = gh.calls();
+        let probe_at = baseline
+            .iter()
+            .position(|c| c.argv[..2] == ["api", "graphql"])
+            .unwrap();
+        let comment_at = baseline
+            .iter()
+            .position(|c| c.argv[..2] == ["pr", "review"])
+            .unwrap();
+
+        for (ok, spawned) in [(probe_at, probe_at), (comment_at, comment_at)] {
+            let gh = merge_fixture(&probe_json("true", "null"), r#""APPROVED""#);
+            let exec = gh.exec(
+                Arc::new(CountdownSource {
+                    ok,
+                    calls: Default::default(),
+                }),
+                Some("o/r"),
+            );
+            let result = exec.merge(1, Path::new("/tmp"), &ctx);
+            assert!(!result.success);
+            assert_eq!(result.failure_kind, Some(MergeFailureKind::PolicyBlocked));
+            assert!(!result.message.contains(MERGE_SECRET));
+            let calls = gh.calls();
+            assert_eq!(
+                calls.len(),
+                spawned,
+                "no child after the credential failure"
+            );
+            assert!(calls_for(&calls, "review").is_empty());
+            assert!(calls_for(&calls, "merge").is_empty());
+            assert_token_only_in_env(&calls);
+        }
+
+        // A missing token file spawns nothing at all.
+        let gh = merge_fixture(&probe_json("true", "null"), r#""APPROVED""#);
+        let exec = gh.exec(
+            Arc::new(LocalDefaultCredentialSource::new(Some(PathBuf::from(
+                "/nonexistent/path/token",
+            )))),
+            Some("o/r"),
+        );
+        assert!(!exec.merge(1, Path::new("/tmp"), &ctx).success);
+        assert!(gh.calls().is_empty());
     }
 
     #[test]
