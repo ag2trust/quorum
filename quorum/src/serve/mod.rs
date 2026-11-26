@@ -3121,8 +3121,8 @@ fn routed_collector_request(
         },
         probe,
     )?;
-    let provider_bin = |model: &str| {
-        resolve_provider(model)
+    let provider_bin = |runner: &str| {
+        resolve_profile_runner(runner)
             .ok()
             .and_then(|kind| agent_bin_for_kind(config, kind))
             .map(str::to_owned)
@@ -3134,7 +3134,7 @@ fn routed_collector_request(
         .map(|weighted| {
             (
                 weighted.profile.id.clone(),
-                provider_bin(&weighted.profile.model),
+                provider_bin(&weighted.profile.runner),
             )
         })
         .collect();
@@ -3145,7 +3145,7 @@ fn routed_collector_request(
         repo,
         config.db_path.clone(),
         config.repo_dir.clone(),
-        provider_bin(&profile.model),
+        provider_bin(&profile.runner),
         config.bare_agent,
     )
     .with_collector(
@@ -4133,12 +4133,34 @@ fn resolve_profile_runner(runner: &str) -> Result<runner::AgentKind> {
     runner::AgentKind::for_profile_runner(runner).map_err(QuorumError::Usage)
 }
 
+/// Resolve the runner kind of a run whose durable record or routed profile
+/// names `recorded` as its provider/runner. An `"external"` record is its own
+/// authority: the model string is opaque and `for_model` is never consulted.
+/// Built-in records still derive the kind from the model so each caller's
+/// existing record/model mismatch check keeps binding the two together.
+fn resolve_recorded_provider(recorded: &str, model: &str) -> Result<runner::AgentKind> {
+    if recorded == "external" {
+        return Ok(runner::AgentKind::External);
+    }
+    resolve_provider(model)
+}
+
+#[cfg(test)]
 fn resolve_worker_provider(model: &str) -> Result<runner::AgentKind> {
     resolve_provider(model)
 }
 
+#[cfg(test)]
 fn resolve_managed_provider(model: &str, role: &str) -> Result<runner::AgentKind> {
-    let kind = resolve_provider(model)?;
+    resolve_recorded_managed_provider("", model, role)
+}
+
+fn resolve_recorded_managed_provider(
+    recorded: &str,
+    model: &str,
+    role: &str,
+) -> Result<runner::AgentKind> {
+    let kind = resolve_recorded_provider(recorded, model)?;
     if kind == runner::AgentKind::Grok {
         return Err(QuorumError::Usage(format!(
             "model '{model}' selects Grok, but managed Grok {role} roles are not enabled"
@@ -4153,7 +4175,7 @@ fn require_configured_provider(
     actual: runner::AgentKind,
     context: &str,
 ) -> Result<()> {
-    let resolved = resolve_worker_provider(model)?;
+    let resolved = resolve_recorded_provider(&actual.to_string(), model)?;
     if resolved != actual {
         return Err(QuorumError::Io(format!(
             "{context} persisted provider '{actual}' does not match model '{model}' resolved as '{resolved}'"
@@ -4331,8 +4353,10 @@ fn resolve_original_remediation_provider(
     recorded_provider: Option<&str>,
     model: &str,
 ) -> Result<runner::AgentKind> {
-    let model_kind = resolve_worker_provider(model)?;
     let kind = match recorded_provider {
+        // The durable record is the authority for an external run; its model
+        // string is opaque and never resolved.
+        Some("external") => return Ok(runner::AgentKind::External),
         Some("claude") => runner::AgentKind::Claude,
         Some("codex") => runner::AgentKind::Codex,
         Some("grok") => runner::AgentKind::Grok,
@@ -4347,6 +4371,7 @@ fn resolve_original_remediation_provider(
             )));
         }
     };
+    let model_kind = resolve_provider(model)?;
     if kind != model_kind {
         return Err(QuorumError::Io(format!(
             "persisted provider '{kind}' does not match model '{model}' resolved as '{model_kind}'"
@@ -4465,7 +4490,7 @@ fn resolve_reviewer_recovery(
             run.id
         ))
     })?;
-    let kind = resolve_managed_provider(&run.model, "reviewer recovery")?;
+    let kind = resolve_recorded_managed_provider(provider, &run.model, "reviewer recovery")?;
     if provider != kind.to_string() {
         return Err(QuorumError::Io(format!(
             "persisted provider '{provider}' does not match reviewer model '{}' resolved as '{kind}'",
@@ -5863,7 +5888,7 @@ fn worker_publication_pr(
 fn runner_retry_turn(refs: Option<&str>) -> Option<PendingTurn> {
     let refs: serde_json::Value = serde_json::from_str(refs?).ok()?;
     let turn = runner_state::requested_retry_any(&refs)?;
-    let resolved = resolve_worker_provider(&turn.model).ok()?;
+    let resolved = resolve_recorded_provider(&turn.provider, &turn.model).ok()?;
     (turn.provider == resolved.to_string()).then_some(turn)
 }
 
@@ -9296,7 +9321,7 @@ async fn spawn_arbiter_review(
         },
         None,
     )?;
-    let arbiter_kind = resolve_provider(&assignment.model)?;
+    let arbiter_kind = resolve_recorded_provider(&assignment.runner, &assignment.model)?;
     let view = match retain_cached_frozen_planner_view(config, coordinator, snapshot).await {
         Ok(view) => view,
         Err(error) => {
@@ -10308,7 +10333,7 @@ async fn tick_decomposition(
                 return Ok(false);
             }
         };
-        let planner_kind = resolve_provider(&assignment.model)?;
+        let planner_kind = resolve_recorded_provider(&assignment.runner, &assignment.model)?;
         // One attempt, one identity. This id is the run capability, the
         // `QUORUM_RUN_ID` the `submit_plan` tool authenticates with, the graph's
         // `planner_session_id` the endpoint resolver requires, the journalled
@@ -21956,6 +21981,10 @@ fn runner_continuation_identity(slot: &SlotState) -> std::io::Result<(&str, &str
         ));
     }
     let expected = slot.process_kind();
+    // An external slot's kind is its durable runner; the model is opaque.
+    if expected == runner::AgentKind::External {
+        return Ok((&slot.model, &slot.effort));
+    }
     match runner::AgentKind::for_model(&slot.model) {
         Ok(actual) if actual == expected => Ok((&slot.model, &slot.effort)),
         Ok(actual) => Err(std::io::Error::new(
@@ -25372,7 +25401,7 @@ async fn provision_reviewer_reserved(
     )?;
     let reviewer_model = assignment.model.clone();
     let reviewer_effort = assignment.effort.clone();
-    let reviewer_kind = resolve_provider(&reviewer_model)?;
+    let reviewer_kind = resolve_recorded_provider(&assignment.runner, &reviewer_model)?;
     let reviewer_runner = resolve_profile_runner(&assignment.runner)?;
     let reviewer_continuation_id = recovery
         .as_ref()
@@ -28244,7 +28273,7 @@ async fn spawn_admitted_worker(
         prompt_text.push_str(context);
     }
 
-    let resolved_kind = match resolve_worker_provider(&resolved_model) {
+    let resolved_kind = match resolve_recorded_provider(&assignment.runner, &resolved_model) {
         Ok(kind) => kind,
         Err(error) => {
             refuse_launch!(format!(
@@ -29933,39 +29962,42 @@ async fn activate_reviewer_fallback(
         fallback::FallbackInstallOutcome::Installed(intent) => intent,
     };
 
-    let alternate_kind =
-        match resolve_managed_provider(&intent.pending_turn.model, "reviewer fallback") {
-            Ok(kind) if kind.to_string() == intent.pending_turn.provider => kind,
-            Ok(kind) => {
-                let error = format!(
-                    "fallback intent provider '{}' does not match model '{}' resolved as '{kind}'",
-                    intent.pending_turn.provider, intent.pending_turn.model
-                );
-                return settle_failed_reviewer_fallback(
-                    config,
-                    slot,
-                    &intent.capability_run_id,
-                    &session_id,
-                    &intent.worktree,
-                    &intent.pending_turn.provider,
-                    &error,
-                )
-                .await;
-            }
-            Err(error) => {
-                let reason = format!("reviewer fallback route is not executable: {error}");
-                return settle_failed_reviewer_fallback(
-                    config,
-                    slot,
-                    &intent.capability_run_id,
-                    &session_id,
-                    &intent.worktree,
-                    &intent.pending_turn.provider,
-                    &reason,
-                )
-                .await;
-            }
-        };
+    let alternate_kind = match resolve_recorded_managed_provider(
+        &intent.pending_turn.provider,
+        &intent.pending_turn.model,
+        "reviewer fallback",
+    ) {
+        Ok(kind) if kind.to_string() == intent.pending_turn.provider => kind,
+        Ok(kind) => {
+            let error = format!(
+                "fallback intent provider '{}' does not match model '{}' resolved as '{kind}'",
+                intent.pending_turn.provider, intent.pending_turn.model
+            );
+            return settle_failed_reviewer_fallback(
+                config,
+                slot,
+                &intent.capability_run_id,
+                &session_id,
+                &intent.worktree,
+                &intent.pending_turn.provider,
+                &error,
+            )
+            .await;
+        }
+        Err(error) => {
+            let reason = format!("reviewer fallback route is not executable: {error}");
+            return settle_failed_reviewer_fallback(
+                config,
+                slot,
+                &intent.capability_run_id,
+                &session_id,
+                &intent.worktree,
+                &intent.pending_turn.provider,
+                &reason,
+            )
+            .await;
+        }
+    };
     // The selected alternate may itself be cooling down. Retire it as a
     // classified profile-unavailable launch without contacting the provider;
     // each skip adds one durable profile exclusion, so this walk is bounded by
@@ -30643,7 +30675,10 @@ async fn activate_worker_fallback_with(
         continuation_id: None,
         requested: intent.pending_turn.requested,
     };
-    let alternate_kind = match resolve_worker_provider(&intent.pending_turn.model) {
+    let alternate_kind = match resolve_recorded_provider(
+        &intent.pending_turn.provider,
+        &intent.pending_turn.model,
+    ) {
         Ok(kind) if kind.to_string() == intent.pending_turn.provider => kind,
         Ok(kind) => {
             let reason = format!(
@@ -30912,7 +30947,11 @@ async fn resume_pending_fallbacks(
         let intent = recovery.intent;
         let entry = recovery.entry;
         let agent_name = recovery.agent;
-        let kind = resolve_managed_provider(&intent.pending_turn.model, "fallback recovery")?;
+        let kind = resolve_recorded_managed_provider(
+            &intent.pending_turn.provider,
+            &intent.pending_turn.model,
+            "fallback recovery",
+        )?;
         if kind.to_string() != intent.pending_turn.provider {
             return Err(QuorumError::Io(format!(
                 "fallback recovery provider '{}' does not match model '{}'",
@@ -33441,7 +33480,7 @@ async fn spawn_remediation_worker(
             None => {
                 let assignment =
                     fresh_assignment.expect("workerless remediation has a fresh assignment");
-                resolve_worker_provider(&assignment.model).and_then(|kind| {
+                resolve_recorded_provider(&assignment.runner, &assignment.model).and_then(|kind| {
                     let runner = resolve_profile_runner(&assignment.runner)?;
                     Ok((
                         assignment.model.clone(),
@@ -50595,6 +50634,74 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 .contains("refusing provider migration"),
             "a runner must never continue through a different provider adapter"
         );
+    }
+
+    /// The routed collector's primary binary comes from the profile's runner,
+    /// not its model: a model string is not a runner name, and resolving it
+    /// as one silently dropped the configured binary (falling back to PATH).
+    #[cfg(unix)]
+    #[test]
+    fn routed_collector_request_uses_the_profile_runner_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = launch_test_repo(dir.path());
+        let (runner, _) = retry_test_claude_runner(dir.path());
+        let config = claude_only_retry_test_config(dir.path(), &repo, &runner);
+        let task_id = seed_retry_test_task(&config, "in-review", serde_json::json!(null));
+
+        let request = routed_collector_request(&config, 77, task_id, None, 0).unwrap();
+
+        let expected = config.agent_bin.clone();
+        assert!(expected.is_some());
+        assert_eq!(request.agent_bin, expected);
+        assert_eq!(request.collector_runner, "claude");
+        let routing = request.routing.as_ref().unwrap();
+        assert_eq!(
+            routing.agent_bins.get("c-claude").cloned().flatten(),
+            expected
+        );
+    }
+
+    #[test]
+    fn external_runner_kind_comes_from_durable_record_not_model() {
+        // "gpt-5" maps to Codex through for_model; an external record must
+        // resolve External regardless.
+        assert_eq!(
+            resolve_recorded_provider("external", "gpt-5").unwrap(),
+            runner::AgentKind::External
+        );
+        assert_eq!(
+            resolve_recorded_managed_provider("external", "gpt-5", "reviewer recovery").unwrap(),
+            runner::AgentKind::External
+        );
+        assert_eq!(
+            resolve_original_remediation_provider(Some("external"), "gpt-5").unwrap(),
+            runner::AgentKind::External
+        );
+        // Built-in records keep the model-derived kind and its mismatch check.
+        assert_eq!(
+            resolve_recorded_provider("codex", "gpt-5").unwrap(),
+            runner::AgentKind::Codex
+        );
+        assert_eq!(
+            resolve_recorded_provider("claude", "gpt-5").unwrap(),
+            runner::AgentKind::Codex
+        );
+        assert!(resolve_recorded_provider("claude", "unknown-model").is_err());
+        assert!(resolve_original_remediation_provider(Some("claude"), "gpt-5").is_err());
+        assert!(
+            resolve_recorded_managed_provider("grok", "grok-4.5", "reviewer recovery").is_err()
+        );
+
+        let mut slot = make_dummy_slot();
+        slot.proc =
+            SlotProcess::dormant(runner::AgentKind::External, Some("external-session")).unwrap();
+        slot.model = "gpt-5".into();
+        assert_eq!(
+            runner_continuation_identity(&slot).unwrap(),
+            ("gpt-5", "high")
+        );
+        let entry = slot_journal_entry(&slot, "worker", "working");
+        assert_eq!(entry.provider.as_deref(), Some("external"));
     }
 
     #[test]
