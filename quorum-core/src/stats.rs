@@ -3732,7 +3732,8 @@ fn alert_messages(conn: &Connection, now: i64) -> Result<Vec<AlertMessage>> {
 ///
 /// Two sources:
 /// 1. Tasks with `body = MERGE_BLOCKED_BODY` — merge-blocked by conflict (review-only
-///    tasks whose PR has conflicts; daemon parks them until mergeable again).
+///    tasks whose PR has conflicts; daemon parks them until mergeable again), or
+///    refs carrying `PRE_REVIEW_MERGE_BLOCKED_REF` (the same, before review).
 /// 2. Tasks in `merging` status — approved, waiting for CI/merge to complete.
 ///
 /// Neither is terminal; dependents stay blocked by the normal dep rule.
@@ -3743,14 +3744,15 @@ fn merge_blockers(conn: &Connection, now: i64) -> Result<Vec<MergeBlockerView>> 
     let mut stmt = conn.prepare(
         "SELECT id, title, refs, status, updated_at, rework_round
          FROM tasks
-         WHERE body IN (?1, ?2) AND status NOT IN ('done', 'failed', 'cancelled')
+         WHERE (body = ?1 OR json_extract(refs, ?2) IS NOT NULL)
+           AND status NOT IN ('done', 'failed', 'cancelled')
          ORDER BY updated_at ASC",
     )?;
     let rows = stmt
         .query_map(
             params![
                 crate::tasks::MERGE_BLOCKED_BODY,
-                crate::tasks::PRE_REVIEW_MERGE_BLOCKED_BODY
+                format!("$.{}", crate::tasks::PRE_REVIEW_MERGE_BLOCKED_REF)
             ],
             |r| {
                 Ok((

@@ -334,11 +334,63 @@ pub fn ci_remediation_intent(refs: Option<&str>) -> Result<Option<CiRemediationI
 /// becomes MERGEABLE again.
 pub const MERGE_BLOCKED_BODY: &str = "daemon:merge-blocked";
 
-/// Body marker for a review-only task whose PR GitHub reported as conflicting
-/// (`DIRTY`) at its recorded head before review. Unlike [`MERGE_BLOCKED_BODY`]
-/// there is no approval to re-fire: once the PR is mergeable the daemon clears
-/// the marker and the normal pre-review CI gate and reviewer path resume.
-pub const PRE_REVIEW_MERGE_BLOCKED_BODY: &str = "daemon:merge-blocked:pre-review";
+/// Daemon-owned refs key marking a review-only task whose PR GitHub reported
+/// as conflicting (`DIRTY`) at its recorded head before review; the value is
+/// that head. Unlike [`MERGE_BLOCKED_BODY`] it lives in refs, not the body: the
+/// review-only contract body must survive for R1/R2, and refs writes do not
+/// invalidate classification. There is no approval to re-fire: once the PR is
+/// mergeable the daemon clears the key and the normal pre-review CI gate and
+/// reviewer path resume.
+pub const PRE_REVIEW_MERGE_BLOCKED_REF: &str = "pre_review_merge_blocked";
+
+/// Whether `refs` carry the [`PRE_REVIEW_MERGE_BLOCKED_REF`] marker.
+pub fn pre_review_merge_blocked(refs: Option<&str>) -> bool {
+    refs.and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+        .is_some_and(|value| {
+            value
+                .get(PRE_REVIEW_MERGE_BLOCKED_REF)
+                .is_some_and(|head| !head.is_null())
+        })
+}
+
+/// Park an in-review task as pre-review merge-blocked at `head_sha`. Returns
+/// whether a row changed; re-marking the same head is a no-op.
+pub fn set_pre_review_merge_block(
+    conn: &Connection,
+    id: i64,
+    head_sha: &str,
+    now: i64,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE tasks
+         SET refs=json_set(COALESCE(refs, '{}'), '$.pre_review_merge_blocked', ?2),
+             updated_at=?3
+         WHERE id=?1 AND status='in-review'
+           AND json_extract(COALESCE(refs, '{}'), '$.pre_review_merge_blocked') IS NOT ?2",
+        params![id, head_sha, now],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Clear the [`PRE_REVIEW_MERGE_BLOCKED_REF`] marker. Reads first so the
+/// common unblocked case takes no write lock; never touches the body.
+pub fn clear_pre_review_merge_block(conn: &Connection, id: i64, now: i64) -> Result<bool> {
+    let blocked: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1
+             AND json_extract(refs, '$.pre_review_merge_blocked') IS NOT NULL)",
+        params![id],
+        |row| row.get(0),
+    )?;
+    if !blocked {
+        return Ok(false);
+    }
+    let changed = conn.execute(
+        "UPDATE tasks SET refs=json_remove(refs, '$.pre_review_merge_blocked'), updated_at=?2
+         WHERE id=?1 AND json_extract(refs, '$.pre_review_merge_blocked') IS NOT NULL",
+        params![id, now],
+    )?;
+    Ok(changed == 1)
+}
 
 const KNOWN_EFFORTS: &[&str] = &["medium", "high"];
 const KNOWN_COMPLEXITIES: &[&str] = &["1", "2", "3", "4", "5"];
@@ -949,6 +1001,11 @@ pub fn validate_creator_refs(refs_json: Option<&str>) -> Result<()> {
     if object.contains_key(MERGE_CHECKS_REF) {
         return Err(QuorumError::Usage(format!(
             "refs key '{MERGE_CHECKS_REF}' is daemon-owned merge-gate state"
+        )));
+    }
+    if object.contains_key(PRE_REVIEW_MERGE_BLOCKED_REF) {
+        return Err(QuorumError::Usage(format!(
+            "refs key '{PRE_REVIEW_MERGE_BLOCKED_REF}' is daemon-owned pre-review merge-block state"
         )));
     }
     Ok(())
@@ -14104,6 +14161,56 @@ mod tests {
             })
             .unwrap();
         assert_eq!(task, "daemon:parked:provision-exhausted");
+    }
+
+    #[test]
+    fn pre_review_merge_block_preserves_body_and_refs() {
+        let (_d, mut c) = open_tmp();
+        let id = create(
+            &mut c,
+            "boss",
+            "review PR",
+            Some("Review contract: check X and Y"),
+            0,
+            None,
+            None,
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE tasks SET status='in-review',
+                 refs=json_object('pr', 1007, 'cx_est', 2, 'cx_size', 'S',
+                     'cx_ready', json('true'), 'cx_not_ready_reason', json('null'))
+             WHERE id=?1",
+            params![id],
+        )
+        .unwrap();
+        let read = |c: &Connection| -> (Option<String>, Option<String>) {
+            c.query_row(
+                "SELECT body, refs FROM tasks WHERE id=?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+
+        assert!(set_pre_review_merge_block(&c, id, "8aadb5bc", 1001).unwrap());
+        assert!(!set_pre_review_merge_block(&c, id, "8aadb5bc", 1002).unwrap());
+        let (body, refs) = read(&c);
+        assert_eq!(body.as_deref(), Some("Review contract: check X and Y"));
+        assert!(pre_review_merge_blocked(refs.as_deref()));
+        assert!(classification_is_complete(&refs));
+
+        assert!(clear_pre_review_merge_block(&c, id, 1003).unwrap());
+        assert!(!clear_pre_review_merge_block(&c, id, 1004).unwrap());
+        let (body, refs) = read(&c);
+        assert_eq!(body.as_deref(), Some("Review contract: check X and Y"));
+        assert!(!pre_review_merge_blocked(refs.as_deref()));
+        assert!(classification_is_complete(&refs));
+        assert_eq!(extract_pr_number(&refs), Some(1007));
+        assert!(validate_creator_refs(Some(r#"{"pre_review_merge_blocked":"x"}"#)).is_err());
     }
 
     #[test]

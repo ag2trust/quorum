@@ -11225,35 +11225,75 @@ async fn pre_review_conflict_head(
     }
 }
 
-fn discard_pre_review_wait(waits: &mut HashMap<i64, PreReviewChecksEntry>, task_id: i64) {
-    if let Some(entry) = waits.remove(&task_id) {
-        if let PreReviewChecksState::Waiting(handle) = entry.state {
-            handle.abort();
+/// Hold a task whose pre-review mergeability read ended the pass early (a
+/// conflict, or a still-blocked review-only PR) on the shared per-PR GitHub
+/// cadence. Any CI wait is aborted, but the entry keeps a fresh
+/// `last_head_poll` stamp so `pre_review_external_poll_due` stays false until
+/// the next configured poll instead of re-reading GitHub every serve tick.
+fn hold_pre_review_on_cadence(
+    waits: &mut HashMap<i64, PreReviewChecksEntry>,
+    task_id: i64,
+    pr: i64,
+    head_sha: &str,
+    now: std::time::Instant,
+) {
+    let previous = waits.remove(&task_id);
+    let (consecutive_timeouts, timeout_alerted, previous_head) = match previous {
+        Some(entry) => {
+            if let PreReviewChecksState::Waiting(handle) = entry.state {
+                handle.abort();
+            }
+            let previous_head = (entry.pr == pr).then_some(entry.head_sha);
+            (
+                entry.consecutive_timeouts,
+                entry.timeout_alerted,
+                previous_head,
+            )
         }
-    }
+        None => (0, false, None),
+    };
+    // An empty head keeps the previously tracked head for this PR, so a hold
+    // never adopts an unverified GitHub-reported head as the recorded one.
+    let head_sha = if head_sha.is_empty() {
+        previous_head.unwrap_or_default()
+    } else {
+        head_sha.to_string()
+    };
+    waits.insert(
+        task_id,
+        PreReviewChecksEntry {
+            pr,
+            head_sha,
+            last_head_poll: Some(now),
+            post_gate_validation_attempted: false,
+            state: PreReviewChecksState::Retry,
+            consecutive_timeouts,
+            timeout_alerted,
+            head_lag_since: None,
+        },
+    );
+}
+
+/// Park a review-only task as pre-review merge-blocked in daemon-owned refs.
+/// The task body (the review contract) is never touched.
+async fn set_pre_review_merge_block(db_path: &Path, task_id: i64, head_sha: &str) -> Result<bool> {
+    let db_path = db_path.to_path_buf();
+    let head_sha = head_sha.to_string();
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let conn = quorum_core::db::open(&db_path)?;
+        tasks::set_pre_review_merge_block(&conn, task_id, &head_sha, now_unix())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("pre-review merge-block set join: {error}")))?
 }
 
 /// Clear a pre-review merge block once GitHub no longer reports the PR as
-/// conflicting. The guarded update is a no-op for every other body.
+/// conflicting. Only the refs marker is removed; the body is preserved.
 async fn clear_pre_review_merge_block(db_path: &Path, task_id: i64) -> Result<bool> {
     let db_path = db_path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<bool> {
         let conn = quorum_core::db::open(&db_path)?;
-        // Read first so the common unblocked case takes no write lock.
-        let blocked: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND body=?2)",
-            rusqlite::params![task_id, tasks::PRE_REVIEW_MERGE_BLOCKED_BODY],
-            |row| row.get(0),
-        )?;
-        if !blocked {
-            return Ok(false);
-        }
-        let changed = conn.execute(
-            "UPDATE tasks SET body='', updated_at=?3
-             WHERE id=?1 AND status='in-review' AND body=?2",
-            rusqlite::params![task_id, tasks::PRE_REVIEW_MERGE_BLOCKED_BODY, now_unix()],
-        )?;
-        Ok(changed == 1)
+        tasks::clear_pre_review_merge_block(&conn, task_id, now_unix())
     })
     .await
     .map_err(|error| QuorumError::Io(format!("pre-review merge-block clear join: {error}")))?
@@ -11792,12 +11832,7 @@ async fn handle_pre_review_conflict(
             "PRE-REVIEW CONFLICT: review-only task #{task_id} PR #{pr} head {head_sha} \
              conflicts with {base} — parking merge-blocked, not reworking"
         ));
-        set_task_body(
-            &config.db_path,
-            task_id,
-            tasks::PRE_REVIEW_MERGE_BLOCKED_BODY,
-        )
-        .await;
+        set_pre_review_merge_block(&config.db_path, task_id, head_sha).await?;
         return Ok(());
     }
     let feedback = merge_base_remediation_message(
@@ -19279,14 +19314,19 @@ async fn tick(
     if !drain_state.draining {
         // Reviewer-slot admission spans Phases 5 and 5b: one queue, one pass.
         reviewer_slot_queue.begin_pass();
-        let active_in_review = {
+        let (active_in_review, pre_review_merge_blocked) = {
             let p = db_path.clone();
-            tokio::task::spawn_blocking(move || -> Result<HashSet<i64>> {
+            tokio::task::spawn_blocking(move || -> Result<(HashSet<i64>, HashSet<i64>)> {
                 let conn = quorum_core::db::open(&p)?;
-                Ok(tasks::list(&conn, Some("in-review"), None, None)?
-                    .into_iter()
-                    .map(|task| task.id)
-                    .collect())
+                let mut active = HashSet::new();
+                let mut blocked = HashSet::new();
+                for task in tasks::list(&conn, Some("in-review"), None, None)? {
+                    if tasks::pre_review_merge_blocked(task.refs.as_deref()) {
+                        blocked.insert(task.id);
+                    }
+                    active.insert(task.id);
+                }
+                Ok((active, blocked))
             })
             .await
             .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))??
@@ -19375,18 +19415,39 @@ async fn tick(
             }
             // A PR GitHub reports DIRTY at the recorded head runs no CI; route
             // it to merge-base rework before any CI wait or reviewer.
+            let merge_blocked = pre_review_merge_blocked.contains(task_id);
             if let Some(observation) = &mergeability {
                 if let Some(conflict_head) =
                     pre_review_conflict_head(config, pre_review_checks, *task_id, *pr, observation)
                         .await?
                 {
-                    discard_pre_review_wait(pre_review_checks, *task_id);
+                    hold_pre_review_on_cadence(
+                        pre_review_checks,
+                        *task_id,
+                        *pr,
+                        &conflict_head,
+                        std::time::Instant::now(),
+                    );
                     conflicting_pre_review.push((*task_id, *pr, conflict_head));
                     continue;
                 }
                 if observation.0 != merge::MergeabilityState::Conflicting {
-                    clear_pre_review_merge_block(&db_path, *task_id).await?;
+                    if merge_blocked {
+                        clear_pre_review_merge_block(&db_path, *task_id).await?;
+                    }
+                } else if merge_blocked {
+                    hold_pre_review_on_cadence(
+                        pre_review_checks,
+                        *task_id,
+                        *pr,
+                        "",
+                        std::time::Instant::now(),
+                    );
+                    continue;
                 }
+            } else if merge_blocked {
+                // Still merge-blocked and not yet due for the next shared read.
+                continue;
             }
             let (ci_gate, head_sha, head_polled) =
                 poll_resume_reviewer_pre_review_checks(config, pre_review_checks, *task_id, *pr)
@@ -19718,7 +19779,7 @@ async fn tick(
             if has_worker || has_reviewer {
                 continue;
             }
-            let pre_review_blocked = body.as_deref() == Some(tasks::PRE_REVIEW_MERGE_BLOCKED_BODY);
+            let pre_review_blocked = tasks::pre_review_merge_blocked(task_refs.as_deref());
             let mergeability =
                 poll_pre_review_mergeability_if_due(config, pre_review_checks, *task_id, *pr).await;
             if let Some((pr_state, _)) = &mergeability {
@@ -19745,6 +19806,15 @@ async fn tick(
                         if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY)
                             || pre_review_blocked =>
                     {
+                        // Still blocked: stamp the shared cadence so the next
+                        // read waits for the configured poll interval.
+                        hold_pre_review_on_cadence(
+                            pre_review_checks,
+                            *task_id,
+                            *pr,
+                            "",
+                            std::time::Instant::now(),
+                        );
                         continue;
                     }
                     _ => {}
@@ -19830,7 +19900,13 @@ async fn tick(
                     pre_review_conflict_head(config, pre_review_checks, *task_id, *pr, observation)
                         .await?
                 {
-                    discard_pre_review_wait(pre_review_checks, *task_id);
+                    hold_pre_review_on_cadence(
+                        pre_review_checks,
+                        *task_id,
+                        *pr,
+                        &conflict_head,
+                        std::time::Instant::now(),
+                    );
                     handle_pre_review_conflict(
                         config,
                         wt_mgr,
@@ -36810,7 +36886,7 @@ mod tests {
             .unwrap()
             .expect("DIRTY at the recorded head is a conflict");
         assert_eq!(head, CONFLICT_HEAD);
-        discard_pre_review_wait(&mut waits, task_id);
+        hold_pre_review_on_cadence(&mut waits, task_id, pr, &head, std::time::Instant::now());
         let mut workers = Vec::new();
         handle_pre_review_conflict(
             &config,
@@ -36825,7 +36901,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(waits.is_empty(), "no pre-review CI wait may start");
+        let entry = waits.get(&task_id).expect("cadence stamp is kept");
+        assert!(
+            matches!(entry.state, PreReviewChecksState::Retry),
+            "no pre-review CI wait may start"
+        );
+        assert!(!pre_review_external_poll_due(&config, &waits, task_id, pr));
         assert!(workers.is_empty(), "no worker or reviewer slot is created");
         assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let conn = quorum_core::db::open(&db_path).unwrap();
@@ -36952,8 +37033,13 @@ mod tests {
                 .unwrap(),
             Some(CONFLICT_HEAD.to_string())
         );
-        discard_pre_review_wait(&mut waits, task_id);
-        assert!(waits.is_empty());
+        // A hold with no verified head keeps the tracked head and stamps the
+        // shared cadence instead of dropping the entry.
+        hold_pre_review_on_cadence(&mut waits, task_id, pr, "", std::time::Instant::now());
+        let entry = waits.get(&task_id).unwrap();
+        assert_eq!(entry.head_sha, CONFLICT_HEAD);
+        assert!(matches!(entry.state, PreReviewChecksState::Retry));
+        assert!(!pre_review_external_poll_due(&config, &waits, task_id, pr));
     }
 
     #[tokio::test]
@@ -36967,7 +37053,7 @@ mod tests {
                 &mut conn,
                 "owner",
                 "review-only conflict",
-                None,
+                Some(REVIEW_ONLY_CONTRACT),
                 0,
                 None,
                 None,
@@ -36991,8 +37077,10 @@ mod tests {
         assert_eq!(task.rework_round, 0);
         assert_eq!(
             task.body.as_deref(),
-            Some(tasks::PRE_REVIEW_MERGE_BLOCKED_BODY)
+            Some(REVIEW_ONLY_CONTRACT),
+            "the review contract survives the block"
         );
+        assert!(tasks::pre_review_merge_blocked(task.refs.as_deref()));
         assert_eq!(
             tasks::ci_remediation_intent(task.refs.as_deref()).unwrap(),
             None
@@ -37010,10 +37098,138 @@ mod tests {
         let conn = quorum_core::db::open(&db_path).unwrap();
         let task = tasks::get(&conn, task_id).unwrap().unwrap();
         assert_eq!(task.status, "in-review");
-        assert_ne!(
+        assert!(!tasks::pre_review_merge_blocked(task.refs.as_deref()));
+        assert_eq!(
             task.body.as_deref(),
-            Some(tasks::PRE_REVIEW_MERGE_BLOCKED_BODY)
+            Some(REVIEW_ONLY_CONTRACT),
+            "the review contract survives block -> clear for R1/R2"
         );
+        assert_eq!(tasks::extract_pr_number(&task.refs), Some(pr));
+    }
+
+    const REVIEW_ONLY_CONTRACT: &str = "Review contract: verify the CI gate change.";
+
+    #[test]
+    fn blocked_review_only_task_reads_github_once_per_cadence_window() {
+        // A real tick needs more than the default test-thread stack.
+        std::thread::Builder::new()
+            .name("blocked-cadence-tick".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(blocked_review_only_cadence_body())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn blocked_review_only_cadence_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("blocked-cadence.db");
+        let pr = 1013;
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let now = now_unix();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "blocked review-only",
+                Some(REVIEW_ONLY_CONTRACT),
+                0,
+                None,
+                None,
+                None,
+                Some(pr),
+                now,
+            )
+            .unwrap();
+            tasks::update_refs_daemon(
+                &mut conn,
+                task_id,
+                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                now,
+            )
+            .unwrap();
+            assert!(tasks::set_pre_review_merge_block(&conn, task_id, CONFLICT_HEAD, now).unwrap());
+            task_id
+        };
+        let executor =
+            HeadBoundMergeability::new(merge::MergeabilityState::Conflicting, Some(CONFLICT_HEAD));
+        let mut config = conflict_test_config(&db_path, dir.path(), executor.clone());
+        config.merge_checks_poll_secs = 3600;
+
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut reviewers = Vec::new();
+        let mut branch_sync_checks = branch_sync::BranchSyncChecks::default();
+        let mut pre_review_checks = HashMap::new();
+        let mut pending_reviewer_resumes = HashMap::new();
+        let mut poison_tracker = PoisonTracker::new();
+        let mut claim_skip_logs = ClaimSkipLogLimiter::new();
+        let mut graph_skip_logs = ClaimSkipLogLimiter::new();
+        let mut unrecordable = UnrecordableStrikes::new();
+        let mut reviewer_respawn_backoff = ReviewerRespawnBackoff::new();
+        let mut profile_cooldown = ProfileCooldown::new();
+        let mut reviewer_slot_queue = ReviewerSlotQueue::default();
+        let mut drain_state = DrainState::new();
+        let mut lifetime_roster = LifetimeRoster::new();
+        let mut classifier_slot = None;
+        let mut decomposition_coordinator = DecompositionCoordinator::default();
+        let mut classifier_consec_errors = 0;
+        let mut classifier_backoff_until = None;
+        let mut doctor_slot = None;
+        let mut doctored_tasks = std::collections::HashSet::new();
+        let collectors = collector::CollectorTracker::default();
+        let signal_count = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        for _ in 0..2 {
+            tick(
+                &config,
+                &wt_mgr,
+                &mut name_pool,
+                &mut workers,
+                &mut reviewers,
+                &mut branch_sync_checks,
+                &mut pre_review_checks,
+                &mut pending_reviewer_resumes,
+                &mut poison_tracker,
+                &mut claim_skip_logs,
+                &mut graph_skip_logs,
+                &mut unrecordable,
+                &mut reviewer_respawn_backoff,
+                &mut profile_cooldown,
+                &mut reviewer_slot_queue,
+                &mut drain_state,
+                &mut lifetime_roster,
+                &mut classifier_slot,
+                &mut decomposition_coordinator,
+                &mut classifier_consec_errors,
+                &mut classifier_backoff_until,
+                &mut doctor_slot,
+                &mut doctored_tasks,
+                &collectors,
+                &signal_count,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            executor.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "two passes in one cadence window make one mergeability read"
+        );
+        assert!(reviewers.is_empty(), "a blocked task gets no reviewer");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(task.rework_round, 0);
+        assert!(tasks::pre_review_merge_blocked(task.refs.as_deref()));
+        assert_eq!(task.body.as_deref(), Some(REVIEW_ONLY_CONTRACT));
     }
 
     #[tokio::test]

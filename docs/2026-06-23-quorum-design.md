@@ -1698,8 +1698,11 @@ provisioning and merge.
   with the merge-time `merge_base_remediation_message` feedback for its effective target
   branch, persisted as the same durable remediation intent as `ChecksFailed` (check label
   `merge-conflict`), so restart provisions exactly one remediation worker. A review-only
-  task is not reworked: it is marked `daemon:merge-blocked:pre-review` and resumes the
-  normal gate once the PR is no longer conflicting (no approval exists to re-fire). A
+  task is not reworked: it is marked with the daemon-owned refs key
+  `pre_review_merge_blocked` (the body, its review contract, is untouched) and resumes the
+  normal gate once the PR is no longer conflicting (no approval exists to re-fire). While
+  blocked, each mergeability read stamps the shared cadence, so a blocked task makes at
+  most one GitHub read per `merge_checks_poll_secs` window. A
   `no_rework` task closes `done` with `review_outcome=merge_conflict`. As defense in depth,
   a gate failure whose required jobs are all `absent` re-reads head-bound mergeability once
   and routes a `DIRTY` exact head to the conflict path instead of CI feedback.
