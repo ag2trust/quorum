@@ -11547,6 +11547,154 @@ async fn notify_pre_review_checks_timeout(
     .map_err(|error| QuorumError::Io(format!("pre-review timeout alert join: {error}")))?
 }
 
+/// Entry cap on the daemon-owned failed-job digest cache. Each value is at
+/// most one rendered digest (`ci_digest::DIGEST_MAX_BYTES`), so the cache
+/// stays well under a megabyte; the oldest entry is evicted first.
+const CI_DIGEST_CACHE_MAX_ENTRIES: usize = 128;
+/// Failed jobs whose digest is fetched and appended to one remediation
+/// feedback; the rest are counted in a single line. Bounds the combined
+/// feedback to this many digests plus fixed text.
+const CI_DIGEST_FEEDBACK_MAX_JOBS: usize = 4;
+
+/// (database, PR, head SHA, job name). The database path namespaces the
+/// per-DB daemon inside one process.
+type CiDigestKey = (PathBuf, i64, String, String);
+
+/// Rendered failure digests and fetch failures (`None`) of failed CI jobs,
+/// so each (PR, head SHA, job) is fetched at most once across ticks and
+/// failure handling. In-memory only: a daemon restart refetches.
+#[derive(Default)]
+struct CiDigestCache {
+    entries: HashMap<CiDigestKey, Option<String>>,
+    order: VecDeque<CiDigestKey>,
+}
+
+impl CiDigestCache {
+    fn get(&self, key: &CiDigestKey) -> Option<Option<String>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: CiDigestKey, value: Option<String>) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        while self.order.len() >= CI_DIGEST_CACHE_MAX_ENTRIES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, value);
+    }
+}
+
+static CI_DIGEST_CACHE: LazyLock<Mutex<CiDigestCache>> =
+    LazyLock::new(|| Mutex::new(CiDigestCache::default()));
+
+/// The GitHub check-run name behind one failing-check label, or `None` for a
+/// required job that never ran (`name (absent)`), which has no log. The
+/// required-jobs gate labels jobs `name (CONCLUSION)`; rollup failures carry
+/// the bare name.
+fn failed_check_job_name(check: &str) -> Option<&str> {
+    if check.ends_with(" (absent)") {
+        return None;
+    }
+    let conclusion_suffix = check
+        .strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once(" ("))
+        .filter(|(name, conclusion)| {
+            !name.is_empty()
+                && conclusion
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b == b'_')
+        });
+    Some(conclusion_suffix.map_or(check, |(name, _)| name))
+}
+
+/// Feedback lines carrying the failure digest of each failed (not absent)
+/// job, fetched through the daemon's merge executor at most once per
+/// (PR, head SHA, job). Each fetch runs in `spawn_blocking` with no DB
+/// transaction open. A fetch failure becomes one generic line: the error
+/// detail is logged, never shown to the worker.
+async fn failed_job_digest_feedback(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    head_sha: &str,
+    failing_checks: &[String],
+) -> Vec<String> {
+    let jobs: Vec<&str> = failing_checks
+        .iter()
+        .filter_map(|check| failed_check_job_name(check))
+        .collect();
+    let mut lines = Vec::new();
+    for job in jobs.iter().take(CI_DIGEST_FEEDBACK_MAX_JOBS) {
+        let key: CiDigestKey = (
+            config.db_path.clone(),
+            pr,
+            head_sha.to_string(),
+            job.to_string(),
+        );
+        let cached = CI_DIGEST_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key);
+        let digest = match cached {
+            Some(digest) => digest,
+            None => {
+                let fetched = if head_sha.is_empty() {
+                    Err("PR head SHA unknown".to_string())
+                } else {
+                    let executor = Arc::clone(&config.merge_executor);
+                    let repo = config.repo_dir.clone();
+                    let head = head_sha.to_string();
+                    let name = job.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        executor
+                            .fetch_failed_job_digest(pr, &repo, &head, &name)
+                            .map(|found| {
+                                quorum_core::ci_digest::render_digest(
+                                    &found.digest,
+                                    &name,
+                                    found.run_id,
+                                    found.job_id,
+                                )
+                            })
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(format!("digest fetch join: {error}")))
+                };
+                let digest = match fetched {
+                    Ok(rendered) => Some(rendered),
+                    Err(error) => {
+                        log(&format!(
+                            "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} — failure digest \
+                             for job {job} at head {head_sha} unavailable: {error}"
+                        ));
+                        None
+                    }
+                };
+                CI_DIGEST_CACHE
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(key, digest.clone());
+                digest
+            }
+        };
+        lines.push(digest.unwrap_or_else(|| {
+            format!("The failure digest for CI job `{job}` couldn't be fetched.")
+        }));
+    }
+    let omitted = jobs.len().saturating_sub(CI_DIGEST_FEEDBACK_MAX_JOBS);
+    if omitted > 0 {
+        lines.push(format!(
+            "Failure digests for {omitted} more failed CI job(s) were not included."
+        ));
+    }
+    lines
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_pre_review_checks_failure(
     config: &ServeConfig,
@@ -11593,10 +11741,14 @@ async fn handle_pre_review_checks_failure(
     }
 
     let names = failing_checks.join(", ");
-    let feedback = format!(
+    let mut feedback = format!(
         "CI checks failed before review for PR #{pr}: {names}\n\n\
          Fix the failing checks, commit, and submit the existing PR again without pushing."
     );
+    for digest in failed_job_digest_feedback(config, task_id, pr, head_sha, failing_checks).await {
+        feedback.push_str("\n\n");
+        feedback.push_str(&digest);
+    }
 
     let (review_only, no_rework) = {
         let path = config.db_path.clone();
@@ -37622,6 +37774,355 @@ mod tests {
             .unwrap();
         assert!(intent.feedback.contains("Fix the failing checks"));
         assert_eq!(intent.checks, vec!["container (absent)".to_string()]);
+    }
+
+    /// Counts `fetch_failed_job_digest` calls; returns a fixed digest or a
+    /// rate-limit failure.
+    struct DigestCountingExecutor {
+        fail: bool,
+        fetched: std::sync::Mutex<Vec<(i64, String, String)>>,
+    }
+
+    impl DigestCountingExecutor {
+        fn new(fail: bool) -> Arc<Self> {
+            Arc::new(Self {
+                fail,
+                fetched: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.fetched.lock().unwrap().len()
+        }
+    }
+
+    impl merge::MergeExecutor for DigestCountingExecutor {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: true,
+                message: String::new(),
+                failure_kind: None,
+            }
+        }
+
+        fn fetch_failed_job_digest(
+            &self,
+            pr: i64,
+            _repo_dir: &Path,
+            head_sha: &str,
+            job_name: &str,
+        ) -> std::result::Result<merge::FailedJobDigest, merge::CiDigestFetchError> {
+            self.fetched
+                .lock()
+                .unwrap()
+                .push((pr, head_sha.to_string(), job_name.to_string()));
+            if self.fail {
+                return Err(merge::CiDigestFetchError::RateLimited);
+            }
+            let log =
+                "test tests::boom ... FAILED\n##[error]Process completed with exit code 101.\n";
+            Ok(merge::FailedJobDigest {
+                run_id: 4242,
+                job_id: 9191,
+                digest: quorum_core::ci_digest::digest_job_log(log.as_bytes()).unwrap(),
+            })
+        }
+    }
+
+    fn digest_test_config(
+        db_path: &Path,
+        dir: &Path,
+        executor: Arc<DigestCountingExecutor>,
+    ) -> ServeConfig {
+        let mut config = pre_review_ci_test_config(db_path.to_path_buf(), dir.to_path_buf());
+        config.merge_executor = executor;
+        config
+    }
+
+    async fn run_pre_review_checks_failure(
+        config: &ServeConfig,
+        task_id: i64,
+        pr: i64,
+        head: &str,
+        failing_checks: &[String],
+    ) {
+        handle_pre_review_checks_failure(
+            config,
+            &WorktreeManager::new(),
+            &mut Pool::new_generated(),
+            &mut Vec::new(),
+            &mut LifetimeRoster::new(),
+            &mut ProfileCooldown::new(),
+            task_id,
+            pr,
+            head,
+            failing_checks,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn pre_review_ci_base_feedback(pr: i64, names: &str) -> String {
+        format!(
+            "CI checks failed before review for PR #{pr}: {names}\n\n\
+             Fix the failing checks, commit, and submit the existing PR again without pushing."
+        )
+    }
+
+    #[tokio::test]
+    async fn pre_review_ci_failure_feedback_appends_digest_fetched_once_per_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ci-digest-feedback.db");
+        let pr = 1015;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, Some(CONFLICT_HEAD));
+        let executor = DigestCountingExecutor::new(false);
+        let config = digest_test_config(&db_path, dir.path(), executor.clone());
+        let checks: Vec<String> = vec![
+            "test".into(),
+            "lint (FAILURE)".into(),
+            "container (absent)".into(),
+        ];
+        run_pre_review_checks_failure(&config, task_id, pr, CONFLICT_HEAD, &checks).await;
+
+        assert_eq!(
+            *executor.fetched.lock().unwrap(),
+            vec![
+                (pr, CONFLICT_HEAD.to_string(), "test".to_string()),
+                (pr, CONFLICT_HEAD.to_string(), "lint".to_string()),
+            ],
+            "only failed (not absent) jobs are fetched, by check-run name"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.rework_round, 1);
+        let intent = tasks::ci_remediation_intent(task.refs.as_deref())
+            .unwrap()
+            .expect("durable remediation intent");
+        assert_eq!(intent.head_sha, CONFLICT_HEAD);
+        assert_eq!(intent.checks, checks);
+        let base = pre_review_ci_base_feedback(pr, "test, lint (FAILURE), container (absent)");
+        assert!(
+            intent.feedback.starts_with(&base),
+            "today's feedback text leads: {}",
+            intent.feedback
+        );
+        for expected in [
+            "CI job failure digest\njob: test\nrun id: 4242\njob id: 9191",
+            "CI job failure digest\njob: lint\nrun id: 4242\njob id: 9191",
+            "tests::boom",
+        ] {
+            assert!(
+                intent.feedback.contains(expected),
+                "missing {expected:?}: {}",
+                intent.feedback
+            );
+        }
+        assert!(!intent.feedback.contains("couldn't be fetched"));
+        assert!(!intent.feedback.contains("job: container"));
+
+        // Repeated handling of the same (PR, head, job) is served from cache.
+        for _ in 0..3 {
+            let lines =
+                failed_job_digest_feedback(&config, task_id, pr, CONFLICT_HEAD, &checks).await;
+            assert_eq!(lines.len(), 2);
+            assert!(lines[0].contains("job: test"));
+        }
+        assert_eq!(executor.calls(), 2, "cached keys are never refetched");
+
+        // A new head is a new key.
+        let new_head = "1111111111111111111111111111111111111111";
+        failed_job_digest_feedback(&config, task_id, pr, new_head, &checks).await;
+        assert_eq!(executor.calls(), 4);
+        assert_eq!(
+            executor.fetched.lock().unwrap()[2],
+            (pr, new_head.to_string(), "test".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn review_only_pre_review_ci_park_feedback_carries_job_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ci-digest-review-only.db");
+        let now = now_unix();
+        let pr = 1019;
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "review-only",
+                None,
+                0,
+                None,
+                None,
+                None,
+                Some(pr),
+                now,
+            )
+            .unwrap();
+            tasks::update_refs_daemon(
+                &mut conn,
+                task_id,
+                &format!(
+                    r#"{{"pr":{pr},"cx_est":3,"cx_size":"M","cx_ready":true,
+                        "cx_not_ready_reason":null,"cx_by":"test:v2"}}"#
+                ),
+                now,
+            )
+            .unwrap();
+            task_id
+        };
+        let executor = DigestCountingExecutor::new(false);
+        let config = digest_test_config(&db_path, dir.path(), executor.clone());
+        run_pre_review_checks_failure(&config, task_id, pr, CONFLICT_HEAD, &["test".into()]).await;
+
+        assert_eq!(executor.calls(), 1);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let parked = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(parked.status, "failed");
+        let refs: serde_json::Value =
+            serde_json::from_str(parked.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[tasks::PARKED_REF], true);
+        let reason = refs[tasks::PARKED_REASON_REF].as_str().unwrap();
+        assert!(reason.starts_with(&pre_review_ci_base_feedback(pr, "test")));
+        assert!(
+            reason.contains("CI job failure digest\njob: test\nrun id: 4242\njob id: 9191"),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_review_ci_digest_fetch_failure_falls_back_and_still_enters_rework() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ci-digest-fetch-failure.db");
+        let pr = 1016;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, Some(CONFLICT_HEAD));
+        let executor = DigestCountingExecutor::new(true);
+        let config = digest_test_config(&db_path, dir.path(), executor.clone());
+        let checks: Vec<String> = vec!["test".into()];
+        run_pre_review_checks_failure(&config, task_id, pr, CONFLICT_HEAD, &checks).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(
+            task.status, "rework",
+            "remediation proceeds without a digest"
+        );
+        assert_eq!(task.rework_round, 1);
+        let intent = tasks::ci_remediation_intent(task.refs.as_deref())
+            .unwrap()
+            .expect("durable remediation intent");
+        assert_eq!(
+            intent.feedback,
+            format!(
+                "{}\n\nThe failure digest for CI job `test` couldn't be fetched.",
+                pre_review_ci_base_feedback(pr, "test")
+            ),
+            "fallback carries no error internals"
+        );
+        assert_eq!(executor.calls(), 1);
+
+        // The failure is cached too: no refetch on later handling.
+        let lines = failed_job_digest_feedback(&config, task_id, pr, CONFLICT_HEAD, &checks).await;
+        assert_eq!(
+            lines,
+            vec!["The failure digest for CI job `test` couldn't be fetched.".to_string()]
+        );
+        assert_eq!(executor.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_absent_pre_review_checks_fetch_no_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ci-digest-all-absent.db");
+        let pr = 1017;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, Some(CONFLICT_HEAD));
+        let executor = DigestCountingExecutor::new(false);
+        let config = digest_test_config(&db_path, dir.path(), executor.clone());
+        let checks: Vec<String> = vec!["container (absent)".into(), "shell-tests (absent)".into()];
+        run_pre_review_checks_failure(&config, task_id, pr, CONFLICT_HEAD, &checks).await;
+
+        assert_eq!(executor.calls(), 0, "absent jobs have no log to fetch");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let intent = tasks::ci_remediation_intent(task.refs.as_deref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            intent.feedback,
+            pre_review_ci_base_feedback(pr, "container (absent), shell-tests (absent)")
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_review_ci_digest_feedback_is_bounded_in_job_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ci-digest-bounded.db");
+        let executor = DigestCountingExecutor::new(false);
+        let config = digest_test_config(&db_path, dir.path(), executor.clone());
+        let checks: Vec<String> = (0..CI_DIGEST_FEEDBACK_MAX_JOBS + 2)
+            .map(|i| format!("job-{i}"))
+            .collect();
+        let lines = failed_job_digest_feedback(&config, 1, 1018, CONFLICT_HEAD, &checks).await;
+        assert_eq!(executor.calls(), CI_DIGEST_FEEDBACK_MAX_JOBS);
+        assert_eq!(lines.len(), CI_DIGEST_FEEDBACK_MAX_JOBS + 1);
+        assert_eq!(
+            lines.last().unwrap(),
+            "Failure digests for 2 more failed CI job(s) were not included."
+        );
+        let total: usize = lines.iter().map(String::len).sum();
+        assert!(
+            total <= CI_DIGEST_FEEDBACK_MAX_JOBS * quorum_core::ci_digest::DIGEST_MAX_BYTES + 128,
+            "combined digest text is bounded: {total}"
+        );
+    }
+
+    #[test]
+    fn ci_digest_cache_evicts_oldest_beyond_entry_cap() {
+        let mut cache = CiDigestCache::default();
+        let key = |i: usize| {
+            (
+                PathBuf::from("/db"),
+                1,
+                format!("head-{i}"),
+                "job".to_string(),
+            )
+        };
+        for i in 0..CI_DIGEST_CACHE_MAX_ENTRIES + 5 {
+            cache.insert(key(i), Some(format!("digest-{i}")));
+        }
+        assert_eq!(cache.entries.len(), CI_DIGEST_CACHE_MAX_ENTRIES);
+        assert_eq!(cache.order.len(), CI_DIGEST_CACHE_MAX_ENTRIES);
+        assert_eq!(cache.get(&key(0)), None, "oldest entry evicted");
+        assert_eq!(
+            cache.get(&key(CI_DIGEST_CACHE_MAX_ENTRIES + 4)),
+            Some(Some(format!("digest-{}", CI_DIGEST_CACHE_MAX_ENTRIES + 4)))
+        );
+        // Re-inserting a live key neither duplicates nor overwrites it.
+        let last = key(CI_DIGEST_CACHE_MAX_ENTRIES + 4);
+        cache.insert(last.clone(), None);
+        assert_eq!(cache.order.len(), CI_DIGEST_CACHE_MAX_ENTRIES);
+        assert!(cache.get(&last).unwrap().is_some());
+    }
+
+    #[test]
+    fn failed_check_job_name_maps_gate_labels_to_check_runs() {
+        assert_eq!(failed_check_job_name("container (absent)"), None);
+        assert_eq!(failed_check_job_name("test"), Some("test"));
+        assert_eq!(failed_check_job_name("fmt (SKIPPED)"), Some("fmt"));
+        assert_eq!(failed_check_job_name("e2e (TIMED_OUT)"), Some("e2e"));
+        assert_eq!(
+            failed_check_job_name("test (ubuntu-latest)"),
+            Some("test (ubuntu-latest)"),
+            "matrix rollup names keep their suffix"
+        );
     }
 
     #[tokio::test]
