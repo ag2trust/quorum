@@ -311,6 +311,23 @@ pub trait MergeExecutor: Send + Sync {
         DefaultBranchStatus::Green
     }
 
+    /// Bounded failure digest of the check run named `job_name` on the PR's
+    /// exact head `head_sha`. The run id and job id come from that rollup
+    /// entry's `detailsUrl`; a rollup for any other head is an error, never a
+    /// digest. The daemon's executor holds the GitHub read authority; workers
+    /// never fetch logs themselves. Default: [`CiDigestFetchError::Unsupported`]
+    /// so lightweight test executors stay source-compatible.
+    #[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+    fn fetch_failed_job_digest(
+        &self,
+        _pr: i64,
+        _repo_dir: &Path,
+        _head_sha: &str,
+        _job_name: &str,
+    ) -> Result<FailedJobDigest, CiDigestFetchError> {
+        Err(CiDigestFetchError::Unsupported)
+    }
+
     /// #159: post or verify the daemon-owned REQUEST_CHANGES review carrying the
     /// blocking findings. Managed reviewer agents share the PR author's GitHub
     /// identity, so formal review state stays with the daemon's merge account.
@@ -364,6 +381,266 @@ fn credential_failure(error: &GithubCredentialError) -> MergeResult {
         message: format!("GitHub credential unavailable (gh not run): {error}"),
         failure_kind: Some(MergeFailureKind::PolicyBlocked),
     }
+}
+
+/// Wall-clock cap on one [`MergeExecutor::fetch_failed_job_digest`] call,
+/// covering both the rollup read and the streamed log download.
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+pub const CI_DIGEST_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Cap on the `statusCheckRollup,headRefOid` JSON read for the job lookup.
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+const CI_DIGEST_ROLLUP_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// Bytes of `gh` stderr kept for error classification only; the remainder is
+/// drained and discarded. Stderr is never rendered into an error.
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+const CI_DIGEST_STDERR_CLASSIFY_BYTES: u64 = 8 * 1024;
+
+/// Failure digest of one GitHub Actions job, with the ids it was read from.
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedJobDigest {
+    pub run_id: u64,
+    pub job_id: u64,
+    pub digest: quorum_core::ci_digest::CiJobDigest,
+}
+
+/// Why a failed-job digest could not be produced. Variants carry only
+/// daemon-derived facts: never `gh` stderr, response bodies, headers, or a
+/// token value.
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CiDigestFetchError {
+    /// The executor has no GitHub log access (test/mock executors).
+    Unsupported,
+    /// The credential source produced no token; no `gh` child was spawned.
+    Credentials(GithubCredentialError),
+    /// The `gh` binary could not be spawned.
+    SpawnFailed,
+    /// `gh pr view` for the rollup exited non-zero.
+    RollupQueryFailed { exit_code: Option<i32> },
+    /// The rollup response was not valid JSON with a rollup array, or
+    /// exceeded its byte cap.
+    RollupUnparseable,
+    /// The rollup GitHub returned is for a different PR head.
+    HeadMismatch {
+        expected: String,
+        actual: Option<String>,
+    },
+    /// No check run with the requested name is in the rollup.
+    JobNotFound,
+    /// The matching check run has no `detailsUrl`.
+    MissingDetailsUrl,
+    /// The `detailsUrl` is not an Actions `.../runs/<run>/job/<job>` URL.
+    UnparseableDetailsUrl,
+    /// GitHub no longer has the job log (HTTP 410 / expired).
+    LogExpired,
+    /// GitHub rate-limited the request.
+    RateLimited,
+    /// HTTP 401/403 for the log.
+    Forbidden,
+    /// HTTP 404 for the log.
+    NotFound,
+    /// `gh api` exited non-zero for another reason.
+    ApiFailed { exit_code: Option<i32> },
+    /// Reading the streamed log failed.
+    LogReadFailed,
+    /// The fetch exceeded its wall-clock cap; the child was killed.
+    TimedOut { after: Duration },
+}
+
+impl std::fmt::Display for CiDigestFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported => write!(f, "CI log fetch is not supported by this executor"),
+            Self::Credentials(error) => {
+                write!(f, "GitHub credential unavailable (gh not run): {error}")
+            }
+            Self::SpawnFailed => write!(f, "failed to run gh"),
+            Self::RollupQueryFailed { exit_code } => {
+                write!(
+                    f,
+                    "gh pr view for the check rollup failed (exit {exit_code:?})"
+                )
+            }
+            Self::RollupUnparseable => write!(f, "check rollup response was unparseable"),
+            Self::HeadMismatch { expected, actual } => write!(
+                f,
+                "check rollup is for head {} but expected {expected}",
+                actual.as_deref().unwrap_or("<none>")
+            ),
+            Self::JobNotFound => write!(f, "no check run with that name in the rollup"),
+            Self::MissingDetailsUrl => write!(f, "check run has no detailsUrl"),
+            Self::UnparseableDetailsUrl => {
+                write!(f, "check run detailsUrl is not an Actions job URL")
+            }
+            Self::LogExpired => write!(f, "job log has expired"),
+            Self::RateLimited => write!(f, "GitHub API rate limit hit fetching the job log"),
+            Self::Forbidden => write!(f, "GitHub denied access to the job log"),
+            Self::NotFound => write!(f, "job log not found"),
+            Self::ApiFailed { exit_code } => {
+                write!(f, "gh api for the job log failed (exit {exit_code:?})")
+            }
+            Self::LogReadFailed => write!(f, "reading the job log stream failed"),
+            Self::TimedOut { after } => write!(f, "CI log fetch timed out after {after:?}"),
+        }
+    }
+}
+
+impl std::error::Error for CiDigestFetchError {}
+
+/// Parse `(run_id, job_id)` from an Actions check-run URL of the form
+/// `.../actions/runs/<run>/job/<job>` (optionally followed by `?`/`#`).
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+fn parse_actions_job_url(url: &str) -> Option<(u64, u64)> {
+    let path = url.split(['?', '#']).next()?;
+    let rest = path.rsplit_once("/actions/runs/")?.1;
+    let (run, rest) = rest.split_once("/job/")?;
+    let job = rest.trim_end_matches('/');
+    let parse = |s: &str| -> Option<u64> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok().filter(|id| *id > 0)
+    };
+    Some((parse(run)?, parse(job)?))
+}
+
+/// Resolve the run and job ids of the check run named `job_name` from a
+/// `statusCheckRollup,headRefOid` response bound to `expected_head`. The first
+/// entry with that name is used, matching [`validate_required_jobs`].
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+fn resolve_failed_job_ids(
+    json: &[u8],
+    expected_head: &str,
+    job_name: &str,
+) -> Result<(u64, u64), CiDigestFetchError> {
+    let val: serde_json::Value =
+        serde_json::from_slice(json).map_err(|_| CiDigestFetchError::RollupUnparseable)?;
+    let actual = val
+        .get("headRefOid")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|sha| !sha.is_empty());
+    if actual != Some(expected_head.trim()) || expected_head.trim().is_empty() {
+        return Err(CiDigestFetchError::HeadMismatch {
+            expected: expected_head.to_string(),
+            actual: actual.map(str::to_string),
+        });
+    }
+    let rollup = val
+        .get("statusCheckRollup")
+        .and_then(|v| v.as_array())
+        .ok_or(CiDigestFetchError::RollupUnparseable)?;
+    let entry = rollup
+        .iter()
+        .find(|entry| entry.get("name").and_then(|v| v.as_str()) == Some(job_name))
+        .ok_or(CiDigestFetchError::JobNotFound)?;
+    let url = entry
+        .get("detailsUrl")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .ok_or(CiDigestFetchError::MissingDetailsUrl)?;
+    parse_actions_job_url(url).ok_or(CiDigestFetchError::UnparseableDetailsUrl)
+}
+
+/// Classify a failed `gh api` log download from the bounded stderr head. The
+/// stderr text itself never leaves this function.
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+fn classify_log_fetch_failure(stderr_head: &[u8], exit_code: Option<i32>) -> CiDigestFetchError {
+    let text = String::from_utf8_lossy(stderr_head).to_ascii_lowercase();
+    if text.contains("rate limit") || text.contains("http 429") {
+        CiDigestFetchError::RateLimited
+    } else if text.contains("http 410") || text.contains("expired") {
+        CiDigestFetchError::LogExpired
+    } else if text.contains("http 404") {
+        CiDigestFetchError::NotFound
+    } else if text.contains("http 403") || text.contains("http 401") {
+        CiDigestFetchError::Forbidden
+    } else {
+        CiDigestFetchError::ApiFailed { exit_code }
+    }
+}
+
+/// Result of one deadline-bounded `gh` child.
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+struct BoundedGhRun<T> {
+    status: std::process::ExitStatus,
+    stdout: T,
+    stderr_head: Vec<u8>,
+}
+
+/// Spawn `cmd` with piped stdout/stderr, hand stdout to `consume` on a reader
+/// thread, and wait until `deadline`. On timeout the child is killed and
+/// reaped. Stderr keeps only [`CI_DIGEST_STDERR_CLASSIFY_BYTES`] and drains
+/// the rest so the child never blocks on a full pipe.
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+fn run_gh_bounded<T, F>(
+    mut cmd: Command,
+    deadline: Instant,
+    timeout: Duration,
+    consume: F,
+) -> Result<BoundedGhRun<T>, CiDigestFetchError>
+where
+    T: Send + 'static,
+    F: FnOnce(std::process::ChildStdout) -> T + Send + 'static,
+{
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|_| CiDigestFetchError::SpawnFailed)?;
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+
+    let (out_tx, out_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = out_tx.send(consume(stdout));
+    });
+    let (err_tx, err_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut head = Vec::new();
+        let _ = (&mut stderr)
+            .take(CI_DIGEST_STDERR_CLASSIFY_BYTES)
+            .read_to_end(&mut head);
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        let _ = err_tx.send(head);
+    });
+
+    let timed_out = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+        CiDigestFetchError::TimedOut { after: timeout }
+    };
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+
+    let Ok(stdout) = out_rx.recv_timeout(remaining()) else {
+        return Err(timed_out(&mut child));
+    };
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if remaining().is_zero() => return Err(timed_out(&mut child)),
+            Ok(None) => std::thread::sleep(remaining().min(Duration::from_millis(20))),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CiDigestFetchError::SpawnFailed);
+            }
+        }
+    };
+    // The child has exited; a stderr pipe still held open by a grandchild
+    // must not extend the wall-clock cap.
+    let stderr_head = err_rx.recv_timeout(remaining()).unwrap_or_default();
+    Ok(BoundedGhRun {
+        status,
+        stdout,
+        stderr_head,
+    })
 }
 
 fn gh_pr_state_is_merged(json_output: &str) -> bool {
@@ -731,6 +1008,95 @@ impl GhMergeExecutor {
         }
         token.apply_to_command(&mut cmd);
         Ok(cmd)
+    }
+
+    /// Build one `gh api` child. `gh api` rejects `-R`, so the repo travels
+    /// via `GH_REPO` ([`crate::serve::collector::gh_env`]); the token comes
+    /// from the same per-call credential source as [`Self::build_gh_cmd`].
+    #[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+    fn build_gh_api_cmd(
+        &self,
+        args: &[&str],
+        repo_dir: &Path,
+    ) -> std::result::Result<Command, GithubCredentialError> {
+        let token = self.credentials.token()?;
+        let mut cmd = Command::new(&self.gh_program);
+        cmd.args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(repo_dir);
+        for (key, value) in crate::serve::collector::gh_env(&self.gh_repo) {
+            cmd.env(key, value);
+        }
+        token.apply_to_command(&mut cmd);
+        Ok(cmd)
+    }
+
+    /// [`MergeExecutor::fetch_failed_job_digest`] with an explicit wall-clock
+    /// cap (tests use a short one).
+    #[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+    fn fetch_failed_job_digest_within(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        head_sha: &str,
+        job_name: &str,
+        timeout: Duration,
+    ) -> Result<FailedJobDigest, CiDigestFetchError> {
+        use std::io::Read;
+
+        let deadline = Instant::now() + timeout;
+        let pr_str = pr.to_string();
+        let rollup_cmd = self
+            .build_gh_cmd(
+                &[
+                    "pr",
+                    "view",
+                    &pr_str,
+                    "--json",
+                    "statusCheckRollup,headRefOid",
+                ],
+                repo_dir,
+            )
+            .map_err(CiDigestFetchError::Credentials)?;
+        let rollup = run_gh_bounded(rollup_cmd, deadline, timeout, |stdout| {
+            let mut buf = Vec::new();
+            stdout
+                .take(CI_DIGEST_ROLLUP_MAX_BYTES + 1)
+                .read_to_end(&mut buf)
+                .map(|_| buf)
+        })?;
+        if !rollup.status.success() {
+            return Err(CiDigestFetchError::RollupQueryFailed {
+                exit_code: rollup.status.code(),
+            });
+        }
+        let json = rollup
+            .stdout
+            .ok()
+            .filter(|buf| buf.len() as u64 <= CI_DIGEST_ROLLUP_MAX_BYTES)
+            .ok_or(CiDigestFetchError::RollupUnparseable)?;
+        let (run_id, job_id) = resolve_failed_job_ids(&json, head_sha, job_name)?;
+
+        let endpoint = format!("repos/{{owner}}/{{repo}}/actions/jobs/{job_id}/logs");
+        let log_cmd = self
+            .build_gh_api_cmd(&["api", &endpoint], repo_dir)
+            .map_err(CiDigestFetchError::Credentials)?;
+        let log = run_gh_bounded(log_cmd, deadline, timeout, |stdout| {
+            quorum_core::ci_digest::digest_job_log(std::io::BufReader::new(stdout))
+        })?;
+        if !log.status.success() {
+            return Err(classify_log_fetch_failure(
+                &log.stderr_head,
+                log.status.code(),
+            ));
+        }
+        let digest = log.stdout.map_err(|_| CiDigestFetchError::LogReadFailed)?;
+        Ok(FailedJobDigest {
+            run_id,
+            job_id,
+            digest,
+        })
     }
 
     fn run_gh(&self, args: &[&str], repo_dir: &Path) -> MergeResult {
@@ -1965,6 +2331,22 @@ impl MergeExecutor for GhMergeExecutor {
         required_jobs: &[String],
     ) -> RequiredJobsOutcome {
         self.query_required_jobs(pr, repo_dir, Some(expected_head), required_jobs)
+    }
+
+    fn fetch_failed_job_digest(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        head_sha: &str,
+        job_name: &str,
+    ) -> Result<FailedJobDigest, CiDigestFetchError> {
+        self.fetch_failed_job_digest_within(
+            pr,
+            repo_dir,
+            head_sha,
+            job_name,
+            CI_DIGEST_FETCH_TIMEOUT,
+        )
     }
 
     fn check_default_branch_ci(&self, repo_dir: &Path, branch: &str) -> DefaultBranchStatus {
@@ -3493,7 +3875,8 @@ mod tests {
 
     /// Reusable fake `gh`: records argv and `GH_TOKEN` per call and serves
     /// scripted stdout/stderr/exit per route (`probe`, `reviews`, `decision`,
-    /// `review`, `merge`, `view`, `other`).
+    /// `rollup`, `logs`, `review`, `merge`, `view`, `other`). A
+    /// `<route>.sleep` file makes that route `exec sleep` after its output.
     #[cfg(unix)]
     struct FakeGh {
         dir: tempfile::TempDir,
@@ -3505,6 +3888,8 @@ mod tests {
     struct FakeGhCall {
         argv: Vec<String>,
         gh_token: String,
+        /// `GH_REPO` in the child env (empty when unset).
+        gh_repo_env: String,
     }
 
     #[cfg(unix)]
@@ -3517,9 +3902,11 @@ mod tests {
                 r#"#!/bin/sh
 d='{root}'
 printf 'CALL\t%s\n' "$GH_TOKEN" >> "$d/calls.log"
+printf 'REPO\t%s\n' "${{GH_REPO:-}}" >> "$d/calls.log"
 for a in "$@"; do printf 'ARG\t%s\n' "$(printf '%s' "$a" | tr '\n' '\036')" >> "$d/calls.log"; done
 case "$1 $2" in
   "api graphql") route=probe ;;
+  "api repos/"*) route=logs ;;
   "pr review") route=review ;;
   "pr merge") route=merge ;;
   "pr view")
@@ -3527,6 +3914,7 @@ case "$1 $2" in
     for a in "$@"; do
       case "$a" in
         reviews,headRefOid) route=reviews ;;
+        statusCheckRollup,headRefOid) route=rollup ;;
         reviewDecision) route=decision ;;
       esac
     done ;;
@@ -3539,6 +3927,7 @@ out="$d/$route.out"
 [ -f "$out.$n" ] && out="$out.$n"
 [ -f "$out" ] && cat "$out"
 [ -f "$d/$route.err" ] && cat "$d/$route.err" >&2
+[ -f "$d/$route.sleep" ] && exec sleep "$(cat "$d/$route.sleep")"
 code=0
 [ -f "$d/$route.code" ] && code=$(cat "$d/$route.code")
 exit "$code"
@@ -3577,7 +3966,10 @@ exit "$code"
                     calls.push(FakeGhCall {
                         argv: Vec::new(),
                         gh_token: token.to_string(),
+                        gh_repo_env: String::new(),
                     });
+                } else if let Some(repo) = line.strip_prefix("REPO\t") {
+                    calls.last_mut().unwrap().gh_repo_env = repo.to_string();
                 } else if let Some(arg) = line.strip_prefix("ARG\t") {
                     // The script encodes newlines as RS (0x1e) to keep one arg per line.
                     calls
@@ -3790,6 +4182,320 @@ exit "$code"
         );
         assert_eq!(calls[3].argv[..2], ["pr", "review"]);
         assert_eq!(calls[4].argv[..2], ["pr", "merge"]);
+    }
+
+    // ── fetch_failed_job_digest ─────────────────────────────────────────
+
+    #[cfg(unix)]
+    const DIGEST_SECRET: &str = "ghs_digest_secret_value";
+    #[cfg(unix)]
+    const DIGEST_HEAD: &str = "abc123head";
+
+    #[cfg(unix)]
+    fn rollup_json(head: &str, details_url: Option<&str>) -> String {
+        let url = details_url
+            .map(|u| format!(r#","detailsUrl":"{u}""#))
+            .unwrap_or_default();
+        format!(
+            r#"{{"headRefOid":"{head}","statusCheckRollup":[{{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/o/r/actions/runs/1/job/2"}},{{"__typename":"CheckRun","name":"container","status":"COMPLETED","conclusion":"FAILURE"{url}}}]}}"#
+        )
+    }
+
+    #[cfg(unix)]
+    fn digest_fixture(gh_repo: Option<&str>) -> (FakeGh, GhMergeExecutor) {
+        let gh = FakeGh::new();
+        let exec = gh.exec(
+            Arc::new(FakeCredentialSource::token(DIGEST_SECRET)),
+            gh_repo,
+        );
+        (gh, exec)
+    }
+
+    #[cfg(unix)]
+    fn assert_no_repo_flag_or_secret(calls: &[FakeGhCall]) {
+        for call in calls {
+            assert_eq!(call.gh_token, DIGEST_SECRET, "token travels via GH_TOKEN");
+            assert!(!call.argv.iter().any(|a| a.contains(DIGEST_SECRET)));
+            if call.argv.first().map(String::as_str) == Some("api") {
+                assert!(
+                    !call.argv.iter().any(|a| a == "-R" || a == "--repo"),
+                    "gh api rejects -R: {:?}",
+                    call.argv
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn actions_job_url_parses_run_and_job_ids() {
+        assert_eq!(
+            parse_actions_job_url("https://github.com/o/r/actions/runs/123/job/456"),
+            Some((123, 456))
+        );
+        assert_eq!(
+            parse_actions_job_url("https://github.com/o/r/actions/runs/123/job/456?pr=9#step:3:1"),
+            Some((123, 456))
+        );
+        for bad in [
+            "",
+            "https://github.com/o/r/runs/456",
+            "https://github.com/o/r/actions/runs/123",
+            "https://github.com/o/r/actions/runs/x/job/456",
+            "https://github.com/o/r/actions/runs/123/job/",
+            "https://github.com/o/r/actions/runs/0/job/456",
+            "https://github.com/o/r/actions/runs/123/job/45/extra",
+        ] {
+            assert_eq!(parse_actions_job_url(bad), None, "{bad}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_failed_job_digest_resolves_ids_and_streams_digest() {
+        let (gh, exec) = digest_fixture(Some("owner/repo"));
+        gh.respond(
+            "rollup",
+            &rollup_json(
+                DIGEST_HEAD,
+                Some("https://github.com/owner/repo/actions/runs/777/job/888"),
+            ),
+            0,
+        );
+        gh.respond(
+            "logs",
+            "2026-01-01T00:00:00.0000000Z test serve::merge::tests::boom ... FAILED\n\
+             2026-01-01T00:00:00.0000000Z ##[error]Process completed with exit code 1.\n",
+            0,
+        );
+
+        let fetched = exec
+            .fetch_failed_job_digest(9, Path::new("/tmp"), DIGEST_HEAD, "container")
+            .unwrap();
+        assert_eq!((fetched.run_id, fetched.job_id), (777, 888));
+        assert_eq!(fetched.digest.failed_names, ["serve::merge::tests::boom"]);
+        let rendered = quorum_core::ci_digest::render_digest(
+            &fetched.digest,
+            "container",
+            fetched.run_id,
+            fetched.job_id,
+        );
+        assert!(
+            rendered.contains("777") && rendered.contains("888"),
+            "{rendered}"
+        );
+
+        let calls = gh.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].argv,
+            [
+                "pr",
+                "view",
+                "9",
+                "--json",
+                "statusCheckRollup,headRefOid",
+                "-R",
+                "owner/repo"
+            ]
+        );
+        assert_eq!(
+            calls[1].argv,
+            ["api", "repos/{owner}/{repo}/actions/jobs/888/logs"]
+        );
+        assert_eq!(calls[1].gh_repo_env, "owner/repo", "repo via GH_REPO");
+        assert_no_repo_flag_or_secret(&calls);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_failed_job_digest_maps_gh_api_failures_without_stderr() {
+        let cases: &[(&str, CiDigestFetchError)] = &[
+            (
+                "gh: Gone (HTTP 410) Authorization: token ghs_leak",
+                CiDigestFetchError::LogExpired,
+            ),
+            (
+                "gh: API rate limit exceeded for installation (HTTP 403)",
+                CiDigestFetchError::RateLimited,
+            ),
+            (
+                "gh: Resource not accessible by integration (HTTP 403)",
+                CiDigestFetchError::Forbidden,
+            ),
+            ("gh: Not Found (HTTP 404)", CiDigestFetchError::NotFound),
+            (
+                "unexpected ghs_leak failure",
+                CiDigestFetchError::ApiFailed { exit_code: Some(1) },
+            ),
+        ];
+        for (stderr, expected) in cases {
+            let (gh, exec) = digest_fixture(None);
+            gh.respond(
+                "rollup",
+                &rollup_json(
+                    DIGEST_HEAD,
+                    Some("https://github.com/o/r/actions/runs/5/job/6"),
+                ),
+                0,
+            );
+            gh.fail("logs", stderr, 1);
+            let error = exec
+                .fetch_failed_job_digest(9, Path::new("/tmp"), DIGEST_HEAD, "container")
+                .unwrap_err();
+            assert_eq!(&error, expected, "{stderr}");
+            let text = format!("{error} {error:?}");
+            for leaked in ["ghs_leak", "Authorization", DIGEST_SECRET, stderr] {
+                assert!(!text.contains(leaked), "{text}");
+            }
+            let calls = gh.calls();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[1].gh_repo_env, "", "no GH_REPO without a slug");
+            assert_no_repo_flag_or_secret(&calls);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_failed_job_digest_rejects_rollup_without_fetching_log() {
+        let url = Some("https://github.com/o/r/actions/runs/5/job/6");
+        let cases: Vec<(String, i32, &str, CiDigestFetchError)> = vec![
+            (
+                rollup_json("otherhead", url),
+                0,
+                "container",
+                CiDigestFetchError::HeadMismatch {
+                    expected: DIGEST_HEAD.into(),
+                    actual: Some("otherhead".into()),
+                },
+            ),
+            (
+                r#"{"statusCheckRollup":[]}"#.into(),
+                0,
+                "container",
+                CiDigestFetchError::HeadMismatch {
+                    expected: DIGEST_HEAD.into(),
+                    actual: None,
+                },
+            ),
+            (
+                rollup_json(DIGEST_HEAD, None),
+                0,
+                "container",
+                CiDigestFetchError::MissingDetailsUrl,
+            ),
+            (
+                rollup_json(DIGEST_HEAD, Some("https://example.com/build/5")),
+                0,
+                "container",
+                CiDigestFetchError::UnparseableDetailsUrl,
+            ),
+            (
+                rollup_json(DIGEST_HEAD, url),
+                0,
+                "absent-job",
+                CiDigestFetchError::JobNotFound,
+            ),
+            (
+                "not json".into(),
+                0,
+                "container",
+                CiDigestFetchError::RollupUnparseable,
+            ),
+            (
+                String::new(),
+                1,
+                "container",
+                CiDigestFetchError::RollupQueryFailed { exit_code: Some(1) },
+            ),
+        ];
+        for (rollup, code, job, expected) in cases {
+            let (gh, exec) = digest_fixture(Some("o/r"));
+            gh.respond("rollup", &rollup, code);
+            gh.respond("logs", "should never be read", 0);
+            let error = exec
+                .fetch_failed_job_digest(9, Path::new("/tmp"), DIGEST_HEAD, job)
+                .unwrap_err();
+            assert_eq!(error, expected, "{rollup}");
+            let calls = gh.calls();
+            assert_eq!(calls.len(), 1, "no log fetch after a rollup error");
+            assert_no_repo_flag_or_secret(&calls);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_failed_job_digest_caps_large_streamed_log() {
+        use quorum_core::ci_digest::{render_digest, DIGEST_MAX_BYTES, FAILED_NAMES_MAX};
+        use std::fmt::Write as _;
+
+        let (gh, exec) = digest_fixture(Some("o/r"));
+        gh.respond(
+            "rollup",
+            &rollup_json(
+                DIGEST_HEAD,
+                Some("https://github.com/o/r/actions/runs/5/job/6"),
+            ),
+            0,
+        );
+        // ~12 MiB: many FAILED markers, filler, and one unbounded line.
+        let mut log = String::with_capacity(13 << 20);
+        for i in 0..100_000 {
+            writeln!(log, "test suite::case_{i} ... FAILED").unwrap();
+            writeln!(log, "filler line {i} {}", "x".repeat(64)).unwrap();
+        }
+        log.push_str(&"y".repeat(4 << 20));
+        log.push('\n');
+        assert!(log.len() > 12 << 20);
+        gh.respond("logs", &log, 0);
+
+        let fetched = exec
+            .fetch_failed_job_digest(9, Path::new("/tmp"), DIGEST_HEAD, "container")
+            .unwrap();
+        assert_eq!(fetched.digest.failed_names.len(), FAILED_NAMES_MAX);
+        assert!(fetched.digest.failed_names_truncated);
+        let rendered = render_digest(&fetched.digest, "container", 5, 6);
+        assert!(rendered.len() <= DIGEST_MAX_BYTES, "{}", rendered.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_failed_job_digest_kills_log_fetch_at_wall_clock_cap() {
+        let (gh, exec) = digest_fixture(Some("o/r"));
+        gh.respond(
+            "rollup",
+            &rollup_json(
+                DIGEST_HEAD,
+                Some("https://github.com/o/r/actions/runs/5/job/6"),
+            ),
+            0,
+        );
+        gh.respond("logs", "partial line\n", 0);
+        std::fs::write(gh.dir.path().join("logs.sleep"), "30").unwrap();
+
+        let timeout = Duration::from_millis(500);
+        let started = Instant::now();
+        let error = exec
+            .fetch_failed_job_digest_within(9, Path::new("/tmp"), DIGEST_HEAD, "container", timeout)
+            .unwrap_err();
+        assert_eq!(error, CiDigestFetchError::TimedOut { after: timeout });
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timeout must bound the fetch: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn default_executor_digest_fetch_is_unsupported() {
+        let exec = CommandMergeExecutor {
+            command: "true".into(),
+            checks_cmd: None,
+            mergeability_cmd: None,
+        };
+        assert_eq!(
+            exec.fetch_failed_job_digest(1, Path::new("/tmp"), "head", "job"),
+            Err(CiDigestFetchError::Unsupported)
+        );
     }
 
     // ── ensure_changes_requested: one- vs two-identity ──────────────────
