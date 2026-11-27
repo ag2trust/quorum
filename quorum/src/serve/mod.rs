@@ -13647,6 +13647,34 @@ async fn reconcile_merged_continuations(
     }
 }
 
+/// How often the standalone heartbeat refreshes the daemon lock and detects
+/// theft.
+const LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only override for [`LOCK_HEARTBEAT_INTERVAL`], scoped to one
+    /// `tick_loop` future so lock-theft tests need not wait the full interval.
+    static TEST_LOCK_HEARTBEAT_INTERVAL: Duration;
+}
+
+/// Run `future` (a `tick_loop` call) with a shortened lock heartbeat.
+#[cfg(test)]
+pub(crate) async fn with_test_lock_heartbeat<F: std::future::Future>(
+    interval: Duration,
+    future: F,
+) -> F::Output {
+    TEST_LOCK_HEARTBEAT_INTERVAL.scope(interval, future).await
+}
+
+fn lock_heartbeat_interval() -> Duration {
+    #[cfg(test)]
+    if let Ok(interval) = TEST_LOCK_HEARTBEAT_INTERVAL.try_with(|interval| *interval) {
+        return interval;
+    }
+    LOCK_HEARTBEAT_INTERVAL
+}
+
 async fn tick_loop(
     config: &ServeConfig,
     daemon_pid: i64,
@@ -14006,8 +14034,9 @@ async fn tick_loop_owning_doctor(
         let db = config.db_path.clone();
         let instance = daemon_instance.clone();
         let stolen = lock_stolen.clone();
+        let heartbeat = lock_heartbeat_interval();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            let mut interval = tokio::time::interval(heartbeat);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
@@ -44541,13 +44570,14 @@ mod tests {
 
         let mut child = tokio::process::Command::new("sh")
             .args(["-c", "sleep 2"])
+            .process_group(0)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        let proc = runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+        let proc = runner::RunnerProc::Claude(agent::AgentProc::from_parts_in_own_group(
             child,
             stdin,
             BufReader::new(stdout),
@@ -44585,19 +44615,20 @@ mod tests {
         body.push('\n');
         std::fs::write(&path, body).unwrap();
         let script = format!("cat '{}'; {then}", path.display());
+        // Own process group so `kill_and_reap` ends the `then` tail instead of
+        // waiting it out.
         let mut child = tokio::process::Command::new("sh")
             .args(["-c", &script])
+            .process_group(0)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        slot_with_process(runner::RunnerProc::Claude(agent::AgentProc::from_parts(
-            child,
-            stdin,
-            BufReader::new(stdout),
-        )))
+        slot_with_process(runner::RunnerProc::Claude(
+            agent::AgentProc::from_parts_in_own_group(child, stdin, BufReader::new(stdout)),
+        ))
     }
 
     fn fixture_prefix_through(fixture: &str, kind: &str, subtype: Option<&str>) -> Vec<String> {
@@ -65041,10 +65072,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             drain_test_slot(DRAIN_AUTHOR, 1, worktree, DRAIN_AUTHOR_CAP, Some(run_id)).await;
         slot.pr = None;
         // Alive across the whole park/reap pass, like a persistent provider
-        // child between turns. Test-only `from_parts` children have no process
-        // group to kill, so teardown waits for this bounded exit.
+        // child between turns. Its own process group lets teardown kill it
+        // rather than wait for this bounded exit.
         let mut child = tokio::process::Command::new("sleep")
             .arg("2")
+            .process_group(0)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -65053,11 +65085,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let stdout = child.stdout.take().unwrap();
         let short_lived = std::mem::replace(
             &mut slot.proc,
-            SlotProcess::running(runner::RunnerProc::Claude(agent::AgentProc::from_parts(
-                child,
-                stdin,
-                tokio::io::BufReader::new(stdout),
-            ))),
+            SlotProcess::running(runner::RunnerProc::Claude(
+                agent::AgentProc::from_parts_in_own_group(
+                    child,
+                    stdin,
+                    tokio::io::BufReader::new(stdout),
+                ),
+            )),
         );
         short_lived.kill_and_reap().await;
         assert_eq!(
@@ -67353,13 +67387,21 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
     #[test]
     fn planning_and_claim_partition_classified_shapes() {
+        // Migrate once and give every shape a fresh copy: 80 full migration
+        // runs dominated this test's wall time. Dropping the only connection
+        // checkpoints the WAL, so the copied main file is the whole database.
+        let dir = tempfile::tempdir().unwrap();
+        let template = dir.path().join("template.db");
+        drop(quorum_core::db::open(&template).unwrap());
+        assert!(!dir.path().join("template.db-wal").exists());
         for size in ["S", "M", "L", "XL"] {
             for cx_est in 1..=5 {
                 for flag_count in [0, 1] {
                     for continue_pr in [None, Some(500)] {
                         let dir = tempfile::tempdir().unwrap();
-                        let mut conn =
-                            quorum_core::db::open(&dir.path().join("partition.db")).unwrap();
+                        let path = dir.path().join("partition.db");
+                        std::fs::copy(&template, &path).unwrap();
+                        let mut conn = quorum_core::db::open(&path).unwrap();
                         conn.execute(
                             "INSERT INTO tasks(
                                 title,status,priority,created_by,created_at,updated_at,refs,
@@ -74603,29 +74645,50 @@ exec /bin/cat '{stdout}'
         std::fs::set_permissions(&git_wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::set_permissions(&tar_wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let error = frozen_planner_view_with_options(
-            repo.path(),
-            &frozen,
-            &git_wrapper,
-            &tar_wrapper,
-            // The full suite runs many real-process canaries concurrently;
-            // leave enough headroom for the preliminary git check and both
-            // wrappers to be scheduled before exercising the deadline path.
-            Duration::from_secs(15),
-            1024 * 1024,
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("timed out"), "{error}");
-        for pid_file in [&archive_pid, &tar_pid] {
-            let pid: i32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
-            assert_eq!(
-                unsafe { libc::kill(pid, 0) },
-                -1,
-                "{} was not reaped",
-                pid_file.display()
-            );
+        // The deadline is pure wall time in the passing case. Try a short one
+        // first; the full suite runs many real-process canaries concurrently,
+        // so fall back to a CI-tolerant deadline only when the preliminary git
+        // check and both wrappers were not all scheduled before it fired.
+        let timeouts = [Duration::from_secs(2), Duration::from_secs(15)];
+        for (attempt, timeout) in timeouts.into_iter().enumerate() {
+            for pid_file in [&archive_pid, &tar_pid] {
+                let _ = std::fs::remove_file(pid_file);
+            }
+            let error = frozen_planner_view_with_options(
+                repo.path(),
+                &frozen,
+                &git_wrapper,
+                &tar_wrapper,
+                timeout,
+                1024 * 1024,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("timed out"), "{error}");
+            let pids =
+                [&archive_pid, &tar_pid].map(|pid_file| std::fs::read_to_string(pid_file).ok());
+            if pids.iter().any(Option::is_none) {
+                // A wrapper that never started may still have been reaped; check
+                // whichever did start, then retry with the longer deadline.
+                assert!(
+                    attempt + 1 < timeouts.len(),
+                    "wrappers never all started within {timeout:?}"
+                );
+            }
+            for (pid_file, pid) in [&archive_pid, &tar_pid].iter().zip(&pids) {
+                let Some(pid) = pid else { continue };
+                let pid: i32 = pid.parse().unwrap();
+                assert_eq!(
+                    unsafe { libc::kill(pid, 0) },
+                    -1,
+                    "{} was not reaped",
+                    pid_file.display()
+                );
+            }
+            if pids.iter().all(Option::is_some) {
+                return;
+            }
         }
     }
 

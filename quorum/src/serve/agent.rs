@@ -1045,6 +1045,20 @@ impl AgentProc {
         self.diagnostics.drain()
     }
 
+    /// Like [`Self::from_parts`] for a child spawned with `process_group(0)`:
+    /// teardown kills that group instead of waiting for a natural exit.
+    #[cfg(test)]
+    pub fn from_parts_in_own_group(
+        child: Child,
+        stdin: tokio::process::ChildStdin,
+        reader: BufReader<tokio::process::ChildStdout>,
+    ) -> Self {
+        let process_group_id = child.id().expect("fixture child is running") as i32;
+        let mut proc = Self::from_parts(child, stdin, reader);
+        proc.process_group_id = process_group_id;
+        proc
+    }
+
     #[cfg(test)]
     pub fn from_parts(
         child: Child,

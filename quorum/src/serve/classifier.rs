@@ -424,7 +424,11 @@ mod tests {
     // process-heavy cases. Keep their assertion bounded without mistaking
     // ordinary CI scheduling delay for a boundary regression.
     const TEST_BOUNDARY_TIMEOUT: Duration = Duration::from_secs(15);
-    const TEST_STDIN_FEED_TIMEOUT: Duration = Duration::from_secs(15);
+    // A no-read provider makes the feed deadline pure wall time in the
+    // passing case: try a short deadline first and fall back to the
+    // CI-tolerant one only if the provider had not recorded its PID yet.
+    const TEST_STDIN_FEED_TIMEOUTS: [Duration; 2] =
+        [Duration::from_secs(2), Duration::from_secs(15)];
 
     fn prompt_task(body: Option<String>) -> TaskForClassification {
         TaskForClassification {
@@ -755,33 +759,44 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let error = match spawn_classifier_configured_with_timeout(
-            &tasks,
-            &[],
-            runner.to_str(),
-            false,
-            AgentKind::for_model(CLASSIFIER_MODEL).unwrap(),
-            CLASSIFIER_MODEL,
-            CLASSIFIER_EFFORT,
-            "read-only",
-            "",
-            TEST_STDIN_FEED_TIMEOUT,
-        )
-        .await
-        {
-            Ok(slot) => {
-                slot.kill_and_reap().await;
-                panic!("a no-read classifier unexpectedly accepted the bounded prompt")
-            }
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        let pid: i32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
-        assert_eq!(
-            unsafe { libc::kill(pid, 0) },
-            -1,
-            "classifier was not reaped"
-        );
+        for (attempt, timeout) in TEST_STDIN_FEED_TIMEOUTS.into_iter().enumerate() {
+            let _ = std::fs::remove_file(&pid_path);
+            let error = match spawn_classifier_configured_with_timeout(
+                &tasks,
+                &[],
+                runner.to_str(),
+                false,
+                AgentKind::for_model(CLASSIFIER_MODEL).unwrap(),
+                CLASSIFIER_MODEL,
+                CLASSIFIER_EFFORT,
+                "read-only",
+                "",
+                timeout,
+            )
+            .await
+            {
+                Ok(slot) => {
+                    slot.kill_and_reap().await;
+                    panic!("a no-read classifier unexpectedly accepted the bounded prompt")
+                }
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            let Ok(pid) = std::fs::read_to_string(&pid_path) else {
+                assert!(
+                    attempt + 1 < TEST_STDIN_FEED_TIMEOUTS.len(),
+                    "classifier never started within {timeout:?}"
+                );
+                continue;
+            };
+            let pid: i32 = pid.parse().unwrap();
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "classifier was not reaped"
+            );
+            return;
+        }
     }
 
     #[cfg(unix)]

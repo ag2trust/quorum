@@ -51,6 +51,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import select
 import shlex
 import shutil
@@ -84,6 +85,12 @@ DARWIN_REUSED_ROOT_PID_FILE_ENV = "TIMING_TEST_DARWIN_REUSED_ROOT_PID_FILE"
 DEFAULT_TEST_TIMEOUT_SECS = 120.0
 DEFAULT_TERM_GRACE_SECS = 2.0
 TIMEOUT_EXIT_CODE = 124
+# libtest prints one ``test <name> ... FAILED`` line per failure as it happens,
+# but its failures section (with panic messages) only at the end. Keep a
+# bounded list of the names seen so a whole-binary timeout still names them.
+FAILED_TEST_LINE = re.compile(rb"^test (\S+) \.\.\. FAILED$")
+MAX_FAILED_TEST_NAMES = 50
+MAX_PARTIAL_LINE_BYTES = 64 * 1024
 
 ProcessStart = tuple[int, int]
 RetainedProcesses = dict[int, ProcessStart | None]
@@ -1179,12 +1186,83 @@ def _cleanup_process_tree(
     return cleanup
 
 
+class FailedTestScanner:
+    """Tee a test binary's stdout and remember libtest ``... FAILED`` names."""
+
+    def __init__(self) -> None:
+        self.partial = b""
+        self.names: list[str] = []
+        self.total = 0
+
+    def feed(self, data: bytes) -> None:
+        lines = (self.partial + data).split(b"\n")
+        self.partial = lines.pop()
+        if len(self.partial) > MAX_PARTIAL_LINE_BYTES:
+            # An unbounded line cannot be a libtest result line.
+            self.partial = self.partial[-MAX_PARTIAL_LINE_BYTES:]
+        for line in lines:
+            self._line(line)
+
+    def finish(self) -> None:
+        if self.partial:
+            self._line(self.partial)
+            self.partial = b""
+
+    def _line(self, line: bytes) -> None:
+        match = FAILED_TEST_LINE.match(line.rstrip(b"\r"))
+        if match is None:
+            return
+        self.total += 1
+        if len(self.names) < MAX_FAILED_TEST_NAMES:
+            self.names.append(match.group(1).decode("utf-8", "replace"))
+
+    def summary(self) -> str:
+        shown = ", ".join(self.names)
+        hidden = self.total - len(self.names)
+        return shown + (f" (+{hidden} more)" if hidden > 0 else "")
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    while data:
+        try:
+            written = os.write(fd, data)
+        except BlockingIOError:
+            select.select([], [fd], [], 0.05)
+            continue
+        data = data[written:]
+
+
+def _pump_test_stdout(
+    fd: int, scanner: FailedTestScanner, *, until_eof: bool
+) -> bool:
+    """Copy available test stdout to ours. Return False once EOF is seen.
+
+    The final drain is bounded so a leaked descendant that keeps writing
+    cannot hold the supervisor after cleanup.
+    """
+    for _ in range(1024 if until_eof else 1):
+        try:
+            chunk = os.read(fd, 65536)
+        except BlockingIOError:
+            return True
+        if not chunk:
+            scanner.finish()
+            return False
+        try:
+            _write_all(sys.stdout.fileno(), chunk)
+        except OSError:
+            pass
+        scanner.feed(chunk)
+    return True
+
+
 def _run_result(
     started: float,
     rc: int,
     outcome: str,
     timeout_secs: float,
     cleanup: dict,
+    scanner: FailedTestScanner | None = None,
 ) -> dict:
     return {
         "duration_secs": now() - started,
@@ -1193,6 +1271,8 @@ def _run_result(
         "timed_out": outcome == "timed_out",
         "timeout_secs": timeout_secs,
         "cleanup": cleanup,
+        "failed_tests": list(scanner.names) if scanner else [],
+        "failed_tests_total": scanner.total if scanner else 0,
     }
 
 
@@ -1241,6 +1321,8 @@ def _test_supervisor() -> int:
     proc: subprocess.Popen | None = None
     result: dict | None = None
     known_descendants: RetainedProcesses = {}
+    scanner = FailedTestScanner()
+    out_fd = -1
 
     def interrupted(signum: int, _frame: object) -> None:
         raise SupervisorInterrupted(signum)
@@ -1275,11 +1357,15 @@ def _test_supervisor() -> int:
             proc = subprocess.Popen(
                 argv,
                 env=test_env,
+                stdout=subprocess.PIPE,
                 start_new_session=True,
                 preexec_fn=restore_child_signal_mask,
             )
         finally:
             signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+        assert proc.stdout is not None
+        out_fd = proc.stdout.fileno()
+        os.set_blocking(out_fd, False)
 
         deadline = started + timeout_secs
         known_descendants[proc.pid] = None
@@ -1323,10 +1409,15 @@ def _test_supervisor() -> int:
                         proc.pid, known_descendants, rows
                     )
                 next_darwin_snapshot = now() + 0.25
+            watched = [owner_fd] + ([out_fd] if out_fd >= 0 else [])
             readable, _, _ = select.select(
-                [owner_fd], [], [], min(remaining, 0.05)
+                watched, [], [], min(remaining, 0.05)
             )
-            if readable and os.read(owner_fd, 1) == b"":
+            if out_fd in readable and not _pump_test_stdout(
+                out_fd, scanner, until_eof=False
+            ):
+                out_fd = -1
+            if owner_fd in readable and os.read(owner_fd, 1) == b"":
                 rc = 1
                 outcome = "owner_lost"
                 break
@@ -1352,13 +1443,26 @@ def _test_supervisor() -> int:
         cleanup = _cleanup_process_tree(
             proc, grace_secs, known_descendants
         )
-        result = _run_result(started, rc, outcome, timeout_secs, cleanup)
+        if out_fd >= 0:
+            # The test tree is reaped (or cleanup reported why not), so only
+            # buffered output remains; never block on a leaked writer.
+            _pump_test_stdout(out_fd, scanner, until_eof=True)
+            scanner.finish()
+        result = _run_result(
+            started, rc, outcome, timeout_secs, cleanup, scanner
+        )
         if outcome == "timed_out":
+            failed_seen = (
+                f" Tests already FAILED before the timeout: "
+                f"{scanner.summary()}."
+                if scanner.total
+                else ""
+            )
             print(
                 f"preflight timing: test binary {display_name!r} timed out "
                 f"after {result['duration_secs']:.2f}s "
                 f"(deadline {timeout_secs:.2f}s); "
-                f"{_cleanup_diagnostic(cleanup)}. Re-run "
+                f"{_cleanup_diagnostic(cleanup)}.{failed_seen} Re-run "
                 f"{shlex.join([*argv, '--nocapture'])} to diagnose.",
                 file=sys.stderr,
                 flush=True,
@@ -1648,6 +1752,8 @@ def test_binary_failure(
         "outcome": result["outcome"],
         "cleanup_complete": result["cleanup"]["complete"],
         "rerun_command": cargo_rerun_command(binary, test_threads),
+        "failed_tests": result.get("failed_tests", []),
+        "failed_tests_total": result.get("failed_tests_total", 0),
     }
 
 
@@ -1660,6 +1766,8 @@ def record_test_result(
     binary["execute_timed_out"] = result["timed_out"]
     binary["execute_timeout_secs"] = result["timeout_secs"]
     binary["cleanup"] = result["cleanup"]
+    binary["failed_tests"] = result.get("failed_tests", [])
+    binary["failed_tests_total"] = result.get("failed_tests_total", 0)
     if cancelled_by_fail_fast:
         binary["execute_cancelled_by_fail_fast"] = True
 
@@ -1882,6 +1990,13 @@ def emit_summary(path: Path, data: dict, top_n: int) -> None:
             lines.append(f"  outcome: {first_failure['outcome']}")
         if first_failure.get("rerun_command"):
             lines.append(f"  rerun: {first_failure['rerun_command']}")
+        failed_tests = first_failure.get("failed_tests") or []
+        if failed_tests:
+            total = first_failure.get("failed_tests_total") or len(
+                failed_tests
+            )
+            lines.append(f"  failed_tests_seen: {total}")
+            lines.extend(f"    {name}" for name in failed_tests)
     lines.append("")
     lines.append("gates:")
     for g in data["gates"]:
