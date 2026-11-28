@@ -4277,7 +4277,7 @@ fn runner_adapter_config<'a>(
             permission_mode: &config.grok.permission_mode,
             max_turns: config.grok.max_turns,
         },
-        external: None,
+        external: config.external_runner.as_deref(),
     }
 }
 
@@ -5104,6 +5104,9 @@ pub struct ServeConfig {
     /// invalid configured repository) provisions reviewers without slot
     /// ownership, so they can never publish a pending review.
     pub review_publication: Option<Arc<review_cleanup::ReviewPublication>>,
+    /// Validated `[external_runner]` declaration, passed to every launch as
+    /// `AdapterConfig.external`. `None` when the table is absent.
+    pub external_runner: Option<Arc<crate::external_runner_spec::ExternalSpec>>,
 }
 
 impl ServeConfig {
@@ -35074,6 +35077,7 @@ mod tests {
             max_active_graphs: 2,
             agent_mcp_url: Some("http://127.0.0.1:9/mcp".into()),
             review_publication: None,
+            external_runner: None,
         }
     }
 
@@ -39133,6 +39137,7 @@ mod tests {
             max_active_graphs: 2,
             agent_mcp_url: Some("http://127.0.0.1:9/mcp".into()),
             review_publication: None,
+            external_runner: None,
         }
     }
 
@@ -50577,6 +50582,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             max_active_graphs: 2,
             agent_mcp_url: Some("http://127.0.0.1:9/mcp".into()),
             review_publication: None,
+            external_runner: None,
         }
     }
 
@@ -66565,6 +66571,115 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         };
         config.agent_bin = Some(program.to_string_lossy().into_owned());
         config
+    }
+
+    /// One daemon worker turn through the external runner: the
+    /// `[external_runner]` declaration is resolved exactly as `main` does,
+    /// the fake CLI is the `agent_bin`, and the daemon's normal dispatch and
+    /// drain path records the terminal turn's usage on the agent run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_worker_turn_runs_end_to_end_and_records_usage() {
+        const FAKE_CLI: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/serve/testdata/external/fake_cli.sh"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let repo = launch_test_repo(dir.path());
+        let declaration = crate::external_runner_spec::tests::VALID.replacen(
+            "executable = \"/usr/local/bin/fake-cli\"\n",
+            "",
+            1,
+        );
+        assert!(!declaration.contains("executable"));
+        let file_cfg: crate::serve_config::ServeFileConfig =
+            toml::from_str(&format!("agent_bin = \"{FAKE_CLI}\"\n{declaration}")).unwrap();
+        let spec = crate::serve_config::resolve_external_runner(&file_cfg)
+            .unwrap()
+            .expect("declared");
+
+        let mut config = claude_only_retry_test_config(dir.path(), &repo, Path::new(FAKE_CLI));
+        config.agent_bin = Some(FAKE_CLI.into());
+        config.external_runner = Some(Arc::new(spec));
+        config.model_profiles = std::collections::BTreeMap::from([(
+            "x-ext".into(),
+            crate::serve_config::ModelProfile {
+                runner: "external".into(),
+                model: "m-1".into(),
+                effort: "high".into(),
+            },
+        )]);
+        let pool = std::collections::BTreeMap::from([("x-ext".to_string(), 100)]);
+        config.routing = crate::serve_config::RoutingPolicy {
+            classifier: pool.clone(),
+            planner: pool.clone(),
+            arbiter: pool.clone(),
+            collector: pool.clone(),
+            worker: (1..=5)
+                .map(|level| (level.to_string(), pool.clone()))
+                .collect(),
+            reviewer: (1..=5)
+                .map(|level| (level.to_string(), pool.clone()))
+                .collect(),
+        };
+        let task_id = {
+            let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+            tasks::create(
+                &mut conn,
+                "owner",
+                "external worker task",
+                Some("one external worker turn"),
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap()
+        };
+
+        let (mut workers, spawned) = dispatch_retry_test_worker(&config).await;
+        assert!(spawned, "the external worker launches");
+        assert_eq!(workers.len(), 1);
+        let mut slot = workers.pop().unwrap();
+        assert_eq!(slot.task_id, task_id);
+        assert_eq!(slot.process_kind(), runner::AgentKind::External);
+        let run_id = slot.agent_run_id.expect("worker run recorded");
+
+        let expected = runner::TokenUsage {
+            input_tokens: 13,
+            uncached_input_tokens: 10,
+            cached_input_tokens: 2,
+            cache_write_input_tokens: 1,
+            output_tokens: 5,
+            reasoning_tokens: 0,
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while slot.token_usage != expected {
+                drain_events(&mut slot, &config.db_path, "worker", &config.limits)
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the external turn must complete through the daemon drain");
+        assert_eq!(slot.last_terminal_usage, expected);
+
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        assert_eq!(
+            quorum_core::token_usage::usage_for_agent_run(&conn, run_id)
+                .unwrap()
+                .expect("usage row recorded for the external run"),
+            runner::try_durable_token_usage(expected).unwrap()
+        );
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.assignee.as_deref(), Some(slot.agent_name.as_str()));
+        drop(conn);
+        slot.kill_and_reap().await;
     }
 
     /// Task #306 (Cleat, run 907): the reopened task still carried Pivot's

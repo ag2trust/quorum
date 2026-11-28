@@ -1777,6 +1777,8 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 .and_then(|c| c.sandbox.clone())
                 .unwrap_or_else(|| "danger-full-access".to_string());
             let grok = serve_config::resolve_grok_adapter(file_cfg.grok.as_ref())?;
+            let external_runner =
+                serve_config::resolve_external_runner(&file_cfg)?.map(std::sync::Arc::new);
             let agent_mcp = serve_config::resolve_agent_mcp(&file_cfg)?;
 
             // Print the resolved config banner.
@@ -1933,6 +1935,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 // Set by `run_serve` once the agent MCP listener is bound.
                 agent_mcp_url: None,
                 review_publication: None,
+                external_runner,
             };
             Ok(serve::run_serve(config, agent_mcp)?)
         }
