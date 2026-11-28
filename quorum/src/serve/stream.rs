@@ -156,6 +156,42 @@ fn content_blocks(value: &serde_json::Value) -> impl Iterator<Item = &serde_json
         .flatten()
 }
 
+/// Items named by [`ClaudeTurnTracker::outstanding_work_summary`].
+const MAX_OUTSTANDING_SUMMARY_ITEMS: usize = 3;
+/// Characters kept per outstanding-work label.
+const MAX_WORK_LABEL_CHARS: usize = 160;
+
+/// One line, control characters folded to spaces, bounded.
+fn work_label(text: &str) -> String {
+    let folded: String = text
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if folded.chars().count() <= MAX_WORK_LABEL_CHARS {
+        folded
+    } else {
+        let mut out: String = folded.chars().take(MAX_WORK_LABEL_CHARS - 1).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// `Bash: ./preflight.sh` for a command-carrying tool call, else the tool name.
+fn tool_use_label(block: &serde_json::Value) -> String {
+    let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+    match block.pointer("/input/command").and_then(|c| c.as_str()) {
+        Some(command) => work_label(&format!("{name}: {command}")),
+        None => work_label(name),
+    }
+}
+
+fn background_task_label(task: &serde_json::Value) -> String {
+    task.get("description")
+        .and_then(|d| d.as_str())
+        .map_or_else(|| "task".to_string(), work_label)
+}
+
 fn tool_result_ids(value: &serde_json::Value) -> impl Iterator<Item = &str> {
     content_blocks(value)
         .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
@@ -228,8 +264,11 @@ struct FedTurn {
 /// with no fed turn open are never attributed.
 #[derive(Debug, Default)]
 pub struct ClaudeTurnTracker {
-    outstanding_tools: std::collections::BTreeSet<String>,
-    background_tasks: std::collections::BTreeSet<String>,
+    /// Outstanding tool-call id → bounded label (tool name and command).
+    outstanding_tools: std::collections::BTreeMap<String, String>,
+    /// Running background-task id → bounded label (the launching command when
+    /// the provider reported it, else the task description).
+    background_tasks: std::collections::BTreeMap<String, String>,
     fed: Option<FedTurn>,
     /// Results for turns the daemon did not feed since its latest feed.
     unfed_results_since_feed: u32,
@@ -277,9 +316,40 @@ impl ClaudeTurnTracker {
         self.outstanding_tools.len() + self.background_tasks.len()
     }
 
-    fn insert_bounded(set: &mut std::collections::BTreeSet<String>, id: &str) {
-        if set.len() < MAX_TRACKED_PROVIDER_WORK {
-            set.insert(id.to_string());
+    /// Bounded, human-readable summary of the outstanding work (background
+    /// tasks first, then tool calls), or `None` when nothing is outstanding.
+    /// Diagnostics only: it names the work in watchdog logs and task notes.
+    pub fn outstanding_work_summary(&self) -> Option<String> {
+        if !self.has_outstanding_work() {
+            return None;
+        }
+        let labelled = self
+            .background_tasks
+            .values()
+            .map(|label| format!("background {label}"))
+            .chain(
+                self.outstanding_tools
+                    .values()
+                    .map(|label| format!("tool {label}")),
+            );
+        let total = self.background_tasks.len() + self.outstanding_tools.len();
+        let mut parts: Vec<String> = labelled.take(MAX_OUTSTANDING_SUMMARY_ITEMS).collect();
+        if total > MAX_OUTSTANDING_SUMMARY_ITEMS {
+            parts.push(format!("+{} more", total - MAX_OUTSTANDING_SUMMARY_ITEMS));
+        }
+        Some(parts.join("; "))
+    }
+
+    /// Insert or relabel `id`. New ids beyond the bound are not tracked.
+    fn insert_bounded(
+        map: &mut std::collections::BTreeMap<String, String>,
+        id: &str,
+        label: String,
+    ) {
+        if let Some(existing) = map.get_mut(id) {
+            *existing = label;
+        } else if map.len() < MAX_TRACKED_PROVIDER_WORK {
+            map.insert(id.to_string(), label);
         }
     }
 
@@ -294,7 +364,11 @@ impl ClaudeTurnTracker {
                 for block in content_blocks(&value) {
                     if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                         if let Some(id) = block.get("id").and_then(|id| id.as_str()) {
-                            Self::insert_bounded(&mut self.outstanding_tools, id);
+                            Self::insert_bounded(
+                                &mut self.outstanding_tools,
+                                id,
+                                tool_use_label(block),
+                            );
                         }
                     }
                 }
@@ -309,7 +383,13 @@ impl ClaudeTurnTracker {
                     self.unfed_turn_open |= self.fed.is_none();
                 }
                 (Some("task_started"), Some(task_id)) => {
-                    Self::insert_bounded(&mut self.background_tasks, task_id);
+                    // The launching tool call carries the actual command; the
+                    // task description is the fallback.
+                    let label = str_field("tool_use_id")
+                        .and_then(|tool| self.outstanding_tools.get(tool).cloned())
+                        .or_else(|| self.background_tasks.get(task_id).cloned())
+                        .unwrap_or_else(|| background_task_label(&value));
+                    Self::insert_bounded(&mut self.background_tasks, task_id, label);
                 }
                 (Some("task_updated"), Some(task_id)) => {
                     let status = value.pointer("/patch/status").and_then(|s| s.as_str());
@@ -321,15 +401,20 @@ impl ClaudeTurnTracker {
                     self.background_tasks.remove(task_id);
                 }
                 (Some("background_tasks_changed"), _) => {
-                    self.background_tasks.clear();
-                    let ids = value
+                    let mut previous = std::mem::take(&mut self.background_tasks);
+                    let tasks = value
                         .get("tasks")
                         .and_then(|tasks| tasks.as_array())
                         .into_iter()
-                        .flatten()
-                        .filter_map(|task| task.get("task_id").and_then(|id| id.as_str()));
-                    for id in ids {
-                        Self::insert_bounded(&mut self.background_tasks, id);
+                        .flatten();
+                    for task in tasks {
+                        let Some(id) = task.get("task_id").and_then(|id| id.as_str()) else {
+                            continue;
+                        };
+                        let label = previous
+                            .remove(id)
+                            .unwrap_or_else(|| background_task_label(task));
+                        Self::insert_bounded(&mut self.background_tasks, id, label);
                     }
                 }
                 _ => {}
@@ -736,6 +821,52 @@ mod tests {
             r#"{"type":"system","subtype":"task_updated","task_id":"b5l9efi28","patch":{"status":"running"}}"#,
         );
         assert!(tracker.has_outstanding_work());
+    }
+
+    #[test]
+    fn tracker_names_the_background_command_in_its_outstanding_summary() {
+        let mut tracker = ClaudeTurnTracker::default();
+        tracker.begin_fed_turn(None);
+        assert_eq!(tracker.outstanding_work_summary(), None);
+        let mut lines = BETWEEN_TURNS.lines();
+        for line in lines.by_ref() {
+            if tracker.observe_line(line) == LineAttribution::EndsFedTurn {
+                break;
+            }
+        }
+        assert_eq!(
+            tracker.outstanding_work_summary().as_deref(),
+            Some("background Bash: sleep 10 && echo bg-done2"),
+            "the launching command outlives its tool_result and the fed turn"
+        );
+        for line in lines {
+            tracker.observe_line(line);
+        }
+        assert_eq!(tracker.outstanding_work_summary(), None);
+    }
+
+    #[test]
+    fn outstanding_summary_is_one_bounded_line() {
+        let mut tracker = ClaudeTurnTracker::default();
+        let command = format!("cargo test \\\n  --all\n{}", "x".repeat(400));
+        for i in 0..5 {
+            let line = serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "tool_use", "id": format!("t{i}"), "name": "Bash",
+                    "input": {"command": command},
+                }]},
+            });
+            tracker.observe_line(&line.to_string());
+        }
+        tracker.observe_line(
+            r#"{"type":"system","subtype":"task_started","task_id":"b1","description":"no tool"}"#,
+        );
+        let summary = tracker.outstanding_work_summary().unwrap();
+        assert!(summary.starts_with("background no tool; tool Bash: cargo test \\ --all x"));
+        assert!(summary.ends_with("; +3 more"), "{summary}");
+        assert!(!summary.contains('\n'));
+        assert!(summary.chars().count() < 3 * (MAX_WORK_LABEL_CHARS + 20));
     }
 
     #[test]

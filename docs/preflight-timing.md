@@ -66,6 +66,13 @@ and the supervisor reaped the children it owns. `error` also retains a
 transient process-discovery diagnostic when fallback or a later snapshot still
 allowed cleanup to complete. A timeout uses exit code `124`.
 
+The supervisor tees the test binary's stdout and records the names from
+libtest `test <name> ... FAILED` lines in `failed_tests` (at most 50 names)
+and `failed_tests_total`. A timeout kills libtest before it prints its
+failures section, so the timeout diagnostic on stderr, `first_failure`, and
+the `FIRST FAILURE` block of `summary.txt` (`failed_tests_seen`) name the
+tests that had already failed.
+
 A cache hit instead has `cached: true`, `execute_secs: 0.0`,
 `execute_exit_code: 0`, and `execute_outcome: "cached_pass"`. It has no
 `cleanup` object because the collector did not launch a supervisor or test

@@ -3121,8 +3121,8 @@ fn routed_collector_request(
         },
         probe,
     )?;
-    let provider_bin = |model: &str| {
-        resolve_provider(model)
+    let provider_bin = |runner: &str| {
+        resolve_profile_runner(runner)
             .ok()
             .and_then(|kind| agent_bin_for_kind(config, kind))
             .map(str::to_owned)
@@ -3134,7 +3134,7 @@ fn routed_collector_request(
         .map(|weighted| {
             (
                 weighted.profile.id.clone(),
-                provider_bin(&weighted.profile.model),
+                provider_bin(&weighted.profile.runner),
             )
         })
         .collect();
@@ -3145,7 +3145,7 @@ fn routed_collector_request(
         repo,
         config.db_path.clone(),
         config.repo_dir.clone(),
-        provider_bin(&profile.model),
+        provider_bin(&profile.runner),
         config.bare_agent,
     )
     .with_collector(
@@ -4133,12 +4133,34 @@ fn resolve_profile_runner(runner: &str) -> Result<runner::AgentKind> {
     runner::AgentKind::for_profile_runner(runner).map_err(QuorumError::Usage)
 }
 
+/// Resolve the runner kind of a run whose durable record or routed profile
+/// names `recorded` as its provider/runner. An `"external"` record is its own
+/// authority: the model string is opaque and `for_model` is never consulted.
+/// Built-in records still derive the kind from the model so each caller's
+/// existing record/model mismatch check keeps binding the two together.
+fn resolve_recorded_provider(recorded: &str, model: &str) -> Result<runner::AgentKind> {
+    if recorded == "external" {
+        return Ok(runner::AgentKind::External);
+    }
+    resolve_provider(model)
+}
+
+#[cfg(test)]
 fn resolve_worker_provider(model: &str) -> Result<runner::AgentKind> {
     resolve_provider(model)
 }
 
+#[cfg(test)]
 fn resolve_managed_provider(model: &str, role: &str) -> Result<runner::AgentKind> {
-    let kind = resolve_provider(model)?;
+    resolve_recorded_managed_provider("", model, role)
+}
+
+fn resolve_recorded_managed_provider(
+    recorded: &str,
+    model: &str,
+    role: &str,
+) -> Result<runner::AgentKind> {
+    let kind = resolve_recorded_provider(recorded, model)?;
     if kind == runner::AgentKind::Grok {
         return Err(QuorumError::Usage(format!(
             "model '{model}' selects Grok, but managed Grok {role} roles are not enabled"
@@ -4153,7 +4175,7 @@ fn require_configured_provider(
     actual: runner::AgentKind,
     context: &str,
 ) -> Result<()> {
-    let resolved = resolve_worker_provider(model)?;
+    let resolved = resolve_recorded_provider(&actual.to_string(), model)?;
     if resolved != actual {
         return Err(QuorumError::Io(format!(
             "{context} persisted provider '{actual}' does not match model '{model}' resolved as '{resolved}'"
@@ -4331,8 +4353,10 @@ fn resolve_original_remediation_provider(
     recorded_provider: Option<&str>,
     model: &str,
 ) -> Result<runner::AgentKind> {
-    let model_kind = resolve_worker_provider(model)?;
     let kind = match recorded_provider {
+        // The durable record is the authority for an external run; its model
+        // string is opaque and never resolved.
+        Some("external") => return Ok(runner::AgentKind::External),
         Some("claude") => runner::AgentKind::Claude,
         Some("codex") => runner::AgentKind::Codex,
         Some("grok") => runner::AgentKind::Grok,
@@ -4347,6 +4371,7 @@ fn resolve_original_remediation_provider(
             )));
         }
     };
+    let model_kind = resolve_provider(model)?;
     if kind != model_kind {
         return Err(QuorumError::Io(format!(
             "persisted provider '{kind}' does not match model '{model}' resolved as '{model_kind}'"
@@ -4465,7 +4490,7 @@ fn resolve_reviewer_recovery(
             run.id
         ))
     })?;
-    let kind = resolve_managed_provider(&run.model, "reviewer recovery")?;
+    let kind = resolve_recorded_managed_provider(provider, &run.model, "reviewer recovery")?;
     if provider != kind.to_string() {
         return Err(QuorumError::Io(format!(
             "persisted provider '{provider}' does not match reviewer model '{}' resolved as '{kind}'",
@@ -5869,7 +5894,7 @@ fn worker_publication_pr(
 fn runner_retry_turn(refs: Option<&str>) -> Option<PendingTurn> {
     let refs: serde_json::Value = serde_json::from_str(refs?).ok()?;
     let turn = runner_state::requested_retry_any(&refs)?;
-    let resolved = resolve_worker_provider(&turn.model).ok()?;
+    let resolved = resolve_recorded_provider(&turn.provider, &turn.model).ok()?;
     (turn.provider == resolved.to_string()).then_some(turn)
 }
 
@@ -9302,7 +9327,7 @@ async fn spawn_arbiter_review(
         },
         None,
     )?;
-    let arbiter_kind = resolve_provider(&assignment.model)?;
+    let arbiter_kind = resolve_recorded_provider(&assignment.runner, &assignment.model)?;
     let view = match retain_cached_frozen_planner_view(config, coordinator, snapshot).await {
         Ok(view) => view,
         Err(error) => {
@@ -10314,7 +10339,7 @@ async fn tick_decomposition(
                 return Ok(false);
             }
         };
-        let planner_kind = resolve_provider(&assignment.model)?;
+        let planner_kind = resolve_recorded_provider(&assignment.runner, &assignment.model)?;
         // One attempt, one identity. This id is the run capability, the
         // `QUORUM_RUN_ID` the `submit_plan` tool authenticates with, the graph's
         // `planner_session_id` the endpoint resolver requires, the journalled
@@ -11165,22 +11190,144 @@ fn defer_pre_review_after_head_move(
 
 /// Share one per-PR cadence for pre-review GitHub reads across normal, orphan,
 /// and resumed-reviewer reconciliation.
+///
+/// Returns the mergeability state together with the `headRefOid` GitHub
+/// reported in the same response (`None` when unknown). A failed read keeps
+/// the fail-open `Mergeable` default.
 async fn poll_pre_review_mergeability_if_due(
     config: &ServeConfig,
     waits: &HashMap<i64, PreReviewChecksEntry>,
     task_id: i64,
     pr: i64,
-) -> Option<merge::MergeabilityState> {
+) -> Option<(merge::MergeabilityState, Option<String>)> {
     if !pre_review_external_poll_due(config, waits, task_id, pr) {
         return None;
     }
+    Some(read_pre_review_mergeability(config, pr).await)
+}
+
+async fn read_pre_review_mergeability(
+    config: &ServeConfig,
+    pr: i64,
+) -> (merge::MergeabilityState, Option<String>) {
     let executor = Arc::clone(&config.merge_executor);
     let repo = config.repo_dir.clone();
-    Some(
-        tokio::task::spawn_blocking(move || executor.check_mergeability(pr, &repo))
-            .await
-            .unwrap_or(merge::MergeabilityState::Mergeable),
-    )
+    tokio::task::spawn_blocking(move || executor.check_mergeability_with_head(pr, &repo))
+        .await
+        .unwrap_or((merge::MergeabilityState::Mergeable, None))
+}
+
+/// Decide whether a pre-review mergeability observation is an actionable
+/// conflict: GitHub must report `DIRTY` for exactly the recorded head. The
+/// recorded head is the daemon-published `pr_targets` baseline, else the head
+/// the pre-review gate is already tracking. A DIRTY report for any other head
+/// (e.g. GitHub lagging behind a just-pushed merge commit) or with no reported
+/// head keeps today's behavior. Returns the bound head on a conflict.
+async fn pre_review_conflict_head(
+    config: &ServeConfig,
+    waits: &HashMap<i64, PreReviewChecksEntry>,
+    task_id: i64,
+    pr: i64,
+    observation: &(merge::MergeabilityState, Option<String>),
+) -> Result<Option<String>> {
+    let (merge::MergeabilityState::Conflicting, Some(reported)) = observation else {
+        return Ok(None);
+    };
+    let recorded = match load_publication_pr_baseline(&config.db_path, task_id, pr)
+        .await
+        .map_err(QuorumError::Io)?
+    {
+        Some(target) => Some(target.head_sha),
+        None => waits
+            .get(&task_id)
+            .filter(|entry| entry.pr == pr && !entry.head_sha.is_empty())
+            .map(|entry| entry.head_sha.clone()),
+    };
+    match recorded {
+        Some(recorded) if &recorded == reported => Ok(Some(recorded)),
+        Some(recorded) => {
+            log(&format!(
+                "PRE-REVIEW CONFLICT: task #{task_id} PR #{pr} — GitHub reports DIRTY for head \
+                 {reported}, not recorded head {recorded}; not treating as a conflict"
+            ));
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
+/// Hold a task whose pre-review mergeability read ended the pass early (a
+/// conflict, or a still-blocked review-only PR) on the shared per-PR GitHub
+/// cadence. Any CI wait is aborted, but the entry keeps a fresh
+/// `last_head_poll` stamp so `pre_review_external_poll_due` stays false until
+/// the next configured poll instead of re-reading GitHub every serve tick.
+fn hold_pre_review_on_cadence(
+    waits: &mut HashMap<i64, PreReviewChecksEntry>,
+    task_id: i64,
+    pr: i64,
+    head_sha: &str,
+    now: std::time::Instant,
+) {
+    let previous = waits.remove(&task_id);
+    let (consecutive_timeouts, timeout_alerted, previous_head) = match previous {
+        Some(entry) => {
+            if let PreReviewChecksState::Waiting(handle) = entry.state {
+                handle.abort();
+            }
+            let previous_head = (entry.pr == pr).then_some(entry.head_sha);
+            (
+                entry.consecutive_timeouts,
+                entry.timeout_alerted,
+                previous_head,
+            )
+        }
+        None => (0, false, None),
+    };
+    // An empty head keeps the previously tracked head for this PR, so a hold
+    // never adopts an unverified GitHub-reported head as the recorded one.
+    let head_sha = if head_sha.is_empty() {
+        previous_head.unwrap_or_default()
+    } else {
+        head_sha.to_string()
+    };
+    waits.insert(
+        task_id,
+        PreReviewChecksEntry {
+            pr,
+            head_sha,
+            last_head_poll: Some(now),
+            post_gate_validation_attempted: false,
+            state: PreReviewChecksState::Retry,
+            consecutive_timeouts,
+            timeout_alerted,
+            head_lag_since: None,
+        },
+    );
+}
+
+/// Park a review-only task as pre-review merge-blocked in daemon-owned refs.
+/// The task body (the review contract) is never touched.
+async fn set_pre_review_merge_block(db_path: &Path, task_id: i64, head_sha: &str) -> Result<bool> {
+    let db_path = db_path.to_path_buf();
+    let head_sha = head_sha.to_string();
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let conn = quorum_core::db::open(&db_path)?;
+        tasks::set_pre_review_merge_block(&conn, task_id, &head_sha, now_unix())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("pre-review merge-block set join: {error}")))?
+}
+
+/// Clear a pre-review merge block once GitHub no longer reports the PR as
+/// conflicting. Only the refs marker is removed; the body is preserved.
+async fn clear_pre_review_merge_block(db_path: &Path, task_id: i64) -> Result<bool> {
+    let db_path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<bool> {
+        let conn = quorum_core::db::open(&db_path)?;
+        tasks::clear_pre_review_merge_block(&conn, task_id, now_unix())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("pre-review merge-block clear join: {error}")))?
 }
 
 async fn poll_resume_reviewer_pre_review_checks(
@@ -11406,6 +11553,154 @@ async fn notify_pre_review_checks_timeout(
     .map_err(|error| QuorumError::Io(format!("pre-review timeout alert join: {error}")))?
 }
 
+/// Entry cap on the daemon-owned failed-job digest cache. Each value is at
+/// most one rendered digest (`ci_digest::DIGEST_MAX_BYTES`), so the cache
+/// stays well under a megabyte; the oldest entry is evicted first.
+const CI_DIGEST_CACHE_MAX_ENTRIES: usize = 128;
+/// Failed jobs whose digest is fetched and appended to one remediation
+/// feedback; the rest are counted in a single line. Bounds the combined
+/// feedback to this many digests plus fixed text.
+const CI_DIGEST_FEEDBACK_MAX_JOBS: usize = 4;
+
+/// (database, PR, head SHA, job name). The database path namespaces the
+/// per-DB daemon inside one process.
+type CiDigestKey = (PathBuf, i64, String, String);
+
+/// Rendered failure digests and fetch failures (`None`) of failed CI jobs,
+/// so each (PR, head SHA, job) is fetched at most once across ticks and
+/// failure handling. In-memory only: a daemon restart refetches.
+#[derive(Default)]
+struct CiDigestCache {
+    entries: HashMap<CiDigestKey, Option<String>>,
+    order: VecDeque<CiDigestKey>,
+}
+
+impl CiDigestCache {
+    fn get(&self, key: &CiDigestKey) -> Option<Option<String>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: CiDigestKey, value: Option<String>) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        while self.order.len() >= CI_DIGEST_CACHE_MAX_ENTRIES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, value);
+    }
+}
+
+static CI_DIGEST_CACHE: LazyLock<Mutex<CiDigestCache>> =
+    LazyLock::new(|| Mutex::new(CiDigestCache::default()));
+
+/// The GitHub check-run name behind one failing-check label, or `None` for a
+/// required job that never ran (`name (absent)`), which has no log. The
+/// required-jobs gate labels jobs `name (CONCLUSION)`; rollup failures carry
+/// the bare name.
+fn failed_check_job_name(check: &str) -> Option<&str> {
+    if check.ends_with(" (absent)") {
+        return None;
+    }
+    let conclusion_suffix = check
+        .strip_suffix(')')
+        .and_then(|rest| rest.rsplit_once(" ("))
+        .filter(|(name, conclusion)| {
+            !name.is_empty()
+                && conclusion
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b == b'_')
+        });
+    Some(conclusion_suffix.map_or(check, |(name, _)| name))
+}
+
+/// Feedback lines carrying the failure digest of each failed (not absent)
+/// job, fetched through the daemon's merge executor at most once per
+/// (PR, head SHA, job). Each fetch runs in `spawn_blocking` with no DB
+/// transaction open. A fetch failure becomes one generic line: the error
+/// detail is logged, never shown to the worker.
+async fn failed_job_digest_feedback(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    head_sha: &str,
+    failing_checks: &[String],
+) -> Vec<String> {
+    let jobs: Vec<&str> = failing_checks
+        .iter()
+        .filter_map(|check| failed_check_job_name(check))
+        .collect();
+    let mut lines = Vec::new();
+    for job in jobs.iter().take(CI_DIGEST_FEEDBACK_MAX_JOBS) {
+        let key: CiDigestKey = (
+            config.db_path.clone(),
+            pr,
+            head_sha.to_string(),
+            job.to_string(),
+        );
+        let cached = CI_DIGEST_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key);
+        let digest = match cached {
+            Some(digest) => digest,
+            None => {
+                let fetched = if head_sha.is_empty() {
+                    Err("PR head SHA unknown".to_string())
+                } else {
+                    let executor = Arc::clone(&config.merge_executor);
+                    let repo = config.repo_dir.clone();
+                    let head = head_sha.to_string();
+                    let name = job.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        executor
+                            .fetch_failed_job_digest(pr, &repo, &head, &name)
+                            .map(|found| {
+                                quorum_core::ci_digest::render_digest(
+                                    &found.digest,
+                                    &name,
+                                    found.run_id,
+                                    found.job_id,
+                                )
+                            })
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(format!("digest fetch join: {error}")))
+                };
+                let digest = match fetched {
+                    Ok(rendered) => Some(rendered),
+                    Err(error) => {
+                        log(&format!(
+                            "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} — failure digest \
+                             for job {job} at head {head_sha} unavailable: {error}"
+                        ));
+                        None
+                    }
+                };
+                CI_DIGEST_CACHE
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(key, digest.clone());
+                digest
+            }
+        };
+        lines.push(digest.unwrap_or_else(|| {
+            format!("The failure digest for CI job `{job}` couldn't be fetched.")
+        }));
+    }
+    let omitted = jobs.len().saturating_sub(CI_DIGEST_FEEDBACK_MAX_JOBS);
+    if omitted > 0 {
+        lines.push(format!(
+            "Failure digests for {omitted} more failed CI job(s) were not included."
+        ));
+    }
+    lines
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_pre_review_checks_failure(
     config: &ServeConfig,
@@ -11419,11 +11714,47 @@ async fn handle_pre_review_checks_failure(
     head_sha: &str,
     failing_checks: &[String],
 ) -> Result<()> {
+    // GitHub runs no `pull_request` workflows on a conflicting PR, so an
+    // all-absent required-jobs result may be a conflict, not a CI failure.
+    // Confirm with one head-bound mergeability read (only on this failure
+    // event) before sending "fix the failing checks" feedback.
+    if !failing_checks.is_empty()
+        && failing_checks
+            .iter()
+            .all(|check| check.ends_with(" (absent)"))
+    {
+        let (state, reported) = read_pre_review_mergeability(config, pr).await;
+        if state == merge::MergeabilityState::Conflicting
+            && reported.as_deref() == Some(head_sha)
+            && !head_sha.is_empty()
+        {
+            log(&format!(
+                "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} — required jobs absent because \
+                 head {head_sha} is DIRTY; routing to merge-base rework"
+            ));
+            return handle_pre_review_conflict(
+                config,
+                wt_mgr,
+                name_pool,
+                workers,
+                profile_cooldown,
+                task_id,
+                pr,
+                head_sha,
+            )
+            .await;
+        }
+    }
+
     let names = failing_checks.join(", ");
-    let feedback = format!(
+    let mut feedback = format!(
         "CI checks failed before review for PR #{pr}: {names}\n\n\
          Fix the failing checks, commit, and submit the existing PR again without pushing."
     );
+    for digest in failed_job_digest_feedback(config, task_id, pr, head_sha, failing_checks).await {
+        feedback.push_str("\n\n");
+        feedback.push_str(&digest);
+    }
 
     let (review_only, no_rework) = {
         let path = config.db_path.clone();
@@ -11500,6 +11831,36 @@ async fn handle_pre_review_checks_failure(
             }
         }
     };
+    deliver_pre_review_remediation(
+        config,
+        wt_mgr,
+        name_pool,
+        workers,
+        profile_cooldown,
+        task_id,
+        pr,
+        &feedback,
+        transition,
+        "pre-review CI failure",
+    )
+    .await
+}
+
+/// Feed (or durably defer) the rework that a pre-review CI failure or
+/// conflict transition selected, or clean up a terminal close.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_pre_review_remediation(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    profile_cooldown: &mut ProfileCooldown,
+    task_id: i64,
+    pr: i64,
+    feedback: &str,
+    transition: Option<tasks::TransitionResult>,
+    cause: &str,
+) -> Result<()> {
     match transition {
         Some(ref result) if result.task.status == "rework" => {
             if let Some(worker_index) = workers.iter().position(|w| w.task_id == task_id) {
@@ -11508,7 +11869,7 @@ async fn handle_pre_review_checks_failure(
                     workers[worker_index].agent_name.clone(),
                     task_id,
                     pr,
-                    &feedback,
+                    feedback,
                 )
                 .await?
                 {
@@ -11527,7 +11888,7 @@ async fn handle_pre_review_checks_failure(
                         &workers[worker_index].agent_name,
                         task_id,
                         pr,
-                        &feedback,
+                        feedback,
                         workers[worker_index].cost_usd,
                         config.limits.max_task_cost_usd,
                         &load_task_risk_flags_for_prompt(&config.db_path, task_id).await?,
@@ -11537,7 +11898,7 @@ async fn handle_pre_review_checks_failure(
                         feed_worker_turn(&mut workers[worker_index], &prompt, config).await
                     {
                         log(&format!(
-                            "pre-review CI rework feed failed for task #{task_id}: {error}; \
+                            "{cause} rework feed failed for task #{task_id}: {error}; \
                          preserving durable remediation intent"
                         ));
                         if !handle_dormant_worker_feed_failure(
@@ -11581,14 +11942,14 @@ async fn handle_pre_review_checks_failure(
                             return Ok(());
                         }
                         log(&format!(
-                            "worker {} rework #{} (pre-review CI failure)",
+                            "worker {} rework #{} ({cause})",
                             worker.agent_name, worker.rework_count
                         ));
                     }
                 }
             } else {
                 log(&format!(
-                    "no live worker for pre-review CI rework on task #{task_id} — \
+                    "no live worker for {cause} rework on task #{task_id} — \
                      durable remediation will provision from the tick reconciler"
                 ));
             }
@@ -11610,11 +11971,114 @@ async fn handle_pre_review_checks_failure(
         }
         None => {
             log(&format!(
-                "PRE-REVIEW CI GATE: ChecksFailed transition failed for task #{task_id}"
+                "PRE-REVIEW: {cause} transition failed for task #{task_id}"
             ));
         }
     }
     Ok(())
+}
+
+/// Route a pre-review PR that GitHub reports `DIRTY` at the recorded head to
+/// the merge-time conflict remediation, before any CI wait or reviewer. An
+/// implementation task enters rework with merge-base feedback; a review-only
+/// task is parked merge-blocked until the PR is mergeable; a `--review-only`
+/// (`no_rework`) task closes `done` with `review_outcome=merge_conflict`.
+#[allow(clippy::too_many_arguments)]
+async fn handle_pre_review_conflict(
+    config: &ServeConfig,
+    wt_mgr: &WorktreeManager,
+    name_pool: &mut Pool,
+    workers: &mut Vec<SlotState>,
+    profile_cooldown: &mut ProfileCooldown,
+    task_id: i64,
+    pr: i64,
+    head_sha: &str,
+) -> Result<()> {
+    let (review_only, no_rework) = {
+        let path = config.db_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<(bool, bool)> {
+            let conn = quorum_core::db::open(&path)?;
+            Ok(tasks::get(&conn, task_id)?
+                .map_or((false, false), |task| (task.review_only, task.no_rework)))
+        })
+        .await
+        .map_err(|error| {
+            QuorumError::Io(format!(
+                "pre-review conflict task lookup join for task #{task_id}: {error}"
+            ))
+        })??
+    };
+    let base = effective_task_base_branch(&config.db_path, task_id, &config.base_branch).await?;
+    if review_only && !no_rework {
+        // The external author owns the merge; mirror the merge-time path.
+        log(&format!(
+            "PRE-REVIEW CONFLICT: review-only task #{task_id} PR #{pr} head {head_sha} \
+             conflicts with {base} — parking merge-blocked, not reworking"
+        ));
+        set_pre_review_merge_block(&config.db_path, task_id, head_sha).await?;
+        return Ok(());
+    }
+    let feedback = merge_base_remediation_message(
+        &format!("PR #{pr} has conflicts with {base} (a sibling PR likely merged first)."),
+        &base,
+    );
+    log(&format!(
+        "PRE-REVIEW CONFLICT: task #{task_id} PR #{pr} head {head_sha} conflicts with {base} — \
+         firing MergeConflict without CI wait or reviewer"
+    ));
+    let transition = {
+        let p = config.db_path.clone();
+        let sha = head_sha.to_string();
+        let remediation_feedback = feedback.clone();
+        match tokio::task::spawn_blocking(move || -> Result<tasks::TransitionResult> {
+            let mut conn = quorum_core::db::open(&p)?;
+            tasks::apply_pre_review_conflict_with_remediation(
+                &mut conn,
+                task_id,
+                pr,
+                &sha,
+                &remediation_feedback,
+                now_unix(),
+            )
+        })
+        .await
+        {
+            Ok(Ok(result)) => {
+                log(&format!(
+                    "lifecycle: task #{task_id} -> {}",
+                    result.task.status
+                ));
+                Some(result)
+            }
+            Ok(Err(error)) => {
+                log(&format!(
+                    "PRE-REVIEW CONFLICT: failed to durably enter remediation \
+                     for task #{task_id}: {error}"
+                ));
+                None
+            }
+            Err(error) => {
+                log(&format!(
+                    "PRE-REVIEW CONFLICT: remediation transition join failed \
+                     for task #{task_id}: {error}"
+                ));
+                None
+            }
+        }
+    };
+    deliver_pre_review_remediation(
+        config,
+        wt_mgr,
+        name_pool,
+        workers,
+        profile_cooldown,
+        task_id,
+        pr,
+        &feedback,
+        transition,
+        "pre-review merge conflict",
+    )
+    .await
 }
 
 async fn sticky_branch_sync_ci_fix_observed_head_matches(
@@ -13341,6 +13805,34 @@ async fn reconcile_merged_continuations(
     }
 }
 
+/// How often the standalone heartbeat refreshes the daemon lock and detects
+/// theft.
+const LOCK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only override for [`LOCK_HEARTBEAT_INTERVAL`], scoped to one
+    /// `tick_loop` future so lock-theft tests need not wait the full interval.
+    static TEST_LOCK_HEARTBEAT_INTERVAL: Duration;
+}
+
+/// Run `future` (a `tick_loop` call) with a shortened lock heartbeat.
+#[cfg(test)]
+pub(crate) async fn with_test_lock_heartbeat<F: std::future::Future>(
+    interval: Duration,
+    future: F,
+) -> F::Output {
+    TEST_LOCK_HEARTBEAT_INTERVAL.scope(interval, future).await
+}
+
+fn lock_heartbeat_interval() -> Duration {
+    #[cfg(test)]
+    if let Ok(interval) = TEST_LOCK_HEARTBEAT_INTERVAL.try_with(|interval| *interval) {
+        return interval;
+    }
+    LOCK_HEARTBEAT_INTERVAL
+}
+
 async fn tick_loop(
     config: &ServeConfig,
     daemon_pid: i64,
@@ -13700,8 +14192,9 @@ async fn tick_loop_owning_doctor(
         let db = config.db_path.clone();
         let instance = daemon_instance.clone();
         let stolen = lock_stolen.clone();
+        let heartbeat = lock_heartbeat_interval();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            let mut interval = tokio::time::interval(heartbeat);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
@@ -17865,10 +18358,17 @@ async fn tick(
     )
     .await;
     for &(i, idle, limit, awaiting_rereview) in idle_reviewers.iter().rev() {
+        let kind = between_turn_idle_kind(&reviewers[i]);
         let reason = if awaiting_rereview {
             format!(
                 "reviewer idle {idle}s awaiting sticky re-review (busy ceiling {limit}s) — \
                  zombie reaped; a fresh reviewer reviews the reworked head"
+            )
+        } else if kind == IdleReapKind::BusyCeiling {
+            format!(
+                "reviewer exceeded busy ceiling {limit}s ({idle}s after its last daemon-fed turn) \
+                 while its work was still running (outstanding work: {})",
+                outstanding_work_description(&reviewers[i])
             )
         } else {
             format!("reviewer idle {idle}s between turns (limit {limit}s) — zombie reaped")
@@ -17888,7 +18388,11 @@ async fn tick(
             continue;
         }
         let dead = reviewers.remove(i);
-        teardown_reviewer(config, wt_mgr, name_pool, dead, "idle").await;
+        let close_reason = match kind {
+            IdleReapKind::BusyCeiling if !awaiting_rereview => "busy_ceiling",
+            _ => "idle",
+        };
+        teardown_reviewer(config, wt_mgr, name_pool, dead, close_reason).await;
     }
 
     // ── Phase 4: Drain events from active workers ──────────────────────
@@ -17977,7 +18481,7 @@ async fn tick(
     // Phase-aware: workers whose task is already in-review or merging are
     // legitimately idle (awaiting review/merge) — release gracefully without
     // firing AgentFailed (#176).
-    let mut idle_workers: Vec<(usize, u64, u64)> = Vec::new();
+    let mut idle_workers: Vec<(usize, u64, u64, IdleReapKind)> = Vec::new();
     for (i, w) in workers.iter().enumerate() {
         if !slot_is_idle_zombie_candidate(w, idle_timeout, max_busy_idle_secs(&config.limits)) {
             continue;
@@ -17985,10 +18489,10 @@ async fn tick(
         if let Some((idle_secs, idle_limit)) =
             between_turn_idle(w, idle_timeout, max_busy_idle_secs(&config.limits))
         {
-            idle_workers.push((i, idle_secs, idle_limit));
+            idle_workers.push((i, idle_secs, idle_limit, between_turn_idle_kind(w)));
         }
     }
-    for &(i, idle_secs, idle_limit) in idle_workers.iter().rev() {
+    for &(i, idle_secs, idle_limit, kind) in idle_workers.iter().rev() {
         let task_id = workers[i].task_id;
 
         // Look up current task status to distinguish legitimate waits from zombies.
@@ -18023,8 +18527,10 @@ async fn tick(
                 cleanup_slot(config, wt_mgr, name_pool, dead, None, end_reason).await;
             }
             _ => {
-                reap_idle_zombie_worker(config, wt_mgr, name_pool, dead, idle_secs, idle_limit)
-                    .await;
+                reap_idle_zombie_worker(
+                    config, wt_mgr, name_pool, dead, idle_secs, idle_limit, kind,
+                )
+                .await;
             }
         }
     }
@@ -19033,14 +19539,19 @@ async fn tick(
     if !drain_state.draining {
         // Reviewer-slot admission spans Phases 5 and 5b: one queue, one pass.
         reviewer_slot_queue.begin_pass();
-        let active_in_review = {
+        let (active_in_review, pre_review_merge_blocked) = {
             let p = db_path.clone();
-            tokio::task::spawn_blocking(move || -> Result<HashSet<i64>> {
+            tokio::task::spawn_blocking(move || -> Result<(HashSet<i64>, HashSet<i64>)> {
                 let conn = quorum_core::db::open(&p)?;
-                Ok(tasks::list(&conn, Some("in-review"), None, None)?
-                    .into_iter()
-                    .map(|task| task.id)
-                    .collect())
+                let mut active = HashSet::new();
+                let mut blocked = HashSet::new();
+                for task in tasks::list(&conn, Some("in-review"), None, None)? {
+                    if tasks::pre_review_merge_blocked(task.refs.as_deref()) {
+                        blocked.insert(task.id);
+                    }
+                    active.insert(task.id);
+                }
+                Ok((active, blocked))
             })
             .await
             .map_err(|error| QuorumError::Io(format!("spawn_blocking join: {error}")))??
@@ -19080,6 +19591,7 @@ async fn tick(
         let mut repo_mismatch_workers: Vec<(usize, String)> = Vec::new();
         let mut pr_closed_workers: Vec<usize> = Vec::new();
         let mut failed_pre_review_checks: Vec<(i64, i64, String, Vec<String>)> = Vec::new();
+        let mut conflicting_pre_review: Vec<(i64, i64, String)> = Vec::new();
         for (pr, task_id, wi) in &needs_reviewer_from_workers {
             // #75: detect cross-repo PR before burning provision strikes
             let task_refs = lookup_task_refs(&db_path, *task_id).await;
@@ -19094,9 +19606,9 @@ async fn tick(
                 repo_mismatch_workers.push((*wi, task_repo));
                 continue;
             }
-            if let Some(pr_state) =
-                poll_pre_review_mergeability_if_due(config, pre_review_checks, *task_id, *pr).await
-            {
+            let mergeability =
+                poll_pre_review_mergeability_if_due(config, pre_review_checks, *task_id, *pr).await;
+            if let Some((pr_state, _)) = &mergeability {
                 match pr_state {
                     merge::MergeabilityState::AlreadyMerged => {
                         log(&format!(
@@ -19124,6 +19636,42 @@ async fn tick(
             // worktree, strike, or park is ever spent on it.
             if !reviewer_graph_authority_current(&db_path, *task_id).await? {
                 log_graph_hold(graph_skip_logs, *task_id, *pr);
+                continue;
+            }
+            // A PR GitHub reports DIRTY at the recorded head runs no CI; route
+            // it to merge-base rework before any CI wait or reviewer.
+            let merge_blocked = pre_review_merge_blocked.contains(task_id);
+            if let Some(observation) = &mergeability {
+                if let Some(conflict_head) =
+                    pre_review_conflict_head(config, pre_review_checks, *task_id, *pr, observation)
+                        .await?
+                {
+                    hold_pre_review_on_cadence(
+                        pre_review_checks,
+                        *task_id,
+                        *pr,
+                        &conflict_head,
+                        std::time::Instant::now(),
+                    );
+                    conflicting_pre_review.push((*task_id, *pr, conflict_head));
+                    continue;
+                }
+                if observation.0 != merge::MergeabilityState::Conflicting {
+                    if merge_blocked {
+                        clear_pre_review_merge_block(&db_path, *task_id).await?;
+                    }
+                } else if merge_blocked {
+                    hold_pre_review_on_cadence(
+                        pre_review_checks,
+                        *task_id,
+                        *pr,
+                        "",
+                        std::time::Instant::now(),
+                    );
+                    continue;
+                }
+            } else if merge_blocked {
+                // Still merge-blocked and not yet due for the next shared read.
                 continue;
             }
             let (ci_gate, head_sha, head_polled) =
@@ -19363,6 +19911,19 @@ async fn tick(
             notify_provision_failure(&db_path, w.task_id, &notification_reason, &pr_label).await;
             cleanup_slot(config, wt_mgr, name_pool, w, None, "parked").await;
         }
+        for (task_id, pr, head_sha) in conflicting_pre_review {
+            handle_pre_review_conflict(
+                config,
+                wt_mgr,
+                name_pool,
+                workers,
+                profile_cooldown,
+                task_id,
+                pr,
+                &head_sha,
+            )
+            .await?;
+        }
         for (task_id, pr, head_sha, failing_checks) in failed_pre_review_checks {
             pre_review_checks.remove(&task_id);
             handle_pre_review_checks_failure(
@@ -19443,9 +20004,10 @@ async fn tick(
             if has_worker || has_reviewer {
                 continue;
             }
-            if let Some(pr_state) =
-                poll_pre_review_mergeability_if_due(config, pre_review_checks, *task_id, *pr).await
-            {
+            let pre_review_blocked = tasks::pre_review_merge_blocked(task_refs.as_deref());
+            let mergeability =
+                poll_pre_review_mergeability_if_due(config, pre_review_checks, *task_id, *pr).await;
+            if let Some((pr_state, _)) = &mergeability {
                 match pr_state {
                     merge::MergeabilityState::AlreadyMerged => {
                         log(&format!(
@@ -19466,11 +20028,31 @@ async fn tick(
                         continue;
                     }
                     merge::MergeabilityState::Conflicting
-                        if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY) =>
+                        if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY)
+                            || pre_review_blocked =>
                     {
+                        // Still blocked: stamp the shared cadence so the next
+                        // read waits for the configured poll interval.
+                        hold_pre_review_on_cadence(
+                            pre_review_checks,
+                            *task_id,
+                            *pr,
+                            "",
+                            std::time::Instant::now(),
+                        );
                         continue;
                     }
                     _ => {}
+                }
+
+                // Pre-review merge block: no approval exists to re-fire, so
+                // clear the marker and resume the normal pre-review path.
+                if pre_review_blocked {
+                    log(&format!(
+                        "pre-review merge-blocked task #{task_id} PR #{pr}: \
+                         PR is no longer conflicting — resuming pre-review"
+                    ));
+                    clear_pre_review_merge_block(&db_path, *task_id).await?;
                 }
 
                 // Merge-blocked retry: approved review-only task waiting for
@@ -19500,7 +20082,7 @@ async fn tick(
                     }
                     continue;
                 }
-            } else if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY) {
+            } else if body.as_deref() == Some(tasks::MERGE_BLOCKED_BODY) || pre_review_blocked {
                 continue;
             }
 
@@ -19537,6 +20119,32 @@ async fn tick(
             if !reviewer_graph_authority_current(&db_path, *task_id).await? {
                 log_graph_hold(graph_skip_logs, *task_id, *pr);
                 continue;
+            }
+            if let Some(observation) = &mergeability {
+                if let Some(conflict_head) =
+                    pre_review_conflict_head(config, pre_review_checks, *task_id, *pr, observation)
+                        .await?
+                {
+                    hold_pre_review_on_cadence(
+                        pre_review_checks,
+                        *task_id,
+                        *pr,
+                        &conflict_head,
+                        std::time::Instant::now(),
+                    );
+                    handle_pre_review_conflict(
+                        config,
+                        wt_mgr,
+                        name_pool,
+                        workers,
+                        profile_cooldown,
+                        *task_id,
+                        *pr,
+                        &conflict_head,
+                    )
+                    .await?;
+                    continue;
+                }
             }
             let (ci_gate, head_sha, head_polled) =
                 poll_resume_reviewer_pre_review_checks(config, pre_review_checks, *task_id, *pr)
@@ -20715,10 +21323,7 @@ const MAX_UNFED_TURNS_PER_FED_TURN: u32 = 8;
 /// `max_task_wall_secs` still bound a provider that keeps itself busy.
 fn between_turn_idle(slot: &SlotState, idle_secs: u64, busy_idle_secs: u64) -> Option<(u64, u64)> {
     let fed_turn_ended = slot.turn_ended_at?;
-    let provider_active = matches!(
-        &slot.proc,
-        SlotProcess::Running(proc) if proc.has_outstanding_work() || proc.unfed_turn_open()
-    );
+    let provider_active = between_turn_idle_kind(slot) == IdleReapKind::BusyCeiling;
     let anchor = if provider_active {
         fed_turn_ended
     } else {
@@ -20730,6 +21335,84 @@ fn between_turn_idle(slot: &SlotState, idle_secs: u64, busy_idle_secs: u64) -> O
         effective_idle_secs(idle_secs, busy_idle_secs, provider_active),
     ))
 }
+
+/// Which between-turn ceiling [`between_turn_idle`] applies, and therefore why
+/// a slot past it is reaped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdleReapKind {
+    /// Plain idle ceiling: nothing outstanding and no self-continued turn
+    /// open. The worker is a zombie and the reap spends a recovery attempt.
+    Zombie,
+    /// Busy ceiling: tool/background work outstanding or a self-continued
+    /// turn open. The worker was alive; the bound on self-continuation from
+    /// the last daemon-fed turn stopped it.
+    BusyCeiling,
+}
+
+impl IdleReapKind {
+    fn end_reason(self) -> &'static str {
+        match self {
+            Self::Zombie => "idle_reaped",
+            Self::BusyCeiling => "busy_ceiling",
+        }
+    }
+}
+
+/// The single classification shared by the worker and reviewer between-turn
+/// watchdogs: the busy ceiling applies exactly while the provider is acting.
+fn between_turn_idle_kind(slot: &SlotState) -> IdleReapKind {
+    if matches!(
+        &slot.proc,
+        SlotProcess::Running(proc) if proc.has_outstanding_work() || proc.unfed_turn_open()
+    ) {
+        IdleReapKind::BusyCeiling
+    } else {
+        IdleReapKind::Zombie
+    }
+}
+
+/// Bounded description of what a busy slot was still doing.
+fn outstanding_work_description(slot: &SlotState) -> String {
+    match &slot.proc {
+        SlotProcess::Running(proc) => proc
+            .outstanding_work_summary()
+            .unwrap_or_else(|| "self-continued provider turn in progress".to_string()),
+        _ => "none reported".to_string(),
+    }
+}
+
+/// Watchdog log line and task-note failure cause for a between-turn reap.
+fn worker_idle_reap_text(
+    kind: IdleReapKind,
+    agent: &str,
+    task_id: i64,
+    idle_secs: u64,
+    limit_secs: u64,
+    outstanding: &str,
+) -> (String, String) {
+    match kind {
+        IdleReapKind::Zombie => (
+            format!(
+                "WATCHDOG: worker {agent} idle {idle_secs}s on task #{task_id} (limit {limit_secs}s) — killing zombie"
+            ),
+            format!("worker idle {idle_secs}s between turns (limit {limit_secs}s) — zombie reaped"),
+        ),
+        IdleReapKind::BusyCeiling => (
+            format!(
+                "WATCHDOG: worker {agent} exceeded busy ceiling {limit_secs}s on task #{task_id} (outstanding work: {outstanding})"
+            ),
+            format!(
+                "{BUSY_CEILING_CAUSE_MARKER}{limit_secs}s ({idle_secs}s after its last daemon-fed turn) \
+                 while its work was still running (outstanding work: {outstanding}); stopped at the \
+                 busy ceiling, not a dead worker"
+            ),
+        ),
+    }
+}
+
+/// Stable start of a busy-ceiling failure cause; the resume note finds the
+/// predecessor's cause by it.
+const BUSY_CEILING_CAUSE_MARKER: &str = "worker exceeded busy ceiling ";
 
 /// Refresh `last_provider_activity_at` after one normalized stdout line: a
 /// self-continued turn ended, or outstanding tool/background work went from
@@ -21485,6 +22168,10 @@ fn runner_continuation_identity(slot: &SlotState) -> std::io::Result<(&str, &str
         ));
     }
     let expected = slot.process_kind();
+    // An external slot's kind is its durable runner; the model is opaque.
+    if expected == runner::AgentKind::External {
+        return Ok((&slot.model, &slot.effort));
+    }
     match runner::AgentKind::for_model(&slot.model) {
         Ok(actual) if actual == expected => Ok((&slot.model, &slot.effort)),
         Ok(actual) => Err(std::io::Error::new(
@@ -22348,10 +23035,13 @@ async fn renew_active_worker_task_leases(db_path: &Path, workers: &[SlotState]) 
 /// operator-configured limit. Extracted so the production decision is
 /// testable: a regression that lets the watchdog kill a dormant awaiting-
 /// review slot must break the same predicate the tick loop consults.
-/// Reap a genuine idle-zombie worker (Phase 4-idle): fail its assignment and
-/// release the slot. The failure is sweep-aware, so a lease that lapsed while
-/// the worker idled is settled by the committed reap rather than a rejected
-/// second `AgentFailed`.
+/// Reap a worker past its between-turn ceiling (Phase 4-idle): fail its
+/// assignment and release the slot. The failure is sweep-aware, so a lease
+/// that lapsed while the worker idled is settled by the committed reap rather
+/// than a rejected second `AgentFailed`. A plain-idle zombie spends a recovery
+/// attempt; a busy-ceiling reap does not while the task's busy-ceiling wall
+/// stays within `max_task_wall_secs` (see
+/// `tasks::fail_worker_assignment_at_busy_ceiling`).
 async fn reap_idle_zombie_worker(
     config: &ServeConfig,
     wt_mgr: &WorktreeManager,
@@ -22359,6 +23049,7 @@ async fn reap_idle_zombie_worker(
     dead: SlotState,
     idle_secs: u64,
     idle_timeout: u64,
+    kind: IdleReapKind,
 ) {
     // A reaction committed after the last mailbox snapshot is still honored.
     if park_worker_on_reaction(&config.db_path, &dead).await
@@ -22371,18 +23062,48 @@ async fn reap_idle_zombie_worker(
         cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
         return;
     }
-    log(&format!(
-        "WATCHDOG: worker {} idle {}s on task #{} (limit {}s) — killing zombie",
-        dead.agent_name, idle_secs, dead.task_id, idle_timeout
-    ));
-    fail_worker_assignment_settled(
-        &config.db_path,
+    let (line, reason) = worker_idle_reap_text(
+        kind,
         &dead.agent_name,
         dead.task_id,
-        &format!("worker idle {idle_secs}s between turns (limit {idle_timeout}s) — zombie reaped"),
-    )
-    .await;
-    cleanup_slot(config, wt_mgr, name_pool, dead, None, "idle_reaped").await;
+        idle_secs,
+        idle_timeout,
+        &outstanding_work_description(&dead),
+    );
+    log(&line);
+    match kind {
+        IdleReapKind::Zombie => {
+            fail_worker_assignment_settled(
+                &config.db_path,
+                &dead.agent_name,
+                dead.task_id,
+                &reason,
+            )
+            .await;
+        }
+        IdleReapKind::BusyCeiling => {
+            let charge = WorkerFailureCharge::BusyCeiling {
+                slot_wall_secs: dead.task_started_at.elapsed().as_secs(),
+                max_task_wall_secs: config.limits.max_task_wall_secs,
+            };
+            if let Some(tasks::WorkerFailureOutcome::Applied(transition)) =
+                fail_worker_assignment_with(
+                    &config.db_path,
+                    &dead.agent_name,
+                    dead.task_id,
+                    &reason,
+                    charge,
+                )
+                .await
+            {
+                log(&format!(
+                    "busy-ceiling reap of {} on task #{}: recovery_attempts now {}",
+                    dead.agent_name, dead.task_id, transition.task.recovery_attempts
+                ));
+            }
+        }
+    }
+    cleanup_slot(config, wt_mgr, name_pool, dead, None, kind.end_reason()).await;
 }
 
 /// Phase 4-react: park every live persistent worker whose turn ended on a
@@ -22579,6 +23300,13 @@ async fn idle_reviewer_reap_candidates(
                  exceeded the busy ceiling ({limit}s) — reaping; the fresh-reviewer path \
                  reviews the reworked head",
                 r.agent_name, r.task_id
+            ));
+        } else if between_turn_idle_kind(r) == IdleReapKind::BusyCeiling {
+            log(&format!(
+                "WATCHDOG: reviewer {} exceeded busy ceiling {limit}s on task #{} (outstanding work: {})",
+                r.agent_name,
+                r.task_id,
+                outstanding_work_description(r)
             ));
         } else {
             log(&format!(
@@ -24860,7 +25588,7 @@ async fn provision_reviewer_reserved(
     )?;
     let reviewer_model = assignment.model.clone();
     let reviewer_effort = assignment.effort.clone();
-    let reviewer_kind = resolve_provider(&reviewer_model)?;
+    let reviewer_kind = resolve_recorded_provider(&assignment.runner, &reviewer_model)?;
     let reviewer_runner = resolve_profile_runner(&assignment.runner)?;
     let reviewer_continuation_id = recovery
         .as_ref()
@@ -27732,7 +28460,7 @@ async fn spawn_admitted_worker(
         prompt_text.push_str(context);
     }
 
-    let resolved_kind = match resolve_worker_provider(&resolved_model) {
+    let resolved_kind = match resolve_recorded_provider(&assignment.runner, &resolved_model) {
         Ok(kind) => kind,
         Err(error) => {
             refuse_launch!(format!(
@@ -29421,39 +30149,42 @@ async fn activate_reviewer_fallback(
         fallback::FallbackInstallOutcome::Installed(intent) => intent,
     };
 
-    let alternate_kind =
-        match resolve_managed_provider(&intent.pending_turn.model, "reviewer fallback") {
-            Ok(kind) if kind.to_string() == intent.pending_turn.provider => kind,
-            Ok(kind) => {
-                let error = format!(
-                    "fallback intent provider '{}' does not match model '{}' resolved as '{kind}'",
-                    intent.pending_turn.provider, intent.pending_turn.model
-                );
-                return settle_failed_reviewer_fallback(
-                    config,
-                    slot,
-                    &intent.capability_run_id,
-                    &session_id,
-                    &intent.worktree,
-                    &intent.pending_turn.provider,
-                    &error,
-                )
-                .await;
-            }
-            Err(error) => {
-                let reason = format!("reviewer fallback route is not executable: {error}");
-                return settle_failed_reviewer_fallback(
-                    config,
-                    slot,
-                    &intent.capability_run_id,
-                    &session_id,
-                    &intent.worktree,
-                    &intent.pending_turn.provider,
-                    &reason,
-                )
-                .await;
-            }
-        };
+    let alternate_kind = match resolve_recorded_managed_provider(
+        &intent.pending_turn.provider,
+        &intent.pending_turn.model,
+        "reviewer fallback",
+    ) {
+        Ok(kind) if kind.to_string() == intent.pending_turn.provider => kind,
+        Ok(kind) => {
+            let error = format!(
+                "fallback intent provider '{}' does not match model '{}' resolved as '{kind}'",
+                intent.pending_turn.provider, intent.pending_turn.model
+            );
+            return settle_failed_reviewer_fallback(
+                config,
+                slot,
+                &intent.capability_run_id,
+                &session_id,
+                &intent.worktree,
+                &intent.pending_turn.provider,
+                &error,
+            )
+            .await;
+        }
+        Err(error) => {
+            let reason = format!("reviewer fallback route is not executable: {error}");
+            return settle_failed_reviewer_fallback(
+                config,
+                slot,
+                &intent.capability_run_id,
+                &session_id,
+                &intent.worktree,
+                &intent.pending_turn.provider,
+                &reason,
+            )
+            .await;
+        }
+    };
     // The selected alternate may itself be cooling down. Retire it as a
     // classified profile-unavailable launch without contacting the provider;
     // each skip adds one durable profile exclusion, so this walk is bounded by
@@ -30131,7 +30862,10 @@ async fn activate_worker_fallback_with(
         continuation_id: None,
         requested: intent.pending_turn.requested,
     };
-    let alternate_kind = match resolve_worker_provider(&intent.pending_turn.model) {
+    let alternate_kind = match resolve_recorded_provider(
+        &intent.pending_turn.provider,
+        &intent.pending_turn.model,
+    ) {
         Ok(kind) if kind.to_string() == intent.pending_turn.provider => kind,
         Ok(kind) => {
             let reason = format!(
@@ -30400,7 +31134,11 @@ async fn resume_pending_fallbacks(
         let intent = recovery.intent;
         let entry = recovery.entry;
         let agent_name = recovery.agent;
-        let kind = resolve_managed_provider(&intent.pending_turn.model, "fallback recovery")?;
+        let kind = resolve_recorded_managed_provider(
+            &intent.pending_turn.provider,
+            &intent.pending_turn.model,
+            "fallback recovery",
+        )?;
         if kind.to_string() != intent.pending_turn.provider {
             return Err(QuorumError::Io(format!(
                 "fallback recovery provider '{}' does not match model '{}'",
@@ -31152,12 +31890,60 @@ async fn fail_worker_assignment(
     task_id: i64,
     reason: &str,
 ) -> Option<tasks::WorkerFailureOutcome> {
+    fail_worker_assignment_with(
+        db_path,
+        agent,
+        task_id,
+        reason,
+        WorkerFailureCharge::Charged,
+    )
+    .await
+}
+
+/// How a worker failure is charged against the task's recovery budget.
+#[derive(Clone, Copy, Debug)]
+enum WorkerFailureCharge {
+    Charged,
+    /// Busy-ceiling reap: waived while within the task's wall ceiling.
+    BusyCeiling {
+        slot_wall_secs: u64,
+        max_task_wall_secs: Option<u64>,
+    },
+}
+
+async fn fail_worker_assignment_with(
+    db_path: &Path,
+    agent: &str,
+    task_id: i64,
+    reason: &str,
+    charge: WorkerFailureCharge,
+) -> Option<tasks::WorkerFailureOutcome> {
     let p = db_path.to_path_buf();
     let actor = agent.to_string();
     let failure_reason = reason.to_string();
     let result = tokio::task::spawn_blocking(move || {
         let mut conn = quorum_core::db::open(&p)?;
-        tasks::fail_worker_assignment(&mut conn, &actor, task_id, &failure_reason, now_unix())
+        match charge {
+            WorkerFailureCharge::Charged => tasks::fail_worker_assignment(
+                &mut conn,
+                &actor,
+                task_id,
+                &failure_reason,
+                now_unix(),
+            ),
+            WorkerFailureCharge::BusyCeiling {
+                slot_wall_secs,
+                max_task_wall_secs,
+            } => tasks::fail_worker_assignment_at_busy_ceiling(
+                &mut conn,
+                &actor,
+                task_id,
+                &failure_reason,
+                slot_wall_secs,
+                max_task_wall_secs,
+                now_unix(),
+            ),
+        }
     })
     .await;
     let event_debug = format!(
@@ -32881,7 +33667,7 @@ async fn spawn_remediation_worker(
             None => {
                 let assignment =
                     fresh_assignment.expect("workerless remediation has a fresh assignment");
-                resolve_worker_provider(&assignment.model).and_then(|kind| {
+                resolve_recorded_provider(&assignment.runner, &assignment.model).and_then(|kind| {
                     let runner = resolve_profile_runner(&assignment.runner)?;
                     Ok((
                         assignment.model.clone(),
@@ -33375,6 +34161,13 @@ mod tests {
         }
         fn check_mergeability(&self, pr: i64, repo_dir: &Path) -> merge::MergeabilityState {
             self.inner.check_mergeability(pr, repo_dir)
+        }
+        fn check_mergeability_with_head(
+            &self,
+            pr: i64,
+            repo_dir: &Path,
+        ) -> (merge::MergeabilityState, Option<String>) {
+            self.inner.check_mergeability_with_head(pr, repo_dir)
         }
         fn head_sha(&self, pr: i64, repo_dir: &Path) -> Option<String> {
             self.inner.head_sha(pr, repo_dir)
@@ -35202,7 +35995,7 @@ mod tests {
 
         assert_eq!(
             poll_pre_review_mergeability_if_due(&config, &waits, TASK_ID, PR).await,
-            Some(merge::MergeabilityState::Mergeable)
+            Some((merge::MergeabilityState::Mergeable, None))
         );
         let (gate, head_sha, polled) =
             poll_resume_reviewer_pre_review_checks(&config, &mut waits, TASK_ID, PR)
@@ -35278,7 +36071,7 @@ mod tests {
             Some(std::time::Instant::now() - Duration::from_secs(30));
         assert_eq!(
             poll_pre_review_mergeability_if_due(&config, &waits, TASK_ID, PR).await,
-            Some(merge::MergeabilityState::Mergeable)
+            Some((merge::MergeabilityState::Mergeable, None))
         );
         let (_, _, polled) =
             poll_resume_reviewer_pre_review_checks(&config, &mut waits, TASK_ID, PR)
@@ -36366,6 +37159,977 @@ mod tests {
         .expect("the green same-head gate must leave reviewer provisioning eligible");
         assert_eq!(reviewer.status, "in-review");
         assert_eq!(reviewer.reviewer.as_deref(), Some("reviewer"));
+    }
+
+    /// Mergeability executor that reports a fixed state for a fixed head, read
+    /// in one response like `gh pr view --json mergeStateStatus,state,headRefOid`.
+    struct HeadBoundMergeability {
+        state: merge::MergeabilityState,
+        head: Option<String>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HeadBoundMergeability {
+        fn new(state: merge::MergeabilityState, head: Option<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                state,
+                head: head.map(str::to_string),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl merge::MergeExecutor for HeadBoundMergeability {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: true,
+                message: String::new(),
+                failure_kind: None,
+            }
+        }
+
+        fn check_mergeability_with_head(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+        ) -> (merge::MergeabilityState, Option<String>) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (self.state, self.head.clone())
+        }
+    }
+
+    const CONFLICT_HEAD: &str = "8aadb5bc8aadb5bc8aadb5bc8aadb5bc8aadb5bc";
+
+    /// An implementation task in review on `pr` with a daemon-recorded head.
+    fn seed_in_review_conflict_task(db_path: &Path, pr: i64, recorded_head: Option<&str>) -> i64 {
+        let mut conn = quorum_core::db::open(db_path).unwrap();
+        let now = now_unix();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "conflicting child",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now,
+        )
+        .unwrap();
+        tasks::update_refs_daemon(
+            &mut conn,
+            task_id,
+            r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+            now,
+        )
+        .unwrap();
+        tasks::claim(&mut conn, "W1", Some(task_id), &[], 3600, now)
+            .unwrap()
+            .unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "W1",
+            task_id,
+            &Event::SignaledDone { pr: pr.to_string() },
+            now,
+        )
+        .unwrap();
+        if let Some(head) = recorded_head {
+            pr_targets::upsert(&mut conn, task_id, pr, "daemon/w1-t1", head, false).unwrap();
+        }
+        task_id
+    }
+
+    fn conflict_test_config(
+        db_path: &Path,
+        dir: &Path,
+        executor: Arc<HeadBoundMergeability>,
+    ) -> ServeConfig {
+        let mut config = pre_review_ci_test_config(db_path.to_path_buf(), dir.to_path_buf());
+        config.merge_executor = executor;
+        config
+    }
+
+    async fn run_pre_review_conflict(config: &ServeConfig, task_id: i64, pr: i64, head: &str) {
+        handle_pre_review_conflict(
+            config,
+            &WorktreeManager::new(),
+            &mut Pool::new_generated(),
+            &mut Vec::new(),
+            &mut ProfileCooldown::new(),
+            task_id,
+            pr,
+            head,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pre_review_dirty_at_recorded_head_enters_merge_base_rework_without_ci_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pre-review-conflict.db");
+        let pr = 1007;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, Some(CONFLICT_HEAD));
+        let executor =
+            HeadBoundMergeability::new(merge::MergeabilityState::Conflicting, Some(CONFLICT_HEAD));
+        let config = conflict_test_config(&db_path, dir.path(), executor.clone());
+        let mut waits: HashMap<i64, PreReviewChecksEntry> = HashMap::new();
+
+        let observation = poll_pre_review_mergeability_if_due(&config, &waits, task_id, pr)
+            .await
+            .expect("first read is due");
+        let head = pre_review_conflict_head(&config, &waits, task_id, pr, &observation)
+            .await
+            .unwrap()
+            .expect("DIRTY at the recorded head is a conflict");
+        assert_eq!(head, CONFLICT_HEAD);
+        hold_pre_review_on_cadence(&mut waits, task_id, pr, &head, std::time::Instant::now());
+        let mut workers = Vec::new();
+        handle_pre_review_conflict(
+            &config,
+            &WorktreeManager::new(),
+            &mut Pool::new_generated(),
+            &mut workers,
+            &mut ProfileCooldown::new(),
+            task_id,
+            pr,
+            &head,
+        )
+        .await
+        .unwrap();
+
+        let entry = waits.get(&task_id).expect("cadence stamp is kept");
+        assert!(
+            matches!(entry.state, PreReviewChecksState::Retry),
+            "no pre-review CI wait may start"
+        );
+        assert!(!pre_review_external_poll_due(&config, &waits, task_id, pr));
+        assert!(workers.is_empty(), "no worker or reviewer slot is created");
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.rework_round, 1);
+        assert_eq!(task.reviewer, None, "no reviewer is provisioned");
+        let intent = tasks::ci_remediation_intent(task.refs.as_deref())
+            .unwrap()
+            .expect("durable remediation intent");
+        assert_eq!(intent.pr, pr);
+        assert_eq!(intent.head_sha, CONFLICT_HEAD);
+        assert_eq!(
+            intent.checks,
+            vec![tasks::PRE_REVIEW_CONFLICT_REMEDIATION_CHECK.to_string()]
+        );
+        assert_eq!(
+            intent.feedback,
+            merge_base_remediation_message(
+                "PR #1007 has conflicts with main (a sibling PR likely merged first).",
+                "main"
+            )
+        );
+        assert!(intent.feedback.contains("merge main into the PR branch"));
+        assert!(!intent.feedback.contains("Fix the failing checks"));
+        let runs = quorum_core::agent_runs::runs_for_task(&conn, task_id).unwrap();
+        assert!(runs.is_empty(), "no reviewer run: {runs:?}");
+    }
+
+    #[tokio::test]
+    async fn pre_review_conflict_requires_dirty_for_the_recorded_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pre-review-conflict-head.db");
+        let pr = 1008;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, Some(CONFLICT_HEAD));
+        let config = conflict_test_config(
+            &db_path,
+            dir.path(),
+            HeadBoundMergeability::new(merge::MergeabilityState::Mergeable, None),
+        );
+        let waits: HashMap<i64, PreReviewChecksEntry> = HashMap::new();
+        let decide = |state, head: Option<&str>| {
+            let observation = (state, head.map(str::to_string));
+            let config = &config;
+            let waits = &waits;
+            async move {
+                pre_review_conflict_head(config, waits, task_id, pr, &observation)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // GitHub lagging: DIRTY reported for the pre-merge head, not ours.
+        assert_eq!(
+            decide(merge::MergeabilityState::Conflicting, Some("d4419eb-old")).await,
+            None
+        );
+        // DIRTY with no head in the response is never bound.
+        assert_eq!(
+            decide(merge::MergeabilityState::Conflicting, None).await,
+            None
+        );
+        // UNKNOWN/BLOCKED/BEHIND/UNSTABLE and failed reads all parse to
+        // Mergeable (merge.rs parse tests), which is never a conflict.
+        assert_eq!(
+            decide(merge::MergeabilityState::Mergeable, Some(CONFLICT_HEAD)).await,
+            None
+        );
+        // After the worker merges the base, the new head is no longer DIRTY
+        // and the normal pre-review CI gate runs.
+        assert_eq!(
+            decide(merge::MergeabilityState::Mergeable, Some("merged-head")).await,
+            None
+        );
+        assert_eq!(
+            decide(merge::MergeabilityState::Conflicting, Some(CONFLICT_HEAD)).await,
+            Some(CONFLICT_HEAD.to_string())
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review", "decisions alone never transition");
+        assert_eq!(task.rework_round, 0);
+    }
+
+    #[tokio::test]
+    async fn pre_review_conflict_without_baseline_binds_to_the_gated_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pre-review-conflict-gated.db");
+        let pr = 1009;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, None);
+        let config = conflict_test_config(
+            &db_path,
+            dir.path(),
+            HeadBoundMergeability::new(merge::MergeabilityState::Mergeable, None),
+        );
+        let observation = (
+            merge::MergeabilityState::Conflicting,
+            Some(CONFLICT_HEAD.to_string()),
+        );
+        let mut waits: HashMap<i64, PreReviewChecksEntry> = HashMap::new();
+        assert_eq!(
+            pre_review_conflict_head(&config, &waits, task_id, pr, &observation)
+                .await
+                .unwrap(),
+            None,
+            "no recorded or gated head: keep today's behavior"
+        );
+        waits.insert(
+            task_id,
+            PreReviewChecksEntry {
+                pr,
+                head_sha: CONFLICT_HEAD.into(),
+                last_head_poll: Some(std::time::Instant::now()),
+                post_gate_validation_attempted: false,
+                state: PreReviewChecksState::Retry,
+                consecutive_timeouts: 0,
+                timeout_alerted: false,
+                head_lag_since: None,
+            },
+        );
+        assert_eq!(
+            pre_review_conflict_head(&config, &waits, task_id, pr, &observation)
+                .await
+                .unwrap(),
+            Some(CONFLICT_HEAD.to_string())
+        );
+        // A hold with no verified head keeps the tracked head and stamps the
+        // shared cadence instead of dropping the entry.
+        hold_pre_review_on_cadence(&mut waits, task_id, pr, "", std::time::Instant::now());
+        let entry = waits.get(&task_id).unwrap();
+        assert_eq!(entry.head_sha, CONFLICT_HEAD);
+        assert!(matches!(entry.state, PreReviewChecksState::Retry));
+        assert!(!pre_review_external_poll_due(&config, &waits, task_id, pr));
+    }
+
+    #[tokio::test]
+    async fn review_only_pre_review_conflict_parks_merge_blocked_until_mergeable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("review-only-pre-review-conflict.db");
+        let pr = 1010;
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            tasks::create(
+                &mut conn,
+                "owner",
+                "review-only conflict",
+                Some(REVIEW_ONLY_CONTRACT),
+                0,
+                None,
+                None,
+                None,
+                Some(pr),
+                now_unix(),
+            )
+            .unwrap()
+        };
+        let config = conflict_test_config(
+            &db_path,
+            dir.path(),
+            HeadBoundMergeability::new(merge::MergeabilityState::Conflicting, Some(CONFLICT_HEAD)),
+        );
+        run_pre_review_conflict(&config, task_id, pr, CONFLICT_HEAD).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert!(task.review_only);
+        assert_eq!(task.status, "in-review", "review-only is never reworked");
+        assert_eq!(task.rework_round, 0);
+        assert_eq!(
+            task.body.as_deref(),
+            Some(REVIEW_ONLY_CONTRACT),
+            "the review contract survives the block"
+        );
+        assert!(tasks::pre_review_merge_blocked(task.refs.as_deref()));
+        assert_eq!(
+            tasks::ci_remediation_intent(task.refs.as_deref()).unwrap(),
+            None
+        );
+        drop(conn);
+
+        // Once GitHub no longer reports a conflict the block clears and the
+        // normal pre-review path resumes; a second clear is a no-op.
+        assert!(clear_pre_review_merge_block(&db_path, task_id)
+            .await
+            .unwrap());
+        assert!(!clear_pre_review_merge_block(&db_path, task_id)
+            .await
+            .unwrap());
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert!(!tasks::pre_review_merge_blocked(task.refs.as_deref()));
+        assert_eq!(
+            task.body.as_deref(),
+            Some(REVIEW_ONLY_CONTRACT),
+            "the review contract survives block -> clear for R1/R2"
+        );
+        assert_eq!(tasks::extract_pr_number(&task.refs), Some(pr));
+    }
+
+    const REVIEW_ONLY_CONTRACT: &str = "Review contract: verify the CI gate change.";
+
+    #[test]
+    fn blocked_review_only_task_reads_github_once_per_cadence_window() {
+        // A real tick needs more than the default test-thread stack.
+        std::thread::Builder::new()
+            .name("blocked-cadence-tick".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(blocked_review_only_cadence_body())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn blocked_review_only_cadence_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("blocked-cadence.db");
+        let pr = 1013;
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let now = now_unix();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "blocked review-only",
+                Some(REVIEW_ONLY_CONTRACT),
+                0,
+                None,
+                None,
+                None,
+                Some(pr),
+                now,
+            )
+            .unwrap();
+            tasks::update_refs_daemon(
+                &mut conn,
+                task_id,
+                r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                now,
+            )
+            .unwrap();
+            assert!(tasks::set_pre_review_merge_block(&conn, task_id, CONFLICT_HEAD, now).unwrap());
+            task_id
+        };
+        let executor =
+            HeadBoundMergeability::new(merge::MergeabilityState::Conflicting, Some(CONFLICT_HEAD));
+        let mut config = conflict_test_config(&db_path, dir.path(), executor.clone());
+        config.merge_checks_poll_secs = 3600;
+
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        let mut workers = Vec::new();
+        let mut reviewers = Vec::new();
+        let mut branch_sync_checks = branch_sync::BranchSyncChecks::default();
+        let mut pre_review_checks = HashMap::new();
+        let mut pending_reviewer_resumes = HashMap::new();
+        let mut poison_tracker = PoisonTracker::new();
+        let mut claim_skip_logs = ClaimSkipLogLimiter::new();
+        let mut graph_skip_logs = ClaimSkipLogLimiter::new();
+        let mut unrecordable = UnrecordableStrikes::new();
+        let mut reviewer_respawn_backoff = ReviewerRespawnBackoff::new();
+        let mut profile_cooldown = ProfileCooldown::new();
+        let mut reviewer_slot_queue = ReviewerSlotQueue::default();
+        let mut drain_state = DrainState::new();
+        let mut lifetime_roster = LifetimeRoster::new();
+        let mut classifier_slot = None;
+        let mut decomposition_coordinator = DecompositionCoordinator::default();
+        let mut classifier_consec_errors = 0;
+        let mut classifier_backoff_until = None;
+        let mut doctor_slot = None;
+        let mut doctored_tasks = std::collections::HashSet::new();
+        let collectors = collector::CollectorTracker::default();
+        let signal_count = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        for _ in 0..2 {
+            tick(
+                &config,
+                &wt_mgr,
+                &mut name_pool,
+                &mut workers,
+                &mut reviewers,
+                &mut branch_sync_checks,
+                &mut pre_review_checks,
+                &mut pending_reviewer_resumes,
+                &mut poison_tracker,
+                &mut claim_skip_logs,
+                &mut graph_skip_logs,
+                &mut unrecordable,
+                &mut reviewer_respawn_backoff,
+                &mut profile_cooldown,
+                &mut reviewer_slot_queue,
+                &mut drain_state,
+                &mut lifetime_roster,
+                &mut classifier_slot,
+                &mut decomposition_coordinator,
+                &mut classifier_consec_errors,
+                &mut classifier_backoff_until,
+                &mut doctor_slot,
+                &mut doctored_tasks,
+                &collectors,
+                &signal_count,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            executor.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "two passes in one cadence window make one mergeability read"
+        );
+        assert!(reviewers.is_empty(), "a blocked task gets no reviewer");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "in-review");
+        assert_eq!(task.rework_round, 0);
+        assert!(tasks::pre_review_merge_blocked(task.refs.as_deref()));
+        assert_eq!(task.body.as_deref(), Some(REVIEW_ONLY_CONTRACT));
+    }
+
+    #[tokio::test]
+    async fn no_rework_pre_review_conflict_closes_done_with_merge_conflict_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("no-rework-pre-review-conflict.db");
+        let pr = 1011;
+        let task_id = create_no_rework_review_task(&db_path, pr);
+        let config = conflict_test_config(
+            &db_path,
+            dir.path(),
+            HeadBoundMergeability::new(merge::MergeabilityState::Conflicting, Some(CONFLICT_HEAD)),
+        );
+        run_pre_review_conflict(&config, task_id, pr, CONFLICT_HEAD).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "done");
+        assert_eq!(task.rework_round, 0);
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[tasks::REVIEW_OUTCOME_REF], "merge_conflict");
+        assert!(refs.get(tasks::CI_REMEDIATION_REQUESTED_REF).is_none());
+    }
+
+    #[tokio::test]
+    async fn pre_review_conflict_at_rework_cap_fails_with_cap_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pre-review-conflict-cap.db");
+        let pr = 1012;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, Some(CONFLICT_HEAD));
+        let cap = {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let cap = tasks::get(&conn, task_id)
+                .unwrap()
+                .unwrap()
+                .effective_rework_cap();
+            conn.execute(
+                "UPDATE tasks SET rework_round=?2 WHERE id=?1",
+                rusqlite::params![task_id, cap],
+            )
+            .unwrap();
+            cap
+        };
+        let config = conflict_test_config(
+            &db_path,
+            dir.path(),
+            HeadBoundMergeability::new(merge::MergeabilityState::Conflicting, Some(CONFLICT_HEAD)),
+        );
+        run_pre_review_conflict(&config, task_id, pr, CONFLICT_HEAD).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        assert_eq!(task.rework_round, i64::from(cap), "cap is not exceeded");
+        assert_eq!(
+            tasks::ci_remediation_intent(task.refs.as_deref()).unwrap(),
+            None
+        );
+        let alert: String = conn
+            .query_row(
+                "SELECT body FROM messages
+                 WHERE recipient='owner' AND kind='alert' AND refs=?1",
+                [format!("task:{task_id}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            alert,
+            format!("task #{task_id}: rework cap ({cap}) exceeded"),
+            "same owner notice as the merge-time conflict"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_absent_required_jobs_on_dirty_head_never_send_ci_feedback() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("absent-dirty.db");
+        let pr = 1013;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, Some(CONFLICT_HEAD));
+        let executor =
+            HeadBoundMergeability::new(merge::MergeabilityState::Conflicting, Some(CONFLICT_HEAD));
+        let config = conflict_test_config(&db_path, dir.path(), executor.clone());
+        handle_pre_review_checks_failure(
+            &config,
+            &WorktreeManager::new(),
+            &mut Pool::new_generated(),
+            &mut Vec::new(),
+            &mut LifetimeRoster::new(),
+            &mut ProfileCooldown::new(),
+            task_id,
+            pr,
+            CONFLICT_HEAD,
+            &["container (absent)".into(), "shell-tests (absent)".into()],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.rework_round, 1);
+        let intent = tasks::ci_remediation_intent(task.refs.as_deref())
+            .unwrap()
+            .unwrap();
+        assert!(!intent.feedback.contains("Fix the failing checks"));
+        assert!(intent.feedback.contains("PR #1013 has conflicts with main"));
+        assert_eq!(
+            intent.checks,
+            vec![tasks::PRE_REVIEW_CONFLICT_REMEDIATION_CHECK.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn all_absent_required_jobs_on_lagging_dirty_report_keep_ci_feedback() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("absent-lagging-dirty.db");
+        let pr = 1014;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, Some(CONFLICT_HEAD));
+        let config = conflict_test_config(
+            &db_path,
+            dir.path(),
+            HeadBoundMergeability::new(merge::MergeabilityState::Conflicting, Some("older-head")),
+        );
+        handle_pre_review_checks_failure(
+            &config,
+            &WorktreeManager::new(),
+            &mut Pool::new_generated(),
+            &mut Vec::new(),
+            &mut LifetimeRoster::new(),
+            &mut ProfileCooldown::new(),
+            task_id,
+            pr,
+            CONFLICT_HEAD,
+            &["container (absent)".into()],
+        )
+        .await
+        .unwrap();
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let intent = tasks::ci_remediation_intent(task.refs.as_deref())
+            .unwrap()
+            .unwrap();
+        assert!(intent.feedback.contains("Fix the failing checks"));
+        assert_eq!(intent.checks, vec!["container (absent)".to_string()]);
+    }
+
+    /// Counts `fetch_failed_job_digest` calls; returns a fixed digest or a
+    /// rate-limit failure.
+    struct DigestCountingExecutor {
+        fail: bool,
+        fetched: std::sync::Mutex<Vec<(i64, String, String)>>,
+    }
+
+    impl DigestCountingExecutor {
+        fn new(fail: bool) -> Arc<Self> {
+            Arc::new(Self {
+                fail,
+                fetched: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.fetched.lock().unwrap().len()
+        }
+    }
+
+    impl merge::MergeExecutor for DigestCountingExecutor {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: true,
+                message: String::new(),
+                failure_kind: None,
+            }
+        }
+
+        fn fetch_failed_job_digest(
+            &self,
+            pr: i64,
+            _repo_dir: &Path,
+            head_sha: &str,
+            job_name: &str,
+        ) -> std::result::Result<merge::FailedJobDigest, merge::CiDigestFetchError> {
+            self.fetched
+                .lock()
+                .unwrap()
+                .push((pr, head_sha.to_string(), job_name.to_string()));
+            if self.fail {
+                return Err(merge::CiDigestFetchError::RateLimited);
+            }
+            let log =
+                "test tests::boom ... FAILED\n##[error]Process completed with exit code 101.\n";
+            Ok(merge::FailedJobDigest {
+                run_id: 4242,
+                job_id: 9191,
+                digest: quorum_core::ci_digest::digest_job_log(log.as_bytes()).unwrap(),
+            })
+        }
+    }
+
+    fn digest_test_config(
+        db_path: &Path,
+        dir: &Path,
+        executor: Arc<DigestCountingExecutor>,
+    ) -> ServeConfig {
+        let mut config = pre_review_ci_test_config(db_path.to_path_buf(), dir.to_path_buf());
+        config.merge_executor = executor;
+        config
+    }
+
+    async fn run_pre_review_checks_failure(
+        config: &ServeConfig,
+        task_id: i64,
+        pr: i64,
+        head: &str,
+        failing_checks: &[String],
+    ) {
+        handle_pre_review_checks_failure(
+            config,
+            &WorktreeManager::new(),
+            &mut Pool::new_generated(),
+            &mut Vec::new(),
+            &mut LifetimeRoster::new(),
+            &mut ProfileCooldown::new(),
+            task_id,
+            pr,
+            head,
+            failing_checks,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn pre_review_ci_base_feedback(pr: i64, names: &str) -> String {
+        format!(
+            "CI checks failed before review for PR #{pr}: {names}\n\n\
+             Fix the failing checks, commit, and submit the existing PR again without pushing."
+        )
+    }
+
+    #[tokio::test]
+    async fn pre_review_ci_failure_feedback_appends_digest_fetched_once_per_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ci-digest-feedback.db");
+        let pr = 1015;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, Some(CONFLICT_HEAD));
+        let executor = DigestCountingExecutor::new(false);
+        let config = digest_test_config(&db_path, dir.path(), executor.clone());
+        let checks: Vec<String> = vec![
+            "test".into(),
+            "lint (FAILURE)".into(),
+            "container (absent)".into(),
+        ];
+        run_pre_review_checks_failure(&config, task_id, pr, CONFLICT_HEAD, &checks).await;
+
+        assert_eq!(
+            *executor.fetched.lock().unwrap(),
+            vec![
+                (pr, CONFLICT_HEAD.to_string(), "test".to_string()),
+                (pr, CONFLICT_HEAD.to_string(), "lint".to_string()),
+            ],
+            "only failed (not absent) jobs are fetched, by check-run name"
+        );
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        assert_eq!(task.rework_round, 1);
+        let intent = tasks::ci_remediation_intent(task.refs.as_deref())
+            .unwrap()
+            .expect("durable remediation intent");
+        assert_eq!(intent.head_sha, CONFLICT_HEAD);
+        assert_eq!(intent.checks, checks);
+        let base = pre_review_ci_base_feedback(pr, "test, lint (FAILURE), container (absent)");
+        assert!(
+            intent.feedback.starts_with(&base),
+            "today's feedback text leads: {}",
+            intent.feedback
+        );
+        for expected in [
+            "CI job failure digest\njob: test\nrun id: 4242\njob id: 9191",
+            "CI job failure digest\njob: lint\nrun id: 4242\njob id: 9191",
+            "tests::boom",
+        ] {
+            assert!(
+                intent.feedback.contains(expected),
+                "missing {expected:?}: {}",
+                intent.feedback
+            );
+        }
+        assert!(!intent.feedback.contains("couldn't be fetched"));
+        assert!(!intent.feedback.contains("job: container"));
+
+        // Repeated handling of the same (PR, head, job) is served from cache.
+        for _ in 0..3 {
+            let lines =
+                failed_job_digest_feedback(&config, task_id, pr, CONFLICT_HEAD, &checks).await;
+            assert_eq!(lines.len(), 2);
+            assert!(lines[0].contains("job: test"));
+        }
+        assert_eq!(executor.calls(), 2, "cached keys are never refetched");
+
+        // A new head is a new key.
+        let new_head = "1111111111111111111111111111111111111111";
+        failed_job_digest_feedback(&config, task_id, pr, new_head, &checks).await;
+        assert_eq!(executor.calls(), 4);
+        assert_eq!(
+            executor.fetched.lock().unwrap()[2],
+            (pr, new_head.to_string(), "test".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn review_only_pre_review_ci_park_feedback_carries_job_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ci-digest-review-only.db");
+        let now = now_unix();
+        let pr = 1019;
+        let task_id = {
+            let mut conn = quorum_core::db::open(&db_path).unwrap();
+            let task_id = tasks::create(
+                &mut conn,
+                "owner",
+                "review-only",
+                None,
+                0,
+                None,
+                None,
+                None,
+                Some(pr),
+                now,
+            )
+            .unwrap();
+            tasks::update_refs_daemon(
+                &mut conn,
+                task_id,
+                &format!(
+                    r#"{{"pr":{pr},"cx_est":3,"cx_size":"M","cx_ready":true,
+                        "cx_not_ready_reason":null,"cx_by":"test:v2"}}"#
+                ),
+                now,
+            )
+            .unwrap();
+            task_id
+        };
+        let executor = DigestCountingExecutor::new(false);
+        let config = digest_test_config(&db_path, dir.path(), executor.clone());
+        run_pre_review_checks_failure(&config, task_id, pr, CONFLICT_HEAD, &["test".into()]).await;
+
+        assert_eq!(executor.calls(), 1);
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let parked = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(parked.status, "failed");
+        let refs: serde_json::Value =
+            serde_json::from_str(parked.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[tasks::PARKED_REF], true);
+        let reason = refs[tasks::PARKED_REASON_REF].as_str().unwrap();
+        assert!(reason.starts_with(&pre_review_ci_base_feedback(pr, "test")));
+        assert!(
+            reason.contains("CI job failure digest\njob: test\nrun id: 4242\njob id: 9191"),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_review_ci_digest_fetch_failure_falls_back_and_still_enters_rework() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ci-digest-fetch-failure.db");
+        let pr = 1016;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, Some(CONFLICT_HEAD));
+        let executor = DigestCountingExecutor::new(true);
+        let config = digest_test_config(&db_path, dir.path(), executor.clone());
+        let checks: Vec<String> = vec!["test".into()];
+        run_pre_review_checks_failure(&config, task_id, pr, CONFLICT_HEAD, &checks).await;
+
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(
+            task.status, "rework",
+            "remediation proceeds without a digest"
+        );
+        assert_eq!(task.rework_round, 1);
+        let intent = tasks::ci_remediation_intent(task.refs.as_deref())
+            .unwrap()
+            .expect("durable remediation intent");
+        assert_eq!(
+            intent.feedback,
+            format!(
+                "{}\n\nThe failure digest for CI job `test` couldn't be fetched.",
+                pre_review_ci_base_feedback(pr, "test")
+            ),
+            "fallback carries no error internals"
+        );
+        assert_eq!(executor.calls(), 1);
+
+        // The failure is cached too: no refetch on later handling.
+        let lines = failed_job_digest_feedback(&config, task_id, pr, CONFLICT_HEAD, &checks).await;
+        assert_eq!(
+            lines,
+            vec!["The failure digest for CI job `test` couldn't be fetched.".to_string()]
+        );
+        assert_eq!(executor.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_absent_pre_review_checks_fetch_no_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ci-digest-all-absent.db");
+        let pr = 1017;
+        let task_id = seed_in_review_conflict_task(&db_path, pr, Some(CONFLICT_HEAD));
+        let executor = DigestCountingExecutor::new(false);
+        let config = digest_test_config(&db_path, dir.path(), executor.clone());
+        let checks: Vec<String> = vec!["container (absent)".into(), "shell-tests (absent)".into()];
+        run_pre_review_checks_failure(&config, task_id, pr, CONFLICT_HEAD, &checks).await;
+
+        assert_eq!(executor.calls(), 0, "absent jobs have no log to fetch");
+        let conn = quorum_core::db::open(&db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "rework");
+        let intent = tasks::ci_remediation_intent(task.refs.as_deref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            intent.feedback,
+            pre_review_ci_base_feedback(pr, "container (absent), shell-tests (absent)")
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_review_ci_digest_feedback_is_bounded_in_job_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ci-digest-bounded.db");
+        let executor = DigestCountingExecutor::new(false);
+        let config = digest_test_config(&db_path, dir.path(), executor.clone());
+        let checks: Vec<String> = (0..CI_DIGEST_FEEDBACK_MAX_JOBS + 2)
+            .map(|i| format!("job-{i}"))
+            .collect();
+        let lines = failed_job_digest_feedback(&config, 1, 1018, CONFLICT_HEAD, &checks).await;
+        assert_eq!(executor.calls(), CI_DIGEST_FEEDBACK_MAX_JOBS);
+        assert_eq!(lines.len(), CI_DIGEST_FEEDBACK_MAX_JOBS + 1);
+        assert_eq!(
+            lines.last().unwrap(),
+            "Failure digests for 2 more failed CI job(s) were not included."
+        );
+        let total: usize = lines.iter().map(String::len).sum();
+        assert!(
+            total <= CI_DIGEST_FEEDBACK_MAX_JOBS * quorum_core::ci_digest::DIGEST_MAX_BYTES + 128,
+            "combined digest text is bounded: {total}"
+        );
+    }
+
+    #[test]
+    fn ci_digest_cache_evicts_oldest_beyond_entry_cap() {
+        let mut cache = CiDigestCache::default();
+        let key = |i: usize| {
+            (
+                PathBuf::from("/db"),
+                1,
+                format!("head-{i}"),
+                "job".to_string(),
+            )
+        };
+        for i in 0..CI_DIGEST_CACHE_MAX_ENTRIES + 5 {
+            cache.insert(key(i), Some(format!("digest-{i}")));
+        }
+        assert_eq!(cache.entries.len(), CI_DIGEST_CACHE_MAX_ENTRIES);
+        assert_eq!(cache.order.len(), CI_DIGEST_CACHE_MAX_ENTRIES);
+        assert_eq!(cache.get(&key(0)), None, "oldest entry evicted");
+        assert_eq!(
+            cache.get(&key(CI_DIGEST_CACHE_MAX_ENTRIES + 4)),
+            Some(Some(format!("digest-{}", CI_DIGEST_CACHE_MAX_ENTRIES + 4)))
+        );
+        // Re-inserting a live key neither duplicates nor overwrites it.
+        let last = key(CI_DIGEST_CACHE_MAX_ENTRIES + 4);
+        cache.insert(last.clone(), None);
+        assert_eq!(cache.order.len(), CI_DIGEST_CACHE_MAX_ENTRIES);
+        assert!(cache.get(&last).unwrap().is_some());
+    }
+
+    #[test]
+    fn failed_check_job_name_maps_gate_labels_to_check_runs() {
+        assert_eq!(failed_check_job_name("container (absent)"), None);
+        assert_eq!(failed_check_job_name("test"), Some("test"));
+        assert_eq!(failed_check_job_name("fmt (SKIPPED)"), Some("fmt"));
+        assert_eq!(failed_check_job_name("e2e (TIMED_OUT)"), Some("e2e"));
+        assert_eq!(
+            failed_check_job_name("test (ubuntu-latest)"),
+            Some("test (ubuntu-latest)"),
+            "matrix rollup names keep their suffix"
+        );
     }
 
     #[tokio::test]
@@ -43315,13 +45079,14 @@ mod tests {
 
         let mut child = tokio::process::Command::new("sh")
             .args(["-c", "sleep 2"])
+            .process_group(0)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        let proc = runner::RunnerProc::Claude(agent::AgentProc::from_parts(
+        let proc = runner::RunnerProc::Claude(agent::AgentProc::from_parts_in_own_group(
             child,
             stdin,
             BufReader::new(stdout),
@@ -43359,19 +45124,20 @@ mod tests {
         body.push('\n');
         std::fs::write(&path, body).unwrap();
         let script = format!("cat '{}'; {then}", path.display());
+        // Own process group so `kill_and_reap` ends the `then` tail instead of
+        // waiting it out.
         let mut child = tokio::process::Command::new("sh")
             .args(["-c", &script])
+            .process_group(0)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
-        slot_with_process(runner::RunnerProc::Claude(agent::AgentProc::from_parts(
-            child,
-            stdin,
-            BufReader::new(stdout),
-        )))
+        slot_with_process(runner::RunnerProc::Claude(
+            agent::AgentProc::from_parts_in_own_group(child, stdin, BufReader::new(stdout)),
+        ))
     }
 
     fn fixture_prefix_through(fixture: &str, kind: &str, subtype: Option<&str>) -> Vec<String> {
@@ -43905,6 +45671,68 @@ mod tests {
         let mut idle = make_dummy_slot_async().await;
         idle.turn_ended_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(1000));
         assert!(slot_is_idle_zombie_candidate(&idle, 900, 3600));
+        idle.kill_and_reap().await;
+    }
+
+    /// Incident #476: the busy ceiling and the plain idle ceiling are distinct
+    /// reap reasons with distinct end reasons and wording.
+    #[tokio::test]
+    async fn idle_reap_classification_distinguishes_busy_ceiling_from_zombie() {
+        let dir = tempfile::tempdir().unwrap();
+        let started =
+            fixture_prefix_through(CLAUDE_BETWEEN_TURNS_FIXTURE, "system", Some("task_started"));
+        let mut lines: Vec<&str> = started.iter().map(String::as_str).collect();
+        lines.push(r#"{"type":"result","result":"started"}"#);
+        let mut busy = claude_replay_slot(dir.path(), &lines, "sleep 5");
+        run_turn_then_observe_between_turns(&mut busy, dir.path()).await;
+        assert_eq!(between_turn_idle_kind(&busy), IdleReapKind::BusyCeiling);
+        assert_eq!(IdleReapKind::BusyCeiling.end_reason(), "busy_ceiling");
+        let outstanding = outstanding_work_description(&busy);
+        assert_eq!(outstanding, "background Bash: sleep 10 && echo bg-done2");
+        let (line, reason) = worker_idle_reap_text(
+            IdleReapKind::BusyCeiling,
+            "Cleat",
+            476,
+            3601,
+            3600,
+            &outstanding,
+        );
+        assert_eq!(
+            line,
+            "WATCHDOG: worker Cleat exceeded busy ceiling 3600s on task #476 \
+             (outstanding work: background Bash: sleep 10 && echo bg-done2)"
+        );
+        assert!(reason.starts_with(BUSY_CEILING_CAUSE_MARKER), "{reason}");
+        assert!(
+            reason.contains("3601s after its last daemon-fed turn"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("Bash: sleep 10 && echo bg-done2"),
+            "{reason}"
+        );
+        assert!(
+            !line.contains("zombie") && !reason.contains("zombie"),
+            "{reason}"
+        );
+        busy.kill_and_reap().await;
+
+        let idle = make_dummy_slot_async().await;
+        assert_eq!(between_turn_idle_kind(&idle), IdleReapKind::Zombie);
+        assert_eq!(IdleReapKind::Zombie.end_reason(), "idle_reaped");
+        let (line, reason) = worker_idle_reap_text(
+            IdleReapKind::Zombie,
+            "Cleat",
+            476,
+            901,
+            900,
+            &outstanding_work_description(&idle),
+        );
+        assert!(line.ends_with("— killing zombie"), "{line}");
+        assert_eq!(
+            reason,
+            "worker idle 901s between turns (limit 900s) — zombie reaped"
+        );
         idle.kill_and_reap().await;
     }
 
@@ -49347,6 +51175,74 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 .contains("refusing provider migration"),
             "a runner must never continue through a different provider adapter"
         );
+    }
+
+    /// The routed collector's primary binary comes from the profile's runner,
+    /// not its model: a model string is not a runner name, and resolving it
+    /// as one silently dropped the configured binary (falling back to PATH).
+    #[cfg(unix)]
+    #[test]
+    fn routed_collector_request_uses_the_profile_runner_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = launch_test_repo(dir.path());
+        let (runner, _) = retry_test_claude_runner(dir.path());
+        let config = claude_only_retry_test_config(dir.path(), &repo, &runner);
+        let task_id = seed_retry_test_task(&config, "in-review", serde_json::json!(null));
+
+        let request = routed_collector_request(&config, 77, task_id, None, 0).unwrap();
+
+        let expected = config.agent_bin.clone();
+        assert!(expected.is_some());
+        assert_eq!(request.agent_bin, expected);
+        assert_eq!(request.collector_runner, "claude");
+        let routing = request.routing.as_ref().unwrap();
+        assert_eq!(
+            routing.agent_bins.get("c-claude").cloned().flatten(),
+            expected
+        );
+    }
+
+    #[test]
+    fn external_runner_kind_comes_from_durable_record_not_model() {
+        // "gpt-5" maps to Codex through for_model; an external record must
+        // resolve External regardless.
+        assert_eq!(
+            resolve_recorded_provider("external", "gpt-5").unwrap(),
+            runner::AgentKind::External
+        );
+        assert_eq!(
+            resolve_recorded_managed_provider("external", "gpt-5", "reviewer recovery").unwrap(),
+            runner::AgentKind::External
+        );
+        assert_eq!(
+            resolve_original_remediation_provider(Some("external"), "gpt-5").unwrap(),
+            runner::AgentKind::External
+        );
+        // Built-in records keep the model-derived kind and its mismatch check.
+        assert_eq!(
+            resolve_recorded_provider("codex", "gpt-5").unwrap(),
+            runner::AgentKind::Codex
+        );
+        assert_eq!(
+            resolve_recorded_provider("claude", "gpt-5").unwrap(),
+            runner::AgentKind::Codex
+        );
+        assert!(resolve_recorded_provider("claude", "unknown-model").is_err());
+        assert!(resolve_original_remediation_provider(Some("claude"), "gpt-5").is_err());
+        assert!(
+            resolve_recorded_managed_provider("grok", "grok-4.5", "reviewer recovery").is_err()
+        );
+
+        let mut slot = make_dummy_slot();
+        slot.proc =
+            SlotProcess::dormant(runner::AgentKind::External, Some("external-session")).unwrap();
+        slot.model = "gpt-5".into();
+        assert_eq!(
+            runner_continuation_identity(&slot).unwrap(),
+            ("gpt-5", "high")
+        );
+        let entry = slot_journal_entry(&slot, "worker", "working");
+        assert_eq!(entry.provider.as_deref(), Some("external"));
     }
 
     #[test]
@@ -63605,7 +65501,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let mut name_pool = Pool::new_generated();
         let slot = drain_test_slot(DRAIN_AUTHOR, 1, worktree, DRAIN_AUTHOR_CAP, None).await;
 
-        reap_idle_zombie_worker(&config, &wt_mgr, &mut name_pool, slot, 900, 600).await;
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            slot,
+            900,
+            600,
+            IdleReapKind::Zombie,
+        )
+        .await;
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         let task = tasks::get(&conn, 1).unwrap().unwrap();
@@ -63640,7 +65545,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let mut name_pool = Pool::new_generated();
         let slot = drain_test_slot(DRAIN_AUTHOR, 1, worktree, DRAIN_AUTHOR_CAP, None).await;
 
-        reap_idle_zombie_worker(&config, &wt_mgr, &mut name_pool, slot, 900, 600).await;
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            slot,
+            900,
+            600,
+            IdleReapKind::Zombie,
+        )
+        .await;
 
         let conn = quorum_core::db::open(&db_path).unwrap();
         let task = tasks::get(&conn, 1).unwrap().unwrap();
@@ -63668,10 +65582,11 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             drain_test_slot(DRAIN_AUTHOR, 1, worktree, DRAIN_AUTHOR_CAP, Some(run_id)).await;
         slot.pr = None;
         // Alive across the whole park/reap pass, like a persistent provider
-        // child between turns. Test-only `from_parts` children have no process
-        // group to kill, so teardown waits for this bounded exit.
+        // child between turns. Its own process group lets teardown kill it
+        // rather than wait for this bounded exit.
         let mut child = tokio::process::Command::new("sleep")
             .arg("2")
+            .process_group(0)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -63680,11 +65595,13 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         let stdout = child.stdout.take().unwrap();
         let short_lived = std::mem::replace(
             &mut slot.proc,
-            SlotProcess::running(runner::RunnerProc::Claude(agent::AgentProc::from_parts(
-                child,
-                stdin,
-                tokio::io::BufReader::new(stdout),
-            ))),
+            SlotProcess::running(runner::RunnerProc::Claude(
+                agent::AgentProc::from_parts_in_own_group(
+                    child,
+                    stdin,
+                    tokio::io::BufReader::new(stdout),
+                ),
+            )),
         );
         short_lived.kill_and_reap().await;
         assert_eq!(
@@ -63829,7 +65746,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             append_worker_reaction_row(&db_path, state, "which config should I use?");
             assert!(slot_is_idle_zombie_candidate(&slot, 900, 3600), "{state}");
 
-            reap_idle_zombie_worker(&config, &wt_mgr, &mut name_pool, slot, 901, 900).await;
+            reap_idle_zombie_worker(
+                &config,
+                &wt_mgr,
+                &mut name_pool,
+                slot,
+                901,
+                900,
+                IdleReapKind::Zombie,
+            )
+            .await;
 
             assert_parked_without_recovery(&db_path, run_id, state);
         }
@@ -63865,7 +65791,16 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             let mut slot = workers.remove(0);
             slot.turn_ended_at =
                 Some(std::time::Instant::now() - std::time::Duration::from_secs(901));
-            reap_idle_zombie_worker(&config, &wt_mgr, &mut name_pool, slot, 901, 900).await;
+            reap_idle_zombie_worker(
+                &config,
+                &wt_mgr,
+                &mut name_pool,
+                slot,
+                901,
+                900,
+                IdleReapKind::Zombie,
+            )
+            .await;
 
             let conn = quorum_core::db::open(&db_path).unwrap();
             let task = tasks::get(&conn, 1).unwrap().unwrap();
@@ -65962,13 +67897,21 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
 
     #[test]
     fn planning_and_claim_partition_classified_shapes() {
+        // Migrate once and give every shape a fresh copy: 80 full migration
+        // runs dominated this test's wall time. Dropping the only connection
+        // checkpoints the WAL, so the copied main file is the whole database.
+        let dir = tempfile::tempdir().unwrap();
+        let template = dir.path().join("template.db");
+        drop(quorum_core::db::open(&template).unwrap());
+        assert!(!dir.path().join("template.db-wal").exists());
         for size in ["S", "M", "L", "XL"] {
             for cx_est in 1..=5 {
                 for flag_count in [0, 1] {
                     for continue_pr in [None, Some(500)] {
                         let dir = tempfile::tempdir().unwrap();
-                        let mut conn =
-                            quorum_core::db::open(&dir.path().join("partition.db")).unwrap();
+                        let path = dir.path().join("partition.db");
+                        std::fs::copy(&template, &path).unwrap();
+                        let mut conn = quorum_core::db::open(&path).unwrap();
                         conn.execute(
                             "INSERT INTO tasks(
                                 title,status,priority,created_by,created_at,updated_at,refs,
@@ -73212,29 +75155,50 @@ exec /bin/cat '{stdout}'
         std::fs::set_permissions(&git_wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::set_permissions(&tar_wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let error = frozen_planner_view_with_options(
-            repo.path(),
-            &frozen,
-            &git_wrapper,
-            &tar_wrapper,
-            // The full suite runs many real-process canaries concurrently;
-            // leave enough headroom for the preliminary git check and both
-            // wrappers to be scheduled before exercising the deadline path.
-            Duration::from_secs(15),
-            1024 * 1024,
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("timed out"), "{error}");
-        for pid_file in [&archive_pid, &tar_pid] {
-            let pid: i32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
-            assert_eq!(
-                unsafe { libc::kill(pid, 0) },
-                -1,
-                "{} was not reaped",
-                pid_file.display()
-            );
+        // The deadline is pure wall time in the passing case. Try a short one
+        // first; the full suite runs many real-process canaries concurrently,
+        // so fall back to a CI-tolerant deadline only when the preliminary git
+        // check and both wrappers were not all scheduled before it fired.
+        let timeouts = [Duration::from_secs(2), Duration::from_secs(15)];
+        for (attempt, timeout) in timeouts.into_iter().enumerate() {
+            for pid_file in [&archive_pid, &tar_pid] {
+                let _ = std::fs::remove_file(pid_file);
+            }
+            let error = frozen_planner_view_with_options(
+                repo.path(),
+                &frozen,
+                &git_wrapper,
+                &tar_wrapper,
+                timeout,
+                1024 * 1024,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("timed out"), "{error}");
+            let pids =
+                [&archive_pid, &tar_pid].map(|pid_file| std::fs::read_to_string(pid_file).ok());
+            if pids.iter().any(Option::is_none) {
+                // A wrapper that never started may still have been reaped; check
+                // whichever did start, then retry with the longer deadline.
+                assert!(
+                    attempt + 1 < timeouts.len(),
+                    "wrappers never all started within {timeout:?}"
+                );
+            }
+            for (pid_file, pid) in [&archive_pid, &tar_pid].iter().zip(&pids) {
+                let Some(pid) = pid else { continue };
+                let pid: i32 = pid.parse().unwrap();
+                assert_eq!(
+                    unsafe { libc::kill(pid, 0) },
+                    -1,
+                    "{} was not reaped",
+                    pid_file.display()
+                );
+            }
+            if pids.iter().all(Option::is_some) {
+                return;
+            }
         }
     }
 
@@ -74127,6 +76091,302 @@ exec /bin/cat '{stdout}'
         workers.remove(0)
     }
 
+    #[cfg(unix)]
+    fn task_recovery_state(db_path: &Path, task_id: i64) -> (String, i64) {
+        let conn = quorum_core::db::open(db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        (task.status, task.recovery_attempts)
+    }
+
+    #[cfg(unix)]
+    fn daemon_notes(db_path: &Path, task_id: i64) -> Vec<String> {
+        let conn = quorum_core::db::open(db_path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT body FROM task_notes WHERE task_id=?1 AND agent='daemon' ORDER BY id")
+            .unwrap();
+        stmt.query_map([task_id], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// Incident #476: a live worker whose background verification outlives
+    /// the busy ceiling is reaped as `busy_ceiling`, spends no recovery
+    /// attempt, and its successor is told why and what to do differently.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn busy_ceiling_reap_spends_no_recovery_attempt_and_explains_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = recover_fixture_repo(dir.path());
+        let db_path = dir.path().join("quorum.db");
+        let task_id = recover_fixture_task(&db_path);
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo.clone());
+        config.worktree_base = dir.path().join("worktrees");
+        config.limits.max_task_wall_secs = Some(14_400);
+        // The worker starts a background Bash command, ends its fed turn,
+        // and keeps the child alive.
+        let started =
+            fixture_prefix_through(CLAUDE_BETWEEN_TURNS_FIXTURE, "system", Some("task_started"));
+        let replay = dir.path().join("busy.jsonl");
+        std::fs::write(
+            &replay,
+            format!(
+                "{}\n{{\"type\":\"result\",\"result\":\"started\"}}\n",
+                started.join("\n")
+            ),
+        )
+        .unwrap();
+        config.agent_bin = Some(
+            write_fake_gh_script(
+                dir.path(),
+                "busy-worker",
+                &format!(
+                    "#!/bin/sh\ncat '{}'\nwhile IFS= read -r _; do :; done\n",
+                    replay.display()
+                ),
+            )
+            .to_string_lossy()
+            .into_owned(),
+        );
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+
+        let mut first = recover_spawn(&config, &wt_mgr, &mut names).await;
+        std::fs::write(first.worktree_path.join("state.txt"), "half-verified\n").unwrap();
+        for _ in 0..200 {
+            drain_events(&mut first, &db_path, "worker", &config.limits)
+                .await
+                .unwrap();
+            if !first.draining {
+                break;
+            }
+        }
+        assert!(!first.draining, "the fed turn ends");
+        assert!(first.has_outstanding_provider_work());
+        first.turn_ended_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(3601));
+        assert!(slot_is_idle_zombie_candidate(&first, 900, 3600));
+        let (idle_secs, limit) = between_turn_idle(&first, 900, 3600).unwrap();
+        assert_eq!(limit, 3600, "the busy ceiling was selected");
+        let kind = between_turn_idle_kind(&first);
+        assert_eq!(kind, IdleReapKind::BusyCeiling);
+
+        reap_idle_zombie_worker(&config, &wt_mgr, &mut names, first, idle_secs, limit, kind).await;
+
+        assert_eq!(
+            task_recovery_state(&db_path, task_id),
+            ("open".to_string(), 0),
+            "a busy-ceiling reap within the task wall spends no recovery attempt"
+        );
+        let refs = recover_refs_for(&repo, task_id);
+        assert_eq!(refs.len(), 1, "work preservation is unchanged: {refs:?}");
+        assert!(refs[0].0.ends_with("/busy_ceiling"), "{}", refs[0].0);
+        let notes = daemon_notes(&db_path, task_id);
+        let reap_note = notes
+            .iter()
+            .find(|n| n.starts_with(tasks::BUSY_CEILING_NOTE_PREFIX))
+            .unwrap_or_else(|| panic!("{notes:?}"));
+        assert!(
+            reap_note.contains("exceeded busy ceiling 3600s"),
+            "{reap_note}"
+        );
+        assert!(!reap_note.contains("zombie"), "{reap_note}");
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            let end_reason: String = conn
+                .query_row(
+                    "SELECT end_reason FROM agent_runs WHERE task_id=?1 ORDER BY rowid DESC LIMIT 1",
+                    [task_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(end_reason, "busy_ceiling");
+        }
+
+        config.agent_bin = Some(
+            fake_stdin_holding_agent(dir.path(), "hold-worker")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let second = recover_spawn(&config, &wt_mgr, &mut names).await;
+        assert_eq!(
+            std::fs::read_to_string(second.worktree_path.join("state.txt")).unwrap(),
+            "half-verified\n",
+            "resume-from-ref is unchanged"
+        );
+        let notes = daemon_notes(&db_path, task_id);
+        let resume = notes
+            .iter()
+            .find(|n| n.contains("resumed from"))
+            .unwrap_or_else(|| panic!("{notes:?}"));
+        assert!(
+            resume.contains(
+                "stopped at the busy ceiling while its background work was still running"
+            ),
+            "{resume}"
+        );
+        assert!(
+            resume.contains("Bash: sleep 10 && echo bg-done2"),
+            "{resume}"
+        );
+        assert!(resume.contains(&format!("{idle_secs}s after its last daemon-fed turn")));
+        assert!(resume.contains("once in the foreground"), "{resume}");
+        second.kill_and_reap().await;
+    }
+
+    /// A plain idle zombie still spends a recovery attempt and still fails
+    /// the task once the budget is exhausted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plain_idle_zombie_reap_still_spends_recovery_and_fails_when_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = recover_fixture_repo(dir.path());
+        let db_path = dir.path().join("quorum.db");
+        let task_id = recover_fixture_task(&db_path);
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo);
+        config.worktree_base = dir.path().join("worktrees");
+        config.limits.max_task_wall_secs = Some(14_400);
+        config.agent_bin = Some(
+            fake_stdin_holding_agent(dir.path(), "hold-worker")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+
+        let first = recover_spawn(&config, &wt_mgr, &mut names).await;
+        assert_eq!(between_turn_idle_kind(&first), IdleReapKind::Zombie);
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            first,
+            901,
+            900,
+            IdleReapKind::Zombie,
+        )
+        .await;
+        assert_eq!(
+            task_recovery_state(&db_path, task_id),
+            ("open".to_string(), 1)
+        );
+
+        {
+            let conn = quorum_core::db::open(&db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET recovery_attempts=?2 WHERE id=?1",
+                rusqlite::params![task_id, tasks::MAX_RECOVERY_ATTEMPTS],
+            )
+            .unwrap();
+        }
+        let last = recover_spawn(&config, &wt_mgr, &mut names).await;
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            last,
+            901,
+            900,
+            IdleReapKind::Zombie,
+        )
+        .await;
+        assert_eq!(task_recovery_state(&db_path, task_id).0, "failed");
+    }
+
+    /// The task wall ceiling still bounds busy-ceiling reaps: once their
+    /// cumulative slot time passes `max_task_wall_secs`, each reap is charged
+    /// and the exhausted budget fails the task.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wall_ceiling_exhaustion_fails_task_even_when_every_reap_is_busy_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = recover_fixture_repo(dir.path());
+        let db_path = dir.path().join("quorum.db");
+        let task_id = recover_fixture_task(&db_path);
+        let mut config = pre_review_ci_test_config(db_path.clone(), repo);
+        config.worktree_base = dir.path().join("worktrees");
+        config.limits.max_task_wall_secs = Some(5000);
+        config.agent_bin = Some(
+            fake_stdin_holding_agent(dir.path(), "hold-worker")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let reap_busy = |mut slot: SlotState| {
+            slot.task_started_at = std::time::Instant::now() - std::time::Duration::from_secs(3700);
+            slot
+        };
+
+        let first = reap_busy(recover_spawn(&config, &wt_mgr, &mut names).await);
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            first,
+            3601,
+            3600,
+            IdleReapKind::BusyCeiling,
+        )
+        .await;
+        assert_eq!(
+            task_recovery_state(&db_path, task_id),
+            ("open".to_string(), 0),
+            "3700s of 5000s: within the wall"
+        );
+
+        let second = reap_busy(recover_spawn(&config, &wt_mgr, &mut names).await);
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            second,
+            3601,
+            3600,
+            IdleReapKind::BusyCeiling,
+        )
+        .await;
+        assert_eq!(
+            task_recovery_state(&db_path, task_id),
+            ("open".to_string(), 1),
+            "7400s of 5000s: past the wall, the reap is charged"
+        );
+
+        for _ in 1..tasks::MAX_RECOVERY_ATTEMPTS {
+            let next = reap_busy(recover_spawn(&config, &wt_mgr, &mut names).await);
+            reap_idle_zombie_worker(
+                &config,
+                &wt_mgr,
+                &mut names,
+                next,
+                3601,
+                3600,
+                IdleReapKind::BusyCeiling,
+            )
+            .await;
+        }
+        assert_eq!(
+            task_recovery_state(&db_path, task_id),
+            ("open".to_string(), tasks::MAX_RECOVERY_ATTEMPTS)
+        );
+        let last = reap_busy(recover_spawn(&config, &wt_mgr, &mut names).await);
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            last,
+            3601,
+            3600,
+            IdleReapKind::BusyCeiling,
+        )
+        .await;
+        assert_eq!(
+            task_recovery_state(&db_path, task_id).0,
+            "failed",
+            "the wall ceiling remains the bound that fails the task"
+        );
+    }
+
     /// Incident 412/422: an idle-reaped worker's finished but uncommitted
     /// (and committed-but-unpushed) code must survive teardown and seed the
     /// next worker for the same task.
@@ -74157,7 +76417,16 @@ exec /bin/cat '{stdout}'
         std::fs::write(wt.join("state.txt"), "finished\n").unwrap();
         std::fs::write(wt.join("new_module.rs"), "pub fn done() {}\n").unwrap();
 
-        reap_idle_zombie_worker(&config, &wt_mgr, &mut names, first, 999, 10).await;
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            first,
+            999,
+            10,
+            IdleReapKind::Zombie,
+        )
+        .await;
 
         assert!(!wt.exists(), "reap still releases the checkout");
         assert!(
@@ -74265,7 +76534,16 @@ exec /bin/cat '{stdout}'
         let first = recover_spawn(&config, &wt_mgr, &mut names).await;
         let wt = first.worktree_path.clone();
         std::fs::write(wt.join("state.txt"), "precious\n").unwrap();
-        reap_idle_zombie_worker(&config, &wt_mgr, &mut names, first, 999, 10).await;
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            first,
+            999,
+            10,
+            IdleReapKind::Zombie,
+        )
+        .await;
         let refs = recover_refs_for(&repo, task_id);
         assert_eq!(refs.len(), 1, "{refs:?}");
         assert!(!wt.exists());
@@ -74333,7 +76611,16 @@ exec /bin/cat '{stdout}'
         let branch = first.branch.clone();
         std::fs::write(wt.join("state.txt"), "precious\n").unwrap();
 
-        reap_idle_zombie_worker(&config, &failing, &mut names, first, 999, 10).await;
+        reap_idle_zombie_worker(
+            &config,
+            &failing,
+            &mut names,
+            first,
+            999,
+            10,
+            IdleReapKind::Zombie,
+        )
+        .await;
 
         assert!(wt.exists(), "a failed snapshot must not force-remove");
         assert_eq!(
@@ -74673,7 +76960,16 @@ exec /bin/cat '{stdout}'
         // First run records the allocation, then is reaped with no work.
         let first = recover_spawn(&config, &wt_mgr, &mut names).await;
         let wt = first.worktree_path.clone();
-        reap_idle_zombie_worker(&config, &wt_mgr, &mut names, first, 999, 10).await;
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            first,
+            999,
+            10,
+            IdleReapKind::Zombie,
+        )
+        .await;
         assert!(!wt.exists());
         assert!(recover_refs_for(&repo, task_id).is_empty());
 
@@ -74802,9 +77098,14 @@ exec /bin/cat '{stdout}'
             std::fs::read_to_string(wt2.join("state.txt")).unwrap(),
             "base edit\n"
         );
-        let note =
-            worker_recover::recover_resume_note("Forge", "PR head", &resume, restored.as_ref())
-                .unwrap();
+        let note = worker_recover::recover_resume_note(
+            "Forge",
+            "PR head",
+            &resume,
+            restored.as_ref(),
+            None,
+        )
+        .unwrap();
         assert!(note.contains("FAILED"), "{note}");
         assert!(note.contains(&snap.refname), "{note}");
     }
@@ -74831,7 +77132,16 @@ exec /bin/cat '{stdout}'
 
         let first = recover_spawn(&config, &wt_mgr, &mut names).await;
         std::fs::write(first.worktree_path.join("state.txt"), "old attempt\n").unwrap();
-        reap_idle_zombie_worker(&config, &wt_mgr, &mut names, first, 999, 10).await;
+        reap_idle_zombie_worker(
+            &config,
+            &wt_mgr,
+            &mut names,
+            first,
+            999,
+            10,
+            IdleReapKind::Zombie,
+        )
+        .await;
         assert_eq!(recover_refs_for(&repo, task_id).len(), 1);
         {
             let conn = quorum_core::db::open(&db_path).unwrap();

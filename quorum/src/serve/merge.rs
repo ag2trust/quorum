@@ -259,6 +259,19 @@ pub trait MergeExecutor: Send + Sync {
         MergeabilityState::Mergeable
     }
 
+    /// [`MergeExecutor::check_mergeability`] plus the `headRefOid` GitHub
+    /// computed that state for, read in the same response. The pre-review gate
+    /// acts on `Conflicting` only when this head equals the recorded head, so a
+    /// lagging DIRTY report for an older head never triggers conflict rework.
+    /// Default: no head, which never authorizes pre-review conflict routing.
+    fn check_mergeability_with_head(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+    ) -> (MergeabilityState, Option<String>) {
+        (self.check_mergeability(pr, repo_dir), None)
+    }
+
     /// Current head commit SHA of the PR's branch (`headRefOid`). Used by #228
     /// restart recovery to SHA-bind a durable approval to the exact diff the
     /// reviewer approved: a moved head auto-invalidates the approval. Returns
@@ -298,6 +311,23 @@ pub trait MergeExecutor: Send + Sync {
         DefaultBranchStatus::Green
     }
 
+    /// Bounded failure digest of the check run named `job_name` on the PR's
+    /// exact head `head_sha`. The run id and job id come from that rollup
+    /// entry's `detailsUrl`; a rollup for any other head is an error, never a
+    /// digest. The daemon's executor holds the GitHub read authority; workers
+    /// never fetch logs themselves. Default: [`CiDigestFetchError::Unsupported`]
+    /// so lightweight test executors stay source-compatible.
+    #[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+    fn fetch_failed_job_digest(
+        &self,
+        _pr: i64,
+        _repo_dir: &Path,
+        _head_sha: &str,
+        _job_name: &str,
+    ) -> Result<FailedJobDigest, CiDigestFetchError> {
+        Err(CiDigestFetchError::Unsupported)
+    }
+
     /// #159: post or verify the daemon-owned REQUEST_CHANGES review carrying the
     /// blocking findings. Managed reviewer agents share the PR author's GitHub
     /// identity, so formal review state stays with the daemon's merge account.
@@ -328,12 +358,15 @@ pub trait MergeExecutor: Send + Sync {
     }
 
     /// The daemon's PR-authoring (publishing) identity: publication,
-    /// PR-target lookup, drift, branch-sync, and cleanup `gh` children. This
-    /// must differ from the merge-authority source when a merge token file is
-    /// configured — daemon PRs authored by the merge account would make the
-    /// daemon's own approve/request-changes reviews self-reviews, which
-    /// GitHub rejects. The default is the merge default (both are the local
-    /// default source with no token file).
+    /// PR-target lookup, drift, branch-sync, and cleanup `gh` children.
+    /// Configuring a merge token file distinct from this source keeps the two
+    /// identities apart, so the merge account's formal APPROVE/REQUEST_CHANGES
+    /// review is never a self-review. The default is the merge default (both
+    /// are the local default source with no token file); GitHub then rejects a
+    /// formal self-review, so `MergeExecutor::merge` and
+    /// `ensure_changes_requested` detect that per PR (`viewerDidAuthor`) and
+    /// fall back to posting a `COMMENT` verdict review instead — one-identity
+    /// mode.
     fn publication_credentials(&self) -> Arc<dyn GithubCredentialSource> {
         self.github_credentials()
     }
@@ -348,6 +381,266 @@ fn credential_failure(error: &GithubCredentialError) -> MergeResult {
         message: format!("GitHub credential unavailable (gh not run): {error}"),
         failure_kind: Some(MergeFailureKind::PolicyBlocked),
     }
+}
+
+/// Wall-clock cap on one [`MergeExecutor::fetch_failed_job_digest`] call,
+/// covering both the rollup read and the streamed log download.
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+pub const CI_DIGEST_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// Cap on the `statusCheckRollup,headRefOid` JSON read for the job lookup.
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+const CI_DIGEST_ROLLUP_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// Bytes of `gh` stderr kept for error classification only; the remainder is
+/// drained and discarded. Stderr is never rendered into an error.
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+const CI_DIGEST_STDERR_CLASSIFY_BYTES: u64 = 8 * 1024;
+
+/// Failure digest of one GitHub Actions job, with the ids it was read from.
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedJobDigest {
+    pub run_id: u64,
+    pub job_id: u64,
+    pub digest: quorum_core::ci_digest::CiJobDigest,
+}
+
+/// Why a failed-job digest could not be produced. Variants carry only
+/// daemon-derived facts: never `gh` stderr, response bodies, headers, or a
+/// token value.
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CiDigestFetchError {
+    /// The executor has no GitHub log access (test/mock executors).
+    Unsupported,
+    /// The credential source produced no token; no `gh` child was spawned.
+    Credentials(GithubCredentialError),
+    /// The `gh` binary could not be spawned.
+    SpawnFailed,
+    /// `gh pr view` for the rollup exited non-zero.
+    RollupQueryFailed { exit_code: Option<i32> },
+    /// The rollup response was not valid JSON with a rollup array, or
+    /// exceeded its byte cap.
+    RollupUnparseable,
+    /// The rollup GitHub returned is for a different PR head.
+    HeadMismatch {
+        expected: String,
+        actual: Option<String>,
+    },
+    /// No check run with the requested name is in the rollup.
+    JobNotFound,
+    /// The matching check run has no `detailsUrl`.
+    MissingDetailsUrl,
+    /// The `detailsUrl` is not an Actions `.../runs/<run>/job/<job>` URL.
+    UnparseableDetailsUrl,
+    /// GitHub no longer has the job log (HTTP 410 / expired).
+    LogExpired,
+    /// GitHub rate-limited the request.
+    RateLimited,
+    /// HTTP 401/403 for the log.
+    Forbidden,
+    /// HTTP 404 for the log.
+    NotFound,
+    /// `gh api` exited non-zero for another reason.
+    ApiFailed { exit_code: Option<i32> },
+    /// Reading the streamed log failed.
+    LogReadFailed,
+    /// The fetch exceeded its wall-clock cap; the child was killed.
+    TimedOut { after: Duration },
+}
+
+impl std::fmt::Display for CiDigestFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported => write!(f, "CI log fetch is not supported by this executor"),
+            Self::Credentials(error) => {
+                write!(f, "GitHub credential unavailable (gh not run): {error}")
+            }
+            Self::SpawnFailed => write!(f, "failed to run gh"),
+            Self::RollupQueryFailed { exit_code } => {
+                write!(
+                    f,
+                    "gh pr view for the check rollup failed (exit {exit_code:?})"
+                )
+            }
+            Self::RollupUnparseable => write!(f, "check rollup response was unparseable"),
+            Self::HeadMismatch { expected, actual } => write!(
+                f,
+                "check rollup is for head {} but expected {expected}",
+                actual.as_deref().unwrap_or("<none>")
+            ),
+            Self::JobNotFound => write!(f, "no check run with that name in the rollup"),
+            Self::MissingDetailsUrl => write!(f, "check run has no detailsUrl"),
+            Self::UnparseableDetailsUrl => {
+                write!(f, "check run detailsUrl is not an Actions job URL")
+            }
+            Self::LogExpired => write!(f, "job log has expired"),
+            Self::RateLimited => write!(f, "GitHub API rate limit hit fetching the job log"),
+            Self::Forbidden => write!(f, "GitHub denied access to the job log"),
+            Self::NotFound => write!(f, "job log not found"),
+            Self::ApiFailed { exit_code } => {
+                write!(f, "gh api for the job log failed (exit {exit_code:?})")
+            }
+            Self::LogReadFailed => write!(f, "reading the job log stream failed"),
+            Self::TimedOut { after } => write!(f, "CI log fetch timed out after {after:?}"),
+        }
+    }
+}
+
+impl std::error::Error for CiDigestFetchError {}
+
+/// Parse `(run_id, job_id)` from an Actions check-run URL of the form
+/// `.../actions/runs/<run>/job/<job>` (optionally followed by `?`/`#`).
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+fn parse_actions_job_url(url: &str) -> Option<(u64, u64)> {
+    let path = url.split(['?', '#']).next()?;
+    let rest = path.rsplit_once("/actions/runs/")?.1;
+    let (run, rest) = rest.split_once("/job/")?;
+    let job = rest.trim_end_matches('/');
+    let parse = |s: &str| -> Option<u64> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok().filter(|id| *id > 0)
+    };
+    Some((parse(run)?, parse(job)?))
+}
+
+/// Resolve the run and job ids of the check run named `job_name` from a
+/// `statusCheckRollup,headRefOid` response bound to `expected_head`. The first
+/// entry with that name is used, matching [`validate_required_jobs`].
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+fn resolve_failed_job_ids(
+    json: &[u8],
+    expected_head: &str,
+    job_name: &str,
+) -> Result<(u64, u64), CiDigestFetchError> {
+    let val: serde_json::Value =
+        serde_json::from_slice(json).map_err(|_| CiDigestFetchError::RollupUnparseable)?;
+    let actual = val
+        .get("headRefOid")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|sha| !sha.is_empty());
+    if actual != Some(expected_head.trim()) || expected_head.trim().is_empty() {
+        return Err(CiDigestFetchError::HeadMismatch {
+            expected: expected_head.to_string(),
+            actual: actual.map(str::to_string),
+        });
+    }
+    let rollup = val
+        .get("statusCheckRollup")
+        .and_then(|v| v.as_array())
+        .ok_or(CiDigestFetchError::RollupUnparseable)?;
+    let entry = rollup
+        .iter()
+        .find(|entry| entry.get("name").and_then(|v| v.as_str()) == Some(job_name))
+        .ok_or(CiDigestFetchError::JobNotFound)?;
+    let url = entry
+        .get("detailsUrl")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .ok_or(CiDigestFetchError::MissingDetailsUrl)?;
+    parse_actions_job_url(url).ok_or(CiDigestFetchError::UnparseableDetailsUrl)
+}
+
+/// Classify a failed `gh api` log download from the bounded stderr head. The
+/// stderr text itself never leaves this function.
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+fn classify_log_fetch_failure(stderr_head: &[u8], exit_code: Option<i32>) -> CiDigestFetchError {
+    let text = String::from_utf8_lossy(stderr_head).to_ascii_lowercase();
+    if text.contains("rate limit") || text.contains("http 429") {
+        CiDigestFetchError::RateLimited
+    } else if text.contains("http 410") || text.contains("expired") {
+        CiDigestFetchError::LogExpired
+    } else if text.contains("http 404") {
+        CiDigestFetchError::NotFound
+    } else if text.contains("http 403") || text.contains("http 401") {
+        CiDigestFetchError::Forbidden
+    } else {
+        CiDigestFetchError::ApiFailed { exit_code }
+    }
+}
+
+/// Result of one deadline-bounded `gh` child.
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+struct BoundedGhRun<T> {
+    status: std::process::ExitStatus,
+    stdout: T,
+    stderr_head: Vec<u8>,
+}
+
+/// Spawn `cmd` with piped stdout/stderr, hand stdout to `consume` on a reader
+/// thread, and wait until `deadline`. On timeout the child is killed and
+/// reaped. Stderr keeps only [`CI_DIGEST_STDERR_CLASSIFY_BYTES`] and drains
+/// the rest so the child never blocks on a full pipe.
+#[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+fn run_gh_bounded<T, F>(
+    mut cmd: Command,
+    deadline: Instant,
+    timeout: Duration,
+    consume: F,
+) -> Result<BoundedGhRun<T>, CiDigestFetchError>
+where
+    T: Send + 'static,
+    F: FnOnce(std::process::ChildStdout) -> T + Send + 'static,
+{
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|_| CiDigestFetchError::SpawnFailed)?;
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+
+    let (out_tx, out_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = out_tx.send(consume(stdout));
+    });
+    let (err_tx, err_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut head = Vec::new();
+        let _ = (&mut stderr)
+            .take(CI_DIGEST_STDERR_CLASSIFY_BYTES)
+            .read_to_end(&mut head);
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        let _ = err_tx.send(head);
+    });
+
+    let timed_out = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+        CiDigestFetchError::TimedOut { after: timeout }
+    };
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+
+    let Ok(stdout) = out_rx.recv_timeout(remaining()) else {
+        return Err(timed_out(&mut child));
+    };
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if remaining().is_zero() => return Err(timed_out(&mut child)),
+            Ok(None) => std::thread::sleep(remaining().min(Duration::from_millis(20))),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CiDigestFetchError::SpawnFailed);
+            }
+        }
+    };
+    // The child has exited; a stderr pipe still held open by a grandchild
+    // must not extend the wall-clock cap.
+    let stderr_head = err_rx.recv_timeout(remaining()).unwrap_or_default();
+    Ok(BoundedGhRun {
+        status,
+        stdout,
+        stderr_head,
+    })
 }
 
 fn gh_pr_state_is_merged(json_output: &str) -> bool {
@@ -679,7 +972,11 @@ pub struct GhMergeExecutor {
     pub credentials: Arc<dyn GithubCredentialSource>,
     /// PR-authoring source (local default, no merge token file), returned by
     /// [`MergeExecutor::publication_credentials`]. Never the merge token, so
-    /// daemon-authored PRs stay reviewable by the merge account.
+    /// a distinct `credentials` source keeps daemon-authored PRs reviewable
+    /// by the merge account. Equal to `credentials` by default (no merge
+    /// token file configured), which puts every PR in one-identity mode:
+    /// `merge`/`ensure_changes_requested` detect that per PR and post a
+    /// `COMMENT` verdict instead of a formal review.
     pub publication_credentials: Arc<dyn GithubCredentialSource>,
     /// `owner/repo` slug for `-R` flag — avoids cwd git dependency.
     pub gh_repo: Option<String>,
@@ -711,6 +1008,95 @@ impl GhMergeExecutor {
         }
         token.apply_to_command(&mut cmd);
         Ok(cmd)
+    }
+
+    /// Build one `gh api` child. `gh api` rejects `-R`, so the repo travels
+    /// via `GH_REPO` ([`crate::serve::collector::gh_env`]); the token comes
+    /// from the same per-call credential source as [`Self::build_gh_cmd`].
+    #[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+    fn build_gh_api_cmd(
+        &self,
+        args: &[&str],
+        repo_dir: &Path,
+    ) -> std::result::Result<Command, GithubCredentialError> {
+        let token = self.credentials.token()?;
+        let mut cmd = Command::new(&self.gh_program);
+        cmd.args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(repo_dir);
+        for (key, value) in crate::serve::collector::gh_env(&self.gh_repo) {
+            cmd.env(key, value);
+        }
+        token.apply_to_command(&mut cmd);
+        Ok(cmd)
+    }
+
+    /// [`MergeExecutor::fetch_failed_job_digest`] with an explicit wall-clock
+    /// cap (tests use a short one).
+    #[allow(dead_code)] // consumed when the CI-digest gate wiring lands
+    fn fetch_failed_job_digest_within(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        head_sha: &str,
+        job_name: &str,
+        timeout: Duration,
+    ) -> Result<FailedJobDigest, CiDigestFetchError> {
+        use std::io::Read;
+
+        let deadline = Instant::now() + timeout;
+        let pr_str = pr.to_string();
+        let rollup_cmd = self
+            .build_gh_cmd(
+                &[
+                    "pr",
+                    "view",
+                    &pr_str,
+                    "--json",
+                    "statusCheckRollup,headRefOid",
+                ],
+                repo_dir,
+            )
+            .map_err(CiDigestFetchError::Credentials)?;
+        let rollup = run_gh_bounded(rollup_cmd, deadline, timeout, |stdout| {
+            let mut buf = Vec::new();
+            stdout
+                .take(CI_DIGEST_ROLLUP_MAX_BYTES + 1)
+                .read_to_end(&mut buf)
+                .map(|_| buf)
+        })?;
+        if !rollup.status.success() {
+            return Err(CiDigestFetchError::RollupQueryFailed {
+                exit_code: rollup.status.code(),
+            });
+        }
+        let json = rollup
+            .stdout
+            .ok()
+            .filter(|buf| buf.len() as u64 <= CI_DIGEST_ROLLUP_MAX_BYTES)
+            .ok_or(CiDigestFetchError::RollupUnparseable)?;
+        let (run_id, job_id) = resolve_failed_job_ids(&json, head_sha, job_name)?;
+
+        let endpoint = format!("repos/{{owner}}/{{repo}}/actions/jobs/{job_id}/logs");
+        let log_cmd = self
+            .build_gh_api_cmd(&["api", &endpoint], repo_dir)
+            .map_err(CiDigestFetchError::Credentials)?;
+        let log = run_gh_bounded(log_cmd, deadline, timeout, |stdout| {
+            quorum_core::ci_digest::digest_job_log(std::io::BufReader::new(stdout))
+        })?;
+        if !log.status.success() {
+            return Err(classify_log_fetch_failure(
+                &log.stderr_head,
+                log.status.code(),
+            ));
+        }
+        let digest = log.stdout.map_err(|_| CiDigestFetchError::LogReadFailed)?;
+        Ok(FailedJobDigest {
+            run_id,
+            job_id,
+            digest,
+        })
     }
 
     fn run_gh(&self, args: &[&str], repo_dir: &Path) -> MergeResult {
@@ -891,7 +1277,6 @@ impl GhMergeExecutor {
     /// raw `-f` strings; without one, `-F` expands gh's `{owner}`/`{repo}`
     /// placeholders from `repo_dir`. The token is fetched first, so a source
     /// failure spawns nothing.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn identity_probe_cmd(
         &self,
         pr: i64,
@@ -926,7 +1311,6 @@ impl GhMergeExecutor {
     /// identity authored the PR. `None` (never one-identity) on credential
     /// failure, gh failure, or any malformed/partial response; each failure
     /// is logged.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn probe_pr_identity(&self, pr: i64, repo_dir: &Path) -> Option<PrIdentity> {
         let mut cmd = match self.identity_probe_cmd(pr, repo_dir) {
             Ok(cmd) => cmd,
@@ -959,7 +1343,6 @@ impl GhMergeExecutor {
     /// Fresh `reviewDecision` read (`gh pr view <n> --json reviewDecision`).
     /// `None` on credential/gh failure or a malformed response; `Some("")`
     /// when GitHub reports no decision.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn live_review_decision(&self, pr: i64, repo_dir: &Path) -> Option<String> {
         let pr_str = pr.to_string();
         let mut cmd = match self.build_gh_cmd(
@@ -981,6 +1364,40 @@ impl GhMergeExecutor {
             return None;
         }
         parse_review_decision(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    /// One-identity changes verdict: true once a review on the current head
+    /// carries the changes marker for that head, found or just posted. Never
+    /// posts `--request-changes`. Without a readable head, nothing is posted
+    /// (false) because the marker cannot be bound.
+    fn ensure_changes_comment(&self, pr: i64, repo_dir: &Path, body: &str) -> bool {
+        let Some((reviews, head)) = self.fetch_reviews_and_head(pr, repo_dir) else {
+            eprintln!("warn: PR #{pr} changes comment not posted: reviews/head read failed");
+            return false;
+        };
+        if head.is_empty() {
+            eprintln!("warn: PR #{pr} changes comment not posted: empty head");
+            return false;
+        }
+        if head_has_verdict_marker(&reviews, &head, VerdictKind::Changes) {
+            return true;
+        }
+        let pr_str = pr.to_string();
+        let marked = format!("{body}\n\n{}", verdict_marker(VerdictKind::Changes, &head));
+        let result = self.run_gh(
+            &["pr", "review", &pr_str, "--comment", "--body", &marked],
+            repo_dir,
+        );
+        if !result.success {
+            eprintln!("warn: PR #{pr} changes comment failed: {}", result.message);
+        }
+        result.success
+    }
+
+    /// True only when a fresh `reviewDecision` read is `REVIEW_REQUIRED`; a
+    /// failed read or any other decision leaves today's merge path in charge.
+    fn review_required(&self, pr: i64, repo_dir: &Path) -> bool {
+        self.live_review_decision(pr, repo_dir).as_deref() == Some("REVIEW_REQUIRED")
     }
 
     fn verify_pr_merged(&self, pr: i64, repo_dir: &Path) -> bool {
@@ -1264,6 +1681,20 @@ fn merge_branch_metadata(
     })
 }
 
+/// One-identity park reason: branch protection needs a person's approval the
+/// merge identity (the PR author) cannot give.
+fn self_approval_required(pr: i64, head_sha: &str) -> MergeResult {
+    MergeResult {
+        success: false,
+        message: format!(
+            "PR #{pr}: branch protection requires an approving review from someone \
+             other than the pull request author; the merge identity authored this PR \
+             and cannot approve it. A person must approve head {head_sha}; merge not attempted"
+        ),
+        failure_kind: Some(MergeFailureKind::PolicyBlocked),
+    }
+}
+
 fn merge_command_args<'a>(
     pr: &'a str,
     expected_head_sha: &'a str,
@@ -1304,7 +1735,6 @@ fn head_has_approval(reviews_json: &str, head_sha: &str) -> bool {
 
 /// Fixed GraphQL document for the merge-credential identity probe. Only its
 /// variables carry the daemon-derived repository and PR number.
-#[cfg_attr(not(test), allow(dead_code))]
 const PR_IDENTITY_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!) { \
 repository(owner: $owner, name: $name) { pullRequest(number: $number) { \
 viewerDidAuthor reviewDecision } } }";
@@ -1323,7 +1753,6 @@ pub(crate) struct PrIdentity {
 /// `errors` entry, a missing `pullRequest`, a non-boolean/missing
 /// `viewerDidAuthor`, or a missing/non-string `reviewDecision` key, so no
 /// partial response ever selects one-identity mode.
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_pr_identity(json_str: &str) -> Option<PrIdentity> {
     let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
     match val.get("errors") {
@@ -1349,14 +1778,12 @@ fn parse_pr_identity(json_str: &str) -> Option<PrIdentity> {
 }
 
 /// True only for a well-formed probe that reports `viewerDidAuthor=true`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn is_one_identity(identity: Option<&PrIdentity>) -> bool {
     identity.is_some_and(|identity| identity.viewer_did_author)
 }
 
 /// Parse `gh pr view --json reviewDecision`. `null` reads as `""`;
 /// malformed JSON or a missing/non-string field is `None`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn parse_review_decision(json_str: &str) -> Option<String> {
     match serde_json::from_str::<serde_json::Value>(json_str)
         .ok()?
@@ -1379,7 +1806,6 @@ pub(crate) enum VerdictKind {
 
 /// Hidden marker binding a verdict kind to one head SHA, e.g.
 /// `<!-- quorum-verdict:approved head=<sha> -->`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn verdict_marker(kind: VerdictKind, head_sha: &str) -> String {
     let kind = match kind {
         VerdictKind::Approved => "approved",
@@ -1391,7 +1817,6 @@ fn verdict_marker(kind: VerdictKind, head_sha: &str) -> String {
 /// True iff a review in `reviews_json` (from `fetch_reviews_and_head`) whose
 /// `commit.oid` is `head_sha` carries the exact marker for `kind` and
 /// `head_sha`. Parse failure or an empty head is false. Dedupe only.
-#[cfg_attr(not(test), allow(dead_code))]
 fn head_has_verdict_marker(reviews_json: &str, head_sha: &str, kind: VerdictKind) -> bool {
     if head_sha.is_empty() {
         return false;
@@ -1428,6 +1853,16 @@ fn parse_mergeability(json_str: &str) -> MergeabilityState {
         Some("DIRTY") => MergeabilityState::Conflicting,
         _ => MergeabilityState::Mergeable,
     }
+}
+
+fn parse_head_ref_oid(json_str: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(json_str)
+        .ok()?
+        .get("headRefOid")?
+        .as_str()
+        .map(str::trim)
+        .filter(|sha| !sha.is_empty())
+        .map(str::to_string)
 }
 
 fn parse_merge_commit_sha(json_str: &str) -> Option<String> {
@@ -1518,15 +1953,27 @@ impl MergeExecutor for GhMergeExecutor {
             }
         }
 
+        // Probe once, before any review write. Only a well-formed
+        // `viewerDidAuthor=true` selects one-identity mode; every probe failure
+        // keeps the two-identity `--approve` path.
+        let one_identity = is_one_identity(self.probe_pr_identity(pr, repo_dir).as_ref());
+
         // #49: on a PolicyPending retry the daemon calls merge() again — without
         // dedupe every retry posts another `--approve` stub, cluttering the PR
         // review history (4 identical approvals in 7s observed on task #45).
         // Skip the approve step if an APPROVED review already exists on the
-        // current head SHA. Fail-open: query hiccup falls through to the
-        // approve call and behaves as before this guard.
+        // current head SHA (one-identity: a review on the current head carrying
+        // the approved marker). Fail-open: query hiccup falls through to the
+        // review call and behaves as before this guard.
         let already_approved = self
             .fetch_reviews_and_head(pr, repo_dir)
-            .map(|(reviews_json, head)| head_has_approval(&reviews_json, &head))
+            .map(|(reviews_json, head)| {
+                if one_identity {
+                    head_has_verdict_marker(&reviews_json, &head, VerdictKind::Approved)
+                } else {
+                    head_has_approval(&reviews_json, &head)
+                }
+            })
             .unwrap_or(false);
 
         // Recheck after draft/check/review queries and immediately before the
@@ -1539,7 +1986,45 @@ impl MergeExecutor for GhMergeExecutor {
             return rejected;
         }
 
-        if !already_approved {
+        if one_identity {
+            // GitHub refuses a self-approval, so the merge identity posts its
+            // verdict as a COMMENT. The marker only suppresses a duplicate
+            // comment; it never stands in for an approval.
+            if !already_approved {
+                let comment_body = format!(
+                    "Approved verdict — per {} review verdict (task #{}). \
+                     The merge identity authored this PR, so this is a comment, \
+                     not a formal approval (daemon model).\n\n{}",
+                    ctx.reviewer_name,
+                    ctx.review_task_id,
+                    verdict_marker(VerdictKind::Approved, &ctx.expected_head_sha),
+                );
+                let comment = self.run_gh(
+                    &[
+                        "pr",
+                        "review",
+                        &pr_str,
+                        "--comment",
+                        "--body",
+                        &comment_body,
+                    ],
+                    repo_dir,
+                );
+                if !comment.success {
+                    return MergeResult {
+                        success: false,
+                        message: format!(
+                            "verdict comment failed (merge not attempted): {}",
+                            comment.message
+                        ),
+                        failure_kind: Some(MergeFailureKind::PolicyBlocked),
+                    };
+                }
+            }
+            if self.review_required(pr, repo_dir) {
+                return self_approval_required(pr, &ctx.expected_head_sha);
+            }
+        } else if !already_approved {
             let approve_body = format!(
                 "Formal approval — per {} review verdict (task #{}). \
                  Merge performed programmatically on approved verdict (daemon model).",
@@ -1607,6 +2092,9 @@ impl MergeExecutor for GhMergeExecutor {
                 ),
                 failure_kind: None,
             };
+        }
+        if !result.success && one_identity && self.review_required(pr, repo_dir) {
+            return self_approval_required(pr, &ctx.expected_head_sha);
         }
 
         result
@@ -1774,6 +2262,30 @@ impl MergeExecutor for GhMergeExecutor {
         parse_mergeability(&stdout)
     }
 
+    fn check_mergeability_with_head(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+    ) -> (MergeabilityState, Option<String>) {
+        let pr_str = pr.to_string();
+        let cmd = self.build_gh_cmd(
+            &[
+                "pr",
+                "view",
+                &pr_str,
+                "--json",
+                "mergeStateStatus,state,headRefOid",
+            ],
+            repo_dir,
+        );
+        let output = match cmd.map(|mut cmd| cmd.output()) {
+            Ok(Ok(o)) if o.status.success() => o,
+            _ => return (MergeabilityState::Mergeable, None),
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        (parse_mergeability(&stdout), parse_head_ref_oid(&stdout))
+    }
+
     fn head_sha(&self, pr: i64, repo_dir: &Path) -> Option<String> {
         let pr_str = pr.to_string();
         let mut cmd = self
@@ -1821,6 +2333,22 @@ impl MergeExecutor for GhMergeExecutor {
         self.query_required_jobs(pr, repo_dir, Some(expected_head), required_jobs)
     }
 
+    fn fetch_failed_job_digest(
+        &self,
+        pr: i64,
+        repo_dir: &Path,
+        head_sha: &str,
+        job_name: &str,
+    ) -> Result<FailedJobDigest, CiDigestFetchError> {
+        self.fetch_failed_job_digest_within(
+            pr,
+            repo_dir,
+            head_sha,
+            job_name,
+            CI_DIGEST_FETCH_TIMEOUT,
+        )
+    }
+
     fn check_default_branch_ci(&self, repo_dir: &Path, branch: &str) -> DefaultBranchStatus {
         let cmd = self.build_gh_cmd(
             &[
@@ -1845,6 +2373,12 @@ impl MergeExecutor for GhMergeExecutor {
 
     fn ensure_changes_requested(&self, pr: i64, repo_dir: &Path, body: &str) -> bool {
         let pr_str = pr.to_string();
+        // One identity: GitHub refuses --request-changes on your own PR, so
+        // post a COMMENT carrying the head-bound changes marker instead. A
+        // failed probe falls through to the two-identity path below.
+        if is_one_identity(self.probe_pr_identity(pr, repo_dir).as_ref()) {
+            return self.ensure_changes_comment(pr, repo_dir, body);
+        }
         let post = || {
             self.build_gh_cmd(
                 &["pr", "review", &pr_str, "--request-changes", "--body", body],
@@ -2028,7 +2562,7 @@ impl MergeExecutor for CommandMergeExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github_credentials::FakeCredentialSource;
+    use crate::github_credentials::{FakeCredentialSource, GithubToken};
 
     fn checks_snapshot(head: &str, conclusion: &str) -> String {
         format!(
@@ -2794,6 +3328,21 @@ mod tests {
     #[test]
     fn parse_mergeability_invalid_json() {
         assert_eq!(parse_mergeability("not json"), MergeabilityState::Mergeable,);
+        assert_eq!(
+            parse_mergeability(r#"{"mergeStateStatus":"UNKNOWN"}"#),
+            MergeabilityState::Mergeable,
+            "UNKNOWN just after a push is never a conflict"
+        );
+        assert_eq!(
+            parse_mergeability(r#"{"mergeStateStatus":"UNSTABLE"}"#),
+            MergeabilityState::Mergeable
+        );
+        assert_eq!(parse_head_ref_oid("not json"), None);
+        assert_eq!(parse_head_ref_oid(r#"{"headRefOid":""}"#), None);
+        assert_eq!(
+            parse_head_ref_oid(r#"{"mergeStateStatus":"DIRTY","headRefOid":"8aadb5bc"}"#),
+            Some("8aadb5bc".to_string())
+        );
     }
 
     #[test]
@@ -3326,7 +3875,8 @@ mod tests {
 
     /// Reusable fake `gh`: records argv and `GH_TOKEN` per call and serves
     /// scripted stdout/stderr/exit per route (`probe`, `reviews`, `decision`,
-    /// `review`, `merge`, `view`, `other`).
+    /// `rollup`, `logs`, `review`, `merge`, `view`, `other`). A
+    /// `<route>.sleep` file makes that route `exec sleep` after its output.
     #[cfg(unix)]
     struct FakeGh {
         dir: tempfile::TempDir,
@@ -3338,6 +3888,8 @@ mod tests {
     struct FakeGhCall {
         argv: Vec<String>,
         gh_token: String,
+        /// `GH_REPO` in the child env (empty when unset).
+        gh_repo_env: String,
     }
 
     #[cfg(unix)]
@@ -3350,9 +3902,11 @@ mod tests {
                 r#"#!/bin/sh
 d='{root}'
 printf 'CALL\t%s\n' "$GH_TOKEN" >> "$d/calls.log"
-for a in "$@"; do printf 'ARG\t%s\n' "$a" >> "$d/calls.log"; done
+printf 'REPO\t%s\n' "${{GH_REPO:-}}" >> "$d/calls.log"
+for a in "$@"; do printf 'ARG\t%s\n' "$(printf '%s' "$a" | tr '\n' '\036')" >> "$d/calls.log"; done
 case "$1 $2" in
   "api graphql") route=probe ;;
+  "api repos/"*) route=logs ;;
   "pr review") route=review ;;
   "pr merge") route=merge ;;
   "pr view")
@@ -3360,13 +3914,20 @@ case "$1 $2" in
     for a in "$@"; do
       case "$a" in
         reviews,headRefOid) route=reviews ;;
+        statusCheckRollup,headRefOid) route=rollup ;;
         reviewDecision) route=decision ;;
       esac
     done ;;
   *) route=other ;;
 esac
-[ -f "$d/$route.out" ] && cat "$d/$route.out"
+n=1
+[ -f "$d/$route.n" ] && n=$(( $(cat "$d/$route.n") + 1 ))
+echo "$n" > "$d/$route.n"
+out="$d/$route.out"
+[ -f "$out.$n" ] && out="$out.$n"
+[ -f "$out" ] && cat "$out"
 [ -f "$d/$route.err" ] && cat "$d/$route.err" >&2
+[ -f "$d/$route.sleep" ] && exec sleep "$(cat "$d/$route.sleep")"
 code=0
 [ -f "$d/$route.code" ] && code=$(cat "$d/$route.code")
 exit "$code"
@@ -3385,6 +3946,11 @@ exit "$code"
             let _ = std::fs::remove_file(dir.join(format!("{route}.err")));
         }
 
+        /// Override stdout for only the `nth` (1-based) call on `route`.
+        fn respond_nth(&self, route: &str, nth: usize, stdout: &str) {
+            std::fs::write(self.dir.path().join(format!("{route}.out.{nth}")), stdout).unwrap();
+        }
+
         fn fail(&self, route: &str, stderr: &str, code: i32) {
             self.respond(route, "", code);
             std::fs::write(self.dir.path().join(format!("{route}.err")), stderr).unwrap();
@@ -3400,9 +3966,17 @@ exit "$code"
                     calls.push(FakeGhCall {
                         argv: Vec::new(),
                         gh_token: token.to_string(),
+                        gh_repo_env: String::new(),
                     });
+                } else if let Some(repo) = line.strip_prefix("REPO\t") {
+                    calls.last_mut().unwrap().gh_repo_env = repo.to_string();
                 } else if let Some(arg) = line.strip_prefix("ARG\t") {
-                    calls.last_mut().unwrap().argv.push(arg.to_string());
+                    // The script encodes newlines as RS (0x1e) to keep one arg per line.
+                    calls
+                        .last_mut()
+                        .unwrap()
+                        .argv
+                        .push(arg.replace('\u{1e}', "\n"));
                 }
             }
             calls
@@ -3608,6 +4182,1004 @@ exit "$code"
         );
         assert_eq!(calls[3].argv[..2], ["pr", "review"]);
         assert_eq!(calls[4].argv[..2], ["pr", "merge"]);
+    }
+
+    // ── fetch_failed_job_digest ─────────────────────────────────────────
+
+    #[cfg(unix)]
+    const DIGEST_SECRET: &str = "ghs_digest_secret_value";
+    #[cfg(unix)]
+    const DIGEST_HEAD: &str = "abc123head";
+
+    #[cfg(unix)]
+    fn rollup_json(head: &str, details_url: Option<&str>) -> String {
+        let url = details_url
+            .map(|u| format!(r#","detailsUrl":"{u}""#))
+            .unwrap_or_default();
+        format!(
+            r#"{{"headRefOid":"{head}","statusCheckRollup":[{{"__typename":"CheckRun","name":"lint","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://github.com/o/r/actions/runs/1/job/2"}},{{"__typename":"CheckRun","name":"container","status":"COMPLETED","conclusion":"FAILURE"{url}}}]}}"#
+        )
+    }
+
+    #[cfg(unix)]
+    fn digest_fixture(gh_repo: Option<&str>) -> (FakeGh, GhMergeExecutor) {
+        let gh = FakeGh::new();
+        let exec = gh.exec(
+            Arc::new(FakeCredentialSource::token(DIGEST_SECRET)),
+            gh_repo,
+        );
+        (gh, exec)
+    }
+
+    #[cfg(unix)]
+    fn assert_no_repo_flag_or_secret(calls: &[FakeGhCall]) {
+        for call in calls {
+            assert_eq!(call.gh_token, DIGEST_SECRET, "token travels via GH_TOKEN");
+            assert!(!call.argv.iter().any(|a| a.contains(DIGEST_SECRET)));
+            if call.argv.first().map(String::as_str) == Some("api") {
+                assert!(
+                    !call.argv.iter().any(|a| a == "-R" || a == "--repo"),
+                    "gh api rejects -R: {:?}",
+                    call.argv
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn actions_job_url_parses_run_and_job_ids() {
+        assert_eq!(
+            parse_actions_job_url("https://github.com/o/r/actions/runs/123/job/456"),
+            Some((123, 456))
+        );
+        assert_eq!(
+            parse_actions_job_url("https://github.com/o/r/actions/runs/123/job/456?pr=9#step:3:1"),
+            Some((123, 456))
+        );
+        for bad in [
+            "",
+            "https://github.com/o/r/runs/456",
+            "https://github.com/o/r/actions/runs/123",
+            "https://github.com/o/r/actions/runs/x/job/456",
+            "https://github.com/o/r/actions/runs/123/job/",
+            "https://github.com/o/r/actions/runs/0/job/456",
+            "https://github.com/o/r/actions/runs/123/job/45/extra",
+        ] {
+            assert_eq!(parse_actions_job_url(bad), None, "{bad}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_failed_job_digest_resolves_ids_and_streams_digest() {
+        let (gh, exec) = digest_fixture(Some("owner/repo"));
+        gh.respond(
+            "rollup",
+            &rollup_json(
+                DIGEST_HEAD,
+                Some("https://github.com/owner/repo/actions/runs/777/job/888"),
+            ),
+            0,
+        );
+        gh.respond(
+            "logs",
+            "2026-01-01T00:00:00.0000000Z test serve::merge::tests::boom ... FAILED\n\
+             2026-01-01T00:00:00.0000000Z ##[error]Process completed with exit code 1.\n",
+            0,
+        );
+
+        let fetched = exec
+            .fetch_failed_job_digest(9, Path::new("/tmp"), DIGEST_HEAD, "container")
+            .unwrap();
+        assert_eq!((fetched.run_id, fetched.job_id), (777, 888));
+        assert_eq!(fetched.digest.failed_names, ["serve::merge::tests::boom"]);
+        let rendered = quorum_core::ci_digest::render_digest(
+            &fetched.digest,
+            "container",
+            fetched.run_id,
+            fetched.job_id,
+        );
+        assert!(
+            rendered.contains("777") && rendered.contains("888"),
+            "{rendered}"
+        );
+
+        let calls = gh.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].argv,
+            [
+                "pr",
+                "view",
+                "9",
+                "--json",
+                "statusCheckRollup,headRefOid",
+                "-R",
+                "owner/repo"
+            ]
+        );
+        assert_eq!(
+            calls[1].argv,
+            ["api", "repos/{owner}/{repo}/actions/jobs/888/logs"]
+        );
+        assert_eq!(calls[1].gh_repo_env, "owner/repo", "repo via GH_REPO");
+        assert_no_repo_flag_or_secret(&calls);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_failed_job_digest_maps_gh_api_failures_without_stderr() {
+        let cases: &[(&str, CiDigestFetchError)] = &[
+            (
+                "gh: Gone (HTTP 410) Authorization: token ghs_leak",
+                CiDigestFetchError::LogExpired,
+            ),
+            (
+                "gh: API rate limit exceeded for installation (HTTP 403)",
+                CiDigestFetchError::RateLimited,
+            ),
+            (
+                "gh: Resource not accessible by integration (HTTP 403)",
+                CiDigestFetchError::Forbidden,
+            ),
+            ("gh: Not Found (HTTP 404)", CiDigestFetchError::NotFound),
+            (
+                "unexpected ghs_leak failure",
+                CiDigestFetchError::ApiFailed { exit_code: Some(1) },
+            ),
+        ];
+        for (stderr, expected) in cases {
+            let (gh, exec) = digest_fixture(None);
+            gh.respond(
+                "rollup",
+                &rollup_json(
+                    DIGEST_HEAD,
+                    Some("https://github.com/o/r/actions/runs/5/job/6"),
+                ),
+                0,
+            );
+            gh.fail("logs", stderr, 1);
+            let error = exec
+                .fetch_failed_job_digest(9, Path::new("/tmp"), DIGEST_HEAD, "container")
+                .unwrap_err();
+            assert_eq!(&error, expected, "{stderr}");
+            let text = format!("{error} {error:?}");
+            for leaked in ["ghs_leak", "Authorization", DIGEST_SECRET, stderr] {
+                assert!(!text.contains(leaked), "{text}");
+            }
+            let calls = gh.calls();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[1].gh_repo_env, "", "no GH_REPO without a slug");
+            assert_no_repo_flag_or_secret(&calls);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_failed_job_digest_rejects_rollup_without_fetching_log() {
+        let url = Some("https://github.com/o/r/actions/runs/5/job/6");
+        let cases: Vec<(String, i32, &str, CiDigestFetchError)> = vec![
+            (
+                rollup_json("otherhead", url),
+                0,
+                "container",
+                CiDigestFetchError::HeadMismatch {
+                    expected: DIGEST_HEAD.into(),
+                    actual: Some("otherhead".into()),
+                },
+            ),
+            (
+                r#"{"statusCheckRollup":[]}"#.into(),
+                0,
+                "container",
+                CiDigestFetchError::HeadMismatch {
+                    expected: DIGEST_HEAD.into(),
+                    actual: None,
+                },
+            ),
+            (
+                rollup_json(DIGEST_HEAD, None),
+                0,
+                "container",
+                CiDigestFetchError::MissingDetailsUrl,
+            ),
+            (
+                rollup_json(DIGEST_HEAD, Some("https://example.com/build/5")),
+                0,
+                "container",
+                CiDigestFetchError::UnparseableDetailsUrl,
+            ),
+            (
+                rollup_json(DIGEST_HEAD, url),
+                0,
+                "absent-job",
+                CiDigestFetchError::JobNotFound,
+            ),
+            (
+                "not json".into(),
+                0,
+                "container",
+                CiDigestFetchError::RollupUnparseable,
+            ),
+            (
+                String::new(),
+                1,
+                "container",
+                CiDigestFetchError::RollupQueryFailed { exit_code: Some(1) },
+            ),
+        ];
+        for (rollup, code, job, expected) in cases {
+            let (gh, exec) = digest_fixture(Some("o/r"));
+            gh.respond("rollup", &rollup, code);
+            gh.respond("logs", "should never be read", 0);
+            let error = exec
+                .fetch_failed_job_digest(9, Path::new("/tmp"), DIGEST_HEAD, job)
+                .unwrap_err();
+            assert_eq!(error, expected, "{rollup}");
+            let calls = gh.calls();
+            assert_eq!(calls.len(), 1, "no log fetch after a rollup error");
+            assert_no_repo_flag_or_secret(&calls);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_failed_job_digest_caps_large_streamed_log() {
+        use quorum_core::ci_digest::{render_digest, DIGEST_MAX_BYTES, FAILED_NAMES_MAX};
+        use std::fmt::Write as _;
+
+        let (gh, exec) = digest_fixture(Some("o/r"));
+        gh.respond(
+            "rollup",
+            &rollup_json(
+                DIGEST_HEAD,
+                Some("https://github.com/o/r/actions/runs/5/job/6"),
+            ),
+            0,
+        );
+        // ~12 MiB: many FAILED markers, filler, and one unbounded line.
+        let mut log = String::with_capacity(13 << 20);
+        for i in 0..100_000 {
+            writeln!(log, "test suite::case_{i} ... FAILED").unwrap();
+            writeln!(log, "filler line {i} {}", "x".repeat(64)).unwrap();
+        }
+        log.push_str(&"y".repeat(4 << 20));
+        log.push('\n');
+        assert!(log.len() > 12 << 20);
+        gh.respond("logs", &log, 0);
+
+        let fetched = exec
+            .fetch_failed_job_digest(9, Path::new("/tmp"), DIGEST_HEAD, "container")
+            .unwrap();
+        assert_eq!(fetched.digest.failed_names.len(), FAILED_NAMES_MAX);
+        assert!(fetched.digest.failed_names_truncated);
+        let rendered = render_digest(&fetched.digest, "container", 5, 6);
+        assert!(rendered.len() <= DIGEST_MAX_BYTES, "{}", rendered.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_failed_job_digest_kills_log_fetch_at_wall_clock_cap() {
+        let (gh, exec) = digest_fixture(Some("o/r"));
+        gh.respond(
+            "rollup",
+            &rollup_json(
+                DIGEST_HEAD,
+                Some("https://github.com/o/r/actions/runs/5/job/6"),
+            ),
+            0,
+        );
+        gh.respond("logs", "partial line\n", 0);
+        std::fs::write(gh.dir.path().join("logs.sleep"), "30").unwrap();
+
+        let timeout = Duration::from_millis(500);
+        let started = Instant::now();
+        let error = exec
+            .fetch_failed_job_digest_within(9, Path::new("/tmp"), DIGEST_HEAD, "container", timeout)
+            .unwrap_err();
+        assert_eq!(error, CiDigestFetchError::TimedOut { after: timeout });
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timeout must bound the fetch: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn default_executor_digest_fetch_is_unsupported() {
+        let exec = CommandMergeExecutor {
+            command: "true".into(),
+            checks_cmd: None,
+            mergeability_cmd: None,
+        };
+        assert_eq!(
+            exec.fetch_failed_job_digest(1, Path::new("/tmp"), "head", "job"),
+            Err(CiDigestFetchError::Unsupported)
+        );
+    }
+
+    // ── ensure_changes_requested: one- vs two-identity ──────────────────
+
+    #[cfg(unix)]
+    const CHANGES_SECRET: &str = "ghs_changes_secret";
+
+    #[cfg(unix)]
+    fn reviews_at(head: &str, entries: &[(&str, &str, &str)]) -> String {
+        let reviews: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(state, oid, body)| {
+                serde_json::json!({"state": state, "commit": {"oid": oid}, "body": body})
+            })
+            .collect();
+        serde_json::json!({ "reviews": reviews, "headRefOid": head }).to_string()
+    }
+
+    #[cfg(unix)]
+    fn changes_gh() -> (FakeGh, GhMergeExecutor) {
+        let gh = FakeGh::new();
+        let exec = gh.exec(
+            Arc::new(FakeCredentialSource::token(CHANGES_SECRET)),
+            Some("o/r"),
+        );
+        gh.respond("review", "", 0);
+        (gh, exec)
+    }
+
+    #[cfg(unix)]
+    fn review_calls(gh: &FakeGh) -> Vec<Vec<String>> {
+        gh.calls()
+            .into_iter()
+            .inspect(|call| {
+                assert_eq!(call.gh_token, CHANGES_SECRET, "token via GH_TOKEN");
+                assert!(
+                    !call.argv.iter().any(|a| a.contains(CHANGES_SECRET)),
+                    "token must never enter argv: {:?}",
+                    call.argv
+                );
+            })
+            .filter(|call| call.argv[..2] == ["pr", "review"])
+            .map(|call| call.argv)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn request_changes_argv(body: &str) -> Vec<String> {
+        [
+            "pr",
+            "review",
+            "9",
+            "--request-changes",
+            "--body",
+            body,
+            "-R",
+            "o/r",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    }
+
+    /// Negative case 1: viewerDidAuthor=false keeps today's argv and dedupe.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_changes_two_identity_posts_request_changes_unchanged() {
+        let (gh, exec) = changes_gh();
+        gh.respond("probe", &probe_json("false", "null"), 0);
+        gh.respond("decision", r#"{"reviewDecision":"REVIEW_REQUIRED"}"#, 0);
+        assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        assert_eq!(review_calls(&gh), vec![request_changes_argv("fix it")]);
+        let routes: Vec<String> = gh.calls().iter().map(|c| c.argv[0].clone()).collect();
+        assert_eq!(routes, ["api", "pr", "pr"], "probe, decision, review");
+
+        // Existing CHANGES_REQUESTED dedupe still short-circuits.
+        let (gh, exec) = changes_gh();
+        gh.respond("probe", &probe_json("false", "null"), 0);
+        gh.respond("decision", r#"{"reviewDecision":"CHANGES_REQUESTED"}"#, 0);
+        assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        assert!(review_calls(&gh).is_empty());
+
+        // A refused --request-changes still fails as today.
+        let (gh, exec) = changes_gh();
+        gh.respond("probe", &probe_json("false", "null"), 0);
+        gh.respond("decision", r#"{"reviewDecision":""}"#, 0);
+        gh.fail("review", "refused", 1);
+        assert!(!exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        assert_eq!(review_calls(&gh), vec![request_changes_argv("fix it")]);
+    }
+
+    /// Negative case 2: a failed probe takes the two-identity path.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_changes_failed_probe_falls_back_to_two_identity() {
+        let probes: [fn(&FakeGh); 2] = [
+            |gh| gh.fail("probe", "HTTP 502", 1),
+            |gh| gh.respond("probe", "{not json", 0),
+        ];
+        for fail_probe in probes {
+            let (gh, exec) = changes_gh();
+            fail_probe(&gh);
+            gh.respond("decision", r#"{"reviewDecision":""}"#, 0);
+            assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+            assert_eq!(review_calls(&gh), vec![request_changes_argv("fix it")]);
+        }
+    }
+
+    /// One identity posts a marker COMMENT bound to the current head and
+    /// never `--request-changes`.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_changes_one_identity_posts_marker_comment() {
+        let (gh, exec) = changes_gh();
+        gh.respond("probe", &probe_json("true", "null"), 0);
+        gh.respond("reviews", &reviews_at("head1", &[]), 0);
+        // Even a CHANGES_REQUESTED decision is not consulted in this mode.
+        gh.respond("decision", r#"{"reviewDecision":"CHANGES_REQUESTED"}"#, 0);
+        assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        let marked = format!(
+            "fix it\n\n{}",
+            verdict_marker(VerdictKind::Changes, "head1")
+        );
+        assert_eq!(
+            review_calls(&gh),
+            vec![[
+                "pr",
+                "review",
+                "9",
+                "--comment",
+                "--body",
+                &marked,
+                "-R",
+                "o/r"
+            ]
+            .map(str::to_owned)
+            .to_vec()]
+        );
+        assert!(!gh
+            .calls()
+            .iter()
+            .any(|c| c.argv.iter().any(|a| a == "--request-changes")));
+
+        // A failed comment post is a failure, still never --request-changes.
+        let (gh, exec) = changes_gh();
+        gh.respond("probe", &probe_json("true", "null"), 0);
+        gh.respond("reviews", &reviews_at("head1", &[]), 0);
+        gh.fail("review", "boom", 1);
+        assert!(!exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        let reviews = review_calls(&gh);
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0][3], "--comment");
+
+        // An unreadable head posts nothing.
+        let (gh, exec) = changes_gh();
+        gh.respond("probe", &probe_json("true", "null"), 0);
+        gh.fail("reviews", "boom", 1);
+        assert!(!exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        assert!(review_calls(&gh).is_empty());
+    }
+
+    /// Negative case 4: a retry on the same head finds the marker, posts no
+    /// second comment, and returns true.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_changes_one_identity_retry_same_head_posts_once() {
+        let (gh, exec) = changes_gh();
+        gh.respond("probe", &probe_json("true", "null"), 0);
+        gh.respond("reviews", &reviews_at("head1", &[]), 0);
+        assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        let posted = review_calls(&gh)[0][5].clone();
+        gh.respond(
+            "reviews",
+            &reviews_at("head1", &[("COMMENTED", "head1", &posted)]),
+            0,
+        );
+        assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "other"));
+        assert_eq!(review_calls(&gh).len(), 1, "exactly one marker comment");
+    }
+
+    /// Negative case 5: after the head moves, the old marker does not dedupe.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_changes_one_identity_head_move_posts_new_marker() {
+        let (gh, exec) = changes_gh();
+        gh.respond("probe", &probe_json("true", "null"), 0);
+        let old = format!("x\n\n{}", verdict_marker(VerdictKind::Changes, "head1"));
+        gh.respond(
+            "reviews",
+            &reviews_at("head2", &[("COMMENTED", "head1", &old)]),
+            0,
+        );
+        assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        let reviews = review_calls(&gh);
+        assert_eq!(reviews.len(), 1);
+        assert!(reviews[0][5].ends_with(&verdict_marker(VerdictKind::Changes, "head2")));
+    }
+
+    /// Negative case 10: a current-head comment quoting another head's
+    /// marker, the approved marker, or no marker does not dedupe.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_changes_one_identity_ignores_quoted_or_missing_marker() {
+        let other_head = format!(
+            "as the daemon said: {}",
+            verdict_marker(VerdictKind::Changes, "head0")
+        );
+        let approved = verdict_marker(VerdictKind::Approved, "head1");
+        for body in [other_head.as_str(), approved.as_str(), "please fix"] {
+            let (gh, exec) = changes_gh();
+            gh.respond("probe", &probe_json("true", "null"), 0);
+            gh.respond(
+                "reviews",
+                &reviews_at("head1", &[("COMMENTED", "head1", body)]),
+                0,
+            );
+            assert!(exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+            let reviews = review_calls(&gh);
+            assert_eq!(reviews.len(), 1, "{body}");
+            assert!(reviews[0][5].ends_with(&verdict_marker(VerdictKind::Changes, "head1")));
+        }
+    }
+
+    /// Negative cases 11/12: a missing credential spawns no gh child for the
+    /// probe or any review; the token never enters argv (asserted per call by
+    /// `review_calls` in the other tests).
+    #[cfg(unix)]
+    #[test]
+    fn ensure_changes_missing_credential_spawns_nothing() {
+        let gh = FakeGh::new();
+        gh.respond("probe", &probe_json("true", "null"), 0);
+        gh.respond("reviews", &reviews_at("head1", &[]), 0);
+        gh.respond("review", "", 0);
+        let exec = gh.exec(
+            Arc::new(LocalDefaultCredentialSource::new(Some(PathBuf::from(
+                "/nonexistent/path/token",
+            )))),
+            Some("o/r"),
+        );
+        assert!(!exec.ensure_changes_requested(9, Path::new("/tmp"), "fix it"));
+        assert!(gh.calls().is_empty(), "no gh child may spawn");
+    }
+
+    // ── merge(): one-identity approved-verdict path ─────────────────────
+
+    const MERGE_SECRET: &str = "ghs_merge_path_secret";
+    const VIEW_AT_HEAD: &str =
+        r#"{"baseRefName":"main","headRefOid":"abc123","headRefName":"feature","state":"OPEN"}"#;
+
+    /// A fake gh serving a mergeable PR #1 at head `abc123` (ctx head) with
+    /// no reviews, the given probe stdout, and the given reviewDecision.
+    #[cfg(unix)]
+    fn merge_fixture(probe: &str, decision: &str) -> FakeGh {
+        let gh = FakeGh::new();
+        gh.respond("view", VIEW_AT_HEAD, 0);
+        gh.respond("other", r#"{"defaultBranchRef":{"name":"main"}}"#, 0);
+        gh.respond("reviews", r#"{"reviews":[],"headRefOid":"abc123"}"#, 0);
+        gh.respond("probe", probe, 0);
+        gh.respond(
+            "decision",
+            &format!(r#"{{"reviewDecision":{decision}}}"#),
+            0,
+        );
+        gh.respond("review", "", 0);
+        gh.respond("merge", "", 0);
+        gh
+    }
+
+    #[cfg(unix)]
+    fn merge_exec(gh: &FakeGh) -> GhMergeExecutor {
+        gh.exec(
+            Arc::new(FakeCredentialSource::token(MERGE_SECRET)),
+            Some("o/r"),
+        )
+    }
+
+    #[cfg(unix)]
+    fn calls_for(calls: &[FakeGhCall], verb: &str) -> Vec<Vec<String>> {
+        calls
+            .iter()
+            .filter(|c| c.argv.len() >= 2 && c.argv[0] == "pr" && c.argv[1] == verb)
+            .map(|c| c.argv.clone())
+            .collect()
+    }
+
+    fn expected_merge_argv() -> Vec<String> {
+        [
+            "pr",
+            "merge",
+            "1",
+            "--merge",
+            "--delete-branch",
+            "--match-head-commit",
+            "abc123",
+            "-R",
+            "o/r",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    fn expected_approve_argv(ctx: &MergeContext) -> Vec<String> {
+        let body = format!(
+            "Formal approval — per {} review verdict (task #{}). \
+             Merge performed programmatically on approved verdict (daemon model).",
+            ctx.reviewer_name, ctx.review_task_id,
+        );
+        [
+            "pr",
+            "review",
+            "1",
+            "--approve",
+            "--body",
+            &body,
+            "-R",
+            "o/r",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    #[cfg(unix)]
+    fn assert_token_only_in_env(calls: &[FakeGhCall]) {
+        assert!(!calls.is_empty());
+        for call in calls {
+            assert_eq!(call.gh_token, MERGE_SECRET, "{:?}", call.argv);
+            assert!(
+                !call.argv.iter().any(|a| a.contains(MERGE_SECRET)),
+                "token must never enter argv: {:?}",
+                call.argv
+            );
+        }
+    }
+
+    /// Negative case 1: viewerDidAuthor=false keeps today's argv exactly.
+    #[cfg(unix)]
+    #[test]
+    fn merge_two_identity_keeps_approve_and_merge_argv() {
+        let ctx = test_ctx();
+        let gh = merge_fixture(
+            &probe_json("false", r#""REVIEW_REQUIRED""#),
+            r#""REVIEW_REQUIRED""#,
+        );
+        let result = merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx);
+        assert!(result.success, "{result:?}");
+
+        let calls = gh.calls();
+        assert_eq!(
+            calls_for(&calls, "review"),
+            vec![expected_approve_argv(&ctx)]
+        );
+        assert_eq!(calls_for(&calls, "merge"), vec![expected_merge_argv()]);
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.argv.iter().any(|a| a == "reviewDecision")),
+            "two-identity mode never reads reviewDecision"
+        );
+        assert_token_only_in_env(&calls);
+
+        // #49 dedupe unchanged: an APPROVED review on the head skips --approve.
+        let gh = merge_fixture(&probe_json("false", "null"), "null");
+        gh.respond(
+            "reviews",
+            &reviews_with_head(&[("APPROVED", "abc123", "ok")], "abc123"),
+            0,
+        );
+        assert!(merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx).success);
+        let calls = gh.calls();
+        assert!(calls_for(&calls, "review").is_empty());
+        assert_eq!(calls_for(&calls, "merge"), vec![expected_merge_argv()]);
+    }
+
+    /// Negative case 2: every failed probe keeps the two-identity path.
+    #[cfg(unix)]
+    #[test]
+    fn merge_failed_probe_keeps_two_identity_path() {
+        let ctx = test_ctx();
+        let one_identity = probe_json("true", r#""REVIEW_REQUIRED""#);
+        let errors_entry = r#"{"data":{"repository":{"pullRequest":{"viewerDidAuthor":true,"reviewDecision":null}}},"errors":[{"message":"x"}]}"#;
+        let missing_field = r#"{"data":{"repository":{"pullRequest":{"reviewDecision":null}}}}"#;
+        for (stdout, code) in [
+            (one_identity.as_str(), 1),
+            (errors_entry, 0),
+            ("{not json", 0),
+            (missing_field, 0),
+        ] {
+            let gh = merge_fixture(stdout, r#""REVIEW_REQUIRED""#);
+            gh.respond("probe", stdout, code);
+            let result = merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx);
+            assert!(result.success, "{stdout}: {result:?}");
+            let calls = gh.calls();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|c| c.argv[..2] == ["api", "graphql"])
+                    .count(),
+                1,
+                "probe runs once per merge() call"
+            );
+            assert_eq!(
+                calls_for(&calls, "review"),
+                vec![expected_approve_argv(&ctx)],
+                "{stdout}"
+            );
+            assert_eq!(
+                calls_for(&calls, "merge"),
+                vec![expected_merge_argv()],
+                "{stdout}"
+            );
+        }
+    }
+
+    fn reviews_with_head(entries: &[(&str, &str, &str)], head: &str) -> String {
+        let mut json: serde_json::Value = serde_json::from_str(&reviews_with(entries)).unwrap();
+        json["headRefOid"] = serde_json::Value::String(head.into());
+        json.to_string()
+    }
+
+    /// Negative cases 3 and 7: one marker COMMENT per head, then the
+    /// unchanged merge argv when reviewDecision is not REVIEW_REQUIRED.
+    #[cfg(unix)]
+    #[test]
+    fn merge_one_identity_posts_one_marker_comment_per_head_and_merges() {
+        let ctx = test_ctx();
+        let gh = merge_fixture(&probe_json("true", "null"), r#""APPROVED""#);
+        let exec = merge_exec(&gh);
+        let result = exec.merge(1, Path::new("/tmp"), &ctx);
+        assert!(result.success, "{result:?}");
+
+        let calls = gh.calls();
+        let reviews = calls_for(&calls, "review");
+        assert_eq!(reviews.len(), 1);
+        let comment = &reviews[0];
+        assert_eq!(comment[..5], ["pr", "review", "1", "--comment", "--body"]);
+        assert_eq!(comment[6..], ["-R", "o/r"]);
+        assert!(!comment.iter().any(|a| a == "--approve"));
+        let body = &comment[5];
+        assert!(
+            body.contains("Rev-1") && body.contains("task #99"),
+            "{body}"
+        );
+        assert!(
+            body.contains(&verdict_marker(VerdictKind::Approved, "abc123")),
+            "{body}"
+        );
+        assert_eq!(calls_for(&calls, "merge"), vec![expected_merge_argv()]);
+        assert_token_only_in_env(&calls);
+
+        // Re-entry on the same head: GitHub now lists the daemon's COMMENT.
+        gh.respond(
+            "reviews",
+            &reviews_with_head(&[("COMMENTED", "abc123", body)], "abc123"),
+            0,
+        );
+        assert!(exec.merge(1, Path::new("/tmp"), &ctx).success);
+        let calls = gh.calls();
+        assert_eq!(
+            calls_for(&calls, "review").len(),
+            1,
+            "no second marker comment"
+        );
+        assert_eq!(calls_for(&calls, "merge").len(), 2);
+
+        // A null decision is "anything else": merge is attempted unchanged.
+        let gh = merge_fixture(&probe_json("true", "null"), "null");
+        assert!(merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx).success);
+        assert_eq!(calls_for(&gh.calls(), "merge"), vec![expected_merge_argv()]);
+    }
+
+    /// Negative case 6: REVIEW_REQUIRED never spawns `gh pr merge`.
+    #[cfg(unix)]
+    #[test]
+    fn merge_one_identity_review_required_parks_without_merging() {
+        let ctx = test_ctx();
+        let gh = merge_fixture(&probe_json("true", "null"), r#""REVIEW_REQUIRED""#);
+        let result = merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx);
+        assert!(!result.success);
+        assert_eq!(result.failure_kind, Some(MergeFailureKind::PolicyBlocked));
+        assert_eq!(result.message, self_approval_required(1, "abc123").message);
+        assert!(
+            result
+                .message
+                .contains("someone other than the pull request author")
+                && result.message.contains("A person must approve head abc123")
+                && result.message.contains("merge not attempted"),
+            "{}",
+            result.message
+        );
+        let calls = gh.calls();
+        assert_eq!(calls_for(&calls, "review").len(), 1);
+        assert!(
+            calls_for(&calls, "merge").is_empty(),
+            "gh pr merge must not spawn"
+        );
+    }
+
+    /// Negative case 5: a moved head ignores the old marker and the existing
+    /// drift rejection fires before any comment or merge.
+    #[cfg(unix)]
+    #[test]
+    fn merge_one_identity_moved_head_rejects_before_comment() {
+        let ctx = test_ctx();
+        let gh = merge_fixture(&probe_json("true", "null"), r#""APPROVED""#);
+        let old = verdict_marker(VerdictKind::Approved, "abc123");
+        gh.respond(
+            "reviews",
+            &reviews_with_head(&[("COMMENTED", "abc123", &old)], "def456"),
+            0,
+        );
+        // View calls: base, head, isDraft pass; the post-dedupe base/head
+        // recheck sees the moved head.
+        let moved = VIEW_AT_HEAD.replace("abc123", "def456");
+        for nth in 4..=8 {
+            gh.respond_nth("view", nth, &moved);
+        }
+        let result = merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx);
+        assert!(!result.success);
+        assert_eq!(result.failure_kind, Some(MergeFailureKind::StaleAuthority));
+        assert!(
+            result.message.contains("head drifted to def456"),
+            "{}",
+            result.message
+        );
+        let calls = gh.calls();
+        assert!(
+            calls_for(&calls, "review").is_empty(),
+            "no comment after head moved"
+        );
+        assert!(calls_for(&calls, "merge").is_empty());
+    }
+
+    /// Negative case 8: a failed merge with a fresh non-REVIEW_REQUIRED
+    /// decision is classified exactly as today; REVIEW_REQUIRED names the
+    /// missing person's approval.
+    #[cfg(unix)]
+    #[test]
+    fn merge_one_identity_failed_merge_classification() {
+        let ctx = test_ctx();
+        let stderr = "Pull request is not mergeable: the base branch policy prohibits the merge";
+        for (fresh, expect_specific) in [
+            (r#""APPROVED""#, false),
+            ("null", false),
+            (r#""REVIEW_REQUIRED""#, true),
+        ] {
+            let gh = merge_fixture(&probe_json("true", "null"), r#""APPROVED""#);
+            gh.fail("merge", stderr, 1);
+            gh.respond_nth("decision", 2, &format!(r#"{{"reviewDecision":{fresh}}}"#));
+            let result = merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx);
+            assert!(!result.success);
+            assert_eq!(calls_for(&gh.calls(), "merge"), vec![expected_merge_argv()]);
+            if expect_specific {
+                assert_eq!(result.message, self_approval_required(1, "abc123").message);
+                assert_eq!(result.failure_kind, Some(MergeFailureKind::PolicyBlocked));
+            } else {
+                assert_eq!(result.message, stderr, "{fresh}");
+                assert_eq!(result.failure_kind, Some(classify_merge_failure(stderr)));
+            }
+        }
+        // A failed fresh read keeps today's classification too.
+        let gh = merge_fixture(&probe_json("true", "null"), r#""APPROVED""#);
+        gh.fail("merge", "merge conflict", 1);
+        gh.respond_nth("decision", 2, "{not json");
+        let result = merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx);
+        assert_eq!(result.message, "merge conflict");
+        assert_eq!(
+            result.failure_kind,
+            Some(classify_merge_failure("merge conflict"))
+        );
+    }
+
+    /// Negative case 10: agent-authored comments quoting another head's
+    /// marker or none do not dedupe; a copied current-head marker at most
+    /// suppresses the comment and never changes the merge decision.
+    #[cfg(unix)]
+    #[test]
+    fn merge_one_identity_forged_markers_never_change_merge_outcome() {
+        let ctx = test_ctx();
+        let other_head = verdict_marker(VerdictKind::Approved, "zzz999");
+        for body in ["LGTM, approved!", other_head.as_str()] {
+            let gh = merge_fixture(&probe_json("true", "null"), r#""APPROVED""#);
+            gh.respond(
+                "reviews",
+                &reviews_with_head(&[("COMMENTED", "abc123", body)], "abc123"),
+                0,
+            );
+            assert!(merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx).success);
+            assert_eq!(calls_for(&gh.calls(), "review").len(), 1, "{body}");
+        }
+
+        let copied = verdict_marker(VerdictKind::Approved, "abc123");
+        for (decision, merges) in [(r#""APPROVED""#, true), (r#""REVIEW_REQUIRED""#, false)] {
+            let gh = merge_fixture(&probe_json("true", "null"), decision);
+            gh.respond(
+                "reviews",
+                &reviews_with_head(&[("COMMENTED", "abc123", &copied)], "abc123"),
+                0,
+            );
+            let result = merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx);
+            let calls = gh.calls();
+            assert!(
+                calls_for(&calls, "review").is_empty(),
+                "duplicate comment suppressed"
+            );
+            assert_eq!(result.success, merges, "{decision}: {result:?}");
+            assert_eq!(calls_for(&calls, "merge").len(), usize::from(merges));
+            if !merges {
+                assert_eq!(result.message, self_approval_required(1, "abc123").message);
+            }
+        }
+    }
+
+    /// Succeeds for the first `ok` token fetches, then fails.
+    struct CountdownSource {
+        ok: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GithubCredentialSource for CountdownSource {
+        fn token(&self) -> std::result::Result<GithubToken, GithubCredentialError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.ok {
+                FakeCredentialSource::token(MERGE_SECRET).token()
+            } else {
+                Err(GithubCredentialError::LookupTimedOut {
+                    timeout: Duration::from_secs(10),
+                })
+            }
+        }
+    }
+
+    /// Negative cases 11/12: a credential failure at the probe or at the
+    /// `--comment` review spawns no gh child for it, and nothing merges.
+    #[cfg(unix)]
+    #[test]
+    fn merge_one_identity_credential_failure_spawns_no_probe_or_comment() {
+        let ctx = test_ctx();
+        // Baseline: every gh child fetches exactly one token first.
+        let gh = merge_fixture(&probe_json("true", "null"), r#""APPROVED""#);
+        assert!(merge_exec(&gh).merge(1, Path::new("/tmp"), &ctx).success);
+        let baseline = gh.calls();
+        let probe_at = baseline
+            .iter()
+            .position(|c| c.argv[..2] == ["api", "graphql"])
+            .unwrap();
+        let comment_at = baseline
+            .iter()
+            .position(|c| c.argv[..2] == ["pr", "review"])
+            .unwrap();
+
+        for (ok, spawned) in [(probe_at, probe_at), (comment_at, comment_at)] {
+            let gh = merge_fixture(&probe_json("true", "null"), r#""APPROVED""#);
+            let exec = gh.exec(
+                Arc::new(CountdownSource {
+                    ok,
+                    calls: Default::default(),
+                }),
+                Some("o/r"),
+            );
+            let result = exec.merge(1, Path::new("/tmp"), &ctx);
+            assert!(!result.success);
+            assert_eq!(result.failure_kind, Some(MergeFailureKind::PolicyBlocked));
+            assert!(!result.message.contains(MERGE_SECRET));
+            let calls = gh.calls();
+            assert_eq!(
+                calls.len(),
+                spawned,
+                "no child after the credential failure"
+            );
+            assert!(calls_for(&calls, "review").is_empty());
+            assert!(calls_for(&calls, "merge").is_empty());
+            assert_token_only_in_env(&calls);
+        }
+
+        // A missing token file spawns nothing at all.
+        let gh = merge_fixture(&probe_json("true", "null"), r#""APPROVED""#);
+        let exec = gh.exec(
+            Arc::new(LocalDefaultCredentialSource::new(Some(PathBuf::from(
+                "/nonexistent/path/token",
+            )))),
+            Some("o/r"),
+        );
+        assert!(!exec.merge(1, Path::new("/tmp"), &ctx).success);
+        assert!(gh.calls().is_empty());
     }
 
     #[test]

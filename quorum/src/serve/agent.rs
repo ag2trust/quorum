@@ -313,6 +313,11 @@ impl AgentProc {
         self.turns.has_outstanding_work()
     }
 
+    /// Bounded description of the outstanding tool/background work.
+    pub fn outstanding_work_summary(&self) -> Option<String> {
+        self.turns.outstanding_work_summary()
+    }
+
     /// Self-continued provider turns completed since the latest daemon feed.
     pub fn unfed_turns_since_feed(&self) -> u32 {
         self.turns.unfed_results_since_feed()
@@ -1038,6 +1043,20 @@ impl AgentProc {
 
     pub fn drain_diagnostics(&mut self) -> Vec<CapturedOutput> {
         self.diagnostics.drain()
+    }
+
+    /// Like [`Self::from_parts`] for a child spawned with `process_group(0)`:
+    /// teardown kills that group instead of waiting for a natural exit.
+    #[cfg(test)]
+    pub fn from_parts_in_own_group(
+        child: Child,
+        stdin: tokio::process::ChildStdin,
+        reader: BufReader<tokio::process::ChildStdout>,
+    ) -> Self {
+        let process_group_id = child.id().expect("fixture child is running") as i32;
+        let mut proc = Self::from_parts(child, stdin, reader);
+        proc.process_group_id = process_group_id;
+        proc
     }
 
     #[cfg(test)]

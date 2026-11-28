@@ -867,6 +867,22 @@ full idle window to react to the completion. Because activity can only be record
 while the slot is still under the busy ceiling, a persistent worker is reaped at most
 about `max_busy_idle_secs + max_idle_secs` after its last daemon-fed turn. At most 8
 self-continued turns are tolerated per daemon-fed turn.
+
+The two between-turn reap reasons are distinct, and one classification decides both the
+worker and reviewer watchdogs. A slot reaped while the busy ceiling was selected
+(outstanding work or an open self-continued turn) is logged as
+`WATCHDOG: worker X exceeded busy ceiling Ns on task #T (outstanding work: …)`, naming
+the launching command when the provider reported it. Its end reason is `busy_ceiling`,
+and its task note says the same. Only a plain-idle reap is a zombie (`idle_reaped`). A
+worker `busy_ceiling` reap requeues without spending a recovery attempt while the task's
+cumulative busy-ceiling slot time stays within `max_task_wall_secs`. That total is kept
+in `refs.busy_ceiling_wall_secs`, decided in the same immediate transaction as the
+`AgentFailed`, and cleared on the delivery handoff that also resets `recovery_attempts`.
+Past that total, or with no `max_task_wall_secs` configured, the reap is an ordinary
+charged failure, so the recovery budget still fails the task. When the next worker
+resumes a `busy_ceiling` recover ref, its resume note quotes the predecessor's
+outstanding command and elapsed time. It tells the worker to run that verification once
+in the foreground.
 A reviewer that already recorded its verdict and waits for its sticky re-review — task in
 `rework` (worker rework or CI remediation), in `merging` (merge failure resumes the
 reviewer), or `in-review` with the CI-gated `ResumeReviewer` still pending — is not an
@@ -1054,9 +1070,12 @@ only through an explicit outside request)
 - `VerdictApprove` → Merging · effects: MergePr
 - `VerdictChanges` → Rework · effects: IncrementReworkRound, ResumeWorker
 - `ChecksFailed` → Rework · effects: IncrementReworkRound, ResumeWorker
+- `MergeConflict` (pre-review: GitHub reports `DIRTY` for the recorded head) → Rework ·
+  effects: IncrementReworkRound, ResumeWorker (at the rework cap → Failed · effects:
+  NotifyOwner, ReleaseLease). Same cap accounting as the merge-time conflict.
 - `VerdictChanges` (review_only=true) → Rework · effects: IncrementReworkRound,
   ResumeWorker (at the rework cap → Failed · effects: NotifyOwner, ReleaseLease)
-- `VerdictChanges` / `ChecksFailed` (no_rework=true) → **Done** · effects: ReleaseLease,
+- `VerdictChanges` / `ChecksFailed` / `MergeConflict` (no_rework=true) → **Done** · effects: ReleaseLease,
   PostFindingsNote, NotifyOwner. Takes precedence over the rework cap; never
   IncrementReworkRound or ResumeWorker. R1 changes therefore end the task before any R2.
 - `VerdictChanges` (rework_round ≥ the task's stamped rework cap) → Failed · effects: NotifyOwner, ReleaseLease
@@ -1451,10 +1470,29 @@ Before reconciliation, `quorum status` surfaces these rows as critical health al
 For PR-backed tasks, the GitHub PR is the source of truth for the review conversation:
 findings (BLOCKING and advisory), advisory suggestions, author responses/pushback,
 reviewer resolution of prior findings, and evidence. Quorum coordinates lifecycle,
-provisioning, validated publication, the final formal APPROVE, and merge. Agents author the
-conversation through the run-bound GitHub collaboration MCP; Quorum preserves their Markdown,
-anchors contributions to the authorized PR/revision, and never derives lifecycle transitions
-from comment text. Concretely:
+provisioning, validated publication, the final formal review verdict, and merge. Agents author
+the conversation through the run-bound GitHub collaboration MCP; Quorum preserves their
+Markdown, anchors contributions to the authorized PR/revision, and never derives lifecycle
+transitions from comment text.
+
+The daemon's merge identity runs in one of two modes, detected per PR by probing the merge
+credential's GitHub identity (`viewerDidAuthor`) rather than by static configuration:
+
+- **Two-identity:** a merge credential distinct from the publishing identity (configured
+  `merge_token_file`) that did not author the PR. The daemon posts the formal
+  `APPROVE`/`REQUEST_CHANGES` review from that merge account, as described below.
+- **One-identity:** no distinct merge credential is configured, or the merge credential
+  authored the PR anyway. GitHub refuses a self-review, so the daemon posts a `COMMENT`
+  review carrying the verdict text and a head-SHA-bound dedupe marker instead of a formal
+  review. The marker only prevents a duplicate comment on retry; the daemon's `COMMENT` is
+  never an approval or a request for changes in GitHub's own terms. The daemon merges on the
+  combination of its own passed `COMMENT` verdict, GitHub's `reviewDecision`, and green
+  required checks. When branch protection still reports `REVIEW_REQUIRED` — because it
+  requires an approving review from someone other than the PR author, which the merge
+  identity cannot give itself — the daemon parks the merge with a message that a person must
+  approve the head SHA, rather than merging around that requirement.
+
+Concretely:
 
 - **Reviewer agents** complete their planned audit for the reviewed SHA before
   submitting a verdict: discovering one blocker does not end exploration. They
@@ -1521,11 +1559,17 @@ from comment text. Concretely:
   submit payload is a lifecycle signal, not a second review ledger — the ledger is
   the PR. The `--feedback` string is preserved as rework-turn context for the warm
   worker but is not the authoritative record.
-- **Daemon retains:** the final formal `gh pr review --approve` (posted from the merge
-  account) and `gh pr merge`. Reviewer-owned APPROVE and merge remain forbidden.
+- **Daemon retains:** the final formal approved-verdict review and `gh pr merge`.
+  Two-identity mode posts `gh pr review --approve` from the merge account; one-identity
+  mode posts a `COMMENT` review carrying the approved verdict and head-bound dedupe marker
+  instead, because GitHub refuses a self-approval. Reviewer-owned APPROVE and merge remain
+  forbidden either way.
 - **Daemon writes** the formal REQUEST_CHANGES review from the merge account when a
-  reviewer signals `changes`. This is lifecycle authority, not the findings ledger;
-  the reviewer's inline and summary comments remain the source of truth.
+  reviewer signals `changes`; in one-identity mode it writes a `COMMENT` review carrying the
+  changes verdict and dedupe marker instead, because GitHub refuses `--request-changes` on
+  your own PR. Either way this is lifecycle authority, not the findings ledger; the
+  reviewer's inline and summary comments remain the source of truth, and the marker's only
+  job is suppressing a duplicate comment on retry — it is never treated as an approval.
 
 **Iterative verdict-context contract.** Any bounded Quorum loop in which one role produces an
 artifact and another role reviews it preserves three distinct things across every permitted
@@ -1684,6 +1728,25 @@ provisioning and merge.
   clear only stale runtime ownership, and retry remediation on the existing PR branch.
   Provisioning exhaustion parks loudly in `failed` with a `rework` resume marker; it never
   degrades to a generic `open` task or a fresh implementation prompt.
+- **Pre-review conflict.** GitHub runs no `pull_request` workflows on a conflicting PR,
+  so its rollup stays empty and every required job reads `absent`. Before the gate starts
+  or evaluates a wait, the shared per-PR mergeability read (same `pre_review_external_poll_due`
+  cadence, one `gh pr view --json mergeStateStatus,state,headRefOid` call) is checked: only
+  `DIRTY` reported for exactly the recorded head (the `pr_targets` publication baseline,
+  else the head the gate tracks) is a conflict. `UNKNOWN`, `BLOCKED`, `BEHIND`, `UNSTABLE`,
+  a failed read (fail-open `Mergeable`), and a `DIRTY` report for any other head keep the
+  normal gate. On a conflict an implementation task fires `MergeConflict` from `in-review`
+  with the merge-time `merge_base_remediation_message` feedback for its effective target
+  branch, persisted as the same durable remediation intent as `ChecksFailed` (check label
+  `merge-conflict`), so restart provisions exactly one remediation worker. A review-only
+  task is not reworked: it is marked with the daemon-owned refs key
+  `pre_review_merge_blocked` (the body, its review contract, is untouched) and resumes the
+  normal gate once the PR is no longer conflicting (no approval exists to re-fire). While
+  blocked, each mergeability read stamps the shared cadence, so a blocked task makes at
+  most one GitHub read per `merge_checks_poll_secs` window. A
+  `no_rework` task closes `done` with `review_outcome=merge_conflict`. As defense in depth,
+  a gate failure whose required jobs are all `absent` re-reads head-bound mergeability once
+  and routes a `DIRTY` exact head to the conflict path instead of CI feedback.
 - Gate state is optimization-only memory. On shutdown it is dropped without mutating the
   task; restart finds the durable `in-review` task and polls again. Stateful lifecycle work
   is never raced inside `select!`.

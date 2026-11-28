@@ -814,11 +814,16 @@ mod tests {
         fixture: &LoopFixture,
         trigger: impl FnOnce(&LoopFixture),
     ) -> (quorum_core::error::Result<i32>, i32) {
-        let exit_loop = super::super::tick_loop(
-            &fixture.config,
-            std::process::id() as i64,
-            fixture.instance.clone(),
-            super::super::planner::WritablePathResolver::default(),
+        // A short lock heartbeat lets lock theft be observed promptly
+        // instead of after the production 10s interval.
+        let exit_loop = super::super::with_test_lock_heartbeat(
+            Duration::from_millis(200),
+            super::super::tick_loop(
+                &fixture.config,
+                std::process::id() as i64,
+                fixture.instance.clone(),
+                super::super::planner::WritablePathResolver::default(),
+            ),
         );
         let driver = async {
             let row = wait_for_doctor_row(&fixture.config.db_path).await;

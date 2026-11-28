@@ -5596,11 +5596,16 @@ esac
                 let result = rt.block_on(async {
                     let (config, instance) = matrix_config(&root);
                     std::fs::write(root.join("ready"), "").unwrap();
-                    super::super::tick_loop(
-                        &config,
-                        std::process::id() as i64,
-                        instance,
-                        super::super::planner::WritablePathResolver::default(),
+                    // A short lock heartbeat lets lock theft be observed
+                    // promptly instead of after the production 10s interval.
+                    super::super::with_test_lock_heartbeat(
+                        Duration::from_millis(200),
+                        super::super::tick_loop(
+                            &config,
+                            std::process::id() as i64,
+                            instance,
+                            super::super::planner::WritablePathResolver::default(),
+                        ),
                     )
                     .await
                 });

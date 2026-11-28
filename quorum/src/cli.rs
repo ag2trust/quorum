@@ -520,7 +520,10 @@ pub enum Command {
         #[arg(long)]
         agent_bin: Option<String>,
         /// Path to a file containing a GitHub token for merging PRs.
-        /// Read at merge time; never passed to agent processes.
+        /// Read at merge time; never passed to agent processes. Without it, the daemon
+        /// runs in one-identity mode: it merges using its own publishing identity and
+        /// cannot formally approve its own PR, so branch protection that requires an
+        /// approving review from someone other than the author then needs a person.
         #[arg(long)]
         merge_token_file: Option<String>,
         /// Override the merge command (for testing). Replaces `{pr}` with the PR number.
