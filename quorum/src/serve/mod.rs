@@ -4508,16 +4508,27 @@ fn resolve_reviewer_recovery(
     // A task can retain an older turn-oriented reviewer continuation while a
     // later persistent-child reviewer is interrupted. Provider tagging keeps
     // stale refs from selecting the wrong adapter's resume path.
-    let continuation_id = (kind.turn_mode() == runner::TurnMode::RespawnPerTurn)
-        .then(|| {
-            task_refs
-                .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
-                .and_then(|refs| {
-                    runner_state::continuation(&refs, reviewer_continuation_slot(is_r2), provider)
-                })
-                .map(|identity| identity.id)
-        })
-        .flatten();
+    // An external reviewer has no `runner_continuation*` ref; its
+    // continuation is its slot name, and the slot's session record decides
+    // resume or fresh start at launch (spec "Session record").
+    let continuation_id = if kind == runner::AgentKind::External {
+        external_slot_continuation(kind, reviewer_continuation_slot(is_r2))
+    } else {
+        (kind.turn_mode() == runner::TurnMode::RespawnPerTurn)
+            .then(|| {
+                task_refs
+                    .and_then(|refs| serde_json::from_str::<serde_json::Value>(refs).ok())
+                    .and_then(|refs| {
+                        runner_state::continuation(
+                            &refs,
+                            reviewer_continuation_slot(is_r2),
+                            provider,
+                        )
+                    })
+                    .map(|identity| identity.id)
+            })
+            .flatten()
+    };
     if kind.turn_mode() == runner::TurnMode::RespawnPerTurn && continuation_id.is_none() {
         // A turn-oriented reviewer can only be resumed through its exact
         // provider-issued continuation. Without one the run is unrecoverable,
@@ -22393,11 +22404,16 @@ const EXTERNAL_WORKER_SLOT: ContinuationSlot = ContinuationSlot::Worker;
 /// name as `continuation_id`. The external runner has no provider
 /// continuation, so this never reaches the adapter (`runner_continuation_id`).
 fn external_worker_continuation(kind: runner::AgentKind) -> Option<String> {
-    (kind == runner::AgentKind::External).then(|| EXTERNAL_WORKER_SLOT.slot_name().to_string())
+    external_slot_continuation(kind, EXTERNAL_WORKER_SLOT)
 }
 
-/// Spec "Resume or fresh start", condition 4, for one worker run. Owned so it
-/// can cross into the blocking session-store work.
+/// [`external_worker_continuation`] for any slot.
+fn external_slot_continuation(kind: runner::AgentKind, slot: ContinuationSlot) -> Option<String> {
+    (kind == runner::AgentKind::External).then(|| slot.slot_name().to_string())
+}
+
+/// Spec "Resume or fresh start", condition 4, for one slot run (worker or
+/// reviewer). Owned so it can cross into the blocking session-store work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WorkerRunForm {
     AnsweredResume {
@@ -22407,6 +22423,8 @@ enum WorkerRunForm {
     UnansweredResume,
     Rework(String),
     ReviewRemediation(String),
+    /// A reviewer slot continuing an interrupted review (reviewer slots only).
+    ReviewerContinuation(String),
     ProviderRetry(String),
     RebuiltDormantTurn(String),
     /// Every other run (first run, task reopened after failure, ...).
@@ -22421,6 +22439,7 @@ impl WorkerRunForm {
             Self::UnansweredResume => K::UnansweredResume,
             Self::Rework(turn_text) => K::Rework { turn_text },
             Self::ReviewRemediation(turn_text) => K::ReviewRemediation { turn_text },
+            Self::ReviewerContinuation(turn_text) => K::ReviewerContinuation { turn_text },
             Self::ProviderRetry(turn_text) => K::ProviderRetry { turn_text },
             Self::RebuiltDormantTurn(turn_text) => K::RebuiltDormantTurn { turn_text },
             Self::Other => K::Other,
@@ -22501,7 +22520,7 @@ impl ExternalWorkerSession {
 fn session_launch_failure(detail: impl std::fmt::Display) -> runner::RunnerFailure {
     runner::RunnerFailure::classified(
         runner::FailureDisposition::NonFailover,
-        format!("worker session launch refused: {detail}"),
+        format!("slot session launch refused: {detail}"),
         std::io::ErrorKind::Other,
     )
 }
@@ -22562,21 +22581,31 @@ fn load_task_refs_value(conn: &rusqlite::Connection, task_id: i64) -> Result<ser
         .unwrap_or_else(|| serde_json::json!({})))
 }
 
-/// Spec "Session record": write the worker slot's entry for the external
-/// run about to launch and remove the worker `runner_continuation*` refs, in
-/// one write transaction. The entry is written only through
-/// `runner_state::set_external_session`.
-fn record_external_worker_launch(
+/// The session directory a slot's external runs use (spec "Layout").
+fn session_store_slot(slot: ContinuationSlot) -> session_store::Slot {
+    match slot {
+        ContinuationSlot::Worker => session_store::Slot::Worker,
+        ContinuationSlot::ReviewerR1 => session_store::Slot::ReviewerR1,
+        ContinuationSlot::ReviewerR2 => session_store::Slot::ReviewerR2,
+    }
+}
+
+/// Spec "Session record": write `slot`'s entry for the external run about to
+/// launch and remove that slot's `runner_continuation*` refs, in one write
+/// transaction. Other slots' entries and refs are untouched. The entry is
+/// written only through `runner_state::set_external_session`.
+fn record_external_slot_launch(
     conn: &mut rusqlite::Connection,
     task_id: i64,
+    slot: ContinuationSlot,
     profile_id: &str,
     fingerprint: &str,
 ) -> Result<()> {
     let tx = quorum_core::db::begin_immediate(conn)?;
     edit_task_refs_tx(&tx, task_id, |refs| {
         let before = refs.clone();
-        runner_state::set_external_session(refs, EXTERNAL_WORKER_SLOT, profile_id, fingerprint);
-        runner_state::remove_slot_continuation(refs, EXTERNAL_WORKER_SLOT);
+        runner_state::set_external_session(refs, slot, profile_id, fingerprint);
+        runner_state::remove_slot_continuation(refs, slot);
         *refs != before
     })?;
     tx.commit()?;
@@ -22585,8 +22614,8 @@ fn record_external_worker_launch(
 
 /// Resolve resume-or-fresh for one external worker run (spec "Resume or
 /// fresh start"), remove the session file on a fresh start, and write the
-/// session record. Blocking: filesystem and short DB work only, no
-/// transaction is held across the filesystem steps.
+/// session record.
+#[cfg(test)]
 fn prepare_external_worker_session_sync(
     db_path: &Path,
     session_base: &Path,
@@ -22595,13 +22624,37 @@ fn prepare_external_worker_session_sync(
     profile_id: &str,
     run: &WorkerRunForm,
 ) -> std::result::Result<ExternalWorkerSession, runner::RunnerFailure> {
+    prepare_external_slot_session_sync(
+        db_path,
+        session_base,
+        spec,
+        task_id,
+        EXTERNAL_WORKER_SLOT,
+        profile_id,
+        run,
+    )
+}
+
+/// Resolve resume-or-fresh for one external run on `slot` (spec "Resume or
+/// fresh start"), remove the slot's session file on a fresh start, and write
+/// the slot's session record. Blocking: filesystem and short DB work only, no
+/// transaction is held across the filesystem steps.
+fn prepare_external_slot_session_sync(
+    db_path: &Path,
+    session_base: &Path,
+    spec: &crate::external_runner_spec::ExternalSpec,
+    task_id: i64,
+    slot: ContinuationSlot,
+    profile_id: &str,
+    run: &WorkerRunForm,
+) -> std::result::Result<ExternalWorkerSession, runner::RunnerFailure> {
     let sessions_enabled = spec.args_session.is_some();
     let mut conn = quorum_core::db::open(db_path).map_err(session_launch_failure)?;
     let refs = load_task_refs_value(&conn, task_id).map_err(session_launch_failure)?;
-    let entry = runner_state::external_session(&refs, EXTERNAL_WORKER_SLOT);
+    let entry = runner_state::external_session(&refs, slot);
     let slot_dir = if sessions_enabled {
         Some(
-            session_store::open_slot(session_base, task_id, session_store::Slot::Worker)
+            session_store::open_slot(session_base, task_id, session_store_slot(slot))
                 .map_err(session_launch_failure)?,
         )
     } else {
@@ -22614,7 +22667,7 @@ fn prepare_external_worker_session_sync(
     let run_kind = run.as_run_kind();
     let decision = runner_state::resume_decision(&runner_state::ResumeInputs {
         sessions_enabled,
-        slot: Some(EXTERNAL_WORKER_SLOT),
+        slot: Some(slot),
         entry: entry.as_ref(),
         routed_profile: profile_id,
         fingerprint: &spec.fingerprint,
@@ -22630,7 +22683,7 @@ fn prepare_external_worker_session_sync(
             None
         }
     };
-    record_external_worker_launch(&mut conn, task_id, profile_id, &spec.fingerprint)
+    record_external_slot_launch(&mut conn, task_id, slot, profile_id, &spec.fingerprint)
         .map_err(session_launch_failure)?;
     Ok(ExternalWorkerSession {
         resumed_prompt,
@@ -22644,6 +22697,16 @@ async fn prepare_external_worker_session(
     profile_id: &str,
     run: WorkerRunForm,
 ) -> std::result::Result<ExternalWorkerSession, runner::RunnerFailure> {
+    prepare_external_slot_session(config, task_id, EXTERNAL_WORKER_SLOT, profile_id, run).await
+}
+
+async fn prepare_external_slot_session(
+    config: &ServeConfig,
+    task_id: i64,
+    slot: ContinuationSlot,
+    profile_id: &str,
+    run: WorkerRunForm,
+) -> std::result::Result<ExternalWorkerSession, runner::RunnerFailure> {
     let spec = config
         .external_runner
         .clone()
@@ -22652,45 +22715,65 @@ async fn prepare_external_worker_session(
     let base = session_base(config);
     let profile_id = profile_id.to_string();
     let session = tokio::task::spawn_blocking(move || {
-        prepare_external_worker_session_sync(&db_path, &base, &spec, task_id, &profile_id, &run)
+        prepare_external_slot_session_sync(&db_path, &base, &spec, task_id, slot, &profile_id, &run)
     })
     .await
     .map_err(|join| session_launch_failure(format!("session preparation join: {join}")))??;
     log(&format!(
-        "task #{task_id}: external worker {} (slot worker)",
+        "task #{task_id}: external {} {} (slot {})",
+        if slot == ContinuationSlot::Worker {
+            "worker"
+        } else {
+            "reviewer"
+        },
         if session.resumed_prompt.is_some() {
             "resumes its session"
         } else {
             "starts fresh"
-        }
+        },
+        slot.slot_name(),
     ));
     Ok(session)
 }
 
 /// Spec "Session record" > "Runner change": a worker launching on a built-in
 /// runner removes the worker slot's external entry and unlinks its session
-/// file. A task with no entry is untouched (no filesystem access), so a daemon
-/// that never ran the external runner behaves exactly as before.
+/// file.
+#[cfg(test)]
 fn discard_external_worker_session_sync(
     db_path: &Path,
     session_base: &Path,
     task_id: i64,
 ) -> std::result::Result<(), runner::RunnerFailure> {
+    discard_external_slot_session_sync(db_path, session_base, task_id, EXTERNAL_WORKER_SLOT)
+}
+
+/// Spec "Session record" > "Runner change": a run of `slot` launching on a
+/// built-in runner removes that slot's external entry and unlinks its session
+/// file. A slot with no entry is untouched (no filesystem access), so a daemon
+/// that never ran the external runner behaves exactly as before. Other slots'
+/// entries and files are never touched.
+fn discard_external_slot_session_sync(
+    db_path: &Path,
+    session_base: &Path,
+    task_id: i64,
+    slot: ContinuationSlot,
+) -> std::result::Result<(), runner::RunnerFailure> {
     let mut conn = quorum_core::db::open(db_path).map_err(session_launch_failure)?;
     let refs = load_task_refs_value(&conn, task_id).map_err(session_launch_failure)?;
     let has_entry = refs
         .get(runner_state::EXTERNAL_SESSIONS_REF)
-        .and_then(|sessions| sessions.get(EXTERNAL_WORKER_SLOT.slot_name()))
+        .and_then(|sessions| sessions.get(slot.slot_name()))
         .is_some();
     if !has_entry {
         return Ok(());
     }
-    session_store::open_slot(session_base, task_id, session_store::Slot::Worker)
+    session_store::open_slot(session_base, task_id, session_store_slot(slot))
         .and_then(|dir| dir.remove_session_file())
         .map_err(session_launch_failure)?;
     let tx = quorum_core::db::begin_immediate(&mut conn).map_err(session_launch_failure)?;
     edit_task_refs_tx(&tx, task_id, |refs| {
-        runner_state::remove_external_session(refs, EXTERNAL_WORKER_SLOT);
+        runner_state::remove_external_session(refs, slot);
         true
     })
     .map_err(session_launch_failure)?;
@@ -22702,18 +22785,46 @@ async fn discard_external_worker_session(
     config: &ServeConfig,
     task_id: i64,
 ) -> std::result::Result<(), runner::RunnerFailure> {
+    discard_external_slot_session(config, task_id, EXTERNAL_WORKER_SLOT).await
+}
+
+async fn discard_external_slot_session(
+    config: &ServeConfig,
+    task_id: i64,
+    slot: ContinuationSlot,
+) -> std::result::Result<(), runner::RunnerFailure> {
     let db_path = config.db_path.clone();
     let base = session_base(config);
     tokio::task::spawn_blocking(move || {
-        discard_external_worker_session_sync(&db_path, &base, task_id)
+        discard_external_slot_session_sync(&db_path, &base, task_id, slot)
     })
     .await
     .map_err(|join| session_launch_failure(format!("session discard join: {join}")))?
 }
 
-/// Runner-change rules and resume-or-fresh for a worker launch of `kind`.
+/// Runner-change rules and resume-or-fresh for a launch of `kind` on `slot`.
 /// External: returns the prepared session. Built-in: discards any external
-/// session and returns `None`.
+/// session of that slot and returns `None`.
+async fn prepare_slot_session(
+    config: &ServeConfig,
+    kind: runner::AgentKind,
+    task_id: i64,
+    slot: ContinuationSlot,
+    profile_id: &str,
+    run: WorkerRunForm,
+) -> std::result::Result<Option<ExternalWorkerSession>, runner::RunnerFailure> {
+    if kind == runner::AgentKind::External {
+        prepare_external_slot_session(config, task_id, slot, profile_id, run)
+            .await
+            .map(Some)
+    } else {
+        discard_external_slot_session(config, task_id, slot)
+            .await
+            .map(|()| None)
+    }
+}
+
+/// [`prepare_slot_session`] for the worker slot.
 async fn prepare_worker_slot_session(
     config: &ServeConfig,
     kind: runner::AgentKind,
@@ -22721,15 +22832,7 @@ async fn prepare_worker_slot_session(
     profile_id: &str,
     run: WorkerRunForm,
 ) -> std::result::Result<Option<ExternalWorkerSession>, runner::RunnerFailure> {
-    if kind == runner::AgentKind::External {
-        prepare_external_worker_session(config, task_id, profile_id, run)
-            .await
-            .map(Some)
-    } else {
-        discard_external_worker_session(config, task_id)
-            .await
-            .map(|()| None)
-    }
+    prepare_slot_session(config, kind, task_id, EXTERNAL_WORKER_SLOT, profile_id, run).await
 }
 
 /// The full worker role prompt (task notes included) for a fresh external
@@ -22772,6 +22875,16 @@ async fn fresh_external_worker_prompt(
 /// external worker run, resumed or fresh: a silent fresh run has no
 /// conversation worth resuming either.
 async fn mark_silent_external_worker_session(db_path: &Path, slot: &SlotState) {
+    mark_silent_external_slot_session(db_path, slot, EXTERNAL_WORKER_SLOT).await;
+}
+
+/// [`mark_silent_external_worker_session`] for any slot: only `session_slot`'s
+/// entry is marked.
+async fn mark_silent_external_slot_session(
+    db_path: &Path,
+    slot: &SlotState,
+    session_slot: ContinuationSlot,
+) {
     if slot.external_saw_protocol_line() != Some(false) {
         return;
     }
@@ -22781,21 +22894,21 @@ async fn mark_silent_external_worker_session(db_path: &Path, slot: &SlotState) {
         let mut conn = quorum_core::db::open(&path)?;
         let tx = quorum_core::db::begin_immediate(&mut conn)?;
         edit_task_refs_tx(&tx, task_id, |refs| {
-            runner_state::external_session(refs, EXTERNAL_WORKER_SLOT)
-                .is_some_and(|entry| entry.usable)
-                && runner_state::mark_external_session_unusable(refs, EXTERNAL_WORKER_SLOT)
+            runner_state::external_session(refs, session_slot).is_some_and(|entry| entry.usable)
+                && runner_state::mark_external_session_unusable(refs, session_slot)
         })?;
         tx.commit()?;
         Ok(())
     })
     .await;
+    let name = session_slot.slot_name();
     match result {
         Ok(Ok(())) => {}
         Ok(Err(error)) => log(&format!(
-            "task #{task_id}: marking the external worker session unusable failed: {error}"
+            "task #{task_id}: marking the external {name} session unusable failed: {error}"
         )),
         Err(error) => log(&format!(
-            "task #{task_id}: external worker session marking join failed: {error}"
+            "task #{task_id}: external {name} session marking join failed: {error}"
         )),
     }
 }
@@ -26188,9 +26301,13 @@ async fn provision_reviewer_reserved(
     let reviewer_effort = assignment.effort.clone();
     let reviewer_kind = resolve_recorded_provider(&assignment.runner, &reviewer_model)?;
     let reviewer_runner = resolve_profile_runner(&assignment.runner)?;
+    let reviewer_slot = reviewer_continuation_slot(role.is_r2());
+    // An external reviewer records its slot name as its continuation (spec
+    // "Session record" > "Journal"); built-in runs keep their recovery identity.
     let reviewer_continuation_id = recovery
         .as_ref()
-        .and_then(|recovery| recovery.continuation_id.clone());
+        .and_then(|recovery| recovery.continuation_id.clone())
+        .or_else(|| external_slot_continuation(reviewer_kind, reviewer_slot));
     if let Some(recovery) = &recovery {
         if recovery.assignment_id != Some(assignment.id)
             || recovery.model != reviewer_model
@@ -26908,14 +27025,51 @@ async fn provision_reviewer_reserved(
             ));
         }
     }
-    let reviewer_env = managed_run_environment(config, &reviewer_name, Some(cap_run_id.as_str()));
+    let mut reviewer_env =
+        managed_run_environment(config, &reviewer_name, Some(cap_run_id.as_str()));
     let reviewer_agent_bin = agent_bin_for_kind(config, reviewer_kind);
     let continuation_id = runner_continuation_id(
         reviewer_kind,
         &session_id,
         reviewer_continuation_id.as_deref(),
     );
-    let spawn_result = if skip_cooling_assignment {
+    // Spec "Session record", "Resume or fresh start", and "Roles": apply the
+    // runner-change rules to this reviewer's own slot and, for an external
+    // run, choose resume (restart recovery of an interrupted review is the
+    // reviewer continuation) or fresh start before any process exists.
+    // Failures are `NonFailover` and settle through the failed-spawn path.
+    let mut launch_prompt: Option<String> = None;
+    let slot_session: std::result::Result<(), runner::RunnerFailure> = if skip_cooling_assignment {
+        Ok(())
+    } else {
+        let run = if recovery.is_some() {
+            WorkerRunForm::ReviewerContinuation(prompt.clone())
+        } else {
+            WorkerRunForm::Other
+        };
+        match prepare_slot_session(
+            config,
+            reviewer_kind,
+            worker.task_id,
+            reviewer_slot,
+            &assignment.profile_id,
+            run,
+        )
+        .await
+        {
+            Ok(Some(session)) => {
+                reviewer_env = session.environment(&reviewer_env);
+                // A fresh start sends the full review prompt.
+                launch_prompt = session.resumed_prompt;
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(failure) => Err(failure),
+        }
+    };
+    let spawn_result = if let Err(failure) = slot_session {
+        Err(failure)
+    } else if skip_cooling_assignment {
         // No provider call: the cooling profile is retired as a classified
         // profile-unavailable launch, which hands this exact persisted run to
         // `activate_reviewer_fallback` for the alternate route.
@@ -26927,7 +27081,7 @@ async fn provision_reviewer_reserved(
                 model: &reviewer_model,
                 effort: &reviewer_effort,
                 worktree: &wt_path,
-                prompt: &prompt,
+                prompt: launch_prompt.as_deref().unwrap_or(&prompt),
                 environment: &reviewer_env,
                 mode: runner::LaunchMode::Normal,
                 continuation_id,
@@ -30900,6 +31054,30 @@ async fn activate_reviewer_fallback(
         ))
         .await;
     }
+    // Spec "Session record" > "Runner change": a reviewer failing over onto a
+    // built-in runner drops its own slot's external session first. The
+    // external runner is never a fallback alternate (`routed_provider_executable`).
+    if alternate_kind != runner::AgentKind::External {
+        if let Err(error) = discard_external_slot_session(
+            config,
+            slot.task_id,
+            reviewer_continuation_slot(slot.r2_origin),
+        )
+        .await
+        {
+            let reason = format!("reviewer fallback launch failed: {error}");
+            return settle_failed_reviewer_fallback(
+                config,
+                slot,
+                &intent.capability_run_id,
+                &session_id,
+                &intent.worktree,
+                &intent.pending_turn.provider,
+                &reason,
+            )
+            .await;
+        }
+    }
     let environment = managed_run_environment(
         config,
         &slot.agent_name,
@@ -33061,6 +33239,14 @@ async fn teardown_reviewer_with_terminal_action(
     end_reason: &str,
     terminal_action: Option<TerminalUsageAction>,
 ) -> Option<serde_json::Value> {
+    // Every end of a reviewer run passes here while its process is still
+    // observable: a silent external run leaves its slot no resumable session.
+    mark_silent_external_slot_session(
+        &config.db_path,
+        &state,
+        reviewer_continuation_slot(state.r2_origin),
+    )
+    .await;
     let mut usage = managed_usage_record(&state, "reviewer");
     log(&format!("tearing down reviewer {}", state.agent_name));
 
@@ -79080,6 +79266,452 @@ exec /bin/cat '{stdout}'
         assert_eq!(entry.profile, "x-ext");
         for worker in workers.drain(..) {
             worker.kill_and_reap().await;
+        }
+    }
+
+    // ── External reviewer slot sessions (spec "Session record", "Resume or
+    // fresh start", "Roles": R1 uses `reviewer-r1`, R2 uses `reviewer-r2`) ──
+
+    /// The PR head every session reviewer reviews; publication lookups fail
+    /// before any `gh` child, so the reviewer provisions from `main`.
+    #[cfg(unix)]
+    struct SessionReviewExecutor(String);
+
+    #[cfg(unix)]
+    impl merge::MergeExecutor for SessionReviewExecutor {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: true,
+                message: String::new(),
+                failure_kind: None,
+            }
+        }
+
+        fn head_sha(&self, _pr: i64, _repo_dir: &Path) -> Option<String> {
+            Some(self.0.clone())
+        }
+
+        fn publication_credentials(&self) -> Arc<dyn GithubCredentialSource> {
+            Arc::new(crate::github_credentials::FakeCredentialSource::failing(
+                crate::github_credentials::GithubCredentialError::LookupFailed {
+                    reason: "no publication identity in this fixture".into(),
+                },
+            ))
+        }
+    }
+
+    const SESSION_REVIEW_PR: i64 = 77;
+
+    impl SessionHarness {
+        fn reviewer_slot_dir(&self, slot: ContinuationSlot) -> PathBuf {
+            self.config
+                .session_base
+                .join(self.task_id.to_string())
+                .join(slot.slot_name())
+        }
+
+        fn reviewer_session_file(&self, slot: ContinuationSlot) -> PathBuf {
+            self.reviewer_slot_dir(slot).join("session")
+        }
+
+        fn entry(&self, slot: ContinuationSlot) -> Option<runner_state::ExternalSessionEntry> {
+            runner_state::external_session(&self.refs(), slot)
+        }
+
+        /// Seed `slot`'s resumable entry and session file.
+        fn seed_slot_resumable(&self, slot: ContinuationSlot, contents: &[u8]) {
+            let fingerprint = self.spec().fingerprint.clone();
+            self.edit_refs(|refs| {
+                runner_state::set_external_session(refs, slot, "x-ext", &fingerprint);
+            });
+            session_store::open_slot(
+                &self.config.session_base,
+                self.task_id,
+                session_store_slot(slot),
+            )
+            .unwrap();
+            std::fs::write(self.reviewer_session_file(slot), contents).unwrap();
+        }
+    }
+
+    /// A session harness whose task is in review on PR 77 at `main`'s head.
+    #[cfg(unix)]
+    fn session_review_harness(scenario: &str) -> SessionHarness {
+        let mut h = session_harness(scenario, true);
+        let head = launch_test_git(&h.config.repo_dir, &["rev-parse", "main"])
+            .trim()
+            .to_string();
+        h.config.merge_executor = Arc::new(SessionReviewExecutor(head));
+        let mut conn = quorum_core::db::open(&h.config.db_path).unwrap();
+        let now = now_unix();
+        tasks::claim(&mut conn, "Author", Some(h.task_id), &[], 3600, now - 2)
+            .unwrap()
+            .unwrap();
+        tasks::apply_event(
+            &mut conn,
+            "Author",
+            h.task_id,
+            &Event::SignaledDone {
+                pr: SESSION_REVIEW_PR.to_string(),
+            },
+            now - 1,
+        )
+        .unwrap();
+        h
+    }
+
+    /// Provision one reviewer through the production path and wait for its
+    /// fake CLI to exit. `recover` is daemon-restart recovery of the slot's
+    /// interrupted review (the reviewer continuation).
+    #[cfg(unix)]
+    async fn provision_session_reviewer(
+        h: &SessionHarness,
+        role: &ReviewRole,
+        recover: bool,
+    ) -> SlotState {
+        let head = h
+            .config
+            .merge_executor
+            .head_sha(SESSION_REVIEW_PR, &h.config.repo_dir)
+            .unwrap();
+        let wt_mgr = WorktreeManager::new();
+        let mut names = Pool::new_generated();
+        let mut reviewers = Vec::new();
+        let outcome = provision_reviewer(
+            &h.config,
+            &wt_mgr,
+            &mut names,
+            &mut reviewers,
+            &mut LifetimeRoster::new(),
+            &mut UnrecordableStrikes::new(),
+            &mut ReviewerRespawnBackoff::new(),
+            &mut ProfileCooldown::new(),
+            SESSION_REVIEW_PR,
+            ReviewCounterpart {
+                agent_name: "Author",
+                task_id: h.task_id,
+                branch: "main",
+            },
+            role,
+            &head,
+            recover,
+            if role.is_r2() {
+                ReviewerSlotClaim::InheritR1
+            } else {
+                ReviewerSlotClaim::Fresh
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, ReviewerProvisionOutcome::Attached),
+            "{outcome:?}"
+        );
+        let mut slot = reviewers.pop().unwrap();
+        wait_for_worker_exit(&mut slot).await;
+        slot
+    }
+
+    /// End a reviewer process as a daemon restart would: the run stays open
+    /// (interrupted) and startup cleanup has removed its worktree and branch.
+    #[cfg(unix)]
+    async fn interrupt_session_reviewer(h: &SessionHarness, slot: SlotState) {
+        let (worktree, branch) = (slot.worktree_path.clone(), slot.branch.clone());
+        slot.kill_and_reap().await;
+        launch_test_git(
+            &h.config.repo_dir,
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+        );
+        launch_test_git(&h.config.repo_dir, &["branch", "-D", &branch]);
+    }
+
+    fn session_r2_role(r1: &SlotState) -> ReviewRole {
+        ReviewRole::R2 {
+            r1_reviewer: r1.agent_name.clone(),
+            r1_run_id: r1.agent_run_id,
+        }
+    }
+
+    /// R1 and R2 each launch fresh in their own slot directory, write only
+    /// their own entry, remove only their own `runner_continuation*` refs,
+    /// and never read or alter the worker slot's file or entry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_r1_and_r2_use_isolated_slot_sessions() {
+        let h = session_review_harness("success");
+        h.seed_resumable();
+        let worker_before = h.worker_entry().unwrap();
+        h.edit_refs(|refs| {
+            for slot in [ContinuationSlot::ReviewerR1, ContinuationSlot::ReviewerR2] {
+                runner_state::set_continuation(
+                    refs,
+                    slot,
+                    &ContinuationIdentity {
+                        provider: "codex".into(),
+                        id: format!("thread-{}", slot.slot_name()),
+                    },
+                );
+            }
+            refs["codex_reviewer_r1_thread_id"] = "thread-legacy-r1".into();
+            runner_state::set_continuation(
+                refs,
+                ContinuationSlot::Worker,
+                &ContinuationIdentity {
+                    provider: "codex".into(),
+                    id: "thread-worker".into(),
+                },
+            );
+        });
+
+        let r1 = provision_session_reviewer(&h, &ReviewRole::R1, false).await;
+        assert_eq!(r1.process_kind(), runner::AgentKind::External);
+        assert_eq!(h.runs(), 1);
+        assert_eq!(h.observed(1, "session"), "absent");
+        assert_eq!(
+            h.observed(1, "dir"),
+            h.reviewer_slot_dir(ContinuationSlot::ReviewerR1)
+                .to_str()
+                .unwrap()
+        );
+        assert_eq!(h.observed(1, "prompt"), r1.pending_prompt);
+        assert_eq!(
+            std::fs::read(h.reviewer_session_file(ContinuationSlot::ReviewerR1)).unwrap(),
+            b"turn 1\n"
+        );
+        let refs = h.refs();
+        assert!(
+            refs.get(runner_state::REVIEWER_R1_CONTINUATION_REF)
+                .is_none(),
+            "{refs}"
+        );
+        assert!(refs.get("codex_reviewer_r1_thread_id").is_none(), "{refs}");
+        assert_eq!(
+            refs[runner_state::REVIEWER_R2_CONTINUATION_REF]["id"],
+            "thread-reviewer-r2"
+        );
+        assert_eq!(refs[runner_state::CONTINUATION_REF]["id"], "thread-worker");
+        let r1_entry = h.entry(ContinuationSlot::ReviewerR1).unwrap();
+        assert_eq!(
+            (r1_entry.profile.as_str(), r1_entry.usable),
+            ("x-ext", true)
+        );
+        assert_eq!(r1_entry.fingerprint, h.spec().fingerprint);
+        assert!(h.entry(ContinuationSlot::ReviewerR2).is_none());
+        assert_eq!(
+            h.journal_provider_and_continuation(&r1.agent_name),
+            ("external".into(), Some("reviewer-r1".into()))
+        );
+        assert_eq!(r1.continuation_id.as_deref(), Some("reviewer-r1"));
+
+        let r2_role = session_r2_role(&r1);
+        r1.kill_and_reap().await;
+        let r2 = provision_session_reviewer(&h, &r2_role, false).await;
+        assert_eq!(h.runs(), 2);
+        assert_eq!(h.observed(2, "session"), "absent");
+        assert_eq!(
+            h.observed(2, "dir"),
+            h.reviewer_slot_dir(ContinuationSlot::ReviewerR2)
+                .to_str()
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(h.reviewer_session_file(ContinuationSlot::ReviewerR2)).unwrap(),
+            b"turn 2\n"
+        );
+        assert!(h
+            .refs()
+            .get(runner_state::REVIEWER_R2_CONTINUATION_REF)
+            .is_none());
+        assert!(h.entry(ContinuationSlot::ReviewerR2).unwrap().usable);
+        assert_eq!(
+            h.journal_provider_and_continuation(&r2.agent_name),
+            ("external".into(), Some("reviewer-r2".into()))
+        );
+        // Neither reviewer touched the other's slot or the worker's.
+        assert_eq!(
+            std::fs::read(h.reviewer_session_file(ContinuationSlot::ReviewerR1)).unwrap(),
+            b"turn 1\n"
+        );
+        assert_eq!(h.entry(ContinuationSlot::ReviewerR1), Some(r1_entry));
+        assert_eq!(std::fs::read(h.session_file()).unwrap(), b"conversation\n");
+        assert_eq!(h.worker_entry(), Some(worker_before));
+        assert_eq!(
+            h.refs()[runner_state::CONTINUATION_REF]["id"],
+            "thread-worker"
+        );
+        r2.kill_and_reap().await;
+    }
+
+    /// Restart recovery of an interrupted external review is the reviewer
+    /// continuation: it resumes the slot's session with the review turn text.
+    /// A later ordinary provision of the same slot starts fresh and removes
+    /// the stale session file first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_reviewer_continuation_resumes_and_other_runs_start_fresh() {
+        for (slot, r2) in [
+            (ContinuationSlot::ReviewerR1, false),
+            (ContinuationSlot::ReviewerR2, true),
+        ] {
+            let h = session_review_harness("success");
+            let r1 = provision_session_reviewer(&h, &ReviewRole::R1, false).await;
+            let role = if r2 {
+                session_r2_role(&r1)
+            } else {
+                ReviewRole::R1
+            };
+            let base = h.runs();
+            let first = if r2 {
+                r1.kill_and_reap().await;
+                let first = provision_session_reviewer(&h, &role, false).await;
+                interrupt_session_reviewer(&h, first).await;
+                h.runs()
+            } else {
+                interrupt_session_reviewer(&h, r1).await;
+                base
+            };
+            let first_prompt = h.observed(first, "prompt");
+            let size_before = std::fs::metadata(h.reviewer_session_file(slot))
+                .unwrap()
+                .len();
+
+            // The run stays open (interrupted); a restarted daemon recovers it.
+            let recovered = provision_session_reviewer(&h, &role, true).await;
+            let n = h.runs();
+            assert_eq!(n, first + 1, "{slot:?}");
+            assert_eq!(
+                h.observed(n, "session"),
+                size_before.to_string(),
+                "{slot:?}"
+            );
+            assert_eq!(h.observed(n, "prompt"), first_prompt, "{slot:?}");
+            assert_eq!(
+                h.observed(n, "dir"),
+                h.reviewer_slot_dir(slot).to_str().unwrap()
+            );
+            assert!(h.entry(slot).unwrap().usable);
+            recovered.kill_and_reap().await;
+
+            // A non-recovery provision is a fresh start on the same slot.
+            {
+                let conn = quorum_core::db::open(&h.config.db_path).unwrap();
+                conn.execute(
+                    "UPDATE agent_runs SET ended_at=?2, end_reason='failed'
+                     WHERE task_id=?1 AND role='reviewer' AND ended_at IS NULL",
+                    rusqlite::params![h.task_id, now_unix()],
+                )
+                .unwrap();
+            }
+            let fresh = provision_session_reviewer(&h, &role, false).await;
+            let n = h.runs();
+            assert_eq!(h.observed(n, "session"), "absent", "{slot:?}");
+            assert_eq!(
+                std::fs::read(h.reviewer_session_file(slot)).unwrap(),
+                format!("turn {n}\n").as_bytes(),
+                "{slot:?}"
+            );
+            fresh.kill_and_reap().await;
+        }
+    }
+
+    /// A resumed reviewer whose CLI refuses its session before any protocol
+    /// line marks only its own slot's entry unusable at teardown.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn silent_external_reviewer_resume_marks_only_its_slot_unusable() {
+        let h = session_review_harness("refuse_resume");
+        let r1 = provision_session_reviewer(&h, &ReviewRole::R1, false).await;
+        interrupt_session_reviewer(&h, r1).await;
+        h.seed_resumable();
+        h.seed_slot_resumable(ContinuationSlot::ReviewerR2, b"r2 conversation\n");
+        let recovered = provision_session_reviewer(&h, &ReviewRole::R1, true).await;
+        assert_eq!(h.observed(2, "session"), "7");
+        teardown_reviewer(
+            &h.config,
+            &WorktreeManager::new(),
+            &mut Pool::new_generated(),
+            recovered,
+            "failed",
+        )
+        .await;
+        assert!(!h.entry(ContinuationSlot::ReviewerR1).unwrap().usable);
+        assert!(h.entry(ContinuationSlot::ReviewerR2).unwrap().usable);
+        assert!(h.worker_entry().unwrap().usable);
+    }
+
+    /// Runner change, external -> built-in, per reviewer slot: a reviewer
+    /// launching on a built-in runner drops only its own slot's entry and
+    /// session file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn built_in_reviewer_launch_discards_only_its_slot_session() {
+        let mut h = session_review_harness("success");
+        let claude = fake_stdin_holding_agent(h.dir.path(), "fake-claude");
+        h.config.agent_bin = Some(claude.to_string_lossy().into_owned());
+        h.config.model_profiles = std::collections::BTreeMap::from([(
+            "x-ext".into(),
+            crate::serve_config::ModelProfile {
+                runner: "claude".into(),
+                model: RETRY_TEST_CLAUDE_MODEL.into(),
+                effort: "high".into(),
+            },
+        )]);
+        h.seed_resumable();
+        h.seed_slot_resumable(ContinuationSlot::ReviewerR1, b"r1 conversation\n");
+        h.seed_slot_resumable(ContinuationSlot::ReviewerR2, b"r2 conversation\n");
+
+        let head = h
+            .config
+            .merge_executor
+            .head_sha(SESSION_REVIEW_PR, &h.config.repo_dir)
+            .unwrap();
+        let mut reviewers = Vec::new();
+        let outcome = provision_reviewer(
+            &h.config,
+            &WorktreeManager::new(),
+            &mut Pool::new_generated(),
+            &mut reviewers,
+            &mut LifetimeRoster::new(),
+            &mut UnrecordableStrikes::new(),
+            &mut ReviewerRespawnBackoff::new(),
+            &mut ProfileCooldown::new(),
+            SESSION_REVIEW_PR,
+            ReviewCounterpart {
+                agent_name: "Author",
+                task_id: h.task_id,
+                branch: "main",
+            },
+            &ReviewRole::R1,
+            &head,
+            false,
+            ReviewerSlotClaim::Fresh,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, ReviewerProvisionOutcome::Attached),
+            "{outcome:?}"
+        );
+        assert_eq!(reviewers[0].process_kind(), runner::AgentKind::Claude);
+        assert_eq!(h.runs(), 0, "the external CLI never ran");
+        assert!(h.entry(ContinuationSlot::ReviewerR1).is_none());
+        assert!(!h
+            .reviewer_session_file(ContinuationSlot::ReviewerR1)
+            .exists());
+        assert_eq!(
+            std::fs::read(h.reviewer_session_file(ContinuationSlot::ReviewerR2)).unwrap(),
+            b"r2 conversation\n"
+        );
+        assert!(h.entry(ContinuationSlot::ReviewerR2).is_some());
+        assert_eq!(std::fs::read(h.session_file()).unwrap(), b"conversation\n");
+        assert!(h.worker_entry().is_some());
+        for reviewer in reviewers.drain(..) {
+            reviewer.kill_and_reap().await;
         }
     }
 }
