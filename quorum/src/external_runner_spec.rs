@@ -479,13 +479,7 @@ impl ExternalSpec {
             exits_without_terminal.insert(exit, disposition);
         }
 
-        // Until the blocked outcome (slice 4) and resume (slice 6) land.
-        if let Some((name, _)) = statuses.iter().find(|(_, s)| s.outcome == Outcome::Blocked) {
-            return Err(refuse(
-                &format!("external_runner.statuses.{name}.outcome"),
-                "the blocked outcome is not supported yet",
-            ));
-        }
+        // Until resume (slice 6) lands.
         if file.args_session.is_some() {
             return Err(refuse(
                 "external_runner.args_session",
@@ -1030,8 +1024,8 @@ fn write_string(s: &str, out: &mut String) -> Result<()> {
 pub(crate) mod tests {
     use super::*;
 
-    /// The spec's example declaration, minus the parts gated on later slices
-    /// (the blocked status and `args_session`).
+    /// The spec's example declaration, minus the part gated on a later slice
+    /// (`args_session`).
     pub(crate) const VALID: &str = r#"
 [external_runner]
 executable = "/usr/local/bin/fake-cli"
@@ -1063,6 +1057,7 @@ usage = { uncached_input = "/usage/input", cached_input = "/usage/cache_read", c
 
 [external_runner.statuses]
 completed      = { outcome = "success",   exit = 0 }
+blocked        = { outcome = "blocked",   exit = 5 }
 cancelled      = { outcome = "cancelled", exit = 143 }
 limit_reached  = { outcome = "failure",   exit = 3, disposition = "non_failover" }
 internal_error = { outcome = "failure",   exit = 1, disposition = "non_failover" }
@@ -1327,23 +1322,24 @@ bad_request       = "non_failover"
     }
 
     #[test]
-    fn refuses_blocked_status_without_question_then_refuses_blocked_until_slice_4() {
-        let blocked = edit(
-            "[external_runner.statuses]\n",
-            "[external_runner.statuses]\nblocked = { outcome = \"blocked\", exit = 5 }\n",
-        );
-        let no_question = blocked.replacen("question      = \"/blocker/question\"\n", "", 1);
+    fn blocked_status_requires_terminal_question() {
+        let accepted = spec(VALID).unwrap();
+        assert_eq!(accepted.statuses["blocked"].outcome, Outcome::Blocked);
+        assert_eq!(accepted.statuses["blocked"].exit, 5);
+        let no_question = edit("question      = \"/blocker/question\"\n", "");
         let err = spec(&no_question).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("external_runner.statuses.blocked.outcome"));
-        assert!(err.to_string().contains("terminal.question"), "{err}");
-        let err = spec(&blocked).unwrap_err();
         assert_eq!(err.exit_code(), 2);
         assert!(err
             .to_string()
             .contains("external_runner.statuses.blocked.outcome"));
-        assert!(err.to_string().contains("not supported yet"), "{err}");
+        assert!(err.to_string().contains("terminal.question"), "{err}");
+        // Without a blocked status, the question pointer stays optional.
+        let neither = no_question.replacen(
+            "blocked        = { outcome = \"blocked\",   exit = 5 }\n",
+            "",
+            1,
+        );
+        assert!(spec(&neither).is_ok());
     }
 
     #[test]

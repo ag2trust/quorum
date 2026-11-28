@@ -804,7 +804,7 @@ fn cascade_dead_deps_in_tx(conn: &Connection, now: i64, limit: usize) -> Result<
              SET status='failed',
                  assignee=NULL,
                  refs=json_set(
-                     COALESCE(refs, '{}'),
+                     json_remove(COALESCE(refs, '{}'), '$.daemon_parked_by'),
                      '$.daemon_parked', json('true'),
                      '$.daemon_parked_reason', ?1,
                      '$.daemon_parked_unsatisfiable', json(?5),

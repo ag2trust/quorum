@@ -1468,6 +1468,15 @@ impl RunnerProc {
         }
     }
 
+    /// The external runner's blocked outcome for this turn, once it passed
+    /// the exit check (spec "Blocked outcome"). Built-in runners have none.
+    pub fn runner_blocked(&self) -> Option<&quorum_core::tasks::RunnerBlocked> {
+        match self {
+            Self::Claude(_) | Self::Codex(_) | Self::Grok(_) => None,
+            Self::External(proc) => proc.runner_blocked(),
+        }
+    }
+
     /// Failure evidence for a one-shot turn that ended without a response.
     /// An exited process is finalized first so its buffered records count;
     /// the captured output is returned so the caller keeps its usage. This
@@ -1831,6 +1840,15 @@ pub enum AgentEvent {
         message: String,
         usage: Option<TokenUsage>,
         cost_usd: Option<f64>,
+    },
+    /// Terminal "blocked, here is my question" from the external runner,
+    /// released only after its exit check passed and only for a read-write
+    /// run. The lifecycle parks the task as needs-info from the process's
+    /// retained [`RunnerProc::runner_blocked`], not from this event.
+    TurnBlocked {
+        question: String,
+        context: Vec<String>,
+        usage: Option<TokenUsage>,
     },
     /// Mid-turn usage snapshot (Claude reports per-message usage on assistant
     /// events). Not terminal.

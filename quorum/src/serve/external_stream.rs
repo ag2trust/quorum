@@ -42,7 +42,8 @@ pub const DETAIL_MALFORMED_FINAL_TEXT: &str = "protocol violation: malformed ter
 pub const DETAIL_UNDECLARED_STATUS: &str = "undeclared terminal status";
 pub const DETAIL_NO_EXIT_AFTER_TERMINAL: &str = "no exit after terminal event";
 pub const DETAIL_EXIT_CONTRADICTS: &str = "exit code contradicts terminal status";
-pub const DETAIL_BLOCKED_UNSUPPORTED: &str = "blocked outcome is not supported";
+pub const DETAIL_BLOCKED_WITHOUT_QUESTION: &str = "blocked without question";
+pub const DETAIL_BLOCKED_OUTSIDE_WRITING_ROLE: &str = "blocked outside a writing role";
 pub const DETAIL_EOF_BEFORE_TERMINAL: &str =
     "provider reached EOF before a terminal protocol event";
 
@@ -84,6 +85,11 @@ pub struct TerminalSeen {
     pub error_kind: ErrorKindSeen,
     pub usage: Option<TokenUsage>,
     pub final_text: Option<String>,
+    /// Read only for a blocked status of a run that may block: a non-empty
+    /// string without NUL, else `None`.
+    pub question: Option<String>,
+    /// The non-empty, NUL-free `question_context` values, in declared order.
+    pub context: Vec<String>,
 }
 
 /// How the run's process ended, as the adapter observed it.
@@ -146,6 +152,8 @@ pub struct ExternalStream<S: Deref<Target = ExternalSpec>> {
     saw_protocol_line: bool,
     terminal: Option<TerminalSeen>,
     stopped: bool,
+    /// Only a read-write run may end blocked (spec "Blocked outcome").
+    blocked_allowed: bool,
 }
 
 impl<S: Deref<Target = ExternalSpec>> ExternalStream<S> {
@@ -156,7 +164,15 @@ impl<S: Deref<Target = ExternalSpec>> ExternalStream<S> {
             saw_protocol_line: false,
             terminal: None,
             stopped: false,
+            blocked_allowed: false,
         }
+    }
+
+    /// Allow the blocked outcome. Off by default, so a run that was not
+    /// launched read-write never retains or releases a question.
+    pub fn allowing_blocked(mut self, allowed: bool) -> Self {
+        self.blocked_allowed = allowed;
+        self
     }
 
     pub fn terminal(&self) -> Option<&TerminalSeen> {
@@ -173,6 +189,7 @@ impl<S: Deref<Target = ExternalSpec>> ExternalStream<S> {
             &self.spec,
             self.terminal.as_ref(),
             self.saw_protocol_line,
+            self.blocked_allowed,
             exit,
         )
     }
@@ -312,6 +329,31 @@ impl<S: Deref<Target = ExternalSpec>> ExternalStream<S> {
             .and_then(Value::as_str)
             .filter(|name| self.spec.statuses.contains_key(*name))
             .map(str::to_string);
+        let blocked = self.blocked_allowed
+            && status
+                .as_deref()
+                .and_then(|name| self.spec.statuses.get(name))
+                .is_some_and(|declared| declared.outcome == Outcome::Blocked);
+        // Untrusted text: only a non-empty string without NUL counts.
+        let text_at = |pointer: &str| {
+            value
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty() && !text.contains('\0'))
+                .map(str::to_string)
+        };
+        let (question, context) = if blocked {
+            (
+                terminal.question.as_deref().and_then(text_at),
+                terminal
+                    .question_context
+                    .iter()
+                    .filter_map(|pointer| text_at(pointer))
+                    .collect(),
+            )
+        } else {
+            (None, Vec::new())
+        };
         let error_kind = match terminal
             .error_kind
             .as_deref()
@@ -339,6 +381,8 @@ impl<S: Deref<Target = ExternalSpec>> ExternalStream<S> {
             error_kind,
             usage,
             final_text,
+            question,
+            context,
         })
     }
 }
@@ -418,11 +462,13 @@ fn terminal_message(status: &str, error_kind: &ErrorKindSeen) -> String {
 }
 
 /// Spec "Exit check". Pure: decides the turn's result from the terminal
-/// event (if any), whether any protocol line was seen, and the observed exit.
+/// event (if any), whether any protocol line was seen, whether the run may
+/// end blocked (read-write only), and the observed exit.
 pub fn exit_check(
     spec: &ExternalSpec,
     terminal: Option<&TerminalSeen>,
     saw_protocol_line: bool,
+    blocked_allowed: bool,
     exit: ExitObservation,
 ) -> ExitVerdict {
     if exit == ExitObservation::KilledByQuorum {
@@ -499,12 +545,30 @@ pub fn exit_check(
             };
             failed(&message, disposition, &message)
         }
-        // Refused by validation until the blocked outcome lands; fail closed.
-        Outcome::Blocked => failed(
+        // Spec "Blocked outcome": the question is neither retained nor
+        // released outside a writing role.
+        Outcome::Blocked if !blocked_allowed => failed(
             &message,
             FailureDisposition::NonFailover,
-            DETAIL_BLOCKED_UNSUPPORTED,
+            DETAIL_BLOCKED_OUTSIDE_WRITING_ROLE,
         ),
+        Outcome::Blocked => match &terminal.question {
+            None => failed(
+                &message,
+                FailureDisposition::NonFailover,
+                DETAIL_BLOCKED_WITHOUT_QUESTION,
+            ),
+            Some(question) => ExitVerdict {
+                kill: false,
+                event: Some(AgentEvent::TurnBlocked {
+                    question: question.clone(),
+                    context: terminal.context.clone(),
+                    usage: terminal.usage,
+                }),
+                terminal_text: None,
+                failure: None,
+            },
+        },
     }
 }
 
@@ -1069,7 +1133,7 @@ mod tests {
     fn exit_check_without_terminal() {
         use FailureDisposition::*;
         let spec = spec();
-        let check = |saw, exit| exit_check(&spec, None, saw, exit);
+        let check = |saw, exit| exit_check(&spec, None, saw, false, exit);
 
         // Declared exits_without_terminal entry wins, with or without lines.
         for saw in [false, true] {
@@ -1108,14 +1172,14 @@ mod tests {
             "2 = \"non_failover\"",
             "2 = \"non_failover\"\n137 = \"retryable_same_route\"",
         );
-        let v = exit_check(&spec, None, false, ExitObservation::Signal(9));
+        let v = exit_check(&spec, None, false, false, ExitObservation::Signal(9));
         assert_eq!(
             v.failure.as_ref().unwrap().disposition(),
             RetryableSameRoute
         );
         // Killed by Quorum: existing kill handling.
         assert_eq!(
-            exit_check(&spec, None, true, ExitObservation::KilledByQuorum),
+            exit_check(&spec, None, true, false, ExitObservation::KilledByQuorum),
             ExitVerdict::default()
         );
 
@@ -1135,6 +1199,102 @@ mod tests {
                 .disposition(),
             NonFailover
         );
+    }
+
+    fn run_blocked(allowed: bool, terminal: &str, exit: i32) -> (ExitVerdict, TerminalSeen) {
+        let spec = spec();
+        let mut s = ExternalStream::new(&spec).allowing_blocked(allowed);
+        assert!(s.on_line(START.as_bytes()).kill.is_none());
+        let step = s.on_line(terminal.as_bytes());
+        assert!(step.kill.is_none(), "{terminal}");
+        assert_eq!(step.events, vec![liveness()]);
+        let seen = s.terminal().cloned().expect("terminal seen");
+        (s.exit_check(ExitObservation::Code(exit)), seen)
+    }
+
+    #[test]
+    fn blocked_outcome_releases_turn_blocked_only_for_a_writing_run() {
+        use FailureDisposition::*;
+        let line = r#"{"type":"run.completed","status":"blocked","blocker":{"question":"Q?","reason":"R","summary":"","details":["x"]},"usage":{"input":2,"output":1}}"#;
+        let usage = Some(TokenUsage {
+            input_tokens: 2,
+            uncached_input_tokens: 2,
+            output_tokens: 1,
+            ..TokenUsage::default()
+        });
+        let (v, seen) = run_blocked(true, line, 5);
+        assert_eq!(
+            v,
+            ExitVerdict {
+                kill: false,
+                event: Some(AgentEvent::TurnBlocked {
+                    question: "Q?".into(),
+                    context: vec!["R".into()],
+                    usage,
+                }),
+                terminal_text: None,
+                failure: None,
+            }
+        );
+        assert_eq!(seen.question.as_deref(), Some("Q?"));
+
+        // Read-only and restricted runs: NonFailover, and the question is not
+        // even retained in the terminal record.
+        let (v, seen) = run_blocked(false, line, 5);
+        assert_eq!(failed_message(&v), "blocked");
+        assert_failure(&v.failure, NonFailover, DETAIL_BLOCKED_OUTSIDE_WRITING_ROLE);
+        assert!(seen.question.is_none() && seen.context.is_empty());
+        assert!(!format!("{v:?}{seen:?}").contains("Q?"));
+        // The default stream does not allow blocking.
+        let spec = spec();
+        let mut s = ExternalStream::new(&spec);
+        s.on_line(START.as_bytes());
+        s.on_line(line.as_bytes());
+        assert_failure(
+            &s.exit_check(ExitObservation::Code(5)).failure,
+            NonFailover,
+            DETAIL_BLOCKED_OUTSIDE_WRITING_ROLE,
+        );
+
+        // A contradicting exit code wins over the blocked claim.
+        for allowed in [true, false] {
+            let (v, _) = run_blocked(allowed, line, 0);
+            assert_failure(&v.failure, Unclassified, DETAIL_EXIT_CONTRADICTS);
+            assert!(!matches!(v.event, Some(AgentEvent::TurnBlocked { .. })));
+        }
+    }
+
+    #[test]
+    fn blocked_without_a_valid_question_is_non_failover() {
+        let cases = [
+            r#"{"type":"run.completed","status":"blocked"}"#.to_string(),
+            r#"{"type":"run.completed","status":"blocked","blocker":{"question":""}}"#.into(),
+            r#"{"type":"run.completed","status":"blocked","blocker":{"question":7}}"#.into(),
+            r#"{"type":"run.completed","status":"blocked","blocker":{"question":null,"reason":"R"}}"#
+                .into(),
+            r#"{"type":"run.completed","status":"blocked","blocker":{"question":"a\u0000b"}}"#.into(),
+        ];
+        for line in &cases {
+            let (v, seen) = run_blocked(true, line, 5);
+            assert_eq!(failed_message(&v), "blocked", "{line}");
+            assert_failure(
+                &v.failure,
+                FailureDisposition::NonFailover,
+                DETAIL_BLOCKED_WITHOUT_QUESTION,
+            );
+            assert!(seen.question.is_none(), "{line}");
+        }
+        // Context values with NUL are dropped; the question still parks.
+        let line = r#"{"type":"run.completed","status":"blocked","blocker":{"question":"Q","reason":"a\u0000b","summary":"S"}}"#;
+        let (v, _) = run_blocked(true, line, 5);
+        match v.event {
+            Some(AgentEvent::TurnBlocked { context, .. }) => assert_eq!(context, vec!["S"]),
+            other => panic!("expected TurnBlocked, got {other:?}"),
+        }
+        // A non-blocked status never reads the question pointers.
+        let line = r#"{"type":"run.completed","status":"completed","blocker":{"question":"Q"}}"#;
+        let (_, seen) = run_blocked(true, line, 0);
+        assert!(seen.question.is_none() && seen.context.is_empty());
     }
 
     #[cfg(unix)]
