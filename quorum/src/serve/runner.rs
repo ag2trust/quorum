@@ -1468,6 +1468,15 @@ impl RunnerProc {
         }
     }
 
+    /// Whether an external run wrote any protocol line. Built-in runners have
+    /// no external session, so `None`.
+    pub fn external_saw_protocol_line(&self) -> Option<bool> {
+        match self {
+            Self::Claude(_) | Self::Codex(_) | Self::Grok(_) => None,
+            Self::External(proc) => Some(proc.saw_protocol_line()),
+        }
+    }
+
     /// The external runner's blocked outcome for this turn, once it passed
     /// the exit check (spec "Blocked outcome"). Built-in runners have none.
     pub fn runner_blocked(&self) -> Option<&quorum_core::tasks::RunnerBlocked> {
