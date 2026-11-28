@@ -16,6 +16,9 @@ pub mod codex_agent;
 pub mod codex_stream;
 pub mod collector;
 pub mod doctor;
+// Dormant until the external process adapter consumes it.
+#[allow(dead_code)]
+pub mod external_stream;
 pub mod fallback;
 pub mod fallback_establish;
 pub mod fallback_preflight;
