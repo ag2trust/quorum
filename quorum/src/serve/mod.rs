@@ -3029,10 +3029,10 @@ fn configure_daemon_log(log_dir: Option<&Path>) {
     *configured = logger;
 }
 
-/// The external runner's session root. Until `session_base` is configurable
-/// this is the documented default, `<state dir>/sessions`.
+/// The external runner's session root, as resolved and validated at startup
+/// (`serve_config::resolve_session_base`; default `<state dir>/sessions`).
 fn session_base(config: &ServeConfig) -> PathBuf {
-    session_store::default_session_base(&config.db_path)
+    config.session_base.clone()
 }
 
 /// Remove session trees whose task is `done`, `cancelled` (including
@@ -5722,6 +5722,15 @@ impl SlotState {
     fn runner_blocked(&self) -> Option<&tasks::RunnerBlocked> {
         match &self.proc {
             SlotProcess::Running(proc) => proc.runner_blocked(),
+            SlotProcess::Failed { .. } | SlotProcess::Dormant { .. } => None,
+        }
+    }
+
+    /// Whether the running external run wrote any protocol line; `None` for
+    /// built-in runners and non-running slots.
+    fn external_saw_protocol_line(&self) -> Option<bool> {
+        match &self.proc {
+            SlotProcess::Running(proc) => proc.external_saw_protocol_line(),
             SlotProcess::Failed { .. } | SlotProcess::Dormant { .. } => None,
         }
     }
@@ -18928,6 +18937,9 @@ async fn tick(
         // provider block, so a restart can never observe only one half.
         dead.finalize_pre_authoritative_exit_evidence("worker", &config.limits)
             .await;
+        // Before any lifecycle disposition can make the task admissible
+        // again: a silent external run leaves no resumable session.
+        mark_silent_external_worker_session(&db_path, &dead).await;
         if let Some(session_id) = dead.grok_max_turn_exhaustion() {
             match checkpoint_grok_max_turn_exhaustion(&db_path, &mut dead, &session_id).await {
                 Ok(_) => {
@@ -21541,11 +21553,28 @@ async fn feed_worker_turn(
             .as_ref()
             .map(|authority| &authority.cap_run_id)
             .or(slot.cap_run_id.as_ref());
-        let env_vars = managed_run_environment(
+        let mut env_vars = managed_run_environment(
             config,
             &slot.agent_name,
             launch_capability.map(String::as_str),
         );
+        // Spec "Resume or fresh start": an external turn resumes its slot
+        // session or starts fresh with the full role prompt.
+        let mut launch_prompt = std::borrow::Cow::Borrowed(raw_prompt);
+        if slot.process_kind() == runner::AgentKind::External {
+            match prepare_external_worker_feed(slot, raw_prompt, recovered_startup, config).await {
+                Ok((prompt, session)) => {
+                    env_vars = session.environment(&env_vars);
+                    launch_prompt = std::borrow::Cow::Owned(prompt);
+                }
+                Err(error) => {
+                    if let Some(authority) = dormant_authority {
+                        abort_dormant_worker_turn(&config.db_path, &authority.cap_run_id).await;
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
 
         let launch = runner::RunnerProc::launch(
             &runner::LaunchRequest {
@@ -21553,7 +21582,7 @@ async fn feed_worker_turn(
                 model,
                 effort,
                 worktree: &slot.worktree_path,
-                prompt: raw_prompt,
+                prompt: &launch_prompt,
                 environment: &env_vars,
                 mode: runner::LaunchMode::Normal,
                 continuation_id: runner_continuation_id(
@@ -21681,6 +21710,60 @@ async fn feed_worker_turn(
     }
 }
 
+/// The run form of a turn fed to an existing external worker slot (spec
+/// "Resume or fresh start", condition 4).
+fn external_feed_run_form(
+    slot: &SlotState,
+    raw_prompt: &str,
+    recovered_startup: bool,
+) -> WorkerRunForm {
+    if recovered_startup {
+        WorkerRunForm::RebuiltDormantTurn(raw_prompt.to_string())
+    } else if !should_replace_pending_prompt(raw_prompt) {
+        // The bounded same-route refeed after a failed turn.
+        WorkerRunForm::ProviderRetry(raw_prompt.to_string())
+    } else if slot.pr.is_some() {
+        WorkerRunForm::Rework(raw_prompt.to_string())
+    } else {
+        WorkerRunForm::Other
+    }
+}
+
+/// Resume-or-fresh for one external turn on an existing worker slot. Returns
+/// the prompt to send and the prepared session.
+async fn prepare_external_worker_feed(
+    slot: &SlotState,
+    raw_prompt: &str,
+    recovered_startup: bool,
+    config: &ServeConfig,
+) -> std::result::Result<(String, ExternalWorkerSession), runner::RunnerFailure> {
+    let run_id = slot
+        .agent_run_id
+        .ok_or_else(|| session_launch_failure("worker slot has no agent run"))?;
+    let db_path = config.db_path.clone();
+    let profile_id = tokio::task::spawn_blocking(move || {
+        let conn = quorum_core::db::open(&db_path)?;
+        worker_run_profile_id(&conn, run_id)
+    })
+    .await
+    .map_err(|join| session_launch_failure(format!("profile lookup join: {join}")))?
+    .map_err(session_launch_failure)?
+    // No routed profile: condition 2 cannot hold, so the run starts fresh.
+    .unwrap_or_default();
+    let run = external_feed_run_form(slot, raw_prompt, recovered_startup);
+    let session = prepare_external_worker_session(config, slot.task_id, &profile_id, run).await?;
+    let prompt = match &session.resumed_prompt {
+        Some(prompt) => prompt.clone(),
+        // A fresh start sends the full role prompt, then the fed turn.
+        None => {
+            fresh_external_worker_prompt(config, &slot.agent_name, slot.task_id, Some(raw_prompt))
+                .await
+                .map_err(session_launch_failure)?
+        }
+    };
+    Ok((prompt, session))
+}
+
 fn install_reviewer_rereview_pending_turn(slot: &mut SlotState, rereview_turn: &str) {
     slot.pending_prompt = rereview_turn.to_string();
     slot.pending_turn_kind = "rereview".into();
@@ -21786,16 +21869,27 @@ async fn prepare_dormant_worker_turn(
             .as_deref()
             .and_then(|raw| serde_json::from_str(raw).ok())
             .ok_or_else(|| QuorumError::Io(format!("task #{task_id} has invalid durable refs")))?;
-        let persisted = runner_state::continuation(&refs, ContinuationSlot::Worker, &provider)
-            .ok_or_else(|| {
-                QuorumError::Io(format!(
-                    "task #{task_id} is missing its persisted {provider} continuation"
-                ))
-            })?;
-        if persisted.id != continuation_id {
-            return Err(QuorumError::Io(format!(
-                "task #{task_id} persisted continuation does not match dormant worker {agent}"
-            )));
+        if provider == runner::AgentKind::External.to_string() {
+            // An external slot has no `runner_continuation*` ref (spec
+            // "Session record"); its continuation is the slot name, and the
+            // session record decides resume or fresh start at launch.
+            if continuation_id != EXTERNAL_WORKER_SLOT.slot_name() {
+                return Err(QuorumError::Io(format!(
+                    "task #{task_id} external continuation does not match dormant worker {agent}"
+                )));
+            }
+        } else {
+            let persisted = runner_state::continuation(&refs, ContinuationSlot::Worker, &provider)
+                .ok_or_else(|| {
+                    QuorumError::Io(format!(
+                        "task #{task_id} is missing its persisted {provider} continuation"
+                    ))
+                })?;
+            if persisted.id != continuation_id {
+                return Err(QuorumError::Io(format!(
+                    "task #{task_id} persisted continuation does not match dormant worker {agent}"
+                )));
+            }
         }
         if tasks::extract_pr_number(&task.refs) != Some(pr) {
             return Err(QuorumError::Io(format!(
@@ -22240,7 +22334,9 @@ fn runner_continuation_id<'a>(
         runner::AgentKind::Claude => Some(claude_session_id),
         runner::AgentKind::Codex => provider_continuation_id,
         runner::AgentKind::Grok => provider_continuation_id,
-        runner::AgentKind::External => provider_continuation_id,
+        // The external runner has no provider continuation; its slot session
+        // is resumed through the session file (spec "Resume or fresh start").
+        runner::AgentKind::External => None,
     }
 }
 
@@ -22280,6 +22376,426 @@ async fn persist_runner_continuation(
         )),
         Err(e) => log(&format!(
             "persist_runner_continuation join error for task #{task_id}: {e}"
+        )),
+    }
+}
+
+// ── External worker sessions ───────────────────────────────────────────────
+// Spec `docs/2026-11-20-external-cli-runner-technical-spec.md`, "Session
+// record", "Resume or fresh start", and "Daemon rules". The daemon handles the
+// session file only through `session_store` (fstatat/unlinkat on the slot
+// directory descriptor); it never opens or reads it.
+
+/// The slot an external worker run belongs to.
+const EXTERNAL_WORKER_SLOT: ContinuationSlot = ContinuationSlot::Worker;
+
+/// Spec "Session record" > "Journal": an external slot run records its slot
+/// name as `continuation_id`. The external runner has no provider
+/// continuation, so this never reaches the adapter (`runner_continuation_id`).
+fn external_worker_continuation(kind: runner::AgentKind) -> Option<String> {
+    (kind == runner::AgentKind::External).then(|| EXTERNAL_WORKER_SLOT.slot_name().to_string())
+}
+
+/// Spec "Resume or fresh start", condition 4, for one worker run. Owned so it
+/// can cross into the blocking session-store work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerRunForm {
+    AnsweredResume {
+        identity: String,
+        text: String,
+    },
+    UnansweredResume,
+    Rework(String),
+    ReviewRemediation(String),
+    ProviderRetry(String),
+    RebuiltDormantTurn(String),
+    /// Every other run (first run, task reopened after failure, ...).
+    Other,
+}
+
+impl WorkerRunForm {
+    fn as_run_kind(&self) -> runner_state::ExternalRunKind<'_> {
+        use runner_state::ExternalRunKind as K;
+        match self {
+            Self::AnsweredResume { identity, text } => K::AnsweredResume { identity, text },
+            Self::UnansweredResume => K::UnansweredResume,
+            Self::Rework(turn_text) => K::Rework { turn_text },
+            Self::ReviewRemediation(turn_text) => K::ReviewRemediation { turn_text },
+            Self::ProviderRetry(turn_text) => K::ProviderRetry { turn_text },
+            Self::RebuiltDormantTurn(turn_text) => K::RebuiltDormantTurn { turn_text },
+            Self::Other => K::Other,
+        }
+    }
+}
+
+/// The run form of an admission whose claim consumed `pending_resume`. The
+/// claim returns its pre-removal refs snapshot. An answer whose note is gone
+/// or malformed falls back to a fresh start, whose prompt carries the notes.
+fn admission_pending_resume_form(
+    conn: &rusqlite::Connection,
+    task_id: i64,
+    admission_refs: Option<&str>,
+) -> Result<Option<WorkerRunForm>> {
+    let Some(pending) = admission_refs
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|refs| refs.get(tasks::PENDING_RESUME_REF).cloned())
+    else {
+        return Ok(None);
+    };
+    match pending.get("kind").and_then(serde_json::Value::as_str) {
+        Some("unanswered") => Ok(Some(WorkerRunForm::UnansweredResume)),
+        Some("answer") => {
+            let Some(note_id) = pending.get("note_id").and_then(serde_json::Value::as_i64) else {
+                return Ok(Some(WorkerRunForm::Other));
+            };
+            let note: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT agent, body FROM task_notes WHERE id=?1 AND task_id=?2",
+                    rusqlite::params![note_id, task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            Ok(Some(
+                match note.and_then(|(agent, body)| {
+                    body.strip_prefix("answer:\n")
+                        .map(|text| (agent, text.to_string()))
+                }) {
+                    Some((agent, text)) => WorkerRunForm::AnsweredResume {
+                        identity: agent.chars().take(NOTE_AUTHOR_LABEL_LIMIT).collect(),
+                        text,
+                    },
+                    None => WorkerRunForm::Other,
+                },
+            ))
+        }
+        _ => Ok(Some(WorkerRunForm::Other)),
+    }
+}
+
+/// A prepared external worker launch.
+#[derive(Debug)]
+struct ExternalWorkerSession {
+    /// The spec's resumed-run prompt; `None` for a fresh start.
+    resumed_prompt: Option<String>,
+    /// The slot directory, exported as `QUORUM_SESSION_DIR`; `None` when
+    /// sessions are disabled.
+    slot_dir: Option<PathBuf>,
+}
+
+impl ExternalWorkerSession {
+    /// The launch environment with the slot directory appended.
+    fn environment(&self, base: &[(String, String)]) -> Vec<(String, String)> {
+        let mut environment = base.to_vec();
+        if let Some(dir) = &self.slot_dir {
+            environment.push((
+                external_launch::SESSION_DIR_ENV.into(),
+                dir.to_string_lossy().into_owned(),
+            ));
+        }
+        environment
+    }
+}
+
+/// Session-store and session-record failures on a launch path are
+/// `NonFailover` (spec "Daemon rules"). Details carry only operation labels.
+fn session_launch_failure(detail: impl std::fmt::Display) -> runner::RunnerFailure {
+    runner::RunnerFailure::classified(
+        runner::FailureDisposition::NonFailover,
+        format!("worker session launch refused: {detail}"),
+        std::io::ErrorKind::Other,
+    )
+}
+
+fn session_file_state(file: session_store::SessionFile) -> runner_state::SessionFileState {
+    match file {
+        session_store::SessionFile::Absent => runner_state::SessionFileState::Missing,
+        session_store::SessionFile::Regular { len: 0 } => runner_state::SessionFileState::Empty,
+        session_store::SessionFile::Regular { .. } => {
+            runner_state::SessionFileState::NonEmptyRegular
+        }
+        session_store::SessionFile::NotRegular => runner_state::SessionFileState::NonRegular,
+    }
+}
+
+/// Read-modify-write a task's refs inside the caller's write transaction.
+/// `edit` returns whether it changed anything; unchanged refs are not written.
+fn edit_task_refs_tx(
+    tx: &rusqlite::Transaction<'_>,
+    task_id: i64,
+    edit: impl FnOnce(&mut serde_json::Value) -> bool,
+) -> Result<()> {
+    let raw: Option<String> = tx
+        .query_row("SELECT refs FROM tasks WHERE id=?1", [task_id], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .ok_or_else(|| QuorumError::Io(format!("task #{task_id} disappeared")))?;
+    let mut refs: serde_json::Value = match raw.as_deref() {
+        Some(raw) => serde_json::from_str(raw)
+            .map_err(|_| QuorumError::Io(format!("task #{task_id} refs are not valid JSON")))?,
+        None => serde_json::json!({}),
+    };
+    if !refs.is_object() {
+        return Err(QuorumError::Io(format!(
+            "task #{task_id} refs are not an object"
+        )));
+    }
+    if edit(&mut refs) {
+        tx.execute(
+            "UPDATE tasks SET refs=?2, updated_at=?3 WHERE id=?1",
+            rusqlite::params![task_id, refs.to_string(), now_unix()],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_task_refs_value(conn: &rusqlite::Connection, task_id: i64) -> Result<serde_json::Value> {
+    let raw: Option<String> = conn
+        .query_row("SELECT refs FROM tasks WHERE id=?1", [task_id], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .ok_or_else(|| QuorumError::Io(format!("task #{task_id} disappeared")))?;
+    Ok(raw
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_else(|| serde_json::json!({})))
+}
+
+/// Spec "Session record": write the worker slot's entry for the external
+/// run about to launch and remove the worker `runner_continuation*` refs, in
+/// one write transaction. The entry is written only through
+/// `runner_state::set_external_session`.
+fn record_external_worker_launch(
+    conn: &mut rusqlite::Connection,
+    task_id: i64,
+    profile_id: &str,
+    fingerprint: &str,
+) -> Result<()> {
+    let tx = quorum_core::db::begin_immediate(conn)?;
+    edit_task_refs_tx(&tx, task_id, |refs| {
+        let before = refs.clone();
+        runner_state::set_external_session(refs, EXTERNAL_WORKER_SLOT, profile_id, fingerprint);
+        runner_state::remove_slot_continuation(refs, EXTERNAL_WORKER_SLOT);
+        *refs != before
+    })?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Resolve resume-or-fresh for one external worker run (spec "Resume or
+/// fresh start"), remove the session file on a fresh start, and write the
+/// session record. Blocking: filesystem and short DB work only, no
+/// transaction is held across the filesystem steps.
+fn prepare_external_worker_session_sync(
+    db_path: &Path,
+    session_base: &Path,
+    spec: &crate::external_runner_spec::ExternalSpec,
+    task_id: i64,
+    profile_id: &str,
+    run: &WorkerRunForm,
+) -> std::result::Result<ExternalWorkerSession, runner::RunnerFailure> {
+    let sessions_enabled = spec.args_session.is_some();
+    let mut conn = quorum_core::db::open(db_path).map_err(session_launch_failure)?;
+    let refs = load_task_refs_value(&conn, task_id).map_err(session_launch_failure)?;
+    let entry = runner_state::external_session(&refs, EXTERNAL_WORKER_SLOT);
+    let slot_dir = if sessions_enabled {
+        Some(
+            session_store::open_slot(session_base, task_id, session_store::Slot::Worker)
+                .map_err(session_launch_failure)?,
+        )
+    } else {
+        None
+    };
+    let file = match &slot_dir {
+        Some(dir) => session_file_state(dir.session_file().map_err(session_launch_failure)?),
+        None => runner_state::SessionFileState::Missing,
+    };
+    let run_kind = run.as_run_kind();
+    let decision = runner_state::resume_decision(&runner_state::ResumeInputs {
+        sessions_enabled,
+        slot: Some(EXTERNAL_WORKER_SLOT),
+        entry: entry.as_ref(),
+        routed_profile: profile_id,
+        fingerprint: &spec.fingerprint,
+        session_file: file,
+        run: run_kind,
+    });
+    let resumed_prompt = match decision {
+        runner_state::ResumeDecision::Resume => runner_state::resumed_prompt(&run_kind),
+        runner_state::ResumeDecision::Fresh => {
+            if let Some(dir) = &slot_dir {
+                dir.remove_session_file().map_err(session_launch_failure)?;
+            }
+            None
+        }
+    };
+    record_external_worker_launch(&mut conn, task_id, profile_id, &spec.fingerprint)
+        .map_err(session_launch_failure)?;
+    Ok(ExternalWorkerSession {
+        resumed_prompt,
+        slot_dir: slot_dir.map(|dir| dir.path().to_path_buf()),
+    })
+}
+
+async fn prepare_external_worker_session(
+    config: &ServeConfig,
+    task_id: i64,
+    profile_id: &str,
+    run: WorkerRunForm,
+) -> std::result::Result<ExternalWorkerSession, runner::RunnerFailure> {
+    let spec = config
+        .external_runner
+        .clone()
+        .ok_or_else(|| session_launch_failure("no [external_runner] is declared"))?;
+    let db_path = config.db_path.clone();
+    let base = session_base(config);
+    let profile_id = profile_id.to_string();
+    let session = tokio::task::spawn_blocking(move || {
+        prepare_external_worker_session_sync(&db_path, &base, &spec, task_id, &profile_id, &run)
+    })
+    .await
+    .map_err(|join| session_launch_failure(format!("session preparation join: {join}")))??;
+    log(&format!(
+        "task #{task_id}: external worker {} (slot worker)",
+        if session.resumed_prompt.is_some() {
+            "resumes its session"
+        } else {
+            "starts fresh"
+        }
+    ));
+    Ok(session)
+}
+
+/// Spec "Session record" > "Runner change": a worker launching on a built-in
+/// runner removes the worker slot's external entry and unlinks its session
+/// file. A task with no entry is untouched (no filesystem access), so a daemon
+/// that never ran the external runner behaves exactly as before.
+fn discard_external_worker_session_sync(
+    db_path: &Path,
+    session_base: &Path,
+    task_id: i64,
+) -> std::result::Result<(), runner::RunnerFailure> {
+    let mut conn = quorum_core::db::open(db_path).map_err(session_launch_failure)?;
+    let refs = load_task_refs_value(&conn, task_id).map_err(session_launch_failure)?;
+    let has_entry = refs
+        .get(runner_state::EXTERNAL_SESSIONS_REF)
+        .and_then(|sessions| sessions.get(EXTERNAL_WORKER_SLOT.slot_name()))
+        .is_some();
+    if !has_entry {
+        return Ok(());
+    }
+    session_store::open_slot(session_base, task_id, session_store::Slot::Worker)
+        .and_then(|dir| dir.remove_session_file())
+        .map_err(session_launch_failure)?;
+    let tx = quorum_core::db::begin_immediate(&mut conn).map_err(session_launch_failure)?;
+    edit_task_refs_tx(&tx, task_id, |refs| {
+        runner_state::remove_external_session(refs, EXTERNAL_WORKER_SLOT);
+        true
+    })
+    .map_err(session_launch_failure)?;
+    tx.commit().map_err(session_launch_failure)?;
+    Ok(())
+}
+
+async fn discard_external_worker_session(
+    config: &ServeConfig,
+    task_id: i64,
+) -> std::result::Result<(), runner::RunnerFailure> {
+    let db_path = config.db_path.clone();
+    let base = session_base(config);
+    tokio::task::spawn_blocking(move || {
+        discard_external_worker_session_sync(&db_path, &base, task_id)
+    })
+    .await
+    .map_err(|join| session_launch_failure(format!("session discard join: {join}")))?
+}
+
+/// Runner-change rules and resume-or-fresh for a worker launch of `kind`.
+/// External: returns the prepared session. Built-in: discards any external
+/// session and returns `None`.
+async fn prepare_worker_slot_session(
+    config: &ServeConfig,
+    kind: runner::AgentKind,
+    task_id: i64,
+    profile_id: &str,
+    run: WorkerRunForm,
+) -> std::result::Result<Option<ExternalWorkerSession>, runner::RunnerFailure> {
+    if kind == runner::AgentKind::External {
+        prepare_external_worker_session(config, task_id, profile_id, run)
+            .await
+            .map(Some)
+    } else {
+        discard_external_worker_session(config, task_id)
+            .await
+            .map(|()| None)
+    }
+}
+
+/// The full worker role prompt (task notes included) for a fresh external
+/// start, followed by `turn_text` when the fresh run continues a turn.
+async fn fresh_external_worker_prompt(
+    config: &ServeConfig,
+    agent: &str,
+    task_id: i64,
+    turn_text: Option<&str>,
+) -> Result<String> {
+    let db_path = config.db_path.clone();
+    let task = tokio::task::spawn_blocking(move || -> Result<tasks::Task> {
+        let conn = quorum_core::db::open(&db_path)?;
+        tasks::get(&conn, task_id)?
+            .ok_or_else(|| QuorumError::Io(format!("task #{task_id} disappeared")))
+    })
+    .await
+    .map_err(|join| QuorumError::Io(format!("fresh worker prompt join: {join}")))??;
+    let context = load_worker_task_context(&config.db_path, task_id).await?;
+    let mut prompt = reviewer::build_worker_prompt(
+        agent,
+        task.id,
+        &task.title,
+        task.body.as_deref().unwrap_or(&task.title),
+        config.limits.max_task_cost_usd,
+        &risk::risk_flags(task.refs.as_deref().unwrap_or("")),
+        &context,
+    );
+    if let Some(turn_text) = turn_text {
+        prompt.push_str("\n\n");
+        prompt.push_str(turn_text);
+    }
+    Ok(prompt)
+}
+
+/// Spec "Resume or fresh start": an external worker run that ended before
+/// writing any protocol line marks the slot's entry `usable: false`, so the
+/// slot's next run starts fresh. A run that wrote protocol lines, and every
+/// built-in run, leaves the record unchanged. This is applied to every
+/// external worker run, resumed or fresh: a silent fresh run has no
+/// conversation worth resuming either.
+async fn mark_silent_external_worker_session(db_path: &Path, slot: &SlotState) {
+    if slot.external_saw_protocol_line() != Some(false) {
+        return;
+    }
+    let path = db_path.to_path_buf();
+    let task_id = slot.task_id;
+    let result = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&path)?;
+        let tx = quorum_core::db::begin_immediate(&mut conn)?;
+        edit_task_refs_tx(&tx, task_id, |refs| {
+            runner_state::external_session(refs, EXTERNAL_WORKER_SLOT)
+                .is_some_and(|entry| entry.usable)
+                && runner_state::mark_external_session_unusable(refs, EXTERNAL_WORKER_SLOT)
+        })?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log(&format!(
+            "task #{task_id}: marking the external worker session unusable failed: {error}"
+        )),
+        Err(error) => log(&format!(
+            "task #{task_id}: external worker session marking join failed: {error}"
         )),
     }
 }
@@ -24060,6 +24576,11 @@ fn require_remediation_continuation(
     // its capability is revoked and rework is retained; recovery resumes only
     // after the thread ID is durable. A shutdown before that event therefore
     // fails closed rather than creating a second fresh turn.
+    // An external worker resumes through its slot session, never a provider
+    // continuation; its continuation is the slot name (spec "Session record").
+    if kind == runner::AgentKind::External {
+        return Ok(external_worker_continuation(kind));
+    }
     if kind.turn_mode() == runner::TurnMode::RespawnPerTurn
         && continuation_id.is_none()
         && (!review_only || has_original_worker)
@@ -28657,17 +29178,6 @@ async fn spawn_admitted_worker(
             return Ok(false);
         }
     }
-    let launch = runner::LaunchRequest {
-        runner: resolved_runner,
-        model: &resolved_model,
-        effort: &resolved_effort,
-        worktree: &wt_path,
-        prompt: &prompt_text,
-        environment: &worker_env_vars,
-        mode: runner::LaunchMode::Normal,
-        continuation_id,
-        managed: managed_launch(config, runner::AgentMcpRole::Worker),
-    };
     let responsibility_key = worker_responsibility_key(task.id, task.revision);
     let worker_run_id = {
         let p = db_path.clone();
@@ -28699,7 +29209,98 @@ async fn spawn_admitted_worker(
         .await
         .map_err(|error| QuorumError::Io(format!("worker run persistence join: {error}")))??
     };
-    let spawn_result = if skip_cooling_assignment {
+    // Spec "Session record" and "Resume or fresh start": apply the
+    // runner-change rules and, for an external run, choose resume or fresh
+    // start before any process exists. Failures are `NonFailover` launch
+    // failures and settle through the ordinary failed-spawn path below.
+    let mut worker_env_vars = worker_env_vars;
+    // The prompt actually sent when it differs from the slot's pending turn
+    // text (a resumed prompt, or a rebuilt fresh role prompt). The pending
+    // turn keeps its own text so a later retry never nests role prompts.
+    let mut launch_prompt: Option<String> = None;
+    let slot_session: std::result::Result<(), runner::RunnerFailure> = if skip_cooling_assignment {
+        Ok(())
+    } else {
+        let run_form = if resolved_kind == runner::AgentKind::External {
+            let p = db_path.clone();
+            let task_id = task.id;
+            let admission_refs = task.refs.clone();
+            let pending = tokio::task::spawn_blocking(move || -> Result<Option<WorkerRunForm>> {
+                let conn = quorum_core::db::open(&p)?;
+                admission_pending_resume_form(&conn, task_id, admission_refs.as_deref())
+            })
+            .await
+            .map_err(|join| QuorumError::Io(format!("pending resume join: {join}")))
+            .and_then(|result| result);
+            match pending {
+                Ok(Some(form)) => Ok(form),
+                Ok(None) => Ok(retry_turn.as_ref().map_or(WorkerRunForm::Other, |retry| {
+                    WorkerRunForm::ProviderRetry(retry.prompt.clone())
+                })),
+                Err(error) => Err(session_launch_failure(error)),
+            }
+        } else {
+            Ok(WorkerRunForm::Other)
+        };
+        match run_form {
+            Err(failure) => Err(failure),
+            Ok(run_form) => match prepare_worker_slot_session(
+                config,
+                resolved_kind,
+                task.id,
+                &assignment.profile_id,
+                run_form,
+            )
+            .await
+            {
+                Ok(None) => Ok(()),
+                Ok(Some(session)) => {
+                    worker_env_vars = session.environment(&worker_env_vars);
+                    match (session.resumed_prompt, retry_turn.as_ref()) {
+                        (Some(resumed), _) => {
+                            launch_prompt = Some(resumed);
+                            Ok(())
+                        }
+                        // A fresh start sends the full role prompt. A stored
+                        // retry turn holds only its exact turn text, so the
+                        // role prompt is rebuilt around a non-initial one.
+                        (None, Some(retry)) => fresh_external_worker_prompt(
+                            config,
+                            &agent_name,
+                            task.id,
+                            (retry.turn_kind != "initial").then_some(retry.prompt.as_str()),
+                        )
+                        .await
+                        .map(|prompt| launch_prompt = Some(prompt))
+                        .map_err(session_launch_failure),
+                        (None, None) => Ok(()),
+                    }
+                }
+                Err(failure) => Err(failure),
+            },
+        }
+    };
+    let launch = runner::LaunchRequest {
+        runner: resolved_runner,
+        model: &resolved_model,
+        effort: &resolved_effort,
+        worktree: &wt_path,
+        prompt: launch_prompt.as_deref().unwrap_or(&prompt_text),
+        environment: &worker_env_vars,
+        mode: runner::LaunchMode::Normal,
+        continuation_id,
+        managed: managed_launch(config, runner::AgentMcpRole::Worker),
+    };
+    // An external worker records its slot name as its continuation (spec
+    // "Session record" > "Journal"); built-in runs keep their retry identity.
+    let slot_continuation_id = external_worker_continuation(resolved_kind).or_else(|| {
+        retry_turn
+            .as_ref()
+            .and_then(|retry| retry.continuation_id.clone())
+    });
+    let spawn_result = if let Err(failure) = slot_session {
+        Err(failure)
+    } else if skip_cooling_assignment {
         Err(cooling_profile_failure(&assignment.profile_id))
     } else if resolved_kind == runner::AgentKind::Grok && continuation_id.is_none() {
         // Grok publishes its provider session only in terminal `end`; retain
@@ -28757,9 +29358,7 @@ async fn spawn_admitted_worker(
                     pr: continuation_pr,
                     rework_count: continuation_rework_count,
                     provider: Some(resolved_kind.to_string()),
-                    continuation_id: retry_turn
-                        .as_ref()
-                        .and_then(|retry| retry.continuation_id.clone()),
+                    continuation_id: slot_continuation_id.clone(),
                     local_branch: Some(branch.clone()),
                 };
                 tokio::task::spawn_blocking(move || -> Result<()> {
@@ -28814,9 +29413,7 @@ async fn spawn_admitted_worker(
                 cap_run_id: Some(cap_run_id),
                 r2_origin: false,
                 reviewed_head_sha: None,
-                continuation_id: retry_turn
-                    .as_ref()
-                    .and_then(|retry| retry.continuation_id.clone()),
+                continuation_id: slot_continuation_id,
                 pending_prompt: prompt_text,
                 pending_turn_kind: retry_turn
                     .as_ref()
@@ -28869,9 +29466,7 @@ async fn spawn_admitted_worker(
                 cap_run_id: Some(cap_run_id),
                 r2_origin: false,
                 reviewed_head_sha: None,
-                continuation_id: retry_turn
-                    .as_ref()
-                    .and_then(|retry| retry.continuation_id.clone()),
+                continuation_id: slot_continuation_id,
                 pending_prompt: prompt_text,
                 pending_turn_kind: retry_turn
                     .as_ref()
@@ -31032,6 +31627,23 @@ async fn activate_worker_fallback_with(
         ))
         .await;
     }
+    // Spec "Session record" > "Runner change": a worker failing over onto a
+    // built-in runner drops the slot's external session first. The external
+    // runner is never a fallback alternate (`routed_provider_executable`).
+    if alternate_kind != runner::AgentKind::External {
+        if let Err(error) = discard_external_worker_session(config, slot.task_id).await {
+            return settle_failed_worker_fallback(
+                config,
+                slot,
+                intent.agent_run_id,
+                &intent.capability_run_id,
+                &alternate_pending,
+                format!("fallback launch failed: {error}"),
+                "fallback_launch_failed",
+            )
+            .await;
+        }
+    }
     let environment = managed_run_environment(
         config,
         &slot.agent_name,
@@ -31886,6 +32498,9 @@ async fn cleanup_slot_inner(
     end_reason: &str,
     terminal_action: Option<TerminalUsageAction>,
 ) {
+    // Every other end of a worker run (watchdog kill, refused feed, drain)
+    // passes here while its process is still observable.
+    mark_silent_external_worker_session(&config.db_path, &state).await;
     let mut usage = managed_usage_record(&state, "worker");
     log(&format!(
         "tearing down worker {} (task #{}{})",
@@ -33284,6 +33899,8 @@ async fn spawn_remediation_worker(
     // Acquire the remediation lease BEFORE any other write that could invoke
     // sweep. Without this, an intervening sweep_on_write sees a rework task
     // with no active claim and reaps it to open (#199).
+    // The claim consumes `pending_resume` and returns its pre-removal refs.
+    let remediation_admission_refs: Option<String>;
     {
         match claim_remediation_for_worker(
             db_path.clone(),
@@ -33293,7 +33910,7 @@ async fn spawn_remediation_worker(
         )
         .await
         {
-            Ok(Some(_)) => {}
+            Ok(Some(claimed)) => remediation_admission_refs = claimed.refs,
             Ok(None) => {
                 log(&format!(
                     "remediation: claim lost for task #{task_id} — task no longer eligible"
@@ -33951,6 +34568,68 @@ async fn spawn_remediation_worker(
         }
     };
 
+    // Spec "Session record" and "Resume or fresh start" for the remediation
+    // turn; a failure settles through the failed-spawn path below.
+    let mut remediation_env = remediation_env;
+    let mut launch_prompt: Option<String> = None;
+    let remediation_session: std::result::Result<(), runner::RunnerFailure> = {
+        let run_form = if remediation_kind == runner::AgentKind::External {
+            let p = db_path.clone();
+            let refs = remediation_admission_refs.clone();
+            tokio::task::spawn_blocking(move || -> Result<Option<WorkerRunForm>> {
+                let conn = quorum_core::db::open(&p)?;
+                admission_pending_resume_form(&conn, task_id, refs.as_deref())
+            })
+            .await
+            .map_err(|join| QuorumError::Io(format!("pending resume join: {join}")))
+            .and_then(|result| result)
+            .map(|pending| {
+                pending.unwrap_or_else(|| WorkerRunForm::ReviewRemediation(prompt.clone()))
+            })
+            .map_err(session_launch_failure)
+        } else {
+            Ok(WorkerRunForm::Other)
+        };
+        let profile_id = worker_assignment
+            .as_ref()
+            .map(|assignment| assignment.profile_id.clone())
+            .unwrap_or_default();
+        match run_form {
+            Err(failure) => Err(failure),
+            Ok(run_form) => {
+                match prepare_worker_slot_session(
+                    config,
+                    remediation_kind,
+                    task_id,
+                    &profile_id,
+                    run_form,
+                )
+                .await
+                {
+                    Ok(None) => Ok(()),
+                    Ok(Some(session)) => {
+                        remediation_env = session.environment(&remediation_env);
+                        match session.resumed_prompt {
+                            Some(resumed) => {
+                                launch_prompt = Some(resumed);
+                                Ok(())
+                            }
+                            None => fresh_external_worker_prompt(
+                                config,
+                                &agent_name,
+                                task_id,
+                                Some(&prompt),
+                            )
+                            .await
+                            .map(|fresh| launch_prompt = Some(fresh))
+                            .map_err(session_launch_failure),
+                        }
+                    }
+                    Err(failure) => Err(failure),
+                }
+            }
+        }
+    };
     let launch_continuation_id =
         runner_continuation_id(remediation_kind, &session_id, continuation_id.as_deref());
     let fresh_grok_handoff =
@@ -33960,13 +34639,15 @@ async fn spawn_remediation_worker(
         model: &remediation_model,
         effort: &remediation_effort,
         worktree: &wt_path,
-        prompt: &prompt,
+        prompt: launch_prompt.as_deref().unwrap_or(&prompt),
         environment: &remediation_env,
         mode: runner::LaunchMode::Normal,
         continuation_id: launch_continuation_id,
         managed: managed_launch(config, runner::AgentMcpRole::Worker),
     };
-    let spawn_result = if fresh_grok_handoff {
+    let spawn_result = if let Err(failure) = remediation_session {
+        Err(failure)
+    } else if fresh_grok_handoff {
         // A workerless review-only task begins its first managed Grok turn in
         // lifecycle rework, but it has no provider session to resume. Retain
         // the exact fresh-worker request so Grok's terminal-only session ID
@@ -35067,7 +35748,8 @@ mod tests {
         let done = task_with("done");
         let cancelled = task_with("cancelled");
         drop(conn);
-        let config = pre_review_checks_config(db_path.clone(), root.path().to_path_buf());
+        let mut config = pre_review_checks_config(db_path.clone(), root.path().to_path_buf());
+        config.session_base = root.path().join("sessions");
         let base = session_base(&config);
         assert_eq!(base, root.path().join("sessions"));
 
@@ -77562,5 +78244,842 @@ exec /bin/cat '{stdout}'
         assert_eq!(skipped, 1);
         drop(conn);
         second.kill_and_reap().await;
+    }
+
+    // ── External worker sessions (spec "Session record", "Resume or fresh
+    // start") ──────────────────────────────────────────────────────────────
+
+    /// Reusable session-recording fake CLI (see the script header).
+    const SESSION_RECORDING_CLI: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/session_recording_cli.sh"
+    );
+
+    /// A daemon config routing every role to one external profile `x-ext`
+    /// whose CLI is the session-recording fixture, plus one task.
+    struct SessionHarness {
+        dir: tempfile::TempDir,
+        config: ServeConfig,
+        obs: PathBuf,
+        task_id: i64,
+    }
+
+    impl SessionHarness {
+        fn spec(&self) -> &crate::external_runner_spec::ExternalSpec {
+            self.config.external_runner.as_deref().unwrap()
+        }
+
+        fn slot_dir(&self) -> PathBuf {
+            self.config
+                .session_base
+                .join(self.task_id.to_string())
+                .join("worker")
+        }
+
+        fn session_file(&self) -> PathBuf {
+            self.slot_dir().join("session")
+        }
+
+        /// What the fixture recorded for run `n`.
+        fn observed(&self, n: usize, what: &str) -> String {
+            std::fs::read_to_string(self.obs.join(format!("run.{n}.{what}")))
+                .unwrap_or_else(|e| panic!("run {n} {what} not recorded: {e}"))
+        }
+
+        fn runs(&self) -> usize {
+            std::fs::read_to_string(self.obs.join("runs"))
+                .map(|runs| runs.lines().count())
+                .unwrap_or(0)
+        }
+
+        fn refs(&self) -> serde_json::Value {
+            task_refs_json(&self.config.db_path, self.task_id)
+        }
+
+        fn edit_refs(&self, edit: impl FnOnce(&mut serde_json::Value)) {
+            let mut refs = self.refs();
+            edit(&mut refs);
+            let conn = quorum_core::db::open(&self.config.db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET refs=?2 WHERE id=?1",
+                rusqlite::params![self.task_id, refs.to_string()],
+            )
+            .unwrap();
+        }
+
+        /// Seed the worker entry and, when `file` is set, the session file.
+        fn seed(&self, profile: &str, fingerprint: &str, usable: bool, file: Option<&[u8]>) {
+            self.edit_refs(|refs| {
+                runner_state::set_external_session(
+                    refs,
+                    ContinuationSlot::Worker,
+                    profile,
+                    fingerprint,
+                );
+                if !usable {
+                    runner_state::mark_external_session_unusable(refs, ContinuationSlot::Worker);
+                }
+            });
+            if let Some(file) = file {
+                session_store::open_slot(
+                    &self.config.session_base,
+                    self.task_id,
+                    session_store::Slot::Worker,
+                )
+                .unwrap();
+                std::fs::write(self.session_file(), file).unwrap();
+            }
+        }
+
+        /// Seed a resumable state: usable entry for the routed profile and
+        /// the current fingerprint, and a non-empty session file.
+        fn seed_resumable(&self) {
+            let fingerprint = self.spec().fingerprint.clone();
+            self.seed("x-ext", &fingerprint, true, Some(b"conversation\n"));
+        }
+
+        fn worker_entry(&self) -> Option<runner_state::ExternalSessionEntry> {
+            runner_state::external_session(&self.refs(), ContinuationSlot::Worker)
+        }
+
+        /// Park the task needs-info and restore it with `answer` (task-answer)
+        /// or without one (task-retry).
+        fn restore_needs_info(&self, answer: Option<&str>) {
+            let mut conn = quorum_core::db::open(&self.config.db_path).unwrap();
+            park_needs_info_for_resume(&conn, self.task_id, "open");
+            match answer {
+                Some(answer) => assert!(matches!(
+                    tasks::answer_parked(&mut conn, self.task_id, "owner", answer, 2).unwrap(),
+                    tasks::AnswerOutcome::Answered { .. }
+                )),
+                None => assert!(
+                    tasks::retry_parked(&mut conn, self.task_id, "owner", true, 2)
+                        .unwrap()
+                        .is_some()
+                ),
+            }
+        }
+
+        fn journal_provider_and_continuation(&self, agent: &str) -> (String, Option<String>) {
+            let conn = quorum_core::db::open(&self.config.db_path).unwrap();
+            conn.query_row(
+                "SELECT provider, continuation_id FROM journal WHERE agent=?1",
+                [agent],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        }
+    }
+
+    #[cfg(unix)]
+    fn session_harness(scenario: &str, sessions_enabled: bool) -> SessionHarness {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = launch_test_repo(dir.path());
+        let obs = dir.path().join("observe");
+        std::fs::create_dir(&obs).unwrap();
+        // The scenario is selected by a wrapper, so no process-wide
+        // environment is mutated under the threaded test harness.
+        let wrapper = dir.path().join("session-cli.sh");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nSESSION_CLI_OBSERVE='{}' SESSION_CLI_SCENARIO={scenario} exec '{SESSION_RECORDING_CLI}' \"$@\"\n",
+                obs.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let wrapper = wrapper.to_str().unwrap().to_string();
+        let base = if sessions_enabled {
+            crate::external_runner_spec::tests::with_session()
+        } else {
+            crate::external_runner_spec::tests::VALID.to_string()
+        };
+        let declaration = base.replacen("executable = \"/usr/local/bin/fake-cli\"\n", "", 1);
+        let file_cfg: crate::serve_config::ServeFileConfig =
+            toml::from_str(&format!("agent_bin = \"{wrapper}\"\n{declaration}")).unwrap();
+        let spec = crate::serve_config::resolve_external_runner(&file_cfg)
+            .unwrap()
+            .expect("declared");
+        assert_eq!(spec.args_session.is_some(), sessions_enabled);
+
+        let mut config = claude_only_retry_test_config(dir.path(), &repo, Path::new(&wrapper));
+        config.agent_bin = Some(wrapper);
+        config.external_runner = Some(Arc::new(spec));
+        config.session_base = dir.path().join("sessions");
+        config.model_profiles = std::collections::BTreeMap::from([(
+            "x-ext".into(),
+            crate::serve_config::ModelProfile {
+                runner: "external".into(),
+                model: "m-1".into(),
+                effort: "high".into(),
+            },
+        )]);
+        let pool = std::collections::BTreeMap::from([("x-ext".to_string(), 100)]);
+        config.routing = crate::serve_config::RoutingPolicy {
+            classifier: pool.clone(),
+            planner: pool.clone(),
+            arbiter: pool.clone(),
+            collector: pool.clone(),
+            worker: (1..=5)
+                .map(|level| (level.to_string(), pool.clone()))
+                .collect(),
+            reviewer: (1..=5)
+                .map(|level| (level.to_string(), pool.clone()))
+                .collect(),
+        };
+        let task_id = {
+            let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+            tasks::create(
+                &mut conn,
+                "owner",
+                "external session task",
+                Some("one external worker run"),
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap()
+        };
+        SessionHarness {
+            dir,
+            config,
+            obs,
+            task_id,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_worker_exit(slot: &mut SlotState) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while slot.try_wait().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the fake CLI exits");
+    }
+
+    /// Dispatch one worker through the production admission and wait for its
+    /// fake CLI to exit.
+    #[cfg(unix)]
+    async fn dispatch_session_worker(h: &SessionHarness) -> SlotState {
+        let (mut workers, spawned) = dispatch_retry_test_worker(&h.config).await;
+        assert!(spawned, "the external worker launches");
+        let mut slot = workers.pop().unwrap();
+        assert_eq!(slot.process_kind(), runner::AgentKind::External);
+        wait_for_worker_exit(&mut slot).await;
+        slot
+    }
+
+    #[cfg(unix)]
+    async fn expected_fresh_prompt(h: &SessionHarness, agent: &str, turn: Option<&str>) -> String {
+        fresh_external_worker_prompt(&h.config, agent, h.task_id, turn)
+            .await
+            .unwrap()
+    }
+
+    /// A plain admission is a fresh start even over a resumable record: the
+    /// stale session file is removed before launch, the CLI gets the full
+    /// role prompt with task notes, the record names the routed profile and
+    /// current fingerprint, the worker `runner_continuation*` refs are gone,
+    /// and the journal row records provider `external` and the slot name.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_fresh_admission_removes_session_file_and_writes_the_record() {
+        let h = session_harness("success", true);
+        h.seed_resumable();
+        h.edit_refs(|refs| {
+            runner_state::set_continuation(
+                refs,
+                ContinuationSlot::Worker,
+                &ContinuationIdentity {
+                    provider: "codex".into(),
+                    id: "thread-old".into(),
+                },
+            );
+            refs["codex_thread_id"] = "thread-legacy".into();
+            runner_state::set_continuation(
+                refs,
+                ContinuationSlot::ReviewerR1,
+                &ContinuationIdentity {
+                    provider: "claude".into(),
+                    id: "r1".into(),
+                },
+            );
+        });
+        {
+            let conn = quorum_core::db::open(&h.config.db_path).unwrap();
+            conn.execute(
+                "INSERT INTO task_notes(task_id, ts, agent, body) VALUES (?1, 1, 'owner', 'note: prefer small commits')",
+                [h.task_id],
+            )
+            .unwrap();
+        }
+
+        let slot = dispatch_session_worker(&h).await;
+        assert_eq!(h.runs(), 1);
+        assert_eq!(h.observed(1, "session"), "absent");
+        assert_eq!(h.observed(1, "dir"), h.slot_dir().to_str().unwrap());
+        let prompt = h.observed(1, "prompt");
+        assert_eq!(
+            prompt,
+            expected_fresh_prompt(&h, &slot.agent_name, None).await
+        );
+        assert!(prompt.contains("note: prefer small commits"), "{prompt}");
+        // The CLI saved its new session over a removed one.
+        assert_eq!(std::fs::read(h.session_file()).unwrap(), b"turn 1\n");
+
+        let refs = h.refs();
+        assert_eq!(
+            refs[runner_state::EXTERNAL_SESSIONS_REF],
+            serde_json::json!({"worker": {
+                "profile": "x-ext",
+                "fingerprint": h.spec().fingerprint,
+                "usable": true
+            }})
+        );
+        assert!(refs.get(runner_state::CONTINUATION_REF).is_none(), "{refs}");
+        assert!(refs.get("codex_thread_id").is_none(), "{refs}");
+        assert_eq!(
+            refs[runner_state::REVIEWER_R1_CONTINUATION_REF]["id"],
+            "r1",
+            "other slots keep their continuations"
+        );
+        assert_eq!(
+            h.journal_provider_and_continuation(&slot.agent_name),
+            ("external".into(), Some("worker".into()))
+        );
+        assert_eq!(slot.continuation_id.as_deref(), Some("worker"));
+        slot.kill_and_reap().await;
+    }
+
+    /// The two `pending_resume` admissions resume with the exact spec
+    /// prompts, and the CLI finds its session file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_pending_resume_admissions_resume_with_exact_prompts() {
+        for (answer, expected) in [
+            (
+                Some("use option B\nthanks"),
+                "Answer from owner:\nuse option B\nthanks",
+            ),
+            (
+                None,
+                "No answer was provided. Continue with your best judgment, or ask again.",
+            ),
+        ] {
+            let h = session_harness("success", true);
+            h.seed_resumable();
+            h.restore_needs_info(answer);
+            let slot = dispatch_session_worker(&h).await;
+            assert_eq!(h.observed(1, "session"), "13", "{answer:?}");
+            assert_eq!(h.observed(1, "prompt"), expected);
+            assert_eq!(
+                std::fs::read(h.session_file()).unwrap(),
+                b"conversation\nturn 1\n"
+            );
+            let refs = h.refs();
+            assert!(refs.get(tasks::PENDING_RESUME_REF).is_none(), "{refs}");
+            assert!(h.worker_entry().unwrap().usable);
+            slot.kill_and_reap().await;
+        }
+    }
+
+    /// Conditions 1-3: any mismatch turns a resumable admission into a fresh
+    /// start whose CLI finds no session file and receives the full prompt.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_resume_requires_sessions_entry_profile_fingerprint_and_file() {
+        type Seed = fn(&SessionHarness);
+        let cases: [(&str, bool, Seed); 7] = [
+            ("sessions disabled", false, |h| h.seed_resumable()),
+            ("no entry", true, |h| {
+                session_store::open_slot(
+                    &h.config.session_base,
+                    h.task_id,
+                    session_store::Slot::Worker,
+                )
+                .unwrap();
+                std::fs::write(h.session_file(), b"conversation\n").unwrap();
+            }),
+            ("unusable", true, |h| {
+                let f = h.spec().fingerprint.clone();
+                h.seed("x-ext", &f, false, Some(b"conversation\n"));
+            }),
+            ("profile change", true, |h| {
+                let f = h.spec().fingerprint.clone();
+                h.seed("x-other", &f, true, Some(b"conversation\n"));
+            }),
+            ("fingerprint change", true, |h| {
+                h.seed("x-ext", "0123abcd", true, Some(b"conversation\n"));
+            }),
+            ("missing file", true, |h| {
+                let f = h.spec().fingerprint.clone();
+                h.seed("x-ext", &f, true, None);
+            }),
+            ("zero-byte file", true, |h| {
+                let f = h.spec().fingerprint.clone();
+                h.seed("x-ext", &f, true, Some(b""));
+            }),
+        ];
+        for (name, sessions, seed) in cases {
+            let h = session_harness("success", sessions);
+            seed(&h);
+            h.restore_needs_info(None);
+            let slot = dispatch_session_worker(&h).await;
+            assert_eq!(h.observed(1, "session"), "absent", "{name}");
+            assert_eq!(
+                h.observed(1, "prompt"),
+                expected_fresh_prompt(&h, &slot.agent_name, None).await,
+                "{name}"
+            );
+            let entry = h.worker_entry().unwrap();
+            assert_eq!(
+                (entry.profile.as_str(), entry.usable),
+                ("x-ext", true),
+                "{name}"
+            );
+            assert_eq!(entry.fingerprint, h.spec().fingerprint, "{name}");
+            if sessions {
+                assert_eq!(
+                    std::fs::read(h.session_file()).unwrap(),
+                    b"turn 1\n",
+                    "{name}"
+                );
+            } else {
+                assert_eq!(h.observed(1, "dir"), "", "{name}");
+                assert_eq!(
+                    std::fs::read(h.session_file()).unwrap(),
+                    b"conversation\n",
+                    "{name}: a disabled session store is not touched"
+                );
+            }
+            slot.kill_and_reap().await;
+        }
+    }
+
+    /// Condition 4 for the continued-turn forms: each resumes with its turn
+    /// text and keeps the session file; `Other` starts fresh and removes it.
+    #[cfg(unix)]
+    #[test]
+    fn external_continued_turn_forms_resume_with_turn_text() {
+        let h = session_harness("success", true);
+        let turn = "Review feedback:\n- fix the race\n";
+        for form in [
+            WorkerRunForm::Rework(turn.into()),
+            WorkerRunForm::ReviewRemediation(turn.into()),
+            WorkerRunForm::ProviderRetry(turn.into()),
+            WorkerRunForm::RebuiltDormantTurn(turn.into()),
+        ] {
+            h.seed_resumable();
+            let session = prepare_external_worker_session_sync(
+                &h.config.db_path,
+                &h.config.session_base,
+                h.spec(),
+                h.task_id,
+                "x-ext",
+                &form,
+            )
+            .unwrap();
+            assert_eq!(session.resumed_prompt.as_deref(), Some(turn), "{form:?}");
+            assert_eq!(session.slot_dir.as_deref(), Some(h.slot_dir().as_path()));
+            assert_eq!(std::fs::read(h.session_file()).unwrap(), b"conversation\n");
+        }
+        let session = prepare_external_worker_session_sync(
+            &h.config.db_path,
+            &h.config.session_base,
+            h.spec(),
+            h.task_id,
+            "x-ext",
+            &WorkerRunForm::Other,
+        )
+        .unwrap();
+        assert_eq!(session.resumed_prompt, None);
+        assert!(!h.session_file().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_feed_run_forms_follow_condition_four() {
+        let mut slot = make_dummy_slot();
+        slot.pr = None;
+        let refeed = "Your previous turn was interrupted by a transport/API error (attempt 1/3).";
+        assert_eq!(
+            external_feed_run_form(&slot, "t", true),
+            WorkerRunForm::RebuiltDormantTurn("t".into())
+        );
+        assert_eq!(
+            external_feed_run_form(&slot, refeed, false),
+            WorkerRunForm::ProviderRetry(refeed.into())
+        );
+        assert_eq!(
+            external_feed_run_form(&slot, "t", false),
+            WorkerRunForm::Other
+        );
+        slot.pr = Some(7);
+        assert_eq!(
+            external_feed_run_form(&slot, "t", false),
+            WorkerRunForm::Rework("t".into())
+        );
+    }
+
+    /// Fresh-start removal failure, and a symlink at a session path
+    /// component, fail the launch `NonFailover` without writing the record.
+    #[cfg(unix)]
+    #[test]
+    fn external_session_removal_failure_is_non_failover() {
+        let h = session_harness("success", true);
+        h.seed("x-other", "stale", true, None);
+        let before = h.refs();
+        let mut deep = h.session_file();
+        for _ in 0..=128 {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let failure = prepare_external_worker_session_sync(
+            &h.config.db_path,
+            &h.config.session_base,
+            h.spec(),
+            h.task_id,
+            "x-ext",
+            &WorkerRunForm::Other,
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.disposition(),
+            runner::FailureDisposition::NonFailover
+        );
+        assert!(
+            failure.detail().contains("session file"),
+            "{}",
+            failure.detail()
+        );
+        assert_eq!(h.refs(), before, "a refused launch writes no record");
+
+        let target = h.dir.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::remove_dir_all(h.config.session_base.join(h.task_id.to_string())).unwrap();
+        std::os::unix::fs::symlink(&target, h.config.session_base.join(h.task_id.to_string()))
+            .unwrap();
+        let failure = prepare_external_worker_session_sync(
+            &h.config.db_path,
+            &h.config.session_base,
+            h.spec(),
+            h.task_id,
+            "x-ext",
+            &WorkerRunForm::Other,
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.disposition(),
+            runner::FailureDisposition::NonFailover
+        );
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        assert_eq!(h.refs(), before);
+    }
+
+    /// Runner change to a built-in runner: the worker entry is removed and
+    /// its session file unlinked; other slots are kept; a task without an
+    /// entry is untouched and no session directory is created.
+    #[cfg(unix)]
+    #[test]
+    fn built_in_launch_discards_only_the_worker_external_session() {
+        let h = session_harness("success", true);
+        assert!(discard_external_worker_session_sync(
+            &h.config.db_path,
+            &h.config.session_base,
+            h.task_id
+        )
+        .is_ok());
+        assert!(!h.config.session_base.exists());
+
+        h.seed_resumable();
+        h.edit_refs(|refs| {
+            runner_state::set_external_session(refs, ContinuationSlot::ReviewerR1, "x-ext", "f")
+        });
+        discard_external_worker_session_sync(&h.config.db_path, &h.config.session_base, h.task_id)
+            .unwrap();
+        assert!(h.worker_entry().is_none());
+        assert!(!h.session_file().exists());
+        assert!(runner_state::external_session(&h.refs(), ContinuationSlot::ReviewerR1).is_some());
+    }
+
+    /// External to Grok: the external launch removed the worker
+    /// continuation, so a fresh Grok worker is not refused; its launch drops
+    /// the external entry and unlinks the session file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_to_grok_runner_change_launches_and_drops_the_session() {
+        let mut h = session_harness("success", true);
+        h.edit_refs(|refs| {
+            runner_state::set_continuation(
+                refs,
+                ContinuationSlot::Worker,
+                &ContinuationIdentity {
+                    provider: "codex".into(),
+                    id: "thread-old".into(),
+                },
+            );
+        });
+        let external = dispatch_session_worker(&h).await;
+        external.kill_and_reap().await;
+        assert!(h.session_file().exists());
+        assert!(h.worker_entry().is_some());
+        assert_eq!(
+            grok_fresh_initial_launch_conflict(h.task_id, Some(&h.refs().to_string())),
+            None
+        );
+        // The task comes back for a new worker, now routed to Grok.
+        {
+            let conn = quorum_core::db::open(&h.config.db_path).unwrap();
+            // A new revision gets a new durable worker assignment.
+            conn.execute(
+                "UPDATE tasks SET status='open', assignee=NULL, revision=revision+1 WHERE id=?1",
+                [h.task_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE claims SET active=0 WHERE target=?1",
+                [format!("task#{}", h.task_id)],
+            )
+            .unwrap();
+        }
+        let grok = fake_stdin_holding_agent(h.dir.path(), "fake-grok");
+        h.config.agent_bin = Some(grok.to_string_lossy().into_owned());
+        h.config.model_profiles = std::collections::BTreeMap::from([(
+            "x-ext".into(),
+            crate::serve_config::ModelProfile {
+                runner: "grok".into(),
+                model: "grok-4.5".into(),
+                effort: "high".into(),
+            },
+        )]);
+        let (mut workers, spawned) = dispatch_retry_test_worker(&h.config).await;
+        assert!(spawned, "the Grok worker launches");
+        assert_eq!(workers[0].process_kind(), runner::AgentKind::Grok);
+        assert!(h.worker_entry().is_none());
+        assert!(!h.session_file().exists());
+        for worker in workers.drain(..) {
+            worker.kill_and_reap().await;
+        }
+    }
+
+    /// External dead turn -> provider retry -> delivery: the staged retry
+    /// turn names provider `external` and continuation `worker`, and clearing
+    /// it on delivery must not promote it into `runner_continuation`, so a
+    /// later fresh Grok worker is not refused (spec "Session record": the
+    /// external runner never writes `runner_continuation*`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_retry_delivery_does_not_promote_a_continuation_that_refuses_grok() {
+        let mut h = session_harness("success", true);
+        let dead = dispatch_session_worker(&h).await;
+        let agent = dead.agent_name.clone();
+        // The same pending turn the Phase 4 dead-turn branch builds.
+        let pending_turn = PendingTurn {
+            provider: dead.process_kind().to_string(),
+            model: dead.model.clone(),
+            effort: dead.effort.clone(),
+            prompt: dead.pending_prompt.clone(),
+            turn_kind: dead.pending_turn_kind.clone(),
+            continuation_id: dead.continuation_id.clone(),
+            requested: false,
+        };
+        dead.kill_and_reap().await;
+        assert_eq!(pending_turn.provider, "external");
+        assert_eq!(pending_turn.continuation_id.as_deref(), Some("worker"));
+        let disposition = dispose_dead_turn_runner_worker(
+            &h.config.db_path,
+            h.task_id,
+            &agent,
+            "runner provider/protocol failure",
+            &pending_turn,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            disposition,
+            tasks::DeadTurnRunnerDisposition::ProviderBlocked
+        );
+        assert_eq!(
+            h.refs()[runner_state::RETRY_REF]["continuation_id"],
+            "worker"
+        );
+        {
+            let mut conn = quorum_core::db::open(&h.config.db_path).unwrap();
+            tasks::retry_provider_blocked(&mut conn, h.task_id, "owner", now_unix())
+                .unwrap()
+                .expect("the parked external turn is retried");
+        }
+
+        let retried = dispatch_session_worker(&h).await;
+        let retried_agent = retried.agent_name.clone();
+        retried.kill_and_reap().await;
+        assert!(h.refs().get(runner_state::RETRY_REF).is_some());
+        fire_event_result(
+            &h.config.db_path,
+            &retried_agent,
+            h.task_id,
+            &Event::SignaledDone { pr: "77".into() },
+        )
+        .await
+        .unwrap();
+        let refs = h.refs();
+        assert!(refs.get(runner_state::RETRY_REF).is_none(), "{refs}");
+        assert!(refs.get(runner_state::CONTINUATION_REF).is_none(), "{refs}");
+        assert_eq!(
+            grok_fresh_initial_launch_conflict(h.task_id, Some(&refs.to_string())),
+            None
+        );
+
+        {
+            let conn = quorum_core::db::open(&h.config.db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='open', assignee=NULL, revision=revision+1 WHERE id=?1",
+                [h.task_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE claims SET active=0 WHERE target=?1",
+                [format!("task#{}", h.task_id)],
+            )
+            .unwrap();
+        }
+        let grok = fake_stdin_holding_agent(h.dir.path(), "fake-grok");
+        h.config.agent_bin = Some(grok.to_string_lossy().into_owned());
+        h.config.model_profiles = std::collections::BTreeMap::from([(
+            "x-ext".into(),
+            crate::serve_config::ModelProfile {
+                runner: "grok".into(),
+                model: "grok-4.5".into(),
+                effort: "high".into(),
+            },
+        )]);
+        let (mut workers, spawned) = dispatch_retry_test_worker(&h.config).await;
+        assert!(
+            spawned,
+            "the Grok worker launches after an external retry delivery"
+        );
+        assert_eq!(workers[0].process_kind(), runner::AgentKind::Grok);
+        for worker in workers.drain(..) {
+            worker.kill_and_reap().await;
+        }
+    }
+
+    /// Rework fed to a live external slot resumes with the turn text; after
+    /// the declaration fingerprint changes it starts fresh with the full role
+    /// prompt followed by the turn.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_rework_feed_resumes_then_starts_fresh_on_fingerprint_change() {
+        let h = session_harness("success", true);
+        let mut slot = dispatch_session_worker(&h).await;
+        assert_eq!(h.observed(1, "session"), "absent");
+        slot.pr = Some(7);
+        let turn = "Review feedback:\n- handle the empty case\n";
+        feed_worker_turn(&mut slot, turn, &h.config).await.unwrap();
+        wait_for_worker_exit(&mut slot).await;
+        assert_eq!(h.observed(2, "session"), "7");
+        assert_eq!(h.observed(2, "prompt"), turn);
+        assert_eq!(
+            h.journal_provider_and_continuation(&slot.agent_name),
+            ("external".into(), Some("worker".into()))
+        );
+
+        h.seed("x-ext", "0123abcd", true, None);
+        feed_worker_turn(&mut slot, turn, &h.config).await.unwrap();
+        wait_for_worker_exit(&mut slot).await;
+        assert_eq!(h.observed(3, "session"), "absent");
+        assert_eq!(
+            h.observed(3, "prompt"),
+            expected_fresh_prompt(&h, &slot.agent_name, Some(turn)).await
+        );
+        assert_eq!(h.worker_entry().unwrap().fingerprint, h.spec().fingerprint);
+        slot.kill_and_reap().await;
+    }
+
+    /// A resume that ends before any protocol line marks the entry unusable
+    /// through the daemon's normal tick; one that wrote protocol lines leaves
+    /// it unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn external_silent_resume_marks_the_session_unusable_through_the_tick() {
+        std::thread::Builder::new()
+            .name("external-session-tick".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        external_session_tick_case("refuse_resume", false).await;
+                        external_session_tick_case("success", true).await;
+                    })
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn external_session_tick_case(scenario: &str, usable_after: bool) {
+        let h = session_harness(scenario, true);
+        h.seed_resumable();
+        h.restore_needs_info(None);
+        let slot = dispatch_session_worker(&h).await;
+        assert_eq!(h.observed(1, "session"), "13", "{scenario}");
+        let agent_name = slot.agent_name.clone();
+        let mut workers = vec![slot];
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named(&agent_name).unwrap();
+        let mut reviewers = Vec::new();
+        let mut lifetime_roster = LifetimeRoster::new();
+        lifetime_roster.register(&agent_name);
+        tick(
+            &h.config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+            &mut branch_sync::BranchSyncChecks::default(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut PoisonTracker::new(),
+            &mut ClaimSkipLogLimiter::new(),
+            &mut ClaimSkipLogLimiter::new(),
+            &mut UnrecordableStrikes::new(),
+            &mut ReviewerRespawnBackoff::new(),
+            &mut ProfileCooldown::new(),
+            &mut ReviewerSlotQueue::default(),
+            &mut DrainState::new(),
+            &mut lifetime_roster,
+            &mut None,
+            &mut DecompositionCoordinator::default(),
+            &mut 0,
+            &mut None,
+            &mut None,
+            &mut std::collections::HashSet::new(),
+            &collector::CollectorTracker::default(),
+            &std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(h.runs(), 1, "{scenario}: no further run within the tick");
+        let entry = h.worker_entry().expect("the record survives the failure");
+        assert_eq!(entry.usable, usable_after, "{scenario}");
+        assert_eq!(entry.profile, "x-ext");
+        for worker in workers.drain(..) {
+            worker.kill_and_reap().await;
+        }
     }
 }

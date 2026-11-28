@@ -489,6 +489,12 @@ impl ExternalProc {
         self.failures.observed_failure()
     }
 
+    /// Whether this run wrote at least one protocol line (spec "Resume or
+    /// fresh start": a resume that ends before any marks its session unusable).
+    pub fn saw_protocol_line(&self) -> bool {
+        self.stream.saw_protocol_line()
+    }
+
     /// The turn's blocked outcome, once the exit check released it.
     pub fn runner_blocked(&self) -> Option<&RunnerBlocked> {
         self.blocked.as_ref()
