@@ -3,7 +3,7 @@
 //! process; the process adapter applies the results to its command.
 //!
 //! Contract: `docs/2026-11-20-external-cli-runner-technical-spec.md`,
-//! "Access levels" and "Launch".
+//! "Access levels", "Launch", "Roles", and "Sessions".
 //!
 //! Metadata-only: the prompt never enters argv (the adapter writes it to
 //! stdin), no placeholder carries the run capability, and failure details
@@ -13,10 +13,19 @@ use super::runner::{
     AgentMcpRole, FailureDisposition, LaunchRequest, ManagedRunEnv, RunnerFailure,
     AGENT_MCP_URL_ENV, MANAGED_RUN_REMOVED_ENV,
 };
+use super::session_store::SESSION_FILE;
 use crate::external_runner_spec::{
     AccessLevel, ArgPart, ArgTemplate, EnvSource, ExternalSpec, Placeholder,
 };
+use std::path::Path;
 use tokio::process::Command;
+
+/// Spec "Launch": a slot run's process receives its slot directory under this
+/// name. The daemon supplies it as a launch environment entry on slot runs;
+/// the adapter honors it only for a slot role with sessions enabled and
+/// withholds it from every other run. The `QUORUM_` prefix keeps the
+/// operator's `env` table from setting it.
+pub const SESSION_DIR_ENV: &str = "QUORUM_SESSION_DIR";
 
 /// Names a declared mapping may never set. Startup validation
 /// (`external_runner_spec.rs`, `check_env_name`) already refuses them; this
@@ -48,6 +57,33 @@ fn launch_failure(detail: impl Into<String>) -> RunnerFailure {
     )
 }
 
+/// Spec "Roles": the worker and reviewer launches are the slot runs
+/// (`worker`, `reviewer-r1`, `reviewer-r2`). Planner and unmanaged launches
+/// (classifier, arbiter, collector) have no slot.
+fn has_slot(managed: Option<AgentMcpRole>) -> bool {
+    matches!(managed, Some(AgentMcpRole::Worker | AgentMcpRole::Reviewer))
+}
+
+/// Spec "Sessions": the slot directory in effect for this run, present only
+/// when sessions are enabled (`args_session` declared), the run has a slot,
+/// and the daemon supplied the directory. The daemon never touches the
+/// session file here; this only forms its path.
+fn session_dir<'a>(
+    spec: &ExternalSpec,
+    request: &LaunchRequest<'a>,
+) -> Result<Option<&'a str>, RunnerFailure> {
+    if spec.args_session.is_none() || !has_slot(request.managed.map(|m| m.role)) {
+        return Ok(None);
+    }
+    match env_value(request.environment, SESSION_DIR_ENV) {
+        Some(dir) if Path::new(dir).is_absolute() => Ok(Some(dir)),
+        Some(_) => Err(launch_failure(format!(
+            "{SESSION_DIR_ENV} must be an absolute path"
+        ))),
+        None => Ok(None),
+    }
+}
+
 /// The effective (last, as `Command::env` applies them) non-empty value of
 /// `name` in a launch environment.
 fn env_value<'a>(environment: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -65,6 +101,7 @@ struct ArgValues<'a> {
     model: &'a str,
     effort: &'a str,
     agent_mcp_url: Option<&'a str>,
+    session_file: Option<String>,
 }
 
 /// Substitute one parsed element. `{{`/`}}` escapes were resolved to literal
@@ -95,19 +132,22 @@ fn substitute(
                     )))
                 }
             },
-            // Sessions are a later slice; validation refuses `args_session`.
-            ArgPart::Placeholder(Placeholder::SessionFile) => {
-                return Err(launch_failure(format!(
-                    "placeholder {{session_file}} is not supported, found in external_runner.{list}"
-                )))
-            }
+            ArgPart::Placeholder(Placeholder::SessionFile) => match &values.session_file {
+                Some(path) if list == "args_session" => out.push_str(path),
+                _ => {
+                    return Err(launch_failure(format!(
+                        "placeholder {{session_file}} is allowed only in external_runner.args_session, found in external_runner.{list}"
+                    )))
+                }
+            },
         }
     }
     Ok(out)
 }
 
 /// Spec "Launch": `args`, then the access level's `args_*` list, then
-/// `args_mcp` when the run is wired to the agent MCP. The result is a direct
+/// `args_mcp` when the run is wired to the agent MCP, then `args_session`
+/// when the run has a slot and sessions are enabled. The result is a direct
 /// argv vector (after the program) for a command started without a shell.
 pub fn argv(
     spec: &ExternalSpec,
@@ -119,6 +159,16 @@ pub fn argv(
         .to_str()
         .ok_or_else(|| launch_failure("the run's workspace path is not valid UTF-8"))?;
     let wired = wired_to_agent_mcp(managed);
+    let session_dir = session_dir(spec, request)?;
+    let session_file = session_dir
+        .map(|dir| {
+            Path::new(dir)
+                .join(SESSION_FILE)
+                .into_os_string()
+                .into_string()
+                .map_err(|_| launch_failure("the slot session file path is not valid UTF-8"))
+        })
+        .transpose()?;
     let values = ArgValues {
         workspace,
         model: request.model,
@@ -128,6 +178,7 @@ pub fn argv(
         } else {
             None
         },
+        session_file,
     };
     let (access_name, access_list) = match access_level(managed) {
         AccessLevel::ReadWrite => ("args_read_write", &spec.args_read_write),
@@ -145,6 +196,9 @@ pub fn argv(
             .as_ref()
             .ok_or_else(|| launch_failure("external_runner.args_mcp is not declared"))?;
         lists.push(("args_mcp", mcp));
+    }
+    if let (Some(_), Some(session)) = (session_dir, &spec.args_session) {
+        lists.push(("args_session", session));
     }
     let mut out = Vec::new();
     for (list, args) in lists {
@@ -164,13 +218,20 @@ fn refused_env_name(name: &str) -> bool {
 /// Spec "Launch": today's managed run environment (as given by the launch
 /// request), followed by the declared `env` mappings. A mapping whose run
 /// field is absent from this run (for example the run capability of an
-/// unmanaged launch) is omitted. [`configure_environment`] applies
+/// unmanaged launch) is omitted. [`SESSION_DIR_ENV`] is kept only for a slot
+/// run with sessions enabled. [`configure_environment`] applies
 /// `ManagedRunEnv` after these.
 pub fn environment(
     spec: &ExternalSpec,
     request: &LaunchRequest<'_>,
 ) -> Result<Vec<(String, String)>, RunnerFailure> {
-    let mut out = request.environment.to_vec();
+    let keep_session_dir = session_dir(spec, request)?.is_some();
+    let mut out: Vec<(String, String)> = request
+        .environment
+        .iter()
+        .filter(|(key, _)| keep_session_dir || key != SESSION_DIR_ENV)
+        .cloned()
+        .collect();
     for (name, source) in &spec.env {
         if refused_env_name(name) {
             return Err(launch_failure(format!(
@@ -191,14 +252,20 @@ pub fn environment(
 }
 
 /// Apply the layered environment to `command`, with `ManagedRunEnv` last so
-/// its removals and private `GH_CONFIG_DIR` win over every earlier layer.
+/// its removals and private `GH_CONFIG_DIR` win over every earlier layer. A
+/// run without a slot directory never inherits [`SESSION_DIR_ENV`] from the
+/// daemon's own environment either.
 pub(crate) fn configure_environment(
     command: &mut Command,
     spec: &ExternalSpec,
     request: &LaunchRequest<'_>,
     run_env: &ManagedRunEnv,
 ) -> Result<(), RunnerFailure> {
-    command.envs(environment(spec, request)?);
+    let environment = environment(spec, request)?;
+    if !environment.iter().any(|(key, _)| key == SESSION_DIR_ENV) {
+        command.env_remove(SESSION_DIR_ENV);
+    }
+    command.envs(environment);
     run_env.apply(command);
     Ok(())
 }
@@ -206,7 +273,10 @@ pub(crate) fn configure_environment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::external_runner_spec::{tests::VALID, ExternalRunnerFile};
+    use crate::external_runner_spec::{
+        tests::{with_session, VALID},
+        ExternalRunnerFile,
+    };
     use crate::serve::runner::{AgentKind, LaunchMode, ManagedLaunch};
     use std::collections::HashMap;
     use std::ffi::OsStr;
@@ -408,17 +478,135 @@ mod tests {
         assert_eq!(got.len(), BASE.len() + 2);
     }
 
+    const SLOT_DIR: &str = "/state/sessions/7/worker";
+
+    fn slot_env() -> Vec<(String, String)> {
+        let mut env = managed_env();
+        env.push((SESSION_DIR_ENV.into(), SLOT_DIR.into()));
+        env
+    }
+
+    const ALL_ROLES: [Option<AgentMcpRole>; 4] = [
+        Some(AgentMcpRole::Worker),
+        Some(AgentMcpRole::Reviewer),
+        Some(AgentMcpRole::Planner),
+        None,
+    ];
+
     #[test]
-    fn session_file_placeholder_is_refused() {
-        let mut spec = spec_from(VALID);
+    fn slot_runs_append_args_session_last_and_keep_the_slot_dir() {
+        let spec = spec_from(&with_session());
+        let env = slot_env();
+        for (role, tail) in [
+            (
+                AgentMcpRole::Worker,
+                ["--tools", "read-write", "--mcp-url", URL],
+            ),
+            (
+                AgentMcpRole::Reviewer,
+                ["--tools", "read-only", "--mcp-url", URL],
+            ),
+        ] {
+            let req = request(Some(role), &env);
+            let got = argv(&spec, &req).unwrap();
+            let want: Vec<String> = BASE
+                .iter()
+                .chain(&tail)
+                .chain(&["--session", "/state/sessions/7/worker/session"])
+                .map(|s| s.to_string())
+                .collect();
+            assert_eq!(got, want, "role {role:?}");
+            let got = environment(&spec, &req).unwrap();
+            assert_eq!(&got[..env.len()], &env[..], "{role:?}");
+        }
+    }
+
+    #[test]
+    fn non_slot_runs_get_no_session_args_or_dir() {
+        // Planner, classifier, arbiter, and collector have no slot: even a
+        // supplied directory yields neither session argv nor the variable.
+        let spec = spec_from(&with_session());
+        let env = slot_env();
+        for role in [Some(AgentMcpRole::Planner), None] {
+            let req = request(role, &env);
+            let got = argv(&spec, &req).unwrap();
+            assert!(!got.iter().any(|a| a == "--session" || a.contains(SLOT_DIR)));
+            assert_eq!(got, argv(&spec_from(VALID), &req).unwrap(), "{role:?}");
+            let got = environment(&spec, &req).unwrap();
+            assert!(!got.iter().any(|(k, _)| k == SESSION_DIR_ENV), "{role:?}");
+        }
+    }
+
+    #[test]
+    fn sessions_disabled_or_no_slot_dir_is_todays_launch() {
+        // Without `args_session`, argv and environment are byte-identical to
+        // a run that never carried a slot directory.
+        let spec = spec_from(VALID);
+        let (plain, slot) = (managed_env(), slot_env());
+        for role in ALL_ROLES {
+            let today = request(role, &plain);
+            let with_dir = request(role, &slot);
+            assert_eq!(
+                argv(&spec, &with_dir).unwrap(),
+                argv(&spec, &today).unwrap()
+            );
+            assert_eq!(
+                environment(&spec, &with_dir).unwrap(),
+                environment(&spec, &today).unwrap()
+            );
+            let got = environment(&spec, &today).unwrap();
+            assert_eq!(&got[..plain.len()], &plain[..]);
+            assert!(!got.iter().any(|(k, _)| k == SESSION_DIR_ENV));
+        }
+        // Sessions enabled, but the daemon supplied no slot directory.
+        let session_spec = spec_from(&with_session());
+        for role in ALL_ROLES {
+            let req = request(role, &plain);
+            assert_eq!(
+                argv(&session_spec, &req).unwrap(),
+                argv(&spec, &req).unwrap()
+            );
+            assert_eq!(
+                environment(&session_spec, &req).unwrap(),
+                environment(&spec, &req).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn relative_slot_dir_is_refused_without_echoing_it() {
+        let spec = spec_from(&with_session());
+        let mut env = managed_env();
+        env.push((SESSION_DIR_ENV.into(), "rel/slot-xyz".into()));
+        let req = request(Some(AgentMcpRole::Worker), &env);
+        for err in [
+            argv(&spec, &req).unwrap_err(),
+            environment(&spec, &req).unwrap_err(),
+        ] {
+            assert_eq!(
+                err.detail(),
+                "external runner launch refused: QUORUM_SESSION_DIR must be an absolute path"
+            );
+            assert_eq!(err.disposition(), FailureDisposition::NonFailover);
+        }
+    }
+
+    #[test]
+    fn session_file_placeholder_outside_args_session_is_refused() {
+        // Validation refuses this; a spec that bypassed it is refused at
+        // launch whether or not the run has a slot directory.
+        let mut spec = spec_from(&with_session());
         spec.args.push(ArgTemplate(vec![ArgPart::Placeholder(
             Placeholder::SessionFile,
         )]));
-        let err = argv(&spec, &request(None, &[])).unwrap_err();
-        assert_eq!(
-            err.detail(),
-            "external runner launch refused: placeholder {session_file} is not supported, found in external_runner.args"
-        );
+        let env = slot_env();
+        for role in ALL_ROLES {
+            let err = argv(&spec, &request(role, &env)).unwrap_err();
+            assert_eq!(
+                err.detail(),
+                "external runner launch refused: placeholder {session_file} is allowed only in external_runner.args_session, found in external_runner.args"
+            );
+        }
     }
 
     #[test]
@@ -503,6 +691,24 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn slot_dir_survives_managed_run_env_and_is_withheld_otherwise() {
+        let spec = spec_from(&with_session());
+        let env = slot_env();
+        for role in ALL_ROLES {
+            let run_env = ManagedRunEnv::create().unwrap();
+            let mut command = Command::new("/bin/true");
+            configure_environment(&mut command, &spec, &request(role, &env), &run_env).unwrap();
+            let envs: HashMap<&OsStr, Option<&OsStr>> = command.as_std().get_envs().collect();
+            let want = match role {
+                Some(AgentMcpRole::Worker | AgentMcpRole::Reviewer) => Some(OsStr::new(SLOT_DIR)),
+                // Explicitly removed, so not inherited from the daemon either.
+                _ => None,
+            };
+            assert_eq!(envs[OsStr::new(SESSION_DIR_ENV)], want, "{role:?}");
+        }
+    }
+
     #[test]
     fn refused_names_never_reach_the_child() {
         let env = managed_env();
@@ -513,6 +719,7 @@ mod tests {
             "GH_TOKEN",
             "QUORUM_HOME",
             "QUORUM_RUN_ID",
+            SESSION_DIR_ENV,
             "LD_PRELOAD",
             "DYLD_INSERT_LIBRARIES",
         ] {
