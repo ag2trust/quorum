@@ -13,6 +13,9 @@ pub const REVIEWER_R2_CONTINUATION_REF: &str = "runner_reviewer_r2_continuation"
 pub const PROVIDER_BLOCK_REF: &str = "runner_provider_block";
 pub const RETRY_REF: &str = "runner_retry";
 pub const INITIAL_WORKER_SESSION_REF: &str = "runner_initial_worker_session";
+/// Provider name recorded on pending turns and journal rows for external-CLI
+/// runs. Such turns never own a `runner_continuation*` identity.
+pub const EXTERNAL_PROVIDER: &str = "external";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContinuationIdentity {
@@ -304,10 +307,16 @@ pub fn clear_provider_retry(refs: &mut Value) {
     // A successful retried turn can race the provider's repeated session event.
     // Preserve the already-durable retry continuation before removing the
     // round-scoped pending turn, so later remediation still resumes exactly.
+    // An external-runner turn is never promoted: its continuation_id is the
+    // slot name, its session lives in `runner_external_sessions`, and the
+    // external runner never writes `runner_continuation*` (spec "Session
+    // record"). Promoting it would make a later built-in launch see a stale
+    // foreign continuation.
     if refs.get(CONTINUATION_REF).is_none() {
         let retry_continuation = refs
             .get(RETRY_REF)
             .and_then(|value| serde_json::from_value::<PendingTurn>(value.clone()).ok())
+            .filter(|turn| turn.provider != EXTERNAL_PROVIDER)
             .and_then(|turn| {
                 turn.continuation_id.map(|id| ContinuationIdentity {
                     provider: turn.provider,
@@ -884,6 +893,25 @@ mod tests {
         clear_provider_retry(&mut refs);
         assert_eq!(refs[EXTERNAL_SESSIONS_REF], sessions);
         assert_eq!(refs[CONTINUATION_REF]["id"], "thread-new");
+    }
+
+    #[test]
+    fn clear_provider_retry_never_promotes_external_turn_to_continuation() {
+        let sessions = serde_json::json!({
+            "worker": {"profile": "p", "fingerprint": "f", "usable": true}
+        });
+        let mut refs = serde_json::json!({
+            EXTERNAL_SESSIONS_REF: sessions.clone(),
+            RETRY_REF: {
+                "provider": EXTERNAL_PROVIDER, "model": "m", "effort": "high",
+                "prompt": "finish", "turn_kind": "rework",
+                "continuation_id": "worker", "requested": true
+            }
+        });
+        clear_provider_retry(&mut refs);
+        assert!(refs.get(CONTINUATION_REF).is_none(), "{refs}");
+        assert!(refs.get(RETRY_REF).is_none(), "{refs}");
+        assert_eq!(refs[EXTERNAL_SESSIONS_REF], sessions);
     }
 
     fn entry(usable: bool) -> ExternalSessionEntry {

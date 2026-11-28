@@ -78871,6 +78871,109 @@ exec /bin/cat '{stdout}'
         }
     }
 
+    /// External dead turn -> provider retry -> delivery: the staged retry
+    /// turn names provider `external` and continuation `worker`, and clearing
+    /// it on delivery must not promote it into `runner_continuation`, so a
+    /// later fresh Grok worker is not refused (spec "Session record": the
+    /// external runner never writes `runner_continuation*`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_retry_delivery_does_not_promote_a_continuation_that_refuses_grok() {
+        let mut h = session_harness("success", true);
+        let dead = dispatch_session_worker(&h).await;
+        let agent = dead.agent_name.clone();
+        // The same pending turn the Phase 4 dead-turn branch builds.
+        let pending_turn = PendingTurn {
+            provider: dead.process_kind().to_string(),
+            model: dead.model.clone(),
+            effort: dead.effort.clone(),
+            prompt: dead.pending_prompt.clone(),
+            turn_kind: dead.pending_turn_kind.clone(),
+            continuation_id: dead.continuation_id.clone(),
+            requested: false,
+        };
+        dead.kill_and_reap().await;
+        assert_eq!(pending_turn.provider, "external");
+        assert_eq!(pending_turn.continuation_id.as_deref(), Some("worker"));
+        let disposition = dispose_dead_turn_runner_worker(
+            &h.config.db_path,
+            h.task_id,
+            &agent,
+            "runner provider/protocol failure",
+            &pending_turn,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            disposition,
+            tasks::DeadTurnRunnerDisposition::ProviderBlocked
+        );
+        assert_eq!(
+            h.refs()[runner_state::RETRY_REF]["continuation_id"],
+            "worker"
+        );
+        {
+            let mut conn = quorum_core::db::open(&h.config.db_path).unwrap();
+            tasks::retry_provider_blocked(&mut conn, h.task_id, "owner", now_unix())
+                .unwrap()
+                .expect("the parked external turn is retried");
+        }
+
+        let retried = dispatch_session_worker(&h).await;
+        let retried_agent = retried.agent_name.clone();
+        retried.kill_and_reap().await;
+        assert!(h.refs().get(runner_state::RETRY_REF).is_some());
+        fire_event_result(
+            &h.config.db_path,
+            &retried_agent,
+            h.task_id,
+            &Event::SignaledDone { pr: "77".into() },
+        )
+        .await
+        .unwrap();
+        let refs = h.refs();
+        assert!(refs.get(runner_state::RETRY_REF).is_none(), "{refs}");
+        assert!(refs.get(runner_state::CONTINUATION_REF).is_none(), "{refs}");
+        assert_eq!(
+            grok_fresh_initial_launch_conflict(h.task_id, Some(&refs.to_string())),
+            None
+        );
+
+        {
+            let conn = quorum_core::db::open(&h.config.db_path).unwrap();
+            conn.execute(
+                "UPDATE tasks SET status='open', assignee=NULL, revision=revision+1 WHERE id=?1",
+                [h.task_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE claims SET active=0 WHERE target=?1",
+                [format!("task#{}", h.task_id)],
+            )
+            .unwrap();
+        }
+        let grok = fake_stdin_holding_agent(h.dir.path(), "fake-grok");
+        h.config.agent_bin = Some(grok.to_string_lossy().into_owned());
+        h.config.model_profiles = std::collections::BTreeMap::from([(
+            "x-ext".into(),
+            crate::serve_config::ModelProfile {
+                runner: "grok".into(),
+                model: "grok-4.5".into(),
+                effort: "high".into(),
+            },
+        )]);
+        let (mut workers, spawned) = dispatch_retry_test_worker(&h.config).await;
+        assert!(
+            spawned,
+            "the Grok worker launches after an external retry delivery"
+        );
+        assert_eq!(workers[0].process_kind(), runner::AgentKind::Grok);
+        for worker in workers.drain(..) {
+            worker.kill_and_reap().await;
+        }
+    }
+
     /// Rework fed to a live external slot resumes with the turn text; after
     /// the declaration fingerprint changes it starts fresh with the full role
     /// prompt followed by the turn.
