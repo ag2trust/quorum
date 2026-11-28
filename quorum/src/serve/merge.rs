@@ -138,6 +138,61 @@ pub fn apply_required_jobs_gate(
 
 const REQUIRED_JOBS_PENDING_PREFIX: &str = "required jobs still pending: ";
 
+/// Issue status [`validate_required_jobs`] records for a required job missing
+/// from the rollup.
+const REQUIRED_JOB_ABSENT: &str = "absent";
+
+/// Pre-review classification of an exact-head required-jobs snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreReviewRequiredJobs {
+    Ready,
+    /// A required job reached a terminal non-SUCCESS conclusion (or the
+    /// snapshot could not be read); names exclude merely absent jobs.
+    Failed {
+        failing_checks: Vec<String>,
+    },
+    /// Some required jobs are still running, or the rollup is for another head.
+    Pending {
+        reason: String,
+    },
+    /// Every issue is a required job missing from the rollup: CI has not
+    /// registered it yet. Absence is not worker-actionable, so it never fails.
+    Unregistered {
+        missing_jobs: Vec<String>,
+    },
+}
+
+/// Pre-review counterpart of [`apply_required_jobs_gate`]. GitHub can report a
+/// CLEAN or empty rollup seconds after a push, before CI registers its jobs, so
+/// an absent required job is pending here rather than failed. A real terminal
+/// non-SUCCESS conclusion still fails, even when other jobs are absent. The
+/// merge-time and branch-sync gates keep [`apply_required_jobs_gate`].
+pub fn classify_pre_review_required_jobs(required: RequiredJobsOutcome) -> PreReviewRequiredJobs {
+    match required {
+        RequiredJobsOutcome::AllSucceeded => PreReviewRequiredJobs::Ready,
+        RequiredJobsOutcome::Pending { pending_jobs } => PreReviewRequiredJobs::Pending {
+            reason: format!("{REQUIRED_JOBS_PENDING_PREFIX}{}", pending_jobs.join(", ")),
+        },
+        RequiredJobsOutcome::NotReady { issues } => {
+            let (missing, failing): (Vec<_>, Vec<_>) = issues
+                .into_iter()
+                .partition(|(_, status)| status == REQUIRED_JOB_ABSENT);
+            if failing.is_empty() {
+                PreReviewRequiredJobs::Unregistered {
+                    missing_jobs: missing.into_iter().map(|(name, _)| name).collect(),
+                }
+            } else {
+                PreReviewRequiredJobs::Failed {
+                    failing_checks: failing
+                        .into_iter()
+                        .map(|(name, status)| format!("{name} ({status})"))
+                        .collect(),
+                }
+            }
+        }
+    }
+}
+
 /// Pending required-job names recovered from a `Pending` reason produced by
 /// [`apply_required_jobs_gate`]. Returns `None` for any other pending reason
 /// (e.g. a timed-out rollup wait) so the caller can ask the provider instead.
@@ -909,7 +964,7 @@ pub fn validate_required_jobs(checks_json: &str, required_jobs: &[String]) -> Re
 
     for job in required_jobs {
         match checks.iter().find(|(name, _, _)| *name == job.as_str()) {
-            None => issues.push((job.clone(), "absent".to_string())),
+            None => issues.push((job.clone(), REQUIRED_JOB_ABSENT.to_string())),
             Some((_, status, _)) if *status != "COMPLETED" => pending.push(job.clone()),
             Some((_, _, conclusion)) if *conclusion != "SUCCESS" => {
                 issues.push((job.clone(), conclusion.to_string()));
@@ -5451,6 +5506,110 @@ exit "$code"
                 failing_checks: vec!["clippy".into()]
             },
             "required-job success must not erase a general check failure"
+        );
+    }
+
+    fn pre_review_jobs(json: &str, head: &str, jobs: &[&str]) -> PreReviewRequiredJobs {
+        let jobs: Vec<String> = jobs.iter().map(|job| job.to_string()).collect();
+        classify_pre_review_required_jobs(required_jobs_for_head(json, Some(head), &jobs))
+    }
+
+    #[test]
+    fn pre_review_required_jobs_clean_empty_rollup_is_unregistered_not_failed() {
+        // #474: GitHub reported CLEAN with an empty rollup seconds after push.
+        let json = r#"{"mergeStateStatus":"CLEAN","headRefOid":"h1","statusCheckRollup":[]}"#;
+        assert_eq!(
+            checks_query_for_head(json, Some("h1")),
+            ChecksQueryResult::AllPassed,
+            "precondition: the CLEAN short-circuit still reaches the required-jobs gate"
+        );
+        assert_eq!(
+            pre_review_jobs(json, "h1", &["fmt", "test"]),
+            PreReviewRequiredJobs::Unregistered {
+                missing_jobs: vec!["fmt".into(), "test".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn pre_review_required_jobs_in_progress_and_absent_is_pending() {
+        let json = r#"{"headRefOid":"h1","statusCheckRollup":[
+            {"name":"fmt","status":"IN_PROGRESS","conclusion":""}
+        ]}"#;
+        assert_eq!(
+            pre_review_jobs(json, "h1", &["fmt", "test"]),
+            PreReviewRequiredJobs::Pending {
+                reason: "required jobs still pending: fmt".into()
+            }
+        );
+    }
+
+    #[test]
+    fn pre_review_required_jobs_failure_is_not_hidden_by_absence() {
+        let json = r#"{"headRefOid":"h1","statusCheckRollup":[
+            {"name":"fmt","status":"COMPLETED","conclusion":"FAILURE"}
+        ]}"#;
+        assert_eq!(
+            pre_review_jobs(json, "h1", &["fmt", "test"]),
+            PreReviewRequiredJobs::Failed {
+                failing_checks: vec!["fmt (FAILURE)".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn pre_review_required_jobs_skipped_or_neutral_still_fails() {
+        for conclusion in ["SKIPPED", "NEUTRAL"] {
+            let json = format!(
+                r#"{{"headRefOid":"h1","statusCheckRollup":[
+                    {{"name":"fmt","status":"COMPLETED","conclusion":"{conclusion}"}},
+                    {{"name":"test","status":"COMPLETED","conclusion":"SUCCESS"}}
+                ]}}"#
+            );
+            assert_eq!(
+                pre_review_jobs(&json, "h1", &["fmt", "test"]),
+                PreReviewRequiredJobs::Failed {
+                    failing_checks: vec![format!("fmt ({conclusion})")]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn pre_review_required_jobs_success_other_head_and_query_failure() {
+        let green = r#"{"headRefOid":"h1","statusCheckRollup":[
+            {"name":"fmt","status":"COMPLETED","conclusion":"SUCCESS"}
+        ]}"#;
+        assert_eq!(
+            pre_review_jobs(green, "h1", &["fmt"]),
+            PreReviewRequiredJobs::Ready
+        );
+        assert!(
+            matches!(
+                pre_review_jobs(green, "h2", &["fmt"]),
+                PreReviewRequiredJobs::Pending { .. }
+            ),
+            "a rollup for another head is pending, never ready or failed"
+        );
+        assert!(
+            matches!(
+                pre_review_jobs(
+                    r#"{"headRefOid":"h1","statusCheckRollup":[]}"#,
+                    "h2",
+                    &["fmt"]
+                ),
+                PreReviewRequiredJobs::Pending { .. }
+            ),
+            "an empty rollup for another head is pending, not unregistered"
+        );
+        assert_eq!(
+            classify_pre_review_required_jobs(RequiredJobsOutcome::NotReady {
+                issues: vec![("fmt".into(), "query failed".into())]
+            }),
+            PreReviewRequiredJobs::Failed {
+                failing_checks: vec!["fmt (query failed)".into()]
+            },
+            "only absence is reclassified"
         );
     }
 

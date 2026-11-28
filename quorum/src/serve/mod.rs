@@ -591,6 +591,11 @@ struct PreReviewChecksEntry {
     // First poll at which GitHub reported a strict ancestor of the
     // daemon-recorded PR head (read-after-write lag after our own push).
     head_lag_since: Option<std::time::Instant>,
+    // When this entry first saw `head_sha`; a new head creates a new entry.
+    // Bounds how long required jobs may stay unregistered before one owner
+    // alert ([`notify_pre_review_required_jobs_unregistered`]).
+    head_first_seen: std::time::Instant,
+    unregistered_alerted: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -10995,6 +11000,8 @@ async fn poll_pre_review_checks(
                 consecutive_timeouts: 0,
                 timeout_alerted: false,
                 head_lag_since: None,
+                head_first_seen: std::time::Instant::now(),
+                unregistered_alerted: false,
             },
         );
         log(&format!(
@@ -11015,6 +11022,8 @@ async fn poll_pre_review_checks(
         mut consecutive_timeouts,
         mut timeout_alerted,
         head_lag_since,
+        head_first_seen,
+        mut unregistered_alerted,
     } = entry;
     let PreReviewChecksState::Waiting(handle) = state else {
         return Ok(PreReviewChecksGate::Ready);
@@ -11057,18 +11066,44 @@ async fn poll_pre_review_checks(
             })
             .await
             .map_err(|error| QuorumError::Io(format!("pre-review required jobs join: {error}")))?;
-            match merge::apply_required_jobs_gate(merge::ChecksOutcome::Ready, required) {
-                merge::ChecksOutcome::Ready => PreReviewChecksGate::Ready,
-                merge::ChecksOutcome::Failed { failing_checks } => {
+            // A CLEAN or empty rollup right after a push can precede CI job
+            // registration: absent required jobs wait, only terminal
+            // non-SUCCESS conclusions fail (#474).
+            match merge::classify_pre_review_required_jobs(required) {
+                merge::PreReviewRequiredJobs::Ready => PreReviewChecksGate::Ready,
+                merge::PreReviewRequiredJobs::Failed { failing_checks } => {
                     PreReviewChecksGate::Failed { failing_checks }
                 }
-                merge::ChecksOutcome::Pending { reason } => {
+                merge::PreReviewRequiredJobs::Pending { reason } => {
                     log(&format!(
                         "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} — {reason}"
                     ));
                     PreReviewChecksGate::Waiting
                 }
-                merge::ChecksOutcome::TimedOut => PreReviewChecksGate::Waiting,
+                merge::PreReviewRequiredJobs::Unregistered { missing_jobs } => {
+                    let waited = head_first_seen.elapsed();
+                    let window = Duration::from_secs(config.merge_checks_timeout_secs);
+                    log(&format!(
+                        "PRE-REVIEW CI GATE: task #{task_id} PR #{pr} head {head_sha} — \
+                         required jobs not registered yet: {} ({}s/{}s)",
+                        missing_jobs.join(", "),
+                        waited.as_secs(),
+                        window.as_secs()
+                    ));
+                    if waited >= window && !unregistered_alerted {
+                        notify_pre_review_required_jobs_unregistered(
+                            config,
+                            task_id,
+                            pr,
+                            head_sha,
+                            &missing_jobs,
+                            waited,
+                        )
+                        .await?;
+                        unregistered_alerted = true;
+                    }
+                    PreReviewChecksGate::Waiting
+                }
             }
         }
         merge::ChecksOutcome::Failed { failing_checks } => {
@@ -11100,6 +11135,8 @@ async fn poll_pre_review_checks(
                 consecutive_timeouts,
                 timeout_alerted,
                 head_lag_since,
+                head_first_seen,
+                unregistered_alerted,
             },
         );
         log(&format!(
@@ -11117,6 +11154,8 @@ async fn poll_pre_review_checks(
                 consecutive_timeouts,
                 timeout_alerted,
                 head_lag_since,
+                head_first_seen,
+                unregistered_alerted,
             },
         );
     }
@@ -11263,16 +11302,20 @@ fn hold_pre_review_on_cadence(
     now: std::time::Instant,
 ) {
     let previous = waits.remove(&task_id);
-    let (consecutive_timeouts, timeout_alerted, previous_head) = match previous {
+    let (consecutive_timeouts, timeout_alerted, previous_entry) = match previous {
         Some(entry) => {
             if let PreReviewChecksState::Waiting(handle) = entry.state {
                 handle.abort();
             }
-            let previous_head = (entry.pr == pr).then_some(entry.head_sha);
+            let previous_entry = (entry.pr == pr).then_some((
+                entry.head_sha,
+                entry.head_first_seen,
+                entry.unregistered_alerted,
+            ));
             (
                 entry.consecutive_timeouts,
                 entry.timeout_alerted,
-                previous_head,
+                previous_entry,
             )
         }
         None => (0, false, None),
@@ -11280,9 +11323,22 @@ fn hold_pre_review_on_cadence(
     // An empty head keeps the previously tracked head for this PR, so a hold
     // never adopts an unverified GitHub-reported head as the recorded one.
     let head_sha = if head_sha.is_empty() {
-        previous_head.unwrap_or_default()
+        previous_entry
+            .as_ref()
+            .map(|(head, _, _)| head.clone())
+            .unwrap_or_default()
     } else {
         head_sha.to_string()
+    };
+    // A new head creates a new entry for the unregistered-jobs alert window;
+    // otherwise keep the window (and whether it already fired) from before.
+    let (head_first_seen, unregistered_alerted) = match previous_entry {
+        Some((previous_head, head_first_seen, unregistered_alerted))
+            if previous_head == head_sha =>
+        {
+            (head_first_seen, unregistered_alerted)
+        }
+        _ => (now, false),
     };
     waits.insert(
         task_id,
@@ -11295,6 +11351,8 @@ fn hold_pre_review_on_cadence(
             consecutive_timeouts,
             timeout_alerted,
             head_lag_since: None,
+            head_first_seen,
+            unregistered_alerted,
         },
     );
 }
@@ -11395,6 +11453,9 @@ async fn poll_resume_reviewer_pre_review_checks(
                     timeout_alerted,
                     // An unavailable head does not reset the lag bound.
                     head_lag_since,
+                    // No head to bind; the next real head starts a new entry.
+                    head_first_seen: std::time::Instant::now(),
+                    unregistered_alerted: false,
                 },
             );
         } else if let Some(entry) = waits.get_mut(&task_id) {
@@ -11503,9 +11564,49 @@ fn hold_pre_review_for_head_propagation(
             consecutive_timeouts,
             timeout_alerted,
             head_lag_since: Some(lag_since),
+            head_first_seen: now,
+            unregistered_alerted: false,
         },
     );
     PreReviewChecksGate::Waiting
+}
+
+/// One owner alert when required jobs stay unregistered at the exact PR head
+/// past the registration window (`merge_checks_timeout_secs`). Absence is not
+/// worker-actionable, so the task keeps waiting in review.
+async fn notify_pre_review_required_jobs_unregistered(
+    config: &ServeConfig,
+    task_id: i64,
+    pr: i64,
+    head_sha: &str,
+    missing_jobs: &[String],
+    waited: Duration,
+) -> Result<()> {
+    let db_path = config.db_path.clone();
+    let body = format!(
+        "task #{task_id} PR #{pr} head {head_sha}: required jobs not registered after {}s; \
+         missing: {}",
+        waited.as_secs(),
+        missing_jobs.join(", ")
+    );
+    let refs = format!("task:{task_id},pr:{pr},head:{head_sha}");
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut conn = quorum_core::db::open(&db_path)?;
+        quorum_core::feed::post(
+            &mut conn,
+            "daemon",
+            "alert",
+            None,
+            &body,
+            Some(&refs),
+            Some("owner"),
+            quorum_core::feed::DEFAULT_MESSAGE_TTL_SECS,
+            now_unix(),
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| QuorumError::Io(format!("pre-review unregistered alert join: {error}")))?
 }
 
 async fn notify_pre_review_checks_timeout(
@@ -35865,6 +35966,8 @@ mod tests {
                 consecutive_timeouts: 0,
                 timeout_alerted: false,
                 head_lag_since: None,
+                head_first_seen: std::time::Instant::now(),
+                unregistered_alerted: false,
             },
         )]);
 
@@ -35939,6 +36042,8 @@ mod tests {
                 consecutive_timeouts: 0,
                 timeout_alerted: false,
                 head_lag_since: None,
+                head_first_seen: std::time::Instant::now(),
+                unregistered_alerted: false,
             },
         );
 
@@ -36121,6 +36226,8 @@ mod tests {
                     consecutive_timeouts: 0,
                     timeout_alerted: false,
                     head_lag_since: None,
+                    head_first_seen: std::time::Instant::now(),
+                    unregistered_alerted: false,
                 },
             );
 
@@ -36364,6 +36471,318 @@ mod tests {
             waits.get(&377).map(|entry| &entry.state),
             Some(PreReviewChecksState::Retry)
         ));
+    }
+
+    /// Rollup general checks always report Ready, as GitHub's CLEAN
+    /// short-circuit does right after a push; required jobs are validated from
+    /// the current scripted rollup JSON.
+    struct ScriptedRequiredJobsExecutor {
+        rollup: std::sync::Mutex<String>,
+        required_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedRequiredJobsExecutor {
+        fn new(rollup: &str) -> Self {
+            Self {
+                rollup: std::sync::Mutex::new(rollup.to_string()),
+                required_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn set(&self, rollup: &str) {
+            *self.rollup.lock().unwrap() = rollup.to_string();
+        }
+    }
+
+    impl merge::MergeExecutor for ScriptedRequiredJobsExecutor {
+        fn merge(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _ctx: &merge::MergeContext,
+        ) -> merge::MergeResult {
+            merge::MergeResult {
+                success: true,
+                message: String::new(),
+                failure_kind: None,
+            }
+        }
+
+        fn wait_for_checks(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            _timeout_secs: u64,
+            _poll_interval_secs: u64,
+        ) -> merge::ChecksOutcome {
+            merge::ChecksOutcome::Ready
+        }
+
+        fn check_required_jobs(
+            &self,
+            _pr: i64,
+            _repo_dir: &Path,
+            required_jobs: &[String],
+        ) -> merge::RequiredJobsOutcome {
+            self.required_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            merge::validate_required_jobs(&self.rollup.lock().unwrap(), required_jobs)
+        }
+    }
+
+    const EMPTY_ROLLUP: &str = r#"{"mergeStateStatus":"CLEAN","statusCheckRollup":[]}"#;
+
+    fn required_jobs_gate_fixture(
+        rollup: &str,
+        required_jobs: &[&str],
+    ) -> (
+        tempfile::TempDir,
+        ServeConfig,
+        Arc<ScriptedRequiredJobsExecutor>,
+        i64,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = pre_review_checks_config(dir.path().join("quorum.db"), dir.path().into());
+        config.merge_checks_timeout_secs = 600;
+        config.merge_checks_poll_secs = 30;
+        config.required_jobs = required_jobs.iter().map(|job| job.to_string()).collect();
+        let executor = Arc::new(ScriptedRequiredJobsExecutor::new(rollup));
+        config.merge_executor = executor.clone();
+        let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task_id = tasks::create(
+            &mut conn,
+            "owner",
+            "required jobs gate",
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            now_unix(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET status='in-review', refs='{\"pr\":1010}' WHERE id=?1",
+            [task_id],
+        )
+        .unwrap();
+        (dir, config, executor, task_id)
+    }
+
+    /// Run one scheduled pre-review CI cycle to completion and return its gate.
+    async fn complete_pre_review_cycle(
+        config: &ServeConfig,
+        waits: &mut HashMap<i64, PreReviewChecksEntry>,
+        task_id: i64,
+        pr: i64,
+        head_sha: &str,
+    ) -> PreReviewChecksGate {
+        if let Some(entry) = waits.get_mut(&task_id) {
+            if matches!(entry.state, PreReviewChecksState::Retry) {
+                entry.last_head_poll = Some(
+                    std::time::Instant::now() - Duration::from_secs(config.merge_checks_poll_secs),
+                );
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            // The first call starts (or restarts) the wait.
+            let mut gate = poll_pre_review_checks(config, waits, task_id, pr, head_sha)
+                .await
+                .unwrap();
+            loop {
+                let settled = !matches!(
+                    waits.get(&task_id).map(|entry| &entry.state),
+                    Some(PreReviewChecksState::Waiting(_))
+                );
+                if gate != PreReviewChecksGate::Waiting || settled {
+                    return gate;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                gate = poll_pre_review_checks(config, waits, task_id, pr, head_sha)
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .expect("pre-review cycle did not complete")
+    }
+
+    fn task_gate_state(config: &ServeConfig, task_id: i64) -> (String, i64, Option<String>, i64) {
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let alerts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE kind='alert' AND recipient='owner'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (task.status, task.rework_round, task.refs, alerts)
+    }
+
+    #[tokio::test]
+    async fn pre_review_unregistered_required_jobs_wait_instead_of_failing() {
+        const PR: i64 = 1010;
+        let jobs = ["fmt", "test"];
+        let (_dir, config, executor, task_id) = required_jobs_gate_fixture(EMPTY_ROLLUP, &jobs);
+        let before = task_gate_state(&config, task_id);
+        let mut waits = HashMap::new();
+
+        // #474 regression: CLEAN + empty rollup on the first poll is pending.
+        assert_eq!(
+            complete_pre_review_cycle(&config, &mut waits, task_id, PR, "head-a").await,
+            PreReviewChecksGate::Waiting
+        );
+        // A second consecutive empty poll is still pending, not Ready→Failed.
+        assert_eq!(
+            complete_pre_review_cycle(&config, &mut waits, task_id, PR, "head-a").await,
+            PreReviewChecksGate::Waiting
+        );
+        // Some jobs in progress, the rest absent: pending.
+        executor.set(
+            r#"{"statusCheckRollup":[{"name":"fmt","status":"IN_PROGRESS","conclusion":""}]}"#,
+        );
+        assert_eq!(
+            complete_pre_review_cycle(&config, &mut waits, task_id, PR, "head-a").await,
+            PreReviewChecksGate::Waiting
+        );
+        // Daemon restart: the in-memory wait is lost; the task resumes waiting.
+        let mut waits = HashMap::new();
+        executor.set(EMPTY_ROLLUP);
+        assert_eq!(
+            complete_pre_review_cycle(&config, &mut waits, task_id, PR, "head-a").await,
+            PreReviewChecksGate::Waiting
+        );
+        assert!(
+            executor
+                .required_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 4,
+            "each cycle must consult the exact-head required-jobs check"
+        );
+        assert_eq!(
+            task_gate_state(&config, task_id),
+            before,
+            "a registration wait must not change status, rework_round, refs, or alert"
+        );
+
+        // Jobs register and pass: normal classification resumes.
+        executor.set(
+            r#"{"statusCheckRollup":[
+                {"name":"fmt","status":"COMPLETED","conclusion":"SUCCESS"},
+                {"name":"test","status":"COMPLETED","conclusion":"SUCCESS"}
+            ]}"#,
+        );
+        assert_eq!(
+            complete_pre_review_cycle(&config, &mut waits, task_id, PR, "head-a").await,
+            PreReviewChecksGate::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_review_terminal_required_job_failure_is_not_hidden_by_absence() {
+        const PR: i64 = 1011;
+        let (_dir, config, executor, task_id) = required_jobs_gate_fixture(
+            r#"{"statusCheckRollup":[{"name":"fmt","status":"COMPLETED","conclusion":"FAILURE"}]}"#,
+            &["fmt", "test"],
+        );
+        let mut waits = HashMap::new();
+        assert_eq!(
+            complete_pre_review_cycle(&config, &mut waits, task_id, PR, "head-a").await,
+            PreReviewChecksGate::Failed {
+                failing_checks: vec!["fmt (FAILURE)".into()]
+            }
+        );
+
+        for conclusion in ["SKIPPED", "NEUTRAL"] {
+            executor.set(&format!(
+                r#"{{"statusCheckRollup":[
+                    {{"name":"fmt","status":"COMPLETED","conclusion":"SUCCESS"}},
+                    {{"name":"test","status":"COMPLETED","conclusion":"{conclusion}"}}
+                ]}}"#
+            ));
+            let mut waits = HashMap::new();
+            assert_eq!(
+                complete_pre_review_cycle(&config, &mut waits, task_id, PR, "head-a").await,
+                PreReviewChecksGate::Failed {
+                    failing_checks: vec![format!("test ({conclusion})")]
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_review_unregistered_window_alerts_once_and_restarts_for_new_head() {
+        const PR: i64 = 1012;
+        let (_dir, config, _executor, task_id) =
+            required_jobs_gate_fixture(EMPTY_ROLLUP, &["branch-base", "test"]);
+        let before = task_gate_state(&config, task_id);
+        let mut waits = HashMap::new();
+
+        assert_eq!(
+            complete_pre_review_cycle(&config, &mut waits, task_id, PR, "head-a").await,
+            PreReviewChecksGate::Waiting
+        );
+        assert_eq!(
+            task_gate_state(&config, task_id).3,
+            0,
+            "no alert inside the window"
+        );
+
+        waits.get_mut(&task_id).unwrap().head_first_seen =
+            std::time::Instant::now() - Duration::from_secs(config.merge_checks_timeout_secs + 1);
+        for _ in 0..3 {
+            assert_eq!(
+                complete_pre_review_cycle(&config, &mut waits, task_id, PR, "head-a").await,
+                PreReviewChecksGate::Waiting
+            );
+        }
+        let (status, rework_round, refs, alerts) = task_gate_state(&config, task_id);
+        assert_eq!(alerts, 1, "exactly one owner alert per head");
+        assert_eq!((status, rework_round, refs), (before.0, before.1, before.2));
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let (body, alert_refs): (String, String) = conn
+            .query_row(
+                "SELECT body, refs FROM messages WHERE kind='alert' AND recipient='owner'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(conn);
+        assert!(body.contains(&format!("task #{task_id}")));
+        assert!(body.contains("PR #1012"));
+        assert!(body.contains("head-a"));
+        assert!(body.contains("branch-base, test"));
+        assert_eq!(alert_refs, format!("task:{task_id},pr:1012,head:head-a"));
+
+        // A new head discards the old wait and restarts the window.
+        assert_eq!(
+            complete_pre_review_cycle(&config, &mut waits, task_id, PR, "head-b").await,
+            PreReviewChecksGate::Waiting
+        );
+        let entry = &waits[&task_id];
+        assert_eq!(entry.head_sha, "head-b");
+        assert!(!entry.unregistered_alerted);
+        assert!(entry.head_first_seen.elapsed() < Duration::from_secs(60));
+        assert_eq!(task_gate_state(&config, task_id).3, 1);
+    }
+
+    #[tokio::test]
+    async fn pre_review_without_required_jobs_is_unchanged() {
+        const PR: i64 = 1013;
+        let (_dir, config, executor, task_id) = required_jobs_gate_fixture(EMPTY_ROLLUP, &[]);
+        let mut waits = HashMap::new();
+        assert_eq!(
+            complete_pre_review_cycle(&config, &mut waits, task_id, PR, "head-a").await,
+            PreReviewChecksGate::Ready
+        );
+        assert_eq!(
+            executor
+                .required_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     fn graph_blocker_fixture(
@@ -37422,6 +37841,8 @@ mod tests {
                 consecutive_timeouts: 0,
                 timeout_alerted: false,
                 head_lag_since: None,
+                head_first_seen: std::time::Instant::now(),
+                unregistered_alerted: false,
             },
         );
         assert_eq!(
