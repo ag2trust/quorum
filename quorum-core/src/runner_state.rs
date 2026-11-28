@@ -351,6 +351,212 @@ pub fn discard_provider_retry(refs: &mut Value) {
     );
 }
 
+/// Task ref holding one external-runner session record per slot (spec
+/// "Session record"). It is separate from the `runner_continuation*` refs and
+/// is written only through the `external_session` helpers below.
+pub const EXTERNAL_SESSIONS_REF: &str = "runner_external_sessions";
+
+/// One slot's external-runner session record. Metadata only: it never holds
+/// prompts, CLI output, or session file contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalSessionEntry {
+    pub profile: String,
+    pub fingerprint: String,
+    pub usable: bool,
+}
+
+impl ContinuationSlot {
+    /// Slot name used as the `runner_external_sessions` key and session
+    /// directory component.
+    pub fn slot_name(self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::ReviewerR1 => "reviewer-r1",
+            Self::ReviewerR2 => "reviewer-r2",
+        }
+    }
+}
+
+/// Read a slot's entry. A malformed or partial entry reads as absent, so the
+/// resume decision fails closed to a fresh start.
+pub fn external_session(refs: &Value, slot: ContinuationSlot) -> Option<ExternalSessionEntry> {
+    let entry: ExternalSessionEntry = serde_json::from_value(
+        refs.get(EXTERNAL_SESSIONS_REF)?
+            .get(slot.slot_name())?
+            .clone(),
+    )
+    .ok()?;
+    (!entry.profile.is_empty() && !entry.fingerprint.is_empty()).then_some(entry)
+}
+
+/// Write or replace a slot's entry as usable. Other slots' entries are kept;
+/// a non-object ref value is replaced.
+pub fn set_external_session(
+    refs: &mut Value,
+    slot: ContinuationSlot,
+    profile: &str,
+    fingerprint: &str,
+) {
+    let entry = ExternalSessionEntry {
+        profile: profile.into(),
+        fingerprint: fingerprint.into(),
+        usable: true,
+    };
+    if !refs
+        .get(EXTERNAL_SESSIONS_REF)
+        .is_some_and(Value::is_object)
+    {
+        refs[EXTERNAL_SESSIONS_REF] = Value::Object(serde_json::Map::new());
+    }
+    refs[EXTERNAL_SESSIONS_REF][slot.slot_name()] =
+        serde_json::to_value(entry).expect("external session entry is serializable");
+}
+
+/// Mark a slot's entry `usable: false`. Returns whether an entry was marked.
+pub fn mark_external_session_unusable(refs: &mut Value, slot: ContinuationSlot) -> bool {
+    match refs
+        .get_mut(EXTERNAL_SESSIONS_REF)
+        .and_then(|sessions| sessions.get_mut(slot.slot_name()))
+        .and_then(Value::as_object_mut)
+    {
+        Some(entry) => {
+            entry.insert("usable".into(), Value::Bool(false));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Remove a slot's entry; the ref itself is dropped once no slot remains.
+pub fn remove_external_session(refs: &mut Value, slot: ContinuationSlot) {
+    let Some(sessions) = refs
+        .get_mut(EXTERNAL_SESSIONS_REF)
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    sessions.remove(slot.slot_name());
+    if sessions.is_empty() {
+        remove_keys(refs, &[EXTERNAL_SESSIONS_REF]);
+    }
+}
+
+/// Remove a slot's continuation, in both its neutral and historical Codex
+/// forms, when the slot launches on the external runner. Removing only the
+/// neutral record would let the legacy reader fall back to a stale thread.
+pub fn remove_slot_continuation(refs: &mut Value, slot: ContinuationSlot) {
+    remove_keys(refs, &[slot.ref_key(), slot.legacy_codex_ref_key()]);
+}
+
+/// `fstatat(AT_SYMLINK_NOFOLLOW)` classification of a slot's session file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionFileState {
+    Missing,
+    /// Not a regular file (directory, symlink, or other).
+    NonRegular,
+    Empty,
+    NonEmptyRegular,
+}
+
+impl SessionFileState {
+    /// Classify no-follow metadata; `None` means the file does not exist.
+    pub fn from_metadata(metadata: Option<&std::fs::Metadata>) -> Self {
+        match metadata {
+            None => Self::Missing,
+            Some(m) if !m.file_type().is_file() => Self::NonRegular,
+            Some(m) if m.len() == 0 => Self::Empty,
+            Some(_) => Self::NonEmptyRegular,
+        }
+    }
+}
+
+/// What kind of run is launching on a slot (spec "Resume or fresh start",
+/// condition 4). Continued turns carry the turn text Quorum feeds the
+/// built-in turn-oriented runners today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalRunKind<'a> {
+    /// Admission with `pending_resume.kind = "answer"`.
+    AnsweredResume {
+        identity: &'a str,
+        text: &'a str,
+    },
+    /// Admission with `pending_resume.kind = "unanswered"`.
+    UnansweredResume,
+    Rework {
+        turn_text: &'a str,
+    },
+    ReviewRemediation {
+        turn_text: &'a str,
+    },
+    ReviewerContinuation {
+        turn_text: &'a str,
+    },
+    ProviderRetry {
+        turn_text: &'a str,
+    },
+    RebuiltDormantTurn {
+        turn_text: &'a str,
+    },
+    /// Any other run: first run of a slot, a task reopened after
+    /// `AgentFailed` or a stale lease, a restart without in-place rebuild.
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeDecision {
+    Resume,
+    Fresh,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ResumeInputs<'a> {
+    pub sessions_enabled: bool,
+    pub slot: Option<ContinuationSlot>,
+    pub entry: Option<&'a ExternalSessionEntry>,
+    pub routed_profile: &'a str,
+    pub fingerprint: &'a str,
+    pub session_file: SessionFileState,
+    pub run: ExternalRunKind<'a>,
+}
+
+/// Resume only when all four spec conditions hold; every other run is fresh.
+pub fn resume_decision(inputs: &ResumeInputs<'_>) -> ResumeDecision {
+    let has_slot = inputs.sessions_enabled && inputs.slot.is_some();
+    let entry_matches = inputs.entry.is_some_and(|entry| {
+        entry.usable
+            && !inputs.routed_profile.is_empty()
+            && !inputs.fingerprint.is_empty()
+            && entry.profile == inputs.routed_profile
+            && entry.fingerprint == inputs.fingerprint
+    });
+    let file_resumable = inputs.session_file == SessionFileState::NonEmptyRegular;
+    let run_resumable = resumed_prompt(&inputs.run).is_some();
+    if has_slot && entry_matches && file_resumable && run_resumable {
+        ResumeDecision::Resume
+    } else {
+        ResumeDecision::Fresh
+    }
+}
+
+/// Prompt for a resumed run (spec "Resumed-run prompts"). `None` for runs
+/// that never resume; a fresh start uses the caller's full role prompt.
+pub fn resumed_prompt(run: &ExternalRunKind<'_>) -> Option<String> {
+    match *run {
+        ExternalRunKind::AnsweredResume { identity, text } => {
+            Some(format!("Answer from {identity}:\n{text}"))
+        }
+        ExternalRunKind::UnansweredResume => {
+            Some("No answer was provided. Continue with your best judgment, or ask again.".into())
+        }
+        ExternalRunKind::Rework { turn_text }
+        | ExternalRunKind::ReviewRemediation { turn_text }
+        | ExternalRunKind::ReviewerContinuation { turn_text }
+        | ExternalRunKind::ProviderRetry { turn_text }
+        | ExternalRunKind::RebuiltDormantTurn { turn_text } => Some(turn_text.into()),
+        ExternalRunKind::Other => None,
+    }
+}
+
 fn remove_keys(refs: &mut Value, keys: &[&str]) {
     let Some(object) = refs.as_object_mut() else {
         return;
@@ -551,5 +757,313 @@ mod tests {
         mismatched.pending_turn.model = "grok-other".into();
         set_initial_worker_session(&mut refs, &mismatched);
         assert!(initial_worker_session(&refs).is_none());
+    }
+
+    const SLOTS: [ContinuationSlot; 3] = [
+        ContinuationSlot::Worker,
+        ContinuationSlot::ReviewerR1,
+        ContinuationSlot::ReviewerR2,
+    ];
+
+    #[test]
+    fn external_session_ref_round_trips_per_slot() {
+        assert_eq!(EXTERNAL_SESSIONS_REF, "runner_external_sessions");
+        let mut refs = serde_json::json!({"pr": 7});
+        for (i, slot) in SLOTS.into_iter().enumerate() {
+            set_external_session(&mut refs, slot, &format!("p{i}"), &format!("f{i}"));
+        }
+        assert_eq!(
+            refs[EXTERNAL_SESSIONS_REF],
+            serde_json::json!({
+                "worker": {"profile": "p0", "fingerprint": "f0", "usable": true},
+                "reviewer-r1": {"profile": "p1", "fingerprint": "f1", "usable": true},
+                "reviewer-r2": {"profile": "p2", "fingerprint": "f2", "usable": true}
+            })
+        );
+        for (i, slot) in SLOTS.into_iter().enumerate() {
+            assert_eq!(
+                external_session(&refs, slot),
+                Some(ExternalSessionEntry {
+                    profile: format!("p{i}"),
+                    fingerprint: format!("f{i}"),
+                    usable: true,
+                })
+            );
+        }
+
+        assert!(mark_external_session_unusable(
+            &mut refs,
+            ContinuationSlot::ReviewerR1
+        ));
+        assert!(
+            !external_session(&refs, ContinuationSlot::ReviewerR1)
+                .unwrap()
+                .usable
+        );
+        assert!(
+            external_session(&refs, ContinuationSlot::Worker)
+                .unwrap()
+                .usable
+        );
+
+        // Replace restores usable and the new identity.
+        set_external_session(&mut refs, ContinuationSlot::ReviewerR1, "p9", "f9");
+        assert_eq!(
+            refs[EXTERNAL_SESSIONS_REF]["reviewer-r1"],
+            serde_json::json!({"profile": "p9", "fingerprint": "f9", "usable": true})
+        );
+
+        remove_external_session(&mut refs, ContinuationSlot::Worker);
+        assert!(external_session(&refs, ContinuationSlot::Worker).is_none());
+        assert!(!mark_external_session_unusable(
+            &mut refs,
+            ContinuationSlot::Worker
+        ));
+        remove_external_session(&mut refs, ContinuationSlot::ReviewerR1);
+        remove_external_session(&mut refs, ContinuationSlot::ReviewerR2);
+        assert_eq!(refs, serde_json::json!({"pr": 7}));
+
+        let partial = serde_json::json!({
+            EXTERNAL_SESSIONS_REF: {"worker": {"profile": "p", "fingerprint": "f"}}
+        });
+        assert!(external_session(&partial, ContinuationSlot::Worker).is_none());
+    }
+
+    #[test]
+    fn remove_slot_continuation_touches_only_that_slot() {
+        let mut refs = serde_json::json!({
+            CONTINUATION_REF: {"provider": "codex", "id": "w"},
+            "codex_thread_id": "w-old",
+            REVIEWER_R1_CONTINUATION_REF: {"provider": "claude", "id": "r1"},
+            EXTERNAL_SESSIONS_REF: {"worker": {"profile": "p", "fingerprint": "f", "usable": true}}
+        });
+        remove_slot_continuation(&mut refs, ContinuationSlot::Worker);
+        assert_eq!(
+            refs,
+            serde_json::json!({
+                REVIEWER_R1_CONTINUATION_REF: {"provider": "claude", "id": "r1"},
+                EXTERNAL_SESSIONS_REF: {"worker": {"profile": "p", "fingerprint": "f", "usable": true}}
+            })
+        );
+        assert!(continuation(&refs, ContinuationSlot::Worker, "codex").is_none());
+    }
+
+    #[test]
+    fn continuation_and_retry_helpers_leave_external_sessions_untouched() {
+        let sessions = serde_json::json!({
+            "worker": {"profile": "p", "fingerprint": "f", "usable": false},
+            "reviewer-r2": {"profile": "q", "fingerprint": "g", "usable": true}
+        });
+        let mut refs = serde_json::json!({
+            EXTERNAL_SESSIONS_REF: sessions.clone(),
+            RETRY_REF: {
+                "provider": "codex", "model": "gpt-5", "effort": "high",
+                "prompt": "finish", "turn_kind": "rework",
+                "continuation_id": "thread-new", "requested": true
+            }
+        });
+        for slot in SLOTS {
+            set_continuation(
+                &mut refs,
+                slot,
+                &ContinuationIdentity {
+                    provider: "codex".into(),
+                    id: "t".into(),
+                },
+            );
+        }
+        assert_eq!(refs[EXTERNAL_SESSIONS_REF], sessions);
+        clear_provider_retry(&mut refs);
+        assert_eq!(refs[EXTERNAL_SESSIONS_REF], sessions);
+        refs.as_object_mut().unwrap().remove(CONTINUATION_REF);
+        refs[RETRY_REF] = serde_json::json!({
+            "provider": "codex", "model": "gpt-5", "effort": "high",
+            "prompt": "finish", "turn_kind": "rework",
+            "continuation_id": "thread-new", "requested": true
+        });
+        clear_provider_retry(&mut refs);
+        assert_eq!(refs[EXTERNAL_SESSIONS_REF], sessions);
+        assert_eq!(refs[CONTINUATION_REF]["id"], "thread-new");
+    }
+
+    fn entry(usable: bool) -> ExternalSessionEntry {
+        ExternalSessionEntry {
+            profile: "prof".into(),
+            fingerprint: "abc123".into(),
+            usable,
+        }
+    }
+
+    fn resumable<'a>(entry: &'a ExternalSessionEntry) -> ResumeInputs<'a> {
+        ResumeInputs {
+            sessions_enabled: true,
+            slot: Some(ContinuationSlot::Worker),
+            entry: Some(entry),
+            routed_profile: "prof",
+            fingerprint: "abc123",
+            session_file: SessionFileState::NonEmptyRegular,
+            run: ExternalRunKind::Rework { turn_text: "t" },
+        }
+    }
+
+    #[test]
+    fn resume_requires_all_four_conditions() {
+        let good = entry(true);
+        let unusable = entry(false);
+        let base = resumable(&good);
+
+        let resuming_runs = [
+            ExternalRunKind::AnsweredResume {
+                identity: "owner",
+                text: "yes",
+            },
+            ExternalRunKind::UnansweredResume,
+            ExternalRunKind::Rework { turn_text: "t" },
+            ExternalRunKind::ReviewRemediation { turn_text: "t" },
+            ExternalRunKind::ReviewerContinuation { turn_text: "t" },
+            ExternalRunKind::ProviderRetry { turn_text: "t" },
+            ExternalRunKind::RebuiltDormantTurn { turn_text: "t" },
+        ];
+        for run in resuming_runs {
+            for slot in SLOTS {
+                assert_eq!(
+                    resume_decision(&ResumeInputs {
+                        run,
+                        slot: Some(slot),
+                        ..base
+                    }),
+                    ResumeDecision::Resume,
+                    "{run:?} {slot:?}"
+                );
+            }
+        }
+
+        let fresh_cases = [
+            (
+                "sessions disabled",
+                ResumeInputs {
+                    sessions_enabled: false,
+                    ..base
+                },
+            ),
+            ("no slot", ResumeInputs { slot: None, ..base }),
+            (
+                "missing entry",
+                ResumeInputs {
+                    entry: None,
+                    ..base
+                },
+            ),
+            (
+                "unusable",
+                ResumeInputs {
+                    entry: Some(&unusable),
+                    ..base
+                },
+            ),
+            (
+                "profile change",
+                ResumeInputs {
+                    routed_profile: "other",
+                    ..base
+                },
+            ),
+            (
+                "fingerprint change",
+                ResumeInputs {
+                    fingerprint: "def456",
+                    ..base
+                },
+            ),
+            (
+                "empty profile",
+                ResumeInputs {
+                    routed_profile: "",
+                    ..base
+                },
+            ),
+            (
+                "missing file",
+                ResumeInputs {
+                    session_file: SessionFileState::Missing,
+                    ..base
+                },
+            ),
+            (
+                "zero-byte file",
+                ResumeInputs {
+                    session_file: SessionFileState::Empty,
+                    ..base
+                },
+            ),
+            (
+                "non-regular file",
+                ResumeInputs {
+                    session_file: SessionFileState::NonRegular,
+                    ..base
+                },
+            ),
+            (
+                "other run kind",
+                ResumeInputs {
+                    run: ExternalRunKind::Other,
+                    ..base
+                },
+            ),
+        ];
+        for (name, inputs) in fresh_cases {
+            assert_eq!(resume_decision(&inputs), ResumeDecision::Fresh, "{name}");
+        }
+    }
+
+    #[test]
+    fn session_file_state_classifies_no_follow_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let classify = |name: &str| {
+            SessionFileState::from_metadata(
+                std::fs::symlink_metadata(dir.path().join(name))
+                    .ok()
+                    .as_ref(),
+            )
+        };
+        std::fs::write(dir.path().join("full"), b"x").unwrap();
+        std::fs::write(dir.path().join("empty"), b"").unwrap();
+        std::fs::create_dir(dir.path().join("dir")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path().join("full"), dir.path().join("link")).unwrap();
+
+        assert_eq!(classify("missing"), SessionFileState::Missing);
+        assert_eq!(classify("empty"), SessionFileState::Empty);
+        assert_eq!(classify("dir"), SessionFileState::NonRegular);
+        #[cfg(unix)]
+        assert_eq!(classify("link"), SessionFileState::NonRegular);
+        assert_eq!(classify("full"), SessionFileState::NonEmptyRegular);
+    }
+
+    #[test]
+    fn resumed_prompts_match_spec_strings_exactly() {
+        assert_eq!(
+            resumed_prompt(&ExternalRunKind::AnsweredResume {
+                identity: "Owner-1",
+                text: "use option B\nthanks",
+            })
+            .as_deref(),
+            Some("Answer from Owner-1:\nuse option B\nthanks")
+        );
+        assert_eq!(
+            resumed_prompt(&ExternalRunKind::UnansweredResume).as_deref(),
+            Some("No answer was provided. Continue with your best judgment, or ask again.")
+        );
+        let turn = "Review feedback:\n- fix the race\n";
+        for run in [
+            ExternalRunKind::Rework { turn_text: turn },
+            ExternalRunKind::ReviewRemediation { turn_text: turn },
+            ExternalRunKind::ReviewerContinuation { turn_text: turn },
+            ExternalRunKind::ProviderRetry { turn_text: turn },
+            ExternalRunKind::RebuiltDormantTurn { turn_text: turn },
+        ] {
+            assert_eq!(resumed_prompt(&run).as_deref(), Some(turn), "{run:?}");
+        }
+        assert_eq!(resumed_prompt(&ExternalRunKind::Other), None);
     }
 }
