@@ -479,14 +479,6 @@ impl ExternalSpec {
             exits_without_terminal.insert(exit, disposition);
         }
 
-        // Until resume (slice 6) lands.
-        if file.args_session.is_some() {
-            return Err(refuse(
-                "external_runner.args_session",
-                "sessions are not supported yet",
-            ));
-        }
-
         Ok(Self {
             executable: file.executable.clone(),
             efforts: file.efforts.clone(),
@@ -1024,8 +1016,8 @@ fn write_string(s: &str, out: &mut String) -> Result<()> {
 pub(crate) mod tests {
     use super::*;
 
-    /// The spec's example declaration, minus the part gated on a later slice
-    /// (`args_session`).
+    /// The spec's example declaration without `args_session` (sessions
+    /// disabled); [`WITH_SESSION`] enables them.
     pub(crate) const VALID: &str = r#"
 [external_runner]
 executable = "/usr/local/bin/fake-cli"
@@ -1342,17 +1334,79 @@ bad_request       = "non_failover"
         assert!(spec(&neither).is_ok());
     }
 
+    /// The `args_session` line inserted by [`with_session`].
+    pub(crate) const WITH_SESSION: &str = "args_session    = [\"--session\", \"{session_file}\"]\n";
+
+    /// `VALID` with sessions enabled (`args_session` declared).
+    pub(crate) fn with_session() -> String {
+        let anchor = "args_mcp        =";
+        assert!(VALID.contains(anchor));
+        VALID.replacen(anchor, &format!("{WITH_SESSION}{anchor}"), 1)
+    }
+
     #[test]
-    fn refuses_args_session_until_slice_6() {
-        let src = edit(
-            "args_mcp        =",
-            "args_session = [\"--session\", \"{session_file}\"]\nargs_mcp        =",
+    fn accepts_args_session() {
+        let parsed = spec(&with_session()).unwrap();
+        assert_eq!(
+            parsed.args_session,
+            Some(vec![
+                ArgTemplate(vec![ArgPart::Literal("--session".into())]),
+                ArgTemplate(vec![ArgPart::Placeholder(Placeholder::SessionFile)]),
+            ])
         );
-        assert_refused(&src, "external_runner.args_session");
-        assert!(spec(&src)
-            .unwrap_err()
-            .to_string()
-            .contains("not supported yet"));
+        // Literal-only and empty lists are valid too.
+        let anchor = "args_mcp        =";
+        for list in ["[\"--resume-if-present\"]", "[]"] {
+            let src = edit(anchor, &format!("args_session = {list}\n{anchor}"));
+            assert!(spec(&src).unwrap().args_session.is_some(), "{list}");
+        }
+        assert_eq!(spec(VALID).unwrap().args_session, None);
+        // Declaring sessions changes the fingerprint.
+        assert_ne!(
+            spec(&with_session()).unwrap().fingerprint,
+            spec(VALID).unwrap().fingerprint
+        );
+    }
+
+    #[test]
+    fn session_file_placeholder_is_refused_outside_args_session() {
+        for (from, to, key) in [
+            (
+                r#""{effort}""#,
+                r#""{session_file}""#,
+                "external_runner.args[6]",
+            ),
+            (
+                r#"["--tools", "read-write"]"#,
+                r#"["--s={session_file}"]"#,
+                "external_runner.args_read_write[0]",
+            ),
+            (
+                r#"["--tools", "read-only"]"#,
+                r#"["{session_file}"]"#,
+                "external_runner.args_read_only[0]",
+            ),
+            (
+                r#""{agent_mcp_url}"]"#,
+                r#""{session_file}"]"#,
+                "external_runner.args_mcp[1]",
+            ),
+        ] {
+            let src = with_session().replacen(from, to, 1);
+            assert_ne!(src, with_session(), "fixture lacks {from:?}");
+            assert_refused(&src, key);
+            assert!(spec(&src)
+                .unwrap_err()
+                .to_string()
+                .contains("allowed only in external_runner.args_session"));
+        }
+        // `{agent_mcp_url}` stays refused inside `args_session`.
+        let src = with_session().replacen(
+            "\"{session_file}\"]",
+            "\"{session_file}\", \"{agent_mcp_url}\"]",
+            1,
+        );
+        assert_refused(&src, "external_runner.args_session[2]");
     }
 
     #[test]

@@ -698,8 +698,10 @@ pub fn normalize_line(raw: &str) -> NormalizedLine {
 mod tests {
     use super::*;
     use crate::external_runner_spec::{
-        tests::VALID, ArgPart, ArgTemplate, EnvSource, ExternalRunnerFile, Placeholder,
+        tests::{with_session, VALID},
+        ArgPart, ArgTemplate, EnvSource, ExternalRunnerFile, Placeholder,
     };
+    use crate::serve::external_launch::SESSION_DIR_ENV;
     use crate::serve::external_stream::{
         DETAIL_EOF_BEFORE_TERMINAL, DETAIL_EXIT_CONTRADICTS, DETAIL_LINE_AFTER_TERMINAL,
         DETAIL_LINE_TOO_LONG, DETAIL_NO_EXIT_AFTER_TERMINAL, DETAIL_SECOND_TERMINAL,
@@ -728,7 +730,12 @@ mod tests {
     /// a one-second terminal exit wait. `executable = false` drops the
     /// declared executable so the fake CLI must come from `agent_bin`.
     fn spec(executable: bool) -> ExternalSpec {
-        let mut src = VALID
+        spec_from_src(VALID, executable)
+    }
+
+    /// [`spec`] built from `base` instead of the spec example.
+    fn spec_from_src(base: &str, executable: bool) -> ExternalSpec {
+        let mut src = base
             .replacen("/usr/local/bin/fake-cli", FAKE_CLI, 1)
             .replacen(
                 "max_line_bytes = 1048576",
@@ -1310,6 +1317,87 @@ mod tests {
         }
     }
 
+    /// Launch the fake CLI under `spec` as `role` with a supplied slot
+    /// directory; return its observed argv lines and `env` output.
+    async fn observe_slot_launch(
+        spec: &ExternalSpec,
+        role: Option<AgentMcpRole>,
+        slot_dir: &str,
+        workspace: &Path,
+    ) -> (Vec<String>, String) {
+        let observe = tempfile::tempdir().unwrap();
+        let db = workspace.join("quorum.db");
+        let mut env = match role {
+            Some(_) => managed_env("success"),
+            None => scenario_env("success"),
+        };
+        env.push((SESSION_DIR_ENV.into(), slot_dir.into()));
+        env.push((
+            "FAKE_CLI_OBSERVE".into(),
+            observe.path().to_str().unwrap().into(),
+        ));
+        let managed = role.map(|role| ManagedLaunch { role, db_path: &db });
+        let proc = RunnerProc::launch(
+            &request(workspace, &env, managed),
+            &config(Some(spec), None),
+        )
+        .await
+        .unwrap();
+        let run = drive(proc).await;
+        assert_eq!(run.outcome, None, "{role:?}");
+        let argv = std::fs::read_to_string(observe.path().join("argv")).unwrap();
+        let observed = std::fs::read_to_string(observe.path().join("env")).unwrap();
+        (argv.lines().map(str::to_string).collect(), observed)
+    }
+
+    #[tokio::test]
+    async fn slot_runs_receive_session_argv_and_dir_and_others_do_not() {
+        let slots = tempfile::tempdir().unwrap();
+        let slot_dir = slots.path().join("7").join("worker");
+        let slot_dir = slot_dir.to_str().unwrap();
+        let session_file = format!("{slot_dir}/session");
+        let dir_line = format!("{SESSION_DIR_ENV}={slot_dir}");
+        let dir_prefix = format!("{SESSION_DIR_ENV}=");
+        let with_sessions = spec_from_src(&with_session(), true);
+        let without = spec(true);
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path();
+        for role in [
+            Some(AgentMcpRole::Worker),
+            Some(AgentMcpRole::Reviewer),
+            Some(AgentMcpRole::Planner),
+            None,
+        ] {
+            let slot = matches!(role, Some(AgentMcpRole::Worker | AgentMcpRole::Reviewer));
+            let (argv, env) = observe_slot_launch(&with_sessions, role, slot_dir, workspace).await;
+            let (plain_argv, plain_env) =
+                observe_slot_launch(&without, role, slot_dir, workspace).await;
+            if slot {
+                // args_session comes last, after args_mcp.
+                let n = argv.len();
+                assert_eq!(&argv[n - 4..n - 2], ["--mcp-url", URL]);
+                assert_eq!(&argv[n - 2..], ["--session", session_file.as_str()]);
+                assert_eq!(&argv[..n - 2], &plain_argv[..], "{role:?}");
+                assert!(env.lines().any(|l| l == dir_line), "{role:?}: {env}");
+            } else {
+                assert_eq!(argv, plain_argv, "{role:?}");
+                assert!(!argv.iter().any(|a| a.contains(slot_dir)), "{role:?}");
+                assert!(
+                    !env.lines().any(|l| l.starts_with(&dir_prefix)),
+                    "{role:?}: {env}"
+                );
+            }
+            // Sessions disabled: neither session argv nor the directory.
+            assert!(!plain_argv.iter().any(|a| a == "--session"), "{role:?}");
+            assert!(
+                !plain_env.lines().any(|l| l.starts_with(&dir_prefix)),
+                "{role:?}: {plain_env}"
+            );
+        }
+        // The adapter only forms the path; it never creates the session file.
+        assert!(!Path::new(&session_file).exists());
+    }
+
     #[tokio::test]
     async fn gated_launch_runs_only_after_release() {
         let dir = tempfile::tempdir().unwrap();
@@ -1349,11 +1437,11 @@ mod tests {
                 DETAIL_NO_EXECUTABLE,
             ),
             (with_continuation, config(Some(&full), None), DETAIL_CONTINUATION),
-            // The slice-1 `{session_file}` refusal stays in force.
+            // `{session_file}` outside `args_session` is refused at launch.
             (
                 request(dir.path(), &env, None),
                 config(Some(&session_spec), None),
-                "external runner launch refused: placeholder {session_file} is not supported, found in external_runner.args",
+                "external runner launch refused: placeholder {session_file} is allowed only in external_runner.args_session, found in external_runner.args",
             ),
         ];
         for (request, config, detail) in cases {
