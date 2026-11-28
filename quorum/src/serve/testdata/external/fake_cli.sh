@@ -126,6 +126,21 @@ case "${FAKE_CLI_SCENARIO:-success}" in
     echo "$start"
     sleep 30
     ;;
+  blocked)
+    echo "$start"
+    echo '{"type":"run.completed","status":"blocked","blocker":{"question":"Which schema version?","reason":"two migrations conflict","summary":"","details":7},"usage":{"input":4,"output":2}}'
+    exit 5
+    ;;
+  blocked_without_question)
+    echo "$start"
+    echo '{"type":"run.completed","status":"blocked","blocker":{"question":"","reason":"no question"}}'
+    exit 5
+    ;;
+  blocked_contradicting_exit)
+    echo "$start"
+    echo '{"type":"run.completed","status":"blocked","blocker":{"question":"Which schema version?"}}'
+    exit 0
+    ;;
   *)
     exit 64
     ;;

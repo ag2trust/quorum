@@ -45,6 +45,14 @@ pub const NEEDS_INFO_PARK_REASON: &str = "needs-info";
 /// worker admission transaction ([`consume_pending_resume_tx`]); removed by any
 /// later park and by every terminal status write.
 pub const PENDING_RESUME_REF: &str = "pending_resume";
+/// Who parked the task, when it was not a worker `react`: set to
+/// [`RUNNER_BLOCKED_PARKED_BY`] by the external runner's blocked outcome.
+/// Cleared wherever the other park refs are, so it never outlives its park.
+pub const PARKED_BY_REF: &str = "daemon_parked_by";
+pub const RUNNER_BLOCKED_PARKED_BY: &str = "runner-blocked";
+/// Byte bound of a runner-blocked park note: the per-note prompt cap, so a
+/// later fresh-start prompt shows the question in full.
+pub const RUNNER_BLOCKED_NOTE_MAX_BYTES: usize = 4096;
 /// The prefix that heads every answer note body.
 const ANSWER_NOTE_PREFIX: &str = "answer:\n";
 /// Answer text limit: the whole note must fit the 4 KiB per-note prompt cap.
@@ -5206,7 +5214,47 @@ pub enum DeadTurnRunnerDisposition {
     OwnershipTransferred,
     AgentFailed(Box<TransitionResult>),
     ReactionParked,
+    /// No outcome or reaction outranked the external runner's blocked
+    /// outcome: the task was parked as needs-info with its question.
+    RunnerBlockedParked,
     ProviderBlocked,
+}
+
+/// An external runner's blocked outcome from a read-write run (spec "Blocked
+/// outcome"). Untrusted text: the stream accepts only non-empty strings
+/// without NUL, and [`dispose_dead_turn_runner`] re-checks before parking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerBlocked {
+    pub question: String,
+    /// Each non-empty declared `question_context` value, in declared order.
+    pub context: Vec<String>,
+}
+
+impl RunnerBlocked {
+    fn validate(&self) -> Result<()> {
+        let valid = |text: &str| !text.is_empty() && !text.contains('\0');
+        if !valid(&self.question) || !self.context.iter().all(|c| valid(c)) {
+            return Err(QuorumError::Usage(
+                "runner blocked question and context must be non-empty text without NUL".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `parked: needs-info\n\nworker <agent> question:\n<question>`, then each
+    /// context value on its own line; cut at the note cap on a character
+    /// boundary.
+    fn note_body(&self, agent: &str) -> String {
+        let mut body = format!(
+            "parked: {NEEDS_INFO_PARK_REASON}\n\nworker {agent} question:\n{}",
+            self.question
+        );
+        for context in &self.context {
+            body.push('\n');
+            body.push_str(context);
+        }
+        truncate_utf8(&body, RUNNER_BLOCKED_NOTE_MAX_BYTES)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5643,14 +5691,24 @@ fn dispose_managed_exit_inner(
 /// represented in the journal; a reaction committed after the daemon's
 /// mailbox snapshot remains unconsumed, so it must be read directly here
 /// before classifying the exited turn.
+///
+/// `runner_blocked` is an external runner's blocked outcome. Precedence
+/// (spec "Blocked outcome"): a pending or recorded `submit_work` outcome
+/// wins, then any `react` state (`failed`, `blocked`, `needs-info`); only
+/// then does the blocked outcome park the task as needs-info, in place of the
+/// provider block.
 pub fn dispose_dead_turn_runner(
     conn: &mut Connection,
     id: i64,
     agent: &str,
     block: &ProviderBlock,
     pending_turn: &PendingTurn,
+    runner_blocked: Option<&RunnerBlocked>,
     now: i64,
 ) -> Result<DeadTurnRunnerDisposition> {
+    if let Some(blocked) = runner_blocked {
+        blocked.validate()?;
+    }
     let tx = begin_immediate(conn)?;
     match classify_managed_exit_tx(&tx, ManagedRunRole::Worker, agent, id, None)? {
         ManagedExitClassification::OutcomePending => {
@@ -5729,6 +5787,20 @@ pub fn dispose_dead_turn_runner(
         }
         Some("note") | None => {}
         Some(_) => {}
+    }
+
+    if let Some(blocked) = runner_blocked {
+        park_worker_on_runner_blocked_tx(
+            &tx,
+            id,
+            agent,
+            blocked,
+            &status,
+            refs_raw.as_deref(),
+            now,
+        )?;
+        tx.commit()?;
+        return Ok(DeadTurnRunnerDisposition::RunnerBlockedParked);
     }
 
     let mut refs: serde_json::Value = refs_raw
@@ -5852,6 +5924,48 @@ fn park_worker_on_reaction_tx(
          SET status='failed', assignee=NULL, refs=?2, updated_at=?3
          WHERE id=?1",
         params![id, refs, now],
+    )?;
+    deactivate_lease(tx, id, now)?;
+    tx.execute(
+        "INSERT INTO task_notes(task_id, ts, agent, body)
+         VALUES (?1, ?2, 'daemon', ?3)",
+        params![id, now, note_body],
+    )?;
+    crate::events::emit(tx, "task_parked", &lease_target(id), &excerpt, now)?;
+    alert_owner_of_park(tx, id, &excerpt, now)?;
+    crate::decomposition::block_graph_if_child_failed(tx, id, reason, now)?;
+    consume_pending_worker_reactions_tx(tx, agent, id, now)?;
+    Ok(())
+}
+
+/// Park a worker-owned task as needs-info on an external runner's blocked
+/// outcome. Same transaction shape as [`park_worker_on_reaction_tx`], plus
+/// `daemon_parked_by = "runner-blocked"` and the question note. The caller
+/// commits.
+fn park_worker_on_runner_blocked_tx(
+    tx: &rusqlite::Transaction<'_>,
+    id: i64,
+    agent: &str,
+    blocked: &RunnerBlocked,
+    status: &str,
+    refs_raw: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    let reason = NEEDS_INFO_PARK_REASON;
+    let note_body = blocked.note_body(agent);
+    let excerpt = format!(
+        "{reason}: {}",
+        crate::classify::truncate_for_prompt(&blocked.question, PARK_REASON_EXCERPT_CHARS)
+    );
+    let refs = set_parked_refs(refs_raw, reason, status, None)?;
+    let mut refs: serde_json::Value = serde_json::from_str(&refs)
+        .map_err(|e| QuorumError::Io(format!("invalid task refs JSON: {e}")))?;
+    refs[PARKED_BY_REF] = serde_json::Value::String(RUNNER_BLOCKED_PARKED_BY.into());
+    tx.execute(
+        "UPDATE tasks
+         SET status='failed', assignee=NULL, refs=?2, updated_at=?3
+         WHERE id=?1",
+        params![id, refs.to_string(), now],
     )?;
     deactivate_lease(tx, id, now)?;
     tx.execute(
@@ -5995,6 +6109,9 @@ pub(crate) fn set_parked_refs(
     object.remove(RECOVERED_REMEDIATION_RETRY_REF);
     // A restored park's resume intent never outlives a later park.
     object.remove(PENDING_RESUME_REF);
+    // Only the runner-blocked park names its parker; it sets the ref after
+    // this call, so every other park leaves none behind.
+    object.remove(PARKED_BY_REF);
     // Every park leaves `merging` (if it was there); the merge-gate
     // observation belongs only to a live merging task.
     object.remove(MERGE_CHECKS_REF);
@@ -6264,6 +6381,7 @@ pub(crate) fn restore_classified_task_tx(
     obj.remove(PARKED_REF);
     obj.remove(PARKED_REASON_REF);
     obj.remove(PARKED_RESUME_STATUS_REF);
+    obj.remove(PARKED_BY_REF);
     obj.remove(CLASSIFIER_POLICY_PARKED_REF);
     tx.execute(
         "UPDATE tasks SET status=?2, refs=?3, updated_at=?4 WHERE id=?1",
@@ -6761,7 +6879,7 @@ fn process_cancelled_dependency_reconciliation(
         tx.execute(
             "UPDATE tasks
              SET refs = json_set(
-                     json_remove(refs, '$.pending_resume'),
+                     json_remove(refs, '$.pending_resume', '$.daemon_parked_by'),
                      '$.daemon_parked_unsatisfiable', json('true'),
                      '$.daemon_parked_reason', ?1
                  ),
@@ -6852,7 +6970,8 @@ pub(crate) fn resume_dependents_parked_on(
                      '$.daemon_parked',
                      '$.daemon_parked_reason',
                      '$.daemon_parked_unsatisfiable',
-                     '$.daemon_resume_status'
+                     '$.daemon_resume_status',
+                     '$.daemon_parked_by'
                  ),
                  updated_at=?2
              WHERE id=?1 AND status='failed'",
@@ -7271,7 +7390,7 @@ pub fn retry_parked_tx(
                      )
                  END,
                  '$.poison_retry_generation', ?8
-             ), '$.pending_resume'),
+             ), '$.pending_resume', '$.daemon_parked_by'),
              -- Restoring a needs-info park records that the task's next
              -- worker admission still owes the question an answer
              -- (`task-answer` overwrites this in its own transaction). Any
@@ -9768,6 +9887,7 @@ mod tests {
                 reason: "process exited".into(),
             },
             &dead_turn_retry(),
+            None,
             1001,
         )
         .unwrap();
@@ -10013,6 +10133,7 @@ mod tests {
                     reason: "process exited".into(),
                 },
                 &dead_turn_retry(),
+                None,
                 1001,
             )
             .unwrap();
@@ -10099,6 +10220,7 @@ mod tests {
                 reason: "process exited".into(),
             },
             &dead_turn_retry(),
+            None,
             1001,
         )
         .unwrap();
@@ -10111,6 +10233,330 @@ mod tests {
             )
             .unwrap();
         assert_eq!(note, "parked: blocked");
+    }
+
+    fn runner_blocked_task(c: &mut Connection) -> i64 {
+        let id = create(
+            c,
+            "boss",
+            "t",
+            None,
+            0,
+            None,
+            Some(r#"{"branch":"daemon/worker-t1"}"#),
+            None,
+            None,
+            1000,
+        )
+        .unwrap();
+        claim(c, "worker", Some(id), &[], TTL, 1000).unwrap();
+        id
+    }
+
+    fn runner_blocked(question: &str) -> RunnerBlocked {
+        RunnerBlocked {
+            question: question.into(),
+            context: vec!["CTX-reason".into(), "CTX-summary".into()],
+        }
+    }
+
+    fn dispose_with_blocked(
+        c: &mut Connection,
+        id: i64,
+        blocked: Option<&RunnerBlocked>,
+        now: i64,
+    ) -> Result<DeadTurnRunnerDisposition> {
+        dispose_dead_turn_runner(
+            c,
+            id,
+            "worker",
+            &ProviderBlock {
+                provider: "external".into(),
+                reason: "turn-oriented runner exited before task submission".into(),
+            },
+            &PendingTurn {
+                provider: "external".into(),
+                continuation_id: None,
+                ..dead_turn_retry()
+            },
+            blocked,
+            now,
+        )
+    }
+
+    fn blocked_task_refs(c: &Connection, id: i64) -> serde_json::Value {
+        serde_json::from_str(get(c, id).unwrap().unwrap().refs.as_deref().unwrap()).unwrap()
+    }
+
+    fn park_notes(c: &Connection, id: i64) -> Vec<String> {
+        let mut stmt = c
+            .prepare(
+                "SELECT body FROM task_notes WHERE task_id=?1 AND body LIKE 'parked:%' ORDER BY id",
+            )
+            .unwrap();
+        stmt.query_map([id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn runner_blocked_parks_needs_info_with_the_question_note() {
+        let (_d, mut c) = open_tmp();
+        let id = runner_blocked_task(&mut c);
+        let blocked = runner_blocked("Which schema version?");
+        let disposition = dispose_with_blocked(&mut c, id, Some(&blocked), 1001).unwrap();
+        assert_eq!(disposition, DeadTurnRunnerDisposition::RunnerBlockedParked);
+
+        let task = get(&c, id).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        assert!(task.assignee.is_none());
+        let refs = blocked_task_refs(&c, id);
+        assert_eq!(refs[PARKED_REF], true);
+        assert_eq!(refs[PARKED_REASON_REF], NEEDS_INFO_PARK_REASON);
+        assert_eq!(refs[PARKED_RESUME_STATUS_REF], "working");
+        assert_eq!(refs[PARKED_BY_REF], RUNNER_BLOCKED_PARKED_BY);
+        assert!(refs.get(runner_state::PROVIDER_BLOCK_REF).is_none());
+        let active_leases: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM claims WHERE target=?1 AND active=1",
+                [lease_target(id)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_leases, 0);
+        assert_eq!(
+            park_notes(&c, id),
+            vec!["parked: needs-info\n\nworker worker question:\nWhich schema version?\nCTX-reason\nCTX-summary"
+                .to_string()]
+        );
+        let note_author: String = c
+            .query_row(
+                "SELECT agent FROM task_notes WHERE task_id=?1 AND body LIKE 'parked:%'",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(note_author, "daemon");
+        let event: String = c
+            .query_row(
+                "SELECT body FROM events WHERE kind='task_parked' AND subject=?1",
+                [lease_target(id)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(event, "needs-info: Which schema version?");
+        let alert: String = c
+            .query_row(
+                "SELECT body FROM messages WHERE kind='alert' AND refs=?1",
+                [format!("task:{id}")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            alert.contains("needs-info: Which schema version?"),
+            "{alert}"
+        );
+    }
+
+    #[test]
+    fn runner_blocked_park_keeps_the_rework_phase() {
+        let (_d, mut c) = open_tmp();
+        let id = runner_blocked_task(&mut c);
+        c.execute("UPDATE tasks SET status='rework' WHERE id=?1", [id])
+            .unwrap();
+        let disposition =
+            dispose_with_blocked(&mut c, id, Some(&runner_blocked("Q?")), 1001).unwrap();
+        assert_eq!(disposition, DeadTurnRunnerDisposition::RunnerBlockedParked);
+        assert_eq!(
+            blocked_task_refs(&c, id)[PARKED_RESUME_STATUS_REF],
+            "rework"
+        );
+    }
+
+    #[test]
+    fn runner_blocked_note_is_cut_at_the_note_cap_on_a_char_boundary() {
+        let (_d, mut c) = open_tmp();
+        let id = runner_blocked_task(&mut c);
+        // Three-byte characters make an exact byte cut land mid-character.
+        let question = format!("Q-HEAD {}", "€".repeat(3000));
+        let disposition =
+            dispose_with_blocked(&mut c, id, Some(&runner_blocked(&question)), 1001).unwrap();
+        assert_eq!(disposition, DeadTurnRunnerDisposition::RunnerBlockedParked);
+        let notes = park_notes(&c, id);
+        assert_eq!(notes.len(), 1);
+        let note = &notes[0];
+        assert!(
+            note.len() <= RUNNER_BLOCKED_NOTE_MAX_BYTES,
+            "{}",
+            note.len()
+        );
+        assert!(
+            note.len() > RUNNER_BLOCKED_NOTE_MAX_BYTES - 8,
+            "{}",
+            note.len()
+        );
+        assert!(note.starts_with("parked: needs-info\n\nworker worker question:\nQ-HEAD €"));
+        // The context lines fall beyond the cap.
+        assert!(!note.contains("CTX-reason"));
+    }
+
+    #[test]
+    fn runner_blocked_without_text_or_with_nul_is_refused_without_writes() {
+        for blocked in [
+            RunnerBlocked {
+                question: String::new(),
+                context: Vec::new(),
+            },
+            RunnerBlocked {
+                question: "a\0b".into(),
+                context: Vec::new(),
+            },
+            RunnerBlocked {
+                question: "Q".into(),
+                context: vec![String::new()],
+            },
+        ] {
+            let (_d, mut c) = open_tmp();
+            let id = runner_blocked_task(&mut c);
+            let error = dispose_with_blocked(&mut c, id, Some(&blocked), 1001).unwrap_err();
+            assert!(matches!(error, QuorumError::Usage(_)), "{error}");
+            assert_eq!(get(&c, id).unwrap().unwrap().status, "working");
+            assert!(park_notes(&c, id).is_empty());
+        }
+    }
+
+    #[test]
+    fn runner_blocked_yields_to_a_pending_or_recorded_delivery() {
+        for consumed in [false, true] {
+            let (_d, mut c) = open_tmp();
+            let id = runner_blocked_task(&mut c);
+            let done = crate::mailbox::append(
+                &mut c,
+                &crate::mailbox::MailboxRow {
+                    agent: "worker".into(),
+                    kind: crate::mailbox::MailboxKind::Done,
+                    task_id: Some(id),
+                    pr: None,
+                    verdict: None,
+                    feedback: None,
+                    note: None,
+                    to_agent: None,
+                    payload: None,
+                },
+            )
+            .unwrap();
+            if consumed {
+                // A recorded delivery: the row was consumed and the task left
+                // the worker phase.
+                c.execute("UPDATE mailbox SET consumed_at=1000 WHERE id=?1", [done])
+                    .unwrap();
+                c.execute(
+                    "UPDATE tasks SET status='in-review',
+                         refs=json_set(refs,'$.pr','https://github.com/o/r/pull/7')
+                     WHERE id=?1",
+                    [id],
+                )
+                .unwrap();
+            }
+            let disposition =
+                dispose_with_blocked(&mut c, id, Some(&runner_blocked("Q?")), 1001).unwrap();
+            let expected = if consumed {
+                DeadTurnRunnerDisposition::DeliveryRecorded
+            } else {
+                DeadTurnRunnerDisposition::DonePending
+            };
+            assert_eq!(disposition, expected);
+            assert!(blocked_task_refs(&c, id).get(PARKED_BY_REF).is_none());
+            assert!(park_notes(&c, id).is_empty());
+        }
+    }
+
+    #[test]
+    fn runner_blocked_yields_to_every_react_state_but_not_to_a_note() {
+        for state in ["failed", "blocked", "needs-info", "note"] {
+            let (_d, mut c) = open_tmp();
+            let id = runner_blocked_task(&mut c);
+            append_worker_reaction(&mut c, id, state);
+            let disposition =
+                dispose_with_blocked(&mut c, id, Some(&runner_blocked("RUNNER-Q?")), 1001).unwrap();
+            let refs = blocked_task_refs(&c, id);
+            match state {
+                "failed" => {
+                    assert!(
+                        matches!(disposition, DeadTurnRunnerDisposition::AgentFailed(_)),
+                        "{state}: {disposition:?}"
+                    );
+                    assert!(refs.get(PARKED_BY_REF).is_none(), "{state}");
+                }
+                "blocked" | "needs-info" => {
+                    assert_eq!(disposition, DeadTurnRunnerDisposition::ReactionParked);
+                    assert_eq!(refs[PARKED_REASON_REF], state);
+                    assert!(refs.get(PARKED_BY_REF).is_none(), "{state}");
+                    assert_eq!(park_notes(&c, id), vec![format!("parked: {state}")]);
+                }
+                _ => {
+                    assert_eq!(disposition, DeadTurnRunnerDisposition::RunnerBlockedParked);
+                    assert_eq!(refs[PARKED_BY_REF], RUNNER_BLOCKED_PARKED_BY);
+                }
+            }
+            let question_stored: bool = c
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM task_notes WHERE task_id=?1 AND body LIKE '%RUNNER-Q?%')",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(question_stored, state == "note", "{state}");
+            // The reaction rows are consumed with the disposition.
+            let pending: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM mailbox WHERE task_id=?1 AND consumed_at IS NULL",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(pending, 0, "{state}");
+        }
+    }
+
+    #[test]
+    fn daemon_parked_by_is_cleared_on_retry_and_on_a_later_park() {
+        let (_d, mut c) = open_tmp();
+        let id = runner_blocked_task(&mut c);
+        dispose_with_blocked(&mut c, id, Some(&runner_blocked("Q?")), 1001).unwrap();
+        assert_eq!(
+            blocked_task_refs(&c, id)[PARKED_BY_REF],
+            RUNNER_BLOCKED_PARKED_BY
+        );
+
+        let restored = retry_parked(&mut c, id, "boss", true, 1002)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.status, "open");
+        let refs = blocked_task_refs(&c, id);
+        assert!(refs.get(PARKED_BY_REF).is_none(), "{refs}");
+        assert!(refs.get(PARKED_REF).is_none());
+        assert_eq!(refs[PENDING_RESUME_REF]["kind"], "unanswered");
+
+        // A later react park of the restored task names no parker.
+        claim(&mut c, "worker", Some(id), &[], TTL, 1003).unwrap();
+        append_worker_reaction(&mut c, id, "needs-info");
+        let disposition = dispose_with_blocked(&mut c, id, None, 1004).unwrap();
+        assert_eq!(disposition, DeadTurnRunnerDisposition::ReactionParked);
+        assert!(blocked_task_refs(&c, id).get(PARKED_BY_REF).is_none());
+
+        // set_parked_refs drops a stale parker for every park path.
+        let refs = set_parked_refs(
+            Some(r#"{"daemon_parked_by":"runner-blocked","x":1}"#),
+            "blocked",
+            "working",
+            None,
+        )
+        .unwrap();
+        let refs: serde_json::Value = serde_json::from_str(&refs).unwrap();
+        assert!(refs.get(PARKED_BY_REF).is_none());
+        assert_eq!(refs["x"], 1);
     }
 
     #[test]
@@ -10295,6 +10741,7 @@ mod tests {
                     reason: "process exited".into(),
                 },
                 &dead_turn_retry(),
+                None,
                 1001,
             )
             .unwrap();
@@ -10374,6 +10821,7 @@ mod tests {
                     reason: "process exited".into(),
                 },
                 &dead_turn_retry(),
+                None,
                 1001,
             )
             .unwrap();
@@ -10478,6 +10926,7 @@ mod tests {
                     reason: "process exited".into(),
                 },
                 &dead_turn_retry(),
+                None,
                 1005,
             )
             .unwrap();
@@ -10522,6 +10971,7 @@ mod tests {
                 reason: "process exited".into(),
             },
             &dead_turn_retry(),
+            None,
             1001,
         )
         .unwrap();
@@ -10550,6 +11000,7 @@ mod tests {
                     reason: "process exited".into(),
                 },
                 &dead_turn_retry(),
+                None,
                 1002,
             )
             .unwrap(),

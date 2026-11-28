@@ -3300,6 +3300,7 @@ fn finalize_recovery_delivery(
                      '$.daemon_parked',
                      '$.daemon_parked_reason',
                      '$.daemon_resume_status',
+                     '$.daemon_parked_by',
                      '$.daemon_publication'),
                  '$.merge_commit_sha',
                  ?5,

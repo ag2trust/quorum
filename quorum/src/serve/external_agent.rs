@@ -30,7 +30,8 @@ use super::runner::{
     FailureDisposition, FailureTracker, LaunchGate, LaunchRequest, ManagedRunEnv, NormalizedLine,
     RunnerFailure, TokenUsage, EXIT_EVIDENCE_TIMEOUT,
 };
-use crate::external_runner_spec::ExternalSpec;
+use crate::external_runner_spec::{AccessLevel, ExternalSpec};
+use quorum_core::tasks::RunnerBlocked;
 use serde_json::{json, Value};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -168,6 +169,8 @@ pub struct ExternalProc {
     /// The exit check (or a violation) decided this turn's result.
     decided: bool,
     killed_by_quorum: bool,
+    /// The blocked outcome released by the exit check (read-write runs only).
+    blocked: Option<RunnerBlocked>,
     failures: FailureTracker,
     stderr: Arc<Mutex<StderrCounts>>,
     stderr_task: Option<tokio::task::JoinHandle<()>>,
@@ -261,6 +264,8 @@ impl ExternalProc {
         let reader = BufReader::new(child.stdout.take().expect("stdout was piped"));
         let max_line = usize::try_from(spec.stream.max_line_bytes).unwrap_or(usize::MAX);
         let terminal_exit = std::time::Duration::from_secs(spec.stream.terminal_exit_secs);
+        let read_write = external_launch::access_level(request.managed.map(|m| m.role))
+            == AccessLevel::ReadWrite;
         Ok(Self {
             child,
             process_group_id,
@@ -270,13 +275,14 @@ impl ExternalProc {
             line_buffer: Vec::new(),
             max_line,
             terminal_exit,
-            stream: ExternalStream::new(spec),
+            stream: ExternalStream::new(spec).allowing_blocked(read_write),
             terminal_deadline: None,
             stdout_eof: false,
             exited: None,
             finished: false,
             decided: false,
             killed_by_quorum: false,
+            blocked: None,
             failures,
             stderr: counts,
             stderr_task: Some(stderr_task),
@@ -421,12 +427,26 @@ impl ExternalProc {
             self.kill_tree();
         }
         self.decided = true;
-        match &verdict.failure {
-            Some(failure) => self.failures.record_decided_failure(failure.clone()),
-            None if matches!(verdict.event, Some(AgentEvent::TurnCompleted { .. })) => {
+        match (&verdict.failure, &verdict.event) {
+            (Some(failure), _) => self.failures.record_decided_failure(failure.clone()),
+            (None, Some(AgentEvent::TurnCompleted { .. })) => {
                 self.failures.record_terminal_success()
             }
-            None => {}
+            // A blocked outcome is a declared, exit-checked terminal: no
+            // runner failure. The lifecycle parks from the retained question.
+            (
+                None,
+                Some(AgentEvent::TurnBlocked {
+                    question, context, ..
+                }),
+            ) => {
+                self.failures.record_terminal_success();
+                self.blocked = Some(RunnerBlocked {
+                    question: question.clone(),
+                    context: context.clone(),
+                });
+            }
+            (None, _) => {}
         }
         if verdict.event.is_none() && verdict.failure.is_none() {
             return None;
@@ -467,6 +487,11 @@ impl ExternalProc {
 
     pub fn observed_pre_authoritative_failure(&self) -> Option<RunnerFailure> {
         self.failures.observed_failure()
+    }
+
+    /// The turn's blocked outcome, once the exit check released it.
+    pub fn runner_blocked(&self) -> Option<&RunnerBlocked> {
+        self.blocked.as_ref()
     }
 
     pub(super) fn failure_tracker(&self) -> FailureTracker {
@@ -586,6 +611,13 @@ fn encode(
                 "message": message,
                 "usage": usage.as_ref().map(usage_json),
             })),
+            // Metadata only: the question and its context are kept on the
+            // process ([`ExternalProc::runner_blocked`]) and stored once, in
+            // the park note, never in the stream log.
+            AgentEvent::TurnBlocked { usage, .. } => Some(json!({
+                "event": "turn_blocked",
+                "usage": usage.as_ref().map(usage_json),
+            })),
             _ => None,
         })
         .collect();
@@ -623,6 +655,12 @@ fn decode_event(value: &Value) -> Option<AgentEvent> {
             message: text("message")?,
             usage: usage_from(value.get("usage")),
             cost_usd: None,
+        }),
+        // The record carries no question text (see `encode`).
+        "turn_blocked" => Some(AgentEvent::TurnBlocked {
+            question: String::new(),
+            context: Vec::new(),
+            usage: usage_from(value.get("usage")),
         }),
         _ => None,
     }
@@ -1403,6 +1441,151 @@ mod tests {
             "{error}"
         );
         assert!(!observe.path().join("env").exists(), "child spawned");
+    }
+
+    fn managed_env(scenario: &str) -> Vec<(String, String)> {
+        let mut env: Vec<(String, String)> = [
+            ("QUORUM_REPO", "owner/repo"),
+            ("QUORUM_AGENT", "Bolt-test"),
+            ("QUORUM_RUN_ID", "cap-123"),
+            ("QUORUM_AGENT_ENDPOINT", "/tmp/quorum-agent.sock"),
+            (AGENT_MCP_URL_ENV, URL),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        env.extend(scenario_env(scenario));
+        env
+    }
+
+    /// Launch `scenario` as `role` (`None`: restricted) and drive it; also
+    /// return the retained blocked outcome.
+    async fn launch_as(scenario: &str, role: Option<AgentMcpRole>) -> (Run, Option<RunnerBlocked>) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("quorum.db");
+        let spec = spec(true);
+        // A restricted run carries no managed run environment.
+        let env = match role {
+            Some(_) => managed_env(scenario),
+            None => scenario_env(scenario),
+        };
+        let managed = role.map(|role| ManagedLaunch { role, db_path: &db });
+        let mut proc = RunnerProc::launch(
+            &request(dir.path(), &env, managed),
+            &config(Some(&spec), None),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{scenario}: launch failed: {error}"));
+        // Read the records first so the retained outcome can be inspected
+        // before `drive` consumes the process.
+        let mut records = Vec::new();
+        while let Some(raw) = tokio::time::timeout(Duration::from_secs(20), proc.next_raw_line())
+            .await
+            .expect("record within bound")
+        {
+            records.push(raw);
+        }
+        let blocked = proc.runner_blocked().cloned();
+        let mut run = drive(proc).await;
+        run.events = records
+            .iter()
+            .flat_map(|raw| normalize_line(raw).events)
+            .collect();
+        run.records = records;
+        (run, blocked)
+    }
+
+    #[tokio::test]
+    async fn blocked_worker_run_retains_question_and_records_metadata_only() {
+        let (run, blocked) = launch_as("blocked", Some(AgentMcpRole::Worker)).await;
+        assert!(run.outcome.is_none(), "{:?}", run.outcome);
+        // Empty and non-string context values are dropped; order is kept.
+        assert_eq!(
+            blocked,
+            Some(RunnerBlocked {
+                question: "Which schema version?".into(),
+                context: vec!["two migrations conflict".into()],
+            })
+        );
+        let terminal: Vec<_> = run
+            .events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::TurnBlocked { .. }))
+            .collect();
+        assert_eq!(
+            terminal,
+            vec![&AgentEvent::TurnBlocked {
+                question: String::new(),
+                context: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: 4,
+                    uncached_input_tokens: 4,
+                    output_tokens: 2,
+                    ..TokenUsage::default()
+                }),
+            }]
+        );
+        assert!(run.terminal_events().is_empty());
+        for record in &run.records {
+            assert!(!record.contains("schema version"), "{record}");
+            assert!(!record.contains("migrations conflict"), "{record}");
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_outcome_fails_closed_without_question_contradicting_exit_or_writing_role() {
+        use crate::serve::external_stream::{
+            DETAIL_BLOCKED_OUTSIDE_WRITING_ROLE, DETAIL_BLOCKED_WITHOUT_QUESTION,
+        };
+        use FailureDisposition::*;
+        let cases: &[(&str, Option<AgentMcpRole>, FailureDisposition, &str)] = &[
+            (
+                "blocked_without_question",
+                Some(AgentMcpRole::Worker),
+                NonFailover,
+                DETAIL_BLOCKED_WITHOUT_QUESTION,
+            ),
+            (
+                "blocked_contradicting_exit",
+                Some(AgentMcpRole::Worker),
+                Unclassified,
+                DETAIL_EXIT_CONTRADICTS,
+            ),
+            (
+                "blocked",
+                Some(AgentMcpRole::Reviewer),
+                NonFailover,
+                DETAIL_BLOCKED_OUTSIDE_WRITING_ROLE,
+            ),
+            (
+                "blocked",
+                Some(AgentMcpRole::Planner),
+                NonFailover,
+                DETAIL_BLOCKED_OUTSIDE_WRITING_ROLE,
+            ),
+            (
+                "blocked",
+                None,
+                NonFailover,
+                DETAIL_BLOCKED_OUTSIDE_WRITING_ROLE,
+            ),
+        ];
+        for &(scenario, role, disposition, detail) in cases {
+            let (run, blocked) = launch_as(scenario, role).await;
+            let outcome = run.outcome.as_ref().expect("failure expected");
+            assert_eq!(outcome.disposition(), disposition, "{scenario}/{role:?}");
+            assert_eq!(outcome.detail(), detail, "{scenario}/{role:?}");
+            assert!(blocked.is_none(), "{scenario}/{role:?}");
+            assert!(
+                !run.events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::TurnBlocked { .. })),
+                "{scenario}/{role:?}"
+            );
+            for record in &run.records {
+                assert!(!record.contains("schema version"), "{record}");
+            }
+        }
     }
 
     #[test]

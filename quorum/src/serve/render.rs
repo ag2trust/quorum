@@ -292,6 +292,8 @@ pub fn render_agent_event(event: &AgentEvent) -> Option<String> {
             Some(format!("---\n*Turn complete: {tokens} tokens{cost_str}*\n"))
         }
         AgentEvent::TurnFailed { message, .. } => Some(format!("---\n*Turn failed: {message}*\n")),
+        // The question is recorded once, in the task's park note.
+        AgentEvent::TurnBlocked { .. } => Some("---\n*Turn blocked: asked for input*\n".into()),
         AgentEvent::MidTurnUsage { .. }
         | AgentEvent::Liveness { .. }
         | AgentEvent::UnfedTurnUsage { .. } => None,

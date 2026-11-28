@@ -5719,6 +5719,13 @@ impl SlotState {
         }
     }
 
+    fn runner_blocked(&self) -> Option<&tasks::RunnerBlocked> {
+        match &self.proc {
+            SlotProcess::Running(proc) => proc.runner_blocked(),
+            SlotProcess::Failed { .. } | SlotProcess::Dormant { .. } => None,
+        }
+    }
+
     async fn finalize_pre_authoritative_exit_evidence(
         &mut self,
         role: &str,
@@ -18769,13 +18776,16 @@ async fn tick(
                 &dead.agent_name,
                 &reason,
                 &pending_turn,
+                dead.runner_blocked(),
             )
             .await
             {
                 Ok(tasks::DeadTurnRunnerDisposition::DonePending) => {
+                    log_ignored_runner_blocked(&dead);
                     workers.insert(i, dead);
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::DeliveryRecorded) => {
+                    log_ignored_runner_blocked(&dead);
                     park_or_cleanup_delivered_worker_slot(
                         config, wt_mgr, name_pool, workers, i, dead,
                     )
@@ -18794,9 +18804,15 @@ async fn tick(
                     .await;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::AgentFailed(_)) => {
+                    log_ignored_runner_blocked(&dead);
                     cleanup_slot(config, wt_mgr, name_pool, dead, None, "failed").await;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::ReactionParked) => {
+                    log_ignored_runner_blocked(&dead);
+                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
+                }
+                Ok(tasks::DeadTurnRunnerDisposition::RunnerBlockedParked) => {
+                    log_runner_blocked_park(&dead);
                     cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::ProviderBlocked) => {
@@ -19016,16 +19032,19 @@ async fn tick(
                 &dead.agent_name,
                 &reason,
                 &retry,
+                dead.runner_blocked(),
             )
             .await
             {
                 Ok(tasks::DeadTurnRunnerDisposition::DonePending) => {
                     // Phase 2 must consume the row while the slot still owns its
                     // branch/worktree. Keep the dead slot until the next tick.
+                    log_ignored_runner_blocked(&dead);
                     workers.insert(i, dead);
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::DeliveryRecorded) => {
+                    log_ignored_runner_blocked(&dead);
                     park_or_cleanup_delivered_worker_slot(
                         config, wt_mgr, name_pool, workers, i, dead,
                     )
@@ -19050,10 +19069,17 @@ async fn tick(
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::AgentFailed(_)) => {
+                    log_ignored_runner_blocked(&dead);
                     cleanup_slot(config, wt_mgr, name_pool, dead, None, "failed").await;
                     continue;
                 }
                 Ok(tasks::DeadTurnRunnerDisposition::ReactionParked) => {
+                    log_ignored_runner_blocked(&dead);
+                    cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
+                    continue;
+                }
+                Ok(tasks::DeadTurnRunnerDisposition::RunnerBlockedParked) => {
+                    log_runner_blocked_park(&dead);
                     cleanup_slot(config, wt_mgr, name_pool, dead, None, "parked").await;
                     continue;
                 }
@@ -22092,7 +22118,8 @@ async fn settle_dormant_worker_feed_failure(
     let task_id = workers[worker_index].task_id;
     let agent = workers[worker_index].agent_name.clone();
     let reason = format!("dormant continuation launch failed: {error}");
-    match dispose_dead_turn_runner_worker(&config.db_path, task_id, &agent, &reason, &pending).await
+    match dispose_dead_turn_runner_worker(&config.db_path, task_id, &agent, &reason, &pending, None)
+        .await
     {
         Ok(tasks::DeadTurnRunnerDisposition::AgentFailed(_)) => {
             let worker = workers.remove(worker_index);
@@ -22106,7 +22133,10 @@ async fn settle_dormant_worker_feed_failure(
             cleanup_slot(config, wt_mgr, name_pool, worker, None, "failed").await;
             Ok(DormantWorkerFeedFailureDisposition::Settled)
         }
-        Ok(tasks::DeadTurnRunnerDisposition::ReactionParked) => {
+        Ok(
+            tasks::DeadTurnRunnerDisposition::ReactionParked
+            | tasks::DeadTurnRunnerDisposition::RunnerBlockedParked,
+        ) => {
             let worker = workers.remove(worker_index);
             settle_dormant_worker_turn_identity(
                 &config.db_path,
@@ -22872,6 +22902,25 @@ async fn checkpoint_grok_max_turn_exhaustion(
     Ok(retry)
 }
 
+/// Metadata-only diagnostic: a delivery or an explicit `react` outranked the
+/// external runner's blocked outcome, whose question is discarded (spec
+/// "Blocked outcome", precedence 1 and 2).
+fn log_ignored_runner_blocked(slot: &SlotState) {
+    if slot.runner_blocked().is_some() {
+        log(&format!(
+            "worker {} blocked outcome on task #{} ignored: a delivery or explicit reaction takes precedence",
+            slot.agent_name, slot.task_id
+        ));
+    }
+}
+
+fn log_runner_blocked_park(slot: &SlotState) {
+    log(&format!(
+        "worker {} blocked outcome parked task #{} as needs-info",
+        slot.agent_name, slot.task_id
+    ));
+}
+
 /// Phase 4b disposition for a dead turn-oriented worker.
 ///
 /// A turn-oriented process exits at turn end, so a successful `quorum submit`
@@ -22886,11 +22935,13 @@ async fn dispose_dead_turn_runner_worker(
     agent: &str,
     reason: &str,
     retry: &PendingTurn,
+    runner_blocked: Option<&tasks::RunnerBlocked>,
 ) -> Result<tasks::DeadTurnRunnerDisposition> {
     let p = db_path.to_path_buf();
     let agent = agent.to_string();
     let retry = retry.clone();
     let reason = reason.to_string();
+    let runner_blocked = runner_blocked.cloned();
     let disposition =
         tokio::task::spawn_blocking(move || -> Result<tasks::DeadTurnRunnerDisposition> {
             let mut conn = quorum_core::db::open(&p)?;
@@ -22903,6 +22954,7 @@ async fn dispose_dead_turn_runner_worker(
                     reason,
                 },
                 &retry,
+                runner_blocked.as_ref(),
                 now_unix(),
             )
         })
@@ -24424,7 +24476,19 @@ async fn drain_events(
                     // provider-specific durable handoff has completed.
                     slot.continuation_id = Some(thread_id.clone());
                 }
-                runner::AgentEvent::TurnCompleted { usage, cost_usd } => {
+                runner::AgentEvent::TurnCompleted { .. }
+                | runner::AgentEvent::TurnBlocked { .. } => {
+                    // A blocked turn (external runner, read-write runs only)
+                    // ends the turn like a completion: its usage counts and no
+                    // error refeed follows. The process has already exited;
+                    // Phase 4b parks the task from the retained outcome.
+                    let (usage, cost_usd, blocked) = match agent_event {
+                        runner::AgentEvent::TurnCompleted { usage, cost_usd } => {
+                            (usage, cost_usd, false)
+                        }
+                        runner::AgentEvent::TurnBlocked { usage, .. } => (usage, &None, true),
+                        _ => unreachable!("matched a terminal turn event"),
+                    };
                     let turn_tokens =
                         usage.map_or(0, |u| token_limit_total(u, limits.token_limit_basis));
                     let raw_turn_tokens = usage.map_or(0, |u| {
@@ -24443,7 +24507,9 @@ async fn drain_events(
                         slot.cost_usd = *cost;
                     }
                     let turn_cost_usd = cost_usd.map(|c| (c - prev_cost).max(0.0));
-                    let phase = if role == "worker" {
+                    let phase = if blocked {
+                        "working"
+                    } else if role == "worker" {
                         "awaiting-review"
                     } else {
                         "reviewing"
@@ -30553,6 +30619,7 @@ async fn settle_failed_worker_fallback(
             reason,
         },
         pending_turn,
+        None,
         now_unix(),
     )?;
     drop(conn);
@@ -30858,6 +30925,7 @@ async fn activate_worker_fallback_with(
                 &slot.agent_name,
                 &block,
                 &pending_turn,
+                None,
                 now_unix(),
             )?;
             return Ok(WorkerFallbackActivation::Settled);
@@ -50384,6 +50452,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "Spool",
             "process exited",
             &dead_codex_retry(),
+            None,
         )
         .await
         .unwrap();
@@ -66682,6 +66751,183 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
         slot.kill_and_reap().await;
     }
 
+    /// Spec "Blocked outcome": an external worker whose CLI ends with the
+    /// declared blocked status is parked as needs-info by the daemon's
+    /// normal tick (Phase 4 drain, then the Phase 4b exit park), with the
+    /// question note, `daemon_parked_by`, and the slot released.
+    #[cfg(unix)]
+    #[test]
+    fn external_worker_blocked_outcome_parks_needs_info_through_the_tick() {
+        // A whole tick future exceeds the default test-thread stack.
+        std::thread::Builder::new()
+            .name("external-blocked-tick".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(external_worker_blocked_tick_body())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn external_worker_blocked_tick_body() {
+        use std::os::unix::fs::PermissionsExt;
+        const FAKE_CLI: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/serve/testdata/external/fake_cli.sh"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let repo = launch_test_repo(dir.path());
+        // The scenario is selected by a wrapper, so no process-wide
+        // environment is mutated under the threaded test harness.
+        let wrapper = dir.path().join("blocked-cli.sh");
+        std::fs::write(
+            &wrapper,
+            format!("#!/bin/sh\nFAKE_CLI_SCENARIO=blocked exec '{FAKE_CLI}' \"$@\"\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let wrapper = wrapper.to_str().unwrap().to_string();
+        let declaration = crate::external_runner_spec::tests::VALID.replacen(
+            "executable = \"/usr/local/bin/fake-cli\"\n",
+            "",
+            1,
+        );
+        let file_cfg: crate::serve_config::ServeFileConfig =
+            toml::from_str(&format!("agent_bin = \"{wrapper}\"\n{declaration}")).unwrap();
+        let spec = crate::serve_config::resolve_external_runner(&file_cfg)
+            .unwrap()
+            .expect("declared");
+
+        let mut config = claude_only_retry_test_config(dir.path(), &repo, Path::new(&wrapper));
+        config.agent_bin = Some(wrapper.clone());
+        config.external_runner = Some(Arc::new(spec));
+        config.model_profiles = std::collections::BTreeMap::from([(
+            "x-ext".into(),
+            crate::serve_config::ModelProfile {
+                runner: "external".into(),
+                model: "m-1".into(),
+                effort: "high".into(),
+            },
+        )]);
+        let pool = std::collections::BTreeMap::from([("x-ext".to_string(), 100)]);
+        config.routing = crate::serve_config::RoutingPolicy {
+            classifier: pool.clone(),
+            planner: pool.clone(),
+            arbiter: pool.clone(),
+            collector: pool.clone(),
+            worker: (1..=5)
+                .map(|level| (level.to_string(), pool.clone()))
+                .collect(),
+            reviewer: (1..=5)
+                .map(|level| (level.to_string(), pool.clone()))
+                .collect(),
+        };
+        let task_id = {
+            let mut conn = quorum_core::db::open(&config.db_path).unwrap();
+            tasks::create(
+                &mut conn,
+                "owner",
+                "external blocked task",
+                Some("one external worker turn that asks a question"),
+                0,
+                None,
+                Some(
+                    r#"{"cx_est":3,"cx_size":"M","cx_ready":true,"cx_not_ready_reason":null,"cx_by":"test:v2"}"#,
+                ),
+                None,
+                None,
+                now_unix(),
+            )
+            .unwrap()
+        };
+
+        let (mut workers, spawned) = dispatch_retry_test_worker(&config).await;
+        assert!(spawned, "the external worker launches");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].process_kind(), runner::AgentKind::External);
+        let agent_name = workers[0].agent_name.clone();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while workers[0].try_wait().unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the fake CLI exits after its blocked terminal");
+
+        let wt_mgr = WorktreeManager::new();
+        let mut name_pool = Pool::new_generated();
+        name_pool.acquire_named(&agent_name).unwrap();
+        let mut reviewers = Vec::new();
+        let mut lifetime_roster = LifetimeRoster::new();
+        lifetime_roster.register(&agent_name);
+        tick(
+            &config,
+            &wt_mgr,
+            &mut name_pool,
+            &mut workers,
+            &mut reviewers,
+            &mut branch_sync::BranchSyncChecks::default(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut PoisonTracker::new(),
+            &mut ClaimSkipLogLimiter::new(),
+            &mut ClaimSkipLogLimiter::new(),
+            &mut UnrecordableStrikes::new(),
+            &mut ReviewerRespawnBackoff::new(),
+            &mut ProfileCooldown::new(),
+            &mut ReviewerSlotQueue::default(),
+            &mut DrainState::new(),
+            &mut lifetime_roster,
+            &mut None,
+            &mut DecompositionCoordinator::default(),
+            &mut 0,
+            &mut None,
+            &mut None,
+            &mut std::collections::HashSet::new(),
+            &collector::CollectorTracker::default(),
+            &std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        )
+        .await
+        .unwrap();
+
+        assert!(workers.is_empty(), "the parked worker slot is released");
+        let conn = quorum_core::db::open(&config.db_path).unwrap();
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        assert_eq!(task.status, "failed");
+        assert!(task.assignee.is_none());
+        let refs: serde_json::Value = serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        assert_eq!(refs[tasks::PARKED_REF], true);
+        assert_eq!(
+            refs[tasks::PARKED_REASON_REF],
+            tasks::NEEDS_INFO_PARK_REASON
+        );
+        assert_eq!(refs[tasks::PARKED_BY_REF], tasks::RUNNER_BLOCKED_PARKED_BY);
+        assert!(
+            refs.get(runner_state::PROVIDER_BLOCK_REF).is_none(),
+            "{refs}"
+        );
+        let note: String = conn
+            .query_row(
+                "SELECT body FROM task_notes
+                 WHERE task_id=?1 AND agent='daemon' AND body LIKE 'parked:%'",
+                [task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            note,
+            format!(
+                "parked: needs-info\n\nworker {agent_name} question:\nWhich schema version?\ntwo migrations conflict"
+            )
+        );
+    }
+
     /// Task #306 (Cleat, run 907): the reopened task still carried Pivot's
     /// durable initial handoff, yet a fresh initial Grok worker was launched
     /// whose terminal identity could never persist. Refuse before any run or
@@ -67121,6 +67367,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "Spool",
             "process exited",
             &dead_codex_retry(),
+            None,
         )
         .await
         .unwrap();
@@ -67174,6 +67421,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "Spool",
             "provider quota exhausted",
             &dead_codex_retry(),
+            None,
         )
         .await
         .unwrap();
@@ -67228,6 +67476,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "Spool",
             "process exited",
             &dead_codex_retry(),
+            None,
         )
         .await
         .unwrap();
@@ -67277,6 +67526,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "Replacement",
             "provider quota exhausted",
             &dead_codex_retry(),
+            None,
         )
         .await
         .unwrap();
@@ -67330,6 +67580,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "Replacement",
             "process exited",
             &dead_codex_retry(),
+            None,
         )
         .await
         .unwrap();
@@ -67383,6 +67634,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "Spool",
             "process exited",
             &dead_codex_retry(),
+            None,
         )
         .await
         .unwrap();
@@ -67430,6 +67682,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
             "Spool",
             "process exited",
             &dead_codex_retry(),
+            None,
         )
         .await
         .unwrap();
