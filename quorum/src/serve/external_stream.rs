@@ -20,6 +20,7 @@ use super::runner::{ActivityKind, AgentEvent, FailureDisposition, RunnerFailure,
 use crate::external_runner_spec::{ExternalSpec, Outcome, Scalar, StatusDisposition};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::ops::Deref;
 
 /// Activity summaries use the same bound as the built-in adapters'
 /// `tool_summary` labels (`runner.rs`).
@@ -135,18 +136,20 @@ pub struct ExitVerdict {
     pub failure: Option<RunnerFailure>,
 }
 
-/// Per-turn stream state. One value per process.
+/// Per-turn stream state. One value per process. `S` is any handle to the
+/// spec (`&ExternalSpec` in pure tests, `Arc<ExternalSpec>` in the process
+/// adapter, which outlives the launch request's borrow).
 #[derive(Debug)]
-pub struct ExternalStream<'a> {
-    spec: &'a ExternalSpec,
+pub struct ExternalStream<S: Deref<Target = ExternalSpec>> {
+    spec: S,
     line_number: u64,
     saw_protocol_line: bool,
     terminal: Option<TerminalSeen>,
     stopped: bool,
 }
 
-impl<'a> ExternalStream<'a> {
-    pub fn new(spec: &'a ExternalSpec) -> Self {
+impl<S: Deref<Target = ExternalSpec>> ExternalStream<S> {
+    pub fn new(spec: S) -> Self {
         Self {
             spec,
             line_number: 0,
@@ -167,7 +170,7 @@ impl<'a> ExternalStream<'a> {
     /// The exit check for this turn (see [`exit_check`]).
     pub fn exit_check(&self, exit: ExitObservation) -> ExitVerdict {
         exit_check(
-            self.spec,
+            &self.spec,
             self.terminal.as_ref(),
             self.saw_protocol_line,
             exit,
@@ -573,7 +576,7 @@ mod tests {
         }
     }
 
-    fn feed<'a>(stream: &mut ExternalStream<'a>, lines: &[&str]) -> Vec<LineStep> {
+    fn feed(stream: &mut ExternalStream<&ExternalSpec>, lines: &[&str]) -> Vec<LineStep> {
         lines.iter().map(|l| stream.on_line(l.as_bytes())).collect()
     }
 

@@ -152,6 +152,7 @@ async fn spawn_classifier_configured_with_timeout(
             claude_allowed_tools: "",
             codex_sandbox,
             grok: Default::default(),
+            external: None,
         },
         deadline,
     )
@@ -844,7 +845,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("external runner adapter not built"),
+                .contains(crate::serve::external_agent::DETAIL_NO_SPEC),
             "{error}"
         );
         assert!(!ran.exists(), "a refused classifier launch ran a provider");
