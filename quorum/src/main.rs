@@ -1822,6 +1822,15 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
 
             let db = paths::ensure_repo_dir(&r_repo.value)?;
 
+            let state_dir = db
+                .parent()
+                .ok_or_else(|| QuorumError::Io("quorum.db path has no parent directory".into()))?;
+            let r_session_base = serve_config::resolve_session_base(
+                file_cfg.session_base.as_deref(),
+                state_dir,
+                std::path::Path::new(&r_wt.value),
+            )?;
+
             let merge_executor: std::sync::Arc<dyn serve::merge::MergeExecutor> =
                 if let Some(cmd) = merge_cmd {
                     std::sync::Arc::new(serve::merge::CommandMergeExecutor {
@@ -1876,6 +1885,7 @@ fn dispatch(cmd: cli::Command) -> Result<i32> {
                 cap: r_cap.value,
                 repo_dir: std::path::PathBuf::from(r_repo_dir.value),
                 worktree_base: std::path::PathBuf::from(r_wt.value),
+                session_base: r_session_base,
                 names_file: r_names.value.map(std::path::PathBuf::from),
                 agent_bin: r_agent_bin.value,
                 codex_sandbox,

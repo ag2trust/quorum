@@ -5534,6 +5534,7 @@ esac
                     .collect(),
             },
             repo_dir: repo,
+            session_base: root.join("sessions"),
             worktree_base,
             names_file: None,
             agent_bin: Some(bin.to_string_lossy().into_owned()),
