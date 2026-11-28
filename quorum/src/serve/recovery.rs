@@ -1488,6 +1488,7 @@ mod tests {
             max_active_graphs: 2,
             agent_mcp_url: Some("http://127.0.0.1:9/mcp".into()),
             review_publication: None,
+            external_runner: None,
         }
     }
 
