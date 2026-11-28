@@ -60,6 +60,22 @@ case "${FAKE_CLI_SCENARIO:-success}" in
     echo '{"type":"item.started","item":{"type":"tool_call","name":"Bash"}}'
     sleep 30
     ;;
+  # The *_then_exit scenarios write everything in one write and exit at
+  # once, as a block-buffered CLI does: the exit is observable before the
+  # trailing line is read.
+  second_terminal_then_exit)
+    printf '%s\n%s\n%s\n' "$start" "$completed" "$completed"
+    exit 0
+    ;;
+  line_after_terminal_then_exit)
+    printf '%s\n%s\n%s\n' "$start" "$completed" \
+      '{"type":"item.started","item":{"type":"tool_call","name":"Bash"}}'
+    exit 0
+    ;;
+  non_json_after_terminal_then_exit)
+    printf '%s\n%s\n%s\n' "$start" "$completed" 'plain words, not json'
+    exit 0
+    ;;
   undeclared_status)
     echo "$start"
     echo '{"type":"run.completed","status":"mystery-status"}'
@@ -90,6 +106,13 @@ case "${FAKE_CLI_SCENARIO:-success}" in
     echo "$start"
     echo "$completed"
     sleep 30
+    ;;
+  stdout_held_after_exit)
+    echo "$start"
+    echo "$completed"
+    # A descendant keeps stdout open after the CLI itself exits.
+    sleep 30 &
+    exit 0
     ;;
   eof_without_terminal)
     echo "$start"

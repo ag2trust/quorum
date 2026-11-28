@@ -10,7 +10,9 @@
 //!   which is then closed.
 //! - stdout is read one bounded line at a time. A protocol violation kills
 //!   the process tree. Once the terminal event is seen, [`ExternalProc::next_raw_line`]
-//!   waits at most `terminal_exit_secs` for the process to exit, then kills it.
+//!   waits at most `terminal_exit_secs` for the process to exit and for stdout
+//!   to reach EOF, then kills it. Lines still unread when the exit is
+//!   observed go through the stream before the exit check.
 //! - stderr is read only to keep the pipe drained and is retained as line and
 //!   byte counts. Its text is never classified and never stored.
 //!
@@ -157,6 +159,9 @@ pub struct ExternalProc {
     /// Set when the terminal event is accepted.
     terminal_deadline: Option<tokio::time::Instant>,
     stdout_eof: bool,
+    /// Exit observed after the terminal event; the exit check waits for the
+    /// stdout drain.
+    exited: Option<std::process::ExitStatus>,
     /// No more records: a violation stopped the run, the exit check ran, or
     /// stdout ended without a terminal event.
     finished: bool,
@@ -268,6 +273,7 @@ impl ExternalProc {
             stream: ExternalStream::new(spec),
             terminal_deadline: None,
             stdout_eof: false,
+            exited: None,
             finished: false,
             decided: false,
             killed_by_quorum: false,
@@ -295,15 +301,23 @@ impl ExternalProc {
             if self.finished {
                 return None;
             }
+            // Stream mapping §6: the exit check runs only once stdout has
+            // been drained to EOF, so a trailing protocol line written just
+            // before a prompt exit is still a violation.
+            if let (Some(status), true) = (self.exited, self.stdout_eof) {
+                return self.finish_exit_check(ExitObservation::from_status(status));
+            }
             let next = match self.terminal_deadline {
                 None => Next::Read(
                     read_line(&mut self.reader, &mut self.line_buffer, self.max_line).await,
                 ),
                 // `Child::wait`, `read_line`, and `sleep_until` are all
                 // cancellation-safe, so the losing branches lose no state.
+                // After the exit, only the stdout drain and the remaining
+                // `terminal_exit_secs` deadline race.
                 Some(deadline) => tokio::select! {
                     biased;
-                    status = self.child.wait() => Next::Exited(status),
+                    status = self.child.wait(), if self.exited.is_none() => Next::Exited(status),
                     read = read_line(&mut self.reader, &mut self.line_buffer, self.max_line),
                         if !self.stdout_eof => Next::Read(read),
                     () = tokio::time::sleep_until(deadline) => Next::Deadline,
@@ -337,9 +351,7 @@ impl ExternalProc {
                     self.kill_tree();
                     return None;
                 }
-                Next::Exited(Ok(status)) => {
-                    return self.finish_exit_check(ExitObservation::from_status(status))
-                }
+                Next::Exited(Ok(status)) => self.exited = Some(status),
                 Next::Exited(Err(error)) => {
                     self.failures.note_incomplete_evidence(format!(
                         "external runner exit status could not be read: {}",
@@ -348,6 +360,9 @@ impl ExternalProc {
                     self.finished = true;
                     return None;
                 }
+                // Also reached when the process exited but stdout stayed open
+                // (a descendant holds it): the stream did not end within the
+                // bound, so the fail-safe result is the same kill.
                 Next::Deadline => {
                     return self.finish_exit_check(ExitObservation::NoExitAfterTerminal)
                 }
@@ -852,6 +867,20 @@ mod tests {
                 Some((Unclassified, DETAIL_LINE_AFTER_TERMINAL)),
                 None,
             ),
+            // The exit is observed before the trailing line is read; stdout
+            // is still drained through the stream before the exit check.
+            (
+                "second_terminal_then_exit",
+                Some((Unclassified, DETAIL_SECOND_TERMINAL)),
+                None,
+            ),
+            (
+                "line_after_terminal_then_exit",
+                Some((Unclassified, DETAIL_LINE_AFTER_TERMINAL)),
+                None,
+            ),
+            // A non-protocol line after the terminal is not a violation.
+            ("non_json_after_terminal_then_exit", None, completed.clone()),
             (
                 "undeclared_status",
                 Some((NonFailover, DETAIL_UNDECLARED_STATUS)),
@@ -884,6 +913,16 @@ mod tests {
             ),
             (
                 "no_exit_after_terminal",
+                Some((Unclassified, DETAIL_NO_EXIT_AFTER_TERMINAL)),
+                Some(AgentEvent::TurnFailed {
+                    message: DETAIL_NO_EXIT_AFTER_TERMINAL.into(),
+                    usage: Some(success_usage),
+                    cost_usd: None,
+                }),
+            ),
+            // The CLI exits but stdout never reaches EOF within the bound.
+            (
+                "stdout_held_after_exit",
                 Some((Unclassified, DETAIL_NO_EXIT_AFTER_TERMINAL)),
                 Some(AgentEvent::TurnFailed {
                     message: DETAIL_NO_EXIT_AFTER_TERMINAL.into(),
@@ -965,13 +1004,15 @@ mod tests {
                             "{label}: stderr line and byte counts"
                         );
                     }
-                    "non_json" => {
+                    "non_json" | "non_json_after_terminal_then_exit" => {
+                        let want = if *scenario == "non_json" { 2 } else { 1 };
                         let non_protocol = run
                             .records
                             .iter()
                             .filter(|r| r.contains(RECORD_NON_PROTOCOL))
                             .count();
-                        assert_eq!(non_protocol, 2, "{label}");
+                        assert_eq!(non_protocol, want, "{label}");
+                        assert_eq!(run.terminal_text.as_deref(), Some("final answer"));
                     }
                     "exit_without_terminal" => {
                         assert!(run.records.is_empty(), "{label}");
@@ -992,6 +1033,73 @@ mod tests {
                 {
                     let violation = run.records.last().unwrap();
                     assert!(violation.contains(RECORD_VIOLATION), "{label}: {violation}");
+                }
+            }
+        }
+    }
+
+    /// Deterministic form of the `*_then_exit` cases: the consumer pauses
+    /// after the terminal record, so the exit is already observable and the
+    /// trailing line is still unread when the next record is requested.
+    #[tokio::test]
+    async fn trailing_lines_are_drained_after_an_observed_exit() {
+        use FailureDisposition::*;
+        let cases = [
+            (
+                "second_terminal_then_exit",
+                Some((Unclassified, DETAIL_SECOND_TERMINAL)),
+            ),
+            (
+                "line_after_terminal_then_exit",
+                Some((Unclassified, DETAIL_LINE_AFTER_TERMINAL)),
+            ),
+            ("non_json_after_terminal_then_exit", None),
+        ];
+        for (scenario, want) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let spec = spec(true);
+            let env = scenario_env(scenario);
+            let mut proc =
+                ExternalProc::launch(&request(dir.path(), &env, None), &config(Some(&spec), None))
+                    .unwrap();
+            // Start line, then the terminal line.
+            for _ in 0..2 {
+                let record = proc.next_raw_line().await.expect(scenario);
+                assert!(record.contains(RECORD_PROTOCOL), "{scenario}: {record}");
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while proc.try_wait().unwrap().is_none() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{scenario}: no exit"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let run = drive(RunnerProc::External(proc)).await;
+            let got = run
+                .outcome
+                .as_ref()
+                .map(|f| (f.disposition(), f.detail().to_string()));
+            assert_eq!(
+                got,
+                want.map(|(d, detail)| (d, detail.to_string())),
+                "{scenario}"
+            );
+            match want {
+                Some(_) => {
+                    assert!(run.terminal_events().is_empty(), "{scenario}");
+                    let last = run.records.last().unwrap();
+                    assert!(last.contains(RECORD_VIOLATION), "{scenario}: {last}");
+                }
+                None => {
+                    assert!(
+                        matches!(
+                            run.terminal_events().as_slice(),
+                            [AgentEvent::TurnCompleted { .. }]
+                        ),
+                        "{scenario}"
+                    );
+                    assert!(run.records[0].contains(RECORD_NON_PROTOCOL), "{scenario}");
                 }
             }
         }
