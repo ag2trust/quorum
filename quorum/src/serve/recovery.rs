@@ -160,6 +160,7 @@ fn validate_dormant_recovery(
     entry: &JournalEntry,
     now: i64,
     token_limit_basis: crate::serve_config::TokenLimitBasis,
+    external_fingerprint: Option<&str>,
 ) -> Result<DormantRecoveryDisposition> {
     let invalid = |detail: String| dormant_recovery_error(&entry.agent, detail);
     if !is_explicit_dormant_recovery_entry(entry) {
@@ -330,15 +331,31 @@ fn validate_dormant_recovery(
             )));
         }
     };
-    let persisted = runner_state::continuation(&refs, ContinuationSlot::Worker, provider_name)
-        .ok_or_else(|| {
-            invalid("task refs are missing the matching provider continuation".into())
-        })?;
-    if persisted.id != continuation_id {
-        return Err(invalid(
-            "journal continuation does not match task refs".into(),
-        ));
-    }
+    // Spec "Session record" > "Journal": an external row's continuation is
+    // the slot name and its conversation lives in `runner_external_sessions`,
+    // never in `runner_continuation*`. Built-in rows keep the refs-id check.
+    let external_entry = if provider == super::runner::AgentKind::External {
+        if continuation_id != super::EXTERNAL_WORKER_SLOT.slot_name() {
+            return Err(invalid(
+                "external journal continuation is not the worker slot".into(),
+            ));
+        }
+        Some(runner_state::external_session(
+            &refs,
+            super::EXTERNAL_WORKER_SLOT,
+        ))
+    } else {
+        let persisted = runner_state::continuation(&refs, ContinuationSlot::Worker, provider_name)
+            .ok_or_else(|| {
+                invalid("task refs are missing the matching provider continuation".into())
+            })?;
+        if persisted.id != continuation_id {
+            return Err(invalid(
+                "journal continuation does not match task refs".into(),
+            ));
+        }
+        None
+    };
 
     let runs = quorum_core::agent_runs::runs_for_task(conn, task_id)?;
     let mut active_runs = runs
@@ -368,6 +385,23 @@ fn validate_dormant_recovery(
     if model_provider != provider {
         return Err(invalid("worker run model/provider mismatch".into()));
     }
+    // An external row is rebuilt in place only while the slot's session
+    // record exists, is usable, and names the profile this run executed and
+    // the current declaration fingerprint. Otherwise the row is retired after
+    // every binding below is revalidated, and the slot's next run is a fresh
+    // start (spec "Resume or fresh start").
+    let external_refusal = match &external_entry {
+        None => None,
+        Some(entry) => {
+            let profile = super::worker_run_profile_id(conn, run.id)?;
+            let matches = entry.as_ref().is_some_and(|entry| {
+                entry.usable
+                    && profile.as_deref() == Some(entry.profile.as_str())
+                    && external_fingerprint == Some(entry.fingerprint.as_str())
+            });
+            (!matches).then_some("external session record does not permit in-place rebuild")
+        }
+    };
     let token_usage = quorum_core::token_usage::usage_for_agent_run(conn, run.id)?
         .map(|usage| -> Result<super::runner::TokenUsage> {
             Ok(super::runner::TokenUsage {
@@ -470,7 +504,7 @@ fn validate_dormant_recovery(
             "interrupted recovered rework has no exact pending remediation turn".into(),
         ));
     }
-    Ok(match task_disposition {
+    Ok(match task_disposition.or(external_refusal) {
         Some(reason) => DormantRecoveryDisposition::Retire {
             entry: Box::new(entry.clone()),
             reason,
@@ -737,9 +771,9 @@ fn reconstruct_dormant_slots(
             continuation_id: Some(recovery.continuation_id.clone()),
             pending_prompt: recovery.rework_feedback.clone().unwrap_or_default(),
             pending_turn_kind: if recovery.rework_feedback.is_some() {
-                "recovered-rework".into()
+                super::RECOVERED_REWORK_TURN_KIND.into()
             } else {
-                "awaiting-review".into()
+                super::REBUILT_AWAITING_REVIEW_TURN_KIND.into()
             },
         });
         log(&format!(
@@ -941,13 +975,23 @@ pub(crate) async fn recover(
     let dispositions = {
         let p = db_path.clone();
         let token_limit_basis = config.limits.token_limit_basis;
+        let external_fingerprint = config
+            .external_runner
+            .as_ref()
+            .map(|spec| spec.fingerprint.clone());
         tokio::task::spawn_blocking(move || -> Result<Vec<DormantRecoveryDisposition>> {
             let mut conn = quorum_core::db::open(&p)?;
             let tx = quorum_core::db::begin_immediate(&mut conn)?;
             let dispositions = dormant_entries
                 .iter()
                 .map(|entry| {
-                    validate_dormant_recovery(&tx, entry, super::now_unix(), token_limit_basis)
+                    validate_dormant_recovery(
+                        &tx,
+                        entry,
+                        super::now_unix(),
+                        token_limit_basis,
+                        external_fingerprint.as_deref(),
+                    )
                 })
                 .collect::<Result<Vec<_>>>()?;
             tx.commit()?;
@@ -2028,73 +2072,428 @@ mod tests {
         assert_eq!(worker.effort, "high");
     }
 
-    #[tokio::test]
-    async fn restart_reconstructs_external_worker_from_durable_provider_not_model() {
-        // "gpt-5" resolves to Codex through the built-in model mapping, so a
-        // recovery that consulted it would refuse this external record as a
-        // model/provider mismatch.
-        let fixture = dormant_fixture();
-        {
-            let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
-            let task = tasks::get(&conn, fixture.task_id).unwrap().unwrap();
-            let mut refs: serde_json::Value =
-                serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
-            runner_state::set_continuation(
-                &mut refs,
-                ContinuationSlot::Worker,
-                &runner_state::ContinuationIdentity {
-                    provider: "external".into(),
-                    id: "external-session".into(),
-                },
-            );
-            tasks::update_refs_daemon(
-                &mut conn,
-                fixture.task_id,
-                &refs.to_string(),
-                super::super::now_unix(),
-            )
-            .unwrap();
-            conn.execute(
-                "UPDATE agent_runs SET model='gpt-5',effort='deep',provider='external' \
-                 WHERE task_id=?1 AND role='worker'",
-                [fixture.task_id],
-            )
-            .unwrap();
-            conn.execute(
-                "UPDATE journal SET provider='external',continuation_id='external-session' \
-                 WHERE task_id=?1 AND role='worker'",
-                [fixture.task_id],
-            )
-            .unwrap();
+    // ── External worker restart (spec "Session record" > "Journal", "Resume
+    // or fresh start") ─────────────────────────────────────────────────────
+
+    /// Session-recording fake CLI shared with the daemon session tests.
+    const SESSION_RECORDING_CLI: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/session_recording_cli.sh"
+    );
+    const EXTERNAL_REWORK_FEEDBACK: &str = "Merge main into the PR branch and resolve conflicts.";
+    /// Byte size of the prior conversation seeded in the session file.
+    const SEEDED_SESSION_BYTES: &str = "13";
+
+    /// The worker slot's session record present when the daemon restarts.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SeededRecord {
+        Matching,
+        OtherProfile,
+        OtherFingerprint,
+        Unusable,
+        Absent,
+    }
+
+    struct ExternalRestart {
+        fixture: DormantFixture,
+        obs: PathBuf,
+    }
+
+    impl ExternalRestart {
+        fn config(&self) -> &ServeConfig {
+            &self.fixture.config
         }
 
-        let wt_mgr = WorktreeManager::new();
-        let mut names = super::super::names::Pool::new_generated();
-        let mut workers = Vec::new();
-        let mut roster = LifetimeRoster::new();
-        recover(
-            &fixture.config,
-            &wt_mgr,
-            &mut names,
-            &mut workers,
-            &mut roster,
-        )
-        .await
-        .unwrap();
+        fn session_file(&self) -> PathBuf {
+            self.config()
+                .session_base
+                .join(self.fixture.task_id.to_string())
+                .join("worker")
+                .join("session")
+        }
 
+        /// What the fake CLI recorded for run `n`.
+        fn observed(&self, n: usize, what: &str) -> String {
+            std::fs::read_to_string(self.obs.join(format!("run.{n}.{what}")))
+                .unwrap_or_else(|error| panic!("run {n} {what} not recorded: {error}"))
+        }
+
+        fn runs(&self) -> usize {
+            std::fs::read_to_string(self.obs.join("runs"))
+                .map(|runs| runs.lines().count())
+                .unwrap_or(0)
+        }
+
+        async fn recover(&self) -> (Vec<SlotState>, super::super::names::Pool) {
+            let mut names = super::super::names::Pool::new_generated();
+            let mut workers = Vec::new();
+            recover(
+                self.config(),
+                &WorktreeManager::new(),
+                &mut names,
+                &mut workers,
+                &mut LifetimeRoster::new(),
+            )
+            .await
+            .unwrap();
+            (workers, names)
+        }
+    }
+
+    /// The dormant fixture as an external worker on profile `x-ext`, whose
+    /// CLI is the session-recording fake: the journal row records provider
+    /// `external` and the slot name, the run names its profile, the worker
+    /// `runner_continuation*` refs are gone, `record` is the slot's session
+    /// record, and the session file holds a prior conversation. With
+    /// `rework`, the task waits in sticky rework for its exact recovered turn.
+    #[cfg(unix)]
+    fn external_restart(record: SeededRecord, rework: bool) -> ExternalRestart {
+        let mut fixture = dormant_fixture();
+        let root = fixture._dir.path().to_path_buf();
+        let remote = root.join("remote.git");
+        run_git(
+            &root,
+            &[
+                "init",
+                "--bare",
+                "-q",
+                "--initial-branch=main",
+                "remote.git",
+            ],
+        );
+        run_git(
+            &fixture.config.repo_dir,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_git(
+            &fixture.config.repo_dir,
+            &["push", "-q", "origin", "main", "daemon/dormant-t1"],
+        );
+        run_git(&fixture.config.repo_dir, &["fetch", "-q", "origin"]);
+        let obs = root.join("observe");
+        std::fs::create_dir(&obs).unwrap();
+        let wrapper = root.join("session-cli.sh");
+        write_executable(
+            &wrapper,
+            &format!(
+                "#!/bin/sh\nSESSION_CLI_OBSERVE='{}' exec '{SESSION_RECORDING_CLI}' \"$@\"\n",
+                obs.display()
+            ),
+        );
+        let wrapper = wrapper.to_str().unwrap().to_string();
+        // The live PR target the sticky remediation baseline binds.
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&fixture.config.repo_dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        let gh = root.join("fake-gh");
+        write_executable(
+            &gh,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"headRefName\":\"daemon/dormant-t1\",\"headRefOid\":\"{head}\",\"isCrossRepository\":false,\"baseRefName\":\"main\",\"state\":\"OPEN\"}}'\n"
+            ),
+        );
+        fixture.config.pr_target_program = Some(gh);
+        let declaration = crate::external_runner_spec::tests::with_session().replacen(
+            "executable = \"/usr/local/bin/fake-cli\"\n",
+            "",
+            1,
+        );
+        let file_cfg: crate::serve_config::ServeFileConfig =
+            toml::from_str(&format!("agent_bin = \"{wrapper}\"\n{declaration}")).unwrap();
+        let spec = crate::serve_config::resolve_external_runner(&file_cfg)
+            .unwrap()
+            .expect("declared");
+        let fingerprint = spec.fingerprint.clone();
+        fixture.config.agent_bin = Some(wrapper);
+        fixture.config.external_runner = Some(std::sync::Arc::new(spec));
+        fixture.config.model_profiles = std::collections::BTreeMap::from([(
+            "x-ext".into(),
+            crate::serve_config::ModelProfile {
+                runner: "external".into(),
+                model: "gpt-5".into(),
+                effort: "high".into(),
+            },
+        )]);
+        let pool = std::collections::BTreeMap::from([("x-ext".to_string(), 100)]);
+        fixture.config.routing.worker = (1..=5)
+            .map(|level| (level.to_string(), pool.clone()))
+            .collect();
+        fixture.config.routing.reviewer = fixture.config.routing.worker.clone();
+
+        let task_id = fixture.task_id;
+        let mut conn = quorum_core::db::open(&fixture.config.db_path).unwrap();
+        if rework {
+            enter_merge_conflict_rework(&mut conn, task_id, EXTERNAL_REWORK_FEEDBACK);
+        }
+        let task = tasks::get(&conn, task_id).unwrap().unwrap();
+        let mut refs: serde_json::Value =
+            serde_json::from_str(task.refs.as_deref().unwrap()).unwrap();
+        runner_state::remove_slot_continuation(&mut refs, ContinuationSlot::Worker);
+        let (profile, recorded_fingerprint) = match record {
+            SeededRecord::OtherProfile => ("x-other", fingerprint.as_str()),
+            SeededRecord::OtherFingerprint => ("x-ext", "0123abcd"),
+            _ => ("x-ext", fingerprint.as_str()),
+        };
+        if record != SeededRecord::Absent {
+            runner_state::set_external_session(
+                &mut refs,
+                ContinuationSlot::Worker,
+                profile,
+                recorded_fingerprint,
+            );
+        }
+        if record == SeededRecord::Unusable {
+            runner_state::mark_external_session_unusable(&mut refs, ContinuationSlot::Worker);
+        }
+        tasks::update_refs_daemon(
+            &mut conn,
+            task_id,
+            &refs.to_string(),
+            super::super::now_unix(),
+        )
+        .unwrap();
+        // "gpt-5" resolves to Codex through the built-in model mapping, so a
+        // recovery that consulted the opaque external model would refuse
+        // this row as a model/provider mismatch.
+        conn.execute(
+            "UPDATE agent_runs SET model='gpt-5',effort='high',provider='external',
+                    configured_profile_id='x-ext'
+              WHERE task_id=?1 AND role='worker'",
+            [task_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE journal SET provider='external',continuation_id='worker'
+              WHERE task_id=?1 AND role='worker'",
+            [task_id],
+        )
+        .unwrap();
+        drop(conn);
+        super::super::session_store::open_slot(
+            &fixture.config.session_base,
+            task_id,
+            super::super::session_store::Slot::Worker,
+        )
+        .unwrap();
+        let restart = ExternalRestart { fixture, obs };
+        std::fs::write(restart.session_file(), b"conversation\n").unwrap();
+        restart
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_exit(slot: &mut SlotState) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while slot.try_wait().unwrap().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the fake CLI exits");
+    }
+
+    /// A matching usable record rebuilds the dormant external worker in place
+    /// awaiting review; its next turn is the rebuilt-dormant run form.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_rebuilds_external_worker_awaiting_review_from_its_session_record() {
+        let h = external_restart(SeededRecord::Matching, false);
+        let (workers, _names) = h.recover().await;
         assert_eq!(workers.len(), 1);
         let worker = &workers[0];
         assert_eq!(
             worker.process_kind(),
             super::super::runner::AgentKind::External
         );
-        assert_eq!(
-            worker.continuation_id_for_launch(),
-            Some("external-session")
-        );
+        assert!(matches!(worker.proc, SlotProcess::Dormant { .. }));
+        assert_eq!(worker.continuation_id_for_launch(), Some("worker"));
         assert_eq!(worker.model, "gpt-5");
         let entry = super::super::slot_journal_entry(worker, "worker", "working");
         assert_eq!(entry.provider.as_deref(), Some("external"));
+        assert_eq!(entry.continuation_id.as_deref(), Some("worker"));
+        assert!(super::super::is_rebuilt_dormant_worker(worker));
+        assert_eq!(
+            super::super::external_feed_run_form(
+                worker,
+                "review feedback",
+                super::super::is_rebuilt_dormant_worker(worker)
+            ),
+            super::super::WorkerRunForm::RebuiltDormantTurn("review feedback".into())
+        );
+        let conn = quorum_core::db::open(&h.config().db_path).unwrap();
+        assert_eq!(
+            tasks::get(&conn, h.fixture.task_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "in-review"
+        );
+        assert_eq!(journal::list_in_flight(&conn).unwrap().len(), 1);
+        assert!(h.session_file().exists(), "recovery never touches the file");
+    }
+
+    /// A rebuilt sticky-rework external worker resumes its session with the
+    /// exact turn text the startup coordinator feeds, not a role prompt.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_rebuilt_external_worker_resumes_its_session_on_the_next_turn() {
+        let h = external_restart(SeededRecord::Matching, true);
+        let (mut workers, mut names) = h.recover().await;
+        assert_recovered_sticky_rework(&h.fixture, &workers, EXTERNAL_REWORK_FEEDBACK);
+        assert_eq!(
+            workers[0].process_kind(),
+            super::super::runner::AgentKind::External
+        );
+        let config = h.config();
+        let task_id = h.fixture.task_id;
+        let expected_turn = super::super::reviewer::build_rework_prompt(
+            "Dormant",
+            task_id,
+            901,
+            EXTERNAL_REWORK_FEEDBACK,
+            workers[0].cost_usd,
+            config.limits.max_task_cost_usd,
+            &super::super::load_task_risk_flags_for_prompt(&config.db_path, task_id)
+                .await
+                .unwrap(),
+            &super::super::load_worker_task_context(&config.db_path, task_id)
+                .await
+                .unwrap(),
+        );
+        super::super::resume_recovered_dormant_reworks(
+            config,
+            &WorktreeManager::new(),
+            &mut names,
+            &mut workers,
+            &mut super::super::ProfileCooldown::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(workers.len(), 1);
+        assert!(matches!(workers[0].proc, SlotProcess::Running(_)));
+        wait_for_exit(&mut workers[0]).await;
+        assert_eq!(h.runs(), 1);
+        assert_eq!(h.observed(1, "session"), SEEDED_SESSION_BYTES);
+        assert_eq!(h.observed(1, "prompt"), expected_turn);
+        let refs: serde_json::Value = serde_json::from_str(
+            tasks::get(&quorum_core::db::open(&config.db_path).unwrap(), task_id)
+                .unwrap()
+                .unwrap()
+                .refs
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        let entry = runner_state::external_session(&refs, ContinuationSlot::Worker).unwrap();
+        assert!(entry.usable);
+        assert_eq!(entry.profile, "x-ext");
+        workers.remove(0).kill_and_reap().await;
+    }
+
+    /// A profile mismatch, fingerprint mismatch, unusable, or absent record
+    /// is not rebuilt in place: the row is retired, its authority revoked,
+    /// and the task reset; the slot's next run is a fresh start that removes
+    /// the session file first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_without_a_matching_session_record_does_not_rebuild_and_starts_fresh() {
+        for record in [
+            SeededRecord::OtherProfile,
+            SeededRecord::OtherFingerprint,
+            SeededRecord::Unusable,
+            SeededRecord::Absent,
+        ] {
+            for rework in [false, true] {
+                let h = external_restart(record, rework);
+                let (workers, _names) = h.recover().await;
+                assert!(workers.is_empty(), "{record:?} rework={rework}");
+                let conn = quorum_core::db::open(&h.config().db_path).unwrap();
+                assert!(
+                    journal::list_in_flight(&conn).unwrap().is_empty(),
+                    "{record:?} rework={rework}: the dormant row is retired"
+                );
+                let live_capabilities: i64 = conn
+                    .query_row(
+                        "SELECT count(*) FROM run_capabilities
+                          WHERE task_id=?1 AND revoked_at IS NULL",
+                        [h.fixture.task_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(live_capabilities, 0, "{record:?} rework={rework}");
+                let task = tasks::get(&conn, h.fixture.task_id).unwrap().unwrap();
+                assert_eq!(
+                    task.status,
+                    if rework { "rework" } else { "in-review" },
+                    "{record:?}"
+                );
+                drop(conn);
+                assert!(h.session_file().exists(), "{record:?}: removed at launch");
+
+                // The slot's next run, even in a resumable form (the sticky
+                // remediation turn), is a fresh start through the production
+                // decision: the stale file is removed before launch and the
+                // record is rewritten for the routed profile. (The remediation
+                // path itself resolves its PR through the real `gh`.)
+                let session = super::super::prepare_external_worker_session_sync(
+                    &h.config().db_path,
+                    &h.config().session_base,
+                    h.config().external_runner.as_deref().unwrap(),
+                    h.fixture.task_id,
+                    "x-ext",
+                    &super::super::WorkerRunForm::ReviewRemediation(
+                        EXTERNAL_REWORK_FEEDBACK.into(),
+                    ),
+                )
+                .unwrap();
+                assert_eq!(session.resumed_prompt, None, "{record:?}");
+                assert!(!h.session_file().exists(), "{record:?}");
+                let refs: serde_json::Value = serde_json::from_str(
+                    tasks::get(
+                        &quorum_core::db::open(&h.config().db_path).unwrap(),
+                        h.fixture.task_id,
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .refs
+                    .as_deref()
+                    .unwrap(),
+                )
+                .unwrap();
+                let entry =
+                    runner_state::external_session(&refs, ContinuationSlot::Worker).unwrap();
+                assert!(entry.usable, "{record:?}");
+                assert_eq!(entry.profile, "x-ext", "{record:?}");
+            }
+        }
+    }
+
+    /// A corrupt external row (continuation is not the slot name) stays a
+    /// loud recovery failure, exactly like a built-in refs mismatch.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_refuses_external_row_whose_continuation_is_not_the_slot() {
+        let h = external_restart(SeededRecord::Matching, false);
+        quorum_core::db::open(&h.config().db_path)
+            .unwrap()
+            .execute(
+                "UPDATE journal SET continuation_id='external-session' WHERE role='worker'",
+                [],
+            )
+            .unwrap();
+        let error = recover(
+            h.config(),
+            &WorktreeManager::new(),
+            &mut super::super::names::Pool::new_generated(),
+            &mut Vec::new(),
+            &mut LifetimeRoster::new(),
+        )
+        .await
+        .expect_err("a corrupt external row is fatal");
+        assert!(error.to_string().contains("not the worker slot"), "{error}");
     }
 
     #[tokio::test]
