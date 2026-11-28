@@ -1780,6 +1780,7 @@ async fn spawn_and_run_classifier(
             claude_allowed_tools: "",
             codex_sandbox: &request.codex_sandbox,
             grok: Default::default(),
+            external: None,
         },
     )
     .await;

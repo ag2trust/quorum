@@ -12,6 +12,7 @@
 
 use super::agent::AgentProc;
 use super::codex_agent::CodexProc;
+use super::external_agent::ExternalProc;
 use super::grok_agent::{GrokAdapterConfig, GrokProc};
 use quorum_core::runner_state::{self, PendingTurn};
 use std::collections::VecDeque;
@@ -27,7 +28,7 @@ const DIAGNOSTIC_CAPACITY: usize = 256;
 const DIAGNOSTIC_LINE_BYTES: usize = 16 * 1024;
 const EXIT_EVIDENCE_LINES: usize = 256;
 const EXIT_EVIDENCE_LINE_BYTES: usize = 16 * 1024;
-const EXIT_EVIDENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+pub(super) const EXIT_EVIDENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Closed, provider-neutral classification for runner failures observed before
 /// a managed agent has produced an authoritative task or review outcome.
@@ -237,6 +238,21 @@ impl FailureTracker {
         };
     }
 
+    /// Record a result the external adapter decided itself (a protocol
+    /// violation or its exit check). Same precedence as provider evidence:
+    /// the first disposition wins and a different one is conflicting.
+    pub(super) fn record_decided_failure(&self, failure: RunnerFailure) {
+        self.record(
+            FailureObservation::classified(failure.disposition, failure.detail),
+            false,
+        );
+    }
+
+    /// The external adapter's exit check released a successful terminal event.
+    pub(super) fn record_terminal_success(&self) {
+        self.record(FailureObservation::success(), false);
+    }
+
     pub fn note_incomplete_evidence(&self, detail: impl Into<String>) {
         let mut state = self.0.lock().expect("failure tracker poisoned");
         if state.incomplete_evidence.is_none() {
@@ -396,10 +412,22 @@ fn observed_strict_failure_without_deferred_stderr(
 
 pub enum CapturedOutput {
     Stdout(String),
-    StdoutTruncated { dropped: usize },
+    StdoutTruncated {
+        dropped: usize,
+    },
     Stderr(String),
-    StderrTruncated { dropped: usize },
-    StderrBytesTruncated { dropped: usize },
+    StderrTruncated {
+        dropped: usize,
+    },
+    StderrBytesTruncated {
+        dropped: usize,
+    },
+    /// The external runner's stderr, as counts only: its text is never
+    /// classified or stored.
+    StderrWithheld {
+        lines: usize,
+        bytes: usize,
+    },
 }
 
 impl CapturedOutput {
@@ -422,6 +450,12 @@ impl CapturedOutput {
             Self::StderrBytesTruncated { dropped } => serde_json::json!({
                 "type":"provider.stderr_bytes_truncated",
                 "dropped_bytes":dropped
+            })
+            .to_string(),
+            Self::StderrWithheld { lines, bytes } => serde_json::json!({
+                "type":"provider.stderr_withheld",
+                "lines":lines,
+                "bytes":bytes
             })
             .to_string(),
         }
@@ -861,8 +895,8 @@ fn agent_mcp_launch_failure(detail: String) -> RunnerFailure {
 ///
 /// The endpoint locator, bearer, repository, and agent identity are needed by
 /// every transport (the stdio child reads all four; the HTTP listener resolves
-/// the bearer through the same endpoint). Claude attaches over HTTP and also
-/// needs the daemon listener URL.
+/// the bearer through the same endpoint). Claude and the external runner
+/// attach over HTTP and also need the daemon listener URL.
 pub(crate) fn check_agent_mcp_wiring(
     kind: AgentKind,
     role: AgentMcpRole,
@@ -870,7 +904,7 @@ pub(crate) fn check_agent_mcp_wiring(
     advertised: impl Fn(crate::agent_mcp::RunPhase) -> Vec<String>,
 ) -> Result<(), RunnerFailure> {
     let mut required_env: Vec<&str> = AGENT_MCP_ENV_VARS.to_vec();
-    if kind == AgentKind::Claude {
+    if matches!(kind, AgentKind::Claude | AgentKind::External) {
         required_env.push(AGENT_MCP_URL_ENV);
     }
     let missing_env: Vec<&str> = required_env
@@ -1062,6 +1096,9 @@ pub struct AdapterConfig<'a> {
     pub claude_allowed_tools: &'a str,
     pub codex_sandbox: &'a str,
     pub grok: GrokAdapterConfig<'a>,
+    /// The daemon's validated `[external_runner]` declaration. An external
+    /// launch without one is refused.
+    pub external: Option<&'a crate::external_runner_spec::ExternalSpec>,
 }
 
 /// One raw provider line plus its normalized lifecycle events.
@@ -1079,6 +1116,7 @@ pub enum RunnerProc {
     Claude(AgentProc),
     Codex(CodexProc),
     Grok(GrokProc),
+    External(ExternalProc),
 }
 
 impl RunnerProc {
@@ -1151,7 +1189,7 @@ impl RunnerProc {
             AgentKind::Claude => AgentProc::launch(request, config).await.map(Self::Claude),
             AgentKind::Codex => CodexProc::launch(request, config).map(Self::Codex),
             AgentKind::Grok => GrokProc::launch(request, config).map(Self::Grok),
-            AgentKind::External => return Err(external_adapter_not_built()),
+            AgentKind::External => ExternalProc::launch(request, config).map(Self::External),
         };
         result.map_err(|error| classify_launch_error(kind, error))
     }
@@ -1189,7 +1227,8 @@ impl RunnerProc {
             AgentKind::Grok => {
                 GrokProc::launch_gated(request, config).map(|(proc, gate)| (Self::Grok(proc), gate))
             }
-            AgentKind::External => return Err(external_adapter_not_built()),
+            AgentKind::External => ExternalProc::launch_gated(request, config)
+                .map(|(proc, gate)| (Self::External(proc), gate)),
         };
         result.map_err(|error| classify_launch_error(kind, error))
     }
@@ -1233,7 +1272,7 @@ impl RunnerProc {
                 .map(Self::Claude),
             AgentKind::Codex => CodexProc::launch(request, config).map(Self::Codex),
             AgentKind::Grok => GrokProc::launch(request, config).map(Self::Grok),
-            AgentKind::External => return Err(external_adapter_not_built()),
+            AgentKind::External => ExternalProc::launch(request, config).map(Self::External),
         };
         result.map_err(|error| classify_launch_error(kind, error))
     }
@@ -1243,13 +1282,14 @@ impl RunnerProc {
             Self::Claude(_) => AgentKind::Claude,
             Self::Codex(_) => AgentKind::Codex,
             Self::Grok(_) => AgentKind::Grok,
+            Self::External(_) => AgentKind::External,
         }
     }
 
     pub fn worker_request(&self) -> Option<&WorkerTurnRequest> {
         match self {
             Self::Grok(proc) => proc.worker_request(),
-            Self::Claude(_) | Self::Codex(_) => None,
+            Self::Claude(_) | Self::Codex(_) | Self::External(_) => None,
         }
     }
 
@@ -1261,7 +1301,7 @@ impl RunnerProc {
             Self::Grok(proc) => proc
                 .max_turn_exhaustion()
                 .map(|exhaustion| exhaustion.session_id),
-            Self::Claude(_) | Self::Codex(_) => None,
+            Self::Claude(_) | Self::Codex(_) | Self::External(_) => None,
         }
     }
 
@@ -1270,6 +1310,7 @@ impl RunnerProc {
             Self::Claude(proc) => proc.kill_and_reap().await,
             Self::Codex(proc) => proc.kill_and_reap().await,
             Self::Grok(proc) => proc.kill_and_reap().await,
+            Self::External(proc) => proc.kill_and_reap().await,
         }
     }
 
@@ -1347,6 +1388,7 @@ impl RunnerProc {
             Self::Claude(proc) => proc.failure_tracker(),
             Self::Codex(proc) => proc.failure_tracker(),
             Self::Grok(proc) => proc.failure_tracker(),
+            Self::External(proc) => proc.failure_tracker(),
         }
     }
 
@@ -1355,6 +1397,7 @@ impl RunnerProc {
             Self::Claude(proc) => proc.finish_stderr_until(deadline).await,
             Self::Codex(proc) => proc.finish_stderr_until(deadline).await,
             Self::Grok(proc) => proc.finish_stderr_until(deadline).await,
+            Self::External(proc) => proc.finish_stderr_until(deadline).await,
         }
     }
 
@@ -1366,6 +1409,7 @@ impl RunnerProc {
             Self::Claude(proc) => proc.next_raw_line_bounded(max_bytes).await,
             Self::Codex(proc) => proc.next_raw_line_bounded(max_bytes).await,
             Self::Grok(proc) => proc.next_raw_line_bounded(max_bytes).await,
+            Self::External(proc) => proc.next_raw_line_bounded(max_bytes).await,
         }
     }
 
@@ -1374,6 +1418,7 @@ impl RunnerProc {
             Self::Claude(proc) => proc.pid(),
             Self::Codex(proc) => proc.pid(),
             Self::Grok(proc) => proc.pid(),
+            Self::External(proc) => proc.pid(),
         }
     }
 
@@ -1386,6 +1431,7 @@ impl RunnerProc {
             Self::Claude(proc) => proc.process_group_id(),
             Self::Codex(proc) => proc.process_group_id(),
             Self::Grok(proc) => proc.process_group_id(),
+            Self::External(proc) => proc.process_group_id(),
         }
     }
 
@@ -1394,6 +1440,7 @@ impl RunnerProc {
             Self::Claude(proc) => proc.try_wait(),
             Self::Codex(proc) => proc.try_wait(),
             Self::Grok(proc) => proc.try_wait(),
+            Self::External(proc) => proc.try_wait(),
         }
     }
 
@@ -1408,6 +1455,7 @@ impl RunnerProc {
             Self::Claude(proc) => proc.classify_pre_authoritative_exit(status),
             Self::Codex(proc) => proc.classify_pre_authoritative_exit(status),
             Self::Grok(proc) => proc.classify_pre_authoritative_exit(status),
+            Self::External(proc) => proc.classify_pre_authoritative_exit(status),
         }
     }
 
@@ -1416,6 +1464,7 @@ impl RunnerProc {
             Self::Claude(proc) => proc.observed_pre_authoritative_failure(),
             Self::Codex(proc) => proc.observed_pre_authoritative_failure(),
             Self::Grok(proc) => proc.observed_pre_authoritative_failure(),
+            Self::External(proc) => proc.observed_pre_authoritative_failure(),
         }
     }
 
@@ -1454,6 +1503,7 @@ impl RunnerProc {
             Self::Claude(proc) => proc.next_raw_line().await,
             Self::Codex(proc) => proc.next_raw_line().await,
             Self::Grok(proc) => proc.next_raw_line().await,
+            Self::External(proc) => proc.next_raw_line().await,
         }
     }
 
@@ -1465,6 +1515,7 @@ impl RunnerProc {
             Self::Grok(_) => GrokProc::normalize_stream_line(raw),
             Self::Claude(proc) => proc.normalize_stream_line(raw),
             Self::Codex(_) => normalize_line(self.kind(), raw),
+            Self::External(_) => super::external_agent::normalize_line(raw).events,
         }
     }
 
@@ -1482,21 +1533,21 @@ impl RunnerProc {
     pub fn outstanding_work_summary(&self) -> Option<String> {
         match self {
             Self::Claude(proc) => proc.outstanding_work_summary(),
-            Self::Codex(_) | Self::Grok(_) => None,
+            Self::Codex(_) | Self::Grok(_) | Self::External(_) => None,
         }
     }
 
     pub fn unfed_turns_since_feed(&self) -> u32 {
         match self {
             Self::Claude(proc) => proc.unfed_turns_since_feed(),
-            Self::Codex(_) | Self::Grok(_) => 0,
+            Self::Codex(_) | Self::Grok(_) | Self::External(_) => 0,
         }
     }
 
     pub async fn authorized_grok_terminal(&mut self) -> Option<String> {
         match self {
             Self::Grok(proc) => proc.authorized_terminal().await,
-            Self::Claude(_) | Self::Codex(_) => None,
+            Self::Claude(_) | Self::Codex(_) | Self::External(_) => None,
         }
     }
 
@@ -1547,6 +1598,7 @@ impl RunnerProc {
         match self {
             Self::Claude(proc) => proc.next_raw_line_bounded(max_bytes).await,
             Self::Codex(proc) => proc.next_raw_line_bounded(max_bytes).await,
+            Self::External(proc) => proc.next_raw_line_bounded(max_bytes).await,
             Self::Grok(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "bounded role reads are unavailable for the Grok adapter",
@@ -1559,6 +1611,7 @@ impl RunnerProc {
             Self::Claude(_) => AgentProc::normalize_line(raw),
             Self::Codex(_) => CodexProc::normalize_line(raw),
             Self::Grok(_) => GrokProc::normalize_line(raw),
+            Self::External(_) => super::external_agent::normalize_line(raw),
         }
     }
 
@@ -1573,6 +1626,10 @@ impl RunnerProc {
                 std::io::ErrorKind::Unsupported,
                 "Grok is turn-oriented — respawn with its session ID",
             )),
+            Self::External(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "the external runner is turn-oriented — respawn per turn",
+            )),
         }
     }
 
@@ -1581,6 +1638,7 @@ impl RunnerProc {
             Self::Claude(proc) => proc.drain_diagnostics(),
             Self::Codex(proc) => proc.drain_diagnostics(),
             Self::Grok(proc) => proc.drain_diagnostics(),
+            Self::External(proc) => proc.drain_diagnostics(),
         }
     }
 }
@@ -1594,11 +1652,11 @@ pub fn launch_failure(error: &std::io::Error) -> Option<RunnerFailure> {
 }
 
 /// The runner a launch dispatches on. A built-in runner must agree with
-/// [`AgentKind::for_model`]; an external runner never consults it and is
-/// refused until its adapter exists.
+/// [`AgentKind::for_model`]; an external runner never consults it (its model
+/// is passed through verbatim).
 fn routed_runner(request: &LaunchRequest<'_>) -> Result<AgentKind, RunnerFailure> {
     if request.runner == AgentKind::External {
-        return Err(external_adapter_not_built());
+        return Ok(AgentKind::External);
     }
     let model_kind = AgentKind::for_model(request.model).map_err(|error| {
         RunnerFailure::new(FailureDisposition::Unclassified, error)
@@ -1615,16 +1673,6 @@ fn routed_runner(request: &LaunchRequest<'_>) -> Result<AgentKind, RunnerFailure
         .with_io_kind(std::io::ErrorKind::InvalidInput));
     }
     Ok(request.runner)
-}
-
-/// Launch failure for the external runner until its adapter exists. The
-/// configuration cannot be repaired by failing over, so it is NonFailover.
-fn external_adapter_not_built() -> RunnerFailure {
-    RunnerFailure::new(
-        FailureDisposition::NonFailover,
-        "external runner adapter not built",
-    )
-    .with_io_kind(std::io::ErrorKind::Unsupported)
 }
 
 fn classify_launch_error(kind: AgentKind, error: std::io::Error) -> RunnerFailure {
@@ -1892,9 +1940,9 @@ pub fn normalize_line(kind: AgentKind, raw: &str) -> Vec<AgentEvent> {
         AgentKind::Claude => normalize_claude_line(raw),
         AgentKind::Codex => normalize_codex_line(raw),
         AgentKind::Grok => normalize_grok_line(raw),
-        // The external stream mapping is declared by the operator and is
-        // built with the external adapter; no built-in parser applies.
-        AgentKind::External => Vec::new(),
+        // External records are built by the external adapter from the
+        // operator-declared stream mapping; raw CLI lines decode to nothing.
+        AgentKind::External => super::external_agent::normalize_line(raw).events,
     }
 }
 
@@ -2212,6 +2260,7 @@ mod tests {
             claude_allowed_tools: "Bash,Read",
             codex_sandbox: "danger-full-access",
             grok: Default::default(),
+            external: None,
         };
         let mut complete_claude = managed_environment();
         complete_claude.push((AGENT_MCP_URL_ENV.into(), "http://127.0.0.1:4100/mcp".into()));
@@ -2297,6 +2346,7 @@ mod tests {
             claude_allowed_tools: "",
             codex_sandbox: "read-only",
             grok: Default::default(),
+            external: None,
         };
         let environment = managed_environment();
         let undeclared = mcp_request(LaunchMode::Normal, &environment);
@@ -2567,6 +2617,7 @@ mod tests {
             claude_allowed_tools: "Bash,Read",
             codex_sandbox: "danger-full-access",
             grok: Default::default(),
+            external: None,
         }
     }
 
@@ -2897,6 +2948,7 @@ mod tests {
                 claude_allowed_tools: "Bash,Read",
                 codex_sandbox: "danger-full-access",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await;
@@ -2951,6 +3003,7 @@ mod tests {
                 claude_allowed_tools: "",
                 codex_sandbox: "workspace-write",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await;
@@ -2993,6 +3046,7 @@ mod tests {
                     claude_allowed_tools: "Bash,Read",
                     codex_sandbox: "danger-full-access",
                     grok: Default::default(),
+                    external: None,
                 },
             )
             .await;
@@ -3047,6 +3101,7 @@ mod tests {
                 claude_allowed_tools: "Bash,Read",
                 codex_sandbox: "danger-full-access",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await;
@@ -3115,6 +3170,7 @@ mod tests {
                 claude_allowed_tools: "",
                 codex_sandbox: "danger-full-access",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await;
@@ -3182,6 +3238,7 @@ mod tests {
                     permission_mode: crate::serve::grok_agent::DEFAULT_PERMISSION_MODE,
                     max_turns: crate::serve::grok_agent::DEFAULT_MAX_TURNS,
                 },
+                external: None,
             },
         )
         .await;
@@ -3303,6 +3360,7 @@ mod tests {
                     claude_allowed_tools: "",
                     codex_sandbox: "danger-full-access",
                     grok: Default::default(),
+                    external: None,
                 },
             )
             .await;
@@ -3371,6 +3429,7 @@ mod tests {
                 claude_allowed_tools: "",
                 codex_sandbox: "read-only",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await
@@ -3406,6 +3465,7 @@ mod tests {
             claude_allowed_tools: "",
             codex_sandbox: "read-only",
             grok: Default::default(),
+            external: None,
         };
         let mut failures = Vec::new();
         match RunnerProc::launch(&request(LaunchMode::Normal), &config).await {
@@ -3476,7 +3536,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_kind_launch_is_non_failover_until_adapter_exists() {
+    async fn external_kind_launch_without_spec_is_non_failover() {
         // A model the built-in mapping resolves to Codex must not launch
         // Codex when the routed profile names the external runner.
         let failures = launch_all_entry_points(AgentKind::External, "gpt-5").await;
@@ -3487,58 +3547,12 @@ mod tests {
                 FailureDisposition::NonFailover,
                 "{entry}"
             );
-            assert_eq!(
-                error.detail(),
-                "external runner adapter not built",
-                "{entry}"
-            );
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let request = LaunchRequest {
-            runner: AgentKind::External,
-            model: "gpt-5",
-            effort: "custom_effort",
-            worktree: dir.path(),
-            prompt: "prompt",
-            environment: &[],
-            mode: LaunchMode::Normal,
-            continuation_id: None,
-            managed: None,
-        };
-        let config = AdapterConfig {
-            executable: Some("/definitely/not/a/runner"),
-            claude_bare: false,
-            claude_allowed_tools: "",
-            codex_sandbox: "read-only",
-            grok: Default::default(),
-        };
-        let assert_stub = |error: RunnerFailure| {
-            assert_eq!(error.disposition(), FailureDisposition::NonFailover);
-            assert_eq!(error.detail(), "external runner adapter not built");
-        };
-        match RunnerProc::launch_as(AgentKind::External, &request, &config).await {
-            Ok(_) => panic!("external runner unexpectedly launched"),
-            Err(error) => assert_stub(error),
-        }
-        match RunnerProc::launch_gated_as(AgentKind::External, &request, &config).await {
-            Ok(_) => panic!("external runner unexpectedly launched gated"),
-            Err(error) => assert_stub(error),
-        }
-        let restricted = LaunchRequest {
-            mode: LaunchMode::Restricted,
-            ..request
-        };
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        match RunnerProc::launch_restricted_until_as(
-            AgentKind::External,
-            &restricted,
-            &config,
-            deadline,
-        )
-        .await
-        {
-            Ok(_) => panic!("external runner unexpectedly launched restricted"),
-            Err(error) => assert_stub(error),
+            let want = if entry == "launch_internal_worker" {
+                "internal Grok worker request has incomplete or mismatched task, assignment, role, model, effort, or pending-turn identity"
+            } else {
+                super::super::external_agent::DETAIL_NO_SPEC
+            };
+            assert_eq!(error.detail(), want, "{entry}");
         }
         assert_eq!(
             AgentKind::for_profile_runner("external").unwrap(),
@@ -3579,6 +3593,7 @@ mod tests {
                 claude_allowed_tools: "",
                 codex_sandbox: "read-only",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await
@@ -3654,6 +3669,7 @@ mod tests {
                 claude_allowed_tools: "",
                 codex_sandbox: "danger-full-access",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await;
@@ -3682,6 +3698,7 @@ mod tests {
                 claude_allowed_tools: "",
                 codex_sandbox: "danger-full-access",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await

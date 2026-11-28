@@ -18,6 +18,7 @@ pub mod collector;
 pub mod doctor;
 // Dormant until the external process adapter consumes it.
 #[allow(dead_code)]
+pub mod external_agent;
 pub mod external_launch;
 // Dormant until the external process adapter consumes it.
 #[allow(dead_code)]
@@ -4276,6 +4277,7 @@ fn runner_adapter_config<'a>(
             permission_mode: &config.grok.permission_mode,
             max_turns: config.grok.max_turns,
         },
+        external: None,
     }
 }
 
@@ -40027,6 +40029,7 @@ mod tests {
                         claude_allowed_tools: "",
                         codex_sandbox: "danger-full-access",
                         grok: Default::default(),
+                        external: None,
                     },
                 )
                 .await
@@ -43760,6 +43763,7 @@ mod tests {
                 claude_allowed_tools: "",
                 codex_sandbox: "danger-full-access",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await
@@ -45987,6 +45991,7 @@ mod tests {
                 claude_allowed_tools: "",
                 codex_sandbox: "danger-full-access",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await
@@ -46102,6 +46107,7 @@ mod tests {
                 claude_allowed_tools: "",
                 codex_sandbox: "danger-full-access",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await
@@ -46363,6 +46369,7 @@ mod tests {
                 claude_allowed_tools: "",
                 codex_sandbox: "danger-full-access",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await
@@ -46924,6 +46931,7 @@ mod tests {
                 claude_allowed_tools: "",
                 codex_sandbox: "danger-full-access",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await
@@ -47986,6 +47994,7 @@ printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-session-te
                 claude_allowed_tools: "",
                 codex_sandbox: "danger-full-access",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await
@@ -50117,6 +50126,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 claude_allowed_tools: "",
                 codex_sandbox: "danger-full-access",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await
@@ -52052,6 +52062,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 claude_allowed_tools: "",
                 codex_sandbox: "danger-full-access",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await
@@ -53265,6 +53276,7 @@ printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":70,"cached_input
                 claude_allowed_tools: "",
                 codex_sandbox: "danger-full-access",
                 grok: Default::default(),
+                external: None,
             },
         )
         .await

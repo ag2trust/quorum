@@ -1618,6 +1618,7 @@ mod tests {
             claude_allowed_tools: ALLOWED_TOOLS,
             codex_sandbox: "workspace-write",
             grok: Default::default(),
+            external: None,
         }
     }
 
