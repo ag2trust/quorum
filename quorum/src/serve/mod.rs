@@ -21534,7 +21534,10 @@ async fn feed_worker_turn(
 ) -> std::io::Result<()> {
     if slot.process_kind().turn_mode() == runner::TurnMode::RespawnPerTurn {
         let mut installed_run_id = None;
-        let recovered_startup = slot.pending_turn_kind == "recovered-rework";
+        let recovered_startup = slot.pending_turn_kind == RECOVERED_REWORK_TURN_KIND;
+        // Captured before the pending turn kind is replaced below: the first
+        // turn fed to a worker that restart recovery rebuilt in place.
+        let rebuilt_dormant = is_rebuilt_dormant_worker(slot);
         if !recovered_startup && should_replace_pending_prompt(raw_prompt) {
             slot.pending_prompt = raw_prompt.to_string();
             slot.pending_turn_kind = if slot.pr.is_some() {
@@ -21562,7 +21565,7 @@ async fn feed_worker_turn(
         // session or starts fresh with the full role prompt.
         let mut launch_prompt = std::borrow::Cow::Borrowed(raw_prompt);
         if slot.process_kind() == runner::AgentKind::External {
-            match prepare_external_worker_feed(slot, raw_prompt, recovered_startup, config).await {
+            match prepare_external_worker_feed(slot, raw_prompt, rebuilt_dormant, config).await {
                 Ok((prompt, session)) => {
                     env_vars = session.environment(&env_vars);
                     launch_prompt = std::borrow::Cow::Owned(prompt);
@@ -21710,14 +21713,32 @@ async fn feed_worker_turn(
     }
 }
 
+/// `pending_turn_kind` values restart recovery installs on a dormant worker it
+/// rebuilt in place: awaiting review, or with a recovered sticky rework turn.
+/// Only recovery installs `"awaiting-review"`, and the first fed turn
+/// replaces it.
+pub(crate) const REBUILT_AWAITING_REVIEW_TURN_KIND: &str = "awaiting-review";
+pub(crate) const RECOVERED_REWORK_TURN_KIND: &str = "recovered-rework";
+
+/// Whether `slot` is a dormant worker rebuilt in place by restart recovery
+/// whose next turn has not been fed yet (spec "Resume or fresh start",
+/// condition 4: "the next turn of a dormant worker rebuilt in place").
+fn is_rebuilt_dormant_worker(slot: &SlotState) -> bool {
+    matches!(slot.proc, SlotProcess::Dormant { .. })
+        && matches!(
+            slot.pending_turn_kind.as_str(),
+            REBUILT_AWAITING_REVIEW_TURN_KIND | RECOVERED_REWORK_TURN_KIND
+        )
+}
+
 /// The run form of a turn fed to an existing external worker slot (spec
 /// "Resume or fresh start", condition 4).
 fn external_feed_run_form(
     slot: &SlotState,
     raw_prompt: &str,
-    recovered_startup: bool,
+    rebuilt_dormant: bool,
 ) -> WorkerRunForm {
-    if recovered_startup {
+    if rebuilt_dormant {
         WorkerRunForm::RebuiltDormantTurn(raw_prompt.to_string())
     } else if !should_replace_pending_prompt(raw_prompt) {
         // The bounded same-route refeed after a failed turn.
@@ -21734,7 +21755,7 @@ fn external_feed_run_form(
 async fn prepare_external_worker_feed(
     slot: &SlotState,
     raw_prompt: &str,
-    recovered_startup: bool,
+    rebuilt_dormant: bool,
     config: &ServeConfig,
 ) -> std::result::Result<(String, ExternalWorkerSession), runner::RunnerFailure> {
     let run_id = slot
@@ -21750,7 +21771,7 @@ async fn prepare_external_worker_feed(
     .map_err(session_launch_failure)?
     // No routed profile: condition 2 cannot hold, so the run starts fresh.
     .unwrap_or_default();
-    let run = external_feed_run_form(slot, raw_prompt, recovered_startup);
+    let run = external_feed_run_form(slot, raw_prompt, rebuilt_dormant);
     let session = prepare_external_worker_session(config, slot.task_id, &profile_id, run).await?;
     let prompt = match &session.resumed_prompt {
         Some(prompt) => prompt.clone(),
